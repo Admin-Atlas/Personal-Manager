@@ -133,18 +133,31 @@ impl<S: SyncSlot> Drop for SyncRunGuard<'_, S> {
 /// `run_local_sync`); `slot`, `cancel`, and `pending_key` are that connector's `AppState` fields.
 /// This is the body the three `*_sync_core` wrappers shared byte-for-byte except for those four
 /// values — hoisting it keeps the F-43 guard handling and the crash-resume marking in one place.
-pub async fn run_detached_sync<F, Fut, S>(
+///
+/// `finish` emits the connector's terminal event, and is called exactly ONCE per run — after the
+/// last pass, on every exit path including an error. It must not live inside `pass`: a run can span
+/// several passes (that is what a folded-in request produces), and a terminal event per *pass* tells
+/// the UI the run is over while it is still going, which resets the progress and queued indicators
+/// mid-run and re-fires anything gated on completion.
+///
+/// It also cannot be replaced by a "more passes coming" flag on the per-pass event. The pass's own
+/// cancelled flag and the `stopped` read below are taken at different moments — the gap spans the
+/// manifest flush — so a Stop landing in between would announce "more coming" and then never send
+/// it, stranding the bar for the rest of the session.
+pub async fn run_detached_sync<F, Fut, S, G>(
     st: &AppState,
     slot: &Mutex<S>,
     cancel: &AtomicBool,
     pending_key: &str,
     target: Option<String>,
     pass: F,
+    finish: G,
 ) -> Result<usize>
 where
     S: SyncSlot,
     F: Fn(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<usize>>,
+    G: FnOnce(),
 {
     // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
     // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
@@ -187,6 +200,10 @@ where
             let _ = db::delete_setting(&conn, pending_key);
         }
     }
+    // The run is over — announce it once, however it ended. Deliberately before the `result` is
+    // returned rather than only on `Ok`: a pass that bailed with `?` still leaves the UI mid-run,
+    // and a bar that never terminates is a worse failure than a terminal event reporting little.
+    finish();
     result
 }
 

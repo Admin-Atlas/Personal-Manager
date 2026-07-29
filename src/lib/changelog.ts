@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.108.5-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "Queuing a sync while another one is running no longer looks like it was ignored. Asking to sync a second account mid-sync folds it into a follow-up pass — but PM announced “finished” at the end of every pass, so the progress bar and the Queued badge both cleared while the queued work was still going. It looked like your request had been dropped when it was actually running. PM now says a sync is finished once, when the whole run is genuinely over.",
+      "The summary at the end of a sync now counts the whole run. Because each pass reported separately, a sync that indexed fifty files could finish by telling you it indexed none — the follow-up pass found nothing new and had the last word. The totals now add up across every pass.",
+      "Filing suggestions no longer run twice per sync, or at all after you press Stop. They were triggered by that same per-pass “finished”, so a queued sync generated suggestions once over a half-built index and again at the end. Stopping a sync now also stops the suggestions that would have followed it — pressing Stop used to trigger the largest batch of model calls PM had.",
+    ],
+  },
+  {
     version: "3.108.4-alpha",
     date: "2026-07-29",
     highlights: [

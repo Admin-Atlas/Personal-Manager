@@ -995,6 +995,51 @@ fn emit_local_progress(app: &AppHandle, ev: LocalSyncEvent) {
     let _ = app.emit("local://sync", ev);
 }
 
+/// Fold one pass's report into the run's running total, without emitting. The local mirror of
+/// [`crate::cloud_sync`]'s accumulator, and for the same reason: a run is one or more passes, and
+/// reporting only the last would end a run that indexed 50 files by announcing "0 indexed".
+fn accumulate_local_pass(app: &AppHandle, report: LocalSyncReport) {
+    with_local_snap(app, |snap| match snap.last_report.as_mut() {
+        None => snap.last_report = Some(report),
+        Some(run) => merge_local_pass_into_run(run, report),
+    });
+}
+
+/// Add one pass's counts to the run's — the local mirror of `cloud_sync::merge_pass_into_run`, with
+/// the same rules (`cancelled` is the last pass's, the issue list stays capped, truncation sticky).
+fn merge_local_pass_into_run(run: &mut LocalSyncReport, pass: LocalSyncReport) {
+    run.indexed += pass.indexed;
+    run.updated += pass.updated;
+    run.removed += pass.removed;
+    run.skipped += pass.skipped;
+    run.failed += pass.failed;
+    run.cancelled = pass.cancelled;
+    let room = connector_sync::MAX_REPORT_ISSUES.saturating_sub(run.issues.len());
+    if pass.issues.len() > room {
+        run.issues_truncated = true;
+    }
+    run.issues.extend(pass.issues.into_iter().take(room));
+    run.issues_truncated |= pass.issues_truncated;
+}
+
+/// Emit the run's single terminal event from the accumulated totals. Called once by
+/// [`connector_sync::run_detached_sync`] after the final pass, on every exit path.
+fn emit_local_run_finished(app: &AppHandle) {
+    let report = {
+        // Bind the state to a named local so its temporary outlives the guard borrowed from it
+        // (the E0716 trap the Drive snapshot helper documents).
+        let state = app.state::<AppState>();
+        let guard = state.local_sync.lock();
+        guard.ok().and_then(|snap| snap.last_report.clone())
+    };
+    let _ = app.emit(
+        "local://sync",
+        LocalSyncEvent::Finished {
+            report: report.unwrap_or_default(),
+        },
+    );
+}
+
 /// True if the running local-folder sync has been asked to stop.
 fn local_sync_cancelled(app: &AppHandle) -> bool {
     app.state::<AppState>()
@@ -1033,6 +1078,7 @@ pub(crate) async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> 
         LOCAL_SYNC_PENDING_KEY,
         folder,
         |target| run_local_sync(app, target),
+        || emit_local_run_finished(app),
     )
     .await
 }
@@ -1290,7 +1336,8 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
         issues,
         issues_truncated,
     };
-    emit_local_progress(app, LocalSyncEvent::Finished { report });
+    // End of a PASS, not the run — accumulate; `run_detached_sync` announces the run once.
+    accumulate_local_pass(app, report);
 
     if !cancelled {
         if let Some(e) = last_err {

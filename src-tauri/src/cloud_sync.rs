@@ -266,6 +266,56 @@ fn emit_progress<C: CloudDriver>(app: &AppHandle, ev: CloudSyncEvent) {
     let _ = app.emit(C::EVENT_NAME, ev);
 }
 
+/// Fold one pass's report into the run's running total, without emitting anything.
+///
+/// A run is one or more passes (a request arriving mid-sync is folded into a follow-up sweep), and
+/// the user thinks in runs. Reporting only the final pass would be actively wrong: the sweep that
+/// follows a 50-document pass typically finds nothing new, so the run would end by announcing "0
+/// indexed". `cancelled` takes the latest pass's value — whether the run ended by stopping is a
+/// property of how it ended, not a sum.
+fn accumulate_pass_report<C: CloudDriver>(app: &AppHandle, report: CloudSyncReport) {
+    with_cloud_snap::<C>(app, |snap| match snap.last_report.as_mut() {
+        None => snap.last_report = Some(report),
+        Some(run) => merge_pass_into_run(run, report),
+    });
+}
+
+/// Add one pass's counts to the run's. Pure, so the run-total arithmetic is testable without an app
+/// handle: `cancelled` takes the latest pass's value (how the run ENDED, not a sum), and the issue
+/// list stays bounded by the same cap one pass uses, with truncation sticky once either side hit it.
+fn merge_pass_into_run(run: &mut CloudSyncReport, pass: CloudSyncReport) {
+    run.indexed += pass.indexed;
+    run.updated += pass.updated;
+    run.removed += pass.removed;
+    run.skipped += pass.skipped;
+    run.failed += pass.failed;
+    run.cancelled = pass.cancelled;
+    let room = connector_sync::MAX_REPORT_ISSUES.saturating_sub(run.issues.len());
+    if pass.issues.len() > room {
+        run.issues_truncated = true;
+    }
+    run.issues.extend(pass.issues.into_iter().take(room));
+    run.issues_truncated |= pass.issues_truncated;
+}
+
+/// Emit the run's single terminal event, from the totals accumulated across its passes. Called once
+/// by [`connector_sync::run_detached_sync`] after the final pass, on every exit path.
+fn emit_run_finished<C: CloudDriver>(app: &AppHandle) {
+    let report = {
+        let state = app.state::<AppState>();
+        let guard = C::snapshot(state.inner()).lock();
+        guard.ok().and_then(|snap| snap.last_report.clone())
+    };
+    // A run that never completed a pass (an early bail) has nothing accumulated; still terminate the
+    // UI's run rather than leaving a bar up forever.
+    let _ = app.emit(
+        C::EVENT_NAME,
+        CloudSyncEvent::Finished {
+            report: report.unwrap_or_default(),
+        },
+    );
+}
+
 /// True if the running sync has been asked to stop.
 fn sync_cancelled<C: CloudDriver>(app: &AppHandle) -> bool {
     C::cancel_flag(app.state::<AppState>().inner()).load(Ordering::SeqCst)
@@ -407,6 +457,7 @@ async fn run_cloud_sync<C: CloudDriver>(
         C::PENDING_KEY,
         account,
         |target| run_cloud_pass(app, &driver, target),
+        || emit_run_finished::<C>(app),
     )
     .await
 }
@@ -720,7 +771,9 @@ async fn run_cloud_pass<C: CloudDriver>(
         issues,
         issues_truncated,
     };
-    emit_progress::<C>(app, CloudSyncEvent::Finished { report });
+    // Accumulate, don't announce: this is the end of a PASS, and a run may still have a folded-in
+    // sweep to go. `run_detached_sync` emits the one terminal event once the run is actually over.
+    accumulate_pass_report::<C>(app, report);
 
     // A deliberate stop isn't an error. Otherwise surface a failure (auth/expired) even when some
     // items succeeded — the good ones are already committed.
@@ -1764,5 +1817,94 @@ mod tests {
         assert!(is_file_lock_error(&py));
         assert!(is_file_lock_error(&win));
         assert!(!is_file_lock_error(&genuine));
+    }
+
+    /// A run is one or more passes. Reporting only the last one is how a run that indexed 50 files
+    /// ends by announcing "0 indexed" — the follow-up sweep finds nothing new.
+    #[test]
+    fn a_run_reports_the_sum_of_its_passes_not_the_last_one() {
+        let mut run = CloudSyncReport {
+            indexed: 50,
+            updated: 3,
+            removed: 1,
+            skipped: 2,
+            failed: 1,
+            ..Default::default()
+        };
+        // The folded-in sweep re-scans everything and finds nothing new.
+        merge_pass_into_run(&mut run, CloudSyncReport::default());
+        assert_eq!(
+            run.indexed, 50,
+            "the sweep must not erase the first pass's work"
+        );
+        assert_eq!(
+            (run.updated, run.removed, run.skipped, run.failed),
+            (3, 1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn cancelled_takes_the_last_pass_not_the_union() {
+        let mut run = CloudSyncReport {
+            cancelled: true,
+            ..Default::default()
+        };
+        merge_pass_into_run(&mut run, CloudSyncReport::default());
+        assert!(
+            !run.cancelled,
+            "how the run ENDED is the last pass's answer, not a sum"
+        );
+
+        let mut run = CloudSyncReport::default();
+        merge_pass_into_run(
+            &mut run,
+            CloudSyncReport {
+                cancelled: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            run.cancelled,
+            "a stop in the final pass ends the run stopped"
+        );
+    }
+
+    #[test]
+    fn merged_issues_stay_within_the_one_pass_cap() {
+        let issue = |n: usize| CloudSyncIssue {
+            name: format!("f{n}"),
+            reason: "nope".into(),
+        };
+        let cap = connector_sync::MAX_REPORT_ISSUES;
+        let mut run = CloudSyncReport {
+            issues: (0..cap - 1).map(issue).collect(),
+            ..Default::default()
+        };
+        merge_pass_into_run(
+            &mut run,
+            CloudSyncReport {
+                issues: (0..5).map(issue).collect(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            run.issues.len(),
+            cap,
+            "a multi-pass run must not grow the list past the cap"
+        );
+        assert!(run.issues_truncated, "dropping issues has to be admitted");
+    }
+
+    #[test]
+    fn truncation_is_sticky_across_passes() {
+        let mut run = CloudSyncReport {
+            issues_truncated: true,
+            ..Default::default()
+        };
+        merge_pass_into_run(&mut run, CloudSyncReport::default());
+        assert!(
+            run.issues_truncated,
+            "a clean later pass cannot un-truncate an earlier one"
+        );
     }
 }
