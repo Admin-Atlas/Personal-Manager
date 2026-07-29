@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.108.3-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "“Delete oldest, keep 5” now trims what it can and tells you about the rest. Google Drive only lets PM touch files its own sign-in created, so backups uploaded before you last reconnected your Google account can be listed but not deleted. PM used to stop at the first one it wasn’t allowed to remove, so nothing at all got trimmed and you got a wall of Google error text. It now moves every archive it can, then says plainly how many it had to leave and that you can delete those in Drive yourself. The banner also refreshes now even when the trim fails, instead of sitting there showing the old count.",
+      "Disconnecting Google Drive no longer quietly breaks your backups. The Drive connector and Drive backups share one sign-in, and disconnecting the connector was handing that sign-in back to Google — which is what put PM in the position above. If the account is also your backup destination, PM now keeps the sign-in and only stops using it to index files.",
+      "Automatic backups no longer trim in silence. A scheduled backup that couldn’t tidy up old archives said nothing at all; it now shows up in the same banner that already reports a destination problem.",
+    ],
+  },
+  {
     version: "3.108.2-alpha",
     date: "2026-07-29",
     highlights: [

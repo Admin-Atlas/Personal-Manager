@@ -93,6 +93,7 @@ import type {
   ReviewDecision,
   RetagEvent,
   RetagScope,
+  RetentionOutcome,
   ReviewEvent,
   TagProposalRow,
   RestoreSummary,
@@ -1439,9 +1440,10 @@ export const backupNow = (destination: "proton" | "gdrive") =>
 export const backupArchivePrefix = () => invoke<string>("backup_archive_prefix");
 
 /** Trim this vault's backups at a destination to keep-last-N now (the banner's "delete oldest").
- *  Recoverable (Proton/Drive trash). Returns how many were trimmed. */
+ *  Recoverable (Proton/Drive trash). Returns what was trimmed and what the destination refused —
+ *  see {@link RetentionOutcome}. */
 export const pruneOwnBackups = (destination: "proton" | "gdrive") =>
-  invoke<number>("prune_own_backups", { destination });
+  invoke<RetentionOutcome>("prune_own_backups", { destination });
 
 /** The current automatic-backup schedule (cadence + retention + keychain opt-in + last run). */
 export const getBackupSchedule = () => invoke<BackupSchedule>("get_backup_schedule");

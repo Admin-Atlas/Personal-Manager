@@ -632,24 +632,37 @@ export function BackupSettings() {
 
   // Reconciliation banner action: trim this vault's archives at the destination to keep-last-N now
   // (recoverable — Proton/Drive trash).
+  //
+  // `skipped` is not a failure: Google Drive only lets PM modify files its own sign-in created, so
+  // archives uploaded under an earlier grant stay listed but refuse to be trashed. Saying so beats
+  // "Moved 0" over a banner that still shows ten.
+  function prunedNote(trashed: number, skipped: number): string {
+    const moved =
+      trashed > 0 ? `Moved ${trashed} older backup${trashed === 1 ? "" : "s"} to the trash. ` : "";
+    if (skipped === 0) {
+      return trashed > 0
+        ? moved.trim()
+        : "Nothing to trim — none of this vault's archives were over the limit.";
+    }
+    return `${moved}PM can only remove backups it uploaded with the current Google sign-in, so ${skipped} older archive${
+      skipped === 1 ? "" : "s"
+    } stayed put. Delete ${skipped === 1 ? "it" : "them"} in Google Drive to free the space.`;
+  }
+
   async function doPruneOldest(kind: "proton" | "gdrive") {
     setPruneNote((prev) => ({ ...prev, [kind]: null }));
     try {
       if (kind === "proton") setProtonBusy(true);
       else setGdriveBusy(true);
-      const n = await pruneOwnBackups(kind);
-      if (kind === "proton") await refreshProton();
-      else await refreshGdrive();
-      setPruneNote((prev) => ({
-        ...prev,
-        [kind]:
-          n > 0
-            ? `Moved ${n} older backup${n === 1 ? "" : "s"} to the destination's trash.`
-            : "Nothing to trim — none of this vault's archives were over the limit.",
-      }));
+      const { trashed, skipped } = await pruneOwnBackups(kind);
+      setPruneNote((prev) => ({ ...prev, [kind]: prunedNote(trashed, skipped) }));
     } catch (e) {
       setPruneNote((prev) => ({ ...prev, [kind]: String(e) }));
     } finally {
+      // Refresh even when the trim threw or was refused: a partial pass still moved archives, and
+      // leaving the banner showing a stale count reads as "the button did nothing".
+      if (kind === "proton") await refreshProton().catch(() => {});
+      else await refreshGdrive().catch(() => {});
       if (kind === "proton") setProtonBusy(false);
       else setGdriveBusy(false);
     }

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 use super::naming::BackupEntry;
+use super::RetentionOutcome;
 use crate::error::{Error, Result};
 use crate::AppState;
 
@@ -84,8 +85,10 @@ impl BackupDestination {
         }
     }
 
-    /// Trim to keep the newest `keep_n` archives whose name carries `prefix` (this vault's).
-    pub async fn apply_retention(&self, keep_n: usize, prefix: &str) -> Result<usize> {
+    /// Trim to keep the newest `keep_n` archives whose name carries `prefix` (this vault's). The
+    /// outcome separates what was trimmed from what the destination refused to let PM touch — see
+    /// [`RetentionOutcome`]; only Google Drive can report a refusal.
+    pub async fn apply_retention(&self, keep_n: usize, prefix: &str) -> Result<RetentionOutcome> {
         match self {
             Self::Proton { cli } => {
                 let (cli, prefix) = (cli.clone(), prefix.to_string());

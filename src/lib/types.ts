@@ -945,6 +945,19 @@ export interface BackupReport {
   failed_destinations: string[];
 }
 
+/** What a keep-last-N trim actually managed to do at a destination.
+ *
+ *  `skipped` exists because Google Drive grants PM per-file write authority: it may only modify
+ *  files its own OAuth client created. An archive uploaded under an earlier grant stays visible and
+ *  listable while refusing every write, so a trim can legitimately succeed at nothing. `trashed: 0`
+ *  on its own can't tell "nothing was over the limit" from "PM wasn't allowed to touch any of it". */
+export interface RetentionOutcome {
+  /** Moved to the destination's trash — recoverable, never a hard delete. */
+  trashed: number;
+  /** Chosen for trimming, but the destination refused PM write access. */
+  skipped: number;
+}
+
 /** Snapshot of an in-flight backup/restore, so the UI resumes progress after navigating away. */
 export interface BackupState {
   running: boolean;

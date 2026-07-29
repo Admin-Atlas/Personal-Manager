@@ -103,6 +103,23 @@ pub enum BackupKind {
     Restore,
 }
 
+/// What a retention pass actually managed to do: how many archives it trimmed, and how many it
+/// selected but the destination refused to let it touch.
+///
+/// A refusal is not an error. Google Drive grants PM the narrow `drive.file` scope, whose write
+/// authority is per (user, OAuth client, file) — PM may only modify files *its own client created*.
+/// Revoking and re-granting access, or signing in under a different client, leaves earlier archives
+/// perfectly visible and listable while refusing every write to them. Counting refusals separately
+/// is what lets a pass trim what it can and explain the rest, instead of failing at the first one
+/// and trimming nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RetentionOutcome {
+    /// Moved to the destination's trash (recoverable, never a hard delete).
+    pub trashed: usize,
+    /// Selected for trimming, but the destination refused PM write access to them.
+    pub skipped: usize,
+}
+
 /// The result of a finished backup/restore, kept in the shared snapshot so a user who
 /// navigates away and back still sees the outcome (mirrors `CloudSyncReport`).
 #[derive(Debug, Clone, Serialize)]

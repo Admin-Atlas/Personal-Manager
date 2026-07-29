@@ -23,6 +23,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::naming::{self, BackupEntry, ARCHIVE_EXT};
+use super::RetentionOutcome;
 use crate::error::{Error, Result};
 use crate::google;
 
@@ -245,7 +246,17 @@ pub(crate) async fn upload_archive(
     let len = std::fs::metadata(local)?.len();
 
     // 1) Initiate the resumable session. Small JSON body → safe to 401-retry via `authorized_send`.
-    let meta = serde_json::json!({ "name": archive_name, "parents": [folder_id] }).to_string();
+    //
+    // `appProperties` is private to the OAuth client that wrote it, so its presence is proof this
+    // archive was uploaded by a PM sign-in that could also delete it. Nothing reads it yet —
+    // retention tolerates refusals rather than pre-filtering — but the marker cannot be added
+    // retroactively, so every archive uploaded from here on is one a later diagnostic can identify.
+    let meta = serde_json::json!({
+        "name": archive_name,
+        "parents": [folder_id],
+        "appProperties": { "pmBackup": "1" },
+    })
+    .to_string();
     let init_url = format!("{UPLOAD_API}?uploadType=resumable&fields=id");
     let init = google::authorized_send(&http_client()?, token_key, |c, bearer| {
         c.post(&init_url)
@@ -414,13 +425,22 @@ pub(crate) async fn list_archives(token_key: &str, folder_id: &str) -> Result<Ve
 /// `prefix` (this vault's — see [`naming::archive_prefix`]) and TRASH the rest via
 /// `files.update {trashed:true}` — recoverable (Drive Trash), never a hard delete, mirroring
 /// Proton. Scoped by `prefix` + `valid_archive_name`, so it never touches another vault's/device's
-/// archives or a non-PM file. Returns how many were trashed.
+/// archives or a non-PM file.
+///
+/// **Listing an archive does not mean PM may write to it.** The victims are chosen by listing the
+/// folder, and PM can see everything in it because its Drive grant unions `drive.file` with
+/// `drive.readonly`. Write authority is narrower: `drive.file` covers only files PM's *current*
+/// OAuth client created, so an archive uploaded before the grant was revoked and re-issued, or by a
+/// different client id, refuses the PATCH with 403 `appNotAuthorizedToFile`. That is a per-file
+/// permission fact, not a failure of the pass, so it is skipped and counted — one unreachable
+/// archive must not stop the rest being trimmed. Anything else (a rate limit, a 5xx, a network
+/// error) still fails the whole pass.
 pub(crate) async fn apply_retention(
     token_key: &str,
     folder_id: &str,
     keep_n: usize,
     prefix: &str,
-) -> Result<usize> {
+) -> Result<RetentionOutcome> {
     let files = list_files_with_ids(token_key, folder_id).await?;
     // (name -> id) for this vault's valid archives only.
     let mine: Vec<(String, String)> = files
@@ -430,7 +450,7 @@ pub(crate) async fn apply_retention(
         .collect();
     let names: Vec<String> = mine.iter().map(|(name, _)| name.clone()).collect();
     let doomed = naming::select_for_deletion(&names, keep_n);
-    let mut trashed = 0usize;
+    let mut outcome = RetentionOutcome::default();
     for name in &doomed {
         let Some((_, id)) = mine.iter().find(|(n, _)| n == name) else {
             continue;
@@ -448,11 +468,18 @@ pub(crate) async fn apply_retention(
         })
         .await?;
         if !resp.status().is_success() {
-            return Err(drive_error(resp, "trimming old backups").await);
+            // `drive_error` consumes the body to build the message, so classify the built error
+            // rather than re-reading the response.
+            let err = drive_error(resp, "trimming old backups").await;
+            if crate::drive::is_item_forbidden_or_missing(&err) {
+                outcome.skipped += 1;
+                continue;
+            }
+            return Err(err);
         }
-        trashed += 1;
+        outcome.trashed += 1;
     }
-    Ok(trashed)
+    Ok(outcome)
 }
 
 /// Download one archive (by bare name) into `dest_dir`, written as `dest_dir/<name>`. Resolves the
