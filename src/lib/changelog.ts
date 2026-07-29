@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.108.4-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "On Linux, the window edges now show a resize cursor. PM draws its own window frame, and on Linux the toolkit underneath performs the resize but never changes the pointer — so dragging an edge worked, and there was no way to tell where the edges were except by guessing. The pointer now becomes a resize arrow within a few pixels of any edge or corner, matching exactly where the drag will actually take. Windows and macOS were never affected; they get the cursor from the operating system. Note the arrow deliberately stays hidden while the window is maximised, because resizing genuinely isn’t available then.",
+    ],
+  },
+  {
     version: "3.108.3-alpha",
     date: "2026-07-29",
     highlights: [
