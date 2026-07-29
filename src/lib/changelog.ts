@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.108.1-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "Settings → Storage no longer implies a library is missing when it’s already there. Shared libraries like OpenCV, shapely and scipy sit under the feature that uses them, and while that feature is installed they can’t be removed on their own. They used to be labelled “Needs a step first”, which read like something still to download — so photo text recognition looked half-installed when it was working fine. They now read “Installed — in use”, with the same pill pointing at what to remove first. The help text for the tab also covers the photo text recognition libraries, which it had never mentioned.",
+    ],
+  },
+  {
     version: "3.108.0-alpha",
     date: "2026-07-28",
     highlights: [
