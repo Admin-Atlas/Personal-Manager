@@ -200,11 +200,13 @@ pub struct CloudSyncState {
     pub started_at_ms: Option<i64>,
     /// The account being synced (email), or `None` for an all-accounts pass.
     pub account: Option<String>,
-    /// Internal single-flight flag: a sync was requested while one was already running (e.g. the user
-    /// connected another account mid-index). The running pass drains it with one more all-accounts
-    /// sweep so the new account is still picked up. Not exposed to the UI.
+    /// Internal single-flight queue: the sweeps this run still owes because a request arrived while a
+    /// pass was running (the user pressed "Sync now" for another account mid-index, or connected
+    /// one). Each queued account gets its own follow-up pass, so `account` above moves to it in turn
+    /// and its row reads "Queued" and then "Syncing…"; a request that named no account collapses them
+    /// into one all-accounts sweep. Not exposed to the UI.
     #[serde(skip)]
-    pub rerun: bool,
+    pub queue: connector_sync::SyncQueue,
     /// The most recent finished sync's report (counts + the not-indexed list), so a user returning to
     /// Settings after a sync has completed still sees the result. Cleared when a new sync starts.
     pub last_report: Option<cloud_sync::CloudSyncReport>,
@@ -221,9 +223,10 @@ pub struct LocalFolderSyncState {
     pub started_at_ms: Option<i64>,
     /// The folder key being synced, or `None` for an all-folders pass.
     pub folder: Option<String>,
-    /// Internal single-flight flag (a sync requested while one was running). Not exposed to the UI.
+    /// Internal single-flight queue (the sweeps still owed to requests that arrived while a pass was
+    /// running) — see [`CloudSyncState::queue`]. Not exposed to the UI.
     #[serde(skip)]
-    pub rerun: bool,
+    pub queue: connector_sync::SyncQueue,
     /// The most recent finished sync's report, so a user returning after a sync still sees the result.
     pub last_report: Option<localfolder::LocalSyncReport>,
 }
@@ -296,16 +299,15 @@ impl connector_sync::SyncSlot for CloudSyncState {
     fn set_running(&mut self, running: bool) {
         self.running = running;
     }
-    fn rerun(&self) -> bool {
-        self.rerun
+    fn queue(&mut self) -> &mut connector_sync::SyncQueue {
+        &mut self.queue
     }
-    fn set_rerun(&mut self, rerun: bool) {
-        self.rerun = rerun;
-    }
-    fn reset_for_rerun(&mut self) {
+    fn reset_for_rerun(&mut self, target: Option<String>) {
         self.processed = 0;
         self.total = None;
-        self.account = None;
+        // The sweep's OWN account, not `None`: the follow-up now answers one queued request at a
+        // time, so the row that showed "Queued" is the one that shows "Syncing…" next.
+        self.account = target;
         // `started_at_ms` is deliberately NOT reset: the follow-up sweep is a continuation of the
         // same run the user started, so the elapsed timer keeps counting instead of restarting.
     }
@@ -326,16 +328,13 @@ impl connector_sync::SyncSlot for LocalFolderSyncState {
     fn set_running(&mut self, running: bool) {
         self.running = running;
     }
-    fn rerun(&self) -> bool {
-        self.rerun
+    fn queue(&mut self) -> &mut connector_sync::SyncQueue {
+        &mut self.queue
     }
-    fn set_rerun(&mut self, rerun: bool) {
-        self.rerun = rerun;
-    }
-    fn reset_for_rerun(&mut self) {
+    fn reset_for_rerun(&mut self, target: Option<String>) {
         self.processed = 0;
         self.total = None;
-        self.folder = None;
+        self.folder = target;
         // `started_at_ms` deliberately kept — see the cloud slot above.
     }
     fn begin_pass(&mut self, target: Option<String>) {

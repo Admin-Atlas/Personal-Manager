@@ -937,8 +937,12 @@ pub struct LocalSyncReport {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalSyncEvent {
+    /// The total this PASS will work through, and which folder it is for (`None` = every folder).
+    /// A run can span several passes — see [`crate::connector_sync::SyncQueue`] — so this is also how
+    /// the UI learns a folder it is showing as "Queued" has come up.
     Counted {
         total: usize,
+        target: Option<String>,
     },
     Item {
         processed: usize,
@@ -978,7 +982,7 @@ fn with_local_snap(app: &AppHandle, f: impl FnOnce(&mut crate::LocalFolderSyncSt
 /// cloud engines' `emit_drive_progress` / `emit_onedrive_progress`).
 fn emit_local_progress(app: &AppHandle, ev: LocalSyncEvent) {
     with_local_snap(app, |snap| match &ev {
-        LocalSyncEvent::Counted { total } => {
+        LocalSyncEvent::Counted { total, .. } => {
             snap.total = Some(*total);
             snap.processed = 0;
         }
@@ -1077,7 +1081,9 @@ pub(crate) async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> 
         &st.local_sync_cancel,
         LOCAL_SYNC_PENDING_KEY,
         folder,
-        |target| run_local_sync(app, target),
+        // The local connector covers the same ground whichever request a pass is answering, so
+        // `req.rerun` is unused here (Drive's Shared-with-me widening is the only reader).
+        |req: connector_sync::PassRequest| run_local_sync(app, req.target),
         || emit_local_run_finished(app),
     )
     .await
@@ -1110,8 +1116,8 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
     let keys: Vec<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        match folder {
-            Some(k) => vec![k],
+        match &folder {
+            Some(k) => vec![k.clone()],
             None => folder_keys(&conn)?,
         }
     };
@@ -1173,7 +1179,13 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             w.files.len() + deletions
         })
         .sum();
-    emit_local_progress(app, LocalSyncEvent::Counted { total });
+    emit_local_progress(
+        app,
+        LocalSyncEvent::Counted {
+            total,
+            target: folder,
+        },
+    );
 
     // Phase 2 — reconcile.
     let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0usize, 0, 0, 0, 0);

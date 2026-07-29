@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.109.3-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "A sync you queue now runs for the account you asked for, and its row says so. Queuing a second account mid-sync only recorded that something had been asked for, not what — so PM answered by re-syncing every account, and the row you queued sat on “Queued” the whole time instead of taking its turn. Each queued account now gets its own pass, in the order you asked, and its row switches to “Syncing…” when it comes up.",
+      "Pressing “Sync now” during an automatic background sync no longer quietly skips “Shared with me”. The background check leaves that part out on purpose — it has no quick way to spot changes and is too slow to repeat every few minutes — and a request folded into one inherited that, so the sync you asked for silently covered less than a sync you started yourself. A queued sync now always includes it.",
+      "Stopping a sync now also drops anything queued behind it, rather than starting the next one straight after.",
+    ],
+  },
+  {
     version: "3.109.2-alpha",
     date: "2026-07-29",
     highlights: [

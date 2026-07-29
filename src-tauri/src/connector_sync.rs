@@ -14,8 +14,9 @@
 //! (audit F-43). Because `Drop` runs during unwinding too, the guard always clears the flag.
 //!
 //! On top of the guard this module owns the rest of the shared connector-sync machinery the three
-//! engines call identically: [`run_detached_sync`] (the single-flight + crash-resume-marker + rerun
-//! loop that wraps one connector's pass fn), [`apply_connector_actions`] (the blocking index-only
+//! engines call identically: [`SyncQueue`] (what a run still owes to requests that arrived mid-sync,
+//! and the merge rules for them), [`run_detached_sync`] (the single-flight + crash-resume-marker +
+//! follow-up-sweep loop that wraps one connector's pass fn), [`apply_connector_actions`] (the index-only
 //! executor — one copy for all three, formerly duplicated per connector), and [`action_category`] /
 //! [`ActionKind`] (the tally bucket for a pass's reducer actions).
 
@@ -32,24 +33,109 @@ use crate::{db, index_only, ingest, AppState};
 /// connectors' `record_*_issue` helpers, which is why it lives here rather than in any one engine.
 pub(crate) const MAX_REPORT_ISSUES: usize = 200;
 
+/// The sweeps a running sync still owes — the requests that arrived while a pass was in flight.
+///
+/// This replaces the bare `rerun: bool` the guard used to carry. That flag recorded *that* a request
+/// had arrived but not *what* it asked for, so every follow-up swept **every** target: queueing one
+/// account mid-run re-enumerated all of them, and the row showing "Queued" never showed "Syncing…"
+/// for its own pass — the user asked for one account and watched the whole connector go round again.
+///
+/// The merge rules live here, in one place, so the three connectors cannot drift:
+///   * request order is preserved, oldest first;
+///   * a repeat of a target already waiting collapses into the one already there;
+///   * an all-targets request **subsumes** the specific ones — one sweep over everything already
+///     covers them, so keeping both would sync those targets twice.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct SyncQueue {
+    /// Specific targets awaiting a sweep, oldest first, deduped. Kept empty while `all` is set.
+    targets: Vec<String>,
+    /// An all-targets sweep is owed. Set by a request that named no target — the background pollers,
+    /// and the newly-connected-account case the single-flight fold was originally written for.
+    all: bool,
+}
+
+impl SyncQueue {
+    /// Record a request that arrived while a pass was running. `None` means every target.
+    pub fn push(&mut self, target: Option<String>) {
+        match target {
+            None => {
+                self.all = true;
+                // One sweep over everything covers whatever was waiting individually.
+                self.targets.clear();
+            }
+            Some(t) => {
+                if !self.all && !self.targets.contains(&t) {
+                    self.targets.push(t);
+                }
+            }
+        }
+    }
+
+    /// Take the next sweep this run owes: `Some(Some(target))` for a specific one, `Some(None)` for
+    /// an all-targets sweep, `None` when the run is finished.
+    pub fn take_next(&mut self) -> Option<Option<String>> {
+        if !self.targets.is_empty() {
+            // O(n) on a list bounded by the number of connected accounts / tracked folders.
+            return Some(Some(self.targets.remove(0)));
+        }
+        if self.all {
+            self.all = false;
+            return Some(None);
+        }
+        None
+    }
+
+    /// Nothing is owed.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty() && !self.all
+    }
+
+    /// Drop everything waiting — a stop, or a fresh claim clearing what a panicked pass orphaned.
+    pub fn clear(&mut self) {
+        self.targets.clear();
+        self.all = false;
+    }
+}
+
+/// What one pass of a run is being asked to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassRequest {
+    /// The target for this pass — an account email / folder key, or `None` for every target.
+    pub target: Option<String>,
+    /// True for a follow-up sweep draining a request that arrived mid-run; false for the run's first
+    /// pass. A connector that varies what a pass covers reads this: the folded-in requests are not
+    /// recorded individually, so `rerun` is all a pass knows about why it exists (see
+    /// `DriveDriver::for_pass` and its Shared-with-me widening).
+    pub rerun: bool,
+}
+
+/// What [`SyncRunGuard::pass_complete`] decided at the end of a pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextPass {
+    /// The run is over; `running` has been cleared.
+    Done,
+    /// Another sweep is owed, for this target (`None` = every target); `running` stays held.
+    Sweep(Option<String>),
+}
+
 /// The single-flight fields every detached-sync snapshot carries, so [`SyncRunGuard`] can own the
-/// `running`/`rerun` lifecycle without knowing the concrete snapshot type. Implemented by the three
+/// `running`/queue lifecycle without knowing the concrete snapshot type. Implemented by the three
 /// `*SyncState` snapshots in [`crate`] (each also carries connector-specific display fields — the
 /// counters, the target, the last report — that the guard never touches).
 pub trait SyncSlot {
     /// Whether a sync is in flight right now.
     fn running(&self) -> bool;
     fn set_running(&mut self, running: bool);
-    /// The coalescing flag: a sync was requested while one was already running, so the in-flight pass
-    /// owes one more all-targets sweep to pick the request up.
-    fn rerun(&self) -> bool;
-    fn set_rerun(&mut self, rerun: bool);
-    /// Reset the per-pass display counters + target for that follow-up sweep. The rerun path folds a
-    /// mid-run request into one more pass over *everything*, so the specific target is dropped.
-    fn reset_for_rerun(&mut self);
-    /// Reset the snapshot to the start of a fresh pass: `running` set, `target` recorded (the account
-    /// email / folder key, or `None` for an all-targets pass), every per-pass counter and the last
-    /// report cleared. Called once by [`run_detached_sync`] right after the slot is claimed.
+    /// The sweeps this run still owes — see [`SyncQueue`]. Handed out as `&mut` so the merge rules
+    /// stay in the queue itself rather than being reimplemented by each of the three snapshots.
+    fn queue(&mut self) -> &mut SyncQueue;
+    /// Reset the per-pass display counters and point the snapshot at the follow-up sweep's target, so
+    /// the row that showed "Queued" shows "Syncing…" when its turn comes.
+    fn reset_for_rerun(&mut self, target: Option<String>);
+    /// Reset the snapshot to the start of a fresh run: `running` set, `target` recorded (the account
+    /// email / folder key, or `None` for an all-targets pass), every per-pass counter, the last
+    /// report and any orphaned queue cleared. Called by [`SyncRunGuard::claim`] under the same lock
+    /// that claims the slot — implementations must set `running` themselves.
     fn begin_pass(&mut self, target: Option<String>);
 }
 
@@ -67,45 +153,58 @@ pub struct SyncRunGuard<'a, S: SyncSlot> {
 }
 
 impl<'a, S: SyncSlot> SyncRunGuard<'a, S> {
-    /// Try to claim the single-flight slot.
+    /// Try to claim the single-flight slot for a run targeting `target` (`None` = every target).
     ///
-    /// - `Ok(Some(guard))` — the slot was free; `running` is now set and stays ours until the guard
-    ///   drops.
-    /// - `Ok(None)` — a sync is already running; a rerun has been marked so the in-flight pass sweeps
-    ///   once more, and the caller should return without starting a second, racing sync.
-    pub fn claim(slot: &'a Mutex<S>) -> Result<Option<Self>> {
+    /// - `Ok(Some(guard))` — the slot was free; the snapshot has been reset for this run and
+    ///   `running` stays ours until the guard drops.
+    /// - `Ok(None)` — a sync is already running; `target` has been queued so the in-flight run sweeps
+    ///   it when the current pass ends, and the caller should return without starting a second,
+    ///   racing sync.
+    pub fn claim(slot: &'a Mutex<S>, target: Option<String>) -> Result<Option<Self>> {
         let mut s = slot
             .lock()
             .map_err(|_| Error::Other("sync state poisoned".into()))?;
         if s.running() {
-            s.set_rerun(true);
+            s.queue().push(target);
             return Ok(None);
         }
-        s.set_running(true);
-        // A fresh claim owes no rerun yet; clear any left orphaned by a prior panicked pass.
-        s.set_rerun(false);
+        // Claim and reset under ONE lock. These used to be two steps — the claim here, `begin_pass`
+        // in `run_detached_sync` — leaving a window in which a request that arrived in between was
+        // queued and then wiped by the reset. Rare, but what it lost was the sync a user had just
+        // asked for, silently.
+        s.begin_pass(target);
         Ok(Some(Self { slot }))
     }
 
     /// End-of-pass handoff. Call once after each pass with whether the user asked to stop.
     ///
-    /// Returns `true` when another sweep is owed — a rerun was requested and we weren't stopped — in
-    /// which case `running` stays set and the per-pass counters are reset for the next pass. Returns
-    /// `false` otherwise, having cleared `running`. The rerun check and the `running` clear happen
-    /// under one lock, so a request landing exactly as a pass finishes is never lost to a race
-    /// against the clear: it either re-arms this guard or starts cleanly once `running` is false.
-    pub fn pass_complete(&self, stopped: bool) -> Result<bool> {
+    /// Returns [`NextPass::Sweep`] when another sweep is owed, carrying the queued target it is for,
+    /// with `running` still held and the per-pass counters reset for it. Returns [`NextPass::Done`]
+    /// when the run is over, having cleared `running`. Draining the queue and clearing `running`
+    /// happen under one lock, so a request landing exactly as a pass finishes is never lost to a race
+    /// against the clear: it either extends this run or starts cleanly once `running` is false.
+    pub fn pass_complete(&self, stopped: bool) -> Result<NextPass> {
         let mut s = self
             .slot
             .lock()
             .map_err(|_| Error::Other("sync state poisoned".into()))?;
-        if s.rerun() && !stopped {
-            s.set_rerun(false);
-            s.reset_for_rerun();
-            Ok(true)
-        } else {
+        // A stop ends the run outright, dropping whatever was queued behind it: the user asked for
+        // the indexing to stop, and honouring a request they made *before* deciding that would just
+        // start it up again.
+        if stopped {
+            s.queue().clear();
             s.set_running(false);
-            Ok(false)
+            return Ok(NextPass::Done);
+        }
+        match s.queue().take_next() {
+            Some(target) => {
+                s.reset_for_rerun(target.clone());
+                Ok(NextPass::Sweep(target))
+            }
+            None => {
+                s.set_running(false);
+                Ok(NextPass::Done)
+            }
         }
     }
 }
@@ -125,9 +224,13 @@ impl<S: SyncSlot> Drop for SyncRunGuard<'_, S> {
 }
 
 /// The single-flight lifecycle every detached connector sync runs identically: claim the slot (or
-/// fold into the running pass's follow-up sweep and return), reset the progress snapshot for this
-/// run, clear the stop flag, persist a crash-resume marker, then run `pass` once — rerunning it while
-/// the guard reports another sweep is owed — and finally drop the marker on the clean exit.
+/// queue this request behind the running one and return), clear the stop flag, then run `pass` — once
+/// per sweep the guard hands back — and finally drop the crash-resume marker on the clean exit.
+///
+/// A run can span several passes: a request arriving mid-sync is queued rather than started, and each
+/// queued target gets its own pass in turn (an all-targets request collapses them into one). That is
+/// what makes a row read "Queued" and then "Syncing…" rather than "Queued" until the whole connector
+/// has been swept — see [`SyncQueue`].
 ///
 /// `pass` is the connector's own one-pass fn (`run_drive_sync` / `run_onedrive_sync` /
 /// `run_local_sync`); `slot`, `cancel`, and `pending_key` are that connector's `AppState` fields.
@@ -155,43 +258,46 @@ pub async fn run_detached_sync<F, Fut, S, G>(
 ) -> Result<usize>
 where
     S: SyncSlot,
-    F: Fn(Option<String>) -> Fut,
+    F: Fn(PassRequest) -> Fut,
     Fut: std::future::Future<Output = Result<usize>>,
     G: FnOnce(),
 {
-    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
-    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
-    // connector with `running = true` for the rest of the session (F-43).
-    let Some(guard) = SyncRunGuard::claim(slot)? else {
+    // Claim the single-flight slot, or queue this request behind the running one. The guard clears
+    // `running` on drop — including if a pass panics — so a crashed sync can't wedge the connector
+    // with `running = true` for the rest of the session (F-43).
+    let Some(guard) = SyncRunGuard::claim(slot, target.clone())? else {
         return Ok(0);
     };
-    // Reset the snapshot for this run (the guard already holds `running`).
-    {
-        let mut snap = slot
-            .lock()
-            .map_err(|_| Error::Other("sync state poisoned".into()))?;
-        snap.begin_pass(target.clone());
-    }
-    // Fresh stop flag for this run; persist a crash-resume marker (cleared on the clean exit below).
-    {
-        cancel.store(false, Ordering::SeqCst);
-        if let Ok(conn) = st.conn() {
-            let marker = serde_json::to_string(&target).unwrap_or_else(|_| "null".to_string());
-            let _ = db::set_setting(&conn, pending_key, &marker);
-        }
-    }
+    // Fresh stop flag for this run (the claim already reset the snapshot).
+    cancel.store(false, Ordering::SeqCst);
 
-    let mut pass_target = target;
+    let mut req = PassRequest {
+        target,
+        rerun: false,
+    };
     let mut result;
     loop {
-        result = pass(pass_target).await;
-        let stopped = cancel.load(Ordering::SeqCst);
-        // The guard drains `rerun` and clears `running` under one lock, so a request landing exactly
-        // as we finish isn't lost to a race against clearing `running`.
-        if !guard.pass_complete(stopped)? {
-            break;
+        // The crash-resume marker, rewritten per pass. A run can now sweep several targets in turn,
+        // and resuming the one that was actually interrupted beats resuming one that already
+        // finished. Only the pass in flight is durable: the rest of the queue lives in memory, so a
+        // crash still loses what was merely waiting — the same exposure the old single marker had.
+        if let Ok(conn) = st.conn() {
+            let marker = serde_json::to_string(&req.target).unwrap_or_else(|_| "null".to_string());
+            let _ = db::set_setting(&conn, pending_key, &marker);
         }
-        pass_target = None;
+        result = pass(req.clone()).await;
+        let stopped = cancel.load(Ordering::SeqCst);
+        // The guard drains the queue and clears `running` under one lock, so a request landing
+        // exactly as we finish isn't lost to a race against clearing `running`.
+        match guard.pass_complete(stopped)? {
+            NextPass::Done => break,
+            NextPass::Sweep(next) => {
+                req = PassRequest {
+                    target: next,
+                    rerun: true,
+                }
+            }
+        }
     }
 
     // Clean exit (finished or stopped): drop the crash-resume marker so launch doesn't re-run it.
@@ -481,7 +587,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSlot {
         running: bool,
-        rerun: bool,
+        queue: SyncQueue,
         processed: usize,
         total: Option<usize>,
         target: Option<String>,
@@ -494,16 +600,13 @@ mod tests {
         fn set_running(&mut self, running: bool) {
             self.running = running;
         }
-        fn rerun(&self) -> bool {
-            self.rerun
+        fn queue(&mut self) -> &mut SyncQueue {
+            &mut self.queue
         }
-        fn set_rerun(&mut self, rerun: bool) {
-            self.rerun = rerun;
-        }
-        fn reset_for_rerun(&mut self) {
+        fn reset_for_rerun(&mut self, target: Option<String>) {
             self.processed = 0;
             self.total = None;
-            self.target = None;
+            self.target = target;
         }
         fn begin_pass(&mut self, target: Option<String>) {
             *self = FakeSlot {
@@ -514,90 +617,159 @@ mod tests {
         }
     }
 
-    #[test]
-    fn claim_takes_a_free_slot_and_marks_running() {
-        let slot = Mutex::new(FakeSlot::default());
-        let guard = SyncRunGuard::claim(&slot).unwrap();
-        assert!(guard.is_some(), "a free slot is claimable");
-        assert!(slot.lock().unwrap().running);
+    /// Queue one request, as a busy slot's `claim` does.
+    fn queue(slot: &Mutex<FakeSlot>, target: Option<&str>) {
+        let second = SyncRunGuard::claim(slot, target.map(str::to_string)).unwrap();
+        assert!(second.is_none(), "a busy slot can't be claimed twice");
     }
 
     #[test]
-    fn claim_folds_a_second_request_into_a_rerun() {
+    fn queue_keeps_request_order_and_dedups() {
+        let mut q = SyncQueue::default();
+        assert!(q.is_empty());
+        q.push(Some("a".into()));
+        q.push(Some("b".into()));
+        q.push(Some("a".into())); // already waiting — collapses
+        assert!(!q.is_empty());
+        assert_eq!(q.take_next(), Some(Some("a".into())));
+        assert_eq!(q.take_next(), Some(Some("b".into())));
+        assert_eq!(q.take_next(), None, "drained");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn an_all_targets_request_subsumes_the_specific_ones() {
+        // Syncing "everything" already covers whatever was queued individually, so keeping both would
+        // sweep those targets twice.
+        let mut q = SyncQueue::default();
+        q.push(Some("a".into()));
+        q.push(None);
+        q.push(Some("b".into()));
+        assert_eq!(q.take_next(), Some(None), "one all-targets sweep");
+        assert_eq!(q.take_next(), None, "and nothing else");
+    }
+
+    #[test]
+    fn claim_takes_a_free_slot_and_marks_running() {
+        let slot = Mutex::new(FakeSlot::default());
+        let guard = SyncRunGuard::claim(&slot, Some("acc-a".into())).unwrap();
+        assert!(guard.is_some(), "a free slot is claimable");
+        let mut s = slot.lock().unwrap();
+        assert!(s.running);
+        assert_eq!(
+            s.target.as_deref(),
+            Some("acc-a"),
+            "claim reset the snapshot"
+        );
+        assert!(s.queue().is_empty(), "a fresh claim owes nothing");
+    }
+
+    #[test]
+    fn claim_queues_a_second_request_against_its_own_target() {
+        // The bug this replaces: the fold recorded only *that* a request arrived, so the follow-up
+        // swept every target and the queued account never got a pass of its own.
         let slot = Mutex::new(FakeSlot {
             running: true,
             ..Default::default()
         });
-        let second = SyncRunGuard::claim(&slot).unwrap();
-        assert!(second.is_none(), "a busy slot can't be claimed twice");
-        assert!(
-            slot.lock().unwrap().rerun,
-            "the in-flight pass is told to sweep once more"
+        queue(&slot, Some("acc-b"));
+        assert_eq!(
+            slot.lock().unwrap().queue().take_next(),
+            Some(Some("acc-b".into())),
+            "the queued sweep remembers which account was asked for"
         );
     }
 
     #[test]
-    fn pass_complete_clears_running_when_no_rerun() {
+    fn pass_complete_clears_running_when_nothing_is_queued() {
         let slot = Mutex::new(FakeSlot::default());
-        let guard = SyncRunGuard::claim(&slot).unwrap().unwrap();
-        assert!(!guard.pass_complete(false).unwrap(), "nothing owed → done");
+        let guard = SyncRunGuard::claim(&slot, None).unwrap().unwrap();
+        assert_eq!(
+            guard.pass_complete(false).unwrap(),
+            NextPass::Done,
+            "nothing owed → done"
+        );
         assert!(!slot.lock().unwrap().running);
     }
 
     #[test]
-    fn pass_complete_rearms_and_resets_when_rerun_pending() {
+    fn pass_complete_sweeps_each_queued_target_in_turn() {
         let slot = Mutex::new(FakeSlot::default());
-        let guard = SyncRunGuard::claim(&slot).unwrap().unwrap();
+        let guard = SyncRunGuard::claim(&slot, Some("acc-a".into()))
+            .unwrap()
+            .unwrap();
+        queue(&slot, Some("acc-b"));
+        queue(&slot, Some("acc-c"));
         {
             let mut s = slot.lock().unwrap();
-            s.rerun = true;
             s.processed = 7;
             s.total = Some(7);
-            s.target = Some("acc-a".into());
         }
-        assert!(
-            guard.pass_complete(false).unwrap(),
-            "a pending rerun owes another sweep"
-        );
-        let s = slot.lock().unwrap();
-        assert!(s.running, "running stays set across the follow-up sweep");
-        assert!(!s.rerun, "the rerun was drained");
-        assert_eq!(s.processed, 0);
-        assert_eq!(s.total, None);
-        assert_eq!(
-            s.target, None,
-            "the follow-up sweeps all targets, not the prior one"
-        );
-    }
 
-    #[test]
-    fn a_stop_beats_a_pending_rerun() {
-        let slot = Mutex::new(FakeSlot::default());
-        let guard = SyncRunGuard::claim(&slot).unwrap().unwrap();
-        slot.lock().unwrap().rerun = true;
-        assert!(
-            !guard.pass_complete(true).unwrap(),
-            "a stop request wins over a pending rerun"
+        assert_eq!(
+            guard.pass_complete(false).unwrap(),
+            NextPass::Sweep(Some("acc-b".into())),
+            "the first queued account gets the next pass"
         );
+        {
+            let s = slot.lock().unwrap();
+            assert!(s.running, "running stays set across the follow-up sweep");
+            assert_eq!(
+                s.target.as_deref(),
+                Some("acc-b"),
+                "the snapshot points at the sweep's own target, so its row reads Syncing"
+            );
+            assert_eq!(s.processed, 0, "per-pass counters reset");
+            assert_eq!(s.total, None);
+        }
+        assert_eq!(
+            guard.pass_complete(false).unwrap(),
+            NextPass::Sweep(Some("acc-c".into())),
+        );
+        assert_eq!(guard.pass_complete(false).unwrap(), NextPass::Done);
         assert!(!slot.lock().unwrap().running);
     }
 
     #[test]
-    fn begin_pass_sets_running_and_target_and_clears_stale_counters() {
-        // run_detached_sync calls begin_pass right after claim to reset the snapshot for a fresh run.
+    fn a_stop_beats_everything_queued() {
+        let slot = Mutex::new(FakeSlot::default());
+        let guard = SyncRunGuard::claim(&slot, None).unwrap().unwrap();
+        queue(&slot, Some("acc-b"));
+        assert_eq!(
+            guard.pass_complete(true).unwrap(),
+            NextPass::Done,
+            "a stop request wins over anything waiting"
+        );
+        let mut s = slot.lock().unwrap();
+        assert!(!s.running);
+        assert!(
+            s.queue().is_empty(),
+            "stopping drops the queue — honouring it would restart the indexing the user just stopped"
+        );
+    }
+
+    #[test]
+    fn begin_pass_sets_running_and_target_and_clears_stale_state() {
+        // `claim` calls begin_pass under its own lock to reset the snapshot for a fresh run.
         let mut slot = FakeSlot {
             running: true,
             processed: 9,
             total: Some(9),
             target: Some("stale".into()),
-            rerun: true,
+            queue: SyncQueue {
+                targets: vec!["orphan".into()],
+                all: true,
+            },
         };
         slot.begin_pass(Some("acc-a".into()));
         assert!(slot.running, "the run holds the slot");
         assert_eq!(slot.target.as_deref(), Some("acc-a"), "target recorded");
         assert_eq!(slot.processed, 0, "stale counters cleared");
         assert_eq!(slot.total, None);
-        assert!(!slot.rerun, "no rerun owed at the start of a fresh pass");
+        assert!(
+            slot.queue().is_empty(),
+            "a queue orphaned by a panicked pass doesn't leak into the next run"
+        );
     }
 
     #[test]
@@ -606,7 +778,7 @@ mod tests {
         // The guard's `Drop` must still clear `running`, or the connector wedges for the session.
         let slot = Mutex::new(FakeSlot::default());
         {
-            let _guard = SyncRunGuard::claim(&slot).unwrap().unwrap();
+            let _guard = SyncRunGuard::claim(&slot, None).unwrap().unwrap();
             assert!(slot.lock().unwrap().running);
             // deliberately no `pass_complete` — this is the panic / early-return path
         }
