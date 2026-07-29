@@ -65,6 +65,7 @@ import {
   listSharedVaults,
   markActivity,
   onBriefingWindowClosed,
+  onDocumentLanded,
   onDriveSync,
   onLocalSync,
   onOneDriveSync,
@@ -101,6 +102,7 @@ import type {
 } from "./lib/types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { runProposalsAfterSync } from "./lib/reviewProposals";
+import { onDocumentsLanded } from "./lib/documentFeed";
 import { VaultJoin } from "./components/VaultJoin";
 import { markJustJoinedVault } from "./lib/joinedVault";
 
@@ -500,6 +502,26 @@ export default function App() {
   useEffect(() => {
     if (aiReady) void refreshReviewCount();
   }, [aiReady, view, refreshReviewCount]);
+
+  // Install the live document-arrival listener once for the whole app, and count the badge up as
+  // files land. Mounted here rather than in a view because arrivals keep coming while neither the
+  // Documents list nor the Review queue is on screen — the store buffers them either way, but the
+  // subscription itself has to outlive any single tab. Unconditional: rows appearing is not an AI
+  // feature, so it must not sit behind `aiReady` the way the proposal run does.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    void onDocumentLanded().then((un) => {
+      if (cancelled) un();
+      else unlisten = un;
+    });
+    const off = onDocumentsLanded(() => void refreshReviewCount());
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      off();
+    };
+  }, [refreshReviewCount]);
 
   // Re-read the conversation roster on the way INTO the Chats tab, for the same reason as the badge
   // above: it is the only thing that keeps the tab's per-project chat counts honest.

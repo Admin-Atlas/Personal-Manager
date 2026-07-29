@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.109.0-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "Files now appear as they’re indexed, instead of all at once when the sync ends. Start a Google Drive, OneDrive or folder sync — or just drag files in — and each one shows up in Documents and in Review the moment it’s stored, with the Review badge counting up beside it. A long sync used to be a progress bar and nothing else until it finished; now you can watch it fill, and start approving the first files while the rest are still arriving.",
+      "It works whichever screen you’re on. Files landing while you’re in Chat are waiting for you when you open Review — PM keeps track of them rather than only noticing what arrived while you were looking.",
+    ],
+  },
+  {
     version: "3.108.5-alpha",
     date: "2026-07-29",
     highlights: [

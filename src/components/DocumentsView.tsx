@@ -23,6 +23,7 @@ import {
   sidecarStatus,
   vaultStatus,
 } from "../lib/ipc";
+import { landingSeq, landingsSince, mergeLandings, onDocumentsLanded } from "../lib/documentFeed";
 import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import {
@@ -404,17 +405,29 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
 
   async function refresh() {
     try {
+      // Capture the arrival sequence BEFORE the await: a document committing between the query
+      // running and `setDocuments` replacing the list would otherwise vanish until the next full
+      // refresh. Anything that landed in that gap is unioned back in below.
+      const since = landingSeq();
       // A retrieval-config change (new chunking/splitter/model) flags a one-time Rebuild;
       // re-reading here also clears the banner once a rebuild has brought the index in line.
       // The two reads are independent, so they go out in parallel; a vault-status failure is
       // tolerated (no banner), while a documents failure surfaces as before.
       const [docs, vs] = await Promise.all([listDocuments(), vaultStatus().catch(() => null)]);
-      setDocuments(docs);
+      setDocuments(mergeLandings(docs, landingsSince(since)));
       setRebuildNeeded(vs?.retrieval_rebuild_needed ?? false);
     } catch (e) {
       setError(String(e));
     }
   }
+
+  // Files appear as a sync or an import commits them, rather than only when the whole run ends.
+  // Its own effect (not the rebuild subscription's) so each owns one unlisten.
+  useEffect(() => {
+    return onDocumentsLanded((landed) => {
+      setDocuments((prev) => mergeLandings(prev, landed));
+    });
+  }, []);
 
   function handleEvent(event: IngestEvent) {
     switch (event.type) {

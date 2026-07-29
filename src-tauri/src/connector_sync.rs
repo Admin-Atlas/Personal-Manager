@@ -22,10 +22,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
-use crate::{db, index_only, AppState};
+use crate::{db, index_only, ingest, AppState};
 
 /// Cap on how many not-indexed files a connector's sync report lists (memory-bounded; the count of
 /// extras beyond this is still conveyed via each report's `issues_truncated`). Shared by the three
@@ -283,6 +283,16 @@ pub fn action_category(actions: &[index_only::Action]) -> ActionKind {
 /// Does NOT write the portable manifest: the caller drives that through a [`ManifestFlusher`], so a
 /// bulk pass rewrites the manifest once per `MANIFEST_FLUSH_EVERY` items instead of once per item.
 /// Mirrors `dev_apply_change_event`'s execution shape.
+///
+/// This is also where a new document is ANNOUNCED. Every index-only connector — Drive, OneDrive, the
+/// local folder, and the live filesystem watcher — funnels through here, so one emit covers all four,
+/// and it is the innermost place that still holds an `AppHandle` (`AppState` alone cannot emit). The
+/// row is already committed by the time the event goes out, so a listener that immediately queries
+/// for it will find it.
+///
+/// The return type stays `bool` deliberately: widening it would touch seven call sites across
+/// `cloud_sync` and `localfolder` that pass the value straight into `flusher.note(...)`, none of
+/// which care about arrivals.
 pub fn apply_connector_actions(
     app: &AppHandle,
     actions: &[index_only::Action],
@@ -297,7 +307,18 @@ pub fn apply_connector_actions(
             .gateway_for_write(&conn)?
             .with_embed_batch(db::indexing_embed_batch(&conn))
     };
-    index_only::apply_actions(state.inner(), &gateway, actions, fetched.as_ref())
+    let applied = index_only::apply_actions(state.inner(), &gateway, actions, fetched.as_ref())?;
+    // Drop the DB guard before emitting: `gateway` borrows a connection, and a listener reacting
+    // synchronously must not find the mutex still held (it is not reentrant).
+    drop(gateway);
+    for document in &applied.landed {
+        // An already-reviewed row is not an arrival for the Review queue's purposes. Cheap to check
+        // here, and it keeps a promoted-then-resynced file from reappearing as new.
+        if !document.reviewed {
+            let _ = app.emit(ingest::DOCUMENT_LANDED, document);
+        }
+    }
+    Ok(applied.dirtied)
 }
 
 /// Rewrite the index-only manifest now from the current DB mirror — the batched replacement for the

@@ -127,6 +127,17 @@ pub struct Document {
 /// the caller is a component that unmounts. This event reaches whatever view is mounted now.
 pub const REBUILD_EVENT: &str = "ingest://progress";
 
+/// Broadcast once per document that has just come into existence, carrying the committed
+/// [`Document`] itself so a listening view can insert the row rather than re-query for it.
+///
+/// Distinct from [`REBUILD_EVENT`], which reports *progress* through a job. This reports an
+/// *arrival*, and only for rows that are genuinely new and unreviewed — the Documents list and the
+/// Review queue can therefore fill in live during a sync instead of waiting for it to finish.
+///
+/// A rebuild deliberately does NOT emit this: its rows are not new, and a large one would fire tens
+/// of thousands of events for documents already on screen.
+pub const DOCUMENT_LANDED: &str = "documents://landed";
+
 /// Where a rebuild's progress goes: the global [`REBUILD_EVENT`] plus the `AppState::ingest_job`
 /// snapshot, together.
 ///
@@ -355,6 +366,13 @@ pub fn run(
         match ingest_one(&state, &gateway, &vault, &cipher, &path, opts) {
             Ok(Outcome::Indexed(document)) => {
                 ingested += 1;
+                // The same arrival the connectors announce, for the drag-and-drop path. The channel
+                // event below feeds the importing view's own Activity list and reaches only the
+                // caller; this is global, so the Documents list and the Review queue fill in live
+                // whichever screen the user is actually on.
+                if !document.reviewed {
+                    let _ = app.emit(DOCUMENT_LANDED, &document);
+                }
                 let _ = on_event.send(IngestEvent::Done { document });
                 // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously.
                 // Re-read each file (cheap) so flipping Fast/Gentle mid-import takes effect at once.

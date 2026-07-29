@@ -29,6 +29,7 @@ import {
   subscribeToProposals,
   withProposalRun,
 } from "../lib/reviewProposals";
+import { landingSeq, landingsSince, mergeLandings, onDocumentsLanded } from "../lib/documentFeed";
 
 interface Props {
   /** Called after the queue changes so the parent can refresh the sidebar badge. */
@@ -112,14 +113,29 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     });
   }, []);
 
+  // New arrivals join the queue live, so a sync fills Review in front of the user instead of
+  // presenting a finished list only once the whole run ends. Every landed document is by definition
+  // unreviewed (the backend filters), so it belongs in the queue.
+  useEffect(() => {
+    return onDocumentsLanded((landed) => {
+      setQueue((prev) => mergeLandings(prev, landed));
+    });
+  }, []);
+
   async function load() {
     setError(null);
     try {
+      // See DocumentsView: capture the sequence before the await so a document landing during it
+      // isn't lost to the wholesale `setQueue` below.
+      const since = landingSeq();
       const [q, p, cached] = await Promise.all([reviewQueue(), listProjects(), cachedProposals()]);
-      setQueue(q);
+      const q2 = mergeLandings(q, landingsSince(since));
+      setQueue(q2);
       setProjects(p);
       // Prune cache entries for documents that have left the queue (committed/removed elsewhere).
-      const ids = new Set(q.map((d) => d.id));
+      // Keyed on the merged queue, not the query result — a document that landed during the await
+      // is in the queue, so its cached proposal must not be pruned as "no longer present".
+      const ids = new Set(q2.map((d) => d.id));
       pruneProposalCache(ids);
       for (const id of [...editCache.keys()]) if (!ids.has(id)) editCache.delete(id);
       // Hydrate the in-memory cache from the persisted proposals so a restart repaints what the model

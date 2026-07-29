@@ -572,6 +572,28 @@ fn embed_and_index(
 }
 
 /// Register a source as an index-only document: chunk + embed its body (fetched once), store the leaf
+/// What [`register_pointer`] did: the document, and whether this call is what created it.
+///
+/// `created: false` means the source was already promoted to a full local import, so an existing
+/// (possibly already-reviewed) row owns the id and nothing new entered the review queue.
+pub struct Registered {
+    pub document: ingest::Document,
+    pub created: bool,
+}
+
+/// What [`apply_actions`] did: whether the portable mirror needs rewriting, and the documents that
+/// came into existence during the call.
+///
+/// `landed` is deliberately narrower than `dirtied`. A re-embed, a state flip or a pointer update all
+/// dirty the mirror while touching a row the user has already seen; only a brand-new row is an
+/// arrival. Keeping them separate is what lets a caller announce arrivals without re-announcing the
+/// whole corpus on every sync.
+#[derive(Default)]
+pub struct Applied {
+    pub dirtied: bool,
+    pub landed: Vec<ingest::Document>,
+}
+
 /// embeddings + a short summary + the pointer. Commits the DB row only — the portable manifest is
 /// rewritten by the caller's batched flush, not per item (see [`MANIFEST_FLUSH_EVERY`]). Writes NO
 /// Markdown vault file. The new document enters the review queue (project Unsorted, `reviewed =
@@ -580,7 +602,7 @@ pub fn register_pointer(
     state: &AppState,
     gateway: &ModelGateway<'_>,
     input: PointerInput,
-) -> Result<ingest::Document> {
+) -> Result<Registered> {
     let body = input.body.trim();
     if body.is_empty() {
         return Err(Error::Other(
@@ -601,7 +623,11 @@ pub fn register_pointer(
             )
             .optional()?
         {
-            return ingest::load_document(&conn, existing);
+            // A pre-existing (and possibly already-reviewed) row — nothing landed here.
+            return Ok(Registered {
+                document: ingest::load_document(&conn, existing)?,
+                created: false,
+            });
         }
     }
     let now = {
@@ -660,7 +686,10 @@ pub fn register_pointer(
     if !project_existed {
         state.sync_entity_rules();
     }
-    Ok(document)
+    Ok(Registered {
+        document,
+        created: true,
+    })
 }
 
 /// Restore the index-only documents from the encrypted manifest during a [`crate::ingest::rebuild`] —
@@ -1404,14 +1433,22 @@ pub fn apply_actions(
     gateway: &ModelGateway<'_>,
     actions: &[Action],
     fetched: Option<&PointerInput>,
-) -> Result<bool> {
-    let mut changed = false;
+) -> Result<Applied> {
+    let mut applied = Applied::default();
+    let changed = &mut applied.dirtied;
     for action in actions {
         match action {
             Action::IngestNew { source_id } => {
                 let input = require_fetched(fetched, source_id)?.clone();
-                register_pointer(state, gateway, input)?;
-                changed = true;
+                let registered = register_pointer(state, gateway, input)?;
+                // ONLY a genuinely new row counts as an arrival. The promote short-circuit returns an
+                // existing document, and every other arm below mutates a row that already existed —
+                // that distinction is the whole reason a caller can announce these without
+                // re-announcing files the user has already seen.
+                if registered.created {
+                    applied.landed.push(registered.document);
+                }
+                *changed = true;
             }
             Action::ReEmbed {
                 source_id,
@@ -1419,7 +1456,7 @@ pub fn apply_actions(
             } => {
                 let input = require_fetched(fetched, source_id)?;
                 reembed_item(state, gateway, source_id, new_content_hash, input)?;
-                changed = true;
+                *changed = true;
             }
             // Nothing to do in the substrate: the connector re-stats and re-fires a hashed Update
             // once the source is stable. This arm is where that decision lands.
@@ -1430,7 +1467,7 @@ pub fn apply_actions(
             } => {
                 let conn = state.conn()?;
                 set_item_state(&conn, source_id, *new_state)?;
-                changed = true;
+                *changed = true;
             }
             Action::SetSourceState {
                 source,
@@ -1438,7 +1475,7 @@ pub fn apply_actions(
             } => {
                 let conn = state.conn()?;
                 set_source_state(&conn, source, *new_state)?;
-                changed = true;
+                *changed = true;
             }
             Action::UpdatePointer {
                 source_id,
@@ -1446,12 +1483,12 @@ pub fn apply_actions(
             } => {
                 let conn = state.conn()?;
                 set_external_ref(&conn, source_id, external_ref.as_deref())?;
-                changed = true;
+                *changed = true;
             }
             Action::Noop => {}
         }
     }
-    Ok(changed)
+    Ok(applied)
 }
 
 #[cfg(test)]

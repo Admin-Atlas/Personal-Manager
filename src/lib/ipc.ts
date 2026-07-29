@@ -4,6 +4,7 @@
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { announceSettingSaved, isSettingWrite } from "./settingsSaved";
+import { pushLanding } from "./documentFeed";
 import type { RepairOutcome, VaultFault } from "./types";
 import type {
   AiProviderStatus,
@@ -1023,6 +1024,16 @@ export const resumeRebuild = () => invoke<boolean>("resume_rebuild");
  *  firing after that view unmounts). */
 export const onIngestProgress = (handler: (e: IngestEvent) => void): Promise<UnlistenFn> =>
   listen<IngestEvent>("ingest://progress", (e) => handler(e.payload));
+
+/** Subscribe to live document arrivals — one per newly-committed, unreviewed document, emitted by
+ *  every connector sync and by drag-and-drop import. Unlike `onIngestProgress` this reports rows
+ *  coming into existence, not progress through a job, so a view can insert the row it carries.
+ *
+ *  Feeds the shared `documentFeed` store rather than handing callers a raw listener: arrivals need
+ *  coalescing (a sync outpaces React) and must keep accumulating while no view is mounted. Subscribe
+ *  via `onDocumentsLanded` there; this only has to be installed once. */
+export const onDocumentLanded = (): Promise<UnlistenFn> =>
+  listen<Document>("documents://landed", (e) => pushLanding(e.payload));
 
 /** Resume a sync interrupted by a previous app close/crash mid-index. Called once on launch; resolves
  *  true if a resume was started. Already-indexed files survive, so it only does the outstanding work. */
