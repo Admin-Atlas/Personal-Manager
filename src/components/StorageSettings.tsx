@@ -205,8 +205,10 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
 function StatusChip({ status }: { status: StorageComponent["status"] }) {
   // Removable and installable rows carry their own action button — no chip needed.
   if (status === "removable" || status === "installable") return null;
+  // `blocked` means installed and held by a dependent, not missing — say "Installed" first, or a
+  // shared library reads as something still to be downloaded. The blocker pill names the holder.
   const label =
-    status === "required" ? "Required" : status === "in_use" ? "In use" : "Needs a step first";
+    status === "required" ? "Required" : status === "in_use" ? "In use" : "Installed — in use";
   return (
     <span className="rounded-[var(--radius-sm)] bg-bg px-1.5 py-0.5 font-mono text-[0.6875rem] text-ink4">
       {label}
