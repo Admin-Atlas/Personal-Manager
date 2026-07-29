@@ -33,10 +33,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::event::{EventKind, ModifyKind, RenameMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, RecommendedCache};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -1523,6 +1523,14 @@ async fn apply_local_actions_off_lock(
 // registry (start newly-added folders, stop removed/unmounted ones, catch up after a lock→unlock),
 // and a PROCESSOR drains the debounced events and applies them. No vault lock is taken — this is a
 // read-only observer, like the cloud connectors.
+//
+// Watching a folder can simply FAIL, and not transiently: on Linux a recursive watch costs one
+// inotify watch per directory out of a machine-wide budget shared with every other running app.
+// Both the manager (a root that won't register) and the processor (a watcher-level error) respond to
+// failure by reconciling, and both are on hot paths — so both are rate-limited. Without that, a
+// single unwatchable folder re-registers, fails, and re-triggers a full reconcile on every tick,
+// forever. Backing off is safe because the watcher is an optimisation, not the only path: the
+// connector poll reconciles every tracked folder on its own timer regardless.
 
 /// Debounce window: wait this long after the last fs event on a path before emitting, so a
 /// multi-write save settles into one change (and the file is stable to hash).
@@ -1530,6 +1538,27 @@ const LOCAL_WATCH_DEBOUNCE_SECS: u64 = 2;
 /// How often the manager reconciles its watch set with the tracked-folder registry and re-checks
 /// whether the vault is unlocked. Short enough that a just-added folder starts being watched promptly.
 const LOCAL_WATCH_TICK_SECS: u64 = 5;
+/// How long to leave a root alone after its watch registration failed, before trying again. Without
+/// a penalty the manager re-proposes the failed root on every tick, and since a newly-watched folder
+/// triggers a catch-up reconcile, one unwatchable folder becomes a permanent sync storm. The usual
+/// cause on Linux is `fs.inotify.max_user_watches` — a machine-wide budget shared with every other
+/// app, which PM cannot raise and which will not clear in five seconds.
+const LOCAL_WATCH_RETRY_SECS: u64 = 300;
+/// Minimum gap between watcher-error self-heal sweeps. A watcher-level error can recur on every
+/// batch (an inotify queue that keeps overflowing), and each sweep walks every tracked folder — with
+/// no floor the errors and the sweeps feed each other.
+const LOCAL_HEAL_MIN_GAP_SECS: u64 = 60;
+
+/// When the last watcher-error self-heal sweep fired. Watcher-local bookkeeping with no reader
+/// outside this module, so it stays out of `AppState` (and out of the database).
+static LAST_WATCH_HEAL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Whether a backoff has expired and the guarded work may run: `None` means it has never tripped, so
+/// the first attempt always passes. Pure — takes the elapsed time rather than reading a clock — so
+/// both watcher backoffs are testable without a real watcher.
+fn backoff_elapsed(since: Option<Duration>, min_gap_secs: u64) -> bool {
+    since.is_none_or(|d| d.as_secs() >= min_gap_secs)
+}
 
 /// Start the live local-folder watcher: a debouncer feeding two background tasks for the life of the
 /// app. A no-op in practice until the user tracks a folder (nothing to watch), and quiet whenever the
@@ -1545,10 +1574,15 @@ pub fn spawn_local_watcher(app: AppHandle) {
             // Forward to the processor; a full channel/closed receiver just means we're shutting down.
             let _ = tx.send(res);
         };
-        let mut debouncer = match new_debouncer(
+        // `follow_symlinks(false)`: the periodic walk refuses to descend a symlink, so a watcher that
+        // followed them would register (and spend inotify watches on) trees the walk will never index
+        // — including, for a link that points at or above its own root, an unbounded one.
+        let mut debouncer = match new_debouncer_opt::<_, notify::RecommendedWatcher, _>(
             Duration::from_secs(LOCAL_WATCH_DEBOUNCE_SECS),
             None,
             handler,
+            RecommendedCache::new(),
+            notify::Config::default().with_follow_symlinks(false),
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -1559,10 +1593,20 @@ pub fn spawn_local_watcher(app: AppHandle) {
         // key -> watched root. Cleared whenever the vault locks; rebuilt on the next unlock.
         let mut watched: std::collections::HashMap<String, std::path::PathBuf> =
             std::collections::HashMap::new();
+        // key -> when its watch registration last failed, so a root PM cannot watch is retried on a
+        // slow cadence instead of every tick. Cleared alongside `watched` when the vault locks.
+        let mut failed: std::collections::HashMap<String, Instant> =
+            std::collections::HashMap::new();
         let mut was_ready = false;
         loop {
             tokio::time::sleep(Duration::from_secs(LOCAL_WATCH_TICK_SECS)).await;
-            manage_local_watches(&manager_app, &mut debouncer, &mut watched, &mut was_ready);
+            manage_local_watches(
+                &manager_app,
+                &mut debouncer,
+                &mut watched,
+                &mut failed,
+                &mut was_ready,
+            );
         }
     });
 
@@ -1585,6 +1629,7 @@ fn manage_local_watches(
         notify_debouncer_full::RecommendedCache,
     >,
     watched: &mut std::collections::HashMap<String, std::path::PathBuf>,
+    failed: &mut std::collections::HashMap<String, Instant>,
     was_ready: &mut bool,
 ) {
     let ready = app.state::<AppState>().conn().is_ok();
@@ -1595,6 +1640,7 @@ fn manage_local_watches(
                 let _ = debouncer.unwatch(root);
             }
             watched.clear();
+            failed.clear();
             *was_ready = false;
         }
         return;
@@ -1608,18 +1654,52 @@ fn manage_local_watches(
         let Ok(conn) = conn else { return };
         watch_targets(&conn).unwrap_or_default()
     };
+    // Drop the retry penalty for anything that left the registry or whose root went away, so a folder
+    // that is removed and re-added — or a drive that comes back — is tried again at once.
+    failed.retain(|key, _| targets.iter().any(|t| t.key == *key && t.present));
+
     let diff = diff_watch_set(watched, &targets);
+    let now = Instant::now();
+    // Count roots that actually STARTED being watched, not roots we merely intended to watch: the
+    // catch-up reconcile below hangs off this, and a root that fails to register has not caught up
+    // on anything.
+    let mut started = 0usize;
     for t in &diff.to_watch {
+        let since_failure = failed.get(&t.key).map(|s| now.duration_since(*s));
+        if !backoff_elapsed(since_failure, LOCAL_WATCH_RETRY_SECS) {
+            continue;
+        }
         match debouncer.watch(&t.root, notify::RecursiveMode::Recursive) {
             Ok(()) => {
                 watched.insert(t.key.clone(), t.root.clone());
+                if failed.remove(&t.key).is_some() {
+                    eprintln!("local watcher: watching {} again", t.root.display());
+                }
+                started += 1;
             }
-            Err(e) => eprintln!("local watcher: could not watch {}: {e}", t.root.display()),
+            Err(e) => {
+                // A recursive add registers directory by directory and gives up on the first failure,
+                // keeping everything it already registered. Those watches are live but unreachable to
+                // us, so hand them back before we forget the root.
+                let _ = debouncer.unwatch(&t.root);
+                // Unwatching a root drops every watch beneath it, including those of a tracked folder
+                // nested inside — forget those too so the next tick re-registers them.
+                watched.retain(|_, r| !r.starts_with(&t.root));
+                if failed.insert(t.key.clone(), now).is_none() {
+                    eprintln!(
+                        "local watcher: could not watch {} ({e}) — retrying in {LOCAL_WATCH_RETRY_SECS}s. \
+                         On Linux this is usually the machine-wide fs.inotify.max_user_watches limit. \
+                         The folder is still reconciled by the periodic sync.",
+                        t.root.display()
+                    );
+                }
+            }
         }
     }
     for root in &diff.to_unwatch {
         let _ = debouncer.unwatch(root);
-        watched.retain(|_, r| r != root);
+        // Same caveat as above: dropping a root's watches drops every nested folder's watches with it.
+        watched.retain(|_, r| !r.starts_with(root));
     }
     // A watched root vanished under us (unmount/removal) → fan its items out to `unreachable` via a
     // per-folder reconcile (the driver's missing-root branch), never a mass deletion.
@@ -1630,7 +1710,7 @@ fn manage_local_watches(
         });
     }
     // A fresh unlock, or any newly-watched folder → catch up on changes made while closed/locked/away.
-    if !*was_ready || !diff.to_watch.is_empty() {
+    if !*was_ready || started > 0 {
         let app2 = app.clone();
         tauri::async_runtime::spawn(async move {
             let _ = local_sync_core(&app2, None).await;
@@ -1656,13 +1736,31 @@ async fn process_local_watch_batch(app: &AppHandle, res: DebounceEventResult) {
     // detached full reconcile, exactly as the manager does on unlock: idempotent (walk + diff) and
     // single-flight, so an error burst folds into one follow-up pass instead of piling up syncs. An
     // unmount still surfaces separately in the manager as an absent root → `unreachable`.
+    //
+    // Rate-limited, because "an error burst folds into one pass" only holds while the errors stop: a
+    // watcher wedged at the inotify limit keeps erroring, and single-flight does not damp that — a
+    // busy run sets the rerun flag and the guard immediately runs another pass.
     let events = match res {
         Ok(events) => events,
         Err(_) => {
-            let app2 = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = local_sync_core(&app2, None).await;
-            });
+            let due = {
+                let mut last = LAST_WATCH_HEAL
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = Instant::now();
+                let due =
+                    backoff_elapsed(last.map(|t| now.duration_since(t)), LOCAL_HEAL_MIN_GAP_SECS);
+                if due {
+                    *last = Some(now);
+                }
+                due
+            };
+            if due {
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = local_sync_core(&app2, None).await;
+                });
+            }
             return;
         }
     };
@@ -2177,5 +2275,58 @@ mod tests {
             vec!["unmounted".to_string()],
             "only the still-registered vanished root is flagged for unreachable"
         );
+    }
+
+    #[test]
+    fn backoff_lets_the_first_attempt_through_then_holds_it_off() {
+        assert!(
+            backoff_elapsed(None, LOCAL_WATCH_RETRY_SECS),
+            "a root that has never failed is watched immediately"
+        );
+        assert!(
+            !backoff_elapsed(Some(Duration::from_secs(0)), LOCAL_WATCH_RETRY_SECS),
+            "the tick right after a failure does not retry — this is the sync storm"
+        );
+        assert!(
+            !backoff_elapsed(
+                Some(Duration::from_secs(LOCAL_WATCH_RETRY_SECS - 1)),
+                LOCAL_WATCH_RETRY_SECS
+            ),
+            "still held off one second short of the window"
+        );
+        assert!(
+            backoff_elapsed(
+                Some(Duration::from_secs(LOCAL_WATCH_RETRY_SECS)),
+                LOCAL_WATCH_RETRY_SECS
+            ),
+            "retried once the window has fully elapsed"
+        );
+    }
+
+    #[test]
+    fn backoff_window_is_long_enough_to_break_the_tick_loop() {
+        // The storm exists because the manager re-proposes a failed root every tick. Whatever the
+        // window is, it has to be longer than a tick or the penalty changes nothing.
+        const {
+            assert!(
+                LOCAL_WATCH_RETRY_SECS > LOCAL_WATCH_TICK_SECS,
+                "a retry window inside one tick is no backoff at all"
+            );
+        }
+        assert!(
+            !backoff_elapsed(
+                Some(Duration::from_secs(LOCAL_WATCH_TICK_SECS)),
+                LOCAL_WATCH_RETRY_SECS
+            ),
+            "one tick after the failure the root is still skipped"
+        );
+        // The self-heal sweep walks every tracked folder, so its floor must clear the debouncer's
+        // own cadence (tick_rate defaults to timeout/4) by a wide margin.
+        const {
+            assert!(
+                LOCAL_HEAL_MIN_GAP_SECS > LOCAL_WATCH_DEBOUNCE_SECS,
+                "a heal floor inside the debounce window would not damp an error burst"
+            );
+        }
     }
 }

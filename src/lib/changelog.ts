@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.108.2-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "A folder PM can’t watch no longer turns into a sync that never stops. Watching a folder for changes costs the operating system one watch per sub-folder, out of a budget shared with everything else running on your machine — so it can genuinely run out. PM used to note the failure and try again five seconds later, and because starting to watch a folder also kicks off a catch-up sync, it would sync, fail, and sync again indefinitely: a progress bar that restarted every few seconds and a Stop button that didn’t take. PM now waits five minutes between attempts, says once what happened and that the limit is usually the cause, and hands back the watches it had already taken instead of stranding them. Your folder still stays up to date — the regular sync covers it either way.",
+      "PM also stops following shortcuts when watching a folder. It never indexed anything behind a symlink, but it was still spending watches on those folders — and a shortcut pointing back at its own parent could spend a great many.",
+    ],
+  },
+  {
     version: "3.108.1-alpha",
     date: "2026-07-29",
     highlights: [
