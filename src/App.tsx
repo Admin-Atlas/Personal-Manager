@@ -696,7 +696,13 @@ export default function App() {
     let cancelled = false;
     const unlisteners: UnlistenFn[] = [];
     const onSync = (e: SyncEvent) => {
-      if (e.type === "finished") void runProposalsAfterSync();
+      // `finished` now arrives once per RUN, not once per pass, so a sync with a folded-in request
+      // no longer proposes twice — the first time over a half-built index.
+      //
+      // A stopped run is skipped outright: stopping is the user saying "that's enough for now", and
+      // the terminal event fires on the cancel path too, so acting on it would answer Stop with the
+      // largest unattended batch of paid model calls the queue can produce.
+      if (e.type === "finished" && !e.report.cancelled) void runProposalsAfterSync();
     };
     for (const subscribe of [onDriveSync, onOneDriveSync, onLocalSync]) {
       void subscribe(onSync).then((un) => {
