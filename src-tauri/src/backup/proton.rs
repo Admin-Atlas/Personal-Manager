@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::naming::{self, BackupEntry, ARCHIVE_EXT};
+use super::RetentionOutcome;
 use crate::error::{Error, Result};
 
 /// Official download page for the Proton Drive CLI (per-OS pre-built binaries). The Backup
@@ -737,9 +738,12 @@ fn trash_archives(cli: &Path, names: &[String]) -> Result<Option<u64>> {
 /// name carries `prefix` (this vault's — see [`archive_prefix`]), and trash the rest to Proton
 /// Trash (recoverable). Scoping by `prefix` means it NEVER touches another vault's/device's
 /// archives sharing the folder, and NEVER a non-PM file; the extra `valid_archive_name` filter is
-/// belt-and-braces so a hostile listing entry can't splice a path into the trash call. Returns how
-/// many were trashed. Used after a successful scheduled backup.
-pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result<usize> {
+/// belt-and-braces so a hostile listing entry can't splice a path into the trash call. Used after a
+/// successful scheduled backup.
+///
+/// Proton has no per-file authority split — the CLI acts as the signed-in user, who owns everything
+/// in the folder — so this never reports a skip, unlike the Drive destination.
+pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result<RetentionOutcome> {
     let names: Vec<String> = list_archives(cli)?
         .into_iter()
         .map(|e| e.name)
@@ -748,7 +752,10 @@ pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result
     let doomed = naming::select_for_deletion(&names, keep_n);
     // Prefer the count the CLI confirmed; fall back to what we asked for when it reports none.
     let confirmed = trash_archives(cli, &doomed)?;
-    Ok(confirmed.map_or(doomed.len(), |n| n as usize))
+    Ok(RetentionOutcome {
+        trashed: confirmed.map_or(doomed.len(), |n| n as usize),
+        skipped: 0,
+    })
 }
 
 #[cfg(test)]

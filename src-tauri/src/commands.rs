@@ -13,6 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::backup::{
     self, destination::BackupDestination, BackupEvent, BackupKind, BackupPhase, BackupReport,
+    RetentionOutcome,
 };
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::error::{Error, Result, VaultFault, VaultFaultCode};
@@ -6030,15 +6031,34 @@ pub async fn connect_drive(
 /// `unreachable` (kept findable — never a hard delete).
 #[tauri::command]
 pub async fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()> {
+    // The backup destination reuses this account's token key, so revoking here would sever a grant
+    // the user has not asked to give up — and a re-granted `drive.file` is a NEW grant, which cannot
+    // write the archives the old one uploaded. That silently breaks backup retention with a 403 the
+    // next time it runs. Only revoke when nothing else is using the account.
+    let used_for_backup = {
+        let conn = state.conn()?;
+        crate::db::get_setting(&conn, crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY)?
+            .is_some_and(|a| a == email)
+    };
     // L-3: sever the grant at Google's end BEFORE forgetting the local token — best-effort, exactly
     // like "Remove PM data" (wipe.rs). Revoking the refresh token drops PM from the account's
     // Connected-apps list; without it the grant lingers at Google until the token expires naturally.
-    if let Ok(Some(blob)) = secrets::get_google_token_for(&drive::account_token_key(&email)) {
-        let _ = google::revoke(blob.expose()).await;
+    if !used_for_backup {
+        if let Ok(Some(blob)) = secrets::get_google_token_for(&drive::account_token_key(&email)) {
+            let _ = google::revoke(blob.expose()).await;
+        }
     }
     {
         let conn = state.conn()?;
-        drive::forget_account(&conn, &email)?;
+        drive::forget_account(
+            &conn,
+            &email,
+            if used_for_backup {
+                drive::Credentials::Keep
+            } else {
+                drive::Credentials::Forget
+            },
+        )?;
     }
     state.sync_index_only();
     Ok(())
@@ -9245,12 +9265,30 @@ pub(crate) async fn run_backup(
                     },
                 );
                 if let Some(keep_n) = retention {
+                    // A retention problem never fails the backup — the archive is already safely
+                    // uploaded — but it must not be invisible either, or old archives pile up in
+                    // silence until the reconciliation banner notices. Route it to
+                    // `failed_destinations`, which the UI already shows as a non-blocking banner.
                     match dest.apply_retention(keep_n as usize, &prefix).await {
-                        Ok(t) if t > 0 => {
-                            eprintln!("backup: trimmed {t} old archive(s) on {}", dest.label())
+                        Ok(o) if o.skipped > 0 => {
+                            failures.push(format!(
+                                "{}: {}",
+                                dest.label(),
+                                retention_refusal_message(o.skipped)
+                            ));
+                        }
+                        Ok(o) if o.trashed > 0 => {
+                            eprintln!(
+                                "backup: trimmed {} old archive(s) on {}",
+                                o.trashed,
+                                dest.label()
+                            )
                         }
                         Ok(_) => {}
-                        Err(e) => eprintln!("backup: retention on {} failed: {e}", dest.label()),
+                        Err(e) => failures.push(format!(
+                            "{}: trimming old backups failed: {e}",
+                            dest.label()
+                        )),
                     }
                 }
             }
@@ -9387,11 +9425,26 @@ pub fn backup_archive_prefix(app: AppHandle) -> Result<String> {
     current_vault_prefix(&app)
 }
 
+/// What to tell the user when a destination refused PM write access to `n` of the archives it chose
+/// to trim. Kept as one function so the scheduled path and the manual button say the same thing.
+fn retention_refusal_message(n: usize) -> String {
+    format!(
+        "PM can only remove backups it uploaded with the current Google sign-in. \
+         {n} older archive{} left in place — delete {} in Google Drive if you want the space back.",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "it" } else { "them" },
+    )
+}
+
 /// Prune this vault's backups at a destination to keep-last-N now — the reconciliation banner's
 /// "delete oldest" action. Recoverable (Proton Trash / Drive trash), never a hard delete; only this
-/// vault's archives (by prefix) are considered. Returns how many were trimmed.
+/// vault's archives (by prefix) are considered.
+///
+/// Returns the full outcome rather than a bare count: a Google Drive destination can refuse PM write
+/// access to an archive it can nevertheless see and list, and "trimmed 0" alone is indistinguishable
+/// from "nothing was over the limit".
 #[tauri::command]
-pub async fn prune_own_backups(app: AppHandle, destination: String) -> Result<u32> {
+pub async fn prune_own_backups(app: AppHandle, destination: String) -> Result<RetentionOutcome> {
     let (dest, prefix, keep_n) = {
         let state = app.state::<AppState>();
         (
@@ -9400,8 +9453,7 @@ pub async fn prune_own_backups(app: AppHandle, destination: String) -> Result<u3
             backup_retention_n(&state)?,
         )
     };
-    let trimmed = dest.apply_retention(keep_n as usize, &prefix).await?;
-    Ok(trimmed as u32)
+    dest.apply_retention(keep_n as usize, &prefix).await
 }
 
 /// Create an encrypted archive and push it to Proton Drive. Same portable format as a local

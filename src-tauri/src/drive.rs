@@ -479,16 +479,31 @@ pub fn finalize_or_flag(
     }
 }
 
+/// Whether disconnecting an account should also drop its stored credentials, or leave them because
+/// another feature still signs in as that account.
+///
+/// The same Google account can back the Drive *connector* and the *backup* destination, which sign
+/// in through one shared keychain token. Dropping the connector must not take the backup's
+/// credentials with it — and a token re-granted later is a NEW `drive.file` grant with no authority
+/// over the archives the old one uploaded, so the loss is not recoverable by signing in again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credentials {
+    /// Clear the token and any per-account client — the normal disconnect.
+    Forget,
+    /// Leave them in the keychain; something else still needs this sign-in.
+    Keep,
+}
+
 /// Disconnect one account: soft-flag its items `unreachable` (kept findable), drop the registry row,
-/// and forget its token plus any per-account (Advanced-Protection) client. Never hard-deletes the
-/// indexed documents.
+/// and, unless `creds` says otherwise, forget its token plus any per-account (Advanced-Protection)
+/// client. Never hard-deletes the indexed documents.
 ///
 /// **My Drive** items (`gdrive:<email>:%`) belong to this account, so they're flagged outright.
 /// **Shared-drive** items are account-independent and may still be reachable by another connected
 /// account — so they're only flagged once NO remaining account can reach the drive. The registry row
 /// is dropped *between* the two so the cascade clears this account's `shared_drive_access` rows first
 /// (leaving any still-reachable drive owner-less, to be re-claimed on another account's next sync).
-pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
+pub fn forget_account(conn: &Connection, email: &str, creds: Credentials) -> Result<()> {
     let account = account_id(email);
     conn.execute(
         "UPDATE documents SET source_state = 'unreachable' \
@@ -523,10 +538,12 @@ pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
     for root_id in swm_roots {
         soft_flag_orphaned_swm_root(conn, &root_id)?;
     }
-    secrets::clear_google_token_for(&account_token_key(email)).ok();
-    // Forget the account's own Cloud-project client too, so reconnecting later with the shared
-    // client isn't silently overridden by stale per-account creds (see `client_creds_for_key`).
-    secrets::clear_google_client_for_account(email).ok();
+    if creds == Credentials::Forget {
+        secrets::clear_google_token_for(&account_token_key(email)).ok();
+        // Forget the account's own Cloud-project client too, so reconnecting later with the shared
+        // client isn't silently overridden by stale per-account creds (see `client_creds_for_key`).
+        secrets::clear_google_client_for_account(email).ok();
+    }
     Ok(())
 }
 
@@ -764,7 +781,8 @@ pub fn forget_all_accounts(conn: &Connection) -> Result<()> {
         rows.into_iter().flatten().collect()
     };
     for email in emails {
-        forget_account(conn, &email)?;
+        // Every Drive account is going — nothing is left to keep a sign-in alive for.
+        forget_account(conn, &email, Credentials::Forget)?;
     }
     Ok(())
 }
