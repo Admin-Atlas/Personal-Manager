@@ -416,6 +416,48 @@ body {
   border-radius: var(--radius-sm);
 }
 
+/* Linux frameless-window resize affordance (see useEdgeResizeCursor.ts). Tauri's GTK path performs
+   the resize but never sets a cursor, so nothing shows where the draggable edges are. The hook puts
+   exactly one of these on <html> while the pointer is over an edge; WebKit then paints the cursor
+   from its own hit test — the only layer that can win over the webview child.
+
+   `!important` and the universal selector are load-bearing here, not shortcuts: the pointer is over
+   ordinary content (a button, a link, a text run) that has its own cursor, and the edge affordance
+   has to beat it for the ~5px the native border occupies. Scoped to the eight edge classes, which
+   are only ever set on Linux and only while off the edge otherwise. */
+html.pm-rz-n,
+html.pm-rz-n * {
+  cursor: ns-resize !important;
+}
+html.pm-rz-s,
+html.pm-rz-s * {
+  cursor: ns-resize !important;
+}
+html.pm-rz-e,
+html.pm-rz-e * {
+  cursor: ew-resize !important;
+}
+html.pm-rz-w,
+html.pm-rz-w * {
+  cursor: ew-resize !important;
+}
+html.pm-rz-nw,
+html.pm-rz-nw * {
+  cursor: nwse-resize !important;
+}
+html.pm-rz-se,
+html.pm-rz-se * {
+  cursor: nwse-resize !important;
+}
+html.pm-rz-ne,
+html.pm-rz-ne * {
+  cursor: nesw-resize !important;
+}
+html.pm-rz-sw,
+html.pm-rz-sw * {
+  cursor: nesw-resize !important;
+}
+
 /* Always-visible, draggable scrollbars ("ribbons") for surfaces a no-wheel user must be able to drag
    to reach the edges — notably the Pinboard, whose board is intentionally larger than the window.
    Styling ::-webkit-scrollbar opts the element out of WebView2/Chromium's thin auto-hiding overlay

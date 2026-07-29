@@ -18,6 +18,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
+import { useEdgeResizeCursor } from "./useEdgeResizeCursor";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
@@ -134,6 +135,9 @@ export function TitleBar() {
   const { system } = useTheme();
   const [maximized, setMaximized] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  // Mounted here because TitleBar sits above <App/> in main.tsx, so it is present on every screen
+  // (loading and onboarding included) — the window is resizable throughout, so the cursor must be too.
+  useEdgeResizeCursor();
 
   useEffect(() => {
     const win = getCurrentWindow();
