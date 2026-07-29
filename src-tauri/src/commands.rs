@@ -2967,7 +2967,7 @@ pub async fn dev_apply_change_event(
         });
         let actions = index_only::react(event, item_state.as_ref());
         // A single dev event: apply, then flush its manifest change immediately (no batch loop here).
-        if index_only::apply_actions(&state, &gateway, &actions, fetched.as_ref())? {
+        if index_only::apply_actions(&state, &gateway, &actions, fetched.as_ref())?.dirtied {
             let conn = state.conn()?;
             index_only::write_synced(&conn, &vault_root, &manifest_cipher)?;
         }
