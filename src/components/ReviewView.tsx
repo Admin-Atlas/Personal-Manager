@@ -103,9 +103,13 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     return subscribeToProposals((documentId, proposal) => {
       setProposals((prev) => ({ ...prev, [documentId]: proposal }));
       if (dirtyRef.current.has(documentId)) return;
+      // Copy the tag array rather than aliasing the proposal's, matching `seedReviewEdit`: this path
+      // used to alias it, and `decisionFor` compares the edit against the proposal to decide what to
+      // log as a correction — with both sides the same array, an in-place edit would move both and
+      // the correction would silently never be recorded.
       const edit = {
         project: proposal.project,
-        tags: proposal.tags,
+        tags: [...proposal.tags],
         importance: proposal.importance,
       };
       editCache.set(documentId, edit);
@@ -178,6 +182,11 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       editCache.delete(d.id);
     }
     setProposals({});
+    // Reseed the visible values from each document's own metadata, exactly as a fresh `load` would.
+    // Clearing the caches but leaving `edits` alone left every row still showing the DISCARDED run's
+    // values — and `decisionFor` compares the edit against the (now absent) proposal, so approving
+    // such a row logged those stale values as a correction the user never made.
+    setEdits(Object.fromEntries(queue.map((d) => [d.id, seedReviewEdit(undefined, undefined, d)])));
     await runProposals(queue.map((d) => d.id));
   }
 
@@ -287,7 +296,11 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   // File a single document (a row's own Approve button) with the values currently shown, leaving
   // the rest of the queue in place — so a confident item can be cleared without committing all.
   async function commitOne(doc: Document) {
-    if (proposing || committing || committingIds.has(doc.id)) return;
+    // Must mirror this button's own `disabled` exactly (see the Approve button below). It used to
+    // bail on `proposing` alone while the button stayed enabled for any row that already had its
+    // proposal — so mid-run the button looked live and silently did nothing. A row whose proposal
+    // has arrived is complete and can be filed; only one still waiting on the model is blocked.
+    if (committing || committingIds.has(doc.id) || (proposing && !proposals[doc.id])) return;
     setCommittingIds((s) => new Set(s).add(doc.id));
     setError(null);
     try {

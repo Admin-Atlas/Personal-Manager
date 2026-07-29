@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.109.1-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "Approving a single file in Review now works while suggestions are still being written. The row’s Approve button stayed clickable once that file had its suggestion, but pressing it did nothing at all — so the one thing you’d naturally do while watching files arrive was the one thing that silently failed.",
+      "Re-propose no longer leaves the old suggestions on screen. It cleared everything behind the scenes but left the previous run’s project, tags and importance showing in each row — so approving one filed values from a run you’d just discarded, and recorded them as a correction you never made.",
+      "Suggestions no longer go missing when two syncs finish together. A second batch of files arriving while suggestions were being written was quietly dropped instead of being picked up next, so those files sat unsuggested until something reloaded the Review tab. They now queue.",
+    ],
+  },
+  {
     version: "3.109.0-alpha",
     date: "2026-07-29",
     highlights: [
