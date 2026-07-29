@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
-import { seedReviewEdit } from "./reviewProposals";
+import { seedReviewEdit, withProposalRun } from "./reviewProposals";
 import type { MetadataProposal } from "./types";
 
 const proposal: MetadataProposal = {
@@ -56,5 +56,45 @@ describe("seedReviewEdit", () => {
     expect(seeded.tags).toEqual(proposal.tags);
     seeded.tags.push("mutated");
     expect(proposal.tags).toEqual(["logistics", "travel"]);
+  });
+});
+
+// A second caller's ids used to be dropped: it received the in-flight promise and its own `fn` was
+// never invoked, so two connectors finishing close together silently lost the second's documents.
+describe("withProposalRun", () => {
+  it("runs a joiner's work after the in-flight run instead of discarding it", async () => {
+    const order: string[] = [];
+    let releaseFirst: () => void = () => {};
+    const first = withProposalRun(async () => {
+      order.push("first:start");
+      await new Promise<void>((r) => (releaseFirst = r));
+      order.push("first:end");
+    });
+    const second = withProposalRun(async () => {
+      order.push("second:start");
+    });
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first:start", "first:end", "second:start"]);
+  });
+
+  it("still starts the queued run when the one before it fails", async () => {
+    let ran = false;
+    const failing = withProposalRun(async () => {
+      throw new Error("no credits");
+    });
+    await expect(failing).rejects.toThrow("no credits");
+    await withProposalRun(async () => {
+      ran = true;
+    });
+    expect(ran).toBe(true);
+  });
+
+  it("surfaces a run's own error to its own caller only", async () => {
+    const bad = withProposalRun(async () => {
+      throw new Error("boom");
+    });
+    await expect(bad).rejects.toThrow("boom");
+    await expect(withProposalRun(async () => {})).resolves.toBeUndefined();
   });
 });

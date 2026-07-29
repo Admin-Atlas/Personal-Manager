@@ -101,18 +101,33 @@ export function currentProposalRun(): Promise<void> {
   return current ?? Promise.resolve();
 }
 
-/** Start a proposal run — or JOIN the one already in flight rather than starting a second. That
- *  join is the whole point: the Review tab opening while a post-sync background run is still going
- *  must not bill a second time for the same documents. Both callers then await the same work, and
- *  both see its results through {@link subscribeToProposals}.
+/** Start a proposal run — or QUEUE behind the one already in flight rather than starting a second.
+ *  Not billing twice for the same documents is the whole point: the Review tab opening while a
+ *  post-sync background run is still going must join, not duplicate. Both callers see results
+ *  through {@link subscribeToProposals}.
  *
- *  Errors propagate to every joiner; each decides whether to surface them. */
+ *  A joiner's `fn` runs after the in-flight one settles, rather than being dropped. It used to be
+ *  discarded outright — the joiner got the running promise and its own ids were never proposed at
+ *  all, so two connectors finishing close together silently lost the second one's documents until
+ *  something reloaded Review. Each `fn` re-derives what still needs proposing (the caches and the
+ *  `reviewed` flag are re-read at that point), so a queued run over already-handled documents costs
+ *  nothing.
+ *
+ *  Errors propagate to that run's own caller; a failed run must not stop the queued one starting,
+ *  or one bad sync would wedge proposals for the session. */
 export function withProposalRun(fn: () => Promise<void>): Promise<void> {
-  if (current) return current;
-  const run = fn().finally(() => {
-    if (current === run) current = null;
-  });
-  current = run;
+  // With nothing in flight, start synchronously — deferring even the first run by a microtask would
+  // change when callers observe `proposing`. A joiner chains, swallowing the predecessor's failure
+  // so a rejected run still lets the next one start.
+  const run = current ? current.catch(() => {}).then(fn) : fn();
+  // Sequencing handle only: errors are the caller's to surface via `run`, so this copy absorbs them
+  // rather than surfacing as an unhandled rejection when nobody awaits `currentProposalRun()`.
+  const tracked: Promise<void> = run
+    .catch(() => {})
+    .then(() => {
+      if (current === tracked) current = null;
+    });
+  current = tracked;
   return run;
 }
 
