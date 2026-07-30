@@ -1595,9 +1595,13 @@ pub fn delete_conversation(state: State<'_, AppState>, conversation_id: i64) -> 
 ///   `ON DELETE SET NULL`, so purging the document alone would leave a live conversation whose
 ///   transcript index had silently vanished, plus an orphaned vault file. A saved chat and its
 ///   document are one object to the user, so deleting either deletes both.
-/// * **An index-only document is a POINTER** at a file in Drive/OneDrive. PM drops its own row and
-///   its `.pmindex` manifest entry; the file at the provider is never touched.
-/// * **A vault document** loses its `documents`/`chunks` rows and its Markdown.
+/// * **An index-only document is a POINTER** at a file in Drive/OneDrive/a watched local folder. PM
+///   drops its own row and its `.pmindex` manifest entry; the file at the source is never touched.
+/// * **Everything else is a document PM holds the file for** — a plain vault document, a photo, a
+///   spreadsheet — and loses its `documents`/`chunks` rows AND the Markdown behind it. For a photo
+///   saved with "keep a copy", the original in `vault/photos/` goes with it: it exists only because
+///   this document does, and the `photos` row that records where it is cascades away with the
+///   delete, so nothing would ever find it again.
 ///
 /// Side effects land only AFTER the commit — the same rule `MutationFiles` encodes for project
 /// deletion: a file or manifest entry that outlives its row is harmless and self-healing, whereas
@@ -1630,19 +1634,22 @@ pub fn delete_document(state: State<'_, AppState>, document_id: i64) -> Result<(
         .optional()?
         .ok_or_else(|| Error::Other("that document no longer exists".into()))?;
 
-    // `source_type` is NULL/'vault' for a document PM owns the file for; anything else is a pointer.
-    let index_only = source_type.as_deref().is_some_and(|s| s != "vault");
+    // Read BEFORE the delete — the `photos` row cascades away with the document.
+    let photo_original = ingest::saved_photo_original(&conn, document_id)?;
+    let owns_file = ingest::owns_a_vault_file(source_type.as_deref());
 
     let tx = conn.unchecked_transaction()?;
     ingest::delete_document(&tx, document_id)?;
     tx.commit()?;
 
-    if index_only {
-        if let Some(sid) = source_id.as_deref().filter(|s| !s.trim().is_empty()) {
-            let _ = index_only::forget_source(&vault_root, &manifest_cipher, sid);
+    if owns_file {
+        for rel in [vault_path, photo_original].into_iter().flatten() {
+            if !rel.trim().is_empty() {
+                let _ = std::fs::remove_file(vault_dir.join(rel));
+            }
         }
-    } else if let Some(rel) = vault_path.as_deref().filter(|p| !p.trim().is_empty()) {
-        let _ = std::fs::remove_file(vault_dir.join(rel));
+    } else if let Some(sid) = source_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        let _ = index_only::forget_source(&vault_root, &manifest_cipher, sid);
     }
     Ok(())
 }
@@ -4983,7 +4990,7 @@ pub async fn delete_project(
             };
             match files {
                 FileDisposition::Unsorted => {
-                    for (id, _, _, _) in &file_rows {
+                    for (id, ..) in &file_rows {
                         tx.execute(
                             "UPDATE documents SET entity_id = ?2, project = ?3 WHERE id = ?1",
                             params![id, unsorted_id, UNSORTED],
@@ -4995,18 +5002,24 @@ pub async fn delete_project(
                     for (id, vault_path, source_type, source_id) in &file_rows {
                         // An index-only document is a POINTER at someone else's file. Deleting it
                         // must remove PM's row + its manifest entry and nothing else — PM never
-                        // deletes from Drive/OneDrive, and there is no vault file to unlink.
-                        let index_only = source_type.as_deref().is_some_and(|s| s != "vault");
-                        if index_only {
-                            if let Some(sid) = source_id.as_deref().filter(|s| !s.is_empty()) {
-                                // Queued, not applied here — the manifest must not lose an entry
-                                // for a document whose row survives a failed commit.
-                                out.forget_sources.push(sid.to_string());
+                        // deletes from Drive/OneDrive or a watched folder, and there is no vault
+                        // file to unlink. Everything else PM holds the file for, including the
+                        // saved original behind a photo — looked up per document (before the
+                        // delete below cascades the `photos` row away) rather than joined into the
+                        // query above, so the rule lives in one tested place. The extra indexed
+                        // lookup is nothing beside the statements `delete_document` already runs
+                        // for each of these.
+                        if ingest::owns_a_vault_file(source_type.as_deref()) {
+                            let photo_original = ingest::saved_photo_original(tx, *id)?;
+                            for rel in [vault_path.clone(), photo_original].into_iter().flatten() {
+                                if !rel.trim().is_empty() {
+                                    out.unlink.push(vault.join(rel));
+                                }
                             }
-                        } else if let Some(rel) =
-                            vault_path.as_deref().filter(|p| !p.trim().is_empty())
-                        {
-                            out.unlink.push(vault.join(rel));
+                        } else if let Some(sid) = source_id.as_deref().filter(|s| !s.is_empty()) {
+                            // Queued, not applied here — the manifest must not lose an entry
+                            // for a document whose row survives a failed commit.
+                            out.forget_sources.push(sid.to_string());
                         }
                         ingest::delete_document(tx, *id)?;
                         deleted.push(*id);

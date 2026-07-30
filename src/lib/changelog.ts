@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.5-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Deleting a photo or a spreadsheet now actually deletes it. PM was treating both as if they were files indexed from a cloud account — removing them from search but leaving what it had written in your vault behind, so the next time you rebuilt the index they came back. If you kept a copy of a photo in your vault, that picture is now removed with it too; before, it stayed there with nothing left to say where it was.",
+      "The confirmation window tells you the truth about which of those is happening. It used to say a photo you dragged in off your desktop was safe in a cloud account you had never connected. Now it says plainly that PM's copy in your vault is going, and that the file you imported from is left alone.",
+      "Files indexed from Google Drive, OneDrive or a watched folder are unchanged and always were: PM only ever removes its own index entry, and never touches the file where it lives.",
+    ],
+  },
+  {
     version: "3.111.4-alpha",
     date: "2026-07-31",
     highlights: [

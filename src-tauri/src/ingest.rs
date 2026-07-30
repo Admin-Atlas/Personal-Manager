@@ -3570,6 +3570,42 @@ pub(crate) const SOURCE_STATE_UNREACHABLE: &str = "unreachable";
 /// document is what stays legible offline.
 pub(crate) const INDEX_ONLY_BODY_PLACEHOLDER: &str = "(body available at the source)";
 
+/// Does PM hold the file behind this document — so that deleting it must unlink something on disk?
+///
+/// `index_only` is the ONLY pointer kind. Its body lives at the source (Drive, OneDrive, a watched
+/// local folder), and its `vault_path` is the synthetic `idx://<source_id>` sentinel no file will
+/// ever back. Every other kind — `vault`, `photo`, `spreadsheet`, `chat` — keeps its body in a
+/// Markdown file PM wrote, which is precisely why a Rebuild can reconstruct it from the vault walk.
+///
+/// Deliberately phrased as "is this the pointer kind?" rather than "is this a plain vault
+/// document?". The delete paths used to ask the latter (`source_type != "vault"`), which silently
+/// reclassified `photo` and `spreadsheet` as pointers the day those kinds were added: the file
+/// survived the delete, and the next Rebuild — whose walk treats the vault file as the truth —
+/// re-ingested the document the user had deleted. A kind added to the enum later is a document PM
+/// owns a file for until someone says otherwise, and this defaults that way. `rebuild`'s own reap
+/// sweep already asks the question in this direction.
+pub(crate) fn owns_a_vault_file(source_type: Option<&str>) -> bool {
+    source_type != Some(SOURCE_TYPE_INDEX_ONLY)
+}
+
+/// The vault-relative path of the original image PM saved for `doc_id`, when the user ticked "keep a
+/// copy" — `None` for every other document, and for a photo whose original was never saved.
+///
+/// Call it BEFORE deleting the document. `photos.document_id` is `ON DELETE CASCADE`, so once the
+/// row is gone nothing on the machine records where that image is, and an encrypted picture the
+/// user believes they deleted sits in the vault indefinitely.
+pub(crate) fn saved_photo_original(conn: &Connection, doc_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT vault_path FROM photos WHERE document_id = ?1 AND saved_to_vault = 1",
+            params![doc_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|p| !p.trim().is_empty()))
+}
+
 /// The source discriminator + live pointer for a document. `Default` describes a fully-stored vault
 /// document; pointer-ingest overrides these for an index-only item whose body stays at the source.
 #[derive(Clone)]
@@ -4585,6 +4621,77 @@ mod tests {
             truth_source(&conn, index_id).unwrap(),
             TruthSource::IndexManifest
         ));
+    }
+
+    #[test]
+    fn only_an_index_only_document_is_a_pointer() {
+        // The classification behind every delete path. It used to be asked the other way round --
+        // "is it a plain vault document?" -- which silently reclassified `photo` and `spreadsheet`
+        // as pointers the day those kinds were added: the delete skipped the Markdown, and the
+        // next Rebuild (whose walk treats the vault file as the truth) re-ingested the document the
+        // user had deleted. Enumerated deliberately, so a new source type has to come here and
+        // state which side it is on.
+        assert!(owns_a_vault_file(Some(SOURCE_TYPE_VAULT)));
+        assert!(owns_a_vault_file(Some(SOURCE_TYPE_PHOTO)));
+        assert!(owns_a_vault_file(Some(SOURCE_TYPE_SPREADSHEET)));
+        assert!(owns_a_vault_file(Some(SOURCE_TYPE_CHAT)));
+        assert!(owns_a_vault_file(None), "an unset kind is not a pointer");
+        assert!(!owns_a_vault_file(Some(SOURCE_TYPE_INDEX_ONLY)));
+        // The one that must never flip: PM does not delete from Drive, OneDrive or a watched
+        // folder, and an index-only `vault_path` is the `idx://` sentinel no file ever backs.
+        assert!(!owns_a_vault_file(Some("index_only")));
+    }
+
+    #[test]
+    fn the_saved_photo_original_is_found_before_the_row_cascades_away() {
+        // A photo ingested with "keep a copy" leaves an encrypted image in `vault/photos/`. Nothing
+        // has ever deleted it -- and `photos.document_id` cascades, so the moment the document goes
+        // the only record of where that picture lives goes with it.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        let seed = |vault_path: &str, hash: &str, saved: i64, original: Option<&str>| -> i64 {
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+                 VALUES (?1,'T',?2,'photo')",
+                params![vault_path, hash],
+            )
+            .unwrap();
+            let doc = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO photos(document_id, file_hash, saved_to_vault, vault_path) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![doc, hash, saved, original],
+            )
+            .unwrap();
+            doc
+        };
+        let kept = seed("a.md", "ha", 1, Some("photos/ha.png.pmenc"));
+        let not_kept = seed("b.md", "hb", 0, None);
+        // A saved_to_vault row whose path never landed: the copy does not exist, so there is
+        // nothing to unlink and an empty string must not become `vault/`.
+        let blank = seed("c.md", "hc", 1, Some("  "));
+
+        assert_eq!(
+            saved_photo_original(&conn, kept).unwrap().as_deref(),
+            Some("photos/ha.png.pmenc")
+        );
+        assert_eq!(saved_photo_original(&conn, not_kept).unwrap(), None);
+        assert_eq!(saved_photo_original(&conn, blank).unwrap(), None);
+
+        // A document with no photos row at all -- every non-photo document.
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('d.md','T','hd')",
+            [],
+        )
+        .unwrap();
+        let plain = conn.last_insert_rowid();
+        assert_eq!(saved_photo_original(&conn, plain).unwrap(), None);
+
+        // And it really does vanish with the document, which is why the caller reads it first.
+        let tx = conn.unchecked_transaction().unwrap();
+        delete_document(&tx, kept).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(saved_photo_original(&conn, kept).unwrap(), None);
     }
 
     #[test]
