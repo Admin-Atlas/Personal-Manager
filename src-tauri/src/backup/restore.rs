@@ -28,6 +28,22 @@ use super::{bundle, format, manifest, BackupPhase, ProgressReader};
 /// `len`, so rejecting an oversized `len` is a sufficient guard.
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Headroom the unpack leaves free on the restore volume. On Windows the vault usually sits on the
+/// system volume, where driving free space to literally zero destabilises the page file and every
+/// other running app — so a restore that would take the last byte should stop and say so rather than
+/// take the machine down with it. Small next to any real vault, large enough to keep the OS healthy.
+const RESTORE_FREE_SPACE_RESERVE: u64 = 1024 * 1024 * 1024;
+
+/// Whether `len` more bytes still fit inside `budget` after `unpacked`. Pure so the arithmetic — the
+/// part that has to survive a hostile `len` — is testable without a disk. `None` means the free-space
+/// probe had no answer, which reads as "no budget", exactly as before the budget existed.
+fn fits(unpacked: u64, len: u64, budget: Option<u64>) -> bool {
+    match budget {
+        Some(budget) => unpacked.saturating_add(len) <= budget,
+        None => true,
+    }
+}
+
 /// Reject Argon2 cost parameters a hostile header could weaponise. The `argon2` crate does
 /// not range-check `m_cost`/`t_cost`, so a multi-TiB `m_cost_kib` or a `u32::MAX` `t_cost`
 /// would OOM or hang the app *during* derivation — which happens before the header AAD can
@@ -136,6 +152,14 @@ pub fn restore(
         .tempdir_in(target_parent)?;
     let staging_path = staging.path().to_path_buf();
 
+    // What the unpack is allowed to write. Nothing downstream bounds it: `bundle::read_bundle`
+    // streams each entry straight to disk, so a vault larger than the drive fills it and then fails
+    // with a raw OS error. Fails OPEN — a probe with no answer must not be able to block a restore,
+    // so an unrecognised volume behaves exactly as it did before there was a budget.
+    let budget = crate::hardware::available_bytes(target_parent)
+        .map(|free| free.saturating_sub(RESTORE_FREE_SPACE_RESERVE));
+    let mut unpacked: u64 = 0;
+
     let mut manifest_bytes: Option<Vec<u8>> = None;
     bundle::read_bundle(zstd_r, |path, len, content| {
         if path == manifest::MANIFEST_ENTRY {
@@ -155,11 +179,21 @@ pub fn restore(
         for comp in path.split('/') {
             dest.push(comp);
         }
+        // Checked against the DECLARED `len` before a byte is written, so one oversized entry is
+        // refused up front rather than after it has filled the drive; charged by the ACTUAL count
+        // afterwards, so a short entry isn't over-billed.
+        if !fits(unpacked, len, budget) {
+            return Err(Error::Other(
+                "there is not enough free space on this drive to restore this backup; free up \
+                 space and try again"
+                    .into(),
+            ));
+        }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut f = File::create(&dest)?;
-        std::io::copy(content, &mut f)?;
+        unpacked = unpacked.saturating_add(std::io::copy(content, &mut f)?);
         Ok(())
     })?;
 
@@ -210,12 +244,16 @@ pub fn restore(
     if let Err(rename_err) = std::fs::rename(&staged, target_dir) {
         // Cross-volume (or a racing dir): fall back to the shared verified recursive copy,
         // then clean up the persisted staging dir so a decrypted copy isn't left behind.
-        crate::vault::migrate::copy_tree_verified(&staged, target_dir).map_err(|e| {
+        // The cleanup runs on the FAILURE path too — `keep()` above turned off the TempDir's own
+        // auto-delete, so returning early through `?` here used to leave a fully decrypted vault
+        // sitting on disk, which is precisely what the line below exists to prevent.
+        let copied = crate::vault::migrate::copy_tree_verified(&staged, target_dir);
+        let _ = std::fs::remove_dir_all(&staged);
+        copied.map_err(|e| {
             Error::Other(format!(
                 "could not place the restored vault: {e} (rename: {rename_err})"
             ))
         })?;
-        let _ = std::fs::remove_dir_all(&staged);
     }
 
     Ok(RestoreOutcome {
@@ -253,6 +291,28 @@ mod tests {
         std::fs::create_dir_all(&md_dir).unwrap();
         std::fs::write(md_dir.join("note.md"), b"# hello\n\nbody").unwrap();
         (meta, key_hex)
+    }
+
+    #[test]
+    fn the_unpack_budget_stops_before_it_fills_the_drive() {
+        // `read_bundle` streams every entry straight to disk with nothing counting the total, so a
+        // vault larger than the volume filled it and then died on a raw OS error. The arithmetic is
+        // the part worth pinning: it runs against a DECLARED length, which is the one number a
+        // damaged or hostile archive controls, so it must not be able to overflow into a pass.
+        assert!(
+            fits(0, u64::MAX, None),
+            "no probe answer ⇒ no budget, as before"
+        );
+        assert!(
+            fits(900, 100, Some(1000)),
+            "exactly filling the budget is allowed"
+        );
+        assert!(!fits(900, 101, Some(1000)), "one byte past it is not");
+        assert!(
+            !fits(1, u64::MAX, Some(1000)),
+            "a declared length near u64::MAX saturates rather than wrapping to a pass"
+        );
+        assert!(!fits(0, 1, Some(0)), "a full drive admits nothing");
     }
 
     #[test]

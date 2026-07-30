@@ -18,12 +18,14 @@
 //!      revoke endpoint for a public desktop client, so its accounts are returned for a "finish at
 //!      account.microsoft.com" link and only the local tokens are deleted.
 //!   4. **Interface preferences & webview data** — the webview clears its own `localStorage`, then
-//!      this command removes the OS-level store behind it. On macOS that store is a set of real
-//!      directories the app never owned a handle to (`~/Library/WebKit/<id>`, plus caches, cookies,
-//!      saved window state and the `NSUserDefaults` plist — [`paths::macos_app_leftovers`]), so
-//!      `localStorage.clear()` alone left a reinstall remembering dev mode and the last-seen
-//!      version. Windows keeps the equivalent inside the webview folder, which is in use while PM
-//!      runs and is purged by the uninstaller instead.
+//!      this command removes the OS-level store behind it ([`paths::os_app_leftovers`]). On macOS
+//!      that store is a set of real directories the app never owned a handle to
+//!      (`~/Library/WebKit/<id>`, plus caches, cookies, saved window state and the `NSUserDefaults`
+//!      plist), so `localStorage.clear()` alone left a reinstall remembering dev mode and the
+//!      last-seen version. On Linux it is the single directory `~/.local/share/<id>`, which
+//!      WebKitGTK uses for all of the above — and which nothing else on that platform would ever
+//!      remove, since Linux ships no uninstaller hook. Windows is the only no-op: there the folder
+//!      is held open while PM runs, so the NSIS uninstaller purges it from outside instead.
 //!
 //! **Removing PM itself is not the same act on every platform**, and this module no longer pretends
 //! it is: Windows launches the NSIS uninstaller, macOS has none (the user moves the `.app` to the
@@ -66,10 +68,12 @@ pub struct WipeSelection {
     /// Every keychain secret; implies revoking Google grants + reporting Microsoft accounts.
     pub keychain: bool,
     /// Interface preferences. The webview clears its own `localStorage` before calling in; this
-    /// flag is what lets the backend also remove the OS-level store BEHIND it, which on macOS is a
-    /// real directory (`~/Library/WebKit/<id>`) that `localStorage.clear()` cannot reach on its own.
-    /// A no-op on Windows/Linux, where the equivalent folder is in use while PM runs and is left to
-    /// the uninstaller.
+    /// flag is what lets the backend also remove the OS-level store BEHIND it — a real directory
+    /// `localStorage.clear()` cannot reach, at `~/Library/WebKit/<id>` on macOS and
+    /// `~/.local/share/<id>` on Linux. A no-op only on Windows, where the folder is held open while
+    /// PM runs and the NSIS uninstaller purges it from outside instead. Linux used to be grouped
+    /// with Windows here, which was wrong twice: the folder IS removable there, and Linux has no
+    /// uninstaller to fall back on — so nothing removed it, ever.
     #[serde(default)]
     pub local_storage: bool,
 }
@@ -281,13 +285,14 @@ fn remove_db_files_retrying(db_path: &Path) -> bool {
 /// file is confirmed gone first; shared by the wipe and the boot-error "start fresh" recovery.
 fn remove_vault_artifacts(resolved: &vault::ResolvedVault, data_dir: &Path) -> u64 {
     let mut freed = 0u64;
-    let _ = std::fs::remove_file(resolved.vault_root.join(vault::META_FILENAME));
-    let _ = std::fs::remove_file(resolved.vault_root.join(crate::entities::RULES_FILENAME));
-    let _ = std::fs::remove_file(
-        resolved
-            .vault_root
-            .join(crate::index_only::MANIFEST_FILENAME),
-    );
+    // One enumeration, shared with the migration's copy + delete. Naming the files here by hand had
+    // already drifted: `vault-access.json` — the list of OS accounts linked to a shared vault, i.e.
+    // account names — was in `vault_sidecar_files` and not in this list, so it survived "Remove PM
+    // data". A file the erase forgets is also a file that keeps `remove_empty_dir_retrying` below
+    // from ever succeeding, which is how the same class of bug bit the shared-vault delete.
+    for file in vault::migrate::vault_sidecar_files(&resolved.vault_root) {
+        let _ = std::fs::remove_file(file);
+    }
     let _ = vault::lock::clear_baton_files(&resolved.vault_root);
     let _ = vault::migrate::clear_journal(data_dir);
     let migration_backup = vault::migrate::backup_dir(data_dir);
@@ -468,14 +473,14 @@ fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
     report.full_purge = true;
 }
 
-/// Remove the OS-written leftovers that live outside the data dir (macOS only — see
-/// [`paths::macos_app_leftovers`]). Returns how many existed and were removed, so the summary can
-/// say something true rather than claiming a clean sweep it did not make.
+/// Remove the OS-written leftovers that live outside the data dir (see [`paths::os_app_leftovers`]).
+/// Returns how many existed and were removed, so the summary can say something true rather than
+/// claiming a clean sweep it did not make.
 ///
 /// Best-effort per entry, like the rest of the wipe: one stubborn path must not abort the others.
 fn remove_os_leftovers(app: &AppHandle, report: &mut WipeReport) -> usize {
     let mut removed = 0usize;
-    for path in paths::macos_app_leftovers(app) {
+    for path in paths::os_app_leftovers(app) {
         if !path.exists() {
             continue;
         }
@@ -574,8 +579,11 @@ pub async fn wipe_pm_data(
         // pointers, staging, journal + backup. The shared folder is left untouched; deleting
         // it for everyone is a deliberate, separately-confirmed action, never a side effect.
         // (Mirrors the reset_after_open_error guard below, which predates this one.)
-        let pointed = vault::pointer::load(&data_dir).ok().flatten().is_some();
-        let resolved = if pointed {
+        let pointed = vault::pointer::load(&data_dir)
+            .ok()
+            .flatten()
+            .map(|p| p.vault_root);
+        let resolved = if pointed.is_some() {
             let _ = state.take_conn();
             let _ = state.clear_vault_runtime();
             vault::resolve_layout(&data_dir, None)
@@ -607,10 +615,18 @@ pub async fn wipe_pm_data(
         // The DB file is confirmed gone; now the rest of the vault artifacts.
         report.freed_bytes += remove_vault_artifacts(&resolved, &data_dir);
 
-        report.removed.push(if pointed {
-            "This account's PM data (the shared vault folder was left untouched)".into()
-        } else {
-            "Vault & encrypted database".into()
+        // Name the folder rather than calling it "the shared vault folder". The pointer is written by
+        // BOTH doors — joining someone else's vault AND moving your own — and carries no record of
+        // which, so the old wording told a user who had simply moved their vault to D:\ that a folder
+        // full of their own notes was somebody else's. Naming the path is true either way, and it is
+        // the only way they learn those files are still there while their key is being deleted below.
+        report.removed.push(match &pointed {
+            Some(root) => format!(
+                "This account's PM data. Your vault itself is in {} — that folder is outside PM \
+                 and has been left exactly as it is, so delete it yourself if you want it gone",
+                root.display()
+            ),
+            None => "Vault & encrypted database".into(),
         });
         report.quit_required = true;
     }
@@ -886,6 +902,7 @@ mod tests {
             "/Users/someone/Library/HTTPStorages/org.itsatlas.pm",
             "/Users/someone/Library/Preferences/org.itsatlas.pm.plist",
             "/Users/someone/Library/Saved Application State/org.itsatlas.pm.savedState",
+            "/Users/someone/Library/HTTPStorages/org.itsatlas.pm.binarycookies",
         ];
         let got: Vec<String> = got
             .iter()
@@ -904,6 +921,28 @@ mod tests {
                 "{must} must be removed by Remove PM data"
             );
         }
+    }
+
+    #[test]
+    fn linux_leftovers_name_the_webkitgtk_store_the_erase_used_to_skip() {
+        // Tauri forces a webview data directory at `<local data>/<identifier>` on Linux as well as
+        // Windows, and wry hands that exact path to WebKitGTK as BOTH its data and its cache base —
+        // so this one directory is the app's localStorage, IndexedDB, service workers and cookie
+        // jar. The wipe skipped it because the leftover sweep was macOS-only, and Linux has no
+        // uninstaller behind it, so "Remove PM data" left it there permanently.
+        let got =
+            paths::linux_leftovers_in(Path::new("/home/someone/.local/share"), "org.itsatlas.pm");
+        let got: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(got, ["/home/someone/.local/share/org.itsatlas.pm"]);
+
+        // Same one-way-door rule as macOS: read the identifier, never repeat it.
+        let other = paths::linux_leftovers_in(Path::new("/x"), "com.example.other");
+        assert!(other
+            .iter()
+            .all(|p| p.to_string_lossy().contains("com.example.other")));
     }
 
     #[test]
@@ -1100,6 +1139,33 @@ mod tests {
             "could not read the database file (disk I/O error): some os error"
         ));
         assert!(!is_genuine_brick(""));
+    }
+
+    #[test]
+    fn the_erase_removes_every_file_the_vault_list_names() {
+        // The wipe's artifact list used to be typed out by hand beside `vault_sidecar_files`, and had
+        // already drifted: `vault-access.json` — the OS accounts linked to a shared vault — was in
+        // that list and not in this one, so "Remove PM data" left it behind. Driving both from one
+        // enumeration is the fix; this asserts the outcome rather than the mechanism, so a file added
+        // to the list later is covered without anyone remembering to come back here.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        for file in vault::migrate::vault_sidecar_files(&root) {
+            std::fs::write(&file, b"x").unwrap();
+        }
+        std::fs::write(root.join("vault").join("note.md"), b"# note").unwrap();
+        let unrelated = root.join("taxes-2025.xlsx");
+        std::fs::write(&unrelated, b"not PM's to delete").unwrap();
+
+        let resolved = vault::resolve_layout(&root, None);
+        remove_vault_artifacts(&resolved, &root);
+
+        for file in vault::migrate::vault_sidecar_files(&root) {
+            assert!(!file.exists(), "{} survived the erase", file.display());
+        }
+        assert!(!root.join("vault").exists(), "the Markdown tree goes too");
+        assert!(unrelated.exists(), "and nothing that isn't PM's is touched");
     }
 
     // --- F-03: a relocated vault's user-chosen root must never be deleted wholesale ---

@@ -338,6 +338,10 @@ export default function App() {
         // A passphrase vault with no cached key on this profile boots locked (the store can't open
         // until unlocked), so defer the store-backed load until it is.
         setVault(vs);
+        // The backend carries this rather than emitting it, because a vault that opens from a cached
+        // key does so before this component exists to hear `vault://meta-warning`. Set before the
+        // gates below return, so the banner still shows on a locked or faulted boot.
+        if (vs?.meta_warning) setMetaWarning(vs.meta_warning);
         // Another profile may already be the active writer of a shared vault — then this instance is
         // curtained (its store closed). That takes priority over the unlock prompt (the key is
         // cached; the vault just isn't ours to write right now).

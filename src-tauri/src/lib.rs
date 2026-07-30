@@ -460,6 +460,14 @@ pub struct AppState {
     /// [`session_unavailable_message`] — "access denied" must never masquerade as
     /// "the vault is locked" (the ACL-lockout incident).
     pub vault_fault: Mutex<Option<error::VaultFault>>,
+    /// The standing "this vault's settings file was altered outside PM" notice, if any — the
+    /// user-facing half of [`vault::MetaAuthReport`]. Held rather than emitted because boot has no
+    /// listener yet: `unlock_vault` and `adopt_shared_vault` can fire `vault://meta-warning` at a
+    /// webview that is already up, but a vault opened from a cached key comes up before the frontend
+    /// subscribes, so the boot report had nowhere to go but stderr. Surfaced through
+    /// `vault_status.meta_warning`, which the app reads on load, and it STAYS set: a tampered meta is
+    /// no longer re-signed on open, so the condition is real until the file is legitimately rewritten.
+    pub meta_warning: Mutex<Option<String>>,
     /// Single-flight guard for the daily-briefing regeneration. A `tokio::Mutex` rather than the
     /// [`BusyGuard`] pattern above because the wanted semantics differ: a second caller must WAIT
     /// for the running generation and take its result, not give up. The briefing is shown in up to
@@ -610,6 +618,29 @@ impl AppState {
     pub fn set_vault_fault(&self, fault: Option<error::VaultFault>) {
         if let Ok(mut guard) = self.vault_fault.lock() {
             *guard = fault;
+        }
+    }
+
+    /// The standing meta-tamper notice, if any (poison-tolerant — a poisoned slot reads as none).
+    pub fn meta_warning(&self) -> Option<String> {
+        self.meta_warning.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Record the outcome of a meta authentication. Only a warning REPLACES what is stored: every
+    /// open path calls this, and several run against a vault that isn't the one that raised the
+    /// notice, so a clean report must not be able to quietly clear a real one. `clear_meta_warning`
+    /// is the deliberate way to drop it.
+    pub fn note_meta_report(&self, report: &vault::MetaAuthReport) {
+        if let (Some(w), Ok(mut guard)) = (report.warning(), self.meta_warning.lock()) {
+            *guard = Some(w);
+        }
+    }
+
+    /// Drop the meta-tamper notice — for switching to a different vault, where the old vault's
+    /// story no longer applies.
+    pub fn clear_meta_warning(&self) {
+        if let Ok(mut guard) = self.meta_warning.lock() {
+            *guard = None;
         }
     }
 
@@ -1081,9 +1112,9 @@ pub fn run() {
             // (passphrase, uncached) vault leaves both `None` until an unlock command.
             // A device vault opens now with the keychain key; a passphrase/shareable
             // vault opens only if this profile cached its key.
-            let (conn, vault_runtime, boot_fault) = match &open_attempt {
+            let (conn, vault_runtime, boot_fault, boot_meta_warning) = match &open_attempt {
                 Ok(meta) => match vault::open_at_boot(&resolved, meta) {
-                    Ok(Some((conn, master))) => {
+                    Ok(Some((conn, master, report))) => {
                         // Self-heal the discovery marker for an open shared vault living
                         // outside the profile (best-effort; a wiped ProgramData grows it
                         // back, and identical content skips the write).
@@ -1106,9 +1137,10 @@ pub fn run() {
                             Some(conn),
                             Some(VaultRuntime::build(&resolved, meta, &master)),
                             None,
+                            report.warning(),
                         )
                     }
-                    Ok(None) => (None, None, None),
+                    Ok(None) => (None, None, None, None),
                     // A boot-time open failure (a transient AV/search-indexer file lock, disk I/O)
                     // must NOT abort the whole app — `db::open` already maps these to friendly,
                     // retryable messages. Degrade to a not-opened store and carry the fault so the
@@ -1120,14 +1152,14 @@ pub fn run() {
                             "vault: boot open failed, starting locked with Retry: {}",
                             fault.message
                         );
-                        (None, None, Some(fault))
+                        (None, None, Some(fault), None)
                     }
                 },
                 // The pointed vault is missing/unreachable: boot locked, carrying the
                 // classified story so the UI can offer Repair, Retry, or a detach.
                 Err(fault) => {
                     eprintln!("vault: {}", fault.message);
-                    (None, None, Some(fault.clone()))
+                    (None, None, Some(fault.clone()), None)
                 }
             };
 
@@ -1176,6 +1208,7 @@ pub fn run() {
                 backup_busy: AtomicBool::new(false),
                 pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
                 vault_fault: Mutex::new(boot_fault),
+                meta_warning: Mutex::new(boot_meta_warning),
                 briefing_refresh: tokio::sync::Mutex::new(()),
                 briefing_dirty: AtomicBool::new(false),
                 local_ai: local_slot::LocalRuntime::default(),

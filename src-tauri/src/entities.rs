@@ -502,9 +502,7 @@ pub fn write_rules_file(vault_root: &Path, cipher: &RulesCipher, rules: &Rules) 
     let path = rules_path(vault_root);
     let prior = std::fs::read(&path).unwrap_or_default();
     let bytes = cipher.encrypt(rules)?;
-    let tmp = path.with_extension("pmrules.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::vault::write_atomic(&path, &bytes)?;
     Ok(prior)
 }
 

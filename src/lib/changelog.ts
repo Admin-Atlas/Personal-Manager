@@ -24,6 +24,19 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.110.2-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Your notes can no longer be switched back to plain text by editing a file next to them. Every vault keeps a small settings file recording whether notes are encrypted at rest, and PM checked it for tampering — but if the check failed it re-signed whatever it found, so the change became the new truth and the warning went away after one launch. A shared vault could be quietly turned back to plain text by someone who could reach the folder but didn't know the passphrase. PM now refuses to accept a change that weakens protection, keeps encrypting regardless of what the file claims, leaves the altered file alone rather than signing it, and keeps telling you until it's put right.",
+      "You'll now be told about that at startup too. The warning only ever appeared when you typed your passphrase, so a vault that opened on a remembered key reported the problem to a log file nobody reads. It now shows on any launch, and the Vault panel reports whether your notes are actually being encrypted rather than what the settings file says they are.",
+      "A crash while PM is saving no longer costs you the whole note. Notes, chat transcripts and saved photos were written straight over the top of the old file, so an interruption part-way left a half-written file — and on an encrypted vault half a file is unreadable, not partly readable. PM now writes to a temporary file, flushes it to the disk, and swaps it into place in one step, so you always end up with either the old version or the new one. Chat transcripts benefit most: the whole transcript is rewritten on every reply.",
+      'Restoring a backup is much more careful about what it replaces. PM offered to move a restored vault into its usual home when that home looked empty — but "empty" only counted imported documents, so a vault holding your projects, milestones, flags, chats, connected calendars and preferences could be treated as blank and erased. It now checks for anything you put there yourself.',
+      "A restore also stops before it fills your drive, with a clear message instead of a raw disk error, and no longer leaves a decrypted copy behind if the last step fails.",
+      '"Remove PM data" no longer leaves stray files behind, and tells the truth about what it left. It missed the list of accounts linked to a shared vault, and it described a vault you had simply moved to another folder as "the shared vault folder" — now it names the actual folder and says plainly that it hasn\'t touched anything inside it.',
+      "On Linux, \"Remove PM data\" now really removes everything. The folder holding PM's browser-side data — your interface preferences, and the cookies and stored data behind the app window — was skipped on Linux, and unlike Windows there's no uninstaller afterwards to catch it, so it stayed on the machine for good. It's now erased along with the rest. On Mac, the cookie file sitting beside that folder is cleared too.",
+    ],
+  },
+  {
     version: "3.110.1-alpha",
     date: "2026-07-30",
     highlights: [

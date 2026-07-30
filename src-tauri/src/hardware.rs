@@ -159,6 +159,23 @@ fn disk_free_gb(data_dir: Option<&std::path::Path>) -> Option<f64> {
         .map(|b| round1(b as f64 / GIB))
 }
 
+/// Free BYTES on the volume holding `dir`, or `None` when no reported mount point contains it.
+///
+/// Deliberately not [`disk_free_gb`]: that one falls back to the roomiest volume, which is a
+/// reasonable hint for the Workbench's "will this model fit" readout and a bad answer for a budget.
+/// A caller sizing a write needs the volume it is about to write to or nothing at all — guessing
+/// the wrong volume is worse than admitting we don't know.
+pub(crate) fn available_bytes(dir: &std::path::Path) -> Option<u64> {
+    let target = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| target.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
 // --- GPU / VRAM: hand-rolled per OS ------------------------------------------------------------
 
 #[cfg(windows)]
