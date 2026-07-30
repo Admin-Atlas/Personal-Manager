@@ -574,6 +574,11 @@ fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
     // lives elsewhere and was handled by the vault branch), so unlike a user-chosen relocation root
     // this is safe to take wholesale. `paths::data_dir` recreates it empty; delete that. If a stray
     // handle blocks it, the marker-driven uninstaller hook is the backstop.
+    // Latch BEFORE the removal, never after: between the two, any background poll that touches
+    // `data_dir` would put the folder straight back. Windows never saw this because it exits into
+    // the uninstaller immediately; macOS and Linux sit on the done screen with everything still
+    // running.
+    paths::mark_data_dir_purged();
     if let Ok(data_dir) = paths::data_dir(app) {
         remove_dir_all_retrying(&data_dir);
         // Truthful, not assumed. This used to be set unconditionally, so off Windows — where no
@@ -593,6 +598,42 @@ fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
     #[cfg(windows)]
     crate::sidecar_sandbox::remove_container_profile();
     report.full_purge = true;
+}
+
+/// Delete again, on the way out, anything written back since the erase ran.
+///
+/// Called from the `RunEvent::Exit` arm and ONLY after a full purge. The wipe itself runs early —
+/// on macOS and Linux there is no uninstaller to hand off to, so the user is left reading a "what to
+/// do next" screen while PM stays open — and this catches whatever landed in the meantime.
+///
+/// **This is a PRE-teardown hook, not a post-teardown one, and the difference matters.** Traced
+/// through the vendored sources: `RunEvent::Exit` comes from `Event::LoopDestroyed`, which tao
+/// dispatches while the NSWindow (or GTK window) and its webview are *still alive*, and then ends
+/// the process with `process::exit` — so no destructor ever runs and there is no in-process webview
+/// teardown at all. On macOS tao sends `[NSApp stop:]` rather than `terminate:`, so
+/// `applicationWillTerminate:` never fires either. An earlier version of this comment claimed the
+/// webview was already gone by here. It is not, and nothing in the stack offers a hook that late.
+///
+/// So this **narrows the window; it cannot close it.** Whatever WebKit's out-of-process network and
+/// content daemons, or cfprefsd, write after PM's own PID has gone is beyond anything PM can run.
+/// The durable fix is upstream of the timing: the webview's own storage is cleared BEFORE the
+/// backend deletes the directory behind it (see `RemovePmData.tsx`), so a late flush writes nothing.
+///
+/// Best-effort and silent by design: there is no UI left to report into, and an erase that already
+/// succeeded must not turn into a failure at the door. Also re-removes the data dir, which
+/// `paths::mark_data_dir_purged` should already have prevented from coming back — belt and braces,
+/// since one missed caller would otherwise be invisible.
+pub fn final_sweep_after_purge(app: &AppHandle) {
+    for path in paths::os_app_leftovers(app) {
+        if path.is_dir() {
+            remove_dir_all_retrying(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(data_dir) = paths::data_dir(app) {
+        remove_dir_all_retrying(&data_dir);
+    }
 }
 
 /// Remove the OS-written leftovers that live outside the data dir (see [`paths::os_app_leftovers`]).

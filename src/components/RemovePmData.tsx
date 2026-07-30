@@ -202,7 +202,15 @@ export function RemovePmData({ biometricAvailable }: Props) {
       // emptying it in here leaves nothing for the webview to flush back over the top of the
       // directory the backend is about to delete. (Belt-and-braces — the app quits straight after —
       // but the invariant shouldn't rest on that timing.)
-      if (sel.localStorage) {
+      //
+      // The condition has to match the BACKEND's, which removes the OS-level store when
+      // `local_storage || full` — and `full` is regenerable + vault + keychain, which does NOT
+      // include this checkbox. Keying the clear on the checkbox alone meant a user who ticked the
+      // three data classes and left "App preferences" alone had the store deleted underneath a
+      // webview whose localStorage was still fully populated: the one case where WebKit has real
+      // content to write back over the deleted directory.
+      const fullWipe = sel.regenerable && sel.vaultAndDb && sel.keychain;
+      if (sel.localStorage || fullWipe) {
         try {
           localStorage.clear();
         } catch {

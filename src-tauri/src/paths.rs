@@ -44,9 +44,49 @@ pub fn data_dir(app: &AppHandle) -> Result<PathBuf> {
             .map_err(|e| Error::Other(format!("could not resolve local data dir: {e}")))?
             .join("Personal Manager"),
     };
-    std::fs::create_dir_all(&dir)?;
-    // The Markdown vault (source of truth) lives alongside the index; empty in v1.
-    std::fs::create_dir_all(dir.join("vault"))?;
+    prepare_data_dir(dir, data_dir_is_purged())
+}
+
+/// Set once a full "remove PM completely" has taken the data directory away.
+///
+/// Creating the folder on every [`data_dir`] call is exactly right for the whole life of a normal
+/// run — until the run in which the user erases everything. On Windows PM exits into the NSIS
+/// uninstaller straight away and never calls this again; on macOS and Linux there is no uninstaller
+/// to hand off to, so PM sits on the "done" screen while its background work carries on, and the
+/// first poll or Settings read to touch `data_dir` REBUILDS the folder the user was just told was
+/// gone. That asymmetry is why it went unnoticed.
+static DATA_DIR_PURGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop [`data_dir`] (and, through it, `vault::resolve`) re-creating what a full purge is about to
+/// remove. Called BEFORE the removal, so nothing can slip through the gap between the two.
+///
+/// One-way for the life of the process, deliberately: the only way back is a relaunch, which is
+/// what the user is being asked to do anyway. Nothing re-arms it — a wipe that leaves PM running is
+/// a wipe after which PM should create nothing.
+pub fn mark_data_dir_purged() {
+    DATA_DIR_PURGED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a full purge has happened in this process.
+pub fn data_dir_is_purged() -> bool {
+    DATA_DIR_PURGED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve the data dir, creating it and its `vault/` subfolder unless the run has been purged.
+///
+/// Split out with `purged` passed in so the rule is testable without touching the process-wide
+/// latch — a test that set the real one would poison every other test in the binary, since cargo
+/// runs them as threads in one process.
+///
+/// After a purge this still returns the PATH. Callers then fail naturally on the missing folder,
+/// which every caller already handles as "the vault isn't there"; returning an error instead would
+/// invent a new failure surface on the one screen that is meant to be calm.
+fn prepare_data_dir(dir: PathBuf, purged: bool) -> Result<PathBuf> {
+    if !purged {
+        std::fs::create_dir_all(&dir)?;
+        // The Markdown vault (source of truth) lives alongside the index; empty in v1.
+        std::fs::create_dir_all(dir.join("vault"))?;
+    }
     Ok(dir)
 }
 
@@ -171,6 +211,34 @@ pub fn uninstall_purge_marker(app: &AppHandle) -> Result<PathBuf> {
 pub fn clear_stale_uninstall_purge_marker(app: &AppHandle) {
     if let Ok(marker) = uninstall_purge_marker(app) {
         let _ = std::fs::remove_file(marker);
+    }
+}
+
+#[cfg(test)]
+mod purge_latch_tests {
+    use super::*;
+
+    #[test]
+    fn a_purged_run_resolves_the_data_dir_without_rebuilding_it() {
+        // The bug this exists for: after a full erase, PM keeps running on macOS and Linux, and the
+        // next caller to ask where the data dir is used to CREATE it — folder and `vault/` both —
+        // so the thing the user had just been told was gone reappeared while they read the message.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Personal Manager");
+
+        let normal = prepare_data_dir(dir.clone(), false).unwrap();
+        assert_eq!(normal, dir);
+        assert!(dir.is_dir(), "an ordinary run still prepares the folder");
+        assert!(dir.join("vault").is_dir(), "and its vault subfolder");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        let purged = prepare_data_dir(dir.clone(), true).unwrap();
+        assert_eq!(
+            purged, dir,
+            "the PATH is still resolved, so callers fail on the missing folder \
+                                 rather than on a new error shape"
+        );
+        assert!(!dir.exists(), "but nothing is put back");
     }
 }
 

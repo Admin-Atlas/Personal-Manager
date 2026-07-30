@@ -810,6 +810,21 @@ impl SidecarManager {
     ///
     /// [`ensure_installed`]: SidecarManager::ensure_installed
     pub fn ensure_installed_with_progress(&self, on_progress: impl FnMut(f32)) -> Result<()> {
+        // Nothing gets provisioned back into a vault the user has just erased. This is the one
+        // recreator the data-dir latch cannot catch on its own: `paths::data_dir` stops CREATING
+        // after a purge, but provisioning builds `runtime/venv` with a `create_dir_all` on a path
+        // BELOW it, which re-makes every parent — so a connector poll landing after the erase would
+        // rebuild a few hundred MB of Python inside the folder the user was told was gone. Unlike
+        // the empty directories, that is real content coming back.
+        //
+        // Guarded here rather than at the call sites: `run_cloud_pass` and `run_local_sync` both
+        // call this BEFORE their `state.conn()` gate, so the closed store does not stop them, and a
+        // future caller would inherit the same trap. One check, in the one place that matters.
+        if crate::paths::data_dir_is_purged() {
+            return Err(Error::Other(
+                "PM's data has been removed on this device — restart PM to set it up again".into(),
+            ));
+        }
         if self.is_ready_marker_current()? {
             self.set_status(SidecarStatus::Ready);
             return Ok(());
