@@ -508,11 +508,28 @@ pub fn tag_chunk_ids(
 /// list it must write without threading it through the whole call stack. Comparing on the
 /// normalised form means a hand-edited file that repeats the home under different casing still
 /// yields "no extras" rather than a document linked to itself.
+///
+/// TWO homes are excluded, not one: `home` as the caller intends it, AND whatever
+/// `documents.project` still holds. They are the same row on every settled document, but a caller
+/// that is MOVING a document reads this *before* [`crate::ingest::write_document_truth`] moves the
+/// column — that is the only place the home is written — so the old home is still in the join and
+/// would come back as an "extra membership". It would then be written into the vault's
+/// `linked_projects:` line and re-interned as a tag, which survives a Rebuild because
+/// `linked_projects_from_fields` filters only the home as well. `commit_review` re-linked every
+/// approved document to the inbox this way, and rename/merge re-minted the name they had just
+/// retired. Excluding the row's own current project makes the read order stop mattering.
 pub fn linked_projects(conn: &Connection, doc_id: i64, home: &str) -> Result<Vec<String>> {
+    /// Built once: `MEMBERSHIPS_SQL` is a large UNION and this runs per document inside every bulk
+    /// rewrite loop, so neither the `format!` nor the parse should repeat.
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "SELECT name FROM ({MEMBERSHIPS_SQL}) WHERE document_id = ?1 AND norm <> ?2 \
+               AND norm <> (SELECT lower(trim(COALESCE(project,''))) FROM documents WHERE id = ?1) \
+             ORDER BY name"
+        )
+    });
     let home_norm = normalize(home);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT name FROM ({MEMBERSHIPS_SQL}) WHERE document_id = ?1 AND norm <> ?2 ORDER BY name"
-    ))?;
+    let mut stmt = conn.prepare_cached(&SQL)?;
     let rows = stmt
         .query_map(params![doc_id, home_norm], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -890,6 +907,39 @@ mod tests {
             params![id, project],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_home_a_document_is_leaving_is_never_returned_as_a_link() {
+        // The read-before-write trap. Every filing surface calls this BEFORE
+        // `write_document_truth` moves `documents.project`, so at read time the row still holds the
+        // OLD home. Returning it would write the project the document is leaving into its vault
+        // `linked_projects:` line — permanently, since a Rebuild re-derives from that file.
+        let (_dir, conn) = store();
+
+        // An unreviewed document, exactly as `insert_document_row` leaves it: homed in the inbox,
+        // with the inbox's own project tag interned.
+        doc(&conn, 1, "Unsorted");
+        set_document_projects(&conn, 1, "Unsorted", &[]).unwrap();
+
+        // What `commit_review` asks the instant before it files the document into "Atlas".
+        assert!(
+            linked_projects(&conn, 1, "Atlas").unwrap().is_empty(),
+            "approving a document must not link it to the inbox it came from"
+        );
+
+        // The same shape for rename/merge: `rename_project_tag` re-keys the tag first, so the join
+        // already says "New" while the column still says "Old" — and arm 1 of MEMBERSHIPS_SQL then
+        // emits the old name. Nothing may come back but the genuine extra membership.
+        let (_dir2, conn2) = store();
+        doc(&conn2, 1, "Old");
+        set_document_projects(&conn2, 1, "Old", &["Keep".into()]).unwrap();
+        rename_project_tag(&conn2, "Old", "New").unwrap();
+        assert_eq!(
+            linked_projects(&conn2, 1, "New").unwrap(),
+            ["Keep"],
+            "a rename must not re-mint the name it just retired"
+        );
     }
 
     #[test]

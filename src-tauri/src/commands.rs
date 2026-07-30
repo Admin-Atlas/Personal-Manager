@@ -4041,7 +4041,10 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 // Review confirms ONE project — the model proposes one, and extra memberships are
                 // added by hand elsewhere — so this surface carries the existing ones across rather
                 // than passing an empty list, which would silently unlink a document from
-                // everywhere else the moment it was re-reviewed.
+                // everywhere else the moment it was re-reviewed. The document is still homed at its
+                // PRE-review project here (usually the Unsorted inbox); `linked_projects` excludes
+                // that as well as `canonical`, or approving a file would link it to the inbox
+                // forever — in the vault, so a Rebuild would reproduce it.
                 let linked = crate::tags::linked_projects(&tx, d.document_id, &canonical)?;
                 let w = ingest::write_document_truth(
                     &tx,
@@ -4251,17 +4254,6 @@ struct MutationFiles {
     forget_sources: Vec<String>,
 }
 
-impl From<Vec<(std::path::PathBuf, Vec<u8>)>> for MutationFiles {
-    /// The common case — a mutation that only rewrites. Lets every existing caller keep returning
-    /// a plain snapshot list.
-    fn from(written: Vec<(std::path::PathBuf, Vec<u8>)>) -> Self {
-        MutationFiles {
-            written,
-            ..MutationFiles::default()
-        }
-    }
-}
-
 /// Run a mirror mutation in a transaction, persist the encrypted rules file from the resulting
 /// mirror (file-first, so a rule is as durable as the commit), then commit — restoring any
 /// rewritten vault files + the rules file if the commit fails, and unlinking any files the mutation
@@ -4269,7 +4261,7 @@ impl From<Vec<(std::path::PathBuf, Vec<u8>)>> for MutationFiles {
 /// commands. This is the single write path the Teach tab drives, identical to the inline review
 /// correction — and now also the path project deletion (#573) rides, so the rules file, the
 /// rollback and the delete-after-commit rule all stay defined in exactly one place.
-async fn spawn_entity_mutation<F, R>(app: AppHandle, work: F) -> Result<()>
+async fn spawn_entity_mutation<F>(app: AppHandle, work: F) -> Result<()>
 where
     F: FnOnce(
             &Connection,
@@ -4277,10 +4269,10 @@ where
             &vault::MarkdownCipher,
             &std::path::Path,
             &index_only::ManifestCipher,
-        ) -> Result<R>
+            &mut MutationFiles,
+        ) -> Result<()>
         + Send
         + 'static,
-    R: Into<MutationFiles>,
 {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let state = app.state::<AppState>();
@@ -4290,13 +4282,26 @@ where
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
 
-        let files: MutationFiles = match work(&tx, &vault, &cipher, &vault_root, &manifest_cipher) {
-            Ok(w) => w.into(),
-            Err(e) => {
-                drop(tx);
-                return Err(e);
-            }
-        };
+        // The ledger is owned HERE, not by the closure, and is passed in by reference: a mutation
+        // that fails part-way has already rewritten vault files, and if its snapshots go down with
+        // its own return value there is nothing left to restore from. That is what happened when a
+        // project delete tripped the entity FK — the DB rolled back while every moved document's
+        // front matter stayed rewritten, and the vault is what a Rebuild believes. `commit_review`
+        // has always kept its snapshot list outside the fallible section for this reason; this is
+        // the same shape, made the rule for every mutation that rides this path.
+        let mut files = MutationFiles::default();
+        if let Err(e) = work(
+            &tx,
+            &vault,
+            &cipher,
+            &vault_root,
+            &manifest_cipher,
+            &mut files,
+        ) {
+            drop(tx);
+            ingest::restore_vault_files(files.written);
+            return Err(e);
+        }
         let prior_rules = match entities::write_rules_file(
             &vault_root,
             &rules_cipher,
@@ -4330,8 +4335,8 @@ where
 
 /// Rewrite every document currently pointing at `entity_id` so its vault frontmatter + `project`
 /// cache show `canonical` (preserving tags/importance/reviewed/last_activity). The mirror pointer
-/// is already set by the caller; this syncs the denormalised cache + vault. Returns the file
-/// snapshots for rollback.
+/// is already set by the caller; this syncs the denormalised cache + vault. Appends the file
+/// snapshots to `out` for rollback.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_entity_documents(
     tx: &Connection,
@@ -4341,7 +4346,8 @@ fn rewrite_entity_documents(
     manifest_cipher: &index_only::ManifestCipher,
     entity_id: i64,
     canonical: &str,
-) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) -> Result<()> {
     let mut stmt = tx.prepare("SELECT id FROM documents WHERE entity_id = ?1")?;
     let ids: Vec<i64> = stmt
         .query_map(params![entity_id], |r| r.get(0))?
@@ -4355,6 +4361,7 @@ fn rewrite_entity_documents(
         manifest_cipher,
         &ids,
         Some(canonical),
+        out,
     )
 }
 
@@ -4364,6 +4371,11 @@ fn rewrite_entity_documents(
 /// Split out for project deletion (#573), which re-homes only the documents it moved. Rewriting by
 /// entity there would touch every document already sitting in Unsorted — correct but pointlessly
 /// rewriting (and re-encrypting) a potentially large inbox to the name it already carries.
+///
+/// Snapshots are appended to `out` as each file is written, not returned in a batch at the end: a
+/// rewrite that fails on document 5 of 10 has already replaced four vault files, and the caller
+/// needs those four to roll back. Returning them only on success would discard exactly the ones a
+/// failure has to undo.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_documents(
     tx: &Connection,
@@ -4373,7 +4385,8 @@ fn rewrite_documents(
     manifest_cipher: &index_only::ManifestCipher,
     ids: &[i64],
     canonical: Option<&str>,
-) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) -> Result<()> {
     let mut rows: Vec<(i64, String, String, Option<String>, i64, String)> =
         Vec::with_capacity(ids.len());
     {
@@ -4400,7 +4413,6 @@ fn rewrite_documents(
         }
     }
 
-    let mut written = Vec::new();
     for (doc_id, project, tags_json, importance, reviewed, last_activity) in rows {
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
         // `None` = leave this document where it is. That is the case for a document merely LINKED
@@ -4408,9 +4420,13 @@ fn rewrite_documents(
         // its vault file still names the old project in `linked_projects:`, so it has to be
         // rewritten or the next Rebuild reads the dead name straight back in and re-mints it.
         let home = canonical.unwrap_or(project.as_str());
-        // Read AFTER the tag itself has been re-keyed or dropped, so this is already the new truth.
+        // Read AFTER the tag itself has been re-keyed or dropped, so this is already the new truth
+        // for the JOIN half of the membership set. The `documents.project` half has NOT moved yet —
+        // `write_document_truth` below is what moves it — so this relies on `linked_projects`
+        // excluding the row's current home as well as the incoming one. Without that, a rename
+        // emitted the OLD name here and wrote it straight back into every renamed document.
         let linked = crate::tags::linked_projects(tx, doc_id, home)?;
-        written.push(ingest::write_document_truth(
+        out.push(ingest::write_document_truth(
             tx,
             vault,
             cipher,
@@ -4428,7 +4444,7 @@ fn rewrite_documents(
             ingest::FilingActivity::Suppress,
         )?);
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Every project entity with its aliases — the Teach tab's list (PR 2). Read-only.
@@ -4447,14 +4463,14 @@ pub fn list_entities(
 pub async fn add_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> Result<()> {
     spawn_entity_mutation(
         app,
-        move |tx, _vault, _cipher, _vault_root, _manifest_cipher| match entities::add_alias(
+        move |tx, _vault, _cipher, _vault_root, _manifest_cipher, _files| match entities::add_alias(
             tx, entity_id, &alias,
         )? {
             entities::AddAlias::Conflict(_) => Err(Error::Other(format!(
                 "\"{}\" already belongs to another project; merge them instead",
                 alias.trim()
             ))),
-            _ => Ok(Vec::new()),
+            _ => Ok(()),
         },
     )
     .await
@@ -4469,9 +4485,9 @@ pub async fn add_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> 
 pub async fn remove_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> Result<()> {
     spawn_entity_mutation(
         app,
-        move |tx, _vault, _cipher, _vault_root, _manifest_cipher| {
+        move |tx, _vault, _cipher, _vault_root, _manifest_cipher, _files| {
             entities::remove_alias(tx, entity_id, &alias)?;
-            Ok(Vec::new())
+            Ok(())
         },
     )
     .await
@@ -4498,8 +4514,9 @@ fn rewrite_after_project_rekey(
     entity_id: i64,
     canonical: &str,
     members: &[i64],
-) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
-    let mut written = rewrite_entity_documents(
+    out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) -> Result<()> {
+    rewrite_entity_documents(
         tx,
         vault,
         cipher,
@@ -4507,22 +4524,23 @@ fn rewrite_after_project_rekey(
         manifest_cipher,
         entity_id,
         canonical,
+        out,
     )?;
     let elsewhere: Vec<i64> = {
         let mut stmt = tx.prepare("SELECT 1 FROM documents WHERE id = ?1 AND entity_id IS ?2")?;
-        let mut out = Vec::new();
+        let mut ids = Vec::new();
         for id in members {
             let homed_here = stmt
                 .query_row(params![id, entity_id], |_| Ok(()))
                 .optional()?
                 .is_some();
             if !homed_here {
-                out.push(*id);
+                ids.push(*id);
             }
         }
-        out
+        ids
     };
-    written.extend(rewrite_documents(
+    rewrite_documents(
         tx,
         vault,
         cipher,
@@ -4530,8 +4548,8 @@ fn rewrite_after_project_rekey(
         manifest_cipher,
         &elsewhere,
         None,
-    )?);
-    Ok(written)
+        out,
+    )
 }
 
 /// Rename a canonical project — a one-row identity update plus a frontmatter/cache rewrite of its
@@ -4540,7 +4558,7 @@ fn rewrite_after_project_rekey(
 pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> Result<()> {
     spawn_entity_mutation(
         app,
-        move |tx, vault, cipher, vault_root, manifest_cipher| {
+        move |tx, vault, cipher, vault_root, manifest_cipher, files| {
             // Capture the old canonical BEFORE the rename so we can re-key the name-keyed project
             // satellites (triage, milestones, activity, chats) onto the new name — otherwise the
             // renamed project silently loses all of them (F-05). Runs before the document rewrite,
@@ -4559,6 +4577,7 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
                 entity_id,
                 &canonical,
                 &members,
+                &mut files.written,
             )
         },
     )
@@ -4680,7 +4699,7 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
     }
     spawn_entity_mutation(
         app,
-        move |tx, vault, cipher, vault_root, manifest_cipher| {
+        move |tx, vault, cipher, vault_root, manifest_cipher, files| {
             let (from_id, into_id, _) = resolve_merge_pair(tx, &from, &into)?;
             // Identical ordering to `merge_entities`: capture the folded name BEFORE the entity
             // row dies, fold the entity, then re-key the name-keyed satellites onto the survivor.
@@ -4699,6 +4718,7 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
                 into_id,
                 &canonical,
                 &members,
+                &mut files.written,
             )
         },
     )
@@ -4821,11 +4841,10 @@ pub async fn delete_project(
     }
     spawn_entity_mutation(
         app,
-        move |tx, vault, cipher, vault_root, manifest_cipher| {
+        move |tx, vault, cipher, vault_root, manifest_cipher, out| {
             let (entity_id, canonical) = resolve_deletable_project(tx, &project)?;
             let unsorted_id = entities::resolve_project(tx, UNSORTED, true)?
                 .ok_or_else(|| Error::Other("could not resolve the Unsorted inbox".into()))?;
-            let mut out = MutationFiles::default();
             // Documents that survive and move; rewritten to their new name after the moves, so the
             // vault frontmatter and the DB never disagree about where a file is filed.
             let mut moved: Vec<i64> = Vec::new();
@@ -4839,17 +4858,24 @@ pub async fn delete_project(
             let linked_members = crate::tags::documents_tagged(tx, &canonical)?;
 
             // --- 1. CHATS ------------------------------------------------------------------
-            let conv_ids: Vec<i64> = {
-                let mut stmt = tx.prepare("SELECT id FROM conversations WHERE project = ?1")?;
-                let ids = stmt
-                    .query_map(params![canonical], |r| r.get(0))?
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                ids
-            };
+            //
+            // A chat belongs to this project by EITHER of two independent identities, and reaching
+            // it by only one strands it. `conversations.project` is the chat's SCOPE, set when the
+            // chat is started inside a project. `documents.entity_id` is where its transcript is
+            // FILED, which is what Review writes — a general chat is born unscoped and reviewable
+            // (chat_index.rs), so filing it into a project moves the document and leaves the
+            // conversation scope NULL, by design. Selecting on scope alone missed exactly those:
+            // the transcript survived step 3, step 4 rewrote it under its own (just-deleted) home
+            // and re-interned the tag, so the project came back — or, with the name freed, the
+            // surviving `documents.entity_id` tripped the FK at the end and the whole delete
+            // aborted with an opaque error.
+            let conv_ids = chat::conversations_in_project(tx, &canonical, entity_id)?;
             match chats {
                 ChatDisposition::Delete => {
                     for id in conv_ids {
-                        // The same cascade the per-chat delete uses, minus its transaction.
+                        // The same cascade the per-chat delete uses, minus its transaction. It
+                        // deletes the chat's `documents` row too, so the rewrite pass below skips
+                        // it — `rewrite_documents` looks each id up with `.optional()`.
                         if let Some(rel) = chat::delete_conversation_rows(tx, id)? {
                             out.unlink.push(vault.join(rel));
                         }
@@ -4857,11 +4883,14 @@ pub async fn delete_project(
                 }
                 ChatDisposition::Global => {
                     // A general chat is one with no project (`chat.rs` derives scope from exactly
-                    // this), so un-scoping is the whole move.
-                    tx.execute(
-                        "UPDATE conversations SET project = NULL WHERE project = ?1",
-                        params![canonical],
-                    )?;
+                    // this), so un-scoping is the whole move. By id, not by project name, so a chat
+                    // reached only through its filed transcript is un-scoped too.
+                    for id in &conv_ids {
+                        tx.execute(
+                            "UPDATE conversations SET project = NULL WHERE id = ?1",
+                            params![id],
+                        )?;
+                    }
                     // A chat is also a `documents` row; it follows its conversation to the inbox.
                     let mut stmt = tx.prepare(
                         "SELECT id FROM documents WHERE entity_id = ?1 AND source_type = 'chat'",
@@ -4942,7 +4971,7 @@ pub async fn delete_project(
             // to Unsorted. `linked_elsewhere` are documents homed in another project that merely
             // carried this one as an extra membership: they stay where they are (hence `None`), but
             // their files still name the dead project and must be rewritten too.
-            out.written = rewrite_documents(
+            rewrite_documents(
                 tx,
                 vault,
                 cipher,
@@ -4950,12 +4979,13 @@ pub async fn delete_project(
                 manifest_cipher,
                 &moved,
                 Some(UNSORTED),
+                &mut out.written,
             )?;
             let linked_elsewhere: Vec<i64> = linked_members
                 .into_iter()
                 .filter(|id| !moved.contains(id) && !deleted.contains(id))
                 .collect();
-            out.written.extend(rewrite_documents(
+            rewrite_documents(
                 tx,
                 vault,
                 cipher,
@@ -4963,7 +4993,8 @@ pub async fn delete_project(
                 manifest_cipher,
                 &linked_elsewhere,
                 None,
-            )?);
+                &mut out.written,
+            )?;
 
             // --- 5. Project-scoped preferences ---------------------------------------------
             // `preferences.entity_id` REFERENCES entities(id) ON DELETE CASCADE, and those records
@@ -4973,6 +5004,16 @@ pub async fn delete_project(
             // they stay listed in Teach.
             tx.execute(
                 "UPDATE preferences SET entity_id = NULL WHERE entity_id = ?1",
+                params![entity_id],
+            )?;
+            // `calendar_events.entity_id` is the third FK into `entities` and the only one with no
+            // ON DELETE action left unhandled. Nothing writes it yet (v18 added it as the
+            // correspondence slot), so this clears nothing today — but the `Free` arm below deletes
+            // the entity row, and the day that column gains a writer it would abort the whole
+            // delete with an opaque FK error. That is the exact failure the chat pointer above just
+            // caused; one line closes it in advance rather than after a user hits it.
+            tx.execute(
+                "UPDATE calendar_events SET entity_id = NULL WHERE entity_id = ?1",
                 params![entity_id],
             )?;
 
@@ -4995,7 +5036,7 @@ pub async fn delete_project(
                     tx.execute("DELETE FROM entities WHERE id = ?1", params![entity_id])?;
                 }
             }
-            Ok(out)
+            Ok(())
         },
     )
     .await
@@ -5008,7 +5049,7 @@ pub async fn delete_project(
 pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Result<()> {
     spawn_entity_mutation(
         app,
-        move |tx, vault, cipher, vault_root, manifest_cipher| {
+        move |tx, vault, cipher, vault_root, manifest_cipher, files| {
             // Capture the folded project's name BEFORE the merge deletes the source entity, then fold
             // its name-keyed satellites into the survivor's name (F-05). `rename_project_satellites`
             // keeps the survivor's own triage (INSERT OR IGNORE) and sums the daily rollup on collision.
@@ -5027,6 +5068,7 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
                 into_id,
                 &canonical,
                 &members,
+                &mut files.written,
             )
         },
     )

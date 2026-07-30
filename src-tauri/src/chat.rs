@@ -370,6 +370,36 @@ pub(crate) fn delete_conversation_inner(
 /// inside one entity-mutation transaction and unlinks their files together after the commit, for
 /// the same reason this function doesn't unlink: a leftover file is harmless and self-healing,
 /// whereas removing it before a failed commit strands a live session pointing at truth that's gone.
+/// Every conversation that belongs to a project, by EITHER of the two identities a chat has.
+///
+/// `conversations.project` is the chat's SCOPE — set when the chat is started inside a project, and
+/// what `chat.rs` derives retrieval scope from. `documents.entity_id` is where its transcript is
+/// FILED, which is what Review writes. They are deliberately allowed to differ: a general chat is
+/// born unscoped and reviewable, so filing its transcript into a project moves the document and
+/// leaves the conversation global.
+///
+/// Anything that disposes of a whole project has to reach BOTH, or a chat the user filed by hand is
+/// invisible to it: it survives the tag drop, gets rewritten under its own just-deleted home, and
+/// re-mints the project — or, with the name freed, its surviving `documents.entity_id` trips the
+/// `entities` foreign key and aborts the delete outright.
+pub(crate) fn conversations_in_project(
+    conn: &Connection,
+    canonical: &str,
+    entity_id: i64,
+) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM conversations WHERE project = ?1 \
+         UNION \
+         SELECT s.conversation_id FROM chat_sessions s \
+           JOIN documents d ON d.id = s.document_id \
+          WHERE d.entity_id = ?2",
+    )?;
+    let ids = stmt
+        .query_map(params![canonical, entity_id], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
 pub(crate) fn delete_conversation_rows(
     tx: &Connection,
     conversation_id: i64,
@@ -967,6 +997,59 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn a_chat_filed_into_a_project_is_reachable_even_though_its_scope_is_global() {
+        // The gap that made a project either undeletable or self-resurrecting: Review files a
+        // general chat by moving its `documents` row, and never touches `conversations.project`.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(dir.path());
+        // The store seeds the Unsorted inbox entity, so take whatever id this one lands on.
+        conn.execute(
+            "INSERT INTO entities(type, canonical_name) VALUES ('project', 'Atlas')",
+            [],
+        )
+        .unwrap();
+        let atlas = conn.last_insert_rowid();
+
+        // Chat A: started inside the project, so its SCOPE names it.
+        let scoped = new_conversation(&conn);
+        conn.execute(
+            "UPDATE conversations SET project = 'Atlas' WHERE id = ?1",
+            params![scoped],
+        )
+        .unwrap();
+
+        // Chat B: a general chat whose transcript the user later filed into the project from
+        // Review. Scope stays NULL — that is the design, not a bug — and only the document moves.
+        let filed = new_conversation(&conn);
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, project, tags, reviewed, \
+                                   source_type, entity_id) \
+             VALUES (9, 'chats/c.md', 'Chat', 'h', 'Atlas', '[]', 1, 'chat', ?1)",
+            params![atlas],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope, document_id) \
+             VALUES (?1, 'general', 9)",
+            params![filed],
+        )
+        .unwrap();
+
+        // Chat C: unrelated, and must not be swept up.
+        let other = new_conversation(&conn);
+
+        let mut found = conversations_in_project(&conn, "Atlas", atlas).unwrap();
+        found.sort();
+        let mut want = vec![scoped, filed];
+        want.sort();
+        assert_eq!(
+            found, want,
+            "a project's chats are the union of its scoped ones and its filed ones"
+        );
+        assert!(!found.contains(&other));
     }
 
     #[test]

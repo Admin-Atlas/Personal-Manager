@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.110.1-alpha",
+    date: "2026-07-30",
+    highlights: [
+      "Approving a file in Review no longer leaves it attached to the inbox it came from. Filing a document recorded the project it was moving out of as an extra project it still belonged to — written into the file itself, so it survived a re-index — which meant the Unsorted inbox slowly accumulated a link to every document you had ever approved. Nothing about this was visible on screen, so the only sign was the inbox looking oddly full in project pickers.",
+      "Renaming or merging a project now really retires the old name. The same underlying mistake meant every document the rename touched kept a link to the name you had just replaced, so it kept reappearing in pickers and tag suggestions and came back after a re-index. Both are fixed at the one place that derives which projects a document belongs to, so any future filing screen gets it right for free.",
+      "Deleting a project now finds chats you filed into it by hand. A chat you started generally and later filed into a project was reachable by neither half of the delete, so deleting that project either failed with an unhelpful error or reported success while the project quietly came back. It is now found the same way whether it was started in the project or filed into it afterwards.",
+      "If one of these bulk changes fails part-way, PM now puts every file it had already rewritten back the way it was, instead of leaving the files and the database disagreeing about where things are filed.",
+    ],
+  },
+  {
     version: "3.110.0-alpha",
     date: "2026-07-29",
     highlights: [

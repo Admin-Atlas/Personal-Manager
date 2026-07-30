@@ -5475,6 +5475,88 @@ mod tests {
     }
 
     #[test]
+    fn filing_an_unreviewed_document_does_not_link_it_to_the_inbox() {
+        // The co-signer for the `linked_projects` read-order fix, driven through the real seam in
+        // the exact order `commit_review` drives it: read the memberships, THEN write the truth
+        // (which is what moves `documents.project`). Asserting on the vault file rather than on the
+        // join is the point — the file is what a Rebuild believes, so a regression here is
+        // permanent rather than a cache that heals.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut conn = crate::db::open(&dir.path().join("t.sqlite"), key).unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let cipher = MarkdownCipher::plaintext("test-vault");
+        let manifest = crate::index_only::ManifestCipher::from_master("v", &[7u8; 32]);
+
+        let born = "---\ntitle: Receipt\nsource_path: \next: pdf\ncontent_hash: h\n\
+                    created_at: 2026-01-01\ningested_at: 2026-01-01\nproject: \"Unsorted\"\n\
+                    tags: []\nimportance: null\nlast_activity: 2026-01-01\nreviewed: false\n\
+                    ---\n\nBody.\n";
+        cipher.write_to(&vault.join("r.md"), born).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, project, tags, reviewed) \
+             VALUES (1, 'r.md', 'Receipt', 'h', 'Unsorted', '[]', 0)",
+            [],
+        )
+        .unwrap();
+        // Ingest interns the inbox as a real project tag, which is what made the old home visible
+        // to the membership union in the first place.
+        {
+            let tx = conn.transaction().unwrap();
+            crate::tags::set_document_projects(&tx, 1, "Unsorted", &[]).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Approve it into "Atlas" — the two lines `commit_review` runs, in its order.
+        {
+            let tx = conn.transaction().unwrap();
+            let linked = crate::tags::linked_projects(&tx, 1, "Atlas").unwrap();
+            write_document_truth(
+                &tx,
+                &vault,
+                &cipher,
+                1,
+                "Atlas",
+                &linked,
+                &[],
+                None,
+                true,
+                "2026-06-20",
+                dir.path(),
+                &manifest,
+                FilingActivity::Record,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let raw = cipher.read(&vault.join("r.md")).unwrap();
+        let (fields, _) = parse_frontmatter(&raw).unwrap();
+        assert_eq!(nullable(fields.get("project")).as_deref(), Some("Atlas"));
+        assert!(
+            linked_projects_from_fields(&fields, "Atlas").is_empty(),
+            "a document approved out of the inbox must not stay a member of it"
+        );
+        drop(fields);
+
+        // And the join agrees — the inbox tag is gone, not merely absent from the file.
+        let still: Vec<String> = {
+            let mut s = conn
+                .prepare(
+                    "SELECT t.name FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
+                     WHERE dt.document_id = 1 AND t.kind = 'project' ORDER BY t.name",
+                )
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(still, ["Atlas"]);
+    }
+
+    #[test]
     fn rewrite_vault_metadata_round_trips_project_membership() {
         // The INVARIANTS I-03 co-signer for the new key. `rewrite_vault_metadata` REBUILDS the file
         // from a fresh `Frontmatter`, so a key it does not re-emit is silently deleted by the next
