@@ -223,7 +223,10 @@ pub(crate) fn copy_tree_verified(src: &Path, dst: &Path) -> Result<()> {
 /// `entities.pmrules` and `index-only.pmindex` behind at the old root on every move, while the
 /// backup packer and the wipe both correctly treated them as vault members. Both are encrypted
 /// sidecars whose AAD binds the vault id and stem, not the path, so they survive a relocation.
-fn vault_sidecar_files(root: &Path) -> Vec<PathBuf> {
+///
+/// `pub(crate)` because the user-facing teardown ([`crate::wipe`]) is a fourth caller and was
+/// keeping its own copy of the list — which is exactly the drift this list exists to prevent.
+pub(crate) fn vault_sidecar_files(root: &Path) -> Vec<PathBuf> {
     vec![
         meta_path(root),
         // The linked-accounts sidecar travels with the vault so a link made before a move

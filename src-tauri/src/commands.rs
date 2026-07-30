@@ -259,6 +259,11 @@ pub struct VaultStatus {
     /// shared vault (no owner recorded); a shared vault stamped with an owner SID is owned only by its
     /// creator's account, so a joiner sees `false`. Lets the UI present connectors as owner-managed.
     pub is_owner: bool,
+    /// "This vault's settings file was altered outside PM", when the last open said so. The same
+    /// sentence `vault://meta-warning` carries — repeated here because the boot open happens before
+    /// any webview is listening, and because the condition now PERSISTS: a failed integrity check is
+    /// no longer re-signed away on the next launch.
+    pub meta_warning: Option<String>,
 }
 
 /// The joiner-facing record that a pointed shared vault was deleted by its owner (from the
@@ -298,7 +303,7 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
     let pointer = vault::pointer::load(&data_dir).ok().flatten();
     let resolved = vault::resolve_layout(&data_dir, pointer.as_ref());
     let meta = vault::load_meta(&resolved.vault_root).ok().flatten();
-    let (mode, markdown_encrypted, vault_id) = match &meta {
+    let (mode, meta_says_encrypted, vault_id) = match &meta {
         Some(m) => (
             m.key_mode,
             m.markdown.encryption != vault::MarkdownEncryption::None,
@@ -306,6 +311,14 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         ),
         None => (vault::KeyMode::Device, false, None),
     };
+    // Report the cipher that is actually WRITING, not the policy the file claims. The two can now
+    // disagree: `MarkdownCipher::from_meta` refuses to honour a metadata downgrade it can contradict,
+    // and a failed integrity check is no longer repaired on disk — so reading the claim here would
+    // tell the user their notes are in the clear at the exact moment PM is encrypting them.
+    let markdown_encrypted = state
+        .markdown_io()
+        .map(|(_, cipher)| cipher.encryption_on())
+        .unwrap_or(meta_says_encrypted);
     // A populated vault whose stored index was produced by a different retrieval config than
     // this build (a model/chunk/splitter change, or a pre-stamp vault) gets a one-time Rebuild
     // prompt. Only meaningful when the store is open and has documents.
@@ -358,6 +371,7 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         retired_root,
         deleted_notice,
         is_owner: meta.as_ref().map(vault::is_vault_owner).unwrap_or(true),
+        meta_warning: state.meta_warning(),
     })
 }
 
@@ -394,9 +408,10 @@ pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
     match vault::open_at_boot(&resolved, &meta) {
-        Ok(Some((conn, master))) => {
+        Ok(Some((conn, master, report))) => {
             // open_session clears the carried fault (the one healing choke point).
             state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+            state.note_meta_report(&report);
             // Re-engage the cooperative writer lock now the store is open again.
             lock_session::engage(&app)?;
             Ok(())
@@ -630,7 +645,12 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<VaultOpOutcome
 
 /// Surface a non-blocking warning to the UI when the vault meta was repaired on open (M-3): a
 /// silently-downgraded Markdown-encryption policy that PM forced back on, or a failed integrity check.
-fn emit_vault_meta_warning(app: &AppHandle, report: &vault::MetaAuthReport) {
+///
+/// Also parks it in [`AppState::meta_warning`], so the notice survives a dismissal-by-reload and so
+/// the boot path — which has no webview listening yet — can report the same condition through
+/// `vault_status` instead of stderr.
+fn emit_vault_meta_warning(app: &AppHandle, state: &AppState, report: &vault::MetaAuthReport) {
+    state.note_meta_report(report);
     if let Some(msg) = report.warning() {
         let _ = app.emit("vault://meta-warning", msg);
     }
@@ -669,7 +689,7 @@ pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: Stri
     // Now that the store is open, engage the cooperative writer lock for this vault.
     lock_session::engage(&app)?;
     // M-3: if the meta was repaired on open, tell the user (non-blocking).
-    emit_vault_meta_warning(&app, &meta_report);
+    emit_vault_meta_warning(&app, &state, &meta_report);
     if let Some(msg) = cache_warning {
         let _ = app.emit("vault://meta-warning", msg);
     }
@@ -964,7 +984,7 @@ pub fn adopt_shared_vault(
         }
     }
     // M-3: if the meta was repaired on open, tell the user (non-blocking).
-    emit_vault_meta_warning(&app, &meta_report);
+    emit_vault_meta_warning(&app, &state, &meta_report);
     Ok(AdoptOutcome {
         active_writer: lock_session::status(&app).active,
         warnings,
@@ -990,8 +1010,11 @@ pub fn detach_from_shared_vault(app: AppHandle, state: State<'_, AppState>) -> R
     state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
     let meta = vault::ensure_device_meta(&resolved.vault_root)?;
-    if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+    // A different vault from here on, so anything the old one was warning about no longer applies.
+    state.clear_meta_warning();
+    if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &meta)? {
         state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+        state.note_meta_report(&report);
     }
     lock_session::engage(&app)?;
     Ok(())
@@ -1020,8 +1043,11 @@ pub fn acknowledge_deleted_shared_vault(app: AppHandle, state: State<'_, AppStat
     state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
     let meta = vault::ensure_device_meta(&resolved.vault_root)?;
-    if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+    // A different vault from here on, so anything the old one was warning about no longer applies.
+    state.clear_meta_warning();
+    if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &meta)? {
         state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+        state.note_meta_report(&report);
     }
     lock_session::engage(&app)?;
     Ok(())
@@ -1095,8 +1121,11 @@ pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result
     state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
     let local_meta = vault::ensure_device_meta(&resolved.vault_root)?;
-    if let Some((conn, master)) = vault::open_at_boot(&resolved, &local_meta)? {
+    // A different vault from here on, so anything the old one was warning about no longer applies.
+    state.clear_meta_warning();
+    if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &local_meta)? {
         state.open_session(conn, VaultRuntime::build(&resolved, &local_meta, &master))?;
+        state.note_meta_report(&report);
     }
     engage_or_warn(&app, &mut warnings);
     Ok(VaultOpOutcome { warnings })
@@ -1206,9 +1235,10 @@ pub fn repair_vault_access(app: AppHandle, state: State<'_, AppState>) -> Result
             db_path: root.join("pm.sqlite"),
             markdown_dir: root.join("vault"),
         };
-        if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+        if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &meta)? {
             // open_session clears the carried fault (the one healing choke point).
             state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+            state.note_meta_report(&report);
             reopened = true;
         } else {
             state.set_vault_fault(None);
@@ -8724,10 +8754,65 @@ pub async fn restore_local_backup(
 /// by `restore_local_backup` into this device's keychain (`vault_key::<id>`), then opens.
 /// Works for a device-source vault too — no passphrase is needed because the restore
 /// recovered the key.
+/// Whether an open store holds anything the user put there — the test standing between a restore and
+/// [`crate::vault::migrate::delete_vault_artifacts`], so it errs towards "yes" at every step.
+///
+/// `documents` alone used to answer this, which quietly equated "nothing indexed" with "nothing here".
+/// A vault can hold projects, milestones, flags, teachings, chats, connected calendars and connector
+/// accounts before a single file is imported, and all of it was invisible to that question.
+///
+/// Three tables carry migration-seeded rows on EVERY vault, so they are matched by VALUE and never by
+/// "any row" — `settings` and `entities`/`entity_aliases` (migrations.rs `INSERT OR IGNORE` of the
+/// embedder defaults and of the `Unsorted` inbox), plus the keys ordinary boot writes with no user
+/// action at all. Get that wrong in the other direction and re-homing silently never happens again.
+/// Document-derived tables (chunks, tags, layout, proposals, activity) are left out: they cannot be
+/// non-empty while `documents` is empty, so they would only add ways to be wrong.
+fn db_holds_user_data(conn: &rusqlite::Connection) -> bool {
+    // Each on its own row so a failure is per-question, and every failure counts as "yes".
+    const ANY_ROW: &[&str] = &[
+        "documents",
+        "projects",
+        "project_milestones",
+        "flags",
+        "preferences",
+        "connector_sources",
+        "calendars",
+        "calendar_events",
+        "conversations",
+        "chat_sessions",
+    ];
+    for table in ANY_ROW {
+        let q = format!("SELECT EXISTS(SELECT 1 FROM {table})");
+        if conn
+            .query_row(&q, [], |r| r.get::<_, bool>(0))
+            .unwrap_or(true)
+        {
+            return true;
+        }
+    }
+    // The seeded inbox is not user intent; a renamed or merged entity is.
+    let entities = "SELECT EXISTS(SELECT 1 FROM entities \
+                      WHERE NOT (type = 'project' AND canonical_name = 'Unsorted'))";
+    // The pinboard is the one intent that lives ONLY in `settings`. Matched by key rather than by an
+    // exclusion list, because boot writes at least five keys of its own and that list would rot.
+    let pinboard = "SELECT EXISTS(SELECT 1 FROM settings \
+                      WHERE key = 'pinboard' AND trim(COALESCE(value, '')) <> '')";
+    for q in [entities, pinboard] {
+        if conn
+            .query_row(q, [], |r| r.get::<_, bool>(0))
+            .unwrap_or(true)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether this profile's DEFAULT home slot holds only a pristine (empty, device-mode) vault — the one
 /// case where re-homing a restored vault may replace it. A missing vault (free slot), a passphrase
-/// (shareable) home vault, one PM can't open/inspect, or one that already holds any documents ALL read
-/// as NOT pristine, so a restore never clobbers real data — it falls back to running from its folder.
+/// (shareable) home vault, one PM can't open/inspect, or one that already holds any of the user's own
+/// work ([`db_holds_user_data`]) ALL read as NOT pristine, so a restore never clobbers real data — it
+/// falls back to running from its folder.
 fn home_is_pristine(data_dir: &std::path::Path) -> Result<bool> {
     let Some(meta) = vault::load_meta(data_dir)? else {
         return Ok(true); // no vault at the default location → the slot is free
@@ -8741,10 +8826,7 @@ fn home_is_pristine(data_dir: &std::path::Path) -> Result<bool> {
     let Ok(conn) = crate::db::open(&data_dir.join("pm.sqlite"), key.expose()) else {
         return Ok(false); // unreadable → treat as real, never clobber
     };
-    let has_docs: bool = conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))
-        .unwrap_or(true); // on any query error, assume not-pristine
-    Ok(!has_docs)
+    Ok(!db_holds_user_data(&conn))
 }
 
 /// Reconcile a just-activated restored vault to THIS machine (blocking; runs off the async thread).
@@ -8868,12 +8950,15 @@ pub async fn switch_to_vault(
         markdown_dir: root.join("vault"),
         vault_root: root.clone(),
     };
-    let (conn, master) = vault::open_at_boot(&resolved, &meta)?.ok_or_else(|| {
+    let (conn, master, report) = vault::open_at_boot(&resolved, &meta)?.ok_or_else(|| {
         Error::Other(
             "this vault's key isn't available on this device; restore it from a backup first"
                 .into(),
         )
     })?;
+    // A different vault from here on, so the previous one's tamper notice no longer applies.
+    state.clear_meta_warning();
+    state.note_meta_report(&report);
     let runtime = VaultRuntime::build(&resolved, &meta, &master);
     // Point this profile here, then install the new session — `attach_profile_here`
     // stores the pointer first (the next launch reads it), and `open_session` swaps
@@ -10270,6 +10355,86 @@ mod tests {
         let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let conn = db::open(&path, key).unwrap();
         (dir, conn)
+    }
+
+    /// The predicate standing between a restore and an unbacked-up `delete_vault_artifacts`, and the
+    /// two ways it can be wrong. Reading `documents` alone missed everything a user can build before
+    /// importing a file; reading "any row" in the widened tables would be worse still — the migration
+    /// seeds make it permanently false, so re-homing would silently never happen again.
+    #[test]
+    fn a_vault_is_only_pristine_when_the_user_has_put_nothing_in_it() {
+        let (_dir, conn) = temp_db();
+        assert!(
+            !db_holds_user_data(&conn),
+            "a freshly migrated store is empty despite the seeded embedder settings, the Unsorted \
+             inbox and its self-alias"
+        );
+
+        // One case per table, each on its own store, so nothing rides on another's rows. Foreign
+        // keys are off for the duration: `project_milestones` would otherwise need a `projects` row
+        // that already answers the question on its own, and the point is to prove each table is in
+        // the predicate independently.
+        let cases: &[(&str, &str)] = &[
+            (
+                "documents",
+                "INSERT INTO documents(vault_path, title, content_hash) VALUES ('a.md', 't', 'h')",
+            ),
+            ("projects", "INSERT INTO projects(name) VALUES ('Atlas')"),
+            (
+                "project_milestones",
+                "INSERT INTO project_milestones(project_name, label, due_date) \
+                 VALUES ('Atlas', 'pitch', '2026-08-01')",
+            ),
+            (
+                "flags",
+                "INSERT INTO flags(anchor_kind, anchor, type) VALUES ('milestone', '1', 'overdue')",
+            ),
+            (
+                "preferences",
+                "INSERT INTO preferences(scope, value) VALUES ('global', 'strong tea')",
+            ),
+            (
+                "connector_sources",
+                "INSERT INTO connector_sources(id, provider, service, label) \
+                 VALUES ('gdrive:a@b.c', 'google', 'drive', 'a@b.c')",
+            ),
+            (
+                "conversations",
+                "INSERT INTO conversations(title) VALUES ('chat')",
+            ),
+            (
+                "entities beyond the seeded inbox",
+                "INSERT INTO entities(type, canonical_name) VALUES ('person', 'Ramit')",
+            ),
+            (
+                "the pinboard, which lives only in settings",
+                "INSERT OR REPLACE INTO settings(key, value) VALUES ('pinboard', '- a note')",
+            ),
+        ];
+        for (what, sql) in cases {
+            let (_d, c) = temp_db();
+            c.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            // A schema drift would make this INSERT fail and the case vacuously pass, so assert it.
+            c.execute(sql, []).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(db_holds_user_data(&c), "{what} is the user's own work");
+        }
+
+        // And the carve-outs really are carve-outs: writing the seeded rows again changes nothing.
+        let (_d, c) = temp_db();
+        c.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES ('embedding_model', 'x')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR IGNORE INTO entities(type, canonical_name) VALUES ('project', 'Unsorted')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !db_holds_user_data(&c),
+            "boot-written settings and the seeded inbox are not user intent"
+        );
     }
 
     /// Cost is ROW-ADDITIVE: a model's real reported spend always shows, with an estimate filling in

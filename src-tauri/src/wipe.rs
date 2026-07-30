@@ -281,13 +281,14 @@ fn remove_db_files_retrying(db_path: &Path) -> bool {
 /// file is confirmed gone first; shared by the wipe and the boot-error "start fresh" recovery.
 fn remove_vault_artifacts(resolved: &vault::ResolvedVault, data_dir: &Path) -> u64 {
     let mut freed = 0u64;
-    let _ = std::fs::remove_file(resolved.vault_root.join(vault::META_FILENAME));
-    let _ = std::fs::remove_file(resolved.vault_root.join(crate::entities::RULES_FILENAME));
-    let _ = std::fs::remove_file(
-        resolved
-            .vault_root
-            .join(crate::index_only::MANIFEST_FILENAME),
-    );
+    // One enumeration, shared with the migration's copy + delete. Naming the files here by hand had
+    // already drifted: `vault-access.json` — the list of OS accounts linked to a shared vault, i.e.
+    // account names — was in `vault_sidecar_files` and not in this list, so it survived "Remove PM
+    // data". A file the erase forgets is also a file that keeps `remove_empty_dir_retrying` below
+    // from ever succeeding, which is how the same class of bug bit the shared-vault delete.
+    for file in vault::migrate::vault_sidecar_files(&resolved.vault_root) {
+        let _ = std::fs::remove_file(file);
+    }
     let _ = vault::lock::clear_baton_files(&resolved.vault_root);
     let _ = vault::migrate::clear_journal(data_dir);
     let migration_backup = vault::migrate::backup_dir(data_dir);
@@ -574,8 +575,11 @@ pub async fn wipe_pm_data(
         // pointers, staging, journal + backup. The shared folder is left untouched; deleting
         // it for everyone is a deliberate, separately-confirmed action, never a side effect.
         // (Mirrors the reset_after_open_error guard below, which predates this one.)
-        let pointed = vault::pointer::load(&data_dir).ok().flatten().is_some();
-        let resolved = if pointed {
+        let pointed = vault::pointer::load(&data_dir)
+            .ok()
+            .flatten()
+            .map(|p| p.vault_root);
+        let resolved = if pointed.is_some() {
             let _ = state.take_conn();
             let _ = state.clear_vault_runtime();
             vault::resolve_layout(&data_dir, None)
@@ -607,10 +611,18 @@ pub async fn wipe_pm_data(
         // The DB file is confirmed gone; now the rest of the vault artifacts.
         report.freed_bytes += remove_vault_artifacts(&resolved, &data_dir);
 
-        report.removed.push(if pointed {
-            "This account's PM data (the shared vault folder was left untouched)".into()
-        } else {
-            "Vault & encrypted database".into()
+        // Name the folder rather than calling it "the shared vault folder". The pointer is written by
+        // BOTH doors — joining someone else's vault AND moving your own — and carries no record of
+        // which, so the old wording told a user who had simply moved their vault to D:\ that a folder
+        // full of their own notes was somebody else's. Naming the path is true either way, and it is
+        // the only way they learn those files are still there while their key is being deleted below.
+        report.removed.push(match &pointed {
+            Some(root) => format!(
+                "This account's PM data. Your vault itself is in {} — that folder is outside PM \
+                 and has been left exactly as it is, so delete it yourself if you want it gone",
+                root.display()
+            ),
+            None => "Vault & encrypted database".into(),
         });
         report.quit_required = true;
     }
@@ -1100,6 +1112,33 @@ mod tests {
             "could not read the database file (disk I/O error): some os error"
         ));
         assert!(!is_genuine_brick(""));
+    }
+
+    #[test]
+    fn the_erase_removes_every_file_the_vault_list_names() {
+        // The wipe's artifact list used to be typed out by hand beside `vault_sidecar_files`, and had
+        // already drifted: `vault-access.json` — the OS accounts linked to a shared vault — was in
+        // that list and not in this one, so "Remove PM data" left it behind. Driving both from one
+        // enumeration is the fix; this asserts the outcome rather than the mechanism, so a file added
+        // to the list later is covered without anyone remembering to come back here.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        for file in vault::migrate::vault_sidecar_files(&root) {
+            std::fs::write(&file, b"x").unwrap();
+        }
+        std::fs::write(root.join("vault").join("note.md"), b"# note").unwrap();
+        let unrelated = root.join("taxes-2025.xlsx");
+        std::fs::write(&unrelated, b"not PM's to delete").unwrap();
+
+        let resolved = vault::resolve_layout(&root, None);
+        remove_vault_artifacts(&resolved, &root);
+
+        for file in vault::migrate::vault_sidecar_files(&root) {
+            assert!(!file.exists(), "{} survived the erase", file.display());
+        }
+        assert!(!root.join("vault").exists(), "the Markdown tree goes too");
+        assert!(unrelated.exists(), "and nothing that isn't PM's is touched");
     }
 
     // --- F-03: a relocated vault's user-chosen root must never be deleted wholesale ---

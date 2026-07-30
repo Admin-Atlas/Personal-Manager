@@ -92,8 +92,9 @@ fn reopen_store(app: &AppHandle) -> Result<()> {
     let Some(meta) = vault::load_meta(&resolved.vault_root)? else {
         return Ok(());
     };
-    if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+    if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &meta)? {
         state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+        state.note_meta_report(&report);
     }
     Ok(())
 }

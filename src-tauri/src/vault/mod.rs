@@ -240,6 +240,49 @@ pub fn meta_path(vault_root: &Path) -> PathBuf {
     vault_root.join(META_FILENAME)
 }
 
+/// Serial number making concurrent temp names unique within a process, so two writers aiming at the
+/// same target can never adopt each other's half-written file.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `bytes` to `path` atomically: into a sibling temp file, flushed to disk, then renamed over
+/// the target. An interrupted write then leaves either the old file or the new one, never a
+/// truncated one — which matters more here than anywhere else in the app, because
+/// [`crypto::decrypt`] authenticates the WHOLE container: a half-written encrypted file is not a
+/// partial document, it is a permanently unreadable one.
+///
+/// The temp file is a sibling so the rename stays within one volume (where it is atomic, and can't
+/// silently degrade to a copy), and carries a `.tmp` suffix, which the vault walks already ignore.
+/// It is created with `File::create` rather than through `tempfile`, so the file keeps the process
+/// umask's permissions exactly as `fs::write` gave it — a shared vault's folder may be read by
+/// another account, and `tempfile`'s 0600 would lock them out.
+///
+/// Returns the raw [`std::io::Error`] so each caller can keep its own path-bearing classification.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{seq}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
+
+    let write = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        // Without this the rename can land before the data does, turning a crash into an empty
+        // file that reads as authentic — the exact failure the temp file exists to prevent.
+        file.sync_all()
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Read `vault-meta.json` if present. `None` means no metadata yet (a brand-new
 /// vault folder); shipping before any user data exists, that's the only no-meta case.
 pub fn load_meta(vault_root: &Path) -> Result<Option<VaultMeta>> {
@@ -257,16 +300,14 @@ pub fn load_meta(vault_root: &Path) -> Result<Option<VaultMeta>> {
     }
 }
 
-/// Write `vault-meta.json` atomically (temp file in the same dir, then rename), so a
-/// crash mid-write can never leave a half-written metadata file.
+/// Write `vault-meta.json` atomically (see [`write_atomic`]), so a crash mid-write can never leave
+/// a half-written metadata file.
 pub fn store_meta(vault_root: &Path, meta: &VaultMeta) -> Result<()> {
     std::fs::create_dir_all(vault_root).map_err(io_at("write the vault's settings", vault_root))?;
     let path = meta_path(vault_root);
     let json = serde_json::to_vec_pretty(meta)
         .map_err(|e| Error::Other(format!("could not encode {META_FILENAME}: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).map_err(io_at("write the vault's settings", &path))?;
-    std::fs::rename(&tmp, &path).map_err(io_at("write the vault's settings", &path))?;
+    write_atomic(&path, &json).map_err(io_at("write the vault's settings", &path))?;
     Ok(())
 }
 
@@ -340,18 +381,24 @@ impl MetaAuthReport {
     }
 
     /// A short, user-facing warning line, or `None` when there is nothing to report.
+    ///
+    /// A MAC mismatch is reported ahead of a downgrade repair, not behind it: on that path the
+    /// repair is applied in memory only, so the older "PM has turned it back on" wording would
+    /// promise a durable fix that deliberately did not happen.
     pub fn warning(&self) -> Option<String> {
-        if self.downgrade_corrected {
+        if self.mac_mismatch {
+            Some(
+                "This vault's settings file failed its integrity check — it was altered outside \
+                 PM. PM has ignored the change and kept your notes encrypted, and will keep saying \
+                 so until the file is replaced. If you didn't change it, check who can reach the \
+                 vault folder."
+                    .into(),
+            )
+        } else if self.downgrade_corrected {
             Some(
                 "This vault's \"encrypt notes at rest\" setting had been switched off outside PM. \
                  PM has turned it back on, so your notes stay encrypted. If you didn't change it, \
                  check who can reach the vault folder."
-                    .into(),
-            )
-        } else if self.mac_mismatch {
-            Some(
-                "This vault's metadata failed its integrity check — it was altered outside PM. \
-                 PM has re-secured it. If you didn't change it, check who can reach the vault folder."
                     .into(),
             )
         } else {
@@ -375,14 +422,40 @@ fn meta_mac(meta: &VaultMeta, master: &[u8; KEY_LEN]) -> Result<blake3::Hash> {
     Ok(blake3::keyed_hash(&subkey, &bytes))
 }
 
+/// Whether this vault is a passphrase (shareable) vault by EVIDENCE rather than by claim.
+///
+/// `key_mode` is one word in `vault-meta.json`, a file that a shared vault deliberately exposes to
+/// other accounts — so it is exactly the field to flip to turn Markdown encryption off, and on its
+/// own it proves nothing. Two other markers of a passphrase vault are harder to forge and costlier
+/// to remove: the Argon2id block, without which the owner can no longer unlock this vault from any
+/// profile at all, and a verifier only the real master can satisfy. Any one of the three is enough,
+/// because the answer can only ever move protection UP: a genuine device vault carries none of them
+/// and is left exactly as it was.
+fn is_shareable(meta: &VaultMeta, master: &[u8; KEY_LEN]) -> bool {
+    meta.key_mode == KeyMode::Passphrase
+        || meta.kdf.is_some()
+        // A verifier that won't parse counts as present: "can't tell" resolves towards encrypting.
+        || meta
+            .verifier
+            .as_ref()
+            .is_some_and(|v| verifier::check(v, master).unwrap_or(true))
+}
+
 /// Authenticate the non-secret `vault-meta.json` against a keyed MAC under a master subkey, and repair a
 /// silently-downgraded Markdown policy (M-3). `master` MUST already be authenticated by the caller (the
 /// DB opened, or the passphrase verifier passed) — this is the first point where that trust exists.
 ///
 /// Additive + backward-compatible: a legacy vault with no stored MAC is stamped on this first
-/// authenticated open, and enforced thereafter. On any repair the corrected meta is persisted so the
-/// on-disk file is durably safe. Never hard-fails — the master is trusted, so we correct-and-continue
-/// rather than lock the user out of their own data. The returned report drives a non-blocking warning.
+/// authenticated open, and enforced thereafter. Never hard-fails — the master is trusted, so we
+/// correct-and-continue rather than lock the user out of their own data. The returned report drives
+/// a non-blocking warning.
+///
+/// **A failed MAC is never re-stamped.** This used to write a fresh, valid MAC over whatever it
+/// found, which made an edit made outside PM the new authenticated truth and cleared the warning
+/// after a single launch. Verification failing is precisely when the file's contents are not ours to
+/// sign, so the repair below is applied in memory (where [`from_meta`](MarkdownCipher::from_meta)
+/// keeps the live cipher safe) and the file is left as found, mismatch and all, to be reported on
+/// every open until it is legitimately rewritten.
 pub fn authenticate_meta(
     vault_root: &Path,
     meta: &VaultMeta,
@@ -398,18 +471,22 @@ pub fn authenticate_meta(
             report.mac_mismatch = true;
         }
     }
-    // Repair a copy we can persist; the live cipher is already forced safe by `from_meta`.
+    // Repair a copy we can persist; the live cipher is already forced safe by `from_meta`. The
+    // trigger is `is_shareable`, not `key_mode` alone, so flipping that one word to `device` no
+    // longer takes the whole Markdown policy with it.
     let mut fixed = meta.clone();
-    if fixed.key_mode == KeyMode::Passphrase
-        && fixed.markdown.encryption == MarkdownEncryption::None
+    if is_shareable(meta, master)
+        && (fixed.key_mode != KeyMode::Passphrase
+            || fixed.markdown.encryption == MarkdownEncryption::None)
     {
+        fixed.key_mode = KeyMode::Passphrase;
         fixed.markdown.encryption = MarkdownEncryption::XChaCha20Poly1305;
         fixed.markdown.subkey = MARKDOWN_SUBKEY_SCHEME.to_string();
         report.downgrade_corrected = true;
     }
-    // Stamp a legacy vault, or re-secure after a downgrade / tamper. A clean, already-stamped vault is
-    // a pure verify with no write.
-    if legacy || report.downgrade_corrected || report.mac_mismatch {
+    // Stamp a legacy vault, or persist a downgrade repair. A clean, already-stamped vault is a pure
+    // verify with no write — and so, now, is a tampered one.
+    if !report.mac_mismatch && (legacy || report.downgrade_corrected) {
         fixed.meta_mac = Some(meta_mac(&fixed, master)?.to_hex().to_string());
         store_meta(vault_root, &fixed)?;
     }
@@ -564,9 +641,14 @@ impl MarkdownCipher {
         // by other accounts, so plaintext there is a confidentiality downgrade. Enforce the invariant at
         // the point of use, regardless of what `vault-meta.json` claims, so a tampered `encryption:none`
         // can never turn new notes into cleartext — even on the same open that repairs the meta.
-        let encryption = match meta.key_mode {
-            KeyMode::Passphrase => MarkdownEncryption::XChaCha20Poly1305,
-            KeyMode::Device => meta.markdown.encryption,
+        //
+        // The claim to distrust is `key_mode` as much as `encryption`: reading the mode straight off
+        // the file left the enforcement resting on the one field an edit would target first, so this
+        // asks [`is_shareable`] instead, which wants evidence the master can corroborate.
+        let encryption = if is_shareable(meta, master) {
+            MarkdownEncryption::XChaCha20Poly1305
+        } else {
+            meta.markdown.encryption
         };
         let subkey = match encryption {
             MarkdownEncryption::None => None,
@@ -701,10 +783,12 @@ impl MarkdownCipher {
         }
     }
 
-    /// Encode + write a Markdown file to `path` per policy.
+    /// Encode + write a Markdown file to `path` per policy, atomically (see [`write_atomic`]) —
+    /// this and [`write_bytes_to`](Self::write_bytes_to) are the only writers of vault content, so
+    /// they are where a crash would otherwise cost the user a whole note or transcript.
     pub fn write_to(&self, path: &Path, content: &str) -> Result<()> {
         let bytes = self.encode_for(path, content)?;
-        std::fs::write(path, bytes)?;
+        write_atomic(path, &bytes)?;
         Ok(())
     }
 
@@ -723,10 +807,11 @@ impl MarkdownCipher {
         }
     }
 
-    /// Encode + write arbitrary bytes to `path` per policy (see [`encode_bytes_for`](Self::encode_bytes_for)).
+    /// Encode + write arbitrary bytes to `path` per policy (see
+    /// [`encode_bytes_for`](Self::encode_bytes_for)), atomically (see [`write_atomic`]).
     pub fn write_bytes_to(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let out = self.encode_bytes_for(path, bytes)?;
-        std::fs::write(path, out)?;
+        write_atomic(path, &out)?;
         Ok(())
     }
 }
@@ -862,14 +947,19 @@ pub fn current_db_key(meta: &VaultMeta) -> Result<Option<Secret>> {
     )
 }
 
+/// What a successful open yields: the store, the resolved 32-byte master the session runtime is
+/// built from, and what authenticating the metadata found.
+pub type BootOpen = (Connection, Zeroizing<[u8; KEY_LEN]>, MetaAuthReport);
+
 /// Decide how to open a vault at boot from its metadata, via [`current_db_key`]. On
 /// success also returns the resolved 32-byte master, from which the caller builds the
 /// session runtime (the Markdown cipher *and* the always-on rules cipher are both
-/// subkeys of it).
-pub fn open_at_boot(
-    resolved: &ResolvedVault,
-    meta: &VaultMeta,
-) -> Result<Option<(Connection, Zeroizing<[u8; KEY_LEN]>)>> {
+/// subkeys of it), and the meta authentication report.
+///
+/// The report is returned rather than only logged because boot is the one open path with no UI in
+/// front of it: `unlock_vault` and `adopt_shared_vault` hand theirs to the user, and a vault that
+/// comes up on a cached key used to have nowhere to say the same thing but stderr.
+pub fn open_at_boot(resolved: &ResolvedVault, meta: &VaultMeta) -> Result<Option<BootOpen>> {
     let key = match current_db_key(meta)? {
         Some(key) => key,
         None => return Ok(None),
@@ -914,8 +1004,8 @@ pub fn open_at_boot(
                 if let Ok(conn) = db::open(&resolved.db_path, device_key.expose()) {
                     secrets::clear_cached_vault_key(&meta.vault_id)?;
                     let master = master_from_db_key_hex(device_key.expose())?;
-                    log_meta_auth(&resolved.vault_root, meta, &master);
-                    return Ok(Some((conn, master)));
+                    let report = log_meta_auth(&resolved.vault_root, meta, &master);
+                    return Ok(Some((conn, master, report)));
                 }
             }
             // No recovery applied, or the device key didn't open it either — the original
@@ -924,21 +1014,28 @@ pub fn open_at_boot(
         }
     };
     let master = master_from_db_key_hex(key.expose())?;
-    log_meta_auth(&resolved.vault_root, meta, &master);
-    Ok(Some((conn, master)))
+    let report = log_meta_auth(&resolved.vault_root, meta, &master);
+    Ok(Some((conn, master, report)))
 }
 
-/// Authenticate + repair the meta on the boot/reopen path, logging a warning (there is no UI at boot).
+/// Authenticate + repair the meta on the boot/reopen path, logging a warning and handing the report
+/// back so the caller can put it somewhere the user will actually look.
 /// Best-effort: an authentication or persist failure must not abort opening a vault the master already
 /// unlocked, so it is logged rather than propagated (the live cipher is safe regardless, via `from_meta`).
-fn log_meta_auth(vault_root: &Path, meta: &VaultMeta, master: &[u8; KEY_LEN]) {
+/// Such a failure reports a clean slate — it means we could not establish anything, not that anything
+/// is wrong.
+fn log_meta_auth(vault_root: &Path, meta: &VaultMeta, master: &[u8; KEY_LEN]) -> MetaAuthReport {
     match authenticate_meta(vault_root, meta, master) {
         Ok(report) => {
             if let Some(w) = report.warning() {
                 eprintln!("vault: {w}");
             }
+            report
         }
-        Err(e) => eprintln!("vault: meta authentication could not complete: {e}"),
+        Err(e) => {
+            eprintln!("vault: meta authentication could not complete: {e}");
+            MetaAuthReport::default()
+        }
     }
 }
 
@@ -1332,6 +1429,7 @@ mod tests {
         // Tamper the on-disk meta: flip Markdown encryption off, leaving the now-stale MAC in place.
         let mut downgraded = stamped.clone();
         downgraded.markdown.encryption = MarkdownEncryption::None;
+        store_meta(dir.path(), &downgraded).unwrap();
         let r3 = authenticate_meta(dir.path(), &downgraded, &master).unwrap();
         assert!(r3.downgrade_corrected, "the plaintext downgrade is caught");
         assert!(
@@ -1339,14 +1437,87 @@ mod tests {
             "the stale MAC no longer matches the tampered fields"
         );
 
-        // The persisted meta is re-secured: encryption forced back on and a fresh, valid MAC.
-        let repaired = load_meta(dir.path()).unwrap().unwrap();
+        // ...and the file is left exactly as it was found. This USED to re-stamp the tampered meta
+        // with a fresh, valid MAC, which made the edit authentic and silenced the warning after one
+        // launch. Verification failing is the one moment these bytes are not ours to sign.
+        let after = load_meta(dir.path()).unwrap().unwrap();
         assert_eq!(
-            repaired.markdown.encryption,
-            MarkdownEncryption::XChaCha20Poly1305
+            after.markdown.encryption,
+            MarkdownEncryption::None,
+            "a failed MAC is never re-signed, so the tampered file stays as found"
         );
-        let r4 = authenticate_meta(dir.path(), &repaired, &master).unwrap();
-        assert!(!r4.needs_warning(), "the re-secured meta verifies cleanly");
+        assert_eq!(after.meta_mac, stamped.meta_mac, "the stale MAC is kept");
+        let r4 = authenticate_meta(dir.path(), &after, &master).unwrap();
+        assert!(
+            r4.mac_mismatch && r4.needs_warning(),
+            "and it keeps reporting on every open, not just the first"
+        );
+    }
+
+    #[test]
+    fn flipping_key_mode_to_device_cannot_turn_markdown_encryption_off() {
+        // The reported shape: an account that can write the vault FOLDER but has no passphrase edits
+        // two words of `vault-meta.json` — `key_mode: device` and `encryption: none`. The owner's
+        // next launch opens from its cached key, and every note written after that would land in
+        // cleartext in a folder that account can read.
+        let dir = tempfile::tempdir().unwrap();
+        let (meta, master) = build_passphrase_meta("pw", cheap_params()).unwrap();
+        store_meta(dir.path(), &meta).unwrap();
+        authenticate_meta(dir.path(), &meta, &master).unwrap();
+        let stamped = load_meta(dir.path()).unwrap().unwrap();
+
+        let mut tampered = stamped.clone();
+        tampered.key_mode = KeyMode::Device;
+        tampered.markdown.encryption = MarkdownEncryption::None;
+
+        // The live cipher is the thing that matters: it decides what the next write looks like.
+        let cipher = MarkdownCipher::from_meta(&tampered, &master);
+        assert!(
+            cipher.encryption_on() && cipher.subkey.is_some(),
+            "a vault that still carries its passphrase artefacts keeps encrypting, whatever the \
+             file claims about its mode"
+        );
+
+        let report = authenticate_meta(dir.path(), &tampered, &master).unwrap();
+        assert!(report.mac_mismatch, "and the edit is reported");
+        assert!(
+            report.downgrade_corrected,
+            "the repair now covers key_mode too, not only the encryption field"
+        );
+
+        // Stripping the MAC line is not a way around it either: that path skips verification
+        // entirely and used to bless whatever it found, silently.
+        let mut stripped = tampered.clone();
+        stripped.meta_mac = None;
+        assert!(MarkdownCipher::from_meta(&stripped, &master).encryption_on());
+        let report = authenticate_meta(dir.path(), &stripped, &master).unwrap();
+        assert!(
+            report.downgrade_corrected,
+            "an unstamped downgrade is still caught and still warned about"
+        );
+    }
+
+    #[test]
+    fn a_genuine_device_vault_is_left_plaintext() {
+        // The other half of the invariant: `is_shareable` must not sweep up an ordinary device
+        // vault, whose Markdown is plaintext by design. It carries no kdf and no verifier.
+        let meta = VaultMeta::new_device();
+        let master = [3u8; KEY_LEN];
+        assert!(!is_shareable(&meta, &master));
+        assert!(!MarkdownCipher::from_meta(&meta, &master).encryption_on());
+
+        let dir = tempfile::tempdir().unwrap();
+        store_meta(dir.path(), &meta).unwrap();
+        let report = authenticate_meta(dir.path(), &meta, &master).unwrap();
+        assert!(
+            !report.needs_warning(),
+            "a device vault's first stamp is silent, exactly as before"
+        );
+        assert_eq!(
+            load_meta(dir.path()).unwrap().unwrap().markdown.encryption,
+            MarkdownEncryption::None,
+            "and nothing forced encryption on it"
+        );
     }
 
     #[test]
@@ -1381,6 +1552,51 @@ mod tests {
         assert_ne!(
             meta_mac(&meta, &master).unwrap(),
             meta_mac(&meta, &other).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_vault_write_leaves_no_staging_file_and_still_authenticates() {
+        // The staging file must not be observable after the write, and — the subtler half — the
+        // ciphertext must still be encoded for the FINAL name. `aad_stem` binds the file name, so
+        // encoding for the temp path would produce a file that fails authentication the moment it
+        // is renamed, with nothing to show for it at write time.
+        let dir = tempfile::tempdir().unwrap();
+        let c = enc_cipher();
+        let path = dir.path().join(c.on_disk_name("note.md"));
+
+        c.write_to(&path, "# v1").unwrap();
+        assert_eq!(c.read(&path).unwrap(), "# v1");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no staging file survives a successful write"
+        );
+
+        // A rewrite is old-or-new, never a splice of the two.
+        c.write_to(&path, "# v2 much longer body text").unwrap();
+        assert_eq!(c.read(&path).unwrap(), "# v2 much longer body text");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Bytes take the same route, and are what a saved photo original travels on.
+        let photo = dir.path().join(c.on_disk_name("shot.jpg"));
+        c.write_bytes_to(&photo, &[0xffu8; 64]).unwrap();
+        assert_eq!(c.read_bytes(&photo).unwrap(), vec![0xffu8; 64]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_failed_vault_write_leaves_nothing_behind() {
+        // The cleanup the count-sensitive photo/export walks depend on: those loops have no
+        // extension filter, so a leaked staging file would be re-encoded as if it were a photo.
+        let dir = tempfile::tempdir().unwrap();
+        let c = enc_cipher();
+        let path = dir.path().join("no-such-dir").join(c.on_disk_name("a.md"));
+        assert!(c.write_to(&path, "# A").is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a write that could not be placed leaves no residue"
         );
     }
 

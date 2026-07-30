@@ -1298,7 +1298,9 @@ pub fn ingest_note_document(
             // freshly-written file. Keeps file and DB consistent — no divergence a Rebuild would bake in.
             match prior_bytes {
                 Some(bytes) => {
-                    let _ = std::fs::write(&vault_file, bytes);
+                    // Atomic like every other vault write: a rollback that is itself interrupted
+                    // would destroy the very file it exists to put back.
+                    let _ = crate::vault::write_atomic(&vault_file, &bytes);
                 }
                 None => {
                     let _ = std::fs::remove_file(&vault_file);
@@ -3205,7 +3207,9 @@ pub fn restore_vault_files(written: Vec<(std::path::PathBuf, Vec<u8>)>) {
         if original.is_empty() {
             let _ = std::fs::remove_file(&file);
         } else {
-            let _ = std::fs::write(&file, original);
+            // Atomic, for the same reason the forward write is: an interrupted restore would leave
+            // a truncated container, which on an encrypted vault reads as nothing at all.
+            let _ = crate::vault::write_atomic(&file, &original);
         }
     }
 }
@@ -3904,8 +3908,14 @@ pub(crate) fn convert_photo_originals(
         return Ok(0);
     }
     let mut changed = 0usize;
-    for entry in std::fs::read_dir(&photos)? {
-        let path = entry?.path();
+    // Collect BEFORE writing. The write is now a temp file plus a rename (`vault::write_atomic`), so
+    // each iteration adds and removes a directory entry — and enumerating a directory while it is
+    // being mutated is explicitly unspecified on Windows, which can hand the loop its own staging
+    // file or skip a photo entirely. `walk_vault_markdown` already materialises for the same reason.
+    let entries: Vec<PathBuf> = std::fs::read_dir(&photos)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    for path in entries {
         if !path.is_file() {
             continue;
         }

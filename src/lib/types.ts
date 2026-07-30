@@ -213,6 +213,11 @@ export interface VaultStatus {
    *  shared vault (no owner recorded); a shared vault stamped with an owner is owned only by its
    *  creator's account, so a joiner sees false. Connectors are set up only by the owner. */
   is_owner: boolean;
+  /** "This vault's settings file was altered outside PM", when the last open said so — the same
+   *  sentence `vault://meta-warning` carries. Repeated here because the boot open happens before
+   *  the app subscribes to events, and because the condition now persists: a failed integrity
+   *  check is no longer signed away on the next launch. Null when there is nothing to report. */
+  meta_warning: string | null;
 }
 
 /** Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup);

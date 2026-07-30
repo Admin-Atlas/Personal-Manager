@@ -151,9 +151,7 @@ pub fn write_manifest(
     let path = manifest_path(vault_root);
     let prior = std::fs::read(&path).unwrap_or_default();
     let bytes = cipher.encrypt(manifest)?;
-    let tmp = path.with_extension("pmindex.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::vault::write_atomic(&path, &bytes)?;
     Ok(prior)
 }
 
