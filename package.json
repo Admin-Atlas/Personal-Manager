@@ -24,7 +24,7 @@
     "@tauri-apps/plugin-updater": "^2",
     "d3-force": "^3.0.0",
     "d3-quadtree": "^3.0.1",
-    "react": "^19.1.0",
+    "react": "^19.2.8",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "rehype-external-links": "^3.0.0",
