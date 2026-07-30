@@ -19,11 +19,18 @@ import { deleteDocument } from "../lib/ipc";
 import type { Document } from "../lib/types";
 import { ConfirmDialog } from "./ui";
 
-/** Which of the three deletions this document gets. `source_type` is null/"vault" for a document PM
- *  owns the file for; "chat" is a saved conversation; anything else is a connector pointer. */
-function kindOf(doc: Document): "chat" | "pointer" | "vault" {
+/** Which deletion this document gets.
+ *
+ *  `index_only` is the ONLY pointer kind — its body lives at the source (a cloud account or a
+ *  watched folder) and PM holds no file for it. Every other kind, `photo` and `spreadsheet`
+ *  included, keeps its body in a Markdown file in the vault, which PM removes. This used to read
+ *  `source_type !== "vault"`, which quietly promised a photo's original was safe in a cloud account
+ *  the user had never connected — while the backend, making the same mistake, left the vault file
+ *  behind for the next Rebuild to resurrect. */
+function kindOf(doc: Document): "chat" | "pointer" | "photo" | "vault" {
   if (doc.source_type === "chat") return "chat";
-  if (doc.source_type && doc.source_type !== "vault") return "pointer";
+  if (doc.source_type === "index_only") return "pointer";
+  if (doc.source_type === "photo") return "photo";
   return "vault";
 }
 
@@ -32,9 +39,14 @@ function consequence(doc: Document): string {
     case "chat":
       return "This is a saved chat, so deleting it removes the conversation and its messages too — not just the transcript PM searches.";
     case "pointer":
-      return "This file is indexed from a connected account, so only PM's copy of the index is removed. The original file in your cloud account is not touched.";
+      return "This file is indexed from a connected account or a watched folder, so only PM’s copy of the index is removed. The file itself is not touched.";
+    case "photo":
+      // Two things live in the vault for a photo — the text PM read out of the image, and the image
+      // itself when "keep a copy" was ticked. `Document` doesn't say which, so the wording covers
+      // both without claiming either.
+      return "Everything PM keeps for this image goes: the text it read out of it, and the copy of the picture itself if you chose to keep one. The picture you imported from is left alone.";
     default:
-      return "The file is removed from your vault and from search.";
+      return "PM’s copy in your vault is removed, and the file is gone from search. The file you imported from is left alone.";
   }
 }
 
