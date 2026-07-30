@@ -1309,6 +1309,12 @@ export const setTrayEnabled = (enabled: boolean) => invoke<void>("set_tray_enabl
 export const setBriefingWindowVisible = (visible: boolean) =>
   invoke<void>("set_briefing_window_visible", { visible });
 
+/** Destroy the briefing window outright, for "Remove PM data". Hiding is not enough: a hidden
+ *  webview still runs, and this one persists theme preferences into the same origin store the main
+ *  window is about to clear. It holds no capability entry, so it can neither be signalled nor check
+ *  the main window's teardown flag — removing it is the only way to stop it writing. */
+export const destroyBriefingWindow = () => invoke<void>("destroy_briefing_window");
+
 /** Dismiss the always-on-top briefing window from its own ✕. Rust hides it and emits
  *  `briefing://closed` so the setting follows — see {@link onBriefingWindowClosed}. */
 export const closeBriefingWindow = () => invoke<void>("close_briefing_window");

@@ -7722,6 +7722,17 @@ pub fn close_briefing_window(app: AppHandle) -> Result<()> {
     tray::close_briefing_window(&app)
 }
 
+/// Destroy the briefing window before "Remove PM data" clears the webview store.
+///
+/// Distinct from [`close_briefing_window`], which only HIDES it: a hidden webview still runs, and
+/// this one is a second JS context persisting theme preferences into the same origin store the main
+/// window is about to empty. It cannot be signalled — the briefing webview holds no capability entry
+/// — so the erase removes it rather than asking it to be quiet.
+#[tauri::command]
+pub fn destroy_briefing_window(app: AppHandle) -> Result<()> {
+    tray::destroy_briefing_window(&app)
+}
+
 /// Bring the main window to the front — the briefing window's "Open PM" button.
 ///
 /// It has to be a PM command rather than `getCurrentWindow()`/`getAllWebviewWindows()` from

@@ -182,6 +182,24 @@ pub fn close_briefing_window(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// DESTROY the briefing window, for "Remove PM data" — not hide it.
+///
+/// Hiding is what every other caller wants and is wrong here: a hidden webview is a live webview,
+/// and this one is a second JS context writing theme preferences to the SAME origin store the main
+/// window is about to clear. It cannot be told to stop — it holds no capability entry, so it can
+/// neither `listen()` for a signal nor check the main window's teardown flag — so the only way to
+/// stop it writing is for it to stop existing.
+///
+/// Safe for the app's lifetime: PM exits only when every window is DESTROYED, and the main window
+/// remains. The window is built once in `setup`, so it does not come back until PM restarts — which
+/// is why the wipe only calls this when it is actually about to clear that store.
+pub fn destroy_briefing_window(app: &AppHandle) -> Result<()> {
+    if let Some(win) = app.get_webview_window(BRIEFING_LABEL) {
+        let _ = win.destroy();
+    }
+    Ok(())
+}
+
 /// Turn the tray icon on or off at runtime, persisting the choice.
 pub fn set_tray_enabled(app: &AppHandle, enabled: bool) -> Result<()> {
     {
