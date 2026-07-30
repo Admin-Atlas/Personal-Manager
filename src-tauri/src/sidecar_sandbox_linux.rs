@@ -113,6 +113,10 @@ impl Sandbox {
         let staging_dir = runtime_dir.join("sandbox-in");
         std::fs::create_dir_all(&staging_dir)
             .map_err(|e| SbxError::new(sbx::STAGING_DIR, format!("staging dir: {e}")))?;
+        // Take any staged copy a previous run left here. StagedInput deletes on drop, but a crash
+        // skips destructors and what survives is a PLAINTEXT copy of the user's document. This
+        // process has staged nothing yet, so everything matching is orphaned.
+        crate::sidecar_stage::sweep_staging(&staging_dir);
         // The worker only reads the model cache; the unconfined --fetch helper writes it. Make sure the
         // dir exists so the read-only rule below can be added (Landlock add_rule needs an extant path).
         let _ = std::fs::create_dir_all(models_dir);

@@ -1475,7 +1475,10 @@ export type IngestEvent =
   | { type: "counted"; total: number }
   | { type: "started"; path: string; name: string }
   | { type: "skipped"; path: string; reason: string }
-  | { type: "done"; document: Document }
+  /** `warning` is set when the file landed but something about it is not what the user would
+   *  assume — today only a photo whose text recognition was requested and did not run. It replaces
+   *  the plain chunk count on that file's Activity row. */
+  | { type: "done"; document: Document; warning: string | null }
   | { type: "failed"; path: string; error: string }
   | { type: "finished"; ingested: number; skipped: number; failed: number };
 

@@ -41,6 +41,39 @@ impl Drop for StagedInput {
 /// after its request anyway.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The prefix every staged copy is named with. Sweeping matches on it so nothing else in the
+/// staging dir is touched — macOS points the worker's `TMPDIR` here too, and those files are not
+/// ours to delete.
+const STAGE_PREFIX: &str = "in-";
+
+/// Delete staged copies left behind by a previous run.
+///
+/// [`StagedInput`] deletes on drop, which covers every ordinary path — but a crash, a kill, or a
+/// power cut skips destructors, and what is left is a **plaintext copy of the user's document**
+/// sitting in the staging dir indefinitely. Nothing swept it.
+///
+/// Called where the staging dir is (re)established for a fresh worker, so anything still here is by
+/// definition orphaned: this process has not staged anything yet, and the caller holds the process
+/// mutex. Best-effort and per-file — an unreadable dir or one stubborn file must never stop a
+/// worker from starting. Returns how many were removed, which is what the test asserts on.
+pub fn sweep_staging(staging_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(staging_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(STAGE_PREFIX)
+            && entry.file_type().is_ok_and(|t| t.is_file())
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Copy `src` into `staging_dir` under a unique `in-{n}{.ext}` name the confined worker can read,
 /// preserving the extension so the worker's format sniffing (which keys off it) is unaffected. Returns
 /// the guard whose `path()` the request should be rewritten to. `io::Error` on a copy failure — the
@@ -52,7 +85,7 @@ pub fn stage_into(staging_dir: &Path, src: &Path) -> std::io::Result<StagedInput
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
     let n = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dst = staging_dir.join(format!("in-{n}{ext}"));
+    let dst = staging_dir.join(format!("{STAGE_PREFIX}{n}{ext}"));
     std::fs::copy(src, &dst)?;
     Ok(StagedInput { path: dst })
 }
@@ -87,6 +120,30 @@ mod tests {
             "staged copy must be deleted when the guard drops"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A crash skips the Drop that deletes a staged copy, so a plaintext copy of the user's
+    /// document can outlive the process that made it. The sweep takes those — and nothing else,
+    /// because macOS points the worker's TMPDIR at this same dir.
+    #[test]
+    fn sweeps_orphans_from_a_previous_run_and_leaves_everything_else() {
+        let dir = std::env::temp_dir().join(format!("pm_stage_sweep_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("in-0.pdf"), b"a private document").unwrap();
+        std::fs::write(dir.join("in-7"), b"no extension").unwrap();
+        std::fs::write(dir.join("tmpXYZ"), b"someone else's temp file").unwrap();
+        std::fs::create_dir_all(dir.join("in-a-directory")).unwrap();
+
+        assert_eq!(sweep_staging(&dir), 2);
+        assert!(!dir.join("in-0.pdf").exists());
+        assert!(!dir.join("in-7").exists());
+        assert!(dir.join("tmpXYZ").exists(), "not ours to delete");
+        assert!(dir.join("in-a-directory").exists(), "files only");
+
+        // Idempotent, and an absent dir is not an error.
+        assert_eq!(sweep_staging(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(sweep_staging(&dir), 0);
     }
 
     /// Two stages never collide (monotonic counter).

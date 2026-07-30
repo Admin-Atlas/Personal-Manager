@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.4-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Text recognition in photos works again. PM runs the part of it that reads your files in a locked-down process with no internet access — which is right, except that the text reader downloads its own models the first time it runs, so it could never get them. Every photo came back as if it held no text at all: a receipt, a whiteboard, a screenshot of a message, all indexed as blank and unsearchable. PM now fetches those models the same way it fetches the search and speech models, before the reading starts.",
+      "They also live alongside everything else PM downloads now, rather than inside its Python folder, so reinstalling that folder no longer throws them away and re-downloads them.",
+      "And when text recognition genuinely can't run, the photo now says so on its row while it's being added, instead of quietly landing as a photo with no text in it.",
+      "PM is harder to trip up with a booby-trapped file. A small document can be built to unpack into something enormous — PM checked spreadsheets for that, but not Word, PowerPoint or e-book files, which take the same shape. It now checks all of them. Very wide spreadsheets are handled properly too: PM limits how much of a sheet it takes in, and says in the sheet's summary when it left something out, rather than choking on it.",
+      "If PM was closed at the wrong moment while reading a file, it could leave a plain, unencrypted copy of that document in its own working folder. It clears any it finds the next time it starts.",
+      "Under the hood, PM's document engine can no longer be knocked over by a chatty library printing where it shouldn't.",
+    ],
+  },
+  {
     version: "3.111.3-alpha",
     date: "2026-07-31",
     highlights: [

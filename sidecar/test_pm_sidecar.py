@@ -76,6 +76,46 @@ class CountTokensTest(unittest.TestCase):
             counts = S.do_count_tokens({"texts": ["", "a" * 40]})["counts"]
         self.assertEqual(counts, [1, 10])
 
+    def test_a_truncating_shared_tokenizer_is_never_used_for_counting(self):
+        # When the independent clone can't be made, the fallback used to be the SHARED tokenizer —
+        # which has truncation on. Every chunk past the model's window then reports exactly the
+        # window size, so the splitter reads "512, it fits" for a block that does not and stops
+        # splitting the very chunks the counter exists to catch. A rough estimate that keeps
+        # growing beats an exact number that lies.
+        import types
+
+        fake = types.ModuleType("tokenizers")
+
+        class Tokenizer:
+            @staticmethod
+            def from_str(_s):
+                raise RuntimeError("clone unavailable")
+
+            @staticmethod
+            def from_pretrained(_m):
+                raise RuntimeError("not cached")
+
+        fake.Tokenizer = Tokenizer
+
+        class _SharedTruncating:
+            def encode(self, text):
+                return _FakeEncoding([0] * 512, [1] * 512)
+
+            def to_str(self):
+                return "{}"
+
+        shared = _SharedTruncating()
+
+        class _Emb:
+            tokenizer = shared
+
+        with (
+            mock.patch.dict(sys.modules, {"tokenizers": fake}),
+            mock.patch.object(S, "get_embedder", return_value=_Emb()),
+            mock.patch.dict(S._tokenizers, {}, clear=True),
+        ):
+            self.assertIsNone(S.get_tokenizer("some-model"))
+
     @unittest.skipUnless(
         importlib.util.find_spec("fastembed") is not None,
         "fastembed not installed (real-tokenizer counting is a local-only check)",
@@ -262,6 +302,134 @@ class AnalyzeImageTest(unittest.TestCase):
         self.assertEqual(out["ocr_text"], "")
         self.assertEqual((out["width"], out["height"]), (12, 8), "dimensions still read")
 
+    def test_a_cold_model_cache_is_not_swallowed_as_exif_only(self):
+        # The F-56 guard above degrades a BROKEN component, which is right. A cold model cache is
+        # not that: swallowing it commits a photo that claims to hold no text and never looks
+        # again. It has to escape the handler so main() reports a miss, Rust runs the fetcher, and
+        # the retry actually reads the receipt.
+        def _cold():
+            raise S.ModelNotCached("rapidocr models are not downloaded yet")
+
+        with mock.patch.object(S, "get_ocr_engine", _cold):
+            with self.assertRaises(S.ModelNotCached):
+                S.do_analyze_image({"path": "/no/such/image.png", "run_ocr": True})
+
+
+def _fake_rapidocr(captured, model_file="/pm/models/rapidocr/det.onnx"):
+    """A stand-in `rapidocr` package: enough of the real shape to pin the offline contract.
+
+    Two details are load-bearing and mirrored exactly from rapidocr 3.9.0:
+
+    1. the engine holds its OWN reference to the downloader class (`from ... import DownloadFile`),
+       so patching the class attribute has to reach it; and
+    2. the engine calls `DownloadFile.run` UNCONDITIONALLY — the "it's already downloaded" check
+       lives inside `run`, not around the call. A guard that simply refuses would therefore break
+       the warm cache as thoroughly as the cold one.
+    """
+    import types
+
+    pkg = types.ModuleType("rapidocr")
+    utils = types.ModuleType("rapidocr.utils")
+    dl = types.ModuleType("rapidocr.utils.download_file")
+
+    class DownloadFileInput:
+        def __init__(self, save_path):
+            self.save_path = save_path
+
+    class DownloadFile:
+        @classmethod
+        def run(cls, params):
+            captured.setdefault("downloads", []).append(params.save_path)
+
+    class RapidOCR:
+        def __init__(self, params=None):
+            captured["params"] = params
+            DownloadFile.run(DownloadFileInput(model_file))
+
+    dl.DownloadFile = DownloadFile
+    dl.DownloadFileInput = DownloadFileInput
+    utils.download_file = dl
+    pkg.utils = utils
+    pkg.RapidOCR = RapidOCR
+    return {
+        "rapidocr": pkg,
+        "rapidocr.utils": utils,
+        "rapidocr.utils.download_file": dl,
+    }
+
+
+class OcrOfflineContractTest(unittest.TestCase):
+    """H5: rapidocr is the one model that does NOT fetch through huggingface_hub, so the offline
+    flags every other loader honours do not reach it. Under the no-network confinement that means
+    it could never obtain its models at all — the constructor raised on every photo, the F-56 guard
+    swallowed it, and OCR was permanently and silently off. These pin the contract that fixes it.
+    """
+
+    def _engine(self, captured, offline, models_dir="/pm/models", model_file=None):
+        mods = _fake_rapidocr(captured, model_file) if model_file else _fake_rapidocr(captured)
+        with (
+            mock.patch.dict(sys.modules, mods),
+            mock.patch.object(S, "_ocr_engine", None),
+            mock.patch.object(S, "_OFFLINE", offline),
+            mock.patch.object(S, "_MODELS_DIR", models_dir),
+        ):
+            return S.get_ocr_engine()
+
+    def test_the_engine_is_pinned_to_the_shared_model_dir(self):
+        # Left to itself rapidocr caches inside site-packages, so removing the optional OCR
+        # component (a one-click Settings action) or rebuilding the venv throws the weights away.
+        captured = {}
+        self._engine(captured, offline=False)
+        self.assertEqual(
+            captured["params"],
+            {"Global.model_root_dir": os.path.join("/pm/models", "rapidocr")},
+        )
+
+    def test_offline_a_cold_cache_is_a_model_miss_not_an_outbound_socket(self):
+        # The worker parses untrusted file bytes. It must never open a socket to fetch a model —
+        # which is exactly what an unguarded rapidocr does the moment the sandbox falls open.
+        captured = {}
+        with self.assertRaises(S.ModelNotCached):
+            self._engine(captured, offline=True)
+        self.assertNotIn("downloads", captured, "nothing may reach rapidocr's downloader offline")
+
+    def test_offline_a_warm_cache_still_builds_the_engine(self):
+        # The retry after the fetch is the whole point, and it runs in the SAME offline worker. The
+        # engine calls the downloader unconditionally and lets IT decide whether the file is
+        # already there — so a guard that simply refuses rejects the warm cache exactly like the
+        # cold one, the retry fails as hard as the first attempt, and OCR stays off for good.
+        import tempfile
+
+        captured = {}
+        with tempfile.TemporaryDirectory() as d:
+            present = os.path.join(d, "det.onnx")
+            with open(present, "wb") as fh:
+                fh.write(b"onnx")
+            engine = self._engine(captured, offline=True, model_file=present)
+        self.assertIsNotNone(engine)
+        self.assertNotIn("downloads", captured, "a warm cache still needs no network")
+
+    def test_the_fetcher_may_download(self):
+        # The mirror image: the short-lived --fetch helper runs WITHOUT the offline flag and is the
+        # one child allowed a socket, so the same call must go through.
+        captured = {}
+        self._engine(captured, offline=False)
+        self.assertEqual(len(captured["downloads"]), 1)
+
+    def test_ensure_model_knows_how_to_fetch_for_analyze_image(self):
+        # Without this branch the fetcher raised "nothing to fetch for method 'analyze_image'", so
+        # the miss above could never be satisfied and the retry never happened.
+        captured = {}
+        with (
+            mock.patch.dict(sys.modules, _fake_rapidocr(captured)),
+            mock.patch.object(S, "_ocr_engine", None),
+            mock.patch.object(S, "_OFFLINE", False),
+            mock.patch.object(S, "_MODELS_DIR", "/pm/models"),
+        ):
+            # No path in the params: Rust strips them, and nothing here may touch the image.
+            S._ensure_model("analyze_image", {})
+        self.assertEqual(len(captured["downloads"]), 1)
+
 
 class SpreadsheetTest(unittest.TestCase):
     """The dedicated spreadsheet processor that bypasses MarkItDown. The type heuristic and the CSV
@@ -394,7 +562,79 @@ class SpreadsheetTest(unittest.TestCase):
                 # ~4 MiB of zeros deflates to a few KiB — a ratio far above the 200x limit.
                 zf.writestr("xl/sharedStrings.xml", b"\0" * (4 * 1024 * 1024))
             with self.assertRaises(ValueError):
-                S._guard_xlsx_inflation(path)
+                S._guard_archive_inflation(path)
+
+    def test_the_bomb_guard_also_covers_the_documents_markitdown_reads(self):
+        # The guard used to be .xlsx-only, which left .docx / .pptx / .epub — every one of them a
+        # zip, every one handed straight to MarkItDown — with nothing but the on-disk size cap. The
+        # refusal must happen in do_convert, BEFORE MarkItDown is even imported (which is also what
+        # lets this run without markitdown installed).
+        import tempfile
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("bomb.docx", "bomb.pptx", "bomb.epub"):
+                path = f"{d}/{name}"
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("word/document.xml", b"\0" * (4 * 1024 * 1024))
+                with self.assertRaises(ValueError, msg=name):
+                    S.do_convert({"path": path})
+
+    def test_a_wide_sheet_is_column_capped_and_says_so(self):
+        # The row cap bounds one dimension only: a sheet 4,000 columns wide clears it and still
+        # produces a reply the reader must reject. The kept width is capped, the TRUE width is
+        # still reported, and cols_truncated makes Rust's overview say so out loud.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/wide.csv"
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(",".join(f"c{i}" for i in range(10)) + "\n")
+                fh.write(",".join(str(i) for i in range(10)) + "\n")
+            with mock.patch.object(S, "SPREADSHEET_COL_CAP", 4):
+                out = S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
+        sheet = out["sheets"][0]
+        self.assertEqual(sheet["col_count"], 10)  # TRUE width
+        self.assertEqual(sheet["headers"], ["c0", "c1", "c2", "c3"])  # capped
+        self.assertEqual(sheet["rows"][0], ["0", "1", "2", "3"])
+        self.assertTrue(sheet["cols_truncated"])
+
+    def test_an_unbounded_sheet_is_stopped_by_the_reply_budget(self):
+        # The row and column caps bound each sheet's SHAPE; their product is still three orders of
+        # magnitude past the reader's 64 MiB line cap. The budget is the bound that actually holds
+        # — and a sheet it stops must report itself truncated, exactly as a row-capped one does.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/fat.csv"
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("Note\n")
+                for _ in range(20):
+                    fh.write("x" * 10 + "\n")
+            with mock.patch.object(S, "SPREADSHEET_TEXT_BUDGET", 35):
+                out = S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
+        sheet = out["sheets"][0]
+        self.assertEqual(sheet["row_count"], 20)  # TRUE total, counted past the budget
+        self.assertEqual(len(sheet["rows"]), 3)  # 3 x 10 chars fits 35; the 4th does not
+        self.assertTrue(sheet["truncated"])
+
+    def test_the_budget_is_shared_across_a_workbooks_sheets(self):
+        # A workbook can hold any number of sheets, so a per-sheet budget would multiply. Once the
+        # pot is empty the next sheet keeps NO rows at all, and still reports its true row count.
+        budget = S._TextBudget(12)
+        first = S._build_sheet("one", [["H"], ["aaaaaaaaaa"], ["bbbbbbbbbb"]], budget)
+        second = S._build_sheet("two", [["H"], ["cccccccccc"]], budget)
+        self.assertEqual(len(first["rows"]), 1)
+        self.assertTrue(first["truncated"])
+        self.assertEqual(second["rows"], [])
+        self.assertEqual(second["row_count"], 1)
+        self.assertTrue(second["truncated"])
+
+    def test_one_huge_cell_cannot_carry_a_row_past_the_cell_cap(self):
+        sheet = S._build_sheet(
+            "s", [["Note"], ["y" * 5000]], S._TextBudget(S.SPREADSHEET_TEXT_BUDGET)
+        )
+        self.assertEqual(len(sheet["rows"][0][0]), S.SPREADSHEET_CELL_CHARS)
 
 
 # --- the protocol loop itself (driven as a real subprocess) ---------------
@@ -466,6 +706,47 @@ class ProtocolTest(unittest.TestCase):
         ids = [r["id"] for r in replies]
         self.assertNotIn(2, ids)  # dropped, unanswered
         self.assertIn(3, ids)  # loop kept going
+
+    def test_a_library_print_cannot_corrupt_the_reply_channel(self):
+        # stdout IS the reply channel. One `print` inside an unaudited dependency lands mid-line in
+        # the newline-JSON, so Rust can't parse the reply, skips the line, and then blocks on an
+        # answer already sent — wedging the serialized sidecar for the whole per-method timeout.
+        # This used to be guarded only around the two rapidocr calls, so the reply survived exactly
+        # one library's chatter. Driven through the REAL loop with a handler that prints.
+        import tempfile
+        import textwrap
+
+        wrapper_src = textwrap.dedent(
+            """
+            import sys
+            sys.path.insert(0, {dirname!r})
+            import pm_sidecar as S
+
+            def chatty(_params):
+                print("Downloading model: 100%")
+                return {{"said": "hello"}}
+
+            S.HANDLERS["chatty"] = chatty
+            S.main()
+            """
+        ).format(dirname=os.path.dirname(_SIDECAR_PATH))
+
+        with tempfile.TemporaryDirectory() as d:
+            wrapper = os.path.join(d, "chatty_sidecar.py")
+            with open(wrapper, "w", encoding="utf-8") as fh:
+                fh.write(wrapper_src)
+            proc = subprocess.run(
+                [sys.executable, wrapper],
+                input=json.dumps({"id": 4, "method": "chatty"}) + "\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, f"stdout must hold the reply and nothing else: {lines!r}")
+        self.assertEqual(json.loads(lines[0]), {"id": 4, "ok": True, "result": {"said": "hello"}})
+        self.assertIn("Downloading model", proc.stderr, "the chatter goes to stderr, not nowhere")
 
     def test_loop_survives_a_handler_error_between_requests(self):
         reqs = [

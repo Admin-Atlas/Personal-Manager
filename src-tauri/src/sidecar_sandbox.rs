@@ -99,6 +99,10 @@ impl Sandbox {
         let staging_dir = runtime_dir.join("sandbox-in");
         std::fs::create_dir_all(&staging_dir)
             .map_err(|e| SbxError::new(sbx::STAGING_DIR, format!("staging dir: {e}")))?;
+        // Take any staged copy a previous run left here. StagedInput deletes on drop, but a crash
+        // skips destructors and what survives is a PLAINTEXT copy of the user's document. This
+        // process has staged nothing yet, so everything matching is orphaned.
+        crate::sidecar_stage::sweep_staging(&staging_dir);
 
         // Grant the small, always-needed dirs every time (cheap, few files): the staging dir (writable)
         // and the script dir that holds `pm_sidecar.py` (readable). The script dir is NOT marker-cached

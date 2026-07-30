@@ -447,9 +447,7 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
           replaceLastWorking(prev, {
             name: event.document.title,
             status: "done",
-            detail: `${event.document.chunk_count} chunk${
-              event.document.chunk_count === 1 ? "" : "s"
-            }`,
+            detail: doneDetail(event.document.chunk_count, event.warning),
           }),
         );
         break;
@@ -1276,6 +1274,14 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
       )}
     </div>
   );
+}
+
+/** The Activity detail for a file that landed: its chunk count, plus anything that went wrong on
+ *  the way (a photo whose text recognition did not run). Mirrors `ingest::done_detail` exactly — a
+ *  row restored from the backend snapshot and one built from live events must read identically. */
+function doneDetail(chunks: number, warning: string | null): string {
+  const base = `${chunks} chunk${chunks === 1 ? "" : "s"}`;
+  return warning ? `${base} — ${warning}` : base;
 }
 
 function replaceLastWorking(items: ProgressItem[], replacement: ProgressItem) {

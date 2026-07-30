@@ -34,6 +34,13 @@ pub const ROW_COLLAPSE_THRESHOLD: usize = 40;
 pub struct SheetData {
     pub name: String,
     pub headers: Vec<String>,
+    /// The sheet's TRUE column count; `headers` is capped to the sidecar's `SPREADSHEET_COL_CAP`,
+    /// with `cols_truncated` set when the sheet was wider. Defaults to 0 for a reply from an older
+    /// sidecar, which the overview reads as "no cap was applied".
+    #[serde(default)]
+    pub col_count: i64,
+    #[serde(default)]
+    pub cols_truncated: bool,
     pub row_count: i64,
     #[serde(default)]
     pub inferred_types: Vec<String>,
@@ -142,6 +149,16 @@ fn overview_sentence(sheet: &SheetData) -> String {
             sheet.row_count
         ));
     }
+    // The column count above is what we KEPT. Say so when the sheet was wider, or the sentence
+    // quietly reports a 900-column sheet as a 256-column one — the same silence the row note exists
+    // to avoid.
+    if sheet.cols_truncated {
+        s.push_str(&format!(
+            "; columns truncated to the first {} of {}",
+            sheet.headers.len(),
+            sheet.col_count
+        ));
+    }
     s.push('.');
     s
 }
@@ -211,6 +228,8 @@ mod tests {
         SheetData {
             name: name.into(),
             headers: headers.iter().map(|s| s.to_string()).collect(),
+            col_count: headers.len() as i64,
+            cols_truncated: false,
             row_count,
             inferred_types: vec!["string".into(); headers.len()],
             date_range: None,
@@ -220,6 +239,28 @@ mod tests {
                 .collect(),
             truncated: false,
         }
+    }
+
+    #[test]
+    fn a_column_capped_sheet_says_how_wide_it_really_was() {
+        // The overview's column count is what we KEPT. On a sheet wider than the sidecar's cap
+        // that would quietly describe a 900-column sheet as a 2-column one — the same silence the
+        // row-truncation note exists to avoid.
+        let mut s = sheet("Wide", &["A", "B"], vec![vec!["1", "2"]], 1);
+        s.col_count = 900;
+        s.cols_truncated = true;
+        let (body, _) = to_markdown(&[s]).unwrap();
+        assert!(
+            body.contains("columns truncated to the first 2 of 900"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_uncapped_sheet_carries_no_truncation_note() {
+        let s = sheet("Narrow", &["A", "B"], vec![vec!["1", "2"]], 1);
+        let (body, _) = to_markdown(&[s]).unwrap();
+        assert!(!body.contains("truncated"), "{body}");
     }
 
     #[test]
@@ -295,6 +336,8 @@ mod tests {
         let empty = SheetData {
             name: "Sheet1".into(),
             headers: vec![],
+            col_count: 0,
+            cols_truncated: false,
             row_count: 0,
             inferred_types: vec![],
             date_range: None,
