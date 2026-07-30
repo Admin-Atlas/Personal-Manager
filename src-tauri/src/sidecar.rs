@@ -921,8 +921,20 @@ impl SidecarManager {
         // Install the pinned requirements into the venv.
         let py = self.paths.venv_python();
         let mut pip = Command::new(&py);
-        pip.args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
-            .arg(&requirements);
+        // `--no-cache-dir`: pip's wheel cache lives at `~/.cache/pip` (or `~/Library/Caches/pip`),
+        // OUTSIDE everything PM owns, and nothing has ever removed it — hundreds of MB of wheels
+        // surviving a full "remove PM completely". Relocating it under `runtime/` would also work,
+        // but the cache only earns its keep on a venv REBUILD, which is rare, so not writing it at
+        // all is both smaller and simpler than tracking it. First-run download volume is unchanged.
+        pip.args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-cache-dir",
+            "-r",
+        ])
+        .arg(&requirements);
         clean_python_env(&mut pip);
         no_window(&mut pip);
         run_command(&mut pip, "pip install requirements").map_err(|e| ProvisionError {
@@ -1119,8 +1131,10 @@ impl SidecarManager {
 
     /// The on-device model-cache dir for the Whisper weights (a sibling of the venv under
     /// `runtime/models`), created if missing, so they live inside PM's data dir and uninstall
-    /// with it. (The embedder keeps fastembed's default cache in PR 1 — pinning it would force
-    /// existing users to re-download the model; that hygiene is deferred.)
+    /// with it. The embedder's weights, the huggingface cache and the xet chunk cache all land in
+    /// the same subtree via `PM_MODELS_DIR` (issue #286) — an older note here said the embedder
+    /// still used fastembed's own default and called that hygiene deferred, which stopped being
+    /// true and sent a later reader hunting for a cache that isn't there.
     fn model_dir_param(&self) -> Option<String> {
         let dir = self.paths.models_dir()?;
         let _ = std::fs::create_dir_all(&dir);
@@ -1448,9 +1462,12 @@ impl SidecarManager {
         // byte bar) we can parse; the side-thread stderr drain in run_pip_streaming avoids a deadlock.
         let mut downloads = 0u32;
         let mut last = 0.10f32;
+        // `--no-cache-dir` for the same reason as the base install: pip's cache is the largest thing
+        // PM leaves outside its own folders, and nothing ever collects it.
         let mut args: Vec<&str> = vec![
             "install",
             "--disable-pip-version-check",
+            "--no-cache-dir",
             "--progress-bar",
             "off",
         ];

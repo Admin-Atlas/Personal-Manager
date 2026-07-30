@@ -1054,7 +1054,7 @@ pub fn run() {
             // is deliberately disarmed so the converter can open it — so an interrupted sync leaves
             // the user's actual document lying in %TEMP%, and nothing has ever collected it. Boot is
             // the safe moment: no sync, backup or restore can be in flight yet.
-            let swept = wipe::sweep_temp_staging();
+            let swept = wipe::sweep_temp_staging(&handle.package_info().name);
             if swept > 0 {
                 eprintln!(
                     "startup: cleared {swept} abandoned staging file(s) from the temp folder"

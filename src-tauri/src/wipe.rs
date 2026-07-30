@@ -46,7 +46,7 @@ use std::path::Path;
 
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
 use crate::{google, paths, secrets, vault, AppState};
@@ -600,6 +600,36 @@ fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
 /// claiming a clean sweep it did not make.
 ///
 /// Best-effort per entry, like the rest of the wipe: one stubborn path must not abort the others.
+/// Name — never delete — the stores PM CAUSED to exist but does not own.
+///
+/// PM's pull button downloaded the Ollama models and PM signed the user into Proton Drive, so
+/// leaving these unmentioned is the "found something afterwards" failure even though removing them
+/// would be wrong: they are another program's data, shared with whatever else uses it. Reported only
+/// when the path actually exists, so nobody is sent hunting for a folder they never had.
+fn report_third_party_stores(app: &AppHandle, report: &mut WipeReport) {
+    let Ok(home) = app.path().home_dir() else {
+        return;
+    };
+    for root in crate::local_disk::ollama_roots(&home, std::env::var("OLLAMA_MODELS").ok()) {
+        if root.exists() {
+            report.leave_behind(
+                root.display(),
+                "models you downloaded through PM's Local AI tab, stored by Ollama. They can be \
+                 many gigabytes, and they belong to Ollama rather than to PM — remove them there \
+                 if you no longer want them",
+            );
+        }
+    }
+    // macOS keeps the microphone grant in a system database no application may edit.
+    #[cfg(target_os = "macos")]
+    report.leave_behind(
+        "Microphone permission (System Settings > Privacy & Security)",
+        "macOS remembers that you allowed PM to use the microphone, and no app can revoke that for \
+         itself. Remove PM from the Microphone list there, or run: tccutil reset Microphone \
+         org.itsatlas.pm",
+    );
+}
+
 fn remove_os_leftovers(app: &AppHandle, report: &mut WipeReport) -> usize {
     let mut removed = 0usize;
     for path in paths::os_app_leftovers(app) {
@@ -749,10 +779,28 @@ const TEMP_STAGING_PREFIXES: &[&str] = &[
     "pm-python-",
 ];
 
+/// The infix in the updater's own staging directory name, which `tauri-plugin-updater` builds as
+/// `<app name>-<version>-updater-<random>`. It downloads the next installer there and then calls
+/// `process::exit`, so the temp guard's destructor never runs and every installer PM has ever
+/// applied stays on disk — around 100 MB each, forever.
+///
+/// Matched by the infix rather than by an `app_name` prefix on purpose: the product name is "PM",
+/// and sweeping everything in the temp directory starting `PM-` would be reckless. Requiring
+/// `-updater-` as well makes a false positive essentially impossible.
+const UPDATER_STAGING_INFIX: &str = "-updater-";
+
 /// Whether a temp entry is one of PM's own staging files. Pure, so the matching rule — the part
 /// that must never widen to something a user owns — is testable without touching a disk.
-fn is_pm_temp_staging(name: &str) -> bool {
-    TEMP_STAGING_PREFIXES.iter().any(|p| name.starts_with(p))
+///
+/// `app_name` is passed in rather than hardcoded so the rule stays keyed to the configured product
+/// name and this stays testable from anywhere.
+fn is_pm_temp_staging(name: &str, app_name: &str) -> bool {
+    if TEMP_STAGING_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    // Both halves required, and the prefix must be the WHOLE app name followed by a separator —
+    // "PMS-1-updater-x" from some other program must not match.
+    name.starts_with(&format!("{app_name}-")) && name.contains(UPDATER_STAGING_INFIX)
 }
 
 /// Remove PM's abandoned staging files from the OS temp directory, returning how many went.
@@ -760,7 +808,7 @@ fn is_pm_temp_staging(name: &str) -> bool {
 /// Runs at boot (no sync, backup or restore can be in flight yet, so nothing live is at risk) and
 /// again during the wipe. Scoped to `std::env::temp_dir()` and to [`is_pm_temp_staging`]; anything
 /// that is not a positive prefix match is not touched.
-pub fn sweep_temp_staging() -> usize {
+pub fn sweep_temp_staging(app_name: &str) -> usize {
     let tmp = std::env::temp_dir();
     let Ok(rd) = std::fs::read_dir(&tmp) else {
         return 0;
@@ -768,7 +816,7 @@ pub fn sweep_temp_staging() -> usize {
     let mut removed = 0usize;
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_pm_temp_staging(&name) {
+        if !is_pm_temp_staging(&name, app_name) {
             continue;
         }
         let path = entry.path();
@@ -878,7 +926,7 @@ pub async fn wipe_pm_data(
         // PM's staging files in the OS temp dir. A connector download is staged there in the CLEAR
         // and its auto-delete is disarmed so the converter can read it, so an interrupted sync
         // leaves the user's document behind — outside every folder this erase would otherwise visit.
-        let swept = sweep_temp_staging();
+        let swept = sweep_temp_staging(&app.package_info().name);
         if swept > 0 {
             report.removed.push(format!(
                 "{swept} leftover staging file(s) from interrupted syncs"
@@ -950,6 +998,12 @@ pub async fn wipe_pm_data(
             report.removed.push("App preferences & webview data".into());
             report.quit_required = true;
         }
+    }
+
+    // Last: name what PM caused but must not remove. Only on a full purge — on a partial wipe the
+    // user is keeping PM, so pointing them at their own Ollama models would be noise.
+    if full {
+        report_third_party_stores(&app, &mut report);
     }
 
     // How the user finishes removing PM itself. Resolved here, in the one place that knows the wipe
@@ -1467,20 +1521,26 @@ mod tests {
         // This sweep deletes files in a directory shared with every other program on the machine,
         // so the matching rule is the thing that must never widen. Each prefix is PM-minted and
         // followed by a random suffix.
-        assert!(is_pm_temp_staging("pm-drive-a1B2c3.pdf"));
-        assert!(is_pm_temp_staging("pm-onedrive-XyZ.docx"));
-        assert!(is_pm_temp_staging("pm-restore-gdrive-99"));
-        assert!(is_pm_temp_staging("pm-backup-snap-7"));
+        let m = |n: &str| is_pm_temp_staging(n, "PM");
+        assert!(m("pm-drive-a1B2c3.pdf"));
+        assert!(m("pm-onedrive-XyZ.docx"));
+        assert!(m("pm-restore-gdrive-99"));
+        assert!(m("pm-backup-snap-7"));
+        // The updater's own staging. It exits the process rather than dropping its temp guard, so
+        // every installer it has ever applied is still sitting there, around 100 MB each.
+        assert!(m("PM-3.111.0-alpha-updater-Ab12"));
 
         for other in [
             "pm.sqlite",                  // never in temp, but the closest-looking real filename
             "pm-check.log",               // a developer's own scratch file, seen in the wild
             "personal-manager-notes.txt", // a user's file that merely starts similarly
             "drive-export.pdf",
-            "PM-3.110.2-updater-x", // the updater's staging: different owner, different PR
+            "PM-notes.txt",        // our app name, but not the updater's shape
+            "PMS-1-updater-x",     // another program whose name merely starts with ours
+            "something-updater-x", // the infix alone is not enough
             "",
         ] {
-            assert!(!is_pm_temp_staging(other), "{other} is not PM staging");
+            assert!(!m(other), "{other} is not PM staging");
         }
     }
 
@@ -1493,7 +1553,7 @@ mod tests {
         std::fs::write(&staged, b"a user's actual document").unwrap();
         std::fs::write(&innocent, b"not PM's").unwrap();
 
-        sweep_temp_staging();
+        sweep_temp_staging("PM");
 
         assert!(
             !staged.exists(),
