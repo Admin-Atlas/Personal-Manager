@@ -66,7 +66,7 @@ sqlite-vec = "0.1"
 getrandom = "0.4"
 hex = "0.4"
 # base64url for the PKCE S256 code challenge (Step 6 Google OAuth).
-base64 = "0.22"
+base64 = "0.23"
 
 # --- Shared & Portable Vaults (v2.1.0) ---
 # Passphrase-derived key model + at-rest Markdown encryption. argon2id turns a user
