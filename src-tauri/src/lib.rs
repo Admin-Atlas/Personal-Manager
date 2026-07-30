@@ -1607,8 +1607,21 @@ pub fn run() {
             #[cfg(debug_assertions)]
             commands_dev::dev_sidecar_net_selftest,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // The last thing PM runs, and only after a full purge — on macOS and Linux the app
+            // stays open on the "what to do next" screen instead of handing off to an uninstaller,
+            // so this catches anything written back between the erase and the quit.
+            //
+            // It is a PRE-teardown hook: `RunEvent::Exit` fires while the window and webview are
+            // still alive (see `wipe::final_sweep_after_purge` for the trace through tao). It
+            // narrows the window rather than closing it, and it is deliberately the belt to the
+            // braces of clearing the webview's own storage before the directory behind it goes.
+            if matches!(event, tauri::RunEvent::Exit) && paths::data_dir_is_purged() {
+                wipe::final_sweep_after_purge(app);
+            }
+        });
 }
 
 #[cfg(test)]

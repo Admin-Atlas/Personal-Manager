@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.2-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "On Mac and Linux, the folders PM had just erased could reappear while you were still reading the message saying they were gone. There's no uninstaller to hand over to on those systems, so PM stays open on the final screen — and anything still ticking over in the background would ask PM where its folder was, which quietly re-created it. It no longer does: once you've erased everything, PM stops making that folder for the rest of the session.",
+      "Removing everything now also clears the interface preferences behind the app window, even if you didn't tick that box. PM was deleting the folder those live in whenever you removed everything else, but only emptying the window's own copy when the preferences box was ticked — so in that one combination the system could write them straight back over the folder that had just been deleted.",
+      "And a sync running in the background can no longer rebuild PM's Python components into the folder you just erased — a few hundred megabytes that would have reappeared minutes later, on a machine you thought was clean.",
+      "PM also tidies up once more as it closes, in case anything was written back while the final screen was open.",
+      "Windows was never affected by any of this: it hands straight over to the uninstaller and closes immediately.",
+    ],
+  },
+  {
     version: "3.111.1-alpha",
     date: "2026-07-31",
     highlights: [

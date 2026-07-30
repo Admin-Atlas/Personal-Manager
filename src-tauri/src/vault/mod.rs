@@ -598,10 +598,16 @@ pub fn resolve(app: &AppHandle) -> Result<ResolvedVault> {
     let resolved = resolve_layout(&data_dir, pointer.as_ref());
     // Classified + path-bearing: on a pointed root whose ACLs broke, these are the first
     // fresh handles a command opens, so their failure is what the user actually sees.
-    std::fs::create_dir_all(&resolved.vault_root)
-        .map_err(io_at("prepare the vault folder", &resolved.vault_root))?;
-    std::fs::create_dir_all(&resolved.markdown_dir)
-        .map_err(io_at("prepare the vault folder", &resolved.markdown_dir))?;
+    //
+    // Skipped entirely once a full purge has run: PM keeps running after the erase on macOS and
+    // Linux, and this is the other half of the pair (with `paths::data_dir`) that would otherwise
+    // rebuild the folders the user was just told were gone.
+    if !paths::data_dir_is_purged() {
+        std::fs::create_dir_all(&resolved.vault_root)
+            .map_err(io_at("prepare the vault folder", &resolved.vault_root))?;
+        std::fs::create_dir_all(&resolved.markdown_dir)
+            .map_err(io_at("prepare the vault folder", &resolved.markdown_dir))?;
+    }
     Ok(resolved)
 }
 
