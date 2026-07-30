@@ -509,3 +509,61 @@ impl Drop for AttrListGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The environment block handed to the confined worker is a security surface, not plumbing:
+    /// `PYTHON_ENV_REMOVES` exists so a `PYTHONPATH` / `PYTHONHOME` inherited from the user's shell
+    /// cannot inject code into the process that parses untrusted files, and the offline flags are
+    /// overrides that must beat whatever the parent already had. Neither was tested — this module is
+    /// the first `cfg(test)` in the file (H7).
+    #[test]
+    fn the_env_block_drops_removed_keys_and_lets_overrides_win() {
+        // Uniquely named so a parallel test can't race this process-wide state.
+        let inherited = "PM_SBX_TEST_INHERITED_PYTHONPATH";
+        let overridden = "PM_SBX_TEST_OVERRIDDEN";
+        std::env::set_var(inherited, r"C:\attacker\site-packages");
+        std::env::set_var(overridden, "from-the-parent");
+
+        let block = build_env_block(&[(overridden, "from-the-override")], &[inherited]);
+        let text = String::from_utf16_lossy(&block);
+
+        assert!(
+            !text.contains("attacker"),
+            "a key in `removes` must not survive into the child's environment"
+        );
+        assert!(text.contains("PM_SBX_TEST_OVERRIDDEN=from-the-override"));
+        assert!(
+            !text.contains("from-the-parent"),
+            "an override must beat the inherited value, not sit beside it"
+        );
+
+        std::env::remove_var(inherited);
+        std::env::remove_var(overridden);
+    }
+
+    /// The Win32 contract for `lpEnvironment`: NUL after every entry, and a second NUL closing the
+    /// block. Get this wrong and `CreateProcess` either fails or reads past the buffer.
+    #[test]
+    fn the_env_block_is_nul_separated_and_double_nul_terminated() {
+        let block = build_env_block(&[("PM_SBX_TEST_ONE", "1")], &[]);
+        assert_eq!(block.last(), Some(&0), "the block must end with a NUL");
+        assert_eq!(
+            block[block.len() - 2],
+            0,
+            "the final entry's own NUL, then the block terminator"
+        );
+        // Every entry carries an `=`. An entry without one — or an empty entry in the middle —
+        // terminates the block early, silently truncating the child's environment to whatever came
+        // before it.
+        let text = String::from_utf16_lossy(&block[..block.len() - 1]);
+        let entries: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+        assert!(!entries.is_empty());
+        for e in &entries {
+            assert!(e.contains('='), "entry without a key=value: {e:?}");
+        }
+        assert!(entries.contains(&"PM_SBX_TEST_ONE=1"));
+    }
+}

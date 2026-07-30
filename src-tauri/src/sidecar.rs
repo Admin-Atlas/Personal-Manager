@@ -2852,13 +2852,13 @@ mod tests {
             .join("sidecar");
         // No hardcoded path in a public repo: point PM_SANDBOX_SMOKE_VENV at your installed venv dir
         // (…/runtime/venv). Unset → skip.
-        let venv_dir = match std::env::var("PM_SANDBOX_SMOKE_VENV") {
-            Ok(v) => PathBuf::from(v),
-            Err(_) => {
-                eprintln!("skipping: set PM_SANDBOX_SMOKE_VENV to the venv dir to run this");
-                return;
-            }
-        };
+        // PANIC, not `return`. An early return in a #[test] is a PASS, so the whole point of
+        // asking for these explicitly with `--ignored` was defeated: the run reported green
+        // having proved nothing about the confinement it exists to prove (H7). You only reach
+        // this test by naming it, so a missing prerequisite is an error, never a skip.
+        let venv_dir = PathBuf::from(std::env::var("PM_SANDBOX_SMOKE_VENV").expect(
+            "set PM_SANDBOX_SMOKE_VENV to the installed venv dir (.../runtime/venv) to run this",
+        ));
         assert!(venv_dir.join("Scripts\\python.exe").exists(), "no venv");
         let mgr = SidecarManager::new(SidecarPaths {
             source_dir,
@@ -2907,13 +2907,13 @@ mod tests {
             .join("sidecar");
         // No hardcoded path in a public repo: point PM_SANDBOX_SMOKE_VENV at your installed venv dir
         // (…/runtime/venv). Unset → skip.
-        let venv_dir = match std::env::var("PM_SANDBOX_SMOKE_VENV") {
-            Ok(v) => PathBuf::from(v),
-            Err(_) => {
-                eprintln!("skipping: set PM_SANDBOX_SMOKE_VENV to the venv dir to run this");
-                return;
-            }
-        };
+        // PANIC, not `return`. An early return in a #[test] is a PASS, so the whole point of
+        // asking for these explicitly with `--ignored` was defeated: the run reported green
+        // having proved nothing about the confinement it exists to prove (H7). You only reach
+        // this test by naming it, so a missing prerequisite is an error, never a skip.
+        let venv_dir = PathBuf::from(std::env::var("PM_SANDBOX_SMOKE_VENV").expect(
+            "set PM_SANDBOX_SMOKE_VENV to the installed venv dir (.../runtime/venv) to run this",
+        ));
         assert!(
             venv_dir.join("bin/python").exists(),
             "no venv at {venv_dir:?}"
@@ -3012,13 +3012,13 @@ mod tests {
             .join("sidecar");
         // No hardcoded path in a public repo: point PM_SANDBOX_SMOKE_VENV at your installed venv dir
         // (…/runtime/venv). Unset → skip.
-        let venv_dir = match std::env::var("PM_SANDBOX_SMOKE_VENV") {
-            Ok(v) => PathBuf::from(v),
-            Err(_) => {
-                eprintln!("skipping: set PM_SANDBOX_SMOKE_VENV to the venv dir to run this");
-                return;
-            }
-        };
+        // PANIC, not `return`. An early return in a #[test] is a PASS, so the whole point of
+        // asking for these explicitly with `--ignored` was defeated: the run reported green
+        // having proved nothing about the confinement it exists to prove (H7). You only reach
+        // this test by naming it, so a missing prerequisite is an error, never a skip.
+        let venv_dir = PathBuf::from(std::env::var("PM_SANDBOX_SMOKE_VENV").expect(
+            "set PM_SANDBOX_SMOKE_VENV to the installed venv dir (.../runtime/venv) to run this",
+        ));
         assert!(
             venv_dir.join("bin/python").exists(),
             "no venv at {venv_dir:?}"
