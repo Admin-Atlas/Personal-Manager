@@ -52,6 +52,10 @@ concurrency:
 
 jobs:
   bundle:
+    # Explicit display name: both dry-run lanes call their job `bundle`, so without
+    # this the PR check list shows two identical "bundle" rows and you cannot tell
+    # which platform failed.
+    name: macos-bundle
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

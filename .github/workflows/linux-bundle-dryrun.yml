@@ -57,6 +57,10 @@ concurrency:
 
 jobs:
   bundle:
+    # Explicit display name: both dry-run lanes call their job `bundle`, so without
+    # this the PR check list shows two identical "bundle" rows and you cannot tell
+    # which platform failed.
+    name: linux-bundle
     # Pinned to match release.yml's Linux build leg: the runner's distro sets the
     # AppImage's glibc floor (see the matrix comment there).
     runs-on: ubuntu-22.04
