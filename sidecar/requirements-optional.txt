@@ -5,5 +5,5 @@
 # and the `optional_requirements_file_matches_the_pins` unit test keeps this file in lockstep with them.
 # `just pip-audit` scans it alongside requirements.txt so an OCR / t-SNE CVE can't ship unnoticed.
 openTSNE==1.0.4
-rapidocr==3.9.0
-pillow-heif==1.4.0
+rapidocr==3.9.2
+pillow-heif==1.5.0

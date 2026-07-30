@@ -180,11 +180,11 @@ const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
 /// decoding (Pillow itself is already present via markitdown). Both — and rapidocr's image deps
 /// (opencv/shapely/pyclipper) — ship binary wheels for the bundled 3.12 release interpreter and dev
 /// 3.14, so there's no compile step.
-const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.0", "pillow-heif==1.4.0"];
+const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pillow-heif==1.5.0"];
 
 /// The marker's expected contents — the OCR pins joined, so a future bump re-installs. Kept in sync
 /// with [`OPTIONAL_OCR_PINS`]; the `optional_ocr_marker_matches_pins` test guards the join.
-const OPTIONAL_OCR_MARKER: &str = "rapidocr==3.9.0;pillow-heif==1.4.0";
+const OPTIONAL_OCR_MARKER: &str = "rapidocr==3.9.2;pillow-heif==1.5.0";
 
 /// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
 /// operations differ only in these fields, so they share one implementation each

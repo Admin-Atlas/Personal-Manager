@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.8-alpha",
+    date: "2026-07-30",
+    highlights: [
+      "Under-the-hood tidying: eighteen of the outside libraries PM is built from moved up to their latest versions, including the one that reads text out of photos. If you have photo text recognition installed, PM will fetch its updated components the next time it reads a picture — nothing to do, and nothing is lost while it does.",
+      "One update was deliberately left behind: a testing library that now requires a newer version of Node than PM's build machines run. That is a change worth making on its own rather than smuggled in with routine housekeeping.",
+    ],
+  },
+  {
     version: "3.111.7-alpha",
     date: "2026-07-30",
     highlights: [
