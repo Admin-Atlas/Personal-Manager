@@ -141,8 +141,12 @@ export function RemovePmData({ biometricAvailable }: Props) {
   // act on. A connected Microsoft account has no programmatic revoke (only its local token is
   // deleted), and this screen is the ONLY place that tells them to finish at account.live.com; an
   // unreachable Google grant is similar. When either is present, wait for the explicit click.
+  // A list of things PM could not remove counts too: it names paths the user has to go and delete
+  // themselves, and on Windows the auto-launch below would otherwise flash it past them and quit.
   const actionRequired =
-    (report?.microsoftAccounts.length ?? 0) > 0 || (report?.googleRevokeFailures ?? 0) > 0;
+    (report?.microsoftAccounts.length ?? 0) > 0 ||
+    (report?.googleRevokeFailures ?? 0) > 0 ||
+    (report?.couldNotRemove.length ?? 0) > 0;
   // How this platform finishes removing PM itself. The backend decides — the UI used to assume the
   // Windows answer, which is why a Mac (where there IS no uninstaller) got sent to Windows Settings.
   const macFinish = report?.finishStep === "macosDragToTrash";
@@ -281,6 +285,13 @@ export function RemovePmData({ biometricAvailable }: Props) {
         Erase PM from this machine — choose exactly what to remove. Uninstalling PM the usual way
         already clears the big re-downloadable components; this is for clearing your actual data,
         saved keys, and sign-ins as well. Some of this can&apos;t be undone.
+      </p>
+      {/* Said once, up front, before any checkbox is ticked. PM keeps no copy of anything it
+          removes here, and a backup made afterwards is worth nothing. */}
+      <p className="mt-2 text-xs text-ink4">
+        <span className="font-medium text-ink3">Back up first.</span> Make a backup, or export your
+        notes, and keep it somewhere PM isn&apos;t &mdash; another drive or another machine. PM
+        keeps no copy of what it removes here, and it can&apos;t put any of it back.
       </p>
 
       {stage === "locked" && (
@@ -539,6 +550,24 @@ export function RemovePmData({ biometricAvailable }: Props) {
                       .
                     </p>
                   )}
+                </div>
+              )}
+              {/* Anything PM knows about and left, with the path spelled out. Deliberately above
+                  the "your data is gone" lines below, because when this list is non-empty those
+                  lines are only true of the folders PM owns. */}
+              {(report?.couldNotRemove.length ?? 0) > 0 && (
+                <div className="mt-3 rounded-[var(--radius-sm)] border border-st-due p-3">
+                  <p className="text-xs font-medium text-st-due">
+                    PM did not remove these &mdash; they are yours to delete
+                  </p>
+                  <ul className="mt-2 space-y-2">
+                    {report?.couldNotRemove.map((l) => (
+                      <li key={l.path} className="text-xs text-ink3">
+                        <span className="block break-all font-medium text-ink2">{l.path}</span>
+                        <span className="text-ink4">{l.reason}.</span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
               {report?.fullPurge &&

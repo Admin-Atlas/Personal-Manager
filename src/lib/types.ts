@@ -128,8 +128,21 @@ export interface WipeReport {
   fullPurge: boolean;
   /** How the user finishes removing PM itself; `"none"` unless this was a full purge. */
   finishStep: FinishStep;
-  /** OS-written leftovers removed from outside the data dir (macOS only). */
+  /** OS-written leftovers removed from outside the data dir (macOS/Linux). */
   osLeftoversRemoved: number;
+  /** Everything PM knows about and did NOT remove, each with its full path and a plain reason —
+   *  a vault belonging to another account, a folder still holding the user's own files, a marker
+   *  other accounts still need. The promise is not "PM deleted everything", it is "nothing of
+   *  yours is left somewhere you don't know about", and this is the half that makes that true. */
+  couldNotRemove: Leftover[];
+}
+
+/** One thing the erase left behind, and why, so the user can finish by hand. */
+export interface Leftover {
+  /** Full path, ready to paste into a file manager. */
+  path: string;
+  /** Why it is still there — reads as a sentence following the path. */
+  reason: string;
 }
 
 // --- Shared & portable vaults (spec §2–6) ---
@@ -213,6 +226,11 @@ export interface VaultStatus {
    *  shared vault (no owner recorded); a shared vault stamped with an owner is owned only by its
    *  creator's account, so a joiner sees false. Connectors are set up only by the owner. */
   is_owner: boolean;
+  /** Who owns the active vault, with "unknown" kept apart from "ours" — the distinction `is_owner`
+   *  folds away and a delete button needs. `device`: this account's alone. `owned`: a shared vault
+   *  this account created. `joined`: a shared vault someone else created. `unknown`: no owner
+   *  recorded, or an OS that can't tell us (every shared vault off Windows). */
+  ownership: "device" | "owned" | "joined" | "unknown";
   /** "This vault's settings file was altered outside PM", when the last open said so — the same
    *  sentence `vault://meta-warning` carries. Repeated here because the boot open happens before
    *  the app subscribes to events, and because the condition now persists: a failed integrity

@@ -127,6 +127,38 @@ pub struct WipeReport {
     /// OS-written leftovers removed from outside the data dir (macOS only). Reported so the summary
     /// can be specific instead of implying a clean sweep it may not have made.
     pub os_leftovers_removed: usize,
+    /// Everything PM knows about and did NOT remove, each with the path and a plain reason.
+    ///
+    /// The erase is best-effort by design, and until now that meant a locked folder or a vault
+    /// belonging to another account simply went unmentioned while the summary still said everything
+    /// was gone. The promise is not "PM deleted everything" — it is "nothing of yours is left
+    /// somewhere you don't know about", and this is the half that makes the second one true.
+    pub could_not_remove: Vec<Leftover>,
+}
+
+/// One thing the erase left behind, and why — so a user can finish by hand.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Leftover {
+    /// The full path, exactly as it should be pasted into a file manager.
+    pub path: String,
+    /// Why it is still there, as a sentence fragment following the path.
+    pub reason: String,
+}
+
+impl WipeReport {
+    /// Record something the erase deliberately or unavoidably left. De-duplicated by path, since
+    /// several steps can reach the same folder and one leftover should be one line to the user.
+    fn leave_behind(&mut self, path: impl std::fmt::Display, reason: impl Into<String>) {
+        let path = path.to_string();
+        if self.could_not_remove.iter().any(|l| l.path == path) {
+            return;
+        }
+        self.could_not_remove.push(Leftover {
+            path,
+            reason: reason.into(),
+        });
+    }
 }
 
 /// One connected OAuth account, reduced to what the wipe needs: its keychain token key, whether it's
@@ -334,6 +366,81 @@ fn cached_vault_ids_to_wipe(
     out
 }
 
+/// Whether the erase may delete the vault a pointer names, and if not, why not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointedVaultVerdict {
+    /// Provably this account's own vault: remove PM's files from that folder.
+    Delete,
+    /// Not ours to remove. The reason becomes the sentence the user reads next to the path.
+    Leave(LeaveReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaveReason {
+    /// A shared vault another account created. Theirs to delete, from their own PM.
+    OwnedByAnotherAccount,
+    /// A shareable vault with no owner recorded, or an OS that cannot tell us who we are.
+    OwnerUnknown,
+    /// The folder holds no readable vault metadata, so we cannot establish anything about it.
+    MetaUnreadable,
+    /// The metadata failed its integrity check, so the ownership stamp in it is not evidence.
+    MetaTampered,
+}
+
+impl LeaveReason {
+    /// The user-facing half, appended after the folder's path.
+    fn why(self) -> &'static str {
+        match self {
+            Self::OwnedByAnotherAccount => {
+                "it belongs to another account on this machine, so it is theirs to delete"
+            }
+            Self::OwnerUnknown => {
+                "PM can't confirm this account created it, and it won't delete a shared folder on a \
+                 guess"
+            }
+            Self::MetaUnreadable => "PM can no longer read what is in it",
+            Self::MetaTampered => {
+                "its settings file failed its integrity check, so PM won't act on what it claims"
+            }
+        }
+    }
+}
+
+/// Whether "Remove PM data" may delete the vault at the far end of this profile's pointer.
+///
+/// Pure, because this is the entire correctness surface of deleting outside PM's own folder: it
+/// decides whether files the user chose the location of get removed. The polarity is deliberately
+/// the OPPOSITE of [`vault::is_vault_owner`] — that one fails OPEN so a SID hiccup never locks a
+/// real owner out of their connectors; this one fails CLOSED so a SID hiccup can never destroy
+/// somebody's data. Every branch that isn't a proof leaves the folder alone and reports where it is.
+///
+/// `Device` deletes on every platform: a device vault's key lives in one account's keychain, so no
+/// other account can open it wherever it sits. `Owned` needs a SID match, which only Windows can
+/// give — so on macOS and Linux every *shareable* vault lands in `Unknown` and is reported rather
+/// than removed. That is the honest outcome of shared vaults being a Windows feature, not an
+/// oversight, and it leaves the ordinary "I moved my vault to another drive" case working everywhere.
+fn pointed_vault_verdict(
+    ownership: Option<vault::VaultOwnership>,
+    meta_tampered: bool,
+) -> PointedVaultVerdict {
+    // Checked first: a tampered meta means the ownership stamp inside it is exactly the field an
+    // attacker would edit, so it cannot be the thing that authorises a delete.
+    if meta_tampered {
+        return PointedVaultVerdict::Leave(LeaveReason::MetaTampered);
+    }
+    match ownership {
+        None => PointedVaultVerdict::Leave(LeaveReason::MetaUnreadable),
+        Some(vault::VaultOwnership::Device) => PointedVaultVerdict::Delete,
+        Some(vault::VaultOwnership::Owned) => PointedVaultVerdict::Delete,
+        Some(vault::VaultOwnership::Joined) => {
+            PointedVaultVerdict::Leave(LeaveReason::OwnedByAnotherAccount)
+        }
+        Some(vault::VaultOwnership::Unknown) => {
+            PointedVaultVerdict::Leave(LeaveReason::OwnerUnknown)
+        }
+    }
+}
+
 /// Gather (but do not yet act on) everything the keychain teardown needs, while the store is still
 /// open. Best-effort: a locked / forgotten-passphrase vault has no connection, and that user must
 /// still be able to erase their secrets, so no store just means no per-account tokens to enumerate —
@@ -469,7 +576,22 @@ fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
     // handle blocks it, the marker-driven uninstaller hook is the backstop.
     if let Ok(data_dir) = paths::data_dir(app) {
         remove_dir_all_retrying(&data_dir);
+        // Truthful, not assumed. This used to be set unconditionally, so off Windows — where no
+        // uninstaller follows to sweep up — the summary said "everything PM stored is gone" over a
+        // folder that might still be sitting there.
+        if data_dir.exists() {
+            report.leave_behind(
+                data_dir.display(),
+                "PM could not remove its own folder — most likely a file still open in another \
+                 program. Close everything and delete it by hand",
+            );
+        }
     }
+    // The Windows AppContainer PM creates to confine its document worker. Nothing has ever removed
+    // it, so a profile folder and a registry mapping outlive "remove PM completely". Must run after
+    // the worker is stopped — the API refuses while a process is still using the container.
+    #[cfg(windows)]
+    crate::sidecar_sandbox::remove_container_profile();
     report.full_purge = true;
 }
 
@@ -534,6 +656,134 @@ pub fn sweep_restore_staging(data_dir: &Path, active_vault_root: &Path) {
     }
 }
 
+/// Remove PM's own files from a vault folder the user chose the location of, once
+/// [`pointed_vault_verdict`] has proved it is this account's to remove.
+///
+/// Deliberately the `delete_shared_vault` recipe (commands.rs), in its order and for its reasons —
+/// release OUR writer lock first, because `vault.lock` sits in the folder we are about to empty and
+/// `delete_vault_artifacts` spares it on purpose (it cannot tell our lock from another instance's);
+/// then drop the ACL lockdown PM applied so the artifacts are deletable; then the artifacts; then
+/// the folder ONLY if PM had it to itself. Never `remove_dir_all` on a user-chosen folder: it may
+/// hold their own files, and it may be a synced folder where a recursive delete propagates to every
+/// other device on the account.
+fn remove_pointed_vault(
+    app: &AppHandle,
+    state: &AppState,
+    root: &Path,
+    meta: Option<&vault::VaultMeta>,
+    report: &mut WipeReport,
+) {
+    report.freed_bytes += dir_size(&root.join("vault"));
+    report.freed_bytes += std::fs::metadata(root.join("pm.sqlite"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    crate::lock_session::disengage(app);
+    let _ = vault::lock::release(root, &state.instance_id);
+    let _ = vault::acl::reset_inheritance(root);
+    vault::migrate::delete_vault_artifacts(root);
+    // `delete_vault_artifacts` spares vault.lock for its boot-recovery callers; this caller is
+    // erasing its own vault, so the lock is ours or nobody's — and left in place it would guarantee
+    // the empty check below never passes.
+    let _ = std::fs::remove_file(root.join("vault.lock"));
+
+    let emptied = std::fs::read_dir(root)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(false);
+    if emptied {
+        let _ = std::fs::remove_dir(root);
+    } else if root.exists() {
+        report.leave_behind(
+            root.display(),
+            "PM removed its own files from this folder but left the folder itself, because it \
+             still holds things PM did not put there",
+        );
+    }
+
+    // The machine-wide advertisement names this folder and the account that owned it, and lives
+    // where every account can read it. With the vault gone it is stale either way; a vault that
+    // lived outside PM's own folder gets a tombstone instead of a plain retraction, so a joiner
+    // learns it was deleted rather than seeing it as merely unreachable.
+    if let (Some(meta), Some(ads)) = (meta, vault::advert::ads_dir()) {
+        if meta.key_mode == vault::KeyMode::Passphrase {
+            let tombstone = vault::advert::SharedVaultAd::tombstone(&meta.vault_id, root);
+            if vault::advert::publish(&ads, &tombstone).is_ok() {
+                report.leave_behind(
+                    vault::advert::ads_dir()
+                        .map(|d| {
+                            d.join(format!("{}.json", meta.vault_id))
+                                .display()
+                                .to_string()
+                        })
+                        .unwrap_or_default(),
+                    "a small marker telling other accounts on this machine that the shared vault \
+                     was deleted rather than merely unreachable — safe to delete once they have \
+                     each opened PM once",
+                );
+            }
+        } else {
+            let _ = vault::advert::retract(&ads, &meta.vault_id);
+        }
+    }
+}
+
+/// Every filename prefix PM mints inside the OS temp directory. Each is followed by a random
+/// suffix from `tempfile`, so nothing a user put there can match one — which is what makes sweeping
+/// by prefix safe. Kept as one list because a new staging site that forgets to join it becomes a
+/// leftover nothing will ever find.
+///
+/// `pm-drive-`/`pm-onedrive-` are the ones that matter most: they hold a **plaintext** copy of a
+/// document downloaded from a connector, staged for the converter. That staging deliberately
+/// disarms its own auto-delete (`cloud_sync::stage_temp` calls `.keep()`, so the converter can open
+/// it on Windows) and is removed only on the normal return path — so a crash, a kill, or a
+/// force-quit mid-sync strands the user's actual file, in the clear, forever.
+const TEMP_STAGING_PREFIXES: &[&str] = &[
+    "pm-drive-",
+    "pm-onedrive-",
+    "pm-export-",
+    "pm-backup-",
+    "pm-backup-snap-",
+    "pm-restore-",
+    "pm-restore-gdrive-",
+    "pm-restore-proton-",
+    "pm-python-",
+];
+
+/// Whether a temp entry is one of PM's own staging files. Pure, so the matching rule — the part
+/// that must never widen to something a user owns — is testable without touching a disk.
+fn is_pm_temp_staging(name: &str) -> bool {
+    TEMP_STAGING_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Remove PM's abandoned staging files from the OS temp directory, returning how many went.
+///
+/// Runs at boot (no sync, backup or restore can be in flight yet, so nothing live is at risk) and
+/// again during the wipe. Scoped to `std::env::temp_dir()` and to [`is_pm_temp_staging`]; anything
+/// that is not a positive prefix match is not touched.
+pub fn sweep_temp_staging() -> usize {
+    let tmp = std::env::temp_dir();
+    let Ok(rd) = std::fs::read_dir(&tmp) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_pm_temp_staging(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            remove_dir_all_retrying(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        if !path.exists() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Execute the confirmed removal. The UI has already gated this behind the full confirmation ladder
 /// (explicit checkboxes → "are you sure" itemisation → optional Windows Hello → type-to-confirm), so
 /// this simply carries it out in a safe order and reports what happened.
@@ -571,19 +821,24 @@ pub async fn wipe_pm_data(
     //        it can't be removed, before any irreversible key deletion. ---
     if selection.vault_and_db || selection.keychain {
         let data_dir = paths::data_dir(&app)?;
-        // Never delete a vault this profile only POINTS at (a joined/shared vault): the folder
-        // belongs to every account that uses it, and `vault::resolve` follows the pointer — so
-        // an unguarded wipe here would destroy the shared store for ALL of them from any one
-        // account's "Remove PM data". Wipe THIS account's local state instead: the store and
-        // artifacts at the DEFAULT location (a joiner's set-aside vault, or nothing), both
-        // pointers, staging, journal + backup. The shared folder is left untouched; deleting
-        // it for everyone is a deliberate, separately-confirmed action, never a side effect.
-        // (Mirrors the reset_after_open_error guard below, which predates this one.)
-        let pointed = vault::pointer::load(&data_dir)
-            .ok()
-            .flatten()
-            .map(|p| p.vault_root);
-        let resolved = if pointed.is_some() {
+        // A profile can POINT at a vault outside its own folder, and the pointer is written by two
+        // very different doors: joining someone else's shared vault, and moving your own. This used
+        // to refuse both, which was right for the first and wrong for the second — a vault YOU moved
+        // is live and fully accessible, so the erase deleted its key while leaving the folder, and a
+        // moved device vault keeps PLAINTEXT notes. Readable notes with a destroyed key is the worst
+        // of both. So the two cases are now told apart by evidence, and the local state at the
+        // DEFAULT location is wiped either way.
+        let pointed = vault::pointer::load(&data_dir).ok().flatten();
+        let pointed_root = pointed.as_ref().map(|p| p.vault_root.clone());
+        let pointed_verdict = pointed_root.as_ref().map(|root| {
+            let meta = vault::load_meta(root).ok().flatten();
+            let verdict = pointed_vault_verdict(
+                meta.as_ref().map(vault::vault_ownership),
+                state.meta_warning().is_some(),
+            );
+            (verdict, meta)
+        });
+        let resolved = if pointed_root.is_some() {
             let _ = state.take_conn();
             let _ = state.clear_vault_runtime();
             vault::resolve_layout(&data_dir, None)
@@ -614,20 +869,44 @@ pub async fn wipe_pm_data(
 
         // The DB file is confirmed gone; now the rest of the vault artifacts.
         report.freed_bytes += remove_vault_artifacts(&resolved, &data_dir);
+        // `delete_vault_artifacts` spares `vault.lock` for its boot-recovery callers, and the wipe
+        // inherited that without inheriting the reason: here the lock is this profile's own, and
+        // left behind it names the OS profile that held it.
+        crate::lock_session::disengage(&app);
+        let _ = vault::lock::release(&resolved.vault_root, &state.instance_id);
+        let _ = std::fs::remove_file(resolved.vault_root.join("vault.lock"));
+        // PM's staging files in the OS temp dir. A connector download is staged there in the CLEAR
+        // and its auto-delete is disarmed so the converter can read it, so an interrupted sync
+        // leaves the user's document behind — outside every folder this erase would otherwise visit.
+        let swept = sweep_temp_staging();
+        if swept > 0 {
+            report.removed.push(format!(
+                "{swept} leftover staging file(s) from interrupted syncs"
+            ));
+        }
 
-        // Name the folder rather than calling it "the shared vault folder". The pointer is written by
-        // BOTH doors — joining someone else's vault AND moving your own — and carries no record of
-        // which, so the old wording told a user who had simply moved their vault to D:\ that a folder
-        // full of their own notes was somebody else's. Naming the path is true either way, and it is
-        // the only way they learn those files are still there while their key is being deleted below.
-        report.removed.push(match &pointed {
-            Some(root) => format!(
-                "This account's PM data. Your vault itself is in {} — that folder is outside PM \
-                 and has been left exactly as it is, so delete it yourself if you want it gone",
-                root.display()
-            ),
-            None => "Vault & encrypted database".into(),
-        });
+        // Now the pointed vault, if this profile has one and it is provably ours.
+        match (&pointed_root, pointed_verdict) {
+            (Some(root), Some((PointedVaultVerdict::Delete, meta))) => {
+                remove_pointed_vault(&app, &state, root, meta.as_ref(), &mut report);
+                report.removed.push(format!(
+                    "Vault & encrypted database, including {}",
+                    root.display()
+                ));
+            }
+            (Some(root), Some((PointedVaultVerdict::Leave(why), _))) => {
+                // Named, never guessed at. The user is about to lose the key that opens whatever is
+                // in there, so being told exactly where it is is the least PM owes them.
+                report.leave_behind(
+                    root.display(),
+                    format!("PM did not delete this vault: {}", why.why()),
+                );
+                report
+                    .removed
+                    .push("This account's PM data (see what was left below)".into());
+            }
+            _ => report.removed.push("Vault & encrypted database".into()),
+        }
         report.quit_required = true;
     }
 
@@ -1139,6 +1418,92 @@ mod tests {
             "could not read the database file (disk I/O error): some os error"
         ));
         assert!(!is_genuine_brick(""));
+    }
+
+    #[test]
+    fn a_pointed_vault_is_only_deleted_when_it_is_provably_ours() {
+        use vault::VaultOwnership::*;
+        // The whole safety argument for deleting outside PM's own folder. Every branch that is not
+        // a proof must leave the folder alone — the opposite polarity to `is_vault_owner`, which
+        // fails OPEN so a SID hiccup never locks an owner out of their connectors. Here a SID
+        // hiccup must never destroy data instead.
+        assert_eq!(
+            pointed_vault_verdict(Some(Device), false),
+            PointedVaultVerdict::Delete,
+            "a device vault's key lives in this account's keychain alone, wherever the folder sits"
+        );
+        assert_eq!(
+            pointed_vault_verdict(Some(Owned), false),
+            PointedVaultVerdict::Delete,
+            "a shared vault stamped with our own SID is ours"
+        );
+        assert_eq!(
+            pointed_vault_verdict(Some(Joined), false),
+            PointedVaultVerdict::Leave(LeaveReason::OwnedByAnotherAccount)
+        );
+        assert_eq!(
+            pointed_vault_verdict(Some(Unknown), false),
+            PointedVaultVerdict::Leave(LeaveReason::OwnerUnknown),
+            "no recorded owner is not the same as ours -- and off Windows this is EVERY shared vault"
+        );
+        assert_eq!(
+            pointed_vault_verdict(None, false),
+            PointedVaultVerdict::Leave(LeaveReason::MetaUnreadable)
+        );
+
+        // A tampered meta outranks everything: the ownership stamp lives inside the file whose
+        // integrity just failed, so it cannot be the thing that authorises a delete.
+        for ownership in [Device, Owned, Joined, Unknown] {
+            assert_eq!(
+                pointed_vault_verdict(Some(ownership), true),
+                PointedVaultVerdict::Leave(LeaveReason::MetaTampered),
+                "{ownership:?} must not be trusted from a meta that failed its integrity check"
+            );
+        }
+    }
+
+    #[test]
+    fn the_temp_sweep_matches_pms_own_staging_and_nothing_else() {
+        // This sweep deletes files in a directory shared with every other program on the machine,
+        // so the matching rule is the thing that must never widen. Each prefix is PM-minted and
+        // followed by a random suffix.
+        assert!(is_pm_temp_staging("pm-drive-a1B2c3.pdf"));
+        assert!(is_pm_temp_staging("pm-onedrive-XyZ.docx"));
+        assert!(is_pm_temp_staging("pm-restore-gdrive-99"));
+        assert!(is_pm_temp_staging("pm-backup-snap-7"));
+
+        for other in [
+            "pm.sqlite",                  // never in temp, but the closest-looking real filename
+            "pm-check.log",               // a developer's own scratch file, seen in the wild
+            "personal-manager-notes.txt", // a user's file that merely starts similarly
+            "drive-export.pdf",
+            "PM-3.110.2-updater-x", // the updater's staging: different owner, different PR
+            "",
+        ] {
+            assert!(!is_pm_temp_staging(other), "{other} is not PM staging");
+        }
+    }
+
+    #[test]
+    fn sweeping_temp_removes_a_stranded_download_and_leaves_the_rest() {
+        // End to end against the real temp dir, using names no other process would mint.
+        let tmp = std::env::temp_dir();
+        let staged = tmp.join("pm-drive-wipetest-90210.pdf");
+        let innocent = tmp.join("pm-notes-wipetest-90210.txt");
+        std::fs::write(&staged, b"a user's actual document").unwrap();
+        std::fs::write(&innocent, b"not PM's").unwrap();
+
+        sweep_temp_staging();
+
+        assert!(
+            !staged.exists(),
+            "an abandoned staged download is collected"
+        );
+        assert!(
+            innocent.exists(),
+            "anything outside the prefix list is untouched"
+        );
+        let _ = std::fs::remove_file(&innocent);
     }
 
     #[test]

@@ -213,6 +213,57 @@ fn is_owner_given(owner_sid: &Option<String>, current: Option<&str>) -> bool {
     }
 }
 
+/// The four realities [`is_vault_owner`] folds into one `bool`.
+///
+/// That fold is right for its own job — gating connector setup, where failing open means a SID
+/// hiccup never locks the real owner out. It is wrong for anything destructive, because "nobody
+/// recorded an owner" and "this account is the owner" are the same `true` there, and a delete needs
+/// to tell them apart. One rule, so the badge the user reads, the button PM offers and the erase's
+/// own decision can never disagree about who owns a vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultOwnership {
+    /// A device vault: its key lives in this account's keychain alone, so no other account can open
+    /// it wherever it sits. Ours by construction.
+    Device,
+    /// A shareable vault stamped with this account's SID — we created it.
+    Owned,
+    /// A shareable vault stamped with a DIFFERENT account's SID — someone else created it and we
+    /// joined. Theirs.
+    Joined,
+    /// A shareable vault with no recorded owner (created before ownership existed), or one whose
+    /// SID could not be resolved — which is every shareable vault off Windows, since shared vaults
+    /// and SIDs are both Windows-only. Never treated as ours.
+    Unknown,
+}
+
+/// The pure ownership rule, so it unit-tests without a live SID lookup — and so macOS and Linux,
+/// where `current` is always `None`, are covered by the same tests as Windows.
+pub fn ownership_given(
+    key_mode: KeyMode,
+    owner_sid: Option<&str>,
+    current: Option<&str>,
+) -> VaultOwnership {
+    if key_mode == KeyMode::Device {
+        return VaultOwnership::Device;
+    }
+    match (owner_sid, current) {
+        (Some(owner), Some(me)) if owner == me => VaultOwnership::Owned,
+        (Some(_), Some(_)) => VaultOwnership::Joined,
+        // No stamp to compare, or no SID to compare it against. Not provably ours.
+        _ => VaultOwnership::Unknown,
+    }
+}
+
+/// [`ownership_given`] against this vault's metadata and the current OS account.
+pub fn vault_ownership(meta: &VaultMeta) -> VaultOwnership {
+    ownership_given(
+        meta.key_mode,
+        meta.owner_sid.as_deref(),
+        current_user_sid_opt().as_deref(),
+    )
+}
+
 /// The current account's SID for the ownership check — `None` off-Windows or on lookup failure.
 #[cfg(windows)]
 fn current_user_sid_opt() -> Option<String> {
@@ -1543,6 +1594,47 @@ mod tests {
             !report.needs_warning(),
             "the re-stamped meta verifies cleanly (no false tamper warning)"
         );
+    }
+
+    #[test]
+    fn ownership_keeps_unknown_apart_from_ours() {
+        // `is_vault_owner` answers `true` for both "we own it" and "nobody recorded an owner",
+        // which is right for gating connectors and wrong for anything that deletes. These are the
+        // four realities it folds together.
+        let me = Some("S-1-5-21-me");
+        let them = Some("S-1-5-21-them");
+
+        // A device vault is ours by construction: its key is in one account's keychain, so the
+        // owner field is irrelevant and so is the platform.
+        assert_eq!(
+            ownership_given(KeyMode::Device, None, None),
+            VaultOwnership::Device
+        );
+        assert_eq!(
+            ownership_given(KeyMode::Device, them, me),
+            VaultOwnership::Device
+        );
+
+        assert_eq!(
+            ownership_given(KeyMode::Passphrase, me, me),
+            VaultOwnership::Owned
+        );
+        assert_eq!(
+            ownership_given(KeyMode::Passphrase, them, me),
+            VaultOwnership::Joined
+        );
+        // No stamp, or nobody to compare it against. NOT ours -- where the old bool said `true`.
+        assert_eq!(
+            ownership_given(KeyMode::Passphrase, None, me),
+            VaultOwnership::Unknown
+        );
+        assert_eq!(
+            ownership_given(KeyMode::Passphrase, me, None),
+            VaultOwnership::Unknown,
+            "off Windows there is no SID to compare, so every shared vault is Unknown -- the \
+             device case above is what still works there"
+        );
+        assert!(is_owner_given(&None, me), "the old rule still fails open");
     }
 
     #[test]

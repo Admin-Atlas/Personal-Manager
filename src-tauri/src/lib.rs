@@ -1049,6 +1049,18 @@ pub fn run() {
                 wipe::sweep_restore_staging(&data_dir, &resolved.vault_root);
             }
 
+            // Same idea, one directory over: PM's staging files in the OS temp dir. A connector
+            // download is staged there in the CLEAR for the converter to read, and its auto-delete
+            // is deliberately disarmed so the converter can open it — so an interrupted sync leaves
+            // the user's actual document lying in %TEMP%, and nothing has ever collected it. Boot is
+            // the safe moment: no sync, backup or restore can be in flight yet.
+            let swept = wipe::sweep_temp_staging();
+            if swept > 0 {
+                eprintln!(
+                    "startup: cleared {swept} abandoned staging file(s) from the temp folder"
+                );
+            }
+
             // If a prior full "remove PM completely" wipe armed the uninstaller's purge marker but the
             // uninstall didn't happen (cancelled), we're booting normally — the user kept/reinstalled
             // PM — so clear the stale marker or a later *ordinary* uninstall would wrongly purge data.

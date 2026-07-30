@@ -34,7 +34,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES};
 use windows::Win32::System::Pipes::CreatePipe;
@@ -367,6 +367,25 @@ fn ensure_profile_sid() -> Result<String> {
         let s = ptr.to_string().map_err(|e| other("sid utf16", e))?;
         let _ = LocalFree(Some(HLOCAL(ptr.0 as *mut c_void)));
         Ok(s)
+    }
+}
+
+/// Delete the AppContainer profile, for "remove PM completely".
+///
+/// Creating it leaves two things behind that nothing else ever collected: the profile folder at
+/// `%LOCALAPPDATA%\Packages\<CONTAINER_NAME>\` and a registry mapping under
+/// `HKCU\Software\Classes\Local Settings\...\AppContainer\Mappings\<SID>`. One API removes both.
+///
+/// Best-effort and unconditional: it fails while a process is still using the container, so the
+/// caller must have stopped the worker first, and it fails harmlessly when there is no profile.
+///
+/// **Only ever removes the CURRENT name**, which is why [`CONTAINER_NAME`] must never be renamed —
+/// a machine that has run an older build carries the old profile forever, exactly as the bundle id
+/// rule warns. Verified on the author's machine, which still holds an orphan from a retired name.
+pub fn remove_container_profile() {
+    unsafe {
+        let name = HSTRING::from(CONTAINER_NAME);
+        let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
     }
 }
 

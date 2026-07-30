@@ -258,7 +258,14 @@ pub struct VaultStatus {
     /// Whether the CURRENT Windows account owns the active vault. True for a device vault or a legacy
     /// shared vault (no owner recorded); a shared vault stamped with an owner SID is owned only by its
     /// creator's account, so a joiner sees `false`. Lets the UI present connectors as owner-managed.
+    ///
+    /// Fails OPEN on purpose — see [`vault::is_vault_owner`]. For anything destructive read
+    /// `ownership` instead, which keeps "nobody recorded an owner" apart from "this is ours".
     pub is_owner: bool,
+    /// Who owns the active vault, with "unknown" told apart from "ours" — the distinction `is_owner`
+    /// folds away and a delete button needs. Drives hiding "Delete shared vault" for a joiner, and
+    /// warning on it when ownership can't be established.
+    pub ownership: vault::VaultOwnership,
     /// "This vault's settings file was altered outside PM", when the last open said so. The same
     /// sentence `vault://meta-warning` carries — repeated here because the boot open happens before
     /// any webview is listening, and because the condition now PERSISTS: a failed integrity check is
@@ -371,6 +378,10 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         retired_root,
         deleted_notice,
         is_owner: meta.as_ref().map(vault::is_vault_owner).unwrap_or(true),
+        ownership: meta
+            .as_ref()
+            .map(vault::vault_ownership)
+            .unwrap_or(vault::VaultOwnership::Device),
         meta_warning: state.meta_warning(),
     })
 }
@@ -1057,9 +1068,15 @@ pub fn acknowledge_deleted_shared_vault(app: AppHandle, state: State<'_, AppStat
 /// leave a tombstone so every joined account learns it's gone at their next launch, and
 /// switch THIS account back to a vault of its own. Distinct from make-private (which keeps
 /// the data, just re-privatises it) and from detach (which leaves the shared copy intact) —
-/// this is the deliberate "take the shared vault away from everyone" action. Any account
-/// with write access to the folder can run it (it can't be hard-gated to the OS owner), so
-/// the UI warns when the caller isn't the advertised owner.
+/// this is the deliberate "take the shared vault away from everyone" action.
+///
+/// **Refused when the vault records a different account as its owner.** The doc here used to say the
+/// UI warns in that case; it never did, so any joined account got the same button with the same
+/// confirmation and could take the vault away from everyone who used it. The gate cannot be airtight
+/// — a joiner with write access to the folder can delete the files in Explorer regardless — but that
+/// is not a reason for PM to hand them the button. A vault with no owner recorded is still allowed
+/// through, so a genuine owner from before ownership existed, or one whose SID changed, is never
+/// locked out of deleting their own vault; the UI warns there instead.
 #[tauri::command]
 pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result<VaultOpOutcome> {
     let data_dir = paths::data_dir(&app)?;
@@ -1078,6 +1095,14 @@ pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result
     }
     let meta = vault::load_meta(&root)?
         .ok_or_else(|| Error::Other("this folder no longer holds a PM vault".into()))?;
+    if vault::vault_ownership(&meta) == vault::VaultOwnership::Joined {
+        return Err(Error::Other(
+            "This shared vault was created by another account on this machine, so it's theirs to \
+             delete. You can leave it from here instead — the vault stays where it is for everyone \
+             still using it."
+                .into(),
+        ));
+    }
     let mut warnings = Vec::new();
 
     // Close our handle, then remove the vault from the shared folder. Reset any lockdown
