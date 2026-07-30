@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.1-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "PM no longer leaves hundreds of megabytes in a cache folder you'd never think to look in. Setting up its Python components left every downloaded package sitting in a system-wide cache outside PM entirely, where removing PM never touched it. That cache is no longer written at all — the same downloads happen, nothing is kept afterwards.",
+      "The same for the model downloader's own scratch cache, which quietly wrote to your home folder instead of PM's. Everything PM downloads — the search model, the speech model, and their caches — now lives in one folder under PM, so it goes when PM goes.",
+      "Old installers left over from updating PM are cleared out too. Each update downloaded an installer to your temp folder and never removed it, so they built up around 100 MB at a time.",
+      "The removal summary now points you at the things PM caused but shouldn't delete for you — models you pulled through the Local AI tab belong to Ollama, and on a Mac, the microphone permission is macOS's to forget. It tells you where they are and how to clear them, rather than leaving you to find them.",
+      'And it stops saying "everything PM stored is gone" when it has just listed things it left behind.',
+    ],
+  },
+  {
     version: "3.111.0-alpha",
     date: "2026-07-31",
     highlights: [

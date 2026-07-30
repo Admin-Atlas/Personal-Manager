@@ -79,6 +79,12 @@ _MODELS_DIR = os.environ.get("PM_MODELS_DIR") or None
 if _MODELS_DIR:
     # Covers the huggingface_hub / tokenizers cache (the `from_pretrained` fallback path).
     os.environ["HF_HOME"] = os.path.join(_MODELS_DIR, "hf")
+    # hf_xet (pulled in by huggingface_hub) does NOT honour HF_HOME: it has its own variable and
+    # otherwise writes its chunk cache AND its logs to ~/.cache/huggingface/xet, outside everything
+    # PM owns and outside everything the erase visits. Found there on a dev machine, with dated
+    # logs. Pinning it keeps the whole model story inside one deletable subtree, which is also what
+    # the Windows sandbox's filesystem allow-set assumes.
+    os.environ["HF_XET_CACHE"] = os.path.join(_MODELS_DIR, "hf", "xet")
 
 
 def _fastembed_cache_dir():
