@@ -11,6 +11,13 @@
 // This closes that: expand `check` (via `check-fast`) to its leaf recipes and assert
 // each is invoked as a `just <recipe>` step somewhere in pr.yml — with one mapped
 // exception (cargo-deny runs via its pinned Action, not `just deny`). Pure Node.
+//
+// SECOND DIRECTION (2026-07-29 audit, batch A1). The justfile also claims `check-fast`
+// is "what pre-commit runs", and that claim had rotted the same way for the same reason:
+// .pre-commit-config.yaml re-lists the members by hand, so it had drifted to 9 of the 13.
+// The four it had lost were licence-subset, ci-membership, sync-set and script-deps — the
+// drift guards, whose entire job is to notice two files disagreeing, and which therefore
+// could not notice their own absence. Every `check-fast` member must now have a hook.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -21,6 +28,7 @@ const read = (rel) => readFileSync(join(repoRoot, rel), "utf8").replace(/\r\n/g,
 
 const justfile = read("justfile");
 const prYml = read(".github/workflows/pr.yml");
+const preCommit = read(".pre-commit-config.yaml");
 
 // The space-separated prerequisite list after `recipe:` (justfile dependency syntax).
 function recipeDeps(name) {
@@ -63,4 +71,52 @@ if (problems.length) {
   process.exit(1);
 }
 
-console.log(`✓ CI membership: all ${leaves.size} \`just check\` recipes are wired into pr.yml`);
+// --- direction 2: check-fast ⊆ pre-commit --------------------------------------------------
+// Hooks invoke recipes as `entry: just <recipe>`, one per hook.
+const hooked = new Set(
+  [...preCommit.matchAll(/^\s*entry:\s*just\s+([a-z0-9-]+)/gm)].map((m) => m[1]),
+);
+
+// Recipes pre-commit runs through a different, deliberately-named variant.
+const PRE_COMMIT_ALIAS = {
+  // `version-local` is the offline-tolerant form: it does the bumped-vs-base check against
+  // origin/main when that ref is fetched and degrades to lockstep-only (with a warning) when it
+  // is not, so committing on a plane isn't blocked. CI runs the strict `version` (T1-10).
+  version: "version-local",
+};
+
+const missing = [];
+for (const recipe of [...fast].sort()) {
+  if (hooked.has(recipe)) continue;
+  const alias = PRE_COMMIT_ALIAS[recipe];
+  if (alias && hooked.has(alias)) continue;
+  missing.push(recipe);
+}
+
+// The floor: if the hook parser found almost nothing, every check above is vacuously true.
+if (hooked.size < fast.length) {
+  // Only a real diagnostic when it is ALSO reporting misses — a parse of 0 with 0 misses is
+  // impossible, so this can't mask a broken parser.
+  if (!missing.length) {
+    console.error(
+      `✗ CI membership: parsed only ${hooked.size} \`entry: just …\` hooks from ` +
+        `.pre-commit-config.yaml but reported no misses — the hook parser is broken.`,
+    );
+    process.exit(1);
+  }
+}
+
+if (missing.length) {
+  console.error("✗ CI membership: `check-fast` recipes with no pre-commit hook:\n");
+  for (const r of missing) console.error(`  • ${r}  — add a hook running "just ${r}"`);
+  console.error(
+    "\n  The justfile states that check-fast is what pre-commit runs. Either add the hook or\n" +
+      "  stop claiming it — a subset that drifts is worse than an honest one.",
+  );
+  process.exit(1);
+}
+
+console.log(
+  `✓ CI membership: all ${leaves.size} \`just check\` recipes are wired into pr.yml, ` +
+    `and all ${fast.length} \`check-fast\` recipes have a pre-commit hook`,
+);

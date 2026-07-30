@@ -20,10 +20,13 @@ default:
 # --- aggregates -----------------------------------------------------------
 
 # The fast subset (formatting, types, lint, bespoke gates) — what pre-commit runs.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps
+# `just ci-membership` asserts BOTH directions of that claim: every member below has a
+# step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
+# and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
-check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
+check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
 
 # Auto-apply every formatter (the writing counterpart to the --check recipes).
 fmt:
@@ -54,6 +57,15 @@ tsc:
 # tests and scripts/**/*.test.mjs — so "frontend" undersells it; see vitest.config.ts for the globs.
 frontend-test:
     npx vitest run
+
+# Build the PRODUCTION webview bundle — the artifact `tauri build` actually ships.
+# `tsc --noEmit`, ESLint and vitest between them never run the bundler, so a broken
+# dynamic import, a missing asset, a Tailwind/plugin config error or a dependency that
+# simply won't bundle was invisible to every PR and first appeared inside the release
+# job. In `check` rather than `check-fast`: it is the one frontend check slow enough
+# to notice on every commit.
+build-frontend:
+    npx vite build
 
 # --- backend (Rust) -------------------------------------------------------
 
@@ -184,6 +196,13 @@ sync-set:
 # in CI. Also asserts each exception is still imported, dev-only, and exactly pinned.
 script-deps:
     node scripts/check-script-deps.mjs
+
+# Every `uses:` in .github/workflows is pinned to a 40-char commit SHA with a readable
+# version comment. Both workflow headers already CLAIM "the repo enforces it" — until
+# now nothing did, so a `uses: foo/bar@v3` would have sailed through while the repo
+# kept asserting the opposite.
+action-pins:
+    node scripts/check-action-pins.mjs
 
 # --- release-only ---------------------------------------------------------
 
