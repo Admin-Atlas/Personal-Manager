@@ -32,6 +32,13 @@ env:
 permissions:
   contents: read
 
+# One release run per tag. Deliberately NOT cancel-in-progress: a half-published
+# release — assets uploaded, latest.json not yet — is worse than a queued one, so a
+# second dispatch for the same tag waits rather than killing the first mid-upload.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   # --- pre-flight gate (no secrets, runs first) ---------------------------
   guards:
@@ -40,10 +47,8 @@ jobs:
       tag: ${{ steps.ver.outputs.tag }}
       version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
+      # Validate the tag BEFORE checking anything out — the regex needs no working
+      # tree, and the resolved tag is what the checkout below then uses as its ref.
       - name: Resolve + validate version
         id: ver
         shell: bash
@@ -62,6 +67,18 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Check out THE TAG, explicitly. Without a `ref:` this resolved to the tag only
+      # on the `push: tags` trigger; on workflow_dispatch it resolved to whatever
+      # branch the dispatch was started from — so re-running a release for an older
+      # tag built main's current HEAD and published it under that tag. The version
+      # guard below could not catch it, because it reads the manifests it was just
+      # handed. A dispatch naming a tag that does not exist now fails here instead of
+      # quietly shipping something else.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.ver.outputs.tag }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -94,16 +111,15 @@ jobs:
           - os: ubuntu-22.04
             args: ""
     runs-on: ${{ matrix.os }}
-    env:
-      # Empty until the secret is set. Its presence is what flips the notarization-key
-      # step (and therefore macOS Developer-ID signing) on — until then the macOS build
-      # stays UNSIGNED and succeeds exactly as it does today.
-      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
     steps:
       # Actions are SHA-pinned; the trailing "# vX.Y.Z" is the human-readable
       # version (and what Dependabot reads). Keep it.
+      #
+      # `ref` is the tag `guards` validated — the build must compile the SAME commit
+      # the gate approved, not whatever branch a dispatch happened to run from.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.guards.outputs.tag }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -139,38 +155,57 @@ jobs:
 
       - run: npm ci
 
-      # macOS Developer-ID signing + notarization is DORMANT until the Apple secrets exist
-      # (see the cert-detection + signed/unsigned build split below — that's what keeps the
-      # unsigned build green). notarytool needs the App Store Connect key as a FILE, so when
-      # the base64 secret exists this step materialises it and exports APPLE_API_KEY_PATH.
-      - name: Prepare Apple notarization key
-        if: matrix.os == 'macos-latest' && env.APPLE_API_KEY_BASE64 != ''
-        shell: bash
-        run: |
-          key_dir="$RUNNER_TEMP/appstore"
-          mkdir -p "$key_dir"
-          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_dir/AuthKey.p8"
-          echo "APPLE_API_KEY_PATH=$key_dir/AuthKey.p8" >> "$GITHUB_ENV"
-
-      # Is macOS Developer-ID signing configured? The cert/identity env vars must be
-      # ABSENT from the build when unset — an empty-but-defined APPLE_CERTIFICATE makes
-      # Tauri attempt `security import` on empty data and fail the bundle (the maiden
-      # v2.0.0-alpha release hit exactly this). We detect the secret in an isolated step
-      # (its env stays local to the step, never leaking an empty value to the build) and
-      # branch the build on the result. `steps.apple.outputs.enabled` is "" on Windows
-      # and Linux (step skipped), so both always take the unsigned path below.
+      # Is macOS Developer-ID signing / notarization configured? Both secrets are read
+      # HERE and nowhere else, in one isolated step whose env never reaches the build.
+      #
+      # Two reasons that isolation matters. The cert/identity vars must be ABSENT from
+      # the build when unset — an empty-but-defined APPLE_CERTIFICATE makes Tauri
+      # attempt `security import` on empty data and fail the bundle (the maiden
+      # v2.0.0-alpha release hit exactly this). And a secret declared at JOB level, as
+      # APPLE_API_KEY_BASE64 was, is present in every step of the Windows and Linux
+      # legs too, which have no use for it — the one Apple secret that was not
+      # step-scoped like its siblings.
+      #
+      # `steps.apple.outputs.*` is "" on Windows and Linux (step skipped), so both
+      # always take the unsigned path below.
       - name: Detect Apple signing
         id: apple
         if: matrix.os == 'macos-latest'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
         run: |
           if [ -n "$APPLE_CERTIFICATE" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
+          # Emit only a boolean, never the value — step outputs are not secret-masked
+          # by virtue of coming from a secret.
+          if [ -n "$APPLE_API_KEY_BASE64" ]; then
+            echo "notarize=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notarize=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # macOS Developer-ID signing + notarization is DORMANT until the Apple secrets
+      # exist (the signed/unsigned build split below is what keeps the unsigned build
+      # green). notarytool needs the App Store Connect key as a FILE, so when the
+      # base64 secret exists this step materialises it and exports APPLE_API_KEY_PATH.
+      # Gated on the detect step's output rather than on `env.…`, because a step
+      # cannot read its own step-level env from its own `if:` — which is precisely
+      # why the secret used to be job-scoped.
+      - name: Prepare Apple notarization key
+        if: steps.apple.outputs.notarize == 'true'
+        shell: bash
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          key_dir="$RUNNER_TEMP/appstore"
+          mkdir -p "$key_dir"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_dir/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$key_dir/AuthKey.p8" >> "$GITHUB_ENV"
 
       # Default path: minisign updater signing only (always active). No Apple env is
       # defined here, so macOS bundles unsigned and succeeds. Windows also runs here.
@@ -259,7 +294,13 @@ jobs:
           base=src-tauri/target/universal-apple-darwin/release/bundle
           cp "$base"/macos/*.app.tar.gz staged/
           cp "$base"/macos/*.app.tar.gz.sig staged/
-          cp "$base"/dmg/*.dmg staged/ || true
+          # NOT `|| true`. That shrug meant a bundler run which produced no .dmg
+          # published a release with an updater bundle and no installer, silently —
+          # nothing downstream asserts the .dmg exists, so a Mac user arriving at the
+          # release page would find nothing to install. macos-bundle-dryrun.yml now
+          # proves this file gets produced on every PR, so a hard failure here is the
+          # correct behaviour rather than a new way to break a release.
+          cp "$base"/dmg/*.dmg staged/
 
       # AppImage (+ its updater .sig — the only Linux format Tauri's updater
       # handles) plus the rpm (Fedora/RHEL) and deb (Debian/Ubuntu) as plain
@@ -299,6 +340,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The tag's requirements.txt, not a branch's — this smoke exists to prove
+          # the deps THIS release pins actually resolve.
+          ref: ${{ needs.guards.outputs.tag }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -325,6 +369,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The tag's tree — this job reads tauri.conf.json's pubkey (updater
+          # signature verification), about.toml (NOTICE generation) and
+          # RELEASE_NOTES.md, and all three must be the release's, not a branch's.
+          ref: ${{ needs.guards.outputs.tag }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -347,9 +395,25 @@ jobs:
           toolchain: stable
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
       - name: Install cargo-about
+        # Downloaded to a FILE and checksummed before it is unpacked, never piped
+        # straight into /usr/local/bin. This job holds `contents: write` and the
+        # release token, so an unverified binary executed here is the single highest-
+        # value place in the repo to land one — a compromised or MITM'd tarball would
+        # be running with the ability to publish releases. The digest is the one
+        # EmbarkStudios publishes alongside the asset (…tar.gz.sha256); it moves only
+        # when the pinned version does.
+        env:
+          CARGO_ABOUT_VERSION: "0.9.0"
+          CARGO_ABOUT_SHA256: "7a1a1bfb3ae3b6feabe9e1d6147a6b34b85bd0339bfd8b0ec11b312dee10d99a"
+        shell: bash
         run: |
-          curl -sSL https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-x86_64-unknown-linux-musl.tar.gz \
-            | tar -xz -C /usr/local/bin --strip-components=1 cargo-about-0.9.0-x86_64-unknown-linux-musl/cargo-about
+          set -euo pipefail
+          asset="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSLo "$RUNNER_TEMP/$asset.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/$asset.tar.gz"
+          echo "$CARGO_ABOUT_SHA256  $RUNNER_TEMP/$asset.tar.gz" | sha256sum --check --strict
+          tar -xz -C /usr/local/bin --strip-components=1 -f "$RUNNER_TEMP/$asset.tar.gz" "$asset/cargo-about"
+          cargo-about --version
       - name: Generate third-party NOTICE
         run: just notice artifacts/THIRD-PARTY-NOTICES.txt
 
