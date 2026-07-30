@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.3-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Removing your data now stops PM writing anything else down, everywhere at once. Clearing your interface preferences only sticks if nothing puts them back — and two things could. The floating briefing window keeps its own copy of your theme, and it can't be told to stop, so PM now closes it before erasing rather than leaving it running. And the main window re-saved every theme setting whenever your system switched between light and dark or you clicked away, which was enough to restore the lot seconds after they'd been cleared.",
+      "The background syncs also stop as soon as you start removing data, instead of carrying on against a machine that's being erased while the final screen is open.",
+    ],
+  },
+  {
     version: "3.111.2-alpha",
     date: "2026-07-31",
     highlights: [

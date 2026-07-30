@@ -34,6 +34,7 @@ import {
 import { resolveMode, type ModeResolution, type ModeSource } from "./resolveMode";
 import type { Coords } from "./timezones";
 import { getPref, setPref } from "../lib/ipc";
+import { isTearingDown } from "../lib/teardown";
 
 // The settings-table key under which the full theme blob is mirrored (see below).
 const PREF_KEY = "appearance";
@@ -203,6 +204,12 @@ function read(key: string): string | null {
   }
 }
 function write(key: string, value: string): void {
+  // Once "Remove PM data" has cleared the store, nothing may put anything back into it. The persist
+  // effect below runs on every axis change AND on the resolved mode, whose driver listens to
+  // `matchMedia("(prefers-color-scheme: dark)")` and `visibilitychange` — so switching away from the
+  // window after the clear was enough to restore all eleven keys into a folder the backend was
+  // about to delete, or had already deleted.
+  if (isTearingDown()) return;
   try {
     localStorage.setItem(key, value);
   } catch {

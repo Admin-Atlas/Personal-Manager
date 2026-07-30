@@ -103,6 +103,7 @@ import type {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { proposeOnArrival, runProposalsAfterSync } from "./lib/reviewProposals";
 import { onDocumentsLanded } from "./lib/documentFeed";
+import { onTeardown } from "./lib/teardown";
 import { VaultJoin } from "./components/VaultJoin";
 import { markJustJoinedVault } from "./lib/joinedVault";
 
@@ -637,7 +638,14 @@ export default function App() {
     };
     void pass();
     const id = setInterval(() => void pass(), CONNECTOR_POLL_MS);
-    return () => clearInterval(id);
+    // Stop the moment "Remove PM data" starts. Nothing here would recreate the data dir any more,
+    // but a sync firing against a machine that has just been erased is work with nowhere to go --
+    // and this used to keep ticking for as long as the user left the done screen open.
+    const off = onTeardown(() => clearInterval(id));
+    return () => {
+      clearInterval(id);
+      off();
+    };
   }, [aiReady]);
 
   // Keep the read-only calendar mirror fresh in the background: one poll shortly after unlock, then
@@ -660,7 +668,12 @@ export default function App() {
     };
     void poll();
     const id = setInterval(() => void poll(), 15 * 60 * 1000);
-    return () => clearInterval(id);
+    // Same as the connector poll above: an erase in progress ends the schedule.
+    const off = onTeardown(() => clearInterval(id));
+    return () => {
+      clearInterval(id);
+      off();
+    };
   }, [aiReady]);
 
   // Load the boot-primed conversation's messages the first time the user opens chat (F-09): cold

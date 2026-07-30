@@ -1544,6 +1544,7 @@ pub fn run() {
             commands::set_tray_enabled,
             commands::set_briefing_window_visible,
             commands::close_briefing_window,
+            commands::destroy_briefing_window,
             commands::show_main_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,

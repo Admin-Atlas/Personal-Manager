@@ -25,8 +25,15 @@
 import { useEffect, useRef, useState } from "react";
 import { exit } from "@tauri-apps/plugin-process";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { confirmWipeIdentity, launchUninstaller, revealAppInFinder, wipePmData } from "../lib/ipc";
+import {
+  confirmWipeIdentity,
+  destroyBriefingWindow,
+  launchUninstaller,
+  revealAppInFinder,
+  wipePmData,
+} from "../lib/ipc";
 import { formatBytes } from "../lib/format";
+import { beginTeardown } from "../lib/teardown";
 import type { WipeReport } from "../lib/types";
 import { Button, Input, Modal } from "./ui";
 
@@ -211,6 +218,21 @@ export function RemovePmData({ biometricAvailable }: Props) {
       // content to write back over the deleted directory.
       const fullWipe = sel.regenerable && sel.vaultAndDb && sel.keychain;
       if (sel.localStorage || fullWipe) {
+        // Order matters, and all three steps are load-bearing.
+        //
+        // The briefing window goes FIRST. It is a second JS context on the same origin store, it
+        // persists theme preferences of its own, and it holds no capability entry — so it can
+        // neither be signalled nor see the flag below. Hiding it would leave it running; it has to
+        // be destroyed. Best-effort: a failure here must not stop the erase.
+        try {
+          await destroyBriefingWindow();
+        } catch {
+          /* the erase matters more than the window; a stray theme key is not worth aborting for */
+        }
+        // Then stop THIS window writing: the theme provider re-persists eleven keys on any axis or
+        // resolved-mode change, and its driver listens to matchMedia and visibilitychange, so
+        // clicking away after the clear was enough to put them all back.
+        beginTeardown();
         try {
           localStorage.clear();
         } catch {
