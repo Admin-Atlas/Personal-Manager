@@ -62,11 +62,15 @@ pub fn venv_dir(app: &AppHandle) -> Result<PathBuf> {
 /// bundle identifier, so a "remove PM completely" flow has to clear it too. The identifier is
 /// fixed (`org.itsatlas.pm`; renaming it orphans the keychain — see [`data_dir`]).
 ///
-/// **Windows-shaped, despite resolving everywhere.** On macOS this is
-/// `~/Library/Application Support/<identifier>`, which is NOT the webview store — WKWebView keeps
-/// `localStorage` under `~/Library/WebKit/<identifier>` — and on Linux it is not the WebKitGTK one
-/// either. Treating this as "the webview folder" on those platforms is what left a Mac's
-/// `localStorage` intact through a full wipe; use [`macos_app_leftovers`] there.
+/// **Right on Windows AND Linux; wrong on macOS.** Tauri forces a webview data directory at
+/// `<local data>/<identifier>` for *both* those platforms (its own comment says "windows", its
+/// `cfg` says `linux, windows`) and creates it on every launch — and on Linux wry then points
+/// WebKitGTK's `base_data_directory` AND `base_cache_directory` at exactly that path, so
+/// `~/.local/share/<identifier>` really is this app's `localStorage`, IndexedDB, service workers
+/// and cookie jar. macOS is the exception: the `cfg` excludes it, so WKWebView uses its default
+/// store under `~/Library/WebKit/<identifier>` and this path is a near-empty vestige. Treating
+/// this as "the webview folder" on macOS is what left a Mac's `localStorage` intact through a full
+/// wipe — see [`os_app_leftovers`], which resolves the right answer per platform.
 pub fn webview_data_dir(app: &AppHandle) -> Result<PathBuf> {
     let base = app
         .path()
@@ -104,20 +108,47 @@ pub fn macos_leftovers_in(home: &Path, identifier: &str) -> Vec<PathBuf> {
         library
             .join("Saved Application State")
             .join(format!("{identifier}.savedState")),
+        // The cookie jar is a FILE beside the HTTPStorages directory, not inside it, so removing
+        // the directory alone leaves it.
+        library
+            .join("HTTPStorages")
+            .join(format!("{identifier}.binarycookies")),
     ]
 }
 
-/// [`macos_leftovers_in`] resolved against the real home dir and bundle identifier. Empty on every
-/// other platform, so callers need no `cfg` — Windows keeps these leftovers inside
-/// [`webview_data_dir`], which the NSIS uninstaller already purges, and Linux writes none of them.
-pub fn macos_app_leftovers(app: &AppHandle) -> Vec<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return Vec::new();
+/// Everything Linux writes on PM's behalf outside the data dir: one directory, and it is the
+/// important one.
+///
+/// Tauri forces the webview data directory to `<local data>/<identifier>` on Linux as well as
+/// Windows and creates it on every launch, and wry hands that same path to WebKitGTK as both its
+/// data and its cache base — so this holds `localStorage`, IndexedDB, service-worker registrations,
+/// the DOM cache and the cookie file. Unlike Windows there is no uninstaller to sweep it and no
+/// package maintainer script that touches it, so if the wipe skips it nothing ever removes it.
+///
+/// Kept as a list of one, and pure like its macOS sibling, so both platforms take the same path
+/// through [`os_app_leftovers`] and the shapes stay unit-tested from any CI host.
+pub fn linux_leftovers_in(local_data: &Path, identifier: &str) -> Vec<PathBuf> {
+    vec![local_data.join(identifier)]
+}
+
+/// Everything the OS writes on PM's behalf OUTSIDE the data dir, resolved for the running platform.
+/// Empty on Windows — there the webview folder is in use while PM runs and cannot be removed by the
+/// app itself, so the NSIS uninstaller purges it from outside instead (see [`UNINSTALL_PURGE_MARKER`]).
+pub fn os_app_leftovers(app: &AppHandle) -> Vec<PathBuf> {
+    let identifier = &app.config().identifier;
+    if cfg!(target_os = "macos") {
+        return match app.path().home_dir() {
+            Ok(home) => macos_leftovers_in(&home, identifier),
+            Err(_) => Vec::new(),
+        };
     }
-    match app.path().home_dir() {
-        Ok(home) => macos_leftovers_in(&home, &app.config().identifier),
-        Err(_) => Vec::new(),
+    if cfg!(target_os = "linux") {
+        return match app.path().local_data_dir() {
+            Ok(base) => linux_leftovers_in(&base, identifier),
+            Err(_) => Vec::new(),
+        };
     }
+    Vec::new()
 }
 
 /// Filename of the marker a full "remove PM completely" wipe drops in [`webview_data_dir`] so the

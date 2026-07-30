@@ -33,6 +33,7 @@ export const CHANGELOG: ChangelogEntry[] = [
       'Restoring a backup is much more careful about what it replaces. PM offered to move a restored vault into its usual home when that home looked empty — but "empty" only counted imported documents, so a vault holding your projects, milestones, flags, chats, connected calendars and preferences could be treated as blank and erased. It now checks for anything you put there yourself.',
       "A restore also stops before it fills your drive, with a clear message instead of a raw disk error, and no longer leaves a decrypted copy behind if the last step fails.",
       '"Remove PM data" no longer leaves stray files behind, and tells the truth about what it left. It missed the list of accounts linked to a shared vault, and it described a vault you had simply moved to another folder as "the shared vault folder" — now it names the actual folder and says plainly that it hasn\'t touched anything inside it.',
+      "On Linux, \"Remove PM data\" now really removes everything. The folder holding PM's browser-side data — your interface preferences, and the cookies and stored data behind the app window — was skipped on Linux, and unlike Windows there's no uninstaller afterwards to catch it, so it stayed on the machine for good. It's now erased along with the rest. On Mac, the cookie file sitting beside that folder is cleared too.",
     ],
   },
   {
