@@ -230,6 +230,17 @@ fn push_recent(snap: &mut crate::IngestJobState, item: crate::IngestItem) {
     snap.recent.push(item);
 }
 
+/// The Activity detail line for a file that landed: its chunk count, plus anything that went wrong
+/// on the way. Pure, and deliberately shared with the frontend's own fold (`DocumentsView`) by
+/// shape — a restored snapshot row and a live one must read identically.
+pub(crate) fn done_detail(chunks: i64, warning: Option<&str>) -> String {
+    let base = format!("{chunks} chunk{}", if chunks == 1 { "" } else { "s" });
+    match warning {
+        Some(w) => format!("{base} — {w}"),
+        None => base,
+    }
+}
+
 /// Resolve the open `working` row with a terminal event's outcome.
 ///
 /// Amending the last working row (rather than appending) is what keeps one row per file. Doing this
@@ -241,14 +252,10 @@ fn finish_recent(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
     // from one the view built live: `done` adopts the indexed title + chunk count, the other two keep
     // the name from `Started` and carry the reason/error.
     let (status, name, detail) = match ev {
-        IngestEvent::Done { document } => (
+        IngestEvent::Done { document, warning } => (
             "done",
             Some(document.title.clone()),
-            Some(format!(
-                "{} chunk{}",
-                document.chunk_count,
-                if document.chunk_count == 1 { "" } else { "s" }
-            )),
+            Some(done_detail(document.chunk_count, warning.as_deref())),
         ),
         IngestEvent::Skipped { reason, .. } => ("skipped", None, Some(reason.clone())),
         IngestEvent::Failed { error, .. } => ("failed", None, Some(error.clone())),
@@ -291,6 +298,10 @@ pub enum IngestEvent {
     },
     Done {
         document: Document,
+        /// Set when the file landed but something about it is not what the user would assume —
+        /// today only a photo whose OCR was requested and did not run. Shown in place of the chunk
+        /// count on that file's Activity row.
+        warning: Option<String>,
     },
     Failed {
         path: String,
@@ -364,7 +375,7 @@ pub fn run(
         });
 
         match ingest_one(&state, &gateway, &vault, &cipher, &path, opts) {
-            Ok(Outcome::Indexed(document)) => {
+            Ok(Outcome::Indexed { document, warning }) => {
                 ingested += 1;
                 // The same arrival the connectors announce, for the drag-and-drop path. The channel
                 // event below feeds the importing view's own Activity list and reaches only the
@@ -373,7 +384,7 @@ pub fn run(
                 if !document.reviewed {
                     let _ = app.emit(DOCUMENT_LANDED, &document);
                 }
-                let _ = on_event.send(IngestEvent::Done { document });
+                let _ = on_event.send(IngestEvent::Done { document, warning });
                 // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously.
                 // Re-read each file (cheap) so flipping Fast/Gentle mid-import takes effect at once.
                 // Best-effort: a transient lock failure here must not abort the whole import (and skip
@@ -417,11 +428,18 @@ pub fn run(
     Ok(())
 }
 
-// A short-lived per-document result; not copied in bulk, so the size gap between
-// `Indexed(Document)` and `Skipped(String)` is not worth boxing.
+// A short-lived per-document result; not copied in bulk, so the size gap between the `Indexed`
+// arm and `Skipped(String)` is not worth boxing.
 #[allow(clippy::large_enum_variant)]
 enum Outcome {
-    Indexed(Document),
+    /// Indexed, with an optional note about something that went wrong WITHOUT stopping the file
+    /// landing — today only "OCR was asked for and did not run" (see [`ingest_photo`]). It rides
+    /// the terminal event rather than a log line because the document itself looks perfectly
+    /// normal afterwards; nothing else would ever tell the user.
+    Indexed {
+        document: Document,
+        warning: Option<String>,
+    },
     Skipped(String),
 }
 
@@ -531,7 +549,10 @@ fn ingest_one(
     };
     let document =
         index_fresh_document(state, &vault_file, &meta, &chunks, &embeddings, None, None)?;
-    Ok(Outcome::Indexed(document))
+    Ok(Outcome::Indexed {
+        document,
+        warning: None,
+    })
 }
 
 /// Ingest one image: OCR + EXIF via the sidecar, then the SAME chunk/embed/index pipeline as a
@@ -591,6 +612,18 @@ fn ingest_photo(
     // come back either way. No DB lock held across this call.
     let run_ocr = state.sidecar.optional_ocr_ready();
     let analysis = state.sidecar.analyze_image(path, run_ocr)?;
+    // `ocr_ran` is the only thing that tells "OCR was asked for and broke" from "this image holds
+    // no text" — the two produce a byte-identical document otherwise, so a receipt indexed with no
+    // searchable text looked entirely normal. A cold model cache no longer lands here (the sidecar
+    // reports that as a miss and the fetcher fills it), so what is left is a genuinely broken
+    // component, and the user is the only one who can act on it.
+    let ocr_warning = (run_ocr && !analysis.ocr_ran).then(|| {
+        eprintln!(
+            "ingest: photo indexed without OCR (the text-recognition component did not run): {}",
+            path.display()
+        );
+        "text recognition did not run, so any text in this image is not searchable".to_string()
+    });
 
     let capture_date =
         photos::resolve_capture_date(analysis.capture_date.as_deref(), path, &ingested_at);
@@ -689,7 +722,10 @@ fn ingest_photo(
         Some(&photo),
         None,
     )?;
-    Ok(Outcome::Indexed(document))
+    Ok(Outcome::Indexed {
+        document,
+        warning: ocr_warning,
+    })
 }
 
 /// Ingest one spreadsheet: parse it values-only via the sidecar, shape it into a synthetic Markdown
@@ -790,7 +826,10 @@ fn ingest_spreadsheet(
         None,
         Some(&record),
     )?;
-    Ok(Outcome::Indexed(document))
+    Ok(Outcome::Indexed {
+        document,
+        warning: None,
+    })
 }
 
 /// Promote an index-only document to a **full local spreadsheet import** — the "import fully" flow. The
@@ -1624,7 +1663,10 @@ pub fn rebuild(
         match outcome {
             Ok(Some(document)) => {
                 ingested += 1;
-                on_event.send(IngestEvent::Done { document });
+                on_event.send(IngestEvent::Done {
+                    document,
+                    warning: None,
+                });
             }
             // A chat that only ever exchanged small talk indexes no substantive turns, so it (correctly)
             // births no document — count it done, but there is nothing to surface.
@@ -4140,6 +4182,19 @@ mod tests {
             path: path.into(),
             error: "x".into(),
         }
+    }
+
+    #[test]
+    fn a_landed_file_that_lost_something_says_so_on_its_row() {
+        // A photo whose OCR did not run indexes perfectly normally — same title, same chunks, an
+        // empty body where the receipt's text should be. `ocr_ran` is the only thing that knows,
+        // and until this it had no reader anywhere in Rust or TS. The detail line is the reader.
+        assert_eq!(done_detail(3, None), "3 chunks");
+        assert_eq!(done_detail(1, None), "1 chunk");
+        assert_eq!(
+            done_detail(2, Some("text recognition did not run")),
+            "2 chunks — text recognition did not run"
+        );
     }
 
     #[test]

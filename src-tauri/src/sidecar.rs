@@ -1295,9 +1295,13 @@ impl SidecarManager {
     /// Analyse one image for photo ingestion: EXIF capture metadata (always) + OCR text (only when
     /// `run_ocr`). The caller sets `run_ocr` from [`optional_ocr_ready`](Self::optional_ocr_ready),
     /// so a user who declined the optional OCR component still gets dimensions + EXIF for the photo's
-    /// metadata chunk. The first OCR call downloads rapidocr's small models and is slow; later calls
-    /// are fast and fully local. Blocking, like every sidecar call. EXIF/OCR output is untrusted data —
-    /// scored/indexed, never executed.
+    /// metadata chunk. The first OCR call reports a cold cache, [`Self::request`] runs the
+    /// network-allowed `--fetch` helper to download rapidocr's small models, and the retry is slow;
+    /// later calls are fast and fully local. Blocking, like every sidecar call. EXIF/OCR output is
+    /// untrusted data — scored/indexed, never executed.
+    ///
+    /// `ocr_ran` is the reply's only signal that OCR was asked for and did not happen. Read it —
+    /// `ocr_text` alone cannot tell "the component broke" from "this image holds no text".
     pub fn analyze_image(&self, path: &Path, run_ocr: bool) -> Result<ImageAnalysis> {
         guard_input_size(path)?;
         let result = self.request(
@@ -1648,7 +1652,7 @@ impl SidecarManager {
                     // exactly as long.
                     if !fetched && is_model_not_cached(&value) {
                         fetched = true;
-                        self.fetch_model(method, &req["params"])?;
+                        self.fetch_model(method, fetch_params(method, &req["params"]))?;
                         continue;
                     }
                     let msg = value["error"].as_str().unwrap_or("unknown sidecar error");
@@ -2341,6 +2345,21 @@ const SELFTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// Whether a sidecar reply is the offline worker signalling a model isn't downloaded yet (as opposed
 /// to a genuine failure) — the trigger for a fetch-and-retry (issue #286). Pure, so it unit-tests the
 /// classification without a live child.
+/// What the network-allowed `--fetch` helper is given for `method`.
+///
+/// The fetcher is the ONE child that keeps a socket, so it must never receive anything derived from
+/// the file being parsed. For every model-bearing method the params ARE the model id (plus the
+/// speech model's `model_dir`), so they pass straight through — and by reference, since an embed
+/// batch can be large. `analyze_image` is the exception: its params carry the path of the image
+/// mid-ingest, while all the fetcher does with it is build the OCR engine. It gets `null`, which the
+/// helper reads as no params at all (`params or {}`).
+fn fetch_params<'a>(method: &str, params: &'a Value) -> &'a Value {
+    match method {
+        "analyze_image" => &Value::Null,
+        _ => params,
+    }
+}
+
 fn is_model_not_cached(reply: &Value) -> bool {
     reply["ok"].as_bool() != Some(true) && reply["error_kind"].as_str() == Some("model_not_cached")
 }
@@ -3248,6 +3267,22 @@ mod tests {
         assert!(!is_model_not_cached(&json!({
             "ok": true, "error_kind": "model_not_cached"
         })));
+    }
+
+    #[test]
+    fn the_fetcher_is_never_handed_anything_from_the_file_being_parsed() {
+        // The `--fetch` helper is the ONE child that keeps a socket (issue #286). Every other
+        // method's params ARE the model id, so they pass through untouched — and by reference, so
+        // a large embed batch is not cloned to make the point.
+        let embed = json!({ "model": "bge-small", "texts": ["a", "b"] });
+        assert_eq!(fetch_params("embed", &embed), &embed);
+        let whisper = json!({ "model_dir": "/pm/runtime/models" });
+        assert_eq!(fetch_params("transcribe", &whisper), &whisper);
+
+        // analyze_image is the exception: its params carry the path of the image mid-ingest, while
+        // all the fetcher does is build the OCR engine.
+        let image = json!({ "path": "/tmp/sandbox-in/receipt.png", "run_ocr": true });
+        assert_eq!(fetch_params("analyze_image", &image), &Value::Null);
     }
 
     fn paths_with_source(source_dir: PathBuf) -> SidecarPaths {

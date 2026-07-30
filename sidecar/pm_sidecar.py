@@ -93,6 +93,19 @@ def _fastembed_cache_dir():
     return os.path.join(_MODELS_DIR, "fastembed") if _MODELS_DIR else None
 
 
+def _rapidocr_model_dir():
+    """rapidocr's detection/recognition model dir under the shared model root, or None (rapidocr's
+    own default) when PM_MODELS_DIR is unset.
+
+    rapidocr defaults to `<site-packages>/rapidocr/models` — INSIDE the managed venv. That is the
+    one model store PM does not control: rebuilding the venv (or removing the optional OCR
+    component, which is a one-click Settings action) throws the weights away, so the next photo
+    re-downloads them. Pinning them beside every other model puts the whole model story in one
+    subtree — the one the Windows sandbox's filesystem allow-set grants and the one "Remove PM
+    data" walks."""
+    return os.path.join(_MODELS_DIR, "rapidocr") if _MODELS_DIR else None
+
+
 # pdfminer (which MarkItDown uses to extract text from PDFs) logs a warning for every glyph
 # whose font descriptor has no FontBBox ("None cannot be parsed as 4 floats") — cosmetic noise
 # that can flood the console on a single PDF and tells us nothing actionable. Quiet that logger
@@ -264,9 +277,13 @@ def get_tokenizer(model=None, spec=None):
             tok = Tokenizer.from_str(candidate.to_str())
             tok.no_truncation()
         except Exception:
-            # Clone unavailable: count with the shared tokenizer AS-IS (truncation stays
-            # on, so a long chunk just reports a capped length) — never mutate it.
-            tok = candidate
+            # Clone unavailable: fall through to the repo tokenizer below rather than counting
+            # with the SHARED one. That one has truncation ON, so every chunk past the model's
+            # window reports exactly the window size — the splitter reads "512, it fits" for a
+            # block that does not, and stops splitting the very chunks this exists to catch.
+            # A capped count is worse than no count: the chars/4 estimate in `do_count_tokens`
+            # is rough, but it keeps growing with the text. Never mutate the shared tokenizer.
+            tok = None
     if tok is None:
         try:
             from tokenizers import Tokenizer
@@ -366,12 +383,21 @@ MAX_INPUT_FILE_BYTES = 128 * 1024 * 1024
 MAX_TEXT_INPUT_FILE_BYTES = 40 * 1024 * 1024
 TEXT_FAMILY_EXTS = (".txt", ".md", ".markdown", ".html", ".htm", ".json", ".xml")
 
-# An .xlsx is a zip; openpyxl inflates its worksheet / shared-strings XML. The 128 MiB input cap
-# above bounds the on-disk (compressed) size, NOT the inflated size, so a zip-bomb .xlsx could still
-# balloon memory past it. Reject a workbook whose declared uncompressed size, or inflation ratio,
-# is implausible for a real spreadsheet before openpyxl reads it (H-1 subset).
-MAX_INFLATED_XLSX_BYTES = 1024 * 1024 * 1024  # 1 GiB total uncompressed
-MAX_XLSX_INFLATION_RATIO = 200  # uncompressed : compressed
+# Every modern Office/e-book format is a zip, and its reader inflates the XML inside. The 128 MiB
+# input cap above bounds the on-disk (compressed) size, NOT the inflated size, so a zip bomb could
+# still balloon memory past it. Reject an archive whose declared uncompressed size, or inflation
+# ratio, is implausible for a real document before any reader opens it (H-1 subset).
+#
+# This started as an .xlsx-only guard, which left .docx / .pptx / .epub — all zips, all handed
+# straight to MarkItDown — with nothing but the on-disk cap. The numbers are unchanged: 1 GiB is a
+# generous ceiling for any real document, and a genuine Office file inflates ~5-20x (media inside
+# is already compressed), nowhere near 200x.
+MAX_INFLATED_ARCHIVE_BYTES = 1024 * 1024 * 1024  # 1 GiB total uncompressed
+MAX_ARCHIVE_INFLATION_RATIO = 200  # uncompressed : compressed
+
+# The zip-container extensions this guard applies to. .doc/.ppt/.rtf are not zips (OLE / text) and
+# .pdf has its own object streams, which MarkItDown's pdfminer bounds itself.
+ZIP_CONTAINER_EXTS = (".docx", ".pptx", ".epub", ".xlsx", ".xlsm")
 
 
 def _guard_file_size(path):
@@ -401,7 +427,14 @@ def do_convert(params):
     """Convert one file to Markdown. Returns its text and a best-effort title."""
     path = params["path"]
     _guard_file_size(path)
-    result = get_markitdown().convert(path)
+    if str(path).lower().endswith(ZIP_CONTAINER_EXTS):
+        _guard_archive_inflation(path)
+    # `convert_local`, NOT `convert`: MarkItDown's `convert` dispatches on the STRING, and a path
+    # beginning `http:` / `https:` / `file:` / `data:` is routed to `convert_uri` — a network fetch
+    # from the one process that must never hold a socket. The names we pass are staged copies or
+    # the user's own paths, so this is not reachable today; the local entry point makes it
+    # unreachable by construction rather than by luck.
+    result = get_markitdown().convert_local(path)
     title = (getattr(result, "title", None) or "").strip()
     return {
         "markdown": clean_text(result.text_content or ""),
@@ -497,24 +530,69 @@ def do_transcribe(params):
     return {"text": clean_text(text)}
 
 
+def _forbid_rapidocr_downloads():
+    """Make the OFFLINE posture authoritative for rapidocr, which has no offline flag of its own.
+
+    Every other model reaches the network through huggingface_hub, so `HF_HUB_OFFLINE` (set at
+    import) gates it. rapidocr does not: it calls its OWN downloader against its OWN host, which
+    no HF variable touches. Left alone, a cold cache makes the worker that is parsing untrusted
+    file bytes open an outbound socket mid-ingest — the exact egress issue #286 forbids, and the
+    one the sandbox's fall-open contract cannot be relied on to stop.
+
+    So we replace the downloader's single entry point with one that refuses to fetch. A cold cache
+    then surfaces as a clean `ModelNotCached`, `request()` runs the network-allowed `--fetch`
+    helper, and the retry finds the models on disk — which is how the embedder, reranker and speech
+    model already work.
+
+    It has to keep the "already downloaded" case working, and that is not free: rapidocr's engine
+    calls the downloader UNCONDITIONALLY and lets the downloader decide whether the file is already
+    there. Refusing outright would therefore reject a warm cache too — the retry would fail exactly
+    like the first attempt and OCR would stay off for good. So the replacement keeps that one
+    branch: the file is there, return; it is not, report a miss. Nothing else about it can reach
+    the network, and no checksum is re-verified here — a corrupt model fails the ONNX load instead,
+    which `_load_model` turns into the same miss, and the fetcher then re-downloads it against the
+    checksum it holds.
+
+    Best-effort by design: if rapidocr's internals move, OCR must not break outright. The
+    constructor would then attempt its own download, fail under confinement, and `_load_model`
+    still reports the miss — the same recovery, one round trip later.
+    """
+    try:
+        from rapidocr.utils.download_file import DownloadFile
+
+        def _refuse(params):
+            save_path = getattr(params, "save_path", None)
+            if save_path is not None and os.path.exists(save_path):
+                return
+            raise ModelNotCached("rapidocr's OCR models are not downloaded yet")
+
+        DownloadFile.run = staticmethod(_refuse)
+    except Exception:
+        pass
+
+
 def get_ocr_engine():
     """The OPTIONAL on-device OCR engine (rapidocr), cached. Lazy-imported so the engine — and its
     image-processing deps (opencv/shapely/pyclipper) — only load when OCR is actually requested, and
     so the base sidecar runs without them installed. `RapidOCR` runs on the SAME onnxruntime that
-    fastembed already ships and downloads its small detection/recognition ONNX models on first use
-    (like the embedder/whisper). Raises ImportError if the optional component isn't installed — the
+    fastembed already ships. Raises ImportError if the optional component isn't installed — the
     Rust side only requests OCR once the install is confirmed, so that never fires in normal use.
+
+    Its models live under `PM_MODELS_DIR` beside every other model, and the construction goes
+    through `_load_model` so a cold cache in the OFFLINE worker becomes `ModelNotCached` and rides
+    the fetch-and-retry path. Before that, this was the one loader outside that contract: under the
+    no-network confinement rapidocr could never obtain its models, the constructor raised on every
+    photo, `do_analyze_image` swallowed it, and OCR was permanently and silently off.
     """
     global _ocr_engine
     if _ocr_engine is None:
-        # rapidocr (3.x) prints model-download/init chatter; keep it off stdout so it can never
-        # corrupt the newline-delimited JSON protocol (stdout is the reply channel).
-        import contextlib
+        from rapidocr import RapidOCR
 
-        with contextlib.redirect_stdout(sys.stderr):
-            from rapidocr import RapidOCR
-
-            _ocr_engine = RapidOCR()
+        if _OFFLINE:
+            _forbid_rapidocr_downloads()
+        model_dir = _rapidocr_model_dir()
+        params = {"Global.model_root_dir": model_dir} if model_dir else None
+        _ocr_engine = _load_model(lambda: RapidOCR(params=params))
     return _ocr_engine
 
 
@@ -599,17 +677,18 @@ def _run_ocr(engine, img, path):
     """Recognise text in an image, returning the joined lines (newest rapidocr returns an object
     with a `.txts` tuple; tolerate the older list-of-[box,text,score] shape too). Pass a decoded RGB
     array when we already opened the image (HEIC works); else hand rapidocr the path directly.
-    """
-    import contextlib
 
+    rapidocr prints init/inference chatter, which would corrupt the reply channel. `main()` now
+    redirects stdout around EVERY handler, so this call — and the engine construction — no longer
+    carry a guard of their own.
+    """
     if img is not None:
         import numpy as np
 
         target = np.array(img.convert("RGB"))
     else:
         target = path  # let rapidocr read the file itself (non-HEIC)
-    with contextlib.redirect_stdout(sys.stderr):
-        result = engine(target)
+    result = engine(target)
 
     txts = getattr(result, "txts", None)
     if txts:
@@ -650,6 +729,13 @@ def do_analyze_image(params):
         try:
             ocr_text = _run_ocr(get_ocr_engine(), img, path)
             ocr_ran = True
+        except ModelNotCached:
+            # NOT a broken component: the offline worker just needs the fetcher to download
+            # rapidocr's models, after which `request()` retries this very call. Degrading here
+            # would commit a photo that claims to hold no text and never look again — the whole
+            # point of routing OCR through the fetch-and-retry contract. Must precede the broad
+            # `except` below; ModelNotCached is an Exception too.
+            raise
         except Exception as exc:
             # F-56: a broken/offline OCR component must degrade to EXIF-only, not fail the whole
             # photo ingest. The metadata gathered above is intact; Rust reads ocr_ran=false.
@@ -685,6 +771,26 @@ def do_analyze_image(params):
 # 200k-row sheet can't explode into 200k row chunks + embeddings. Tunable; composes
 # with — does not replace — the byte-size cap Rust already enforces on a fetched body.
 SPREADSHEET_ROW_CAP = 5000
+
+# Upper bound on columns returned PER SHEET. The row cap alone bounds one dimension: a sheet 4,000
+# columns wide still fits under it and still produces a reply the Rust reader must reject at its
+# 64 MiB line cap — after minutes of parsing, having read the file twice. Headers past this are
+# dropped; `col_count` still reports the TRUE total and `cols_truncated` is set. 256 is far past
+# any spreadsheet a person reads (Excel's own A-IV classic limit), so a real sheet never meets it.
+SPREADSHEET_COL_CAP = 256
+
+# Upper bound on the characters of ONE cell. A single cell can legally hold 32k characters, and a
+# pasted-in wall of text tells a row chunk nothing the first line didn't.
+SPREADSHEET_CELL_CHARS = 1000
+
+# The character budget for one reply's cell text, SHARED across every sheet in the workbook. The
+# row and column caps bound each sheet's shape but not the product (5,000 x 256 x 1,000 characters
+# is three orders of magnitude past the reader's line cap), and a workbook can hold any number of
+# sheets. This is the one bound that actually holds: rows stop being kept once it is spent, and the
+# sheet reports itself `truncated` exactly as a row-capped one does. 8 MiB of cell text leaves
+# generous headroom under the 64 MiB line cap once JSON-escaped, and a real 5,000-row sheet of 20
+# columns spends well under 1 MiB.
+SPREADSHEET_TEXT_BUDGET = 8 * 1024 * 1024
 
 # How many non-empty values per column the type heuristic samples — enough to be
 # confident without scanning a whole column.
@@ -808,31 +914,72 @@ def _date_range(rows, columns):
     return [min(dates).isoformat(), max(dates).isoformat()]
 
 
-def _build_sheet(name, rows_iter):
+class _TextBudget:
+    """The remaining cell-text characters for one reply, shared across a workbook's sheets.
+
+    Deliberately a tiny mutable object rather than a running total threaded through return values:
+    the budget is a property of the REPLY, and every sheet spends from the same pot. `spend`
+    returns False once a row would not fit, and stays False afterwards — a later, smaller row must
+    not sneak in and leave `rows` non-contiguous with the sheet it came from.
+    """
+
+    def __init__(self, total):
+        self.remaining = total
+
+    def spend(self, chars):
+        if chars > self.remaining:
+            self.remaining = 0
+            return False
+        self.remaining -= chars
+        return True
+
+
+def _cell_text(value):
+    """One cell as the string Rust receives: cleaned and capped (SPREADSHEET_CELL_CHARS)."""
+    if value is None:
+        return ""
+    return clean_text(str(value))[:SPREADSHEET_CELL_CHARS]
+
+
+def _build_sheet(name, rows_iter, budget):
     """Consume one sheet's rows (lazily — the caller keeps the file/workbook open): the first row is
-    the header, the rest are data. Keeps up to SPREADSHEET_ROW_CAP data rows but counts the TRUE
-    total, so a huge sheet reports honestly and is flagged `truncated`. Returns the per-sheet dict
-    Rust consumes, or None for an empty sheet (no header row)."""
+    the header, the rest are data. Keeps up to SPREADSHEET_ROW_CAP data rows, SPREADSHEET_COL_CAP
+    columns, and whatever `budget` has left, while counting the TRUE row and column totals — so a
+    huge sheet reports honestly and is flagged `truncated` / `cols_truncated`. Returns the
+    per-sheet dict Rust consumes, or None for an empty sheet (no header row)."""
     it = iter(rows_iter)
     try:
         header_row = next(it)
     except StopIteration:
         return None
-    headers = [clean_text("" if c is None else str(c)) for c in header_row]
+    col_count = len(header_row)
+    headers = [_cell_text(c) for c in list(header_row)[:SPREADSHEET_COL_CAP]]
 
     kept = []  # native cell rows (capped) — inferred on before stringifying, for accurate types
+    str_rows = []  # the same rows as the strings actually sent, which is what the budget measures
     total = 0
+    spent_out = False
     for row in it:
         total += 1
-        if len(kept) < SPREADSHEET_ROW_CAP:
-            kept.append(list(row))
+        if spent_out or len(kept) >= SPREADSHEET_ROW_CAP:
+            # Keep counting: `row_count` is the sheet's TRUE total, which is what makes the
+            # truncation note honest rather than a silently short table.
+            continue
+        native = list(row)[:SPREADSHEET_COL_CAP]
+        cells = [_cell_text(c) for c in native]
+        if not budget.spend(sum(len(c) for c in cells)):
+            spent_out = True
+            continue
+        kept.append(native)
+        str_rows.append(cells)
 
     columns = inspect_columns(headers, kept)
     date_range = _date_range(kept, columns)
-    str_rows = [[("" if c is None else clean_text(str(c))) for c in row] for row in kept]
     return {
         "name": clean_text(name),
         "headers": headers,
+        "col_count": col_count,
+        "cols_truncated": col_count > len(headers),
         "row_count": total,
         "inferred_types": [c["inferred_type"] for c in columns],
         "date_range": date_range,
@@ -855,7 +1002,7 @@ def _csv_encoding(path):
         return "cp1252"
 
 
-def _sheets_from_csv(path):
+def _sheets_from_csv(path, budget):
     """A CSV is a single sheet named after the file; delimiter is sniffed (falls back to comma).
     Encoding is UTF-8 with a cp1252 fallback (F-55) so an Excel export doesn't crash ingest."""
     import csv
@@ -870,50 +1017,51 @@ def _sheets_from_csv(path):
         except csv.Error:
             dialect = csv.excel
         name = os.path.splitext(os.path.basename(path))[0]
-        sheet = _build_sheet(name, csv.reader(fh, dialect))
+        sheet = _build_sheet(name, csv.reader(fh, dialect), budget)
         return [sheet] if sheet else []
     finally:
         fh.close()
 
 
-def _guard_xlsx_inflation(path):
-    """Refuse a zip-bomb .xlsx before openpyxl inflates it (H-1 subset). Sums the archive's DECLARED
+def _guard_archive_inflation(path):
+    """Refuse a zip bomb before any reader inflates it (H-1 subset). Sums the archive's DECLARED
     uncompressed and compressed sizes (cheap — no decompression) and rejects when the total
-    uncompressed size, or the inflation ratio, is implausible for a real spreadsheet. openpyxl's
-    `read_only=True` streams rows lazily, so the main eager cost this bounds is the shared-strings
-    table. A non-zip file returns quietly — openpyxl raises its own clean error."""
+    uncompressed size, or the inflation ratio, is implausible for a real document. openpyxl's
+    `read_only=True` streams rows lazily, so for a workbook the main eager cost this bounds is the
+    shared-strings table; MarkItDown's .docx/.pptx/.epub readers materialise their XML outright.
+    A non-zip file returns quietly — the reader raises its own clean error."""
     import zipfile
 
     try:
         with zipfile.ZipFile(path) as zf:
             uncompressed = sum(i.file_size for i in zf.infolist())
             compressed = sum(i.compress_size for i in zf.infolist())
-    except zipfile.BadZipFile:
+    except (zipfile.BadZipFile, OSError):
         return
-    if uncompressed > MAX_INFLATED_XLSX_BYTES:
+    if uncompressed > MAX_INFLATED_ARCHIVE_BYTES:
         raise ValueError(
-            f"spreadsheet expands to too much data "
+            f"this file expands to too much data "
             f"({uncompressed // (1024 * 1024)} MiB uncompressed; "
-            f"the limit is {MAX_INFLATED_XLSX_BYTES // (1024 * 1024)} MiB)"
+            f"the limit is {MAX_INFLATED_ARCHIVE_BYTES // (1024 * 1024)} MiB)"
         )
-    if compressed > 0 and uncompressed // compressed > MAX_XLSX_INFLATION_RATIO:
+    if compressed > 0 and uncompressed // compressed > MAX_ARCHIVE_INFLATION_RATIO:
         raise ValueError(
-            f"spreadsheet compression ratio is implausibly high "
-            f"({uncompressed // compressed}x; the limit is {MAX_XLSX_INFLATION_RATIO}x)"
+            f"this file's compression ratio is implausibly high "
+            f"({uncompressed // compressed}x; the limit is {MAX_ARCHIVE_INFLATION_RATIO}x)"
         )
 
 
-def _sheets_from_xlsx(path):
+def _sheets_from_xlsx(path, budget):
     """Every worksheet in an .xlsx/.xlsm. `data_only=True` returns cached VALUES (never formulas);
     `read_only=True` streams rows so a large workbook stays memory-bounded."""
     from openpyxl import load_workbook
 
-    _guard_xlsx_inflation(path)
+    _guard_archive_inflation(path)
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         out = []
         for ws in wb.worksheets:
-            sheet = _build_sheet(ws.title, ws.iter_rows(values_only=True))
+            sheet = _build_sheet(ws.title, ws.iter_rows(values_only=True), budget)
             if sheet:
                 out.append(sheet)
         return out
@@ -924,17 +1072,21 @@ def _sheets_from_xlsx(path):
 def do_analyze_spreadsheet(params):
     """Parse a spreadsheet (.xlsx/.csv) into per-sheet structure for the dedicated ingest path,
     bypassing MarkItDown. Reads VALUES ONLY — no formula evaluation, no styling. Each sheet reports
-    its headers, TRUE row_count, per-column inferred types, an optional date range, and up to
-    SPREADSHEET_ROW_CAP stringified rows (`truncated` set when the sheet had more). Rust shapes
-    these into a metadata chunk + self-describing row chunks. Cell text is untrusted data — cleaned,
-    never executed. Legacy .xls is not supported (its xlrd parser surface was dropped, H-1)."""
+    its headers, TRUE row_count and col_count, per-column inferred types, an optional date range,
+    and the rows that fit the row / column / reply-size caps (`truncated` and `cols_truncated` say
+    when they bit). Rust shapes these into a metadata chunk + self-describing row chunks. Cell text
+    is untrusted data — cleaned, never executed. Legacy .xls is not supported (its xlrd parser
+    surface was dropped, H-1)."""
     path = params["path"]
     _guard_file_size(path)
     ext = (params.get("ext") or "").lower().lstrip(".")
+    # One budget for the whole reply: a workbook of many sheets must not multiply past the reader's
+    # line cap just because each sheet is individually small.
+    budget = _TextBudget(SPREADSHEET_TEXT_BUDGET)
     if ext in ("xlsx", "xlsm"):
-        sheets = _sheets_from_xlsx(path)
+        sheets = _sheets_from_xlsx(path, budget)
     elif ext == "csv":
-        sheets = _sheets_from_csv(path)
+        sheets = _sheets_from_csv(path, budget)
     else:
         raise ValueError(f"unsupported spreadsheet extension: {ext!r}")
     return {"sheets": sheets, "row_cap": SPREADSHEET_ROW_CAP}
@@ -1168,8 +1320,26 @@ if os.environ.get("PM_SIDECAR_DEV") == "1":
 MAX_LINE_CHARS = int(os.environ.get("PM_SIDECAR_MAX_LINE_CHARS", 64 * 1024 * 1024))
 
 
+def _quiet_stdout():
+    """Send anything a handler prints to stderr instead — stdout is the reply channel.
+
+    One stray `print` inside a third-party library lands mid-line in the newline-delimited JSON, so
+    the Rust reader cannot parse the reply, skips the line, and then blocks on an answer that has
+    already been sent — wedging the serialized sidecar for the whole per-method timeout. This used
+    to be guarded only around the two rapidocr calls, which is the one library we happened to
+    catch doing it; MarkItDown, openpyxl, fastembed and faster-whisper all pull in dependency trees
+    nobody has audited for prints. Guarding the DISPATCH covers every handler, present and future,
+    for the same three lines. `main()` and `fetch_main()` hold the real stdout from before this
+    runs, so the reply itself is unaffected."""
+    import contextlib
+
+    return contextlib.redirect_stdout(sys.stderr)
+
+
 def main():
-    # Line-buffered stdout so the Rust side sees each reply immediately.
+    # Line-buffered stdout so the Rust side sees each reply immediately. Captured HERE, before any
+    # handler runs, because `_quiet_stdout` below swaps `sys.stdout` out from under them — `out`
+    # stays the real reply channel.
     out = sys.stdout
     for line in sys.stdin:
         line = line.strip()
@@ -1188,7 +1358,8 @@ def main():
             handler = HANDLERS.get(method)
             if handler is None:
                 raise ValueError(f"unknown method: {method!r}")
-            result = handler(req.get("params") or {})
+            with _quiet_stdout():
+                result = handler(req.get("params") or {})
             response = {"id": req_id, "ok": True, "result": result}
         except ModelNotCached as miss:
             # Not a failure to report: the offline worker just needs Rust to download this
@@ -1249,6 +1420,12 @@ def _ensure_model(method, params):
         get_reranker(params.get("model"), custom)
     elif method == "transcribe":
         get_whisper(params.get("model_dir"))
+    elif method == "analyze_image":
+        # Photo OCR. rapidocr fetches its own models from its own host rather than through
+        # huggingface_hub, but that is the fetcher's problem, not the worker's — the contract is
+        # identical to every other model's, so it rides the same path. Nothing here touches the
+        # image: `params` carries no path (Rust strips it) and this only builds the engine.
+        get_ocr_engine()
     else:
         raise ValueError(f"nothing to fetch for method {method!r}")
 
@@ -1260,16 +1437,20 @@ def fetch_main():
     method's model into the shared cache, writes one reply line, and exits. It never parses
     untrusted file bytes: its only input is a trusted model id from Rust, so it is the one component
     that legitimately keeps network access once the worker is sandboxed."""
+    # The real reply channel, held before `_quiet_stdout` swaps `sys.stdout` — a downloader that
+    # prints its progress (rapidocr's does) would otherwise land on the one line Rust parses.
+    out = sys.stdout
     line = sys.stdin.readline()
     try:
         req = json.loads(line)
-        _ensure_model(req.get("method"), req.get("params") or {})
+        with _quiet_stdout():
+            _ensure_model(req.get("method"), req.get("params") or {})
         reply = {"ok": True}
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         reply = {"ok": False, "error": str(exc)}
-    sys.stdout.write(json.dumps(reply) + "\n")
-    sys.stdout.flush()
+    out.write(json.dumps(reply) + "\n")
+    out.flush()
     sys.exit(0 if reply.get("ok") else 1)
 
 

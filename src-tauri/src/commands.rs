@@ -2879,7 +2879,10 @@ async fn upgrade_index_only_to_full_body(
         match outcome {
             Ok(document) => {
                 upgraded += 1;
-                on_event.send(IngestEvent::Done { document });
+                on_event.send(IngestEvent::Done {
+                    document,
+                    warning: None,
+                });
             }
             Err(e) => {
                 // Leave it as it is (the next Sync heals it) and report — never fatal.
