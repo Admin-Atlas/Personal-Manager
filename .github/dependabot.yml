@@ -32,6 +32,18 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 10
 
+  # --- Python sidecar (sidecar/requirements*.txt) ---
+  # The last ecosystem without coverage, and the one that matters most per-dependency: these
+  # packages are what parse untrusted files (MarkItDown, rapidocr, the archive readers), inside a
+  # worker deliberately confined because that parsing is the app's largest attack surface. A CVE
+  # here was previously only ever found by `just pip-audit` failing a PR — an alert with no fix
+  # attached — rather than by a bump arriving ready to review.
+  - package-ecosystem: "pip"
+    directory: "/sidecar"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
   # --- GitHub Actions (.github/workflows/*.yml) — keeps SHA pins current ---
   - package-ecosystem: "github-actions"
     directory: "/"

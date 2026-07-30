@@ -4,6 +4,13 @@
 # (clippy, cargo test, cargo-deny, gitleaks, zizmor) are left to CI and
 # `just check` — too slow for every commit.
 #
+# "The fast subset" is now a checked claim, not a comment: `just ci-membership`
+# asserts every member of `check-fast` has a hook here. It had drifted to 9 of the
+# 13, and the four it was missing — licence-subset, ci-membership, sync-set,
+# script-deps — were the drift guards, whose whole job is noticing that two files
+# have stopped agreeing. `version` maps to `version-local` (the offline-tolerant
+# variant); that one substitution is declared in scripts/check-ci-membership.mjs.
+#
 # Setup:  pipx install pre-commit && pre-commit install
 # Needs:  just, node + npm install (prettier/eslint/tsc), ruff on PATH.
 repos:
@@ -60,6 +67,36 @@ repos:
       - id: spdx-headers
         name: spdx headers + licence
         entry: just headers
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: license-subset
+        name: licence allow-lists agree (deny ⊆ about)
+        entry: just license-subset
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ci-membership
+        name: CI membership (check-fast ⊆ pr.yml and pre-commit)
+        entry: just ci-membership
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: sync-set
+        name: sync-set register covers every table
+        entry: just sync-set
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: script-deps
+        name: scripts/ stays zero-dependency
+        entry: just script-deps
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: action-pins
+        name: every workflow `uses:` is SHA-pinned
+        entry: just action-pins
         language: system
         pass_filenames: false
         always_run: true

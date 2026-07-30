@@ -13,9 +13,15 @@ name: PR
 # Actions are SHA-pinned (the repo enforces it); the trailing "# vX.Y.Z" is the
 # human-readable version Dependabot reads. Pins mirror release.yml.
 
+# Deliberately NOT filtered by base branch. `branches: [main]` meant a PR based on
+# another branch ran no job at all — no lint, no tests, no secret scan, no version
+# lockstep — and that is precisely the shape of the stacked PRs this repo uses for
+# multi-PR features, so the PRs least likely to be reviewed in isolation were the
+# ones with no gate whatsoever. Every PR gets the baseline now; the `version` job's
+# bumped-vs-base check reads the PR's own base sha, so on a stacked PR it correctly
+# asks "did this bump beyond its parent branch" rather than "beyond main".
 on:
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -47,6 +53,8 @@ jobs:
         run: just tsc
       - name: Frontend tests (vitest)
         run: just frontend-test
+      - name: Production bundle (vite build)
+        run: just build-frontend
 
   # --- backend: format, clippy, check, tests (Rust) -----------------------
   rust:
@@ -294,3 +302,5 @@ jobs:
         run: just sync-set
       - name: scripts/ stays zero-dependency (allowlisted exceptions only)
         run: just script-deps
+      - name: Every workflow `uses:` is SHA-pinned
+        run: just action-pins

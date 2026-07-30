@@ -6,5 +6,9 @@
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true
   },
-  "include": ["vite.config.ts"]
+  // The Node-side configs. `vitest.config.ts` joined `vite.config.ts` here because it had the
+  // identical blind spot T1-9 closed for the latter: the root project includes only `src`, this one
+  // named a single file, and so a type error in the TEST RUNNER's own config was invisible to
+  // `just tsc` — the config that decides which tests exist being the one thing nothing type-checked.
+  "include": ["vite.config.ts", "vitest.config.ts"]
 }

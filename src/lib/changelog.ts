@@ -24,8 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.7-alpha",
+    date: "2026-07-30",
+    highlights: [
+      "Under-the-hood tidying: a handful of PM's own safety checks turned out not to be running. The rule that every outside tool PM is built with is locked to an exact, reviewed version was written down in two places and enforced in none. The set of checks that run before a change is saved had quietly shrunk to nine of thirteen — and the four that had gone missing were the ones whose whole job is to notice that sort of drift.",
+      "Changes built on top of other changes used to get no checks at all — no tests, no scans, no version check — which is exactly how PM's bigger features are put together. They now get the same treatment as everything else.",
+      "PM also builds its actual interface as part of every check now, and proves its Linux packages still assemble, rather than finding out about either on release day.",
+    ],
+  },
+  {
     version: "3.111.6-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "Under-the-hood tidying: two of the checks that keep PM safe were themselves unchecked. The part that strips anything dangerous out of a document before showing it to you is now tested against real hostile input, and the isolation PM runs untrusted files inside now has tests that fail loudly instead of quietly reporting success without having looked.",
       "The test runner also collected only some of the folders it was meant to, so a new test could have been written, committed, and never run once. It now covers everything, and a check makes sure nothing slips outside it again.",
@@ -33,7 +42,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.111.5-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "Deleting a photo or a spreadsheet now actually deletes it. PM was treating both as if they were files indexed from a cloud account — removing them from search but leaving what it had written in your vault behind, so the next time you rebuilt the index they came back. If you kept a copy of a photo in your vault, that picture is now removed with it too; before, it stayed there with nothing left to say where it was.",
       "The confirmation window tells you the truth about which of those is happening. It used to say a photo you dragged in off your desktop was safe in a cloud account you had never connected. Now it says plainly that PM's copy in your vault is going, and that the file you imported from is left alone.",
@@ -42,7 +51,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.111.4-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "Text recognition in photos works again. PM runs the part of it that reads your files in a locked-down process with no internet access — which is right, except that the text reader downloads its own models the first time it runs, so it could never get them. Every photo came back as if it held no text at all: a receipt, a whiteboard, a screenshot of a message, all indexed as blank and unsearchable. PM now fetches those models the same way it fetches the search and speech models, before the reading starts.",
       "They also live alongside everything else PM downloads now, rather than inside its Python folder, so reinstalling that folder no longer throws them away and re-downloads them.",
@@ -54,7 +63,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.111.3-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "Removing your data now stops PM writing anything else down, everywhere at once. Clearing your interface preferences only sticks if nothing puts them back — and two things could. The floating briefing window keeps its own copy of your theme, and it can't be told to stop, so PM now closes it before erasing rather than leaving it running. And the main window re-saved every theme setting whenever your system switched between light and dark or you clicked away, which was enough to restore the lot seconds after they'd been cleared.",
       "The background syncs also stop as soon as you start removing data, instead of carrying on against a machine that's being erased while the final screen is open.",
@@ -62,7 +71,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.111.2-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "On Mac and Linux, the folders PM had just erased could reappear while you were still reading the message saying they were gone. There's no uninstaller to hand over to on those systems, so PM stays open on the final screen — and anything still ticking over in the background would ask PM where its folder was, which quietly re-created it. It no longer does: once you've erased everything, PM stops making that folder for the rest of the session.",
       "Removing everything now also clears the interface preferences behind the app window, even if you didn't tick that box. PM was deleting the folder those live in whenever you removed everything else, but only emptying the window's own copy when the preferences box was ticked — so in that one combination the system could write them straight back over the folder that had just been deleted.",
@@ -73,7 +82,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.111.1-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "PM no longer leaves hundreds of megabytes in a cache folder you'd never think to look in. Setting up its Python components left every downloaded package sitting in a system-wide cache outside PM entirely, where removing PM never touched it. That cache is no longer written at all — the same downloads happen, nothing is kept afterwards.",
       "The same for the model downloader's own scratch cache, which quietly wrote to your home folder instead of PM's. Everything PM downloads — the search model, the speech model, and their caches — now lives in one folder under PM, so it goes when PM goes.",
@@ -84,7 +93,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.111.0-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "An interrupted sync no longer leaves a copy of your document sitting in your temp folder. To read a file from Google Drive or OneDrive, PM saves it briefly as an ordinary unencrypted file so the converter can open it, then deletes it — but if PM was closed or crashed at the wrong moment, that copy stayed there forever, outside your vault and outside everything the erase knew about. PM now clears them at startup and when you remove your data.",
       "\"Remove PM data\" now removes a vault you moved. If you'd moved your vault to another folder, the erase deleted the key that opens it and left the folder behind — so for a private vault, whose notes aren't encrypted, your notes stayed readable on disk while PM could never open them again. It now deletes PM's files there too, and only ever PM's: a folder that also holds your own files keeps them, and keeps the folder.",
@@ -97,7 +106,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.110.2-alpha",
-    date: "2026-07-31",
+    date: "2026-07-30",
     highlights: [
       "Your notes can no longer be switched back to plain text by editing a file next to them. Every vault keeps a small settings file recording whether notes are encrypted at rest, and PM checked it for tampering — but if the check failed it re-signed whatever it found, so the change became the new truth and the warning went away after one launch. A shared vault could be quietly turned back to plain text by someone who could reach the folder but didn't know the passphrase. PM now refuses to accept a change that weakens protection, keeps encrypting regardless of what the file claims, leaves the altered file alone rather than signing it, and keeps telling you until it's put right.",
       "You'll now be told about that at startup too. The warning only ever appeared when you typed your passphrase, so a vault that opened on a remembered key reported the problem to a log file nobody reads. It now shows on any launch, and the Vault panel reports whether your notes are actually being encrypted rather than what the settings file says they are.",
