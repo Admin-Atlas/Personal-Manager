@@ -24,6 +24,19 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.0-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "An interrupted sync no longer leaves a copy of your document sitting in your temp folder. To read a file from Google Drive or OneDrive, PM saves it briefly as an ordinary unencrypted file so the converter can open it, then deletes it — but if PM was closed or crashed at the wrong moment, that copy stayed there forever, outside your vault and outside everything the erase knew about. PM now clears them at startup and when you remove your data.",
+      "\"Remove PM data\" now removes a vault you moved. If you'd moved your vault to another folder, the erase deleted the key that opens it and left the folder behind — so for a private vault, whose notes aren't encrypted, your notes stayed readable on disk while PM could never open them again. It now deletes PM's files there too, and only ever PM's: a folder that also holds your own files keeps them, and keeps the folder.",
+      "It won't touch a vault that isn't yours. A shared vault another account on the machine created is left exactly where it is, and PM tells you where that is rather than quietly skipping it.",
+      "Deleting a shared vault is now the owner's to do. Anyone who had joined a shared vault could delete it for everybody, with no warning that it wasn't theirs. That option is now hidden for a vault someone else set up, and when PM can't tell who set it up, it says so before you go ahead.",
+      "The summary now lists anything PM left behind, with the exact path. Previously a locked folder, or a vault belonging to another account, simply went unmentioned while the screen said everything was gone. If PM can't remove something, it now shows you where it is so you can finish yourself.",
+      "The removal screen asks you to back up first, before anything is ticked — PM keeps no copy of what it erases, and can't put any of it back.",
+      "On Windows, removing PM completely now also clears the sandbox profile PM created for its document reader, which used to be left behind in your app-data folder for good.",
+    ],
+  },
+  {
     version: "3.110.2-alpha",
     date: "2026-07-31",
     highlights: [

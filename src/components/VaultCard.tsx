@@ -248,7 +248,13 @@ export function VaultCard() {
             </Button>
             {/* Deleting a shared vault only makes sense once it's actually in a shared
                 folder (pointed) — it removes the vault for every account that uses it. */}
-            {status?.pointed_root && (
+            {/* Hidden outright for a vault another account created: it is theirs to delete, and
+                PM should not hand a joiner the button. Still offered when ownership is UNKNOWN (a
+                vault from before ownership was recorded, or an account whose SID changed), because
+                hiding it there would lock a genuine owner out of their own vault — the confirmation
+                warns instead. Not a security boundary: anyone with write access to the folder can
+                delete the files themselves. The backend refuses the joined case too. */}
+            {status?.pointed_root && status.ownership !== "joined" && (
               <Button variant="tertiary" onClick={() => setPending("delete")} disabled={busy}>
                 Delete shared vault…
               </Button>
@@ -326,6 +332,16 @@ export function VaultCard() {
                 {status?.has_set_aside_vault
                   ? "This account switches back to the vault that was set aside when you joined."
                   : "This account switches to a new, empty vault (your data was moved into the shared copy when you shared it)."}
+              </p>
+              {status?.ownership === "unknown" && (
+                <p className="text-xs text-st-due" role="alert">
+                  PM can&rsquo;t confirm this account created this vault &mdash; it was made before
+                  PM recorded that, or this account has changed since. If someone else set it up,
+                  ask them to delete it from their own PM instead.
+                </p>
+              )}
+              <p className="text-xs text-ink4">
+                Back up anything you still want first. This cannot be undone, and PM keeps no copy.
               </p>
               <div className="flex gap-2">
                 <Button
