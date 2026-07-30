@@ -127,6 +127,30 @@ for (const f of tracked) {
   }
 }
 
+// 4. Every tracked test file is actually collected by a runner.
+//
+// A test nobody runs reports nothing, and reports it in exactly the same silence as a passing one —
+// so it is worse than no test, because the file's existence says the case is covered. vitest's
+// include globs used to be a list of directories that was narrower than the tree they meant to
+// cover; broadening them to `src/**` closes today's gap, but a glob can always drift again. This
+// asserts the other direction: no tracked test file falls outside a runner.
+//
+// Rust is deliberately absent — `cargo test` finds `#[cfg(test)]` by compilation, not by path.
+const COLLECTED = [
+  { re: /^src\/.+\.test\.tsx?$/, by: "vitest (src/**/*.test.{ts,tsx})" },
+  { re: /^scripts\/.+\.test\.mjs$/, by: "vitest (scripts/**/*.test.mjs)" },
+  { re: /^sidecar\/test_.+\.py$/, by: "just sidecar-test" },
+];
+for (const f of tracked) {
+  const looksLikeATest = /(^|\/)(test_[^/]+\.py|[^/]+\.test\.[^/]+)$/.test(f);
+  if (looksLikeATest && !COLLECTED.some(({ re }) => re.test(f))) {
+    problems.push(
+      `test file no runner collects: ${f}  — move it under a collected path ` +
+        `(${COLLECTED.map((c) => c.by).join(", ")}) or widen the runner in the same PR`,
+    );
+  }
+}
+
 if (problems.length) {
   console.error("✗ files-in-place: found tracked files that should not be here:\n");
   for (const p of problems) console.error(`  • ${p}`);

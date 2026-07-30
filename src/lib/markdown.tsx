@@ -26,6 +26,10 @@ import remarkGfm from "remark-gfm";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeExternalLinks from "rehype-external-links";
 
+// Taken from react-markdown's own props rather than importing `unified` directly: `unified` is a
+// transitive dependency, not a declared one, so a type imported from it rides on hoisting.
+type RehypePlugins = NonNullable<React.ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>;
+
 // Extend the default (safe) schema only to let the external-links plugin's `target`/`rel` survive
 // sanitization on anchors — everything else stays at the conservative default allowlist. Exported for
 // the T-07 unit test, which locks the allowlist against a regression that widens it.
@@ -48,6 +52,17 @@ export function safeUrl(url: string): string {
   return ABSOLUTE_ALLOWED.test(url) ? url : "";
 }
 
+// The rehype pipeline, hoisted out of the JSX so its SHAPE can be asserted rather than only its
+// behaviour (H6). ORDER is the security property: `rehypeSanitize` must be LAST, after every plugin
+// that can introduce nodes, or whatever a later plugin emits reaches the DOM unsanitised. Nothing
+// here may parse raw HTML — adding `rehype-raw` is the one-line change this array exists to make
+// visible. The unit test pins the length too, so adding a plugin is a deliberate act that has to
+// state where it sits relative to the sanitizer.
+export const REHYPE_PLUGINS: RehypePlugins = [
+  [rehypeExternalLinks, { target: "_blank", rel: ["noreferrer"], protocols: ["http", "https"] }],
+  [rehypeSanitize, SCHEMA],
+];
+
 /**
  * Render user-authored Markdown through the app's single sanitizing boundary. Element styling lives in
  * the `.pm-markdown` block in `src/index.css` (bound to design tokens — no typography plugin), so this
@@ -58,13 +73,7 @@ export function Markdown({ children }: { children: string }) {
     <div className="pm-markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[
-          [
-            rehypeExternalLinks,
-            { target: "_blank", rel: ["noreferrer"], protocols: ["http", "https"] },
-          ],
-          [rehypeSanitize, SCHEMA],
-        ]}
+        rehypePlugins={REHYPE_PLUGINS}
         urlTransform={safeUrl}
       >
         {children}

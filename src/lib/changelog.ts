@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.6-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Under-the-hood tidying: two of the checks that keep PM safe were themselves unchecked. The part that strips anything dangerous out of a document before showing it to you is now tested against real hostile input, and the isolation PM runs untrusted files inside now has tests that fail loudly instead of quietly reporting success without having looked.",
+      "The test runner also collected only some of the folders it was meant to, so a new test could have been written, committed, and never run once. It now covers everything, and a check makes sure nothing slips outside it again.",
+    ],
+  },
+  {
     version: "3.111.5-alpha",
     date: "2026-07-31",
     highlights: [

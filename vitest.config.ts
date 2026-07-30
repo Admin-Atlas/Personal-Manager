@@ -17,13 +17,13 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   test: {
-    include: [
-      "src/lib/**/*.test.ts",
-      "src/lib/**/*.test.tsx",
-      "src/components/**/*.test.tsx",
-      "src/theme/**/*.test.ts",
-      "scripts/**/*.test.mjs",
-    ],
+    // One pattern for the whole source tree, not a list of directories. The list version was
+    // narrower than the tree it was meant to cover — `src/components/**/*.test.tsx` collected no
+    // `.test.ts`, `src/theme/**/*.test.ts` collected no `.test.tsx`, and a new `src/` subdirectory
+    // would have been collected by nothing at all. A test file that is never collected reports
+    // nothing and looks exactly like a passing one. `check-files-in-place.mjs` proves the tracked
+    // set holds no test file this misses.
+    include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.mjs"],
     environment: "node",
   },
 });
