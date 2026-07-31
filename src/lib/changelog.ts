@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.113.4-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Approve in the sorting review no longer files a document before its suggestion has arrived. If files landed while PM was still working through them, Approve and Approve all would file those rows with nothing filled in — straight to Unsorted, and out of the review queue for good. Approve all now tells you how many rows are ready and leaves the rest where they are, and a row still waiting says so.",
+      "A file that arrived while the review screen was loading is no longer left out. It used to render with none of its details filled in and never got a suggestion at all — and editing one of those rows could blank the whole window.",
+      "PM stops recording corrections you never made. Filing a document yourself was logged as though you had corrected an AI suggestion that was never offered. It now only records a correction when there was really something to correct. Existing entries are left alone: nothing about them says which were the invented ones, so removing them would be guesswork over your data.",
+      "When PM suggests where a document belongs, it can see the tags you already use again. A change to how imports are batched had quietly closed that door, so on a fresh library the model kept inventing new tags instead of reusing yours. It now looks at everything still waiting to be reviewed, decides the vocabulary once for the whole import, and reuses it.",
+      "If a screen ever fails, you get a card explaining it with a way back, instead of an empty window. PM's window has no system title bar — it draws its own — so a crash used to take the close button with it, leaving nothing to click.",
+      "Smaller repairs: a message you typed and left behind can no longer reappear in the conversation you moved to; a milestone no longer writes an out-of-date name or date back over a newer one, and a date that fails to save visibly reverts; and scrolling to the bottom of an inner list now carries on scrolling the page behind it instead of stopping dead.",
+    ],
+  },
+  {
     version: "3.113.3-alpha",
     date: "2026-07-31",
     highlights: [

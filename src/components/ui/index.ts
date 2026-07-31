@@ -27,3 +27,4 @@ export { Skeleton, type SkeletonProps } from "./Skeleton";
 export { TitleBar } from "./TitleBar";
 export { VisuallyHidden } from "./VisuallyHidden";
 export { Field, useFieldA11y, type FieldProps, type FieldA11y } from "./Field";
+export { ErrorBoundary, type ErrorBoundaryProps } from "./ErrorBoundary";

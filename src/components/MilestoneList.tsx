@@ -180,17 +180,26 @@ function MilestoneRow({
   const met = m.state === "met";
   const status = milestoneStatus(m);
 
+  // Adopt fresh values when a refetch brings them in (e.g. a calendar-linked date syncing). Rows are
+  // keyed by id, so the instance survives a refetch and would otherwise keep its MOUNT-time values
+  // for ever — and `persist`'s no-op guard compares those locals against the LIVE prop, so a stale
+  // local is exactly the case that fails to short-circuit and writes the outdated day back.
+  // Matches PinboardView's `useMilestoneEditor`, which has had these since #213.
+  useEffect(() => setLabel(m.label), [m.label]);
+  useEffect(() => setDate(m.due_date?.slice(0, 10) ?? ""), [m.due_date]);
+
   // Persist label (+ PM-native date) on blur, skipping a no-op so we don't refetch needlessly.
   // `dateOverride` is how DateField commits: it hands us the new value directly, because reading
   // `date` here right after a `setDate` in the same tick would see the PREVIOUS render's value and
-  // silently persist the old day.
-  async function persist(dateOverride?: string) {
+  // silently persist the old day. Reports whether the write landed, so an optimistic caller can put
+  // its field back; a no-op counts as success, or a legitimate nothing-to-do would read as a refusal.
+  async function persist(dateOverride?: string): Promise<boolean> {
     const nextLabel = label.trim() || "deadline";
     const effectiveDate = dateOverride ?? date;
     const nextDate = m.calendar_linked ? null : effectiveDate || null;
     const curDate = m.calendar_linked ? null : (m.due_date?.slice(0, 10) ?? null);
-    if (nextLabel === m.label && nextDate === curDate) return;
-    await runMutation(async () => {
+    if (nextLabel === m.label && nextDate === curDate) return true;
+    return await runMutation(async () => {
       await updateMilestone(m.id, nextLabel, nextDate);
       onChanged();
     }, onError);
@@ -274,8 +283,14 @@ function MilestoneRow({
           <DateField
             value={date}
             onCommit={(iso) => {
+              const prev = date;
               setDate(iso);
-              void persist(iso);
+              // A refused write is followed by no refetch, so `m` never changes and the adopt effect
+              // above cannot undo this — put the field back rather than leave it showing, and later
+              // silently re-committing, a date the backend rejected.
+              void persist(iso).then((ok) => {
+                if (!ok) setDate(prev);
+              });
             }}
             ariaLabel="Milestone deadline"
             wrapperClassName="min-w-0 flex-1"

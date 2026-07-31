@@ -530,6 +530,10 @@ export interface ReviewDecision {
   proposed_project: string;
   proposed_tags: string[];
   proposed_importance: Importance;
+  /** Whether an AI proposal was actually on screen for this row. False with suggestions off (the
+   *  default) or before the model answered — `proposed_*` then just mirror the document's own
+   *  values, so there is nothing to correct and the backend logs nothing. */
+  had_proposal: boolean;
 }
 
 /** Streamed as proposals come back from `propose_metadata`. */

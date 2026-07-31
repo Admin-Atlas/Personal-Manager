@@ -34,7 +34,7 @@ import { VaultOpenError } from "./components/VaultOpenError";
 import { DeletedVaultNotice } from "./components/VaultRecovery";
 import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
-import { Skeleton } from "./components/ui";
+import { ErrorBoundary, Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { ReaderProvider } from "./lib/reader";
 import { BriefingProvider } from "./lib/briefing";
@@ -101,8 +101,13 @@ import type {
   VaultStatus,
 } from "./lib/types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { proposeOnArrival, runProposalsAfterSync } from "./lib/reviewProposals";
-import { onDocumentsLanded } from "./lib/documentFeed";
+import {
+  proposeOnArrival,
+  resetArrivalProposals,
+  runProposalsAfterSync,
+} from "./lib/reviewProposals";
+import { onDocumentsLanded, resetDocumentFeed } from "./lib/documentFeed";
+import { subscribeUntilCleanup } from "./lib/subscribe";
 import { onTeardown } from "./lib/teardown";
 import { VaultJoin } from "./components/VaultJoin";
 import { markJustJoinedVault } from "./lib/joinedVault";
@@ -420,49 +425,57 @@ export default function App() {
   // Writer-lock events: the curtain drops when another profile takes over, and lifts when
   // this instance (re)acquires the baton.
   useEffect(() => {
-    let offCurtain: (() => void) | undefined;
-    let offAcquired: (() => void) | undefined;
-    void onVaultCurtain((e) => {
-      setCurtainReason(e.reason);
-      vaultLockStatus()
-        .then(setVaultLock)
-        .catch(() => {});
-    }).then((off) => (offCurtain = off));
-    void onVaultAcquired(() => void becomeActiveWriter()).then((off) => (offAcquired = off));
-    return () => {
-      offCurtain?.();
-      offAcquired?.();
-    };
+    const offs = [
+      subscribeUntilCleanup(() =>
+        onVaultCurtain((e) => {
+          // The backend has just closed the store under us (`lock_session::close_store`) while this
+          // webview keeps running, so drop the arrival work aimed at it BEFORE anything else: a
+          // queued proposal batch would otherwise retry every 1.5 s against a closed store for as
+          // long as the curtain is up. Deliberately NOT `proposalCache` — the baton comes back to
+          // the SAME vault, so clearing it would re-bill suggestions already paid for on every
+          // hand-off. Nothing is owed on `vault://fault`: that path records and emits, but leaves
+          // the store open.
+          resetArrivalProposals();
+          resetDocumentFeed();
+          setCurtainReason(e.reason);
+          vaultLockStatus()
+            .then(setVaultLock)
+            .catch(() => {});
+        }),
+      ),
+      subscribeUntilCleanup(() => onVaultAcquired(() => void becomeActiveWriter())),
+    ];
+    return () => offs.forEach((off) => off());
     // eslint-disable-next-line react-hooks/exhaustive-deps -- subscribe once for the app's life
   }, []);
 
   // M-3: surface the backend's non-blocking warning when a vault's metadata was repaired on open.
-  useEffect(() => {
-    let off: (() => void) | undefined;
-    void onVaultMetaWarning((message) => setMetaWarning(message)).then((o) => (off = o));
-    return () => off?.();
-  }, []);
+  useEffect(
+    () => subscribeUntilCleanup(() => onVaultMetaWarning((message) => setMetaWarning(message))),
+    [],
+  );
 
   // Issue #343: surface a mid-session loss of access to the vault folder the moment the
   // backend notices it, instead of a wall of "the vault is locked" errors.
-  useEffect(() => {
-    let off: (() => void) | undefined;
-    void onVaultFault((fault) => setVaultFaultNotice(fault.message)).then((o) => (off = o));
-    return () => off?.();
-  }, []);
+  useEffect(
+    () => subscribeUntilCleanup(() => onVaultFault((fault) => setVaultFaultNotice(fault.message))),
+    [],
+  );
 
   // The always-on-top briefing is a real OS window Rust owns, and it can be dismissed from places
   // this webview never sees — its own ✕, or the tray icon being switched off. Follow that back into
   // the pref, or "Floating briefing" would keep reading "Always on top" with nothing on screen and
   // would re-open the window on the next launch. App scope, not Settings: the window can be closed
   // while Settings isn't even open. Mounted here it lives for the app's whole run.
-  useEffect(() => {
-    let off: (() => void) | undefined;
-    void onBriefingWindowClosed(() => {
-      if (readBriefingFloat() === "onTop") writeBriefingFloat("off");
-    }).then((o) => (off = o));
-    return () => off?.();
-  }, []);
+  useEffect(
+    () =>
+      subscribeUntilCleanup(() =>
+        onBriefingWindowClosed(() => {
+          if (readBriefingFloat() === "onTop") writeBriefingFloat("off");
+        }),
+      ),
+    [],
+  );
 
   // While curtained, poll the lock so the holder going stale surfaces the force-take option.
   useEffect(() => {
@@ -1088,141 +1101,151 @@ export default function App() {
                 />
               )}
 
-              {view === "focus" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <FocusView onOpenProject={openProject} onAsk={askInChat} />
-                </main>
-              ) : view === "project" && selectedProject ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <ProjectView
-                    project={selectedProject}
-                    chat={projectChat}
-                    localAi={localAi}
-                    focusDocId={selectedDocId}
-                    onOpenChatCitation={openChatCitation}
-                    onUpgrade={handleUpgrade}
-                    onBack={() => setView("focus")}
-                  />
-                </main>
-              ) : view === "calendar" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <CalendarView
-                    onOpenProject={openProject}
-                    onOpenPinboard={() => setView("pinboard")}
-                  />
-                </main>
-              ) : view === "documents" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
-                  <DocumentsView
-                    onReviewClick={teachVisible ? () => setView("review") : undefined}
-                    // From App's settings, which are re-read when the Settings overlay closes — this
-                    // view stays mounted underneath it, so its own mount-time read never saw the
-                    // toggle change (#282).
-                    duplicateCheck={settings ? settings.duplicate_check : null}
-                    onDuplicateCheckChange={refreshSettings}
-                  />
-                </main>
-              ) : view === "review" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <ReviewView
-                    onChanged={refreshReviewCount}
-                    onOpenSettings={() => setShowSettings(true)}
-                  />
-                </main>
-              ) : view === "teach" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <TeachView />
-                </main>
-              ) : view === "graph" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <GraphView />
-                </main>
-              ) : view === "pinboard" ? (
-                // min-w-0 lets the oversized pinboard board stay contained in its own
-                // overflow-auto scroller instead of inflating <main> and shoving the board
-                // header's right-aligned buttons off-screen.
-                <main className="flex h-full min-w-0 flex-1 flex-col">
-                  <PinboardView />
-                </main>
-              ) : view === "dev" ? (
-                <main className="flex h-full flex-1 flex-col">
-                  <DevView />
-                </main>
-              ) : (
-                <main className="flex h-full flex-1 flex-col">
-                  {chat.error && (
-                    <div
-                      className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
-                      style={{
-                        background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                      }}
-                    >
-                      {chat.error}
-                    </div>
-                  )}
-                  {chat.fallback && (
-                    <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
-                  )}
-                  {activeConv && (
-                    <div className="flex items-center border-b border-rule px-4 py-2">
-                      <ConversationTitle
-                        conversationId={activeConv.id}
-                        title={activeConv.title}
-                        onRenamed={(title) =>
-                          setConversations((prev) =>
-                            prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
-                          )
-                        }
-                      />
-                    </div>
-                  )}
-                  <ChatView
-                    messages={chat.messages}
-                    prompts={chat.prompts}
-                    confidences={chat.confidences}
-                    providers={chat.providers}
-                    showProvenance={!!localAi?.configured}
-                    streaming={chat.streaming}
-                    onOpenChatCitation={openChatCitation}
-                    focusTurn={focusTurn}
-                  />
-                  <QueuedMessages
-                    queued={queue.queued}
-                    stalled={queue.stalled}
-                    failedId={queue.failedId}
-                    onRemove={queue.remove}
-                    onEdit={queue.edit}
-                    onHold={queue.hold}
-                    onResume={queue.resume}
-                  />
-                  <Composer
-                    // Deliberately NOT `chat.sending`: typing ahead is the feature. The composer
-                    // only refuses when the queue is full, which is the one case where accepting
-                    // would silently drop what was typed. `sending` drives the WORDING instead —
-                    // what Enter does changes mid-answer, so the box has to say which it is.
-                    disabled={queue.full}
-                    busy={chat.sending}
-                    onSend={(text) => queue.enqueue(text)}
-                    leftTools={
-                      <div className="flex items-center gap-2">
-                        <ContextMeter
-                          conversationId={activeId}
-                          refreshKey={chat.messages.length}
-                          onUpgrade={handleUpgrade}
-                        />
-                        <ProviderChip status={localAi} />
+              {/* One boundary around the views, so a render throw in any of them costs that view
+                  and not the window: TitleBar (main.tsx), the sidebar and the collapse tab all sit
+                  OUTSIDE it, so "go back" always works — which is why the card offers no back
+                  button of its own. The `key` IS the reset: clicking any sidebar entry changes
+                  `view`, React discards the errored instance and mounts a clean one, so no
+                  `onReset` plumbing is needed. `selectedProject` is in the key too, or a project
+                  that crashes ProjectView would poison the next project opened (`view` alone stays
+                  "project"). */}
+              <ErrorBoundary key={`${view}:${selectedProject ?? ""}`} what="This view">
+                {view === "focus" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <FocusView onOpenProject={openProject} onAsk={askInChat} />
+                  </main>
+                ) : view === "project" && selectedProject ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <ProjectView
+                      project={selectedProject}
+                      chat={projectChat}
+                      localAi={localAi}
+                      focusDocId={selectedDocId}
+                      onOpenChatCitation={openChatCitation}
+                      onUpgrade={handleUpgrade}
+                      onBack={() => setView("focus")}
+                    />
+                  </main>
+                ) : view === "calendar" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <CalendarView
+                      onOpenProject={openProject}
+                      onOpenPinboard={() => setView("pinboard")}
+                    />
+                  </main>
+                ) : view === "documents" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
+                    <DocumentsView
+                      onReviewClick={teachVisible ? () => setView("review") : undefined}
+                      // From App's settings, which are re-read when the Settings overlay closes — this
+                      // view stays mounted underneath it, so its own mount-time read never saw the
+                      // toggle change (#282).
+                      duplicateCheck={settings ? settings.duplicate_check : null}
+                      onDuplicateCheckChange={refreshSettings}
+                    />
+                  </main>
+                ) : view === "review" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <ReviewView
+                      onChanged={refreshReviewCount}
+                      onOpenSettings={() => setShowSettings(true)}
+                    />
+                  </main>
+                ) : view === "teach" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <TeachView />
+                  </main>
+                ) : view === "graph" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <GraphView />
+                  </main>
+                ) : view === "pinboard" ? (
+                  // min-w-0 lets the oversized pinboard board stay contained in its own
+                  // overflow-auto scroller instead of inflating <main> and shoving the board
+                  // header's right-aligned buttons off-screen.
+                  <main className="flex h-full min-w-0 flex-1 flex-col">
+                    <PinboardView />
+                  </main>
+                ) : view === "dev" ? (
+                  <main className="flex h-full flex-1 flex-col">
+                    <DevView />
+                  </main>
+                ) : (
+                  <main className="flex h-full flex-1 flex-col">
+                    {chat.error && (
+                      <div
+                        className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
+                        style={{
+                          background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                        }}
+                      >
+                        {chat.error}
                       </div>
-                    }
-                    rightTools={
-                      <RetrievalExplainPanel
-                        messages={chat.messages}
-                        conversationId={activeId ?? undefined}
-                      />
-                    }
-                  />
-                </main>
-              )}
+                    )}
+                    {chat.fallback && (
+                      <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
+                    )}
+                    {activeConv && (
+                      <div className="flex items-center border-b border-rule px-4 py-2">
+                        <ConversationTitle
+                          conversationId={activeConv.id}
+                          title={activeConv.title}
+                          onRenamed={(title) =>
+                            setConversations((prev) =>
+                              prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
+                            )
+                          }
+                        />
+                      </div>
+                    )}
+                    <ChatView
+                      messages={chat.messages}
+                      prompts={chat.prompts}
+                      confidences={chat.confidences}
+                      providers={chat.providers}
+                      showProvenance={!!localAi?.configured}
+                      streaming={chat.streaming}
+                      onOpenChatCitation={openChatCitation}
+                      focusTurn={focusTurn}
+                    />
+                    <QueuedMessages
+                      queued={queue.queued}
+                      stalled={queue.stalled}
+                      failedId={queue.failedId}
+                      onRemove={queue.remove}
+                      onEdit={queue.edit}
+                      onHold={queue.hold}
+                      onResume={queue.resume}
+                    />
+                    <Composer
+                      // Deliberately NOT `chat.sending`: typing ahead is the feature. The composer
+                      // only refuses when the queue is full, which is the one case where accepting
+                      // would silently drop what was typed. `sending` drives the WORDING instead —
+                      // what Enter does changes mid-answer, so the box has to say which it is.
+                      disabled={queue.full}
+                      busy={chat.sending}
+                      onSend={(text) => queue.enqueue(text)}
+                      leftTools={
+                        <div className="flex items-center gap-2">
+                          <ContextMeter
+                            conversationId={activeId}
+                            refreshKey={chat.messages.length}
+                            onUpgrade={handleUpgrade}
+                          />
+                          <ProviderChip status={localAi} />
+                        </div>
+                      }
+                      rightTools={
+                        <RetrievalExplainPanel
+                          messages={chat.messages}
+                          conversationId={activeId ?? undefined}
+                        />
+                      }
+                    />
+                  </main>
+                )}
+              </ErrorBoundary>
 
               {showSettings && (
                 <div className="absolute inset-0 z-50" style={{ background: "var(--scrim)" }}>

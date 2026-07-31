@@ -17,6 +17,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { useTheme } from "../../theme";
+import { subscribeUntilCleanup } from "../../lib/subscribe";
 import { cn } from "./cn";
 import { useEdgeResizeCursor } from "./useEdgeResizeCursor";
 
@@ -141,7 +142,6 @@ export function TitleBar() {
 
   useEffect(() => {
     const win = getCurrentWindow();
-    let unlisten: (() => void) | undefined;
     // There is no fullscreen-changed event, and toggling fullscreen also fires a
     // resize, so re-read both window states from the one onResized handler.
     const sync = () => {
@@ -155,12 +155,7 @@ export function TitleBar() {
         .catch(() => {});
     };
     sync();
-    win
-      .onResized(sync)
-      .then((fn) => {
-        unlisten = fn;
-      })
-      .catch(() => {});
+    const offResize = subscribeUntilCleanup(() => win.onResized(sync));
 
     // F11 toggles fullscreen; Esc leaves it — a frameless fullscreen must never trap
     // the user. Read the live state (not the closed-over value) before toggling.
@@ -187,7 +182,7 @@ export function TitleBar() {
     };
     window.addEventListener("keydown", onKey);
     return () => {
-      unlisten?.();
+      offResize();
       window.removeEventListener("keydown", onKey);
     };
   }, []);

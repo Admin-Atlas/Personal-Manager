@@ -7,11 +7,18 @@
 //
 // The rule this enforces:
 //   • Find the nearest scroller under the pointer (either axis).
-//   • A vertical wheel drives it up/down when it scrolls vertically. When that nearest scroller can
-//     ONLY scroll horizontally (a wide table / row with no vertical scroll of its own), the vertical
-//     wheel PANS it sideways instead — so a plain mouse with no tilt/side wheel can still reach the
-//     far columns. At the horizontal edge we hand back to a vertical scroller further up so the page
-//     keeps moving past the table.
+//   • A vertical wheel drives it up/down when it scrolls vertically — until that scroller is
+//     EXHAUSTED in the wheel's own direction, where we hand the event back untouched so the
+//     browser's native scroll chaining moves an ancestor (and honours any overscroll-behavior).
+//     Cancelling there instead is what stopped the page dead under an exhausted nested list.
+//   • When that nearest scroller can ONLY scroll horizontally (a wide table / row with no vertical
+//     scroll of its own), the vertical wheel PANS it sideways instead — so a plain mouse with no
+//     tilt/side wheel can still reach the far columns. At the horizontal edge we hand back to a
+//     vertical scroller further up, MANUALLY, so the page keeps moving past the table.
+//   • The asymmetry between those two is deliberate: we hand back to the browser only where the
+//     browser's own axis mapping is already right (a vertical wheel over a vertical scroller). The
+//     sideways-panning case is precisely the mapping it gets wrong — WebKit flips it, Blink does
+//     not — so there we stay authoritative all the way up.
 //   • A horizontal wheel (a tilt wheel / MX-Master side-scroll, |deltaX| ≥ |deltaY|) drives the
 //     nearest horizontal scroller left/right.
 //   • Ctrl+wheel (zoom) and Shift+wheel (the native "wheel scrolls horizontally" convention) are left
@@ -74,6 +81,36 @@ function deltaToPixels(delta: number, mode: number, viewportExtent: number): num
   return delta; // already pixels
 }
 
+/**
+ * Slack for the END edge only. `scrollHeight`/`clientHeight` are INTEGERS (rounded from the real,
+ * fractional layout box) while `scrollTop`/`scrollLeft` are fractional and snap to the DEVICE pixel
+ * grid, so at a non-integer DPR the largest REACHABLE offset sits below `scrollHeight - clientHeight`
+ * by up to ~1px of rounding plus ~1/DPR of snapping. Too tight an epsilon means the end edge is never
+ * recognised and the wheel stays swallowed for ever — exactly the failure this guards — so 2px, which
+ * covers every DPR ≥ 1. The START edge takes NO slack: 0 is both exactly representable and exactly
+ * reachable, and slack there would strand the scroller's last pixels.
+ */
+const EDGE_SLACK_PX = 2;
+
+/**
+ * Whether a wheel of this delta has nothing left to consume on this scroller — the moment the event
+ * must be left alone so it can chain to an ancestor instead of being swallowed.
+ *
+ * Pure and exported so the epsilon is pinned by tests: whole-module behaviour is unit-untestable
+ * (jsdom reports every extent as 0, so nothing looks scrollable), which makes this predicate the
+ * seam — the same choice `wheelShift.ts` and `windowEdge.ts` made.
+ */
+export function atScrollEdge(
+  delta: number,
+  offset: number,
+  clientExtent: number,
+  scrollExtent: number,
+): boolean {
+  if (delta < 0) return offset <= 0;
+  if (delta > 0) return offset + clientExtent >= scrollExtent - EDGE_SLACK_PX;
+  return false;
+}
+
 function onWheel(e: WheelEvent): void {
   // Zoom (Ctrl) and the native shift-to-scroll-horizontally convention are left to the browser /
   // the canvas's own handler.
@@ -95,6 +132,15 @@ function onWheel(e: WheelEvent): void {
   if (wantAxis === "y") {
     // Nearest scroller can move vertically → drive it vertically.
     if (near.y) {
+      // …unless it has nothing left to give in this direction. Then leave the event entirely alone:
+      // the browser chains it to an ancestor itself, which is the one axis mapping it gets right.
+      // Applying the clamped, no-op delta and cancelling the default is what swallowed the wheel.
+      // Note the `return` — a both-axis scroller at its vertical edge must NOT fall through to the
+      // sideways-panning branch below, which exists only for scrollers that cannot scroll vertically
+      // at all.
+      if (atScrollEdge(e.deltaY, near.el.scrollTop, near.el.clientHeight, near.el.scrollHeight)) {
+        return;
+      }
       near.el.scrollTop += deltaToPixels(e.deltaY, e.deltaMode, near.el.clientHeight);
       e.preventDefault();
       return;
@@ -103,9 +149,9 @@ function onWheel(e: WheelEvent): void {
     // plain mouse (no tilt/side wheel) can reach the far columns. At the horizontal edge, hand back to
     // a vertical scroller further up so the page keeps scrolling past a wide table.
     const el = near.el;
-    const atStart = el.scrollLeft <= 0;
-    const atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 1;
-    if ((e.deltaY < 0 && atStart) || (e.deltaY > 0 && atEnd)) {
+    // The handoff stays MANUAL here (see the header): the browser would chain this wheel vertically
+    // on one engine and not the other, so we pick the ancestor ourselves.
+    if (atScrollEdge(e.deltaY, el.scrollLeft, el.clientWidth, el.scrollWidth)) {
       const up = nearestScroller(el.parentElement, "y");
       if (up) {
         up.scrollTop += deltaToPixels(e.deltaY, e.deltaMode, up.clientHeight);
@@ -118,13 +164,19 @@ function onWheel(e: WheelEvent): void {
     return;
   }
 
-  // Horizontal wheel → drive the nearest horizontal scroller.
-  if (near.x) {
+  // Horizontal wheel → drive the nearest horizontal scroller, while it still has room. At its edge
+  // it is not the owner of this event either, so fall through and look further up rather than
+  // swallowing it — the same latent hole as the vertical branch above, one axis over.
+  if (
+    near.x &&
+    !atScrollEdge(e.deltaX, near.el.scrollLeft, near.el.clientWidth, near.el.scrollWidth)
+  ) {
     near.el.scrollLeft += deltaToPixels(e.deltaX, e.deltaMode, near.el.clientWidth);
     e.preventDefault();
     return;
   }
-  // Nearest scroller is vertical-only → look further up for a horizontal one; otherwise leave it.
+  // Nearest scroller is vertical-only (or spent) → look further up for a horizontal one; otherwise
+  // leave it.
   const up = nearestScroller(near.el.parentElement, "x");
   if (up) {
     up.scrollLeft += deltaToPixels(e.deltaX, e.deltaMode, up.clientWidth);

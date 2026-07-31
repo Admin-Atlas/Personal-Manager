@@ -44,7 +44,7 @@ Two rules that fall out of the classes:
 | `conversations` | truth | Chat titles and project scope. The turn text is authoritatively in the vault; this row is not recomputable from it alone. |
 | `messages` | truth | Bodies mirror the vault, but `citations`, `retrieved_chunk_ids` and `model` exist only here. |
 | `chat_sessions` | derived | Session↔document mapping, rolling summary, cursors, last prompt size. Re-derivable — but regenerating the summary is a **billable** model call. |
-| `settings` | mixed | Key-namespaced grab-bag. Truth: user preferences (retrieval k, reranking, backup frequency/retention). Device: local model scan dir, external CLI paths, sync cursors, last-run timestamps. Derived: the briefing cache, layout caches, the retrieval config stamp. **There is no key-prefix convention today** — see Open decisions. |
+| `settings` | mixed | Key-namespaced grab-bag. Truth: user preferences (retrieval k, reranking, backup frequency/retention). Device: local model scan dir, external CLI paths, sync cursors, last-run timestamps. Derived: the briefing cache, layout caches, the retrieval config stamp, the filing seed vocabulary (`filing_seed_vocabulary` — machine-guessed from the unreviewed backlog, regenerable, and travels verbatim in a `.pmbackup`). **There is no key-prefix convention today** — see Open decisions. |
 | `projects` | truth | Triage the user set: deadline, size, blocked-by, parent, importance, active date. |
 | `project_milestones` | truth | Multi-deadline project structure, incl. status and external-source anchoring. |
 | `project_activity` | truth | An emit-only historical record of what happened when. Nothing can recompute a past event. |

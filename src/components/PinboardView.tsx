@@ -2014,14 +2014,16 @@ function useMilestoneEditor(
   useEffect(() => setDate(m.due_date?.slice(0, 10) ?? ""), [m.due_date]);
 
   // `dateOverride` is how DateField commits — it hands the new value straight in, because reading
-  // `date` right after a `setDate` in the same tick still sees the previous render's value.
-  const persist = async (dateOverride?: string) => {
+  // `date` right after a `setDate` in the same tick still sees the previous render's value. Reports
+  // whether the write landed, so an optimistic caller can put its field back; a no-op counts as
+  // success, or a legitimate nothing-to-do would read as a refusal.
+  const persist = async (dateOverride?: string): Promise<boolean> => {
     const nextLabel = label.trim() || "deadline";
     const effectiveDate = dateOverride ?? date;
     const nextDate = m.calendar_linked ? null : effectiveDate || null;
     const curDate = m.calendar_linked ? null : msDate(m) || null;
-    if (nextLabel === m.label && nextDate === curDate) return;
-    await runMutation(async () => {
+    if (nextLabel === m.label && nextDate === curDate) return true;
+    return await runMutation(async () => {
       await updateMilestone(m.id, nextLabel, nextDate);
       onChanged();
     }, onError);
@@ -2119,8 +2121,14 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
         <DateField
           value={date}
           onCommit={(iso) => {
+            const prev = date;
             setDate(iso);
-            void persist(iso);
+            // A refused write triggers no refetch, so `m.due_date` never changes and the adopt
+            // effect cannot undo this — roll the field back instead of leaving it showing, and
+            // later silently re-committing, a date the backend rejected.
+            void persist(iso).then((ok) => {
+              if (!ok) setDate(prev);
+            });
           }}
           ariaLabel="Milestone deadline"
           wrapperClassName="w-full"
@@ -2176,8 +2184,13 @@ function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) 
         <DateField
           value={date}
           onCommit={(iso) => {
+            const prev = date;
             setDate(iso);
-            void persist(iso);
+            // Same rollback as the column view above: no refetch follows a refusal, so the adopt
+            // effect never fires and the field would keep — and re-commit — the rejected date.
+            void persist(iso).then((ok) => {
+              if (!ok) setDate(prev);
+            });
           }}
           ariaLabel="Milestone deadline"
           wrapperClassName="w-[7.5rem] shrink-0"

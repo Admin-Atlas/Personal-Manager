@@ -363,4 +363,49 @@ describe("leaving the conversation", () => {
     await c.settle();
     expect(c.calls).toEqual(["in flight"]);
   });
+
+  // The failure path is the one `clear()` cannot reach: the in-flight message is a closure local
+  // inside the drain loop, already removed from the queue, so emptying the array leaves it alone.
+  // Without the generation fence it comes BACK — into the conversation the user moved to, with a
+  // banner naming a failure in a chat that is gone and a "try again" that would send the old text
+  // into the new chat.
+  it("does not re-queue a failed send into the conversation the user moved to", async () => {
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("in flight");
+      result.current.enqueue("abandoned");
+    });
+
+    act(() => {
+      result.current.clear();
+    });
+    await c.settle(false);
+
+    expect(result.current.queued).toEqual([]);
+    expect(result.current.stalled).toBe(false);
+    expect(result.current.failedId).toBeNull();
+  });
+
+  // Why the drain loop CONTINUES rather than returning. `enqueue`'s own `drain()` is a no-op while
+  // a loop is running, and `clear()` starts none, so the new conversation's messages have no other
+  // runner — returning here would strand them with nothing on screen to explain it.
+  it("keeps draining what the NEW conversation queued after the old send fails", async () => {
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("old");
+    });
+    act(() => {
+      result.current.clear();
+    });
+    act(() => {
+      result.current.enqueue("new");
+    });
+
+    await c.settle(false); // the send belonging to the conversation just left
+    expect(c.calls).toEqual(["old", "new"]);
+    expect(result.current.stalled).toBe(false);
+    await c.settle();
+  });
 });
