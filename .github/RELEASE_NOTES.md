@@ -145,7 +145,15 @@ yourself, or PM can't store the key that protects its database.
 
 Windows and Linux builds bundle a relocatable **CPython** runtime from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) for the
-document features. Python is distributed under the PSF License Agreement; the licence text
-ships with the runtime inside the app (`python/LICENSE.txt`). PM's own third-party Rust
-dependencies and their licences are listed in `THIRD-PARTY-NOTICES.txt`, attached to each
-release.
+document features. Python itself is distributed under the PSF License Agreement.
+
+That runtime is not only CPython: it links **OpenSSL, SQLite, libffi, liblzma, mpdecimal,
+bzip2, expat and zlib**, each under its own terms. PM therefore ships the licence-bearing
+build rather than the smaller `install_only` one, so every component's licence travels with
+the binary — `python/LICENSE.txt` for CPython and `python/licenses/` for the rest, both
+inside the installed app. The licence files come from the exact build PM pins, so they cannot
+drift from what is actually linked.
+
+PM's own third-party dependencies and their licences are listed in `THIRD-PARTY-NOTICES.txt`,
+attached to each release: the Rust crates it is built from, and the npm packages compiled
+into its interface — including the typefaces it self-hosts.

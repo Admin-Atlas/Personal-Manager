@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.112.2-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "The Python runtime PM installs alongside itself is built on a lot of other open-source work — OpenSSL, SQLite and half a dozen others. Their licences now ship with it instead of being left out, and they come from the exact build PM uses, so they can't quietly stop matching what is actually inside.",
+      "PM also got noticeably smaller along the way. It turned out to be installing 82 MB of debugging files that are of no use outside a developer's machine, and had been doing so for as long as it has bundled Python. Those are gone: the installed Python drops from 150 MB to 69 MB.",
+    ],
+  },
+  {
     version: "3.112.1-alpha",
     date: "2026-07-31",
     highlights: [
