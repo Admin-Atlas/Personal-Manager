@@ -106,3 +106,9 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: node-version
+        name: every CI job runs the declared Node major
+        entry: just node-version
+        language: system
+        pass_filenames: false
+        always_run: true

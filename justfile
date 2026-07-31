@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -211,6 +211,12 @@ action-pins:
 # merge, because the lock is what installs on a user's machine.
 requirements-lock:
     node scripts/check-requirements-lock.mjs
+
+# Every CI job runs the Node major package.json declares. The version used to live only in eleven
+# hand-maintained workflow pins, so local and CI drifted apart unnoticed — PM was developed on 24
+# while CI built and bundled on 20, months after 20 went end-of-life.
+node-version:
+    node scripts/check-node-version.mjs
 
 # --- generators (not part of `check`) -------------------------------------
 

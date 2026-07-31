@@ -76,7 +76,7 @@ prior exposure.
 
 ## 3. Set up your environment
 
-Full prerequisites are in the [README](README.md#prerequisites). In short: **Node 20+**,
+Full prerequisites are in the [README](README.md#prerequisites). In short: **Node 24+**,
 **Rust (stable)**, **Python 3.10+** on your PATH, plus your platform's Tauri build
 prerequisites.
 
