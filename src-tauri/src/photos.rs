@@ -12,7 +12,7 @@
 //!
 //! This module owns the photo-specific logic; the ingest orchestration lives in [`crate::ingest`] and
 //! the OCR + EXIF extraction is done by the Python sidecar's `analyze_image` (see [`ImageAnalysis`]).
-//! OCR is an OPTIONAL on-demand component (rapidocr + pillow-heif) — installable and removable from
+//! OCR is an OPTIONAL on-demand component (rapidocr + pi-heif) — installable and removable from
 //! Settings, exactly like the t-SNE reducer — so a user who declines it still ingests photos with
 //! their EXIF metadata chunk (`ocr_text` then stays `None`).
 
@@ -224,7 +224,7 @@ pub fn ocr_text_from_body(body: &str) -> Option<String> {
 /// What the sidecar's `analyze_image` extracts from one image: the OCR text (empty when OCR was not
 /// run) plus best-effort EXIF capture metadata. `ocr_ran` distinguishes "OCR ran and found nothing"
 /// from "OCR was not requested" (the user declined the optional component). Any EXIF field is `None`
-/// when absent or unreadable (e.g. a HEIC opened without the pillow-heif codec) — the caller then
+/// when absent or unreadable (e.g. a HEIC opened without the pi-heif codec) — the caller then
 /// falls back to a filename- or ingest-time capture date.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImageAnalysis {
@@ -246,13 +246,13 @@ pub struct ImageAnalysis {
 
 // ---- optional OCR component: status + install commands --------------------
 //
-// OCR (rapidocr + pillow-heif) is delivered exactly like the t-SNE reducer (see [`crate::layout`]):
+// OCR (rapidocr + pi-heif) is delivered exactly like the t-SNE reducer (see [`crate::layout`]):
 // an OPTIONAL on-demand component the user installs once. These two commands are the install surface
 // (the drop-time prompt and the Storage tab). Removal goes through the Storage manager's guarded
 // cascade ([`crate::components::remove_storage_component`] with id `"ocr"`), which reclaims the heavy
 // image deps in order — so there is deliberately no standalone uninstall command here.
 
-/// Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed.
+/// Whether the optional photo-OCR component (rapidocr + pi-heif) is installed.
 #[derive(Serialize)]
 pub struct OcrStatus {
     installed: bool,
@@ -267,7 +267,7 @@ pub fn optional_ocr_status(state: State<'_, AppState>) -> Result<OcrStatus> {
     })
 }
 
-/// Install the optional photo-OCR component (rapidocr + pillow-heif) on demand — a pip download into
+/// Install the optional photo-OCR component (rapidocr + pi-heif) on demand — a pip download into
 /// the managed venv. The blocking install runs off the async runtime; progress rides `ocr://install`
 /// so the Storage tab and the drop-time prompt can show a real percentage bar. Errors surface to the
 /// caller so the UI can show them. Idempotent (a no-op once installed).

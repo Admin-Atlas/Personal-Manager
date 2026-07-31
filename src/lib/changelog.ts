@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.112.3-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "PM's photo text-recognition add-on now uses a smaller, read-only reader for iPhone photos. The previous one carried a 22 MB video *encoder* PM never had any use for, on licence terms that sat awkwardly beside PM's own. If you already had photo text recognition switched on, Settings → Storage will offer it to you again — adding it back takes a moment and downloads noticeably less than before.",
+      "Under-the-hood tidying. Every Python package PM installs for the document features now has its licence recorded and checked, so a change in what those terms are can't slip by unnoticed. The file-header check covers four more kinds of file and no longer skips anything at all. And the security page now explains how PM stores your keys on each platform, rather than describing the Mac and leaving Windows and Linux to be guessed at.",
+    ],
+  },
+  {
     version: "3.112.2-alpha",
     date: "2026-07-31",
     highlights: [

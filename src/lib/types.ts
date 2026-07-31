@@ -1201,7 +1201,7 @@ export interface InstallProgressEvent {
   fraction: number;
 }
 
-/** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
+/** Whether the optional photo-OCR component (rapidocr + pi-heif) is installed. */
 export interface OcrStatus {
   installed: boolean;
 }

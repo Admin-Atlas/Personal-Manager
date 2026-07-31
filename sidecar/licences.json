@@ -1,0 +1,886 @@
+{
+  "//": [
+    "What licence every Python package in the sidecar's locks is under.",
+    "",
+    "`evidence` and `stamp` are refreshed by `just lock-regen` (scripts/regen-sidecar-licences.mjs)",
+    "straight from PyPI. `licence` and `note` are written BY HAND, because PyPI's licence metadata",
+    "is not reliable enough to normalise: pillow-heif declares BSD-3-Clause and classifies itself",
+    "GPLv2, numpy pastes its whole licence text into a one-line field, and 'BSD License' does not",
+    "say two-clause or three. Where the evidence was ambiguous the value was taken from the",
+    "project's own LICENSE file (or, where a project ships none, from the wheel PM installs) and",
+    "the `note` records what was read.",
+    "",
+    "When upstream's metadata moves, the stamp changes and the generator BLANKS `licence` rather",
+    "than carrying the old answer forward. `just sidecar-licences` then fails until a human looks.",
+    "",
+    "PM does not ship these packages — pip fetches them onto the user's machine on first run — so",
+    "they are deliberately not in THIRD-PARTY-NOTICES.txt, which covers what the installer conveys."
+  ],
+  "version": 1,
+  "packages": {
+    "antlr4-python3-runtime": {
+      "versions": ["4.9.3"],
+      "licence": "BSD-3-Clause",
+      "stamp": "46ba327584d282edc4c707bbbc43ee4e",
+      "evidence": {
+        "expression": null,
+        "license": "BSD",
+        "classifiers": []
+      },
+      "note": "`license: \"BSD\"` does not say how many clauses. ANTLR's LICENSE.txt is the three-clause text (\"Neither name of copyright holders nor the names of its contributors...\")."
+    },
+    "anyio": {
+      "versions": ["4.14.2"],
+      "licence": "MIT",
+      "stamp": "a41517ef0af8f8e02b79334ab2d499d6",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "av": {
+      "versions": ["17.1.0", "18.0.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "3b026d53df107bb008426de37a2a6c7b",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "beautifulsoup4": {
+      "versions": ["4.15.0"],
+      "licence": "MIT",
+      "stamp": "38d6ea3be7050c48b61feaa05fa67a4f",
+      "evidence": {
+        "expression": null,
+        "license": "MIT License",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "certifi": {
+      "versions": ["2026.7.22"],
+      "licence": "MPL-2.0",
+      "stamp": "2f8f467a617c791ee022f6edc5e714e6",
+      "evidence": {
+        "expression": null,
+        "license": "MPL-2.0",
+        "classifiers": ["License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)"]
+      }
+    },
+    "cffi": {
+      "versions": ["2.1.0"],
+      "licence": "MIT-0",
+      "stamp": "9350b7a14468b58a58a3fab753978749",
+      "evidence": {
+        "expression": "MIT-0",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "charset-normalizer": {
+      "versions": ["3.4.9"],
+      "licence": "MIT",
+      "stamp": "4696f7c2f96ba1947455945cfc385f58",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": []
+      }
+    },
+    "click": {
+      "versions": ["8.4.2"],
+      "licence": "BSD-3-Clause",
+      "stamp": "676b8dca54bdd36ef3ff701281764b2f",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "cobble": {
+      "versions": ["0.1.4"],
+      "licence": "BSD-2-Clause OR BSD-3-Clause",
+      "stamp": "f9bd745fe34cf6eb7d31421d6722a43b",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "The one piece of evidence anywhere is the \"OSI Approved :: BSD License\" classifier: the project ships no LICENSE file, and neither does the wheel PM installs. The family is certain, the clause count is not, so both are recorded rather than one of them guessed at."
+    },
+    "colorama": {
+      "versions": ["0.4.6"],
+      "licence": "BSD-3-Clause",
+      "stamp": "e9925198eadf04b01e9e3cee5927a316",
+      "evidence": {
+        "expression": null,
+        "license": "",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "`license` is an empty string. LICENSE.txt in the project is the three-clause text."
+    },
+    "coloredlogs": {
+      "versions": ["15.0.1"],
+      "licence": "MIT",
+      "stamp": "fd371ec1a116116e68ecb69950224bc3",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "colorlog": {
+      "versions": ["6.12.0"],
+      "licence": "MIT",
+      "stamp": "a0893581bf003ca7b436b9091680444d",
+      "evidence": {
+        "expression": null,
+        "license": "MIT License",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "cryptography": {
+      "versions": ["49.0.0"],
+      "licence": "Apache-2.0 OR BSD-3-Clause",
+      "stamp": "3673d905cd3c3b5ae972fff22768b62f",
+      "evidence": {
+        "expression": "Apache-2.0 OR BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "ctranslate2": {
+      "versions": ["4.8.1"],
+      "licence": "MIT",
+      "stamp": "3a129a66b528ce195cea25ca67904ce2",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": []
+      }
+    },
+    "defusedxml": {
+      "versions": ["0.7.1"],
+      "licence": "PSF-2.0",
+      "stamp": "32c4c61c0cab03bfa5bc81e169234e02",
+      "evidence": {
+        "expression": null,
+        "license": "PSFL",
+        "classifiers": ["License :: OSI Approved :: Python Software Foundation License"]
+      },
+      "note": "`license: \"PSFL\"` — the Python Software Foundation Licence, matching the classifier."
+    },
+    "et-xmlfile": {
+      "versions": ["2.0.0"],
+      "licence": "MIT",
+      "stamp": "ad985e7674ba41195a34cd3d03679d27",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "exceptiongroup": {
+      "versions": ["1.3.1"],
+      "licence": "MIT AND PSF-2.0",
+      "stamp": "a11291e74a36928191e31b0dfd435f34",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      },
+      "note": "Classifier says MIT only; the LICENSE file is MIT plus the PSF licence covering the CPython code it backports."
+    },
+    "fastembed": {
+      "versions": ["0.8.0"],
+      "licence": "Apache-2.0",
+      "stamp": "c59dba56cf64f87e21e886e1bb16e031",
+      "evidence": {
+        "expression": null,
+        "license": "Apache License",
+        "classifiers": ["License :: Other/Proprietary License"]
+      },
+      "note": "Classifies itself \"License :: Other/Proprietary License\", which is simply wrong — its LICENSE is the Apache-2.0 text, matching the `license: \"Apache License\"` field."
+    },
+    "faster-whisper": {
+      "versions": ["1.2.1"],
+      "licence": "MIT",
+      "stamp": "6d5a11a0b5ee0e5a5d647136e10dbe05",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "filelock": {
+      "versions": ["3.32.2"],
+      "licence": "MIT",
+      "stamp": "f237aa0952d6c8c6e2832387577a5b08",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "flatbuffers": {
+      "versions": ["25.12.19"],
+      "licence": "Apache-2.0",
+      "stamp": "f4093f66a5da67496d2916bf2f9c9984",
+      "evidence": {
+        "expression": null,
+        "license": "Apache 2.0",
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      },
+      "note": "`license: \"Apache 2.0\"` — the same licence, written informally."
+    },
+    "fsspec": {
+      "versions": ["2026.7.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "ad60b8117cca7a90757a76c3ecc9e31b",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": []
+      },
+      "note": "Declares no licence and carries no classifier. The project's LICENSE is the three-clause text."
+    },
+    "h11": {
+      "versions": ["0.16.0"],
+      "licence": "MIT",
+      "stamp": "f21e2176adb8a95ba335c48ba446f033",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "hf-xet": {
+      "versions": ["1.5.2"],
+      "licence": "Apache-2.0",
+      "stamp": "7351c0b2de6e5dcc23d97b636656233b",
+      "evidence": {
+        "expression": "Apache-2.0",
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      }
+    },
+    "httpcore": {
+      "versions": ["1.0.9"],
+      "licence": "BSD-3-Clause",
+      "stamp": "0f52942e9ff1a01d5d7359b9702c7eb0",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      }
+    },
+    "httpx": {
+      "versions": ["0.28.1"],
+      "licence": "BSD-3-Clause",
+      "stamp": "fc812251c3677e4db53bbb11c9a465ec",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      }
+    },
+    "huggingface-hub": {
+      "versions": ["1.26.0"],
+      "licence": "Apache-2.0",
+      "stamp": "aa3082a555f83445f23c9a8c8c55eb12",
+      "evidence": {
+        "expression": null,
+        "license": "Apache-2.0",
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      }
+    },
+    "humanfriendly": {
+      "versions": ["10.0"],
+      "licence": "MIT",
+      "stamp": "5a29e2c972e72da4620c7c2813d89ed6",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "idna": {
+      "versions": ["3.18"],
+      "licence": "BSD-3-Clause",
+      "stamp": "96204c1eefe79a4f03df40d551a2ba58",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "joblib": {
+      "versions": ["1.5.3"],
+      "licence": "BSD-3-Clause",
+      "stamp": "970774316aa74c030216863fbb6c30fd",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "loguru": {
+      "versions": ["0.7.3"],
+      "licence": "MIT",
+      "stamp": "fa2f4425e3a9d2e562189b7c1d29a2e1",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      },
+      "note": "Classifier only; the project's LICENSE is the MIT text."
+    },
+    "lxml": {
+      "versions": ["6.1.1"],
+      "licence": "BSD-3-Clause",
+      "stamp": "39bde5792bb0d1c4aa6cf5b591368de8",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": []
+      }
+    },
+    "magika": {
+      "versions": ["0.6.2", "0.6.3"],
+      "licence": "Apache-2.0",
+      "stamp": "e4607b5fa00fb587a0bb900973ea177c",
+      "evidence": {
+        "expression": null,
+        "license": "Apache-2.0",
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      }
+    },
+    "mammoth": {
+      "versions": ["1.11.0"],
+      "licence": "BSD-2-Clause",
+      "stamp": "9ead2e01e0bfc7d2070598366b470e09",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-2-Clause",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      }
+    },
+    "markdownify": {
+      "versions": ["1.2.3"],
+      "licence": "MIT",
+      "stamp": "c55ead345aef610747e2a379c7cd5cb1",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      },
+      "note": "Classifier only; the project's LICENSE is the MIT text."
+    },
+    "markitdown": {
+      "versions": ["0.1.6"],
+      "licence": "MIT",
+      "stamp": "75d1e054b729b98540d278c2f3ffb7e1",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "mmh3": {
+      "versions": ["5.2.1"],
+      "licence": "MIT",
+      "stamp": "66d2eb706eab7cd5d341f7de9589ee08",
+      "evidence": {
+        "expression": null,
+        "license": "MIT License Copyright (c) 2011-2026 Hajime Senuma Permission is hereby granted, free of charge, to any person obtaini...",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      },
+      "note": "`license` is the entire MIT text pasted into the one-line field."
+    },
+    "mpmath": {
+      "versions": ["1.3.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "d310b6402ae542a51cd242229fb3d68c",
+      "evidence": {
+        "expression": null,
+        "license": "BSD",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "`license: \"BSD\"`; the project's LICENSE is the three-clause text."
+    },
+    "narwhals": {
+      "versions": ["2.24.0"],
+      "licence": "MIT",
+      "stamp": "a1f64b00c30b491721fc95832e607e39",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "numpy": {
+      "versions": ["2.2.6", "2.4.6", "2.5.1"],
+      "licence": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "stamp": "04fd448617b9b37de70d9353329859e6",
+      "evidence": {
+        "2.2.6": {
+          "expression": null,
+          "license": "Copyright (c) 2005-2024, NumPy Developers. All rights reserved. Redistribution and use in source and binary forms, wi...",
+          "classifiers": ["License :: OSI Approved :: BSD License"]
+        },
+        "2.4.6": {
+          "expression": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+          "license": null,
+          "classifiers": []
+        },
+        "2.5.1": {
+          "expression": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+          "license": null,
+          "classifiers": []
+        }
+      },
+      "note": "The three pinned versions do not declare the same thing. 2.2.6 predates PEP 639 and pastes the bare BSD-3-Clause text into `license`; 2.4.6 and 2.5.1 declare the full expression, which names the licences of the code numpy vendors (0BSD, MIT, Zlib, CC0-1.0) alongside its own BSD-3-Clause. The vendored code is in 2.2.6 too — only the declaration is new — so the fuller expression is recorded for all three."
+    },
+    "olefile": {
+      "versions": ["0.47"],
+      "licence": "BSD-2-Clause",
+      "stamp": "aeb827dc2f9c8bc75a5602339c888f47",
+      "evidence": {
+        "expression": null,
+        "license": "BSD",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "`license: \"BSD\"`. LICENSE.txt has two clauses and no \"neither the name\" clause — genuinely 2-clause, unlike most of the others here."
+    },
+    "omegaconf": {
+      "versions": ["2.3.1"],
+      "licence": "BSD-3-Clause",
+      "stamp": "92c5b29efffce05c531747b5843f372a",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "Classifier only; the project's LICENSE is the three-clause text."
+    },
+    "onnxruntime": {
+      "versions": ["1.23.2", "1.28.0"],
+      "licence": "MIT",
+      "stamp": "703d87ec3a3542719bd93e0611f18ef9",
+      "evidence": {
+        "expression": null,
+        "license": "MIT License",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "opencv-python": {
+      "versions": ["5.0.0.93"],
+      "licence": "Apache-2.0 AND MIT",
+      "stamp": "8b60ee0c8a3b993b6e99e2a003e4039e",
+      "evidence": {
+        "expression": null,
+        "license": "Apache 2.0",
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      },
+      "note": "Two licences in one wheel: OpenCV itself — the library in the binary — is Apache-2.0, which is what `license` reports; the opencv-python packaging project that builds the wheel is MIT."
+    },
+    "openpyxl": {
+      "versions": ["3.1.5"],
+      "licence": "MIT",
+      "stamp": "f9dd2c0f0bf4ef21a1184c8806c5e21e",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "opentsne": {
+      "versions": ["1.0.4"],
+      "licence": "BSD-3-Clause",
+      "stamp": "2a0f8b257e7ba440a39336de13a2d663",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": ["License :: OSI Approved"]
+      }
+    },
+    "packaging": {
+      "versions": ["26.2"],
+      "licence": "Apache-2.0 OR BSD-2-Clause",
+      "stamp": "b1cfe4452bbb208e7645009d5beb96e4",
+      "evidence": {
+        "expression": "Apache-2.0 OR BSD-2-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "pandas": {
+      "versions": ["2.3.3", "3.0.5"],
+      "licence": "BSD-3-Clause",
+      "stamp": "4ef320aea45e48b06dc0b13a82a70145",
+      "evidence": {
+        "2.3.3": {
+          "expression": null,
+          "license": "BSD 3-Clause License Copyright (c) 2008-2011, AQR Capital Management, LLC, Lambda Foundry, Inc. and PyData Developmen...",
+          "classifiers": ["License :: OSI Approved :: BSD License"]
+        },
+        "3.0.5": {
+          "expression": null,
+          "license": "BSD 3-Clause License Copyright (c) 2008-2011, AQR Capital Management, LLC, Lambda Foundry, Inc. and PyData Developmen...",
+          "classifiers": ["License :: OSI Approved :: BSD License"]
+        }
+      },
+      "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
+    },
+    "pdfminer-six": {
+      "versions": ["20260107"],
+      "licence": "MIT",
+      "stamp": "134d956e32da193dc205f631cba7370f",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "pdfplumber": {
+      "versions": ["0.11.10"],
+      "licence": "MIT",
+      "stamp": "09d843c46a4afa386b79b649f2ed3f83",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      },
+      "note": "Classifier only; LICENSE.txt is the MIT text."
+    },
+    "pi-heif": {
+      "versions": ["1.4.0"],
+      "licence": "BSD-3-Clause AND LGPL-3.0-only",
+      "stamp": "2c3ec3d9e79c6a22bb24fbf9aac3af07",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": ["License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)"]
+      },
+      "note": "The bindings are BSD-3-Clause (`license`), but the wheel is not only the bindings. Its own dist-info/licenses/LICENSES_bundled.txt states: \"License for pi-heif binary wheels: LGPLv3, due to base library licenses\" — libheif and libde265, both LGPLv3, shipped as DLLs/shared objects alongside the Python code. That is what the LGPLv3 classifier is about, and why the compound expression is the honest record. Recorded as -only rather than -or-later because upstream writes \"LGPLv3\" without stating \"or later\", and the stricter reading is the safe one. This is also why PM pins pi-heif and not pillow-heif: same author, same repository, same API, but pillow-heif's wheels add the x265 HEVC encoder and are GPLv2 as a whole."
+    },
+    "pillow": {
+      "versions": ["12.3.0"],
+      "licence": "MIT-CMU",
+      "stamp": "76971e148716b4dbfdde09739531af2a",
+      "evidence": {
+        "expression": "MIT-CMU",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "protobuf": {
+      "versions": ["7.35.1"],
+      "licence": "BSD-3-Clause",
+      "stamp": "d5256481a0dd67176561f41ed6be48be",
+      "evidence": {
+        "expression": null,
+        "license": "3-Clause BSD License",
+        "classifiers": []
+      },
+      "note": "`license: \"3-Clause BSD License\"` — the same licence, written informally."
+    },
+    "py-rust-stemmers": {
+      "versions": ["0.1.8"],
+      "licence": "MIT",
+      "stamp": "eceb4db47c3877879ec7d9925f3fcad2",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": []
+      },
+      "note": "PyPI states nothing at all and the source repository has gone. Read from the artifact PM actually installs: the wheel's dist-info/licenses/LICENSE is the MIT text, copyright qdrant."
+    },
+    "pyclipper": {
+      "versions": ["1.4.0"],
+      "licence": "MIT",
+      "stamp": "1e0ca581823af20439e1e2931c50438e",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved", "License :: OSI Approved :: MIT License"]
+      }
+    },
+    "pycparser": {
+      "versions": ["3.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "0b59f9dcc4b05cf87a596c757be8a828",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "pypdfium2": {
+      "versions": ["5.12.1"],
+      "licence": "Apache-2.0 OR BSD-3-Clause",
+      "stamp": "6a8ca2df97413e0192a05ffc502b464a",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause, Apache-2.0, dependency licenses",
+        "classifiers": []
+      },
+      "note": "`license` reads \"BSD-3-Clause, Apache-2.0, dependency licenses\" — the bindings are dual-licensed (either satisfies), and the bundled PDFium is itself BSD-3-Clause."
+    },
+    "pyreadline3": {
+      "versions": ["3.5.6"],
+      "licence": "BSD-3-Clause",
+      "stamp": "03a421d0f90d9e6bd75a36f865d6ada5",
+      "evidence": {
+        "expression": null,
+        "license": "BSD",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "`license: \"BSD\"`; LICENSE.md is the three-clause text."
+    },
+    "python-dateutil": {
+      "versions": ["2.9.0.post0"],
+      "licence": "Apache-2.0 OR BSD-3-Clause",
+      "stamp": "7b88e055c464a215b50ecbd0f91a3557",
+      "evidence": {
+        "expression": null,
+        "license": "Dual License",
+        "classifiers": [
+          "License :: OSI Approved :: Apache Software License",
+          "License :: OSI Approved :: BSD License"
+        ]
+      },
+      "note": "`license: \"Dual License\"`, and the two classifiers name Apache and BSD without saying which applies. The LICENSE file carries both texts and lets the user pick."
+    },
+    "python-dotenv": {
+      "versions": ["1.2.2"],
+      "licence": "BSD-3-Clause",
+      "stamp": "b09535ce6de3e94098ed92d54b88b7dc",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": []
+      }
+    },
+    "python-pptx": {
+      "versions": ["1.0.2"],
+      "licence": "MIT",
+      "stamp": "a5cbd1e7f65876d98d9a102212924b98",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "pytz": {
+      "versions": ["2026.3.post1"],
+      "licence": "MIT",
+      "stamp": "5912a8fdc1f876cdc07af2c37a10d1ce",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "pyyaml": {
+      "versions": ["6.0.3"],
+      "licence": "MIT",
+      "stamp": "aff80db73f7579ac0301808357675e73",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "rapidocr": {
+      "versions": ["3.9.2"],
+      "licence": "Apache-2.0",
+      "stamp": "8e26456be1444bed6ade123556797b2e",
+      "evidence": {
+        "expression": "Apache-2.0",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "requests": {
+      "versions": ["2.34.2"],
+      "licence": "Apache-2.0",
+      "stamp": "05d72993f85df23916222d6c2430f3db",
+      "evidence": {
+        "expression": null,
+        "license": "Apache-2.0",
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      }
+    },
+    "scikit-learn": {
+      "versions": ["1.7.2", "1.9.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "baa048ca53b05ce71759838320e944ef",
+      "evidence": {
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "scipy": {
+      "versions": ["1.15.3", "1.17.1", "1.18.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "fe03df13223671373369ed6c26f8840c",
+      "evidence": {
+        "1.15.3": {
+          "expression": null,
+          "license": "Copyright (c) 2001-2002 Enthought, Inc. 2003-2024, SciPy Developers. All rights reserved. Redistribution and use in s...",
+          "classifiers": ["License :: OSI Approved :: BSD License"]
+        },
+        "1.17.1": {
+          "expression": null,
+          "license": "Copyright (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights reserved. Redistribution and use in source...",
+          "classifiers": ["License :: OSI Approved :: BSD License"]
+        },
+        "1.18.0": {
+          "expression": null,
+          "license": "Copyright (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights reserved. Redistribution and use in source...",
+          "classifiers": ["License :: OSI Approved :: BSD License"]
+        }
+      },
+      "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
+    },
+    "setuptools": {
+      "versions": ["83.0.0"],
+      "licence": "MIT",
+      "stamp": "962d5fa1e5e09750c1c61d2badd9aaeb",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "shapely": {
+      "versions": ["2.1.2"],
+      "licence": "BSD-3-Clause",
+      "stamp": "e5740e231a54c57c0df07ab578e87a20",
+      "evidence": {
+        "expression": null,
+        "license": "BSD 3-Clause",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "`license: \"BSD 3-Clause\"` — the same licence, written informally."
+    },
+    "six": {
+      "versions": ["1.17.0"],
+      "licence": "MIT",
+      "stamp": "2494c33f66703bd3caf3d9be536ebf03",
+      "evidence": {
+        "expression": null,
+        "license": "MIT",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "soupsieve": {
+      "versions": ["2.9.1"],
+      "licence": "MIT",
+      "stamp": "35387e08e827335a9ee9a871c5c97e36",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      }
+    },
+    "sympy": {
+      "versions": ["1.14.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "f58ba55b49068fa960372ebe5205a771",
+      "evidence": {
+        "expression": null,
+        "license": "BSD",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "`license: \"BSD\"`. The LICENSE file is the three-clause text, followed by MIT notices for third-party code sympy vendors."
+    },
+    "threadpoolctl": {
+      "versions": ["3.6.0"],
+      "licence": "BSD-3-Clause",
+      "stamp": "20f9c9f1cfdb9b0baf7f2126c29e7763",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      }
+    },
+    "tokenizers": {
+      "versions": ["0.23.1"],
+      "licence": "Apache-2.0",
+      "stamp": "42b61e2fa16321ab42df8ff2c77e2467",
+      "evidence": {
+        "expression": null,
+        "license": null,
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      },
+      "note": "Classifier only; the project's LICENSE is the Apache-2.0 text."
+    },
+    "tqdm": {
+      "versions": ["4.70.0"],
+      "licence": "MPL-2.0 AND MIT",
+      "stamp": "075bbb3d647918eebab16c6f7a7fd066",
+      "evidence": {
+        "expression": null,
+        "license": "MPL-2.0 AND MIT",
+        "classifiers": []
+      },
+      "note": "Upstream declares the compound expression itself: the CLI is MPL-2.0, the rest MIT."
+    },
+    "typing-extensions": {
+      "versions": ["4.16.0"],
+      "licence": "PSF-2.0",
+      "stamp": "4d9f174b879f2e26ab82b4c207302f1c",
+      "evidence": {
+        "expression": "PSF-2.0",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "tzdata": {
+      "versions": ["2026.3"],
+      "licence": "Apache-2.0",
+      "stamp": "b25b348e9ab0f51fadaca9f2d6876591",
+      "evidence": {
+        "expression": null,
+        "license": "Apache-2.0",
+        "classifiers": []
+      }
+    },
+    "urllib3": {
+      "versions": ["2.7.0"],
+      "licence": "MIT",
+      "stamp": "6b4e9799f17fadb64edb59cd7e755f50",
+      "evidence": {
+        "expression": "MIT",
+        "license": null,
+        "classifiers": []
+      }
+    },
+    "win32-setctime": {
+      "versions": ["1.2.0"],
+      "licence": "MIT",
+      "stamp": "de3fc317b11253a29568772d999d4b4d",
+      "evidence": {
+        "expression": null,
+        "license": "MIT license",
+        "classifiers": ["License :: OSI Approved :: MIT License"]
+      },
+      "note": "`license: \"MIT license\"` — the same licence, written informally."
+    },
+    "xlsxwriter": {
+      "versions": ["3.2.9"],
+      "licence": "BSD-2-Clause",
+      "stamp": "138134804ae768dc3271e2d71d492abf",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-2-Clause",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      }
+    }
+  }
+}

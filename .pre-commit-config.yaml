@@ -118,3 +118,9 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: sidecar-licences
+        name: every sidecar Python package carries a reviewed licence
+        entry: just sidecar-licences
+        language: system
+        pass_filenames: false
+        always_run: true

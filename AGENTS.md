@@ -140,7 +140,8 @@ PM's visual design is a **presentation layer** — design tokens + a small set o
 primitives — that the existing app wears without changing what it *does*. The chosen direction
 came out of a Claude Design session; the full reference lives in
 [`design-system-docs/`](design-system-docs/) (`DESIGN_TOKENS.md` is the authoritative token
-recipe; `README.md` covers per-surface intent; `PM.dc.html` is the visual source of truth).
+recipe and the visual source of truth; `README.md` covers per-surface intent and records why the
+original HTML prototype was removed).
 
 **Four orthogonal, runtime-switchable axes** (state lives in `src/theme/`, persisted in
 localStorage, never IPC): **System** (`editorial` / `slate` / `terminal` — three full layout
