@@ -1043,23 +1043,28 @@ pub fn known_swm_source_ids(conn: &Connection, root_id: &str) -> Result<Vec<Stri
 /// delete). Runtime reconcile only, never a migration (rule #3); mirrors the v19 twin re-key.
 /// Called for each enumerated file BEFORE the root's reconcile reads its known set, so an adopted row
 /// is already in that set and matches as an `Update`/no-op rather than being re-ingested.
+/// Returns the `(old, new)` pair when a row was ACTUALLY re-keyed, so the caller can carry the same
+/// rename into the encrypted manifest ([`crate::index_only::rekey_sources`]). The DB update alone
+/// leaves the old id in the file, where the mirror-∪-file union keeps it forever and a Rebuild
+/// restores it as a duplicate document. `None` when there was nothing to adopt or the `OR IGNORE`
+/// no-opped.
 pub fn adopt_legacy_swm_row(
     conn: &Connection,
     email: &str,
     root_id: &str,
     file_id: &str,
-) -> Result<()> {
+) -> Result<Option<(String, String)>> {
     let old = source_id_for(email, file_id);
     let new = swm_source_id(root_id, file_id);
     if old == new {
-        return Ok(());
+        return Ok(None);
     }
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE OR IGNORE documents SET source_id = ?2 \
          WHERE source_type = 'index_only' AND source_id = ?1",
         params![old, new],
     )?;
-    Ok(())
+    Ok((updated > 0).then_some((old, new)))
 }
 
 // --- Drive file model + pure parsing/mapping (the unit-tested core) ------------------------------

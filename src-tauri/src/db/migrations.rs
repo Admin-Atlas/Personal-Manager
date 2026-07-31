@@ -1392,6 +1392,29 @@ const MIGRATIONS: &[&str] = &[
         created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
     "#,
+    // v49: make retrieval-feedback rows survive a Rebuild, and label them with the regime they were
+    // actually produced under.
+    //
+    // Both halves of the capture were silently wrong about the one thing the corpus exists to record
+    // — WHICH chunk answered WHICH query, under WHICH configuration:
+    //
+    //   * `chunk_ids` holds `chunks.id`, and a Rebuild deletes and re-creates every chunk row. Those
+    //     integers are then reused by unrelated chunks, so a judgement doesn't merely go stale, it
+    //     silently comes to name different text. `chunks.uid` is the stable identity (hashed from the
+    //     document's content hash and the chunk's structural path), so it is what a training example
+    //     must carry. Rebuild-invalidated ids stay in the column beside them — they are still an
+    //     honest record of what was retrieved at the time, and dropping them would rewrite history.
+    //   * `config_stamp` was resolved when the user CLICKED. A thumb given after a re-embed labelled
+    //     the judgement with the new regime although it was formed under the old one, which is the
+    //     exact confusion the stamp exists to prevent. It is now banked with the answer.
+    //
+    // Additive throughout: three nullable columns, no rewrite. Existing rows keep NULL, which reads
+    // as "produced before this was recorded" — distinguishable from any real value.
+    r#"
+    ALTER TABLE messages ADD COLUMN retrieved_chunk_uids  TEXT;  -- JSON array, parallel to retrieved_chunk_ids
+    ALTER TABLE messages ADD COLUMN retrieved_config_stamp TEXT; -- retrieval config at ANSWER time
+    ALTER TABLE retrieval_feedback ADD COLUMN chunk_uids  TEXT;  -- JSON array: Rebuild-stable identities
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1447,7 +1470,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 48,
+            version, 49,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1471,7 +1494,9 @@ mod tests {
              retrieval-relevance feedback capture is v44; \
              calendar work/personal typing is v45; \
              tag registry + M:N project membership is v46; \
-             group tags join the registry is v47;              whole-library re-tag staging is v48)"
+             group tags join the registry is v47; \
+             whole-library re-tag staging is v48; \
+             Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

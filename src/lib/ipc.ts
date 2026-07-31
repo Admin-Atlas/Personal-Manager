@@ -611,8 +611,12 @@ export const devDocumentChunks = (documentId: number) =>
 /** Run a query through the live hybrid retriever and return each candidate's per-stage scores
  *  (issue #81). Read-only; chunk bodies come back as truncated previews. `k` defaults to 6,
  *  clamped 1–50. Embeds via the sidecar, so it needs the document engine ready. */
-export const devRetrievalExplain = (query: string, project?: string, k?: number) =>
-  invoke<DevRetrievalExplain>("dev_retrieval_explain", { query, project, k });
+export const devRetrievalExplain = (
+  query: string,
+  project?: string,
+  k?: number,
+  conversationId?: number,
+) => invoke<DevRetrievalExplain>("dev_retrieval_explain", { query, project, k, conversationId });
 
 /** The untrusted-file worker's OS-confinement state, for the Dev tab's Sandbox panel (issue #286).
  *  A harmless read; off Windows it reports `unsupported`. */
@@ -627,9 +631,14 @@ export const devSidecarNetSelftest = () => invoke<NetSelftest>("dev_sidecar_net_
 /** In-chat "Retrieval explain" (card 7H): the same instrumented read as the dev panel, for
  *  graduated users. When `k` is omitted it defaults to the user's saved retrieval depth (what a
  *  real chat turn uses); pass an explicit `k` to preview a different candidate pool without
- *  committing it. Read-only; needs the document engine ready. */
-export const retrievalExplain = (query: string, project?: string, k?: number) =>
-  invoke<DevRetrievalExplain>("retrieval_explain", { query, project, k });
+ *  committing it. Passing `conversationId` applies the same in-window chat dedup a live turn here
+ *  would, so the explained pool is the pool the answer came from. Read-only; needs the engine ready. */
+export const retrievalExplain = (
+  query: string,
+  project?: string,
+  k?: number,
+  conversationId?: number,
+) => invoke<DevRetrievalExplain>("retrieval_explain", { query, project, k, conversationId });
 
 /** Commit the retrieval depth `k` — the candidate pool that reaches the reranker — as the value
  *  every future chat turn retrieves at (card 7H). Clamped 1–50 in the backend; stateless. */

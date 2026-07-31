@@ -915,7 +915,10 @@ impl AppState {
             Err(_) => return,
         };
         if let Err(e) = index_only::write_synced(&conn, &vault_root, &cipher).map(|_| ()) {
+            // The DB has already moved on, so the file is now behind it. Record that, or the next
+            // boot would read the stale file as portable truth and quietly revert the change.
             eprintln!("index_only: manifest sync skipped ({e})");
+            index_only::mark_manifest_stale(&conn);
         }
     }
 

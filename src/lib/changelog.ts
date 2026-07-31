@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.113.2-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "The numbered sources under a grounded answer now always point at the file they say they do. When PM found two useful passages in the same document, the [1], [2] markers in the answer could drift out of step with the list of sources beneath it — so a citation quietly named the wrong file. The numbering now works document by document, so the marker, the list and the file you open can't disagree.",
+      "Fixed a way a Google Drive file shared with you could turn into two copies of itself after a re-index, and a way a filing change could quietly revert to a previous one if PM couldn't finish writing it down at the time. Nothing you file is lost to either now.",
+      "In a very long conversation, one of your own questions could fall out of both PM's memory of the chat and its search — reachable by nothing. It now stays findable.",
+      "The retrieval inspector now examines exactly the same set of passages your last answer was built from, instead of a slightly wider one.",
+    ],
+  },
+  {
     version: "3.113.1-alpha",
     date: "2026-07-31",
     highlights: [

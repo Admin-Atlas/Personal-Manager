@@ -840,6 +840,11 @@ pub fn explain(
     // differently-ranked corpus than the answer it claims to explain — and it seeds its query from
     // the last user message, which is exactly where the `@mention` is.
     pinned_tags: &[crate::tags::PinnedTag],
+    // The same in-window chat dedup the live turn applied. Without it this panel explains a pool
+    // that still contains the turns the model already had verbatim — a strictly WIDER corpus than
+    // the answer came from, which is the one thing a diagnostic must not get wrong, since the
+    // rows it shows are the evidence the user (and the diagnostician) reason from.
+    exclude_chat: Option<(i64, i64)>,
     multilingual: bool,
 ) -> Result<Vec<ExplainCandidate>> {
     use std::collections::HashMap;
@@ -852,7 +857,11 @@ pub fn explain(
         Some(crate::tags::tag_chunk_ids(conn, pinned_tags)?)
     };
     let allowed = scope_allow_set(conn, project, pinned_chunks.as_ref())?;
-    let scoped = allowed.is_some() || pinned_chunks.is_some();
+    let excluded = match exclude_chat {
+        Some((doc_id, turn_floor)) => Some(in_window_chat_chunk_ids(conn, doc_id, turn_floor)?),
+        None => None,
+    };
+    let scoped = allowed.is_some() || excluded.is_some() || pinned_chunks.is_some();
     let fetch = if scoped {
         SCOPED_POOL.max(branch_limit)
     } else {
@@ -864,6 +873,10 @@ pub fn explain(
     if let Some(allowed) = &allowed {
         vec_scored.retain(|(id, _)| allowed.contains(id));
         fts_hits.retain(|id| allowed.contains(id));
+    }
+    if let Some(excluded) = &excluded {
+        vec_scored.retain(|(id, _)| !excluded.contains(id));
+        fts_hits.retain(|id| !excluded.contains(id));
     }
     if scoped {
         // The same widening production applies — this panel is only worth having if the pool it
@@ -955,17 +968,18 @@ pub fn explain(
     Ok(out)
 }
 
-/// Collapse retrieved chunks to the distinct documents they came from, in
-/// first-seen order — the citation list shown under an answer.
+/// Collapse retrieved chunks to the distinct documents they came from, in first-seen order — the
+/// citation list shown under an answer. Shares [`group_by_document`] with [`grounding_sources`], so
+/// citation `n` and prompt marker `[n]` name the same document by construction.
 pub fn citations_from(chunks: &[RetrievedChunk]) -> Vec<Citation> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for c in chunks {
-        if seen.insert(c.document_id) {
+    group_by_document(chunks)
+        .iter()
+        .map(|doc| {
             // A chat citation carries the first-seen turn's pointer so the UI can reopen that
             // conversation at the exact turn; a plain document leaves the chat fields empty.
+            let c = doc[0];
             let is_chat = c.source_type.as_deref() == Some(crate::ingest::SOURCE_TYPE_CHAT);
-            out.push(Citation {
+            Citation {
                 document_id: c.document_id,
                 title: c.title.clone(),
                 source_path: c.source_path.clone(),
@@ -974,10 +988,9 @@ pub fn citations_from(chunks: &[RetrievedChunk]) -> Vec<Citation> {
                 conversation_id: if is_chat { c.conversation_id } else { None },
                 turn_id: if is_chat { c.chat_turn_id } else { None },
                 dated: if is_chat { c.chunk_at.clone() } else { None },
-            });
-        }
-    }
-    out
+            }
+        })
+        .collect()
 }
 
 /// Unit separator (U+001F) — the non-forgeable boundary wrapping each source in the grounding
@@ -1026,10 +1039,21 @@ fn sanitize_source_field(s: &str) -> String {
     neutralize_citation_markers(&collapsed)
 }
 
-/// Neutralise chunk body text for the grounding prompt: collapse control characters to a space —
-/// including the `\u{1f}` fence — but keep `\n` so a multi-paragraph chunk stays readable, then
-/// defuse forged citation markers. A body can therefore forge neither a source boundary nor a `[n]`.
-fn sanitize_source_content(s: &str) -> String {
+/// Neutralise a block of untrusted context for the model-facing prompt: collapse control characters
+/// to a space — including the `\u{1f}` fence — but keep `\n` so multi-paragraph text stays readable,
+/// then defuse forged citation markers. The text can therefore forge neither a source boundary nor
+/// one of PM's own `[n]` citation markers (M-1).
+///
+/// Applied to chunk bodies here, and — by [`crate::commands`] — to every OTHER untrusted section of
+/// the per-turn context message: the rolling chat summary, the agenda, and the flag context. They
+/// ride in the same user message as the fenced sources, so an unsanitised one could counterfeit a
+/// source boundary just as a chunk body could. The rolling summary is the sharpest case: it is
+/// model-written text summarising untrusted conversation, so it can carry forward whatever a
+/// document talked the summariser into writing down.
+///
+/// The stored and user-displayed text is never altered — this runs only on the model-facing copy —
+/// so display fidelity is preserved.
+pub fn sanitize_untrusted_context(s: &str) -> String {
     let collapsed: String = s
         .chars()
         .map(|c| {
@@ -1094,26 +1118,65 @@ pub fn grounding_instruction_low_confidence() -> &'static str {
 /// source wrapped between `\u{1f}` fences with sanitised fields/body, so a hostile document body
 /// cannot forge a source boundary or one of PM's own `[n]` citation markers (M-1). Contains NO
 /// instruction text. Returns `""` for empty input so the caller can omit the section entirely.
+///
+/// **Numbered per DOCUMENT, not per chunk** — one fenced block per distinct document, in the same
+/// first-seen order [`citations_from`] uses, carrying that document's retrieved chunks in rank
+/// order. The two are built from the identical `retrieved` vec, and the UI renders the citation
+/// list numbered `[i+1]`, so `[n]` in the prompt, `[n]` under the answer and `citations[n-1]` now
+/// agree **by construction**. Numbering by chunk (as this once did) diverged the moment two
+/// retrieved chunks shared a document — the normal case, since selection permits several chunks per
+/// document — and every marker past that point named a different file than the one it cited.
 pub fn grounding_sources(chunks: &[RetrievedChunk]) -> String {
-    if chunks.is_empty() {
+    let grouped = group_by_document(chunks);
+    if grouped.is_empty() {
         return String::new();
     }
     let mut s = String::from("Sources:\n");
-    for (i, c) in chunks.iter().enumerate() {
-        let loc = c.source_path.as_deref().unwrap_or(&c.vault_path);
+    for (i, doc) in grouped.iter().enumerate() {
+        let head = doc[0];
+        let loc = head.source_path.as_deref().unwrap_or(&head.vault_path);
         s.push(SOURCE_FENCE);
         s.push_str(&format!(
             "[{}] {} ({})\n",
             i + 1,
-            sanitize_source_field(&c.title),
+            sanitize_source_field(&head.title),
             sanitize_source_field(loc),
         ));
-        s.push_str(&sanitize_source_content(&c.content));
+        // Several excerpts from one document share a block; a blank line keeps them legible as
+        // separate passages without introducing a second boundary the model could read as a source.
+        for (j, c) in doc.iter().enumerate() {
+            if j > 0 {
+                s.push_str("\n\n");
+            }
+            s.push_str(&sanitize_untrusted_context(&c.content));
+        }
         s.push('\n');
         s.push(SOURCE_FENCE);
         s.push_str("\n\n");
     }
     s
+}
+
+/// Group retrieved chunks by `document_id`, preserving first-seen document order and, within a
+/// document, retrieval rank order. The shared ordering primitive behind [`grounding_sources`] and
+/// [`citations_from`] — extracted so the two lists cannot drift apart again.
+fn group_by_document(chunks: &[RetrievedChunk]) -> Vec<Vec<&RetrievedChunk>> {
+    let mut order: Vec<i64> = Vec::new();
+    let mut by_doc: std::collections::HashMap<i64, Vec<&RetrievedChunk>> =
+        std::collections::HashMap::new();
+    for c in chunks {
+        by_doc
+            .entry(c.document_id)
+            .or_insert_with(|| {
+                order.push(c.document_id);
+                Vec::new()
+            })
+            .push(c);
+    }
+    order
+        .into_iter()
+        .map(|id| by_doc.remove(&id).unwrap_or_default())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1171,6 +1234,79 @@ mod tests {
         assert_eq!(p.matches(SOURCE_FENCE).count(), 2);
         // Empty input yields no payload, so the caller omits the whole Sources section.
         assert!(grounding_sources(&[]).is_empty());
+    }
+
+    /// A retrieved chunk with just the fields the grounding/citation pair reads.
+    fn cited(
+        chunk_id: i64,
+        document_id: i64,
+        title: &str,
+        path: &str,
+        body: &str,
+    ) -> RetrievedChunk {
+        RetrievedChunk {
+            chunk_id,
+            document_id,
+            title: title.into(),
+            source_path: Some(path.into()),
+            vault_path: path.into(),
+            heading: None,
+            content: body.into(),
+            ordinal: 0,
+            source_type: None,
+            chat_turn_id: None,
+            chunk_at: None,
+            conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn grounding_source_numbers_match_the_citation_list() {
+        // The case the two lists used to disagree on: five chunks over three documents, with two
+        // documents contributing more than one chunk. Numbered per CHUNK, `[3]` in the prompt was
+        // doc 1's second excerpt while citation 3 was doc 3 — every marker past the first repeat
+        // named a different file than the one it cited.
+        let chunks = vec![
+            cited(1, 10, "Lease", "lease.md", "rent is 1200"),
+            cited(2, 10, "Lease", "lease.md", "deposit is 2400"),
+            cited(3, 20, "Insurance", "policy.md", "excess is 250"),
+            cited(4, 10, "Lease", "lease.md", "notice is 60 days"),
+            cited(5, 30, "Receipt", "receipt.md", "paid on 04-03-2026"),
+        ];
+        let prompt = grounding_sources(&chunks);
+        let cites = citations_from(&chunks);
+
+        // One block per DOCUMENT, not per chunk: three documents, three fenced pairs.
+        assert_eq!(cites.len(), 3);
+        assert_eq!(prompt.matches(SOURCE_FENCE).count(), 6);
+
+        // `[n]` in the prompt and `citations[n-1]` name the same document, in the same order.
+        for (i, c) in cites.iter().enumerate() {
+            let label = format!("[{}] {} ({})", i + 1, c.title, c.vault_path.clone());
+            assert!(
+                prompt.contains(&label),
+                "citation {} ({}) has no matching prompt label; prompt was:\n{prompt}",
+                i + 1,
+                c.title
+            );
+        }
+        assert_eq!(
+            cites.iter().map(|c| c.document_id).collect::<Vec<_>>(),
+            vec![10, 20, 30],
+            "citations keep first-seen document order"
+        );
+
+        // Every excerpt still reaches the model — grouping must not drop a chunk's text.
+        for c in &chunks {
+            assert!(
+                prompt.contains(&c.content),
+                "excerpt {:?} was dropped from the grounding payload",
+                c.content
+            );
+        }
+        // Doc 10's three excerpts share ONE numbered block, so a second `[1]`-style label can't
+        // appear for them.
+        assert_eq!(prompt.matches("[1] Lease").count(), 1);
     }
 
     #[test]
@@ -2142,6 +2278,33 @@ mod tests {
         assert!(all
             .iter()
             .any(|c| c.content == "agenda recent in-window turn"));
+
+        // The Retrieval-explain panel must analyse the SAME pool. Ignoring the exclusion showed the
+        // in-window turn as a candidate the answer never actually saw — and the diagnostician, which
+        // reasons from these rows, recommended changes against a corpus that doesn't exist.
+        let explained = |exclude| {
+            explain(&conn, "agenda", &unit_vec(0), 6, None, &[], exclude, false)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.chunk.content)
+                .collect::<Vec<_>>()
+        };
+        let with_exclusion = explained(Some((chat_doc, 3)));
+        assert!(
+            !with_exclusion
+                .iter()
+                .any(|c| c == "agenda recent in-window turn"),
+            "explain must apply the same in-window chat dedup the answer did"
+        );
+        assert!(with_exclusion
+            .iter()
+            .any(|c| c == "agenda older summarised turn"));
+        assert!(with_exclusion.iter().any(|c| c == "agenda from a document"));
+        // Control: with no conversation supplied (the Developer-mode free-text box), nothing is
+        // excluded — the panel keeps its old behaviour where there is no turn to mirror.
+        assert!(explained(None)
+            .iter()
+            .any(|c| c == "agenda recent in-window turn"));
     }
 
     #[test]
@@ -2200,7 +2363,7 @@ mod tests {
         );
 
         // A query matching the first chunk in BOTH branches (semantically + the word "purr").
-        let rows = explain(&conn, "purr", &unit_vec(0), 6, None, &[], false).unwrap();
+        let rows = explain(&conn, "purr", &unit_vec(0), 6, None, &[], None, false).unwrap();
         assert!(rows.len() >= 2, "both chunks should be candidates");
 
         // The best match leads and carries scores from both branches.

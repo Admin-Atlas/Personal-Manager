@@ -660,14 +660,39 @@ pub async fn dev_retrieval_explain(
     query: String,
     project: Option<String>,
     k: Option<usize>,
+    conversation_id: Option<i64>,
 ) -> Result<DevRetrievalExplain> {
     tokio::task::spawn_blocking(move || -> Result<DevRetrievalExplain> {
         let state = app.state::<AppState>();
         let k = k.unwrap_or(retrieval::DEFAULT_TOP_K);
-        run_retrieval_explain(&state, &query, project.as_deref(), k)
+        run_retrieval_explain(&state, &query, project.as_deref(), k, conversation_id)
     })
     .await
     .map_err(|e| Error::Other(format!("retrieval explain task panicked: {e}")))?
+}
+
+/// The in-window chat exclusion a live turn in `conversation_id` would apply — resolved through the
+/// SAME [`crate::commands::replay_window`] the live turn uses, so the panel can never explain a
+/// differently-filtered pool than the answer. A conversation with no session row, no summary yet, or
+/// no indexed document yields `None`, exactly as the live turn does.
+fn chat_window_exclusion(
+    conn: &rusqlite::Connection,
+    conversation_id: i64,
+) -> Result<Option<(i64, i64)>> {
+    use rusqlite::OptionalExtension;
+    let session: Option<(Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT document_id, summary_covers_up_to_turn_id FROM chat_sessions \
+             WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((document_id, summary_cursor)) = session else {
+        return Ok(None);
+    };
+    let window = crate::commands::replay_window(conn, conversation_id, summary_cursor)?;
+    Ok(crate::commands::chat_exclusion(document_id, window.floor))
 }
 
 /// Run one "Retrieval explain": embed `query`, fuse + recency-decay the candidates with per-stage
@@ -680,6 +705,11 @@ pub(crate) fn run_retrieval_explain(
     query: &str,
     project: Option<&str>,
     k: usize,
+    // The conversation the panel is opened over, when it is opened from a chat. Retrieval in a live
+    // turn skips that chat's own in-window turns (the model already has them verbatim), so a panel
+    // that didn't know the conversation explained a strictly wider pool than the answer came from.
+    // `None` from a surface with no conversation (the Developer-mode panel's free-text box).
+    conversation_id: Option<i64>,
 ) -> Result<DevRetrievalExplain> {
     let k = k.clamp(db::RETRIEVAL_K_MIN, db::RETRIEVAL_K_MAX);
 
@@ -717,6 +747,10 @@ pub(crate) fn run_retrieval_explain(
         // narrower corpus than the answer it is explaining.
         let pinned = crate::tags::resolve_mentions(&conn, &crate::tags::parse_mentions(query))?;
         let query = crate::tags::strip_mentions(query, &pinned);
+        let exclude_chat = match conversation_id {
+            Some(id) => chat_window_exclusion(&conn, id)?,
+            None => None,
+        };
         retrieval::explain(
             &conn,
             &query,
@@ -724,6 +758,7 @@ pub(crate) fn run_retrieval_explain(
             k,
             project,
             &pinned,
+            exclude_chat,
             embedder.multilingual,
         )?
     };

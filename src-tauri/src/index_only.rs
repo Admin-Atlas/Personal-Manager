@@ -296,16 +296,50 @@ fn merged_manifest(
     })
 }
 
+/// Settings key recording that the DB mirror has moved AHEAD of the encrypted manifest — i.e. that a
+/// classification change committed but its mirror→file push did not land.
+///
+/// The manifest is the portable truth for index-only classification, and [`reconcile_on_open`]
+/// applies it file→DB at every boot. That is only sound while the file is known to be current. The
+/// push is best-effort by design (it must never fail a user's edit, and it is a no-op on a locked
+/// vault), so a failed push used to leave a file that was silently OLDER than the DB — and the next
+/// boot then applied it, quietly reverting the user's filing to a previous value with no error and
+/// nothing in the UI to see. Recording the divergence lets the next boot repair the file BEFORE
+/// reading it as truth.
+const MANIFEST_STALE_KEY: &str = "index_only_manifest_stale";
+
+/// Note that the manifest is behind the DB mirror — see [`MANIFEST_STALE_KEY`]. Best-effort: this is
+/// itself called from error paths, so a failure to record only costs the repair, never the caller.
+pub fn mark_manifest_stale(conn: &Connection) {
+    if let Err(e) = crate::db::set_setting(conn, MANIFEST_STALE_KEY, "1") {
+        eprintln!("index_only: could not record a stale manifest ({e})");
+    }
+}
+
+/// Whether a mirror→file push is known to have been lost since the manifest was last written.
+fn manifest_is_stale(conn: &Connection) -> bool {
+    matches!(
+        crate::db::get_setting(conn, MANIFEST_STALE_KEY),
+        Ok(Some(v)) if v == "1"
+    )
+}
+
 /// Push the DB mirror (merged with any awaiting-Rebuild file items) to the encrypted manifest,
 /// returning the prior bytes for rollback. The single write path: the post-change sync and the
 /// truth-writer manifest arm both go through this.
+///
+/// Clears [`MANIFEST_STALE_KEY`] on success — the file now matches the mirror, whatever was lost
+/// before. Inside the truth-writer's transaction that clear rolls back with the rest, which is the
+/// behaviour we want: an abandoned batch leaves the flag exactly as it found it.
 pub fn write_synced(
     conn: &Connection,
     vault_root: &Path,
     cipher: &ManifestCipher,
 ) -> Result<Vec<u8>> {
     let manifest = merged_manifest(conn, vault_root, cipher)?;
-    write_manifest(vault_root, cipher, &manifest)
+    let prior = write_manifest(vault_root, cipher, &manifest)?;
+    crate::db::set_setting(conn, MANIFEST_STALE_KEY, "0")?;
+    Ok(prior)
 }
 
 /// Drop one source from the encrypted manifest — the "promote to full import" strip. Once a document
@@ -327,6 +361,54 @@ pub fn forget_source(vault_root: &Path, cipher: &ManifestCipher, source_id: &str
         write_manifest(vault_root, cipher, &manifest)?;
     }
     Ok(())
+}
+
+/// Re-key sources in the encrypted manifest, in one read-modify-write, so a `source_id` change made
+/// in the DB travels to the portable truth with its classification intact.
+///
+/// The counterpart to a bare `UPDATE documents SET source_id`. [`merged_manifest`] unions the DB
+/// mirror with every FILE item whose id is absent from the mirror, so an id re-keyed only in the DB
+/// survives in the manifest forever as a ghost — and a Rebuild, which restores from the manifest,
+/// then resurrects it as a SECOND document alongside the re-keyed one. Dropping the old id instead
+/// ([`forget_source`]) would fix the duplicate but throw away the user's filing; renaming in place
+/// keeps it.
+///
+/// Skips any pair whose new id is already in the file (nothing to carry over, and a rename would
+/// duplicate it) by dropping the stale old entry. Idempotent: a missing manifest, or a pair already
+/// applied, is a clean no-op that writes nothing. Returns how many items were re-keyed. Call AFTER
+/// the DB update commits, so the mirror already reports the new id.
+pub fn rekey_sources(
+    vault_root: &Path,
+    cipher: &ManifestCipher,
+    pairs: &[(String, String)],
+) -> Result<usize> {
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    let Some(mut manifest) = read_manifest(vault_root, cipher)? else {
+        return Ok(0);
+    };
+    let mut changed = 0usize;
+    for (old, new) in pairs {
+        if old == new || !manifest.items.iter().any(|it| &it.source_id == old) {
+            continue;
+        }
+        if manifest.items.iter().any(|it| &it.source_id == new) {
+            manifest.items.retain(|it| &it.source_id != old);
+        } else {
+            for it in &mut manifest.items {
+                if &it.source_id == old {
+                    it.source_id = new.clone();
+                }
+            }
+        }
+        changed += 1;
+    }
+    if changed > 0 {
+        manifest.items.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        write_manifest(vault_root, cipher, &manifest)?;
+    }
+    Ok(changed)
 }
 
 /// Apply the portable classification in `manifest` onto the matching index-only rows (the file is the
@@ -478,6 +560,23 @@ pub fn reconcile_on_open(
 ) -> Result<bool> {
     match read_manifest(vault_root, cipher) {
         Ok(Some(manifest)) => {
+            // Repair BEFORE reading the file as truth. A recorded stale flag means a classification
+            // change committed to the DB and its mirror→file push was lost, so the file on disk is
+            // OLDER than the mirror for at least one item — and applying it would silently revert the
+            // user's filing to a previous value. `write_synced` resolves that the only defensible
+            // way: the DB wins for ids present in both, while `merged_manifest`'s union preserves
+            // every file-only item awaiting a Rebuild. Then we re-read and carry on as normal, so
+            // the entity re-resolution and mint accounting below are unchanged.
+            let manifest = if manifest_is_stale(conn) {
+                eprintln!(
+                    "index_only: the manifest is behind the DB mirror (a previous push was lost); \
+                     rewriting it from the mirror before applying it"
+                );
+                write_synced(conn, vault_root, cipher)?;
+                read_manifest(vault_root, cipher)?.unwrap_or(manifest)
+            } else {
+                manifest
+            };
             let tx = conn.unchecked_transaction()?;
             let minted = apply_classification(&tx, &manifest)?;
             tx.commit()?;
@@ -1985,6 +2084,167 @@ mod tests {
             project, "Taxes",
             "the file's classification wins on reconcile"
         );
+    }
+
+    #[test]
+    fn rekey_carries_a_renamed_source_and_its_filing_into_the_manifest() {
+        // A shared-with-me row re-keyed from the My-Drive namespace to the account-independent one.
+        // The DB update alone leaves the OLD id in the file, where `merged_manifest`'s mirror-∪-file
+        // union keeps it forever — and the next Rebuild restores it as a SECOND document beside the
+        // re-keyed one, indistinguishable from a real duplicate.
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("gdrive:a@b.com:F1", "Taxes"), item("other", "Archive")],
+            },
+        )
+        .unwrap();
+
+        let n = rekey_sources(
+            dir.path(),
+            &cipher,
+            &[("gdrive:a@b.com:F1".into(), "gdrive:swm:R1:F1".into())],
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+
+        let m = read_manifest(dir.path(), &cipher).unwrap().unwrap();
+        let ids: Vec<&str> = m.items.iter().map(|i| i.source_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"gdrive:a@b.com:F1"),
+            "the old id must be gone"
+        );
+        assert_eq!(ids.iter().filter(|i| **i == "gdrive:swm:R1:F1").count(), 1);
+        // The filing travelled with the rename — a plain `forget_source` would have thrown it away.
+        let moved = m
+            .items
+            .iter()
+            .find(|i| i.source_id == "gdrive:swm:R1:F1")
+            .unwrap();
+        assert_eq!(moved.project, "Taxes");
+        // Untouched neighbours stay untouched.
+        assert!(ids.contains(&"other"));
+
+        // Idempotent: re-running writes nothing, so a retried sync can't corrupt the file.
+        assert_eq!(
+            rekey_sources(
+                dir.path(),
+                &cipher,
+                &[("gdrive:a@b.com:F1".into(), "gdrive:swm:R1:F1".into())]
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn rekey_onto_an_id_the_file_already_holds_drops_the_stale_entry() {
+        // Both ids present (a partly-applied adoption): renaming would DUPLICATE the new id, so the
+        // stale old entry is dropped instead and the existing item is left as it is.
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("old", "Taxes"), item("new", "Archive")],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            rekey_sources(dir.path(), &cipher, &[("old".into(), "new".into())]).unwrap(),
+            1
+        );
+        let m = read_manifest(dir.path(), &cipher).unwrap().unwrap();
+        let ids: Vec<&str> = m.items.iter().map(|i| i.source_id.as_str()).collect();
+        assert_eq!(ids, vec!["new"]);
+        assert_eq!(m.items[0].project, "Archive");
+    }
+
+    #[test]
+    fn a_manifest_known_to_be_stale_is_repaired_before_it_is_applied() {
+        // The F-20 heal only ever noticed ids the file was MISSING. A push that failed AFTER its rows
+        // committed leaves a file that is complete but OLDER — and reconcile then applied it, silently
+        // reverting the user's filing to a previous value with nothing in the UI to see.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+
+        // The file holds the OLD filing; the DB has the newer one the user just chose.
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("s1", "Unsorted"), item("awaiting", "Archive")],
+            },
+        )
+        .unwrap();
+        insert_index_only(&conn, "s1", "Taxes");
+        mark_manifest_stale(&conn);
+
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+
+        let project: String = conn
+            .query_row(
+                "SELECT project FROM documents WHERE source_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            project, "Taxes",
+            "a manifest known to be behind the mirror must not revert the DB"
+        );
+        // The file was repaired, not merely ignored — and the file-only item awaiting a Rebuild
+        // survived the repair, which is the property `merged_manifest`'s union exists to guarantee.
+        let m = read_manifest(dir.path(), &cipher).unwrap().unwrap();
+        assert_eq!(
+            m.items
+                .iter()
+                .find(|i| i.source_id == "s1")
+                .map(|i| i.project.as_str()),
+            Some("Taxes")
+        );
+        assert!(m.items.iter().any(|i| i.source_id == "awaiting"));
+        // The successful write cleared the flag, so the next boot trusts the file again.
+        assert!(!manifest_is_stale(&conn));
+    }
+
+    #[test]
+    fn a_manifest_not_known_to_be_stale_still_wins_on_reconcile() {
+        // The contract is unchanged in the normal case: with no recorded lost push, the file remains
+        // the portable truth for classification and still applies onto the DB.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("s1", "Taxes")],
+            },
+        )
+        .unwrap();
+        insert_index_only(&conn, "s1", "Unsorted");
+
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+
+        let project: String = conn
+            .query_row(
+                "SELECT project FROM documents WHERE source_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "Taxes");
     }
 
     #[test]

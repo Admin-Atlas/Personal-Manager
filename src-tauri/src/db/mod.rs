@@ -945,6 +945,8 @@ mod tests {
              DROP TABLE tags; \
              DROP TABLE retrieval_feedback; \
              ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
+             ALTER TABLE messages DROP COLUMN retrieved_chunk_uids; \
+             ALTER TABLE messages DROP COLUMN retrieved_config_stamp; \
              DROP INDEX idx_corrections_pipeline; \
              ALTER TABLE corrections DROP COLUMN pipeline_version; \
              ALTER TABLE usage_log DROP COLUMN provider; \
@@ -1123,6 +1125,8 @@ mod tests {
              DROP TABLE tags; \
              DROP TABLE retrieval_feedback; \
              ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
+             ALTER TABLE messages DROP COLUMN retrieved_chunk_uids; \
+             ALTER TABLE messages DROP COLUMN retrieved_config_stamp; \
              DROP INDEX idx_corrections_pipeline; \
              ALTER TABLE corrections DROP COLUMN pipeline_version; \
              ALTER TABLE usage_log DROP COLUMN provider; \

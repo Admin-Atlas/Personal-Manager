@@ -1182,16 +1182,38 @@ async fn gather_shared_with_me(
         truncated |= root_truncated;
         // Adopt any legacy My-Drive-namespaced rows for these files, THEN read the root's known set —
         // so an adopted row is already in that set and reconciles as an Update/no-op, not a re-ingest.
-        let known: std::collections::HashSet<String> = {
+        let (known, adopted): (std::collections::HashSet<String>, Vec<(String, String)>) = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
+            let mut adopted = Vec::new();
             for f in &files {
-                drive::adopt_legacy_swm_row(&conn, email, &root.id, &f.id)?;
+                if let Some(pair) = drive::adopt_legacy_swm_row(&conn, email, &root.id, &f.id)? {
+                    adopted.push(pair);
+                }
             }
-            drive::known_swm_source_ids(&conn, &root.id)?
-                .into_iter()
-                .collect()
+            (
+                drive::known_swm_source_ids(&conn, &root.id)?
+                    .into_iter()
+                    .collect(),
+                adopted,
+            )
         };
+        // Carry each adoption into the encrypted manifest, off the DB guard. Without this the old
+        // My-Drive-namespaced id survives in the portable truth (the mirror-∪-file union never drops
+        // it), and the next Rebuild restores it as a SECOND document beside the re-keyed one — a
+        // duplicate the user cannot tell from a real file. Best-effort: an adoption that already
+        // committed to the DB must not fail the sync, and the next sync retries it.
+        if !adopted.is_empty() {
+            let state = app.state::<AppState>();
+            match state.manifest_io() {
+                Ok((vault_root, cipher)) => {
+                    if let Err(e) = index_only::rekey_sources(&vault_root, &cipher, &adopted) {
+                        eprintln!("drive: shared-with-me manifest re-key skipped ({e})");
+                    }
+                }
+                Err(e) => eprintln!("drive: shared-with-me manifest re-key skipped ({e})"),
+            }
+        }
         let root_id = root.id.clone();
         let mut recon: Vec<DriveItem> =
             index_only::reconcile_enumeration(files, known, !root_truncated, |file_id| {
