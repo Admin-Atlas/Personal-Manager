@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.112.0-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "If you deleted photos or spreadsheets on an older version of PM, the files themselves were left behind in your vault. They don't appear anywhere, but a rebuild would bring them back as documents you thought you'd removed. PM will now offer, once, to clear them out — it shows you exactly what it found and deletes nothing until you say so.",
+      "That prompt only appears if you actually have some, and it won't come back once you've answered either way. Please back up your vault before approving: deleting them is permanent and can't be undone from inside PM.",
+    ],
+  },
+  {
     version: "3.111.11-alpha",
     date: "2026-07-31",
     highlights: [

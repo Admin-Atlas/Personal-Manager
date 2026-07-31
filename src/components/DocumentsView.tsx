@@ -42,6 +42,8 @@ import { ImportancePicker } from "./ImportancePicker";
 import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
 import { ProjectPicker, ProjectSummary, projectsOf } from "./ProjectPicker";
 import { IngestProgress } from "./IngestProgress";
+// ONE-TIME cleanup — remove with the component in the release after this one (card #651 follow-up).
+import { OrphanSweepBanner } from "./OrphanSweepBanner";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
 import { DuplicateNudge, DuplicatesPanel } from "./DuplicatesPanel";
 import { useReader } from "../lib/reader";
@@ -689,6 +691,10 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
 
   return (
     <div className="flex h-full flex-col">
+      {/* ONE-TIME cleanup for vault files older versions left behind — REMOVE this line with the
+          component in the release after this one (the follow-up to card #651). Renders nothing at
+          all unless there is something to clean up. */}
+      <OrphanSweepBanner />
       {/* Project-name autocomplete for the inline reclassify editor (issue #333); rendered once,
           referenced by each row's editor via `list=`. Position is irrelevant for a datalist. */}
       {teachVisible && (

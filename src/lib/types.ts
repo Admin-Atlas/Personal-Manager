@@ -1798,3 +1798,21 @@ export interface DuplicateReport {
   similarity_skipped: boolean;
   similarity_limit: number;
 }
+
+/** ONE-TIME cleanup (card #651) — delete this block with the sweep in the next release.
+ *
+ *  Why the sweep may refuse to say anything. A missing database row is also what a half-migrated,
+ *  mid-restore or unopened store looks like, and PM cannot tell those apart from the file alone. */
+export type SweepRefusal =
+  | { kind: "indexing" }
+  | { kind: "syncing" }
+  | { kind: "incomplete_walk" }
+  | { kind: "no_documents" }
+  | { kind: "implausible_share"; orphans: number; files: number };
+
+/** Vault files with no row behind them. `orphans` is always empty when `refusal` is set — the
+ *  backend refuses to hand out a list it will not act on. */
+export interface SweepPlan {
+  orphans: string[];
+  refusal: SweepRefusal | null;
+}

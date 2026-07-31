@@ -116,6 +116,7 @@ import type {
   VaultOpOutcome,
   VaultStatus,
   SmartAppControlState,
+  SweepPlan,
   TagSummary,
   WipeReport,
   WipeSelection,
@@ -1599,3 +1600,18 @@ export function pullLocalModel(
   channel.onmessage = onProgress;
   return invoke<void>("pull_local_model", { model, onEvent: channel });
 }
+
+// --- ONE-TIME orphan sweep (card #651) -------------------------------------
+// Delete these three with the `sweep` module in the release after this one.
+
+/** What the one-time sweep would delete, or why it will not say. Read-only; returns an empty,
+ *  unrefused plan once the user has answered, or while onboarding is unfinished. */
+export const scanOrphanFiles = () => invoke<SweepPlan>("scan_orphan_files");
+
+/** Delete approved leftovers, returning how many went. The backend re-plans and only acts on paths
+ *  that are STILL orphans, so this list filters rather than authorises. */
+export const deleteOrphanFiles = (paths: string[]) =>
+  invoke<number>("delete_orphan_files", { paths });
+
+/** "Not now" — the banner does not come back. */
+export const dismissOrphanSweep = () => invoke<void>("dismiss_orphan_sweep");

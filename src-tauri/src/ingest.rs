@@ -3819,7 +3819,7 @@ pub(crate) fn walk_vault_markdown(vault: &Path) -> Result<(Vec<VaultFile>, bool)
     let mut complete = true;
     // The root's own failure propagates: an unreadable vault root is not a partial picture, it is a
     // broken vault, and every caller wants to hear about that rather than act on nothing.
-    collect_markdown_dir(vault, None, &mut files, &mut complete)?;
+    collect_dir(vault, None, &mut files, &mut complete, is_vault_markdown)?;
     for sub in MARKDOWN_SUBDIRS {
         let dir = vault.join(sub);
         if !dir.is_dir() {
@@ -3827,20 +3827,59 @@ pub(crate) fn walk_vault_markdown(vault: &Path) -> Result<(Vec<VaultFile>, bool)
         }
         // A subfolder that exists but won't open is exactly the "couldn't tell" case: withhold the
         // sweep rather than propagate, so a locked folder costs one deferred reap, never a deletion.
-        if collect_markdown_dir(&dir, Some(sub), &mut files, &mut complete).is_err() {
+        if collect_dir(
+            &dir,
+            Some(sub),
+            &mut files,
+            &mut complete,
+            is_vault_markdown,
+        )
+        .is_err()
+        {
             complete = false;
         }
     }
     Ok((files, complete))
 }
 
-/// One directory's Markdown files, appended to `out` with `prefix` (if any) joined by `/`. An
+/// Every "keep a copy" original under [`PHOTOS_SUBDIR`], and whether the walk saw all of them.
+///
+/// Deliberately NOT folded into [`walk_vault_markdown`]: [`is_vault_markdown`] accepts any `.pmenc`,
+/// so a photos-inclusive document walk would hand every saved photo to the rebuild sweep as a
+/// document. The two walks answer different questions over the same vault and must stay separate —
+/// which is why this one sits here, next to its sibling, rather than in the module that needs it.
+///
+/// The `keep` predicate is an allow-list, not a catch-all: only the encrypted originals and the
+/// plaintext photo extensions. Anything else under `photos/` is left alone rather than swept.
+pub(crate) fn walk_vault_photos(vault: &Path) -> Result<(Vec<VaultFile>, bool)> {
+    let mut files = Vec::new();
+    let mut complete = true;
+    let dir = vault.join(PHOTOS_SUBDIR);
+    // No photos folder is not incompleteness — a vault where nobody kept a copy simply has none.
+    if !dir.is_dir() {
+        return Ok((files, complete));
+    }
+    if collect_dir(&dir, Some(PHOTOS_SUBDIR), &mut files, &mut complete, |p| {
+        matches!(extension(p).as_deref(), Some("pmenc"))
+            || extension(p)
+                .as_deref()
+                .is_some_and(|e| PHOTO_EXTS.contains(&e))
+    })
+    .is_err()
+    {
+        complete = false;
+    }
+    Ok((files, complete))
+}
+
+/// One directory's files matching `keep`, appended to `out` with `prefix` (if any) joined by `/`. An
 /// unreadable entry clears `complete` instead of failing the walk.
-fn collect_markdown_dir(
+fn collect_dir(
     dir: &Path,
     prefix: Option<&str>,
     out: &mut Vec<VaultFile>,
     complete: &mut bool,
+    keep: impl Fn(&Path) -> bool,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else {
@@ -3848,7 +3887,7 @@ fn collect_markdown_dir(
             continue;
         };
         let path = entry.path();
-        if !path.is_file() || !is_vault_markdown(&path) {
+        if !path.is_file() || !keep(&path) {
             continue;
         }
         let name = file_name(&path);

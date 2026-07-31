@@ -101,6 +101,8 @@ mod sidecar_stage;
 mod smart_app_control;
 mod splitter;
 mod spreadsheets;
+/// ONE-TIME cleanup, removed in the release after this one — see the module docs and card #651.
+mod sweep;
 mod tags;
 mod tray;
 mod update_delivery;
@@ -1361,6 +1363,11 @@ pub fn run() {
             settings::set_reranking,
             settings::set_duplicate_check,
             duplicates::scan_duplicates,
+            // ONE-TIME cleanup — delete these three with the `sweep` module in the release after
+            // this one (card #651's follow-up).
+            sweep::scan_orphan_files,
+            sweep::delete_orphan_files,
+            sweep::dismiss_orphan_sweep,
             settings::set_retrieval_k,
             settings::set_retrieval_confidence_threshold,
             settings::ai_provider_status,
