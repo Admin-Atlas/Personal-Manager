@@ -2826,11 +2826,15 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink, pass: String) 
         }
     }
 
-    let (ingested, skipped, failed) = result?;
+    let (ingested, skipped, failed, unreadable) = result?;
     sink.send(IngestEvent::Finished {
         ingested,
         skipped,
         failed,
+        // A real number from the vault walk, not a placeholder. The walk's partial-picture signal
+        // already withholds the straggler sweep (`may_reap`), but that is invisible: without this the
+        // rebuild reported a clean run over a vault it had only half enumerated.
+        unreadable,
     });
     Ok(())
 }
@@ -2844,7 +2848,7 @@ async fn rebuild_passes<F>(
     extra_total: usize,
     pass: &str,
     on_pass_start: F,
-) -> Result<(usize, usize, usize)>
+) -> Result<(usize, usize, usize, usize)>
 where
     F: Fn() -> Result<()> + Send + 'static,
 {
@@ -2854,7 +2858,9 @@ where
     let app2 = app.clone();
     let sink2 = sink.clone();
     let pass2 = pass.to_string();
-    let (ingested, skipped, failed) = tokio::task::spawn_blocking(move || {
+    // `unreadable` comes only from phase 1: phase 2 works from the encrypted manifest, not a walk of
+    // the filesystem, so it has no entries it could fail to enumerate.
+    let (ingested, skipped, failed, unreadable) = tokio::task::spawn_blocking(move || {
         ingest::rebuild(&app2, &sink2, extra_total, &pass2, &on_pass_start)
     })
     .await
@@ -2879,7 +2885,12 @@ where
         let config = RetrievalConfig::current_for(&db::selected_embedder(&conn)?);
         db::set_retrieval_stamp(&conn, &config)?;
     }
-    Ok((ingested + upgraded, skipped + up_skipped, failed_total))
+    Ok((
+        ingested + upgraded,
+        skipped + up_skipped,
+        failed_total,
+        unreadable,
+    ))
 }
 
 /// Upgrade every reachable index-only item to a full-body index: re-fetch its live body and re-embed (via

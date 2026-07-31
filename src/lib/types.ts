@@ -1466,6 +1466,9 @@ export interface IngestReport {
   ingested: number;
   skipped: number;
   failed: number;
+  /** Entries the walk could not read — a folder that would not open, an entry whose stat was
+   *  refused. In none of the other three counters, because these were never seen at all. */
+  unreadable: number;
 }
 
 /** Result of a plaintext vault export; `null` from the command means the user cancelled the picker. */
@@ -1484,7 +1487,16 @@ export type IngestEvent =
    *  the plain chunk count on that file's Activity row. */
   | { type: "done"; document: Document; warning: string | null }
   | { type: "failed"; path: string; error: string }
-  | { type: "finished"; ingested: number; skipped: number; failed: number };
+  /** `unreadable` counts entries the enumeration could not read (a locked folder, a refused stat),
+   *  which are absent from `counted.total` and from all three other counters — so a run with a
+   *  non-zero value here is NOT the clean import the rest of the numbers describe. */
+  | {
+      type: "finished";
+      ingested: number;
+      skipped: number;
+      failed: number;
+      unreadable: number;
+    };
 
 // --- Developer mode (issue #78): read-only inspection surfaces ---
 // Mirrors the structs in src-tauri/src/commands_dev.rs. Every value is already redacted by the

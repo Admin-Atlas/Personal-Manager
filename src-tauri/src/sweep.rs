@@ -200,8 +200,8 @@ fn current_plan(state: &AppState) -> Result<SweepPlan> {
         // non-reentrant, and a vault walk is slow).
     };
 
-    let (markdown, markdown_complete) = crate::ingest::walk_vault_markdown(&vault_dir)?;
-    let (photos, photos_complete) = crate::ingest::walk_vault_photos(&vault_dir)?;
+    let (markdown, markdown_unreadable) = crate::ingest::walk_vault_markdown(&vault_dir)?;
+    let (photos, photos_unreadable) = crate::ingest::walk_vault_photos(&vault_dir)?;
     let mut files: Vec<String> = markdown
         .into_iter()
         .chain(photos)
@@ -209,10 +209,14 @@ fn current_plan(state: &AppState) -> Result<SweepPlan> {
         .collect();
     files.sort();
 
+    // Both walks report how many entries they could not read; the sweep's question is the binary one
+    // — was EITHER picture partial? A single unread entry anywhere means a file this scan calls an
+    // orphan might simply be one the walk never saw.
+    let complete = markdown_unreadable == 0 && photos_unreadable == 0;
     Ok(plan_sweep(
         &files,
         &known,
-        markdown_complete && photos_complete,
+        complete,
         Busy {
             indexing: state.rebuild_running(),
             syncing: state.sync_active(),

@@ -554,7 +554,10 @@ function IndexOnlyBody({
 }
 
 /** The chunk-boundary overlay: each leaf chunk's source slice as its own block, shaded by parent group,
- *  divided per leaf. Rendered Markdown by default; raw monospace source under dev mode. */
+ *  divided per leaf. Rendered Markdown by default; raw monospace source under dev mode — both draw the
+ *  same tiled segments, so neither substrate shows the splitter's chunk overlap twice (`segmentByLeaves`
+ *  clips it). A consequence worth knowing when reading the overlay: a heavily-overlapped chunk gets a
+ *  shorter band, so band height is not a chunk-size cue. */
 function ChunkOverlayView({
   body,
   spans,

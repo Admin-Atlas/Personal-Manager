@@ -62,6 +62,9 @@ interface Summary {
   ingested: number;
   skipped: number;
   failed: number;
+  /** Entries the walk could not read. Absent from every other counter AND from the total the bar
+   *  filled, so this is the only thing that distinguishes a partial import from a complete one. */
+  unreadable: number;
 }
 
 // Sorting for the document table. The available columns depend on the Depth preset (Ingested only
@@ -478,6 +481,7 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
           ingested: event.ingested,
           skipped: event.skipped,
           failed: event.failed,
+          unreadable: event.unreadable,
         });
         break;
     }
@@ -958,9 +962,16 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                 </Collapsible>
               )}
               {summary && (
+                /* The "could not be read" clause renders only when non-zero, so a clean import reads
+                   exactly as it always has. It says "items", not "files": one folder that would not
+                   open counts as one entry however much sits inside it, and the number underneath is
+                   unknowable by definition. */
                 <p className="mt-2 border-t border-rule px-1 pt-2 text-xs text-ink3">
                   Done — {summary.ingested} ingested, {summary.skipped} skipped, {summary.failed}{" "}
-                  failed.
+                  failed
+                  {summary.unreadable > 0 &&
+                    `, ${summary.unreadable} item${summary.unreadable === 1 ? "" : "s"} could not be read`}
+                  .
                 </p>
               )}
             </Card>

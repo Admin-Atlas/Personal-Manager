@@ -7,7 +7,8 @@
 // `char_count` is a CHARACTER count; a JS string is UTF-16. Slicing the body with the raw byte numbers
 // would drift on any non-ASCII content (emoji, CJK, accented text). This module maps byte offsets to
 // UTF-16 string indices by walking the body's code points once, then slices — so a segment's text is
-// exactly the source substring the splitter saw.
+// the source substring the splitter saw, clipped so that overlapping leaves tile (see
+// [`segmentByLeaves`]: the stored ranges overlap on purpose, the rendered bands must not).
 
 import type { ChunkSpan } from "./types";
 
@@ -80,17 +81,50 @@ export interface ChunkSegment {
  * Slice the document body into ordered per-leaf segments using the stored byte offsets. Only leaves with
  * real offsets are included (chat-turn chunks predate the offset columns and are skipped). The caller
  * decides how to shade parent groups; `parentId` is carried through for that.
+ *
+ * The segments TILE: consecutive ranges are clipped so the concatenated texts are exactly
+ * `body.slice(firstStart, lastEnd)`, with nothing shown twice. That clipping is not cosmetic. Leaf
+ * ranges deliberately OVERLAP — the splitter re-seeds each new chunk with the trailing whole units of
+ * the one just flushed (`overlap_seed`/`CHUNK_OVERLAP_TOKENS`, `splitter.rs`) — so an unclipped overlay
+ * renders the shared run once at the tail of one band and again at the head of the next, and the same
+ * document reads differently depending on the "Show chunks" toggle. Retrieval needs that overlap, so
+ * the reader is the layer that adapts: never "fix" this by changing the emitted ranges (moving a
+ * boundary re-chunks every existing vault and costs recall across boundaries).
+ *
+ * Two properties this rests on, both load-bearing:
+ *
+ * 1. The shared run is given to the EARLIER chunk. That matches [`makeByteToChar`]'s rule that a
+ *    straddling character belongs to the chunk that ENDS on it — one rule for "who owns contested
+ *    text", not two. Attributing it forward instead would be just as seamless, which is why the choice
+ *    is written down rather than left to be re-derived (and re-decided the other way) later.
+ * 2. Leaves must arrive in DOCUMENT order — a running cursor cannot clip against a range it has not
+ *    seen yet. That holds today because `document_chunk_spans` returns `ORDER BY ordinal` and `ordinal`
+ *    is the enumerate index over the splitter's output. Re-ordering the query (e.g. `ORDER BY
+ *    start_offset`) or sorting the array here would silently start swallowing bands instead of
+ *    erroring, so treat the ordering as part of this function's contract.
  */
 export function segmentByLeaves(body: string, leaves: ChunkSpan[]): ChunkSegment[] {
   const toChar = makeByteToChar(body);
-  return leaves
-    .filter((c) => c.kind === "leaf" && c.start_offset != null && c.end_offset != null)
-    .map((c) => ({
+  const out: ChunkSegment[] = [];
+  let cursor = 0; // UTF-16 index one past the last character already rendered
+  for (const c of leaves) {
+    if (c.kind !== "leaf" || c.start_offset == null || c.end_offset == null) continue;
+    const start = Math.max(cursor, toChar(c.start_offset));
+    // Defensive: a leaf swallowed entirely by its predecessor yields an empty band, never a reversed
+    // slice (which JS would silently return as ""... from the wrong place). Monotonic `end_offset`
+    // makes this unreachable in practice; it is a guard, not a case.
+    const end = Math.max(start, toChar(c.end_offset));
+    cursor = end;
+    // Empty segments are kept rather than dropped: the overlay promises a 1:1 chunk→band mapping
+    // (each band's tooltip names `chunk #{ordinal}`), and a missing band would misattribute the rest.
+    out.push({
       chunkId: c.id,
       parentId: c.parent_id,
       ordinal: c.ordinal,
-      text: body.slice(toChar(c.start_offset as number), toChar(c.end_offset as number)),
-    }));
+      text: body.slice(start, end),
+    });
+  }
+  return out;
 }
 
 /**
