@@ -1658,27 +1658,38 @@ pub async fn enumerate_shared(
 /// are never returned. Any folder id in `exclude` is never enqueued — pruning that folder and its whole
 /// subtree, both as a seed root and as a descended child.
 ///
-/// `tolerant` governs a per-item permission gap. In a **shared-with-me** subtree, divergent
-/// permissions are normal — you can see a folder but not enter one child folder (403/404). A tolerant
-/// walk **skips that subtree and marks the result incomplete** (so the reconcile infers NO deletions)
-/// instead of failing the whole account; a non-tolerant walk (My Drive / shared drives, where access
-/// is uniform) propagates the error as before. A transient rate-limit always propagates.
+/// A per-item permission gap (403/404) **always** skips that subtree and marks the result incomplete
+/// (so the reconcile infers NO deletions), whatever `tolerant` says: by status code alone a walk cannot
+/// tell "this one folder is blocked" from "the grant is gone", so the loudness decision is deferred to
+/// the end of the walk, where there IS evidence — see [`walk_gap_is_account_wide`]. `tolerant` is that
+/// rule's input rather than a gate on the skip: a **shared-with-me** walk (divergent permissions are
+/// normal there) never fails the account, while a My Drive / shared-drive walk in which NOTHING listed
+/// still propagates the 403. A transient rate-limit always propagates.
 ///
 /// Returns the deduped files plus whether the walk was cut short (`true` ⇒ INCOMPLETE — the caller must
-/// not treat an unseen file as deleted; see [`connector_sync::paginate`]).
+/// not treat an unseen file as deleted; see [`connector_sync::paginate`]). Three things set it: the
+/// folder-count guard, one folder's page guard, and a skipped forbidden-or-missing subtree.
 async fn walk_folders(
     token_key: &str,
     roots: &[String],
     exclude: &[String],
     tolerant: bool,
-    url_for: impl Fn(&str, Option<&str>) -> Result<String>,
+    url_for: impl Fn(&str, Option<&str>) -> Result<String> + Sync,
 ) -> Result<(Vec<DriveFile>, bool)> {
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
     let mut out: Vec<DriveFile> = Vec::new();
     let mut seen_folders: HashSet<String> = HashSet::new();
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut truncated = false;
+    // The evidence the tail decision rests on: did ANY page anywhere in this walk list successfully?
+    // An atomic rather than a `Cell` because it's set inside the pagination future, which has to stay
+    // `Send` for `gather_account`.
+    let listed_ok = AtomicBool::new(false);
+    // The first 403 skipped, kept in case the tail decides the whole grant is gone. 404s never land
+    // here — an item that's merely missing says nothing about the grant.
+    let mut forbidden: Option<Error> = None;
     let mut queue: Vec<String> = roots
         .iter()
         .filter(|r| !excluded.contains(r.as_str()))
@@ -1695,33 +1706,57 @@ async fn walk_folders(
             return Ok((out, true));
         }
         let q = format!("'{folder}' in parents and trashed = false");
-        let mut page: Option<String> = None;
-        loop {
-            let url = url_for(&q, page.as_deref())?;
-            let v = match google::authorized_get(token_key, &url).await {
-                Ok(v) => v,
-                // A per-item 403/404 inside a shared-with-me subtree: skip this folder and flag the
-                // walk incomplete so the reconcile won't soft-delete files we simply couldn't reach.
-                Err(e) if tolerant && is_item_forbidden_or_missing(&e) => {
-                    truncated = true;
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
-            let (children, next) = parse_files(&v);
-            for child in children {
-                if child.mime_type == FOLDER_MIME {
-                    if !excluded.contains(child.id.as_str()) {
-                        queue.push(child.id);
-                    }
-                } else if seen_files.insert(child.id.clone()) {
-                    out.push(child);
-                }
+        // One bounded pagination per folder — the same guard every other listing uses. A page token
+        // that never clears now flags the walk incomplete instead of spinning forever while re-pushing
+        // the same children into `queue` until the process runs out of memory.
+        let listed = connector_sync::paginate(MAX_PAGES, |page| {
+            // Sync prologue: build the URL here so the future captures only owned data and stays `Send`.
+            let url = url_for(&q, page.as_deref());
+            let listed_ok = &listed_ok;
+            async move {
+                let v = google::authorized_get(token_key, &url?).await?;
+                // Per PAGE, not per folder: one page listed anywhere proves the grant is still live,
+                // which is what keeps a 403 on some *other* folder from failing the whole account.
+                listed_ok.store(true, Ordering::Relaxed);
+                Ok(parse_files(&v))
             }
-            match next {
-                Some(t) => page = Some(t),
-                None => break,
+        })
+        .await;
+        let (children, page_truncated) = match listed {
+            Ok(r) => r,
+            // A per-item 403/404 anywhere in the tree: skip this subtree and flag the walk incomplete
+            // so the reconcile won't soft-delete files we simply couldn't reach (I-09.3). Whether the
+            // gap is loud enough to fail the whole account is decided at the tail, not here. A folder
+            // that 403s on page 3 loses the children pages 1-2 did return — `truncated` covers them
+            // either way, and a permission denial all but always lands on page 1.
+            Err(e) if is_item_forbidden_or_missing(&e) => {
+                if !is_item_missing(&e) && forbidden.is_none() {
+                    forbidden = Some(e);
+                }
+                truncated = true;
+                continue;
             }
+            Err(e) => return Err(e), // 429/5xx/network, and a usage-limit 403 — unchanged
+        };
+        if page_truncated {
+            eprintln!("drive: folder {folder} hit the page guard at {MAX_PAGES} pages");
+            truncated = true;
+        }
+        for child in children {
+            if child.mime_type == FOLDER_MIME {
+                if !excluded.contains(child.id.as_str()) {
+                    queue.push(child.id);
+                }
+            } else if seen_files.insert(child.id.clone()) {
+                out.push(child);
+            }
+        }
+    }
+    // Deferred to here on purpose: `queue` is LIFO, so deciding at the moment of the first 403 would
+    // fail an account whose *second* selected root lists perfectly well.
+    if let Some(e) = forbidden {
+        if walk_gap_is_account_wide(tolerant, listed_ok.load(Ordering::Relaxed), true) {
+            return Err(e);
         }
     }
     Ok((out, truncated))
@@ -2124,6 +2159,25 @@ pub fn is_item_forbidden_or_missing(err: &Error) -> bool {
     }
     let s = err.to_string();
     s.contains("(403") || s.contains("(404")
+}
+
+/// True if a Drive error is a 404 — the item is gone (or was never visible to this account). Never
+/// account-wide: a revoked or downgraded grant answers 401/403, so a walk may always skip a 404 subtree
+/// without doubting the grant itself. Splits the two halves of [`is_item_forbidden_or_missing`].
+fn is_item_missing(err: &Error) -> bool {
+    err.to_string().contains("(404")
+}
+
+/// Whether a folder walk that SKIPPED one or more forbidden subtrees must still fail the whole account.
+/// A shared-with-me walk never does — divergent grants are normal there. Elsewhere, one successful
+/// listing anywhere in the same walk proves the grant is live, so the 403 really was just one folder; a
+/// walk in which NOTHING listed keeps the 403 loud, because a revoked grant, a dropped `drive.readonly`
+/// scope (`insufficientPermissions`) and a disabled API (`SERVICE_DISABLED`) all fail *every* listing
+/// and must still reach the reconnect prompt. The rule is evidence-based rather than status-based
+/// because every Drive error here is a stringly-typed body (`google.rs`), so the two 403s are otherwise
+/// indistinguishable. Pure, so it is unit-testable without a network.
+fn walk_gap_is_account_wide(tolerant: bool, listed_ok: bool, saw_forbidden: bool) -> bool {
+    !tolerant && !listed_ok && saw_forbidden
 }
 
 /// Fetch a file's body as indexable text, or `None` if it has no useful text (skipped type, empty
@@ -2678,6 +2732,56 @@ mod tests {
         assert!(is_rate_limited(&err));
         // The point of F-26: a throttle must NOT flip the whole account to `unreachable`.
         assert!(!is_auth_failure(&err));
+        // Nor may the folder walk swallow it as a permission gap: a throttle has to take the propagate
+        // arm (soft error, cursor held, retried next pass), not be skipped as an unreachable subtree.
+        assert!(!is_item_forbidden_or_missing(&err));
+    }
+
+    #[test]
+    fn one_forbidden_folder_beside_a_listed_one_is_not_account_wide() {
+        // The finding's case: a My Drive walk that listed something and skipped one 403 subtree reports
+        // incomplete coverage and never flips every document of the account to `unreachable`.
+        assert!(!walk_gap_is_account_wide(false, true, true));
+    }
+
+    #[test]
+    fn a_wholly_forbidden_my_drive_walk_still_fails_the_account() {
+        // A revoked grant or a dropped scope 403s every listing, so nothing listed — stay loud, or the
+        // account degrades to permanently-empty-but-'ok' with no reconnect prompt.
+        assert!(walk_gap_is_account_wide(false, false, true));
+    }
+
+    #[test]
+    fn a_wholly_forbidden_shared_with_me_root_stays_tolerated() {
+        // Pins the existing M2 behaviour of enumerate_swm_root / enumerate_swm_shortcut: a root whose
+        // only listing 403s yields (vec![], true), not an account failure.
+        assert!(!walk_gap_is_account_wide(true, false, true));
+    }
+
+    #[test]
+    fn a_missing_folder_never_fails_the_account() {
+        let err =
+            Error::Other("Google API request failed (404 Not Found): File not found: F1".into());
+        assert!(is_item_forbidden_or_missing(&err));
+        assert!(is_item_missing(&err));
+        // A 404 is skipped but never recorded as `forbidden`, so a deleted selected folder leaves
+        // `saw_forbidden` false — it can't pin the account in 'error' pass after pass.
+        assert!(!walk_gap_is_account_wide(false, false, false));
+    }
+
+    #[test]
+    fn a_disabled_drive_api_403_still_fails_the_account() {
+        // Google's real 403 for a project that never enabled the API. It fails EVERY listing, so
+        // `listed_ok` stays false and the walk keeps it loud instead of reporting a quiet coverage gap.
+        let err = Error::Other(
+            "Google API request failed (403): {\"error\":{\"status\":\"SERVICE_DISABLED\",\
+             \"message\":\"Google Drive API has not been used in project 123 before or it is \
+             disabled.\"}}"
+                .into(),
+        );
+        assert!(is_item_forbidden_or_missing(&err));
+        assert!(!is_item_missing(&err));
+        assert!(walk_gap_is_account_wide(false, false, true));
     }
 
     #[test]

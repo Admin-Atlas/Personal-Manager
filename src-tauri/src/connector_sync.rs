@@ -122,6 +122,10 @@ pub enum NextPass {
 /// `running`/queue lifecycle without knowing the concrete snapshot type. Implemented by the three
 /// `*SyncState` snapshots in [`crate`] (each also carries connector-specific display fields — the
 /// counters, the target, the last report — that the guard never touches).
+///
+/// **Every implementor must also be listed in [`AppState::connector_slots`]** — that register is what
+/// the background stand-down gates read, and a slot missing from it fails silently: the gates simply
+/// read "nothing is syncing" (audit B1-7, which is what happened to the local-folder slot).
 pub trait SyncSlot {
     /// Whether a sync is in flight right now.
     fn running(&self) -> bool;
@@ -137,6 +141,33 @@ pub trait SyncSlot {
     /// report and any orphaned queue cleared. Called by [`SyncRunGuard::claim`] under the same lock
     /// that claims the slot — implementations must set `running` themselves.
     fn begin_pass(&mut self, target: Option<String>);
+}
+
+/// A poison-tolerant read of one detached-sync slot's `running` flag. Object-safe on purpose: the
+/// three slots hold *different* snapshot types (`CloudSyncState` for both cloud connectors,
+/// `LocalFolderSyncState` for the local one), so this is what lets them be enumerated together as one
+/// register — see [`AppState::connector_slots`] and [`any_running`].
+pub trait SlotStatus {
+    /// Whether this slot's sync is in flight right now.
+    fn slot_running(&self) -> bool;
+}
+
+impl<S: SyncSlot> SlotStatus for Mutex<S> {
+    fn slot_running(&self) -> bool {
+        // A poisoned slot reads as IDLE. These gates are advisory — a `true`-on-poison read would
+        // stand every background job down for the rest of the session, which is exactly the wedge the
+        // F-43 guard work exists to prevent.
+        self.lock().map(|s| s.running()).unwrap_or(false)
+    }
+}
+
+/// True when ANY of the given slots is mid-run — the whole body of [`AppState::sync_active`].
+///
+/// It takes a slice rather than named slots so the list of connectors lives in ONE place. The gate
+/// used to be hand-written as `drive || onedrive` and the local-folder slot was simply left out of it
+/// (audit B1-7), which no caller could see: every consumer just read "no sync is running".
+pub fn any_running(slots: &[&dyn SlotStatus]) -> bool {
+    slots.iter().any(|s| s.slot_running())
 }
 
 /// RAII single-flight guard for a detached connector sync. Construction ([`SyncRunGuard::claim`])
@@ -775,6 +806,124 @@ mod tests {
         assert!(
             slot.queue().is_empty(),
             "a queue orphaned by a panicked pass doesn't leak into the next run"
+        );
+    }
+
+    #[test]
+    fn any_running_is_false_when_every_slot_is_idle() {
+        let drive = Mutex::new(FakeSlot::default());
+        let onedrive = Mutex::new(FakeSlot::default());
+        let local = Mutex::new(FakeSlot::default());
+        assert!(
+            !any_running(&[&drive, &onedrive, &local]),
+            "nothing is syncing, so nothing stands down"
+        );
+    }
+
+    #[test]
+    fn any_running_is_true_when_only_the_last_slot_runs() {
+        // The exact omission B1-7 shipped: the local-folder slot is the THIRD one, and the hand-rolled
+        // gate ORed the first two, so every background stand-down read false through a local sync.
+        let drive = Mutex::new(FakeSlot::default());
+        let onedrive = Mutex::new(FakeSlot::default());
+        let local = Mutex::new(FakeSlot {
+            running: true,
+            ..Default::default()
+        });
+        assert!(
+            any_running(&[&drive, &onedrive, &local]),
+            "the gate must not stop at the first two slots"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_slot_reads_as_idle_and_never_masks_a_running_one() {
+        // `running: true` under the poison, so this can only pass via the poison arm — a slot whose
+        // lock is unrecoverable reads IDLE, because standing every background job down for the rest of
+        // the session is a worse failure than one advisory gate answering optimistically.
+        let poisoned = Mutex::new(FakeSlot {
+            running: true,
+            ..Default::default()
+        });
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // the deliberate panic below isn't a test failure
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoned.lock().unwrap();
+            panic!("poison the slot");
+        }));
+        std::panic::set_hook(hook);
+
+        assert!(poisoned.is_poisoned(), "the panic really poisoned the lock");
+        assert!(!poisoned.slot_running(), "a poisoned slot reads as idle");
+
+        let local = Mutex::new(FakeSlot {
+            running: true,
+            ..Default::default()
+        });
+        assert!(
+            any_running(&[&poisoned, &local]),
+            "and a poisoned slot never masks one that really is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_stops_at_the_guard_and_flags_truncated() {
+        // A continuation token that never clears must stop AT the bound rather than looping forever,
+        // and hand back what it gathered flagged INCOMPLETE — that flag is what withholds the caller's
+        // deletion sweep (F-30).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let max_pages = 4;
+        let (out, truncated) = paginate(max_pages, |cursor| {
+            let seen = seen.clone();
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    cursor.is_none(),
+                    n == 0,
+                    "only the first call gets no cursor"
+                );
+                Ok::<_, Error>((vec![n], Some(format!("page-{}", n + 1))))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            truncated,
+            "the token never cleared, so the listing is partial"
+        );
+        assert_eq!(out.len(), max_pages, "everything gathered up to the guard");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            max_pages,
+            "the guard bounded the fetches — it didn't just stop counting them"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_reports_complete_when_the_token_clears() {
+        // The false-positive side, and it is not the "safe" one: `truncated` suppresses the caller's
+        // deletion sweep, so a listing that IS complete but claims otherwise leaves files that really
+        // were deleted in the index indefinitely.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (out, truncated) = paginate(10, |_cursor| {
+            let seen = seen.clone();
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>((vec![n], (n < 2).then(|| format!("page-{}", n + 1))))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!truncated, "the token cleared inside the bound → complete");
+        assert_eq!(out, vec![0, 1, 2], "every page's items, in page order");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "and it stopped asking once the token cleared"
         );
     }
 

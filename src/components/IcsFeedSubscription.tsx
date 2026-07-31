@@ -149,12 +149,29 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
             // The feed's calendar row, present once a sync has registered it. Until then there is
             // nothing to type, so the control is simply absent rather than disabled-and-mysterious.
             const cal = overview?.calendars.find((c) => c.id === f.id);
+            // A feed's source row shares the feed's id. 'error' means the fetch succeeded but the
+            // parse couldn't see the whole feed (a body cut mid-event, or one past the parser's
+            // caps): the events already mirrored are kept and nothing is removed, so it must not
+            // read as "unreachable" — and it must not stay silent either.
+            const src = overview?.accounts.find((a) => a.id === f.id);
             return (
               <li
                 key={f.id}
                 className="flex items-center justify-between gap-2 px-3 py-1.5 text-sm text-ink"
               >
                 <span className="min-w-0 flex-1 truncate">{f.label}</span>
+                {src && src.state !== "ok" && (
+                  <span
+                    className="shrink-0 text-[0.625rem] uppercase tracking-wide text-st-due"
+                    title={
+                      src.state === "error"
+                        ? "The last sync didn’t reach the end of this feed. The events already mirrored are kept — nothing was removed — and the next sync picks up the rest."
+                        : "PM couldn’t reach this feed on the last sync. Its events are kept until it syncs again."
+                    }
+                  >
+                    {src.state === "error" ? "sync didn’t finish" : "unreachable"}
+                  </span>
+                )}
                 {cal && (
                   <Select
                     compact

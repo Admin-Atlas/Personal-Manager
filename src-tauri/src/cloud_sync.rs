@@ -197,11 +197,12 @@ trait CloudDriver: Send + Sync + Clone {
     /// The file's display name for the report/progress (falls back to the source id when absent).
     fn file_name(file: &Self::File) -> String;
 
-    /// Whether a body-fetch error is a per-ITEM access failure (the item was revoked/removed for this
-    /// user — common for a "Shared with me" grant that was pulled) rather than an account-wide or
-    /// transient failure. Lets phase 2 skip that one file (record an issue, keep the account healthy)
-    /// instead of failing the whole account (M2). Defaults to `false` — every fetch error fails the
-    /// account, the pre-existing behavior — so only Drive opts in.
+    /// Whether a body-fetch error is a per-ITEM access failure (the item was revoked/removed/locked
+    /// for this user — a "Shared with me" grant that was pulled, a malware-flagged or Personal-Vault
+    /// item) rather than an account-wide or transient failure. Lets phase 2 skip that one file (record
+    /// an issue, keep the account healthy) instead of failing the whole account and holding its cursor
+    /// forever (M2). Both providers now override it; the `false` default is the safe fallback for a
+    /// connector that hasn't classified its errors yet, not the expected answer.
     fn is_item_gone(_err: &Error) -> bool {
         false
     }
@@ -346,9 +347,12 @@ enum ItemOutcome {
     Unmapped,
     /// A body was needed and the fetch produced no extractable text.
     NoText,
-    /// The body fetch failed. `item_gone` marks a per-ITEM revoke/removal — a "Shared with me"
-    /// grant the owner pulled — as opposed to a transient, auth, or network failure.
-    FetchFailed { item_gone: bool },
+    /// The body fetch failed. `permanent` marks a failure that will recur identically on every future
+    /// pass — a per-ITEM revoke/removal/lock, or a body this build can never index (over a cap, or one
+    /// the document engine refuses) — as opposed to a transient, auth, or network failure. Named for
+    /// the CONSEQUENCE rather than the cause ("gone" is a lie for an over-cap file), because the whole
+    /// decision it drives is "replay this next pass, or step past it".
+    FetchFailed { permanent: bool },
     /// The reducer's actions applied cleanly, landing in this category.
     Applied(connector_sync::ActionKind),
     /// The apply itself failed.
@@ -361,7 +365,8 @@ enum ItemOutcome {
 /// `fails_account` is the consequential one. An account with any failed item is finalized `error`
 /// with its delta cursor left UNADVANCED, so the failure retries next pass instead of hiding behind
 /// a misleading `ok` that has already stepped past the change it never applied (F-29). Getting that
-/// wrong for `item_gone` is what M2 fixed: one revoked shared file used to fail the whole account.
+/// wrong cuts both ways: M2 fixed one revoked shared file failing the whole account, and the same
+/// arm's `permanent` flag is what stops a file that can NEVER be fetched holding the cursor forever.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ItemEffect {
     indexed: usize,
@@ -387,13 +392,14 @@ fn item_effect(outcome: ItemOutcome) -> ItemEffect {
             records_issue: true,
             ..ItemEffect::default()
         },
-        // The account survives a file that is simply gone for this user; anything else holds the
-        // cursor so the pass retries rather than stepping past what it never saw.
-        ItemOutcome::FetchFailed { item_gone } => ItemEffect {
-            skipped: usize::from(item_gone),
-            failed: usize::from(!item_gone),
+        // The account survives a file that can never be fetched (gone for this user, or unindexable
+        // by this build) — retrying it forever is what pins the account, not what heals it. Anything
+        // else holds the cursor so the pass retries rather than stepping past what it never saw.
+        ItemOutcome::FetchFailed { permanent } => ItemEffect {
+            skipped: usize::from(permanent),
+            failed: usize::from(!permanent),
             records_issue: true,
-            fails_account: !item_gone,
+            fails_account: !permanent,
             ..ItemEffect::default()
         },
         ItemOutcome::Applied(kind) => ItemEffect {
@@ -543,6 +549,31 @@ fn is_file_lock_error(e: &Error) -> bool {
         || s.contains("being used by another process")
 }
 
+/// Whether a body fetch failed in a way that will fail identically on every future pass, so the item
+/// must be SKIPPED rather than replayed forever. Provider-independent, and the reason it exists is the
+/// cursor: a failure that fails the account holds its delta cursor at the last-good value (F-29), so a
+/// permanently-unindexable file re-fails on every subsequent pass and the account never reads as
+/// synced again. F-29 exists to prevent silent gaps; a permanent per-item failure is that same failure
+/// inverted, so the rule is narrowed here rather than widened.
+///
+/// Three causes, all terminal: PM's own download cap (`google.rs`/`microsoft.rs` `read_capped*`), the
+/// sidecar's input cap (`sidecar::check_input_size`), and the document engine ANSWERING and refusing
+/// this file. `sidecar convert failed:` is the engine's per-FILE verdict, minted in
+/// `SidecarManager::request` — reword that prefix and this classifier silently narrows back to the
+/// stuck behaviour, which is what the test below anchors. `sidecar convert IO error:` and "not
+/// installed" are the engine itself being broken and stay account-fatal, and a transient antivirus file
+/// lock has already been retried by [`convert_staged`]: it is checked FIRST because it arrives wearing
+/// the `sidecar convert failed:` prefix, and skipping it would drop a perfectly indexable file.
+fn is_permanently_unindexable(err: &Error) -> bool {
+    if is_file_lock_error(err) {
+        return false;
+    }
+    let s = err.to_string();
+    s.contains("too large to index")
+        || s.contains("too large to process")
+        || s.contains("sidecar convert failed:")
+}
+
 /// Drive both cloud sync engines: the detached, single-flight, crash-resumable lifecycle around one
 /// [`run_cloud_pass`]. **My Drive / the whole drive** (on by default) uses the efficient delta cursor —
 /// the first sync enumerates everything (the slow one the UI warns about), later syncs apply only the
@@ -615,6 +646,14 @@ async fn run_cloud_pass<C: CloudDriver>(
     // (My Drive + shared drives, or a single OneDrive) and reports any soft, per-account error to fold
     // into `last_err`; hard errors propagate via `?`.
     for email in emails {
+        // Stop requested before this account's gather? Halt phase 1 — phase 2's first check reads the
+        // same flag and reports the pass cancelled, and an ungathered account is simply left untouched
+        // (cursor unadvanced, no inferred deletions). This takes effect at an ACCOUNT boundary only:
+        // a walk already in flight still runs to completion, since interrupting one needs a cancel
+        // probe threaded through every enumerate/walk signature.
+        if sync_cancelled::<C>(app) {
+            break;
+        }
         let (w, soft_err) = driver.gather_account(app, email).await?;
         if let Some(e) = soft_err {
             last_err = Some(e);
@@ -686,16 +725,18 @@ async fn run_cloud_pass<C: CloudDriver>(
             continue;
         }
 
-        // A gather that hit its page/folder guard already withheld the enumeration's cursor advance and
-        // skipped inferred deletions; surface it so the partial pass isn't read as a clean one (F-30).
+        // A gather that couldn't see the whole account — a page/folder guard, or a subtree it wasn't
+        // allowed to open — already withheld the enumeration's cursor advance and skipped inferred
+        // deletions; surface it so the partial pass isn't read as a clean one (F-30). The note stays
+        // cause-agnostic because the user's next step is the same for all of them: wait a sync.
         // Pushed directly, NOT through the per-file `record_issue` (which is capped): there's at most one
         // of these per account and it's the only report-side signal a pass was partial, so it must never
         // be starved by a full per-file issues list.
         if w.coverage_incomplete {
             issues.push(CloudSyncIssue {
                 name: w.email.clone(),
-                reason: "Only part of this account could be listed this sync (too many items to page \
-                         through at once). Nothing was removed; the rest is picked up on the next sync."
+                reason: "Only part of this account could be listed this sync. Nothing was \
+                         removed; the rest is picked up on the next sync."
                     .to_string(),
             });
         }
@@ -720,6 +761,10 @@ async fn run_cloud_pass<C: CloudDriver>(
             };
 
             let name = file.map(C::file_name).unwrap_or_else(|| source_id.clone());
+            // Read the item's state HERE, not during phase 1. Gathers run in sequence and can re-key
+            // rows out from under each other (`drive::adopt_legacy_swm_row`), so a plan built by an
+            // earlier gather is only judged against the store as it stands now — see
+            // [`baseline_my_drive`]'s note on legacy shared-with-me rows.
             let current = {
                 let state = app.state::<AppState>();
                 let conn = state.conn()?;
@@ -786,12 +831,15 @@ async fn run_cloud_pass<C: CloudDriver>(
                             &name,
                             &format!("Couldn't fetch from {}: {e}", C::PROVIDER_LABEL),
                         );
-                        // A per-item revoke/removal (e.g. a "Shared with me" grant the owner pulled)
-                        // skips just this file — recorded as an issue, account stays healthy — instead
-                        // of failing the whole account. Any other error (transient/auth/network) still
-                        // fails the account so its cursor is held and it retries next pass (F-29, M2).
+                        // A failure this file will hit again on every future pass — a per-item
+                        // revoke/removal/lock, or a body PM can never index — skips just this file
+                        // (recorded as an issue, account stays healthy) instead of failing the whole
+                        // account. Holding the cursor for it would replay the same poison item every
+                        // pass and the account would never read as synced again. Any other error
+                        // (transient/auth/network) still fails the account so its cursor is held and it
+                        // retries next pass (F-29, M2).
                         let eff = item_effect(ItemOutcome::FetchFailed {
-                            item_gone: C::is_item_gone(&e),
+                            permanent: C::is_item_gone(&e) || is_permanently_unindexable(&e),
                         });
                         counts.add(eff);
                         if eff.fails_account {
@@ -927,13 +975,13 @@ async fn resolve_folder_name(
 
 /// One unit of sync work for a Drive account, gathered off the lock in phase 1.
 enum DriveItem {
-    /// A My-Drive first-sync file → `Add`.
-    Enumerated(drive::DriveFile),
     /// A My-Drive changes-feed entry → mapped via `map_change`.
     Changed(drive::DriveChange),
-    /// A shared-drive reconcile result with its event pre-built: `Add` for a new/reactivating file
-    /// (reducer: unknown→ingest, missing/unreachable→reachable), `Update` for a present healthy file
-    /// (same-hash→noop, changed→re-embed), or `Delete` for a file that vanished from the enumeration.
+    /// An enumeration reconciled against what is already indexed, with its event pre-built: `Add` for a
+    /// new/reactivating file (reducer: unknown→ingest, missing/unreachable→reachable), `Update` for a
+    /// present healthy file (same-hash→noop, changed→re-embed), or `Delete` for a file that vanished
+    /// from the enumeration. Every listing that returns a whole corpus lands here — folder-scoped, a
+    /// shared-with-me root, and both whole-drive re-baselines (see [`drive_baseline_items`]).
     Reconciled {
         source_id: String,
         event: index_only::ChangeEvent,
@@ -949,6 +997,32 @@ fn drive_reconciled(r: index_only::ReconcileItem<drive::DriveFile>) -> DriveItem
         event: r.event,
         file: r.payload,
     }
+}
+
+/// Plan one Drive enumeration against what is already indexed under the same namespace, and map the
+/// plan onto this connector's work items. **Every** Drive listing that hands back a whole corpus goes
+/// through here — a folder-scoped reconcile, a shared-with-me root, and (since this) the two
+/// whole-drive re-baselines — so "absent means deleted, unless the listing was cut short" has one
+/// implementation rather than one per call site.
+///
+/// The re-baselines used to hand-build an `Add` per enumerated file instead, which silently lost both
+/// halves of the gap the re-baseline exists to close: `react(Add, Some(ok))` is a `Noop`, so a file
+/// deleted while the cursor was dead stayed `source_state = 'ok'` forever (I-09.2), and an *edit*
+/// during the same gap was never compared either (an `Add` carries no content hash).
+///
+/// `truncated` is the listing's own report that it did not see everything; it is inverted into
+/// [`index_only::reconcile_enumeration`]'s `complete`, which withholds the whole deletion pass — a
+/// file we simply didn't reach must never be read as absent (F-30).
+fn drive_baseline_items(
+    files: Vec<drive::DriveFile>,
+    known: std::collections::HashSet<String>,
+    truncated: bool,
+    source_id_of: impl Fn(&str) -> String,
+) -> Vec<DriveItem> {
+    index_only::reconcile_enumeration(files, known, !truncated, source_id_of)
+        .into_iter()
+        .map(drive_reconciled)
+        .collect()
 }
 
 /// Gather one opted-in shared drive's work, dispatching on how much of it is in scope:
@@ -1009,14 +1083,9 @@ async fn gather_shared_folders(
             .into_iter()
             .collect()
     };
-    // A truncated enumeration (`complete = false`) must not infer deletions — a still-present file we
-    // didn't reach would otherwise be soft-deleted (F-30).
-    let items = index_only::reconcile_enumeration(files, known, !truncated, |file_id| {
+    let items = drive_baseline_items(files, known, truncated, |file_id| {
         drive::shared_source_id(drive_id, file_id)
-    })
-    .into_iter()
-    .map(drive_reconciled)
-    .collect();
+    });
     Ok((items, truncated))
 }
 
@@ -1047,14 +1116,51 @@ async fn gather_my_drive_folders(
             .into_iter()
             .collect()
     };
-    // A truncated enumeration (`complete = false`) must not infer deletions (F-30).
-    let items = index_only::reconcile_enumeration(files, known, !truncated, |file_id| {
+    let items = drive_baseline_items(files, known, truncated, |file_id| {
         drive::source_id_for(email, file_id)
-    })
-    .into_iter()
-    .map(drive_reconciled)
-    .collect();
+    });
     Ok((items, truncated))
+}
+
+/// Re-baseline **the whole of My Drive**: enumerate every file, take a fresh changes-feed start token,
+/// and reconcile the enumeration against the account's currently-healthy My-Drive items. Reached on a
+/// first sync, on a 410 cursor reset, and whenever `drive::set_scope` pruned the cursor on the way back
+/// from folder-scoped to whole-drive — the last two run against a fully-populated known set, which is
+/// exactly when a file that vanished (or was edited) while the cursor was dead has to be noticed.
+///
+/// The returned cursor is the one to PERSIST: withheld (`None`) when the enumeration was truncated,
+/// because a partial re-list can't be baselined — the next sync re-enumerates from scratch (F-30).
+///
+/// Shared-with-me files are deliberately out of both sides of the diff: `enumerate_drive` filters
+/// `sharedWithMe = false` and `known_my_drive_source_ids` matches only the `gdrive:<email>:` prefix,
+/// while that corpus lives under `gdrive:swm:<rootId>:` and reconciles per root in
+/// [`gather_shared_with_me`]. Do NOT union the two known sets.
+///
+/// One residue that leaves: a LEGACY shared-with-me row still keyed `gdrive:<email>:<fileId>` (indexed
+/// before the swm namespace landed) is in the known set but can never be in this enumeration, so it
+/// plans as a `Delete`. That is absorbed rather than acted on, because `gather_shared_with_me` runs
+/// later in the SAME phase-1 gather and `drive::adopt_legacy_swm_row` re-keys the row before phase 2
+/// evaluates the plan — at which point phase 2's per-item `read_item_state(old_id)` is `None` and the
+/// reducer no-ops. That ordering is therefore load-bearing: pre-resolving item state during phase 1, or
+/// gathering shared-with-me before My Drive, would turn it into a real (soft, self-healing) flag.
+async fn baseline_my_drive(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+) -> Result<(Vec<DriveItem>, Option<String>, bool)> {
+    let (files, truncated) = drive::enumerate_drive(token_key).await?;
+    let cursor = drive::start_page_token(token_key, None).await?;
+    let known: std::collections::HashSet<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        drive::known_my_drive_source_ids(&conn, email)?
+            .into_iter()
+            .collect()
+    };
+    let items = drive_baseline_items(files, known, truncated, |file_id| {
+        drive::source_id_for(email, file_id)
+    });
+    Ok((items, (!truncated).then_some(cursor), truncated))
 }
 
 /// Whole-drive sync via a **per-drive delta cursor** — the same cheap path My Drive uses, so a large
@@ -1074,26 +1180,28 @@ async fn gather_shared_whole(
         drive::get_shared_cursor(&conn, email, drive_id)?
     };
 
-    // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor. Also
-    // reports whether the enumeration was truncated (⇒ don't baseline the cursor yet — retry next pass).
-    async fn baseline(token_key: &str, drive_id: &str) -> Result<(Vec<DriveItem>, String, bool)> {
+    // First sync / 410 reset: the whole drive re-enumerated and reconciled against what is already
+    // indexed for it + a fresh baseline cursor. Reconciled, not hand-built `Add`s — on a 410 reset the
+    // known set is fully populated, so files deleted (or edited) while the cursor was dead are only
+    // seen by diffing. Also reports whether the enumeration was truncated (⇒ don't baseline the cursor
+    // yet — retry next pass; and `drive_baseline_items` withholds the deletions too).
+    async fn baseline(
+        app: &AppHandle,
+        token_key: &str,
+        drive_id: &str,
+    ) -> Result<(Vec<DriveItem>, String, bool)> {
         let (files, truncated) = drive::enumerate_shared(token_key, drive_id, None, &[]).await?;
         let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
-        let items = files
-            .into_iter()
-            .map(|f| {
-                let source_id = drive::shared_source_id(drive_id, &f.id);
-                let event = index_only::ChangeEvent::Add {
-                    source_id: source_id.clone(),
-                    modified_at: f.modified_time.clone(),
-                };
-                DriveItem::Reconciled {
-                    source_id,
-                    event,
-                    file: Some(f),
-                }
-            })
-            .collect();
+        let known: std::collections::HashSet<String> = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::known_shared_source_ids(&conn, drive_id)?
+                .into_iter()
+                .collect()
+        };
+        let items = drive_baseline_items(files, known, truncated, |file_id| {
+            drive::shared_source_id(drive_id, file_id)
+        });
         Ok((items, new_cursor, truncated))
     }
 
@@ -1105,7 +1213,7 @@ async fn gather_shared_whole(
 
     let cursor = match cursor {
         None => {
-            let (items, c, truncated) = baseline(token_key, drive_id).await?;
+            let (items, c, truncated) = baseline(app, token_key, drive_id).await?;
             return Ok((items, baseline_cursor(truncated, c), truncated));
         }
         Some(c) => c,
@@ -1115,7 +1223,7 @@ async fn gather_shared_whole(
         match drive::list_shared_changes(token_key, drive_id, &cursor).await {
             Ok(v) => v,
             Err(e) if drive::is_cursor_expired(&e) => {
-                let (items, c, truncated) = baseline(token_key, drive_id).await?;
+                let (items, c, truncated) = baseline(app, token_key, drive_id).await?;
                 return Ok((items, baseline_cursor(truncated, c), truncated));
             }
             Err(e) => return Err(e),
@@ -1215,13 +1323,9 @@ async fn gather_shared_with_me(
             }
         }
         let root_id = root.id.clone();
-        let mut recon: Vec<DriveItem> =
-            index_only::reconcile_enumeration(files, known, !root_truncated, |file_id| {
-                drive::swm_source_id(&root_id, file_id)
-            })
-            .into_iter()
-            .map(drive_reconciled)
-            .collect();
+        let mut recon = drive_baseline_items(files, known, root_truncated, |file_id| {
+            drive::swm_source_id(&root_id, file_id)
+        });
         items.append(&mut recon);
     }
 
@@ -1389,30 +1493,16 @@ impl CloudDriver for DriveDriver {
                         let conn = state.conn()?;
                         drive::get_cursor(&conn, &email)?
                     };
-                    // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset). A
-                    // truncated enumeration returns `None` for the cursor to persist — a partial
-                    // re-list can't be baselined, so the next sync re-enumerates from scratch (F-30).
-                    let full_relist = |token_key: String| async move {
-                        let (files, truncated) = drive::enumerate_drive(&token_key).await?;
-                        let cursor = drive::start_page_token(&token_key, None).await?;
-                        Ok::<_, Error>((files, (!truncated).then_some(cursor), truncated))
-                    };
                     // The 2nd element is the cursor to PERSIST: `None` = withhold, `Some` = advance. The
                     // changes feed advances even when truncated — its page token is a resumable
                     // checkpoint and the feed has no absence-inferred deletes, so it drains a big backlog
-                    // across passes instead of re-fetching the same head forever.
+                    // across passes instead of re-fetching the same head forever. A re-baseline
+                    // ([`baseline_my_drive`]) withholds on truncation instead, and reconciles rather
+                    // than re-adding — the only way a change made while the cursor was dead is seen.
                     let outcome: Result<(Vec<DriveItem>, Option<String>, bool)> = if cursor
                         .is_none()
                     {
-                        full_relist(token_key.clone())
-                            .await
-                            .map(|(files, persist, truncated)| {
-                                (
-                                    files.into_iter().map(DriveItem::Enumerated).collect(),
-                                    persist,
-                                    truncated,
-                                )
-                            })
+                        baseline_my_drive(app, &token_key, &email).await
                     } else {
                         match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await
                         {
@@ -1422,15 +1512,7 @@ impl CloudDriver for DriveDriver {
                                 truncated,
                             )),
                             Err(e) if drive::is_cursor_expired(&e) => {
-                                full_relist(token_key.clone()).await.map(
-                                    |(files, persist, truncated)| {
-                                        (
-                                            files.into_iter().map(DriveItem::Enumerated).collect(),
-                                            persist,
-                                            truncated,
-                                        )
-                                    },
-                                )
+                                baseline_my_drive(app, &token_key, &email).await
                             }
                             Err(e) => Err(e),
                         }
@@ -1541,18 +1623,6 @@ impl CloudDriver for DriveDriver {
         item: &'a DriveItem,
     ) -> Result<Resolved<'a, drive::DriveFile>> {
         Ok(match item {
-            DriveItem::Enumerated(file) => {
-                let sid = drive::source_id_for(email, &file.id);
-                let ev = index_only::ChangeEvent::Add {
-                    source_id: sid.clone(),
-                    modified_at: file.modified_time.clone(),
-                };
-                Resolved::Process {
-                    file: Some(file),
-                    source_id: sid,
-                    event: ev,
-                }
-            }
             DriveItem::Changed(change) => {
                 let sid = drive::source_id_for(email, &change.file_id);
                 let known = {
@@ -1569,7 +1639,7 @@ impl CloudDriver for DriveDriver {
                     None => Resolved::Skip,
                 }
             }
-            // Shared-drive reconcile: the event (Add/Update/Delete) is already built.
+            // A reconciled enumeration: the event (Add/Update/Delete) is already built.
             DriveItem::Reconciled {
                 source_id,
                 event,
@@ -1612,16 +1682,43 @@ impl CloudDriver for DriveDriver {
 
 /// One unit of OneDrive sync work for an account, gathered off the lock in phase 1.
 enum OneDriveItem {
-    /// A whole-drive first-sync / re-baseline file → `Add` (reactivates a previously-missing item).
-    Enumerated(onedrive::DriveItem),
     /// A whole-drive incremental delta entry → mapped via `map_change` in phase 2.
     Delta(onedrive::DriveDelta),
-    /// A folder-scoped reconcile result with its event pre-built (`Add`/`Update`/`Delete`).
+    /// An enumeration reconciled against what is already indexed, with its event pre-built
+    /// (`Add`/`Update`/`Delete`) — a folder-scoped listing or a whole-drive re-baseline
+    /// (see [`onedrive_baseline_items`]).
     Reconciled {
         source_id: String,
         event: index_only::ChangeEvent,
         item: Option<onedrive::DriveItem>,
     },
+}
+
+/// Map a reconcile-plan entry ([`index_only::reconcile_enumeration`]) onto this connector's work item
+/// — the enumerated item rides along so phase 2 can fetch a body on `Add`/`Update`. The OneDrive twin
+/// of [`drive_reconciled`].
+fn onedrive_reconciled(r: index_only::ReconcileItem<onedrive::DriveItem>) -> OneDriveItem {
+    OneDriveItem::Reconciled {
+        source_id: r.source_id,
+        event: r.event,
+        item: r.payload,
+    }
+}
+
+/// Plan one OneDrive enumeration against what is already indexed for the account — the twin of
+/// [`drive_baseline_items`], and for the same reason: the whole-drive re-baseline used to hand-build an
+/// `Add` per enumerated item, and `react(Add, Some(ok))` is a `Noop`, so nothing that happened while
+/// the delta cursor was dead (a deletion OR an edit) was ever noticed.
+fn onedrive_baseline_items(
+    files: Vec<onedrive::DriveItem>,
+    known: std::collections::HashSet<String>,
+    truncated: bool,
+    source_id_of: impl Fn(&str) -> String,
+) -> Vec<OneDriveItem> {
+    index_only::reconcile_enumeration(files, known, !truncated, source_id_of)
+        .into_iter()
+        .map(onedrive_reconciled)
+        .collect()
 }
 
 /// Folder-scoped reconcile for OneDrive: enumerate the selected folders live and diff against the
@@ -1643,18 +1740,42 @@ async fn gather_onedrive_folders(
             .into_iter()
             .collect()
     };
-    // A truncated enumeration (`complete = false`) must not infer deletions (F-30).
-    let work = index_only::reconcile_enumeration(items, known, !truncated, |id| {
+    let work = onedrive_baseline_items(items, known, truncated, |id| {
         onedrive::source_id_for(email, id)
-    })
-    .into_iter()
-    .map(|r| OneDriveItem::Reconciled {
-        source_id: r.source_id,
-        event: r.event,
-        item: r.payload,
-    })
-    .collect();
+    });
     Ok((work, truncated))
+}
+
+/// Re-baseline **the whole drive**: the no-token `/root/delta` returns the full enumeration plus a
+/// fresh delta link in one walk, and the enumeration is reconciled against the account's
+/// currently-healthy items rather than replayed as `Add`s. Reached on a first sync and on a 410
+/// `resyncRequired` — the second runs against a fully-populated known set, so a file deleted (or
+/// edited) while the cursor was dead is only seen by diffing.
+///
+/// The returned link is always persisted, exactly as before: on a clean walk it is the true
+/// `@odata.deltaLink`, and on a truncated one the last `@odata.nextLink`, itself resumable. Note the
+/// consequence, which Drive does not share: a truncated re-baseline reconciles with `complete = false`
+/// (no deletions) and the NEXT pass reads its cursor as an incremental delta, so gap deletions are
+/// caught only when a re-baseline completes in one pass. Conservative under F-30 by design.
+async fn baseline_onedrive(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+) -> Result<(Vec<OneDriveItem>, String, bool)> {
+    let (deltas, link, truncated) = onedrive::list_delta(token_key, None).await?;
+    // A no-token delta carries no tombstones, so the live-file payloads ARE the enumeration.
+    let files: Vec<onedrive::DriveItem> = deltas.into_iter().filter_map(|d| d.file).collect();
+    let known: std::collections::HashSet<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        onedrive::known_source_ids(&conn, email)?
+            .into_iter()
+            .collect()
+    };
+    let items = onedrive_baseline_items(files, known, truncated, |id| {
+        onedrive::source_id_for(email, id)
+    });
+    Ok((items, link, truncated))
 }
 
 /// The OneDrive connector's [`CloudDriver`] (the Microsoft sibling of [`DriveDriver`]). The whole drive
@@ -1711,6 +1832,9 @@ impl CloudDriver for OneDriveDriver {
     fn file_name(file: &onedrive::DriveItem) -> String {
         file.name.clone()
     }
+    fn is_item_gone(err: &Error) -> bool {
+        onedrive::is_item_unfetchable(err)
+    }
 
     async fn gather_account(
         &self,
@@ -1749,7 +1873,8 @@ impl CloudDriver for OneDriveDriver {
                 }
             }
             // Whole drive: the Graph delta cursor. No cursor (or a 410 reset) re-baselines via the
-            // no-token delta (every file → Enumerated/Add); otherwise pull the incremental delta.
+            // no-token delta, reconciled against the known set ([`baseline_onedrive`]); otherwise pull
+            // the incremental delta.
             None => {
                 let cursor = {
                     let state = app.state::<AppState>();
@@ -1757,19 +1882,7 @@ impl CloudDriver for OneDriveDriver {
                     onedrive::get_cursor(&conn, &email)?
                 };
                 let outcome: Result<(Vec<OneDriveItem>, String, bool)> = match &cursor {
-                    None => onedrive::list_delta(&token_key, None).await.map(
-                        |(deltas, link, truncated)| {
-                            (
-                                deltas
-                                    .into_iter()
-                                    .filter_map(|d| d.file)
-                                    .map(OneDriveItem::Enumerated)
-                                    .collect(),
-                                link,
-                                truncated,
-                            )
-                        },
-                    ),
+                    None => baseline_onedrive(app, &token_key, &email).await,
                     Some(link) => match onedrive::list_delta(&token_key, Some(link)).await {
                         Ok((deltas, link, truncated)) => Ok((
                             deltas.into_iter().map(OneDriveItem::Delta).collect(),
@@ -1777,19 +1890,7 @@ impl CloudDriver for OneDriveDriver {
                             truncated,
                         )),
                         Err(e) if onedrive::is_cursor_expired(&e) => {
-                            onedrive::list_delta(&token_key, None).await.map(
-                                |(deltas, link, truncated)| {
-                                    (
-                                        deltas
-                                            .into_iter()
-                                            .filter_map(|d| d.file)
-                                            .map(OneDriveItem::Enumerated)
-                                            .collect(),
-                                        link,
-                                        truncated,
-                                    )
-                                },
-                            )
+                            baseline_onedrive(app, &token_key, &email).await
                         }
                         Err(e) => Err(e),
                     },
@@ -1840,18 +1941,6 @@ impl CloudDriver for OneDriveDriver {
         item: &'a OneDriveItem,
     ) -> Result<Resolved<'a, onedrive::DriveItem>> {
         Ok(match item {
-            OneDriveItem::Enumerated(it) => {
-                let sid = onedrive::source_id_for(email, &it.id);
-                let ev = index_only::ChangeEvent::Add {
-                    source_id: sid.clone(),
-                    modified_at: it.modified_time.clone(),
-                };
-                Resolved::Process {
-                    file: Some(it),
-                    source_id: sid,
-                    event: ev,
-                }
-            }
             OneDriveItem::Delta(delta) => {
                 let sid = onedrive::source_id_for(email, &delta.item_id);
                 let known = {
@@ -1995,8 +2084,8 @@ mod tests {
         for outcome in [
             ItemOutcome::Unmapped,
             ItemOutcome::NoText,
-            ItemOutcome::FetchFailed { item_gone: true },
-            ItemOutcome::FetchFailed { item_gone: false },
+            ItemOutcome::FetchFailed { permanent: true },
+            ItemOutcome::FetchFailed { permanent: false },
             ItemOutcome::Applied(connector_sync::ActionKind::Indexed),
             ItemOutcome::Applied(connector_sync::ActionKind::Updated),
             ItemOutcome::Applied(connector_sync::ActionKind::Removed),
@@ -2016,13 +2105,27 @@ mod tests {
         // The F-29 rule: an account with a failed item finalizes 'error' with its cursor
         // UNADVANCED, so the change retries instead of being stepped over by a misleading 'ok'.
         assert!(item_effect(ItemOutcome::ApplyFailed).fails_account);
-        assert!(item_effect(ItemOutcome::FetchFailed { item_gone: false }).fails_account);
+        assert!(item_effect(ItemOutcome::FetchFailed { permanent: false }).fails_account);
 
-        // …and the M2 exception: one file the owner revoked must not fail the whole account, or a
-        // single withdrawn "Shared with me" grant pins the account in 'error' forever.
-        let gone = item_effect(ItemOutcome::FetchFailed { item_gone: true });
+        // …and the exception the field is named for: a failure that will recur identically forever
+        // must not fail the account, or ONE such file pins it in 'error' with its cursor frozen —
+        // M2's revoked "Shared with me" grant, and now any body PM can never index.
+        let gone = item_effect(ItemOutcome::FetchFailed { permanent: true });
         assert!(!gone.fails_account);
         assert_eq!((gone.skipped, gone.failed), (1, 0));
+
+        // The engine composes the flag from the driver's per-item classifier OR the shared
+        // unindexable one, so pin that a hit on EITHER reaches the non-failing arm. A revert of
+        // either half is then a red test rather than a silently re-pinned account.
+        for e in [
+            Error::Other("Microsoft Graph request failed (404 Not Found): itemNotFound".into()),
+            Error::Other("sidecar convert failed: UnsupportedFormatException".into()),
+        ] {
+            let permanent =
+                <OneDriveDriver as CloudDriver>::is_item_gone(&e) || is_permanently_unindexable(&e);
+            assert!(permanent, "{e}");
+            assert!(!item_effect(ItemOutcome::FetchFailed { permanent }).fails_account);
+        }
 
         // Nothing else ever does.
         for benign in [
@@ -2045,8 +2148,8 @@ mod tests {
             !item_effect(ItemOutcome::Applied(connector_sync::ActionKind::Indexed)).records_issue
         );
         assert!(item_effect(ItemOutcome::NoText).records_issue);
-        assert!(item_effect(ItemOutcome::FetchFailed { item_gone: true }).records_issue);
-        assert!(item_effect(ItemOutcome::FetchFailed { item_gone: false }).records_issue);
+        assert!(item_effect(ItemOutcome::FetchFailed { permanent: true }).records_issue);
+        assert!(item_effect(ItemOutcome::FetchFailed { permanent: false }).records_issue);
         assert!(item_effect(ItemOutcome::ApplyFailed).records_issue);
     }
 
@@ -2086,7 +2189,7 @@ mod tests {
             ItemOutcome::Applied(connector_sync::ActionKind::Removed),
             ItemOutcome::Unmapped,
             ItemOutcome::NoText,
-            ItemOutcome::FetchFailed { item_gone: true },
+            ItemOutcome::FetchFailed { permanent: true },
             ItemOutcome::ApplyFailed,
         ] {
             counts.add(item_effect(outcome));
@@ -2192,5 +2295,250 @@ mod tests {
             run.issues_truncated,
             "a clean later pass cannot un-truncate an earlier one"
         );
+    }
+
+    // ---- whole-corpus re-baselines --------------------------------------------------------------
+    //
+    // A re-baseline runs precisely when the delta cursor was dead for a while (a 410, a first sync, a
+    // folder-scoped→whole-drive round trip that pruned the cursor), so the diff against what is
+    // already indexed is the ONLY evidence of what happened in that gap. These pin the mappers both
+    // whole-drive paths now go through; the pure planner they wrap is pinned in `index_only.rs`.
+
+    const EMAIL: &str = "a@b.com";
+
+    /// An enumerated Drive file. Only `id` and the hash carry meaning for a reconcile — the rest are
+    /// the harmless shape `parse_files` yields for a plain uploaded binary.
+    fn drive_file(id: &str, md5: &str, modified: &str) -> drive::DriveFile {
+        drive::DriveFile {
+            id: id.into(),
+            name: format!("{id}.pdf"),
+            mime_type: "application/pdf".into(),
+            modified_time: Some(modified.into()),
+            md5: Some(md5.into()),
+            trashed: false,
+            web_view_link: None,
+            parent_id: None,
+            shared_with_me: false,
+            shared_with_me_time: None,
+            shared_by: None,
+            owned_by_me: true,
+            shortcut_target_id: None,
+            shortcut_target_mime: None,
+            shortcut_target_resource_key: None,
+            can_download: None,
+            resource_key: None,
+        }
+    }
+
+    /// The OneDrive twin of [`drive_file`].
+    fn onedrive_item(id: &str, hash: &str) -> onedrive::DriveItem {
+        onedrive::DriveItem {
+            id: id.into(),
+            name: format!("{id}.pdf"),
+            mime_type: "application/pdf".into(),
+            modified_time: Some("2026-07-01T00:00:00Z".into()),
+            quick_xor_hash: Some(hash.into()),
+            sha256_hash: None,
+            size: Some(10),
+            is_folder: false,
+            is_file: true,
+            web_url: None,
+            parent_id: None,
+            parent_name: None,
+        }
+    }
+
+    /// Every `Delete` the plan emits, by source id — the assertion that actually matters, since a
+    /// deletion is the one outcome a hand-built `Add` could never produce.
+    fn deleted_ids(items: &[DriveItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                DriveItem::Reconciled {
+                    source_id,
+                    event: index_only::ChangeEvent::Delete { .. },
+                    file: None,
+                } => Some(source_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_completed_rebaseline_soft_deletes_a_file_that_vanished_in_the_gap() {
+        // f2 was deleted upstream while the cursor was dead. The old path mapped the enumeration to
+        // `Add`s, and `react(Add, Some(ok))` is a Noop — so f2 stayed `source_state = 'ok'` forever,
+        // retrieval kept citing it, and a later body fetch just 404'd (I-09.2).
+        let known = std::collections::HashSet::from([
+            drive::source_id_for(EMAIL, "f1"),
+            drive::source_id_for(EMAIL, "f2"),
+        ]);
+        let items = drive_baseline_items(
+            vec![drive_file("f1", "h1", "2026-07-01T00:00:00Z")],
+            known,
+            false,
+            |id| drive::source_id_for(EMAIL, id),
+        );
+        assert_eq!(deleted_ids(&items), vec!["gdrive:a@b.com:f2"]);
+    }
+
+    #[test]
+    fn a_truncated_rebaseline_deletes_nothing() {
+        // Same inputs, but the listing admits it didn't see everything — absence then proves nothing,
+        // so the whole deletion pass is withheld while the files we DID reach still reconcile (F-30).
+        let known = std::collections::HashSet::from([
+            drive::source_id_for(EMAIL, "f1"),
+            drive::source_id_for(EMAIL, "f2"),
+        ]);
+        let items = drive_baseline_items(
+            vec![drive_file("f1", "h1", "2026-07-01T00:00:00Z")],
+            known,
+            true,
+            |id| drive::source_id_for(EMAIL, id),
+        );
+        assert!(
+            deleted_ids(&items).is_empty(),
+            "a partial listing must never infer a deletion"
+        );
+        assert_eq!(items.len(), 1, "the file it did reach still gets an event");
+    }
+
+    #[test]
+    fn a_fresh_accounts_first_baseline_is_all_adds() {
+        // The unchanged half: with nothing indexed yet every enumerated file is a new ingest, so the
+        // first sync of a new account behaves exactly as it did before reconciling.
+        let files = vec![
+            drive_file("f1", "h1", "2026-07-01T00:00:00Z"),
+            drive_file("f2", "h2", "2026-07-01T00:00:00Z"),
+        ];
+        let items = drive_baseline_items(files, std::collections::HashSet::new(), false, |id| {
+            drive::source_id_for(EMAIL, id)
+        });
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| matches!(
+            i,
+            DriveItem::Reconciled {
+                event: index_only::ChangeEvent::Add { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_rebaseline_reembeds_a_file_edited_during_the_gap() {
+        // The second silent loss: an EDIT during the gap. An `Add` carries no content hash, so the
+        // reducer had nothing to compare and no-op'd. Reconciling emits an `Update`, and the chain
+        // through `react` is what proves it actually reaches a re-embed rather than another no-op.
+        let sid = drive::source_id_for(EMAIL, "f1");
+        let items = drive_baseline_items(
+            vec![drive_file("f1", "h2", "2026-07-20T00:00:00Z")],
+            std::collections::HashSet::from([sid.clone()]),
+            false,
+            |id| drive::source_id_for(EMAIL, id),
+        );
+        assert_eq!(items.len(), 1);
+        let event = match items.into_iter().next() {
+            Some(DriveItem::Reconciled { event, .. }) => event,
+            _ => panic!("a present, known file must reconcile"),
+        };
+        assert_eq!(
+            event,
+            index_only::ChangeEvent::Update {
+                source_id: sid.clone(),
+                modified_at: Some("2026-07-20T00:00:00Z".into()),
+                new_content_hash: Some("h2".into()),
+            }
+        );
+        let stored = index_only::ItemState {
+            source_id: sid.clone(),
+            source_modified_at: Some("2026-06-01T00:00:00Z".into()),
+            source_content_hash: Some("h1".into()),
+            source_state: index_only::SourceState::Ok,
+            summary_indexed: false,
+        };
+        assert_eq!(
+            index_only::react(event, Some(&stored)),
+            vec![index_only::Action::ReEmbed {
+                source_id: sid,
+                new_content_hash: "h2".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn onedrive_rebaseline_soft_deletes_a_known_absent_item() {
+        // The OneDrive twin: a no-token `/root/delta` re-baseline is an enumeration too, so an item
+        // that disappeared while the delta link was dead must be soft-flagged, not silently kept.
+        let known = std::collections::HashSet::from([
+            onedrive::source_id_for(EMAIL, "01F"),
+            onedrive::source_id_for(EMAIL, "01G"),
+        ]);
+        let items = onedrive_baseline_items(vec![onedrive_item("01F", "h1")], known, false, |id| {
+            onedrive::source_id_for(EMAIL, id)
+        });
+        let deletes: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                OneDriveItem::Reconciled {
+                    source_id,
+                    event: index_only::ChangeEvent::Delete { .. },
+                    item: None,
+                } => Some(source_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deletes, vec!["onedrive:a@b.com:01G"]);
+    }
+
+    // ---- a permanently-failing item must never pin the account ----------------------------------
+
+    #[test]
+    fn onedrive_skips_a_permanently_unfetchable_item_instead_of_pinning_the_account() {
+        // Before this, OneDrive took the trait's `false` default: ANY body-fetch error failed the
+        // account, so `finalize_or_flag` never wrote the delta link and every later pass replayed the
+        // same window onto the same poison item. A whole-drive account has no `exclude` lever, so the
+        // only offered remedy — "Press Sync now to retry" — could not work, ever.
+        let gone =
+            Error::Other("Microsoft Graph request failed (404 Not Found): itemNotFound".into());
+        assert!(<OneDriveDriver as CloudDriver>::is_item_gone(&gone));
+        assert!(!item_effect(ItemOutcome::FetchFailed { permanent: true }).fails_account);
+
+        // …and the transient half is untouched: a 503 must still fail the account, or the cursor
+        // steps past a change PM never applied — the silent gap F-29 exists to prevent.
+        let flaky =
+            Error::Other("Microsoft Graph request failed (503 Service Unavailable): ".into());
+        assert!(!<OneDriveDriver as CloudDriver>::is_item_gone(&flaky));
+        assert!(!is_permanently_unindexable(&flaky));
+        assert!(item_effect(ItemOutcome::FetchFailed { permanent: false }).fails_account);
+    }
+
+    #[test]
+    fn an_unconvertible_body_is_a_skip_but_a_broken_engine_is_a_failure() {
+        // The provider-independent half (it fixes Drive as well as OneDrive): the engine ANSWERED and
+        // refused this file, or the file is over a cap. Retrying either forever is what pins the
+        // account, so they are skips.
+        for terminal in [
+            "sidecar convert failed: UnsupportedFormatException",
+            "That OneDrive file is too large to index.",
+            "sidecar convert failed: file is too large to process (60 MiB; the limit is 40 MiB)",
+        ] {
+            assert!(
+                is_permanently_unindexable(&Error::Other(terminal.into())),
+                "{terminal}"
+            );
+        }
+        // The negatives are the whole reason this is a predicate and not a `contains("sidecar")`. An
+        // engine that is broken or absent will convert this file fine once fixed, and the antivirus
+        // lock arrives wearing the very prefix above — skipping either drops an indexable document.
+        for retryable in [
+            "sidecar convert IO error: broken pipe",
+            "document engine is not installed yet — run setup first",
+            "sidecar convert failed: PermissionError: [Errno 13] Permission denied",
+        ] {
+            assert!(
+                !is_permanently_unindexable(&Error::Other(retryable.into())),
+                "{retryable}"
+            );
+        }
     }
 }

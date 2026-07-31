@@ -12,9 +12,9 @@
 //!     (embedder / dim / node-cap / document-set / t-SNE-availability). The cache spares re-reading
 //!     and averaging every leaf-chunk vector on each Map open.
 //!   - [`precompute_semantic_layout`] recomputes when stale. It is single-flight, kicked off at idle
-//!     priority after unlock ([`start_semantic_layout`]), and **defers to an active Drive sync** so it
-//!     never contends with ingest. Opening the Map calls [`prioritise_semantic_layout`], which jumps
-//!     that queue. Progress rides a global `layout://progress` event, like the Drive sync.
+//!     priority after unlock ([`start_semantic_layout`]), and **defers to any active connector sync**
+//!     so it never contends with ingest. Opening the Map calls [`prioritise_semantic_layout`], which
+//!     jumps that queue. Progress rides a global `layout://progress` event, like the Drive sync.
 //!   - The reducer is **PCA by default** (numpy-only, in the sidecar) and **t-SNE when the optional
 //!     component is installed** ([`install_optional_tsne`]). The reducer never holds the DB lock.
 
@@ -64,7 +64,7 @@ pub enum LayoutProgressEvent {
         count: usize,
         method: String,
     },
-    /// Stepped aside for an active Drive sync (idle priority); will run when the Map is opened.
+    /// Stepped aside for an active connector sync (idle priority); will run when the Map is opened.
     Deferred,
     /// A fresh layout has been cached.
     Done {
@@ -320,12 +320,12 @@ fn read_tsne_enabled(conn: &Connection) -> bool {
 // ---- precompute -----------------------------------------------------------
 
 /// Recompute the semantic layout if stale. Single-flight (folds a concurrent request into the running
-/// one). `force_recompute` ignores the freshness check; `ignore_drive` runs even while a Drive sync is
-/// in flight (the Map-open path) rather than deferring to it (the idle launch path).
+/// one). `force_recompute` ignores the freshness check; `ignore_sync` runs even while a connector sync
+/// is in flight (the Map-open path) rather than deferring to it (the idle launch path).
 pub async fn precompute_semantic_layout(
     app: &AppHandle,
     force_recompute: bool,
-    ignore_drive: bool,
+    ignore_sync: bool,
 ) -> Result<()> {
     // Claim the single-flight slot.
     {
@@ -341,7 +341,7 @@ pub async fn precompute_semantic_layout(
         job.error = None;
     }
 
-    let outcome = run_precompute(app, force_recompute, ignore_drive).await;
+    let outcome = run_precompute(app, force_recompute, ignore_sync).await;
 
     with_job(app, |job| {
         job.running = false;
@@ -360,7 +360,7 @@ pub async fn precompute_semantic_layout(
     outcome
 }
 
-async fn run_precompute(app: &AppHandle, force_recompute: bool, ignore_drive: bool) -> Result<()> {
+async fn run_precompute(app: &AppHandle, force_recompute: bool, ignore_sync: bool) -> Result<()> {
     let tsne_available = app.state::<AppState>().sidecar.optional_tsne_ready();
 
     // 1) Cheap freshness check under a short lock — no vector blobs read.
@@ -394,18 +394,13 @@ async fn run_precompute(app: &AppHandle, force_recompute: bool, ignore_drive: bo
         return Ok(());
     }
 
-    // 2) Idle priority: step aside for an active Drive sync unless the user opened the Map.
-    if !ignore_drive {
-        let drive_running = app
-            .state::<AppState>()
-            .drive_sync
-            .lock()
-            .map(|s| s.running)
-            .unwrap_or(false);
-        if drive_running {
-            emit(app, LayoutProgressEvent::Deferred);
-            return Ok(());
-        }
+    // 2) Idle priority: step aside for an active connector sync unless the user opened the Map. The
+    //    read goes through `sync_active` so the Map defers to the same slot register every other
+    //    background job does — the gate hand-rolled here read only the Drive slot, so a OneDrive or
+    //    local-folder sync never held the precompute back (audit B1-7).
+    if !ignore_sync && app.state::<AppState>().sync_active() {
+        emit(app, LayoutProgressEvent::Deferred);
+        return Ok(());
     }
 
     emit(app, LayoutProgressEvent::Preparing);
@@ -530,18 +525,18 @@ pub fn semantic_layout(state: State<'_, AppState>) -> Result<SemanticLayout> {
 }
 
 /// Kick off the background layout precompute after unlock — detached, idle priority, defers to a
-/// running Drive sync. Mirrors `resume_drive_sync`'s fire-and-forget shape.
+/// running connector sync. Mirrors `resume_drive_sync`'s fire-and-forget shape.
 #[tauri::command]
 pub fn start_semantic_layout(app: AppHandle) -> Result<bool> {
     tauri::async_runtime::spawn(async move {
-        // Idle priority: defer to an active Drive sync (ignore_drive = false).
+        // Idle priority: defer to any active connector sync (ignore_sync = false).
         let _ = precompute_semantic_layout(&app, false, false).await;
     });
     Ok(true)
 }
 
-/// The Map calls this when opened in semantic mode: recompute if stale, jumping ahead of a Drive sync
-/// (the user is looking at the Map now). A no-op when the cache is already fresh.
+/// The Map calls this when opened in semantic mode: recompute if stale, jumping ahead of a connector
+/// sync (the user is looking at the Map now). A no-op when the cache is already fresh.
 #[tauri::command]
 pub async fn prioritise_semantic_layout(app: AppHandle) -> Result<()> {
     precompute_semantic_layout(&app, false, true).await

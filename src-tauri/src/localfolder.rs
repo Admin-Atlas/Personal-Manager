@@ -207,12 +207,32 @@ pub fn should_index(path: &Path, size: u64, hidden: bool) -> bool {
     !hidden && size <= MAX_FILE_BYTES && ingest::is_supported_source(path)
 }
 
+/// Whether a failed directory read leaves files PM never enumerated — in which case the walk is
+/// INCOMPLETE and the caller must not infer deletions from absence (INVARIANTS I-09.3).
+///
+/// Fail-closed by construction: only a `NotFound` BELOW the root is a provable absence (the directory
+/// was deleted between the `is_dir` check and the open — a real delete the sweep should act on).
+/// Everything else counts as unseen. The test is inverted deliberately: an allow-list of "unreadable"
+/// kinds would miss the ones that matter most, because Windows maps a dropped share
+/// (ERROR_BAD_NETPATH, ERROR_NETNAME_DELETED) to an uncategorised kind, not `PermissionDenied`.
+///
+/// At the ROOT (`depth == 0`) even `NotFound` counts: a tracked folder that vanished mid-walk is
+/// [`run_local_sync`]'s `missing` branch (one `SourceFailure` → state `unreachable`) and must never
+/// arrive as a mass deletion of every item under it.
+pub(crate) fn read_failure_hides_files(kind: std::io::ErrorKind, depth: usize) -> bool {
+    depth == 0 || kind != std::io::ErrorKind::NotFound
+}
+
 /// Recursively collect the indexable files under `root`, keyed by OS file id. Skips ignored/hidden
 /// directories, any `exclude`d subfolder (and its whole subtree), unsupported extensions, over-cap
 /// files, and (below the top level) directory symlinks — the same cycle/scope guards the drag-drop
 /// walk uses. `root` itself must be a directory. `exclude` holds root-relative subfolder paths.
-/// Returns the collected files and whether the walk was TRUNCATED at `MAX_COLLECTED_FILES` — an
-/// incomplete enumeration, on which the caller must NOT infer deletions from a file's absence.
+/// Returns the collected files and whether the walk did NOT provably see everything: it hit the
+/// `MAX_COLLECTED_FILES` cap, or a directory/entry it could not read (see
+/// [`read_failure_hides_files`]). Either way the enumeration is incomplete and the caller must NOT
+/// infer deletions from a file's absence. A deliberate prune (an ignored dir, an exclude, the depth
+/// cap) is NOT incompleteness — the watcher applies the same gates, so nothing beneath is ever
+/// indexed and there is nothing to soft-delete.
 pub fn walk(root: &Path, exclude: &[String]) -> (Vec<LocalFile>, bool) {
     let key = folder_key(root);
     let mut out = Vec::new();
@@ -239,14 +259,20 @@ fn walk_into(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     // Below the top level, don't follow directory symlinks (cycle / escape guard); a symlinked file
-    // still indexes, and the root the user explicitly picked is always honoured.
-    if depth > 0 {
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() && !path.is_file() {
+    // still indexes, and the root the user explicitly picked is always honoured. The stat result is
+    // kept rather than discarded: a FAILED stat is the only evidence we have that a listed entry
+    // exists but could not be seen (the non-dir/non-file arm below).
+    let link_meta = if depth > 0 {
+        let meta = std::fs::symlink_metadata(path);
+        if let Ok(m) = &meta {
+            if m.file_type().is_symlink() && !path.is_file() {
                 return;
             }
         }
-    }
+        Some(meta)
+    } else {
+        None
+    };
     if path.is_dir() {
         if depth > 0 && is_ignored_dir(&name) {
             return;
@@ -264,18 +290,46 @@ fn walk_into(
         if depth >= MAX_WALK_DEPTH {
             return;
         }
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                walk_into(root, &entry.path(), key, exclude, out, depth + 1, truncated);
-                if out.len() >= MAX_COLLECTED_FILES {
+        match std::fs::read_dir(path) {
+            Ok(entries) => {
+                for entry in entries {
+                    // A dir entry we could not read is a file we never enumerated — fail closed, the
+                    // rule the vault walk applies.
+                    let Ok(entry) = entry else {
+                        *truncated = true;
+                        continue;
+                    };
+                    walk_into(root, &entry.path(), key, exclude, out, depth + 1, truncated);
+                    if out.len() >= MAX_COLLECTED_FILES {
+                        *truncated = true;
+                        break;
+                    }
+                }
+            }
+            // A directory PM cannot OPEN is not an empty directory: everything beneath it would look
+            // absent and the caller would soft-delete the subtree. The trade this accepts is that a
+            // PERMANENTLY unreadable subtree (a system junction, a placeholder folder that denies
+            // enumeration) permanently withholds this folder's absence-inferred deletion sweep — I-09.3
+            // mandates it, and the live watcher still reconciles real single-file deletes, so the sweep
+            // is a backstop rather than the only path. Don't "fix" this back.
+            Err(e) => {
+                if read_failure_hides_files(e.kind(), depth) {
                     *truncated = true;
-                    break;
                 }
             }
         }
         return;
     }
     if !path.is_file() {
+        // `read_dir` listed this entry, so something IS here. If we could not stat it (a dropped
+        // share, a locked file) it is neither a dir nor a file to us — an item we could not SEE, so
+        // the same fail-closed rule applies. A broken symlink still stats fine via `symlink_metadata`
+        // and so raises no false incompleteness.
+        if let Some(Err(e)) = &link_meta {
+            if read_failure_hides_files(e.kind(), depth) {
+                *truncated = true;
+            }
+        }
         return;
     }
     let hidden = name.starts_with('.');
@@ -436,6 +490,45 @@ pub fn folder_of(path: &Path, roots: &[LocalRoot]) -> Option<LocalRoot> {
         .filter(|r| path.starts_with(&r.root))
         .max_by_key(|r| r.root.components().count())
         .cloned()
+}
+
+/// Whether a stored `external_ref` (an item's absolute path) lies under `dir`. Component-wise, so
+/// `<root>/notes-old/x.md` is NOT under `<root>/notes` — the Rust confirmation of the SQL prefix
+/// [`items_under_dir`] uses.
+pub fn ref_under_dir(external_ref: &str, dir: &Path) -> bool {
+    Path::new(external_ref).starts_with(dir)
+}
+
+/// Where a stored ref lands when an ancestor directory is renamed `from` → `to`. The file's OS id is
+/// untouched by a directory rename, so this is a pure repoint (same item, new path), not a delete +
+/// add. `None` when the ref isn't under `from` at all.
+pub fn repoint_ref(external_ref: &str, from: &Path, to: &Path) -> Option<PathBuf> {
+    Path::new(external_ref)
+        .strip_prefix(from)
+        .ok()
+        .map(|rest| to.join(rest))
+}
+
+/// A directory fan-out target, which must be STRICTLY BELOW a tracked root. The root itself is never
+/// fanned out: an unmounted/removed root is the manager's `gone_absent` → `unreachable` path (see
+/// [`diff_watch_set`] and `run_local_sync`'s missing branch), and per-item `source_missing` there would
+/// be exactly the mass deletion that branch exists to prevent.
+pub fn fanout_dir<'a>(dir: &'a Path, root: &Path) -> Option<&'a Path> {
+    (dir.starts_with(root) && dir != root).then_some(dir)
+}
+
+/// The walk's DIRECTORY gates for a root-relative file path: within the depth cap, no ignored
+/// ancestor, not inside an excluded subtree. Extracted from [`upsert_local_path`] (which now calls it)
+/// so the watcher's directory endpoints apply exactly the gates [`walk_into`] applies — that
+/// equivalence is the only thing preventing an `ok`↔`source_missing` thrash between the two paths.
+pub fn walk_admits_file(rel: &Path, exclude: &[String]) -> bool {
+    let comps: Vec<_> = rel.components().collect();
+    let dir_count = comps.len().saturating_sub(1); // components minus the file name
+    comps.len() <= MAX_WALK_DEPTH
+        && !comps.iter().take(dir_count).any(|c| {
+            matches!(c, std::path::Component::Normal(os) if is_ignored_dir(&os.to_string_lossy()))
+        })
+        && !is_excluded(rel, exclude)
 }
 
 /// One tracked folder as the watcher's set-management sees it: its key, root, and whether the root is
@@ -786,6 +879,58 @@ pub fn source_id_for_ref(
     .map_err(Into::into)
 }
 
+/// Every indexed item whose stored path lies under `dir`, for the watcher's directory endpoints (a
+/// renamed or deleted subfolder, which no single `external_ref` can match). Returns
+/// `(source_id, external_ref, persisted state)` per row.
+///
+/// The prefix compare is `substr(external_ref, 1, n) = ?`, NOT `LIKE`: real paths contain `%` and `_`,
+/// which a `LIKE` pattern would read as wildcards and match a sibling folder with them. The prefix
+/// carries a trailing separator so `<root>/notes` can't claim `<root>/notesX`, and every row is
+/// confirmed component-wise with [`ref_under_dir`] before it is acted on. Scoped to the folder's id
+/// prefix so two tracked folders can't cross-match.
+pub fn items_under_dir(
+    conn: &Connection,
+    key: &str,
+    dir: &Path,
+) -> Result<Vec<(String, String, KnownItem)>> {
+    let id = folder_source_id(key);
+    let prefix = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
+    // SQLite's `substr` counts CHARACTERS on a TEXT value, so the bound length must too.
+    let prefix_len = prefix.chars().count() as i64;
+    let mut stmt = conn.prepare(
+        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state, \
+                content_hash, stored_summary \
+         FROM documents \
+         WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%' \
+           AND substr(external_ref, 1, ?3) = ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![id, prefix, prefix_len], |r| {
+            let sid: String = r.get(0)?;
+            let external_ref: String = r.get(1)?;
+            let content_hash: String = r.get(5)?;
+            let stored_summary: Option<String> = r.get(6)?;
+            let summary_indexed =
+                index_only::summary_indexed_flag(&sid, &content_hash, stored_summary.as_deref());
+            Ok((
+                sid,
+                external_ref.clone(),
+                KnownItem {
+                    external_ref: Some(external_ref),
+                    modified_at: r.get::<_, Option<String>>(2)?,
+                    content_hash: r.get::<_, Option<String>>(3)?,
+                    source_state: r.get::<_, String>(4)?,
+                    summary_indexed,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, external_ref, _)| ref_under_dir(external_ref, dir))
+        .collect())
+}
+
 /// Every tracked folder as a lean [`WatchTarget`] (key, root, present) for the live watcher's set
 /// management — no per-folder document count, unlike [`list_folders`], since the watcher polls this.
 pub fn watch_targets(conn: &Connection) -> Result<Vec<WatchTarget>> {
@@ -1096,7 +1241,8 @@ struct FolderWork {
     files: Vec<LocalFile>,
     known: std::collections::HashMap<String, KnownItem>,
     missing: bool,
-    /// The walk hit `MAX_COLLECTED_FILES` — an incomplete enumeration; don't infer deletions from it.
+    /// The walk did not provably see everything — it hit `MAX_COLLECTED_FILES`, or a directory/entry
+    /// it could not read. An incomplete enumeration; don't infer deletions from it.
     truncated: bool,
 }
 
@@ -1234,16 +1380,21 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
         // Per-folder failure gate (mirrors the cloud connectors, F-29): any failed item flags this
         // folder 'error' at finalize instead of a misleading 'ok', so the item retries next sync.
         let mut folder_failed = false;
-        // A truncated walk (hit the file cap) is an INCOMPLETE enumeration: surface it and, below, skip
-        // inferring deletions from absence so past-cap files aren't soft-deleted every sync.
+        // A truncated walk (the file cap, or a directory/entry it could not read) is an INCOMPLETE
+        // enumeration: surface it and, below, skip inferring deletions from absence so unseen files
+        // aren't soft-deleted every sync. The note stays cause-agnostic because the user's next step is
+        // the same for all of them: wait a sync. Pushed directly, NOT through the capped
+        // `record_local_issue`: there's at most one of these per folder and it's the only report-side
+        // signal that a deletion sweep was withheld, so it must never be starved by a full per-file
+        // issues list (the cloud engine pushes its twin the same way).
         if w.truncated {
-            record_local_issue(
-                &mut issues,
-                &mut issues_truncated,
-                &w.root.to_string_lossy(),
-                "This folder has more files than one sync can list at once; nothing was removed, and \
-                 the rest is picked up on the next sync.",
-            );
+            issues.push(LocalSyncIssue {
+                name: w.root.to_string_lossy().to_string(),
+                reason: "Some of this folder couldn't be listed this sync (too many files, or a \
+                         subfolder PM couldn't read). Nothing was removed — PM tries again on the \
+                         next sync."
+                    .to_string(),
+            });
         }
 
         let present: std::collections::HashSet<String> =
@@ -1301,7 +1452,8 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
         }
 
         // Deletions: known items no longer present → soft `source_missing` (kept findable). SKIPPED when
-        // the walk was truncated — an incomplete enumeration must not read a past-cap file as deleted.
+        // the walk was truncated — an incomplete enumeration must not read a file it never saw as
+        // deleted, whether it sat past the cap or inside a subfolder that wouldn't open.
         if !w.truncated {
             for (source_id, item) in &w.known {
                 if present.contains(source_id) {
@@ -1854,11 +2006,29 @@ async fn process_local_watch_batch(app: &AppHandle, res: DebounceEventResult) {
 /// changed. A rename repoints by the stable OS id: upsert `to` (keeps the item when the id survived,
 /// or ingests a fresh one when the file was only path-keyed), then a remove of `from` that no-ops on
 /// the survived-id case and soft-deletes the orphan otherwise.
+///
+/// Both endpoints of a rename/removal can be a DIRECTORY, and no single item's `external_ref` (always
+/// a file's absolute path) can ever match one — so those two arms fan out over the stored refs beneath
+/// the directory ([`rename_local_dir`] / [`remove_local_dir`]). `Upsert` deliberately does NOT: notify's
+/// Windows backend reports directory LAST_WRITE constantly, and a scoped fan-out per event would be a
+/// hot-path regression. A folder moved *into* a tracked root therefore still waits for the periodic
+/// walk (a copy emits per-file creates, so only same-filesystem moves are affected).
 async fn handle_fs_change(app: &AppHandle, change: FsChange, roots: &[LocalRoot]) -> Result<bool> {
     match change {
         FsChange::Upsert(path) => upsert_local_path(app, &path, roots).await,
-        FsChange::Removed(path) => remove_local_path(app, &path, roots).await,
+        FsChange::Removed(path) => {
+            // Try the exact ref first (cheap, and the overwhelmingly common case). A gone path can't be
+            // stat'd, so a directory is only recognisable as a prefix of the refs we stored.
+            if remove_local_path(app, &path, roots).await? {
+                Ok(true)
+            } else {
+                remove_local_dir(app, &path, roots).await
+            }
+        }
         FsChange::Renamed { from, to } => {
+            if to.is_dir() {
+                return rename_local_dir(app, &from, &to, roots).await;
+            }
             let upserted = upsert_local_path(app, &to, roots).await?;
             let removed = remove_local_path(app, &from, roots).await?;
             Ok(upserted || removed)
@@ -1896,14 +2066,7 @@ async fn upsert_local_path(
     // or below the depth cap — or the next walk (which does skip it) soft-deletes it → ok↔source_missing
     // thrash.
     if let Ok(rel) = path.strip_prefix(&root) {
-        let comps: Vec<_> = rel.components().collect();
-        let dir_count = comps.len().saturating_sub(1); // components minus the file name
-        if comps.len() > MAX_WALK_DEPTH
-            || comps.iter().take(dir_count).any(|c| {
-                matches!(c, std::path::Component::Normal(os) if is_ignored_dir(&os.to_string_lossy()))
-            })
-            || is_excluded(rel, &exclude)
-        {
+        if !walk_admits_file(rel, &exclude) {
             return Ok(false);
         }
     }
@@ -1963,6 +2126,101 @@ async fn remove_local_path(
     reconcile_deleted_item(app, &source_id, &known, &mut manifest_flush).await?;
     manifest_flush.flush()?;
     Ok(true)
+}
+
+/// Reconcile a renamed/moved DIRECTORY: repoint every stored ref beneath it, then soft-delete whatever
+/// didn't make the move. A directory rename leaves each file's OS id untouched, so this is a pure
+/// repoint — the items keep their project, tags and embeddings, exactly as the periodic walk would
+/// resolve them (it just wouldn't run for up to 15 minutes).
+///
+/// A subtree that moved BETWEEN tracked roots, or one whose source wasn't strictly below its root, is
+/// handed to [`remove_local_dir`] instead: re-keying every item into the other folder's
+/// `local:<key>:` namespace is the walk's job, and it does it correctly.
+async fn rename_local_dir(
+    app: &AppHandle,
+    from: &Path,
+    to: &Path,
+    roots: &[LocalRoot],
+) -> Result<bool> {
+    let Some(LocalRoot { key, root, exclude }) = folder_of(to, roots) else {
+        return Ok(false);
+    };
+    let from_key = folder_of(from, roots).map(|f| f.key);
+    if from_key.as_deref() != Some(key.as_str()) || fanout_dir(from, &root).is_none() {
+        return remove_local_dir(app, from, roots).await;
+    }
+    // Collect under a guard that DROPS before any await (the DB mutex is not reentrant, and
+    // `reconcile_present_file` takes its own short locks).
+    let items = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        items_under_dir(&conn, &key, from)?
+    };
+    let mut flusher = connector_sync::ManifestFlusher::new(app);
+    let mut changed = false;
+    for (source_id, external_ref, known) in items {
+        let Some(new_path) = repoint_ref(&external_ref, from, to) else {
+            continue;
+        };
+        if !new_path.is_file() {
+            continue; // gone, not moved — the removal pass below owns it
+        }
+        let Ok(rel) = new_path.strip_prefix(&root) else {
+            continue;
+        };
+        if !walk_admits_file(rel, &exclude) {
+            continue; // renamed into .archive/node_modules/an excluded subtree — the walk skips it too
+        }
+        let file = LocalFile {
+            source_id: source_id_for(&key, &file_identity(&new_path, &root)),
+            abs_path: new_path.clone(),
+            rel_path: rel.to_string_lossy().to_string(),
+            size: std::fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0),
+        };
+        // A volume with no stable file id keys items by PATH, so the move produced a NEW id: hand the
+        // reconcile no prior state and let it ingest a fresh item (the old one is soft-deleted below).
+        let known = (file.source_id == source_id).then_some(known);
+        reconcile_present_file(app, &file, known.as_ref(), &mut flusher).await?;
+        changed = true; // a repoint IS a row change even when the content outcome is NoChange
+    }
+    flusher.flush()?;
+    // Ordering is load-bearing: this re-reads the refs under `from` AFTER the repoint loop, so an item
+    // that moved no longer matches and only genuine leftovers are soft-deleted.
+    let removed = remove_local_dir(app, from, roots).await?;
+    Ok(changed || removed)
+}
+
+/// Reconcile a removed DIRECTORY: soft-delete every indexed item beneath it whose file is really gone.
+/// Deletion is decided per item by a `Path::exists()` check, never by absence from an enumeration, so a
+/// truncated walk can't leak into it.
+///
+/// The tracked ROOT is never fanned out (see [`fanout_dir`]), and neither is anything beneath a root
+/// that has itself gone away: an unmounted or deleted root is the manager's `unreachable` path, and
+/// per-item `source_missing` there would be the mass deletion that path exists to prevent.
+async fn remove_local_dir(app: &AppHandle, dir: &Path, roots: &[LocalRoot]) -> Result<bool> {
+    let Some(LocalRoot { key, root, .. }) = folder_of(dir, roots) else {
+        return Ok(false);
+    };
+    if fanout_dir(dir, &root).is_none() || !root.is_dir() {
+        return Ok(false);
+    }
+    // Same guard discipline as the rename fan-out: collect, drop, then await.
+    let items = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        items_under_dir(&conn, &key, dir)?
+    };
+    let mut flusher = connector_sync::ManifestFlusher::new(app);
+    let mut changed = false;
+    for (source_id, external_ref, known) in items {
+        if Path::new(&external_ref).exists() {
+            continue; // still on disk → this was a rename of an ancestor, not a deletion
+        }
+        reconcile_deleted_item(app, &source_id, &known, &mut flusher).await?;
+        changed = true;
+    }
+    flusher.flush()?;
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -2081,8 +2339,8 @@ mod tests {
         std::fs::create_dir(&git).unwrap();
         std::fs::write(git.join("config.txt"), b"vcs").unwrap(); // ignored dir
 
-        let mut rels: Vec<String> = walk(root, &[])
-            .0
+        let (files, truncated) = walk(root, &[]);
+        let mut rels: Vec<String> = files
             .into_iter()
             .map(|f| f.rel_path.replace('\\', "/"))
             .collect();
@@ -2091,6 +2349,9 @@ mod tests {
             rels,
             vec!["a.md".to_string(), "photo.png".into(), "sub/b.txt".into()]
         );
+        // A healthy walk is COMPLETE: nothing here was unreadable, so the caller may infer deletions
+        // from absence. A flag that fired on a normal tree would suppress every deletion forever.
+        assert!(!truncated, "a healthy walk is complete");
         // Every item is namespaced under this folder's key.
         let key = folder_key(root);
         assert!(walk(root, &[])
@@ -2115,13 +2376,17 @@ mod tests {
         std::fs::write(work.join("plan.md"), b"x").unwrap();
 
         // Excluding "Archive" drops it and its whole subtree, and nothing else.
-        let mut rels: Vec<String> = walk(root, &["Archive".to_string()])
-            .0
+        let (files, truncated) = walk(root, &["Archive".to_string()]);
+        let mut rels: Vec<String> = files
             .into_iter()
             .map(|f| f.rel_path.replace('\\', "/"))
             .collect();
         rels.sort();
         assert_eq!(rels, vec!["Work/plan.md".to_string(), "keep.md".into()]);
+        // A DELIBERATE prune is not incompleteness: the watcher applies the same gate, so nothing under
+        // an exclude is ever indexed and there is nothing to soft-delete. Flagging it would withhold
+        // this folder's deletion sweep for as long as the exclude exists.
+        assert!(!truncated, "a deliberate prune is not incompleteness");
 
         // A nested exclude prunes just that branch; the case/separator style don't matter.
         let mut rels: Vec<String> = walk(root, &["archive/2020".to_string()])
@@ -2138,6 +2403,212 @@ mod tests {
                 "keep.md".into()
             ]
         );
+    }
+
+    #[test]
+    fn unreadable_dir_is_incomplete_but_a_deleted_one_is_not() {
+        use std::io::ErrorKind;
+        // A subtree we were refused is a subtree we never enumerated → the picture is incomplete.
+        assert!(read_failure_hides_files(ErrorKind::PermissionDenied, 1));
+        assert!(
+            read_failure_hides_files(ErrorKind::Other, 1),
+            "Windows reports a dropped share as an uncategorised errno, not PermissionDenied"
+        );
+        // Below the root, a vanished directory is a REAL absence — the sweep must still reap it, or a
+        // deleted folder's items would stay 'ok' forever.
+        assert!(
+            !read_failure_hides_files(ErrorKind::NotFound, 1),
+            "a directory deleted mid-walk is a REAL delete — the sweep must still reap it"
+        );
+        // At the root it is not: a tracked folder that vanished is the missing/unreachable branch.
+        assert!(
+            read_failure_hides_files(ErrorKind::NotFound, 0),
+            "the tracked root vanishing is `missing`/unreachable, never a mass deletion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_flags_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("keep.md"), b"x").unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inside.md"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root ignores the mode bits — skip rather than flake.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let (files, truncated) = walk(root, &[]);
+        // Restore before the tempdir drops, so its recursive cleanup can succeed.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            truncated,
+            "a directory that would not open leaves files unseen — the walk is incomplete"
+        );
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| f.rel_path.replace('\\', "/"))
+            .collect();
+        assert!(
+            rels.contains(&"keep.md".to_string()),
+            "readable files still index"
+        );
+        assert!(
+            !rels.iter().any(|r| r.contains("inside.md")),
+            "nothing under the locked directory was enumerated"
+        );
+    }
+
+    #[test]
+    fn repoint_ref_maps_a_subtree_and_ignores_a_sibling_prefix() {
+        assert_eq!(
+            repoint_ref(
+                "/root/notes/a.md",
+                Path::new("/root/notes"),
+                Path::new("/root/archive")
+            ),
+            Some(PathBuf::from("/root/archive/a.md"))
+        );
+        // Nested refs keep their whole tail.
+        assert_eq!(
+            repoint_ref(
+                "/root/notes/2026/q1/a.md",
+                Path::new("/root/notes"),
+                Path::new("/root/archive")
+            ),
+            Some(PathBuf::from("/root/archive/2026/q1/a.md"))
+        );
+        // A sibling that merely shares a string prefix is NOT under the renamed directory.
+        assert_eq!(
+            repoint_ref(
+                "/root/notes-old/a.md",
+                Path::new("/root/notes"),
+                Path::new("/root/archive")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ref_under_dir_is_component_wise_not_string_prefix() {
+        assert!(ref_under_dir("/root/notes/a.md", Path::new("/root/notes")));
+        assert!(ref_under_dir(
+            "/root/notes/deep/a.md",
+            Path::new("/root/notes")
+        ));
+        // `notesX` starts with `notes` as a STRING but is a different directory.
+        assert!(!ref_under_dir(
+            "/root/notesX/a.md",
+            Path::new("/root/notes")
+        ));
+        assert!(!ref_under_dir("/root/other/a.md", Path::new("/root/notes")));
+    }
+
+    #[test]
+    fn fanout_dir_never_targets_the_tracked_root() {
+        // The one-way guard: an unmounted/removed ROOT must stay the manager's `unreachable` path, never
+        // a per-item `source_missing` fan-out (which would be a mass deletion over the user's files).
+        assert!(fanout_dir(Path::new("/root"), Path::new("/root")).is_none());
+        assert!(fanout_dir(Path::new("/root/sub"), Path::new("/root")).is_some());
+        assert!(fanout_dir(Path::new("/root/sub/deep"), Path::new("/root")).is_some());
+        // A path outside the root isn't this folder's business at all.
+        assert!(fanout_dir(Path::new("/other/sub"), Path::new("/root")).is_none());
+    }
+
+    #[test]
+    fn walk_admits_file_matches_the_walks_directory_gates() {
+        let none: &[String] = &[];
+        assert!(walk_admits_file(Path::new("a/b/c.md"), none));
+        assert!(walk_admits_file(Path::new("c.md"), none));
+        // The walk never descends into these, so the watcher must never index into them either.
+        assert!(!walk_admits_file(Path::new("node_modules/x.md"), none));
+        assert!(!walk_admits_file(Path::new(".git/x.md"), none));
+        assert!(!walk_admits_file(
+            Path::new("a/node_modules/deep/x.md"),
+            none
+        ));
+        // An excluded subtree is pruned at the directory, whatever the depth beneath it.
+        let exclude = &["skipme".to_string()];
+        assert!(!walk_admits_file(Path::new("skipme/deep/x.md"), exclude));
+        assert!(walk_admits_file(Path::new("keepme/deep/x.md"), exclude));
+        // The depth cap counts components: a file exactly at the cap is admitted, one past it is not
+        // (the walk stops descending at `depth >= MAX_WALK_DEPTH`, so its children reach the cap).
+        let at_cap: PathBuf = (0..MAX_WALK_DEPTH).map(|i| format!("d{i}")).collect();
+        assert!(walk_admits_file(&at_cap, none));
+        assert!(!walk_admits_file(&at_cap.join("past.md"), none));
+    }
+
+    #[test]
+    fn items_under_dir_finds_only_the_named_subtree() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                 id INTEGER PRIMARY KEY, source_type TEXT, source_id TEXT, external_ref TEXT,
+                 source_modified_at TEXT, source_content_hash TEXT, source_state TEXT,
+                 content_hash TEXT, stored_summary TEXT
+             );",
+        )
+        .unwrap();
+        let root = PathBuf::from("/vault/docs");
+        let notes = root.join("notes");
+        let add = |sid: &str, path: &Path| {
+            conn.execute(
+                "INSERT INTO documents(source_type,source_id,external_ref,source_modified_at,\
+                     source_content_hash,source_state,content_hash,stored_summary) \
+                 VALUES ('index_only',?1,?2,'t0','h0','ok','h0',NULL)",
+                params![sid, path.to_string_lossy()],
+            )
+            .unwrap();
+        };
+        add("local:k1:f1", &notes.join("a.md"));
+        // A file name full of LIKE metacharacters still comes back — the prefix compare is `substr`.
+        add("local:k1:f2", &notes.join("100%_done.md"));
+        add("local:k1:f3", &notes.join("deep").join("c.md"));
+        add("local:k1:f4", &root.join("notesX").join("b.md")); // sibling prefix, not a child
+        add("local:k2:f5", &notes.join("other.md")); // another tracked folder's namespace
+
+        let mut ids: Vec<String> = items_under_dir(&conn, "k1", &notes)
+            .unwrap()
+            .into_iter()
+            .map(|(sid, _, _)| sid)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "local:k1:f1".to_string(),
+                "local:k1:f2".into(),
+                "local:k1:f3".into()
+            ]
+        );
+
+        // The discriminating case for `substr` vs `LIKE`: the metacharacters in the DIRECTORY name. A
+        // `LIKE '<root>/q_1/%'` pattern would read `_` as "any character" and drag `qX1` in with it.
+        let tricky = root.join("q_1");
+        add("local:k1:f6", &tricky.join("z.md"));
+        add("local:k1:f7", &root.join("qX1").join("z.md"));
+        let ids: Vec<String> = items_under_dir(&conn, "k1", &tricky)
+            .unwrap()
+            .into_iter()
+            .map(|(sid, _, _)| sid)
+            .collect();
+        assert_eq!(ids, vec!["local:k1:f6".to_string()]);
+
+        // The rows carry the persisted state the reconcile needs, not just an id.
+        let (_, external_ref, known) = items_under_dir(&conn, "k1", &tricky)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(external_ref, tricky.join("z.md").to_string_lossy());
+        assert_eq!(known.source_state, "ok");
+        assert_eq!(known.content_hash.as_deref(), Some("h0"));
     }
 
     #[test]

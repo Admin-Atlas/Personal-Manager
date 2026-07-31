@@ -36,6 +36,26 @@ export function isOverlayEvent(ev: CalendarEvent): boolean {
   return isMilestoneEvent(ev) || isPinboardEvent(ev);
 }
 
+// --- occurrence identity ---------------------------------------------------------------------------
+
+/** The dedup key for ONE occurrence: the iCal UID *and* the instant. `null` when the event carries no
+ *  UID — an uncorrelatable event (every PM overlay pseudo-event included) is never deduped.
+ *
+ *  The UID alone names the SERIES: every expanded occurrence of a recurring event shares it, so keying
+ *  on the UID collapsed a weekly meeting to a single row across the whole ~14-month mirror. Naming one
+ *  occurrence needs the instant too (INVARIANTS I-04). The case the dedup was written for — one
+ *  physical event mirrored on two calendars — shares the start as well (every producer normalises it
+ *  to `…Z` or `YYYY-MM-DD`), so it still collapses.
+ *
+ *  Shared by CalendarView and FocusUpcoming so the two grids cannot drift apart. The UID-only
+ *  collapses on the backend's assistant paths (flag detection, the briefing, milestone dates) are
+ *  deliberate and unrelated: those want one row per series, not per occurrence. */
+export function occurrenceKey(ev: CalendarEvent): string | null {
+  // NUL separator: a UID is opaque provider text, so a printable joiner could let one event's
+  // key spell another's.
+  return ev.uid ? `${ev.uid}\u0000${ev.start}` : null;
+}
+
 // --- local-day helpers ---------------------------------------------------------------------------
 
 /** Parse a mirror date string to a LOCAL `Date`. An all-day value is a civil date ("YYYY-MM-DD")

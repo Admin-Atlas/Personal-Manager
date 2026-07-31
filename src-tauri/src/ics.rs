@@ -26,16 +26,59 @@ use crate::calendar::{Attendee, CalendarEvent};
 const MAX_VEVENTS: usize = 50_000;
 const MAX_EVENTS: usize = 100_000;
 
-/// The window-pure core (so recurrence expansion is unit-testable without `now`).
-pub fn parse_feed_within(
+/// The window-pure core keeping only the events — a thin wrapper over
+/// [`parse_feed_within_reporting`], exercised by the unit tests (recurrence expansion is testable
+/// without `now`). Production code goes through the reporting form: anything that WRITES the mirror
+/// needs the completeness verdict, because a silently clamped parse that reaps rows breaks I-09.3.
+#[cfg(test)]
+fn parse_feed_within(
     text: &str,
     feed_id: &str,
     win_start: DateTime<Utc>,
     win_end: DateTime<Utc>,
     tz: ChronoTz,
 ) -> Vec<CalendarEvent> {
+    parse_feed_within_reporting(text, feed_id, win_start, win_end, tz).0
+}
+
+/// [`parse_feed_within`], also reporting whether the parse saw the WHOLE feed. `false` means events
+/// were dropped without anything failing: the body was cut mid-`VEVENT` (a truncated download still
+/// reads as a clean 200), there were more blocks than [`MAX_VEVENTS`], or the expansion hit
+/// [`MAX_EVENTS`]. The mirror write then withholds its delete half — "we never saw it" is not "the
+/// user deleted it" (I-09.3).
+pub fn parse_feed_within_reporting(
+    text: &str,
+    feed_id: &str,
+    win_start: DateTime<Utc>,
+    win_end: DateTime<Utc>,
+    tz: ChronoTz,
+) -> (Vec<CalendarEvent>, bool) {
+    parse_within_capped(
+        text,
+        feed_id,
+        win_start,
+        win_end,
+        tz,
+        MAX_VEVENTS,
+        MAX_EVENTS,
+    )
+}
+
+/// [`parse_feed_within_reporting`] with the defensive caps injected, so both clamp paths are
+/// exercisable without generating a 100k-event feed.
+fn parse_within_capped(
+    text: &str,
+    feed_id: &str,
+    win_start: DateTime<Utc>,
+    win_end: DateTime<Utc>,
+    tz: ChronoTz,
+    max_vevents: usize,
+    max_events: usize,
+) -> (Vec<CalendarEvent>, bool) {
     let lines = unfold(text);
-    let blocks: Vec<Vec<String>> = vevents(&lines).into_iter().take(MAX_VEVENTS).collect();
+    let (parsed, terminated) = vevents(&lines);
+    let blocks_seen = parsed.len();
+    let blocks: Vec<Vec<String>> = parsed.into_iter().take(max_vevents).collect();
 
     // A VEVENT carrying RECURRENCE-ID is a per-instance override (moved or cancelled)
     // of the series with the same UID (RFC 5545 §3.8.4.4). Collect those overridden
@@ -58,15 +101,19 @@ pub fn parse_feed_within(
 
     let mut out = Vec::new();
     for block in &blocks {
-        if out.len() >= MAX_EVENTS {
+        if out.len() >= max_events {
             break;
         }
         out.extend(expand_vevent(
             block, feed_id, win_start, win_end, tz, &overrides,
         ));
     }
-    out.truncate(MAX_EVENTS);
-    out
+    out.truncate(max_events);
+    // A feed landing exactly ON the occurrence cap counts as clamped: the loop can't tell "the last
+    // block fit" from "the next block was never tried". Over-reporting incompleteness only costs a
+    // withheld delete for one sync; under-reporting reaps rows that are still live upstream.
+    let complete = terminated && blocks_seen <= max_vevents && out.len() < max_events;
+    (out, complete)
 }
 
 /// Undo RFC 5545 line folding: a line starting with a space or tab continues the
@@ -84,8 +131,11 @@ fn unfold(text: &str) -> Vec<String> {
     lines
 }
 
-/// Collect the property lines of each `VEVENT` block.
-fn vevents(lines: &[String]) -> Vec<Vec<String>> {
+/// Collect the property lines of each `VEVENT` block, and report whether every block was
+/// TERMINATED. A block still open at the end of the body is dropped by the `cur.take()` below, so
+/// an unterminated tail is the one signal that a cut-off feed leaves behind — the events it lost
+/// can't even be counted.
+fn vevents(lines: &[String]) -> (Vec<Vec<String>>, bool) {
     let mut blocks = Vec::new();
     let mut cur: Option<Vec<String>> = None;
     for l in lines {
@@ -103,7 +153,7 @@ fn vevents(lines: &[String]) -> Vec<Vec<String>> {
             }
         }
     }
-    blocks
+    (blocks, cur.is_none())
 }
 
 /// Turn one VEVENT into its in-window occurrences (one for a single event, many for a
@@ -154,15 +204,23 @@ fn expand_vevent(
         .unwrap_or(start_anchor);
 
     let mut starts: Vec<DateTime<Utc>> = if block.iter().any(|l| is_prop(l, "RRULE")) {
-        expand_rrule(block, win_start, win_end, tz)
+        expand_rrule(block, win_start, win_end, tz, all_day)
     } else if start_anchor <= win_end && effective_end >= win_start {
         vec![start_anchor]
     } else {
         Vec::new()
     };
 
-    // Drop occurrences the series' own RECURRENCE-ID overrides have moved/cancelled.
-    if let Some(skip) = overrides.get(&uid) {
+    // Drop occurrences the series' own RECURRENCE-ID overrides have moved/cancelled — but only
+    // from the series MASTER. A block that itself carries RECURRENCE-ID *is* an override: it
+    // defines exactly one instance and its own RECURRENCE-ID is in the skip set, so applying the
+    // skip here deleted every override that did NOT move in time — the ordinary "change just this
+    // one" edit (new title, room or end time). The master's occurrence at that instant is still
+    // removed below, so the override replaces it rather than doubling it.
+    if let Some(skip) = overrides
+        .get(&uid)
+        .filter(|_| find_prop(block, "RECURRENCE-ID").is_none())
+    {
         starts.retain(|s| !skip.contains(&s.timestamp()));
     }
 
@@ -227,11 +285,15 @@ fn expand_vevent(
 /// back to the machine's. A parse failure retries with the DTSTART pinned to its
 /// resolved UTC instant (so a DST-ambiguous DTSTART doesn't drop the whole series),
 /// and only then degrades to "no occurrences".
+///
+/// An `all_day` series is re-anchored on the way out, so its occurrences land in the same
+/// value space as every other all-day start (see the mapping at the tail).
 fn expand_rrule(
     block: &[String],
     win_start: DateTime<Utc>,
     win_end: DateTime<Utc>,
     tz: ChronoTz,
+    all_day: bool,
 ) -> Vec<DateTime<Utc>> {
     // Only expand a day-or-coarser FREQ. Sub-daily frequencies (SECONDLY/MINUTELY/
     // HOURLY) — or an unrecognisable rule — force the iterator to walk a huge number
@@ -264,7 +326,20 @@ fn expand_rrule(
         .all(limit)
         .dates
         .into_iter()
-        .map(|d| d.with_timezone(&Utc))
+        // An all-day occurrence comes back as a midnight in whatever zone `rrule` resolved the
+        // `VALUE=DATE` DTSTART in — the machine's local zone, since a DATE carries no TZID — so
+        // its UTC instant is NOT the noon-in-`tz` anchor `parse_any` builds for the same civil
+        // date, and the two can even name different days. Read the civil date out of `rrule`'s
+        // own frame (never out of the UTC instant, which is a day out east or west of that zone)
+        // and re-anchor it: the date then renders identically in every zone, and a
+        // RECURRENCE-ID's instant compares equal to the master occurrence it replaces.
+        .filter_map(|d| {
+            if all_day {
+                all_day_anchor(d.date_naive(), tz)
+            } else {
+                Some(d.with_timezone(&Utc))
+            }
+        })
         .collect()
 }
 
@@ -477,16 +552,7 @@ fn parse_any(
 ) -> Option<DateTime<Utc>> {
     let v = value.trim();
     if all_day {
-        let date = NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;
-        // Anchor at NOON, not midnight: a zone whose DST spring-forward lands exactly
-        // at 00:00 (e.g. America/Havana, Africa/Cairo) has no local midnight that day,
-        // so a midnight anchor is a `None` gap and the event silently vanishes. Noon is
-        // never inside a 1-hour gap; `make_event` formats date-only, so the offset is
-        // truncated and the stored civil date is unchanged in every zone.
-        return tz
-            .from_local_datetime(&date.and_hms_opt(12, 0, 0)?)
-            .earliest()
-            .map(|d| d.with_timezone(&Utc));
+        return all_day_anchor(NaiveDate::parse_from_str(v, "%Y%m%d").ok()?, tz);
     }
     if let Some(stripped) = v.strip_suffix('Z') {
         let naive = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S").ok()?;
@@ -500,6 +566,21 @@ fn parse_any(
         // lands on the same instant no matter which machine syncs the feed.
         None => resolve_local(tz, naive),
     }
+}
+
+/// The instant an all-day civil date anchors to: NOON in the user's zone, not midnight. A zone
+/// whose DST spring-forward lands exactly at 00:00 (e.g. America/Havana, Africa/Cairo) has no
+/// local midnight that day, so a midnight anchor is a `None` gap and the event silently vanishes.
+/// Noon is never inside a 1-hour gap; `make_event` formats date-only, so the offset is truncated
+/// and the stored civil date is unchanged in every zone.
+///
+/// Every all-day start goes through here — a lone `VALUE=DATE`, an expanded RRULE occurrence and a
+/// `RECURRENCE-ID` alike — so they share one value space and an override's instant compares equal
+/// to the master occurrence it replaces.
+fn all_day_anchor(date: NaiveDate, tz: ChronoTz) -> Option<DateTime<Utc>> {
+    tz.from_local_datetime(&date.and_hms_opt(12, 0, 0)?)
+        .earliest()
+        .map(|d| d.with_timezone(&Utc))
 }
 
 /// Resolve a naive local datetime in `zone` to a UTC instant, tolerating a DST
@@ -905,6 +986,265 @@ mod tests {
         assert_eq!(events.len(), 5);
         assert!(!events.iter().any(|ev| ev.start == "2026-06-08T10:00:00Z"));
         assert!(events.iter().any(|ev| ev.start == "2026-06-08T14:00:00Z"));
+    }
+
+    // --- occurrence identity: RECURRENCE-ID overrides and the all-day value space (D8) ---------
+    //
+    // The skip set built in `parse_feed_within` prunes the series MASTER; applying it to the
+    // override block deleted the override itself, and all-day starts lived in two different value
+    // spaces so the skip never matched them at all.
+
+    /// A 5-day all-day banner series, plus a window with headroom on both sides.
+    ///
+    /// The headroom is load-bearing: `rrule` resolves a `VALUE=DATE` DTSTART at midnight in the
+    /// MACHINE's zone, so the first occurrence's instant sits up to 14 hours either side of UTC
+    /// midnight and a window starting on the series' own first day would admit or drop it
+    /// depending on where the test runs. What is under test is the civil date each admitted
+    /// occurrence renders as, not which instants the window admits.
+    const ALL_DAY_SERIES: &str = "BEGIN:VEVENT\nUID:s5\nSUMMARY:Daily banner\n\
+                                  DTSTART;VALUE=DATE:20260601\nDTEND;VALUE=DATE:20260602\n\
+                                  RRULE:FREQ=DAILY;COUNT=5\nEND:VEVENT";
+
+    fn wide_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        (
+            Utc.with_ymd_and_hms(2026, 5, 25, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+        )
+    }
+
+    /// The three zones that expose an all-day drift: UTC and one on each side of it.
+    fn zones() -> [ChronoTz; 3] {
+        [
+            ChronoTz::UTC,
+            chrono_tz::Asia::Tokyo,
+            chrono_tz::America::Los_Angeles,
+        ]
+    }
+
+    #[test]
+    fn recurrence_id_override_that_does_not_move_still_renders() {
+        // The commonest override by far: "change just this one" edits the title or the room and
+        // leaves the time alone, so the override's DTSTART equals its own RECURRENCE-ID. Applying
+        // the series' skip set to the override block deleted it — and the master's occurrence at
+        // that instant is (correctly) removed too, so the occurrence vanished from the calendar
+        // altogether rather than merely losing its edit.
+        let feed = "BEGIN:VEVENT\nUID:s3\nSUMMARY:Weekly\n\
+                    DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s3\nRECURRENCE-ID:20260608T100000Z\n\
+                    SUMMARY:Weekly (new room)\nLOCATION:Room 5\n\
+                    DTSTART:20260608T100000Z\nDTEND:20260608T110000Z\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        // 5 Mondays; Jun 8 is the override's, not the master's.
+        assert_eq!(events.len(), 5);
+        let edited: Vec<&CalendarEvent> = events
+            .iter()
+            .filter(|ev| ev.start == "2026-06-08T10:00:00Z")
+            .collect();
+        assert_eq!(
+            edited.len(),
+            1,
+            "the edited occurrence renders exactly once"
+        );
+        assert_eq!(edited[0].summary, "Weekly (new room)");
+        assert_eq!(edited[0].location.as_deref(), Some("Room 5"));
+    }
+
+    #[test]
+    fn an_override_never_collides_with_the_master_row_id() {
+        // `replace_events` skips an unchanged resync only while the stored row count equals
+        // `events.len()`, and its INSERT OR REPLACE collapses two events sharing an id. Two rows
+        // at one id would therefore make that gate unreachable and delete-and-reinsert the whole
+        // calendar on every poll — the churn F-49 exists to prevent.
+        let timed = "BEGIN:VEVENT\nUID:s3\nSUMMARY:Weekly\n\
+                     DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                     RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                     BEGIN:VEVENT\nUID:s3\nRECURRENCE-ID:20260608T100000Z\n\
+                     SUMMARY:Weekly (new room)\nDTSTART:20260608T100000Z\nEND:VEVENT"
+            .to_string();
+        let all_day = format!(
+            "{ALL_DAY_SERIES}\nBEGIN:VEVENT\nUID:s5\nRECURRENCE-ID;VALUE=DATE:20260603\n\
+             SUMMARY:Banner (renamed)\nDTSTART;VALUE=DATE:20260603\n\
+             DTEND;VALUE=DATE:20260604\nEND:VEVENT"
+        );
+        let (s, e) = wide_window();
+        for tz in zones() {
+            for feed in [&timed, &all_day] {
+                let events = parse_feed_within(feed, "f", s, e, tz);
+                let ids: HashSet<&String> = events.iter().map(|ev| &ev.id).collect();
+                assert_eq!(ids.len(), events.len(), "duplicate row id in {tz}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_all_day_cancellation_override_removes_that_day() {
+        // An all-day RECURRENCE-ID resolves through `parse_any`'s noon anchor while the master's
+        // occurrences came back as raw midnights from `rrule`, so the skip set could never match
+        // and a cancelled day still rendered. One value space is what makes the cancellation land.
+        let feed = format!(
+            "{ALL_DAY_SERIES}\nBEGIN:VEVENT\nUID:s5\nRECURRENCE-ID;VALUE=DATE:20260603\n\
+             STATUS:CANCELLED\nDTSTART;VALUE=DATE:20260603\nEND:VEVENT"
+        );
+        let (s, e) = wide_window();
+        for tz in zones() {
+            let events = parse_feed_within(&feed, "f", s, e, tz);
+            assert_eq!(events.len(), 4, "cancelled day still present in {tz}");
+            assert!(!events.iter().any(|ev| ev.start == "2026-06-03"));
+        }
+    }
+
+    #[test]
+    fn an_all_day_override_replaces_only_that_day() {
+        // The all-day twin of the headline: the override renders in place of the master's day,
+        // once, carrying its own title — in every zone, since both sides of the comparison are
+        // now civil dates anchored the same way.
+        let feed = format!(
+            "{ALL_DAY_SERIES}\nBEGIN:VEVENT\nUID:s5\nRECURRENCE-ID;VALUE=DATE:20260603\n\
+             SUMMARY:Banner (renamed)\nDTSTART;VALUE=DATE:20260603\n\
+             DTEND;VALUE=DATE:20260604\nEND:VEVENT"
+        );
+        let (s, e) = wide_window();
+        for tz in zones() {
+            let events = parse_feed_within(&feed, "f", s, e, tz);
+            assert_eq!(events.len(), 5, "wrong occurrence count in {tz}");
+            let on_day: Vec<&CalendarEvent> = events
+                .iter()
+                .filter(|ev| ev.start == "2026-06-03")
+                .collect();
+            assert_eq!(on_day.len(), 1, "the overridden day doubled in {tz}");
+            assert_eq!(on_day[0].summary, "Banner (renamed)");
+            assert!(events.iter().any(|ev| ev.start == "2026-06-02"));
+        }
+    }
+
+    #[test]
+    fn an_all_day_series_keeps_its_civil_date_across_zones() {
+        // The recurring analogue of `all_day_keeps_its_calendar_date_across_zones`. An expanded
+        // all-day occurrence is a civil date with no instant, so it must read as the day the feed
+        // names in every zone; rendering `rrule`'s raw instant drifted the whole series a day.
+        let (s, e) = wide_window();
+        for tz in zones() {
+            let events = parse_feed_within(ALL_DAY_SERIES, "f", s, e, tz);
+            let dates: Vec<&str> = events.iter().map(|ev| ev.start.as_str()).collect();
+            assert_eq!(
+                dates,
+                [
+                    "2026-06-01",
+                    "2026-06-02",
+                    "2026-06-03",
+                    "2026-06-04",
+                    "2026-06-05"
+                ],
+                "all-day series drifted in {tz}"
+            );
+            assert!(events.iter().all(|ev| ev.all_day));
+        }
+    }
+
+    #[test]
+    fn chained_recurrence_id_overrides_each_keep_their_new_slot() {
+        // Two overrides that swap Mondays: A takes B's slot and B takes A's. Both instants are in
+        // the series' skip set, so the master vacates both and each override renders at its own
+        // new start. This is the shape that discriminates the fix from "exclude only the block's
+        // own RECURRENCE-ID from the skip set" — under that rule A's new start is still B's
+        // RECURRENCE-ID, so A would be deleted anyway.
+        let feed = "BEGIN:VEVENT\nUID:s4\nSUMMARY:Weekly\n\
+                    DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s4\nRECURRENCE-ID:20260608T100000Z\n\
+                    SUMMARY:A moved to Jun 15\nDTSTART:20260615T100000Z\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s4\nRECURRENCE-ID:20260615T100000Z\n\
+                    SUMMARY:B moved to Jun 8\nDTSTART:20260608T100000Z\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        assert_eq!(events.len(), 5);
+        let at = |start: &str| {
+            events
+                .iter()
+                .find(|ev| ev.start == start)
+                .map(|ev| ev.summary.as_str())
+        };
+        assert_eq!(at("2026-06-15T10:00:00Z"), Some("A moved to Jun 15"));
+        assert_eq!(at("2026-06-08T10:00:00Z"), Some("B moved to Jun 8"));
+        let ids: HashSet<&String> = events.iter().map(|ev| &ev.id).collect();
+        assert_eq!(ids.len(), events.len());
+    }
+
+    #[test]
+    fn a_weekly_series_shares_one_uid_and_varies_only_the_start() {
+        // The premise the mirror's occurrence key rests on (INVARIANTS I-04, and the (uid, start)
+        // dedup in `calendar::agenda_query`): every expanded occurrence carries the SERIES uid, so
+        // the uid alone names the series and only uid + instant names one occurrence. If
+        // `make_event` ever minted a per-occurrence uid, that dedup would quietly become a no-op.
+        let feed = "BEGIN:VEVENT\nUID:e\nSUMMARY:Weekly sync\n\
+                    DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        assert_eq!(events.len(), 5);
+        assert!(events.iter().all(|ev| ev.uid.as_deref() == Some("e")));
+        let starts: HashSet<&str> = events.iter().map(|ev| ev.start.as_str()).collect();
+        assert_eq!(starts.len(), 5, "occurrences must differ only by start");
+    }
+
+    #[test]
+    fn a_feed_cut_mid_vevent_reports_the_parse_incomplete() {
+        // A body that stops partway through a VEVENT (a truncated transfer that still reads as a
+        // clean 200) loses that block silently — `vevents` drops the unclosed `cur`. The events it
+        // DID parse are still good, so they're kept; what must not happen is the mirror treating
+        // them as the whole picture and reaping the tail.
+        let cut = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:a\nSUMMARY:Standup\n\
+                   DTSTART:20260615T090000Z\nEND:VEVENT\n\
+                   BEGIN:VEVENT\nUID:b\nDTSTART:20260616T090000Z";
+        let whole = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:a\nSUMMARY:Standup\n\
+                     DTSTART:20260615T090000Z\nEND:VEVENT\n\
+                     BEGIN:VEVENT\nUID:b\nDTSTART:20260616T090000Z\nEND:VEVENT\n\
+                     END:VCALENDAR";
+        let (s, e) = window();
+        let (events, complete) = parse_feed_within_reporting(cut, "f", s, e, ChronoTz::UTC);
+        assert!(!complete, "an unterminated block is an incomplete parse");
+        assert_eq!(events.len(), 1, "the terminated block still parses");
+        let ids = |evs: &[CalendarEvent]| evs.iter().map(|ev| ev.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&events),
+            ids(&parse_feed_within(cut, "f", s, e, ChronoTz::UTC)),
+            "the thin wrapper must parse identically"
+        );
+
+        let (events, complete) = parse_feed_within_reporting(whole, "f", s, e, ChronoTz::UTC);
+        assert!(complete, "a properly terminated feed is complete");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn hitting_the_expanded_event_cap_reports_incomplete() {
+        // Both defensive caps drop events without failing, so both must report incompleteness — and
+        // a feed comfortably inside them must not, or every sync would withhold every deletion
+        // forever. Driven through the cap-injected core rather than a synthesised 100k-event feed.
+        let feed = "BEGIN:VEVENT\nUID:a\nDTSTART:20260615T090000Z\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:b\nDTSTART:20260616T090000Z\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:c\nDTSTART:20260617T090000Z\nEND:VEVENT";
+        let (s, e) = window();
+        let capped = |max_vevents, max_events| {
+            let (events, complete) =
+                parse_within_capped(feed, "f", s, e, ChronoTz::UTC, max_vevents, max_events);
+            (events.len(), complete)
+        };
+        assert_eq!(capped(10, 10), (3, true), "well inside both caps");
+        assert_eq!(capped(2, 10), (2, false), "a block past the VEVENT cap");
+        assert_eq!(
+            capped(10, 2),
+            (2, false),
+            "an occurrence past the event cap"
+        );
+        // Exactly on the occurrence cap reads as clamped: nothing distinguishes it from a feed that
+        // had one more event to give.
+        assert_eq!(capped(10, 3), (3, false), "landing exactly on the cap");
     }
 
     #[test]
