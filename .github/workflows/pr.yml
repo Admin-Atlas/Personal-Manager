@@ -351,3 +351,5 @@ jobs:
         run: just npm-licenses
       - name: Every sidecar Python package carries a reviewed licence
         run: just sidecar-licences
+      - name: Every catalogued local model carries a reviewed licence
+        run: just model-licences

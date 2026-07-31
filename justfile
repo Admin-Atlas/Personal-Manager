@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences model-licences
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -234,6 +234,13 @@ npm-licenses:
 # offline and reaches nothing.
 sidecar-licences:
     node scripts/check-sidecar-licences.mjs
+
+# Every model in the curated local-AI catalogue is under a licence someone read, and the catalogue's
+# copy of it still matches the ledger it came from. Seven of the seventeen are under bespoke
+# publisher terms rather than an open-source licence (Gemma, Llama, the largest Qwen 2.5) and the
+# catalogue carried nothing about any of it. Offline: two committed JSON files and one Rust file.
+model-licences:
+    node scripts/check-model-licences.mjs
 
 # --- generators (not part of `check`) -------------------------------------
 

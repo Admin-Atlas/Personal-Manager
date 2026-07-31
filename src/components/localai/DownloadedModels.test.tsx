@@ -87,6 +87,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     disk_sources_present: ["lm_studio"],
     disk_truncated: false,
     scan_dir: null,
+    terms_accepted: [],
     ...over,
   };
 }

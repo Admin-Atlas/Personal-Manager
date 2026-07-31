@@ -34,7 +34,7 @@ import { dirname, join } from "node:path";
 const HF = "https://huggingface.co";
 const UA = "pm-local-catalog-generator (Personal-Manager)";
 const DEFAULT_QUANTS = ["Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"];
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 // Bounded retries for transient Hugging Face failures (network drop / HTTP 5xx) before we give up.
 const MAX_ATTEMPTS = 4;
 
@@ -44,34 +44,86 @@ const MAX_ATTEMPTS = 4;
 // model that fetched fine but doesn't qualify (embedding, no curated quant), which is a clean drop.
 class AbortRun extends Error {}
 
-// The curated SEED: verified-real GGUF repos spanning small→large, dense + MoE + multimodal, from
-// reputable quantizers (bartowski / unsloth / ggml-org). `sort=downloads` discovery is a maintainer
-// aid for finding new entries (see --discover) — never an auto-append, so diffs stay reviewable.
-// `role`: which slot this suits ("background" = fast/cheap summaries, "chat" = quality replies).
-const SEED = [
-  { repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", role: "background" },
-  { repo: "ggml-org/gemma-3-1b-it-GGUF", role: "background" },
-  { repo: "bartowski/gemma-2-2b-it-GGUF", role: "background" },
-  { repo: "bartowski/Llama-3.2-3B-Instruct-GGUF", role: "background" },
-  { repo: "bartowski/Phi-3.5-mini-instruct-GGUF", role: "background" },
-  { repo: "unsloth/Qwen3.5-4B-GGUF", role: "background" },
-  { repo: "ggml-org/gemma-3-4b-it-GGUF", role: "chat" },
-  { repo: "bartowski/Qwen2.5-7B-Instruct-GGUF", role: "chat" },
-  { repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", role: "chat" },
-  { repo: "unsloth/Qwen3.5-9B-GGUF", role: "chat" },
-  { repo: "unsloth/gemma-4-12b-it-GGUF", role: "chat" },
-  { repo: "bartowski/Qwen2.5-14B-Instruct-GGUF", role: "chat" },
-  { repo: "ggml-org/gpt-oss-20b-GGUF", role: "chat" },
-  { repo: "unsloth/Qwen3.6-27B-GGUF", role: "chat" },
-  { repo: "unsloth/Qwen3.6-35B-A3B-GGUF", role: "chat" },
-  { repo: "unsloth/gemma-4-26B-A4B-it-GGUF", role: "chat" },
-  { repo: "bartowski/Qwen2.5-72B-Instruct-GGUF", role: "chat" },
-  { repo: "bartowski/DeepSeek-V4-Flash-GGUF", role: "chat" },
-  { repo: "ggml-org/SmolVLM-500M-Instruct-GGUF", role: "background" },
-];
-
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outPath = join(repoRoot, "src-tauri", "local_models.json");
+const ledgerPath = join(repoRoot, "src-tauri", "model_licences.json");
+
+// The curated SEED — verified-real GGUF repos spanning small→large, dense + MoE + multimodal, from
+// reputable quantizers (bartowski / unsloth / ggml-org) — now lives in `src-tauri/model_licences.json`
+// as the keys of its `models` map. `sort=downloads` discovery is still a maintainer aid for finding
+// new entries (see --discover), never an auto-append, so diffs stay reviewable.
+//
+// It moved there so a model CANNOT be catalogued without a licence row: one list, no second list to
+// drift from it. The other half of the reason is `just model-licences`, the offline gate — it has to
+// read the seed, and it cannot import this file, because the `@huggingface/gguf` import above
+// resolves at module load and pr.yml's `hygiene` job runs with no `npm ci` (INVARIANTS.md I-18). A
+// gate that imported this would pass on a dev box and die only in CI.
+function readLedger() {
+  const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+  const seed = Object.entries(ledger.models).map(([repo, row]) => ({ repo, role: row.role }));
+  return { ledger, seed };
+}
+
+/**
+ * The upstream fields worth watching, in a stable shape so the stamp only moves when the licence
+ * story does. Descriptions, download counts and file lists are deliberately not in here.
+ */
+export function evidenceOf(info) {
+  const card = info?.cardData ?? {};
+  return {
+    license: card.license ?? null,
+    license_name: card.license_name ?? null,
+    license_link: card.license_link ?? null,
+    gated: info?.gated ?? null,
+    tags: (info?.tags ?? []).filter((t) => t.startsWith("license:")).sort(),
+  };
+}
+
+export function stampOf(evidence) {
+  return createHash("sha256").update(JSON.stringify(evidence), "utf8").digest("hex").slice(0, 32);
+}
+
+/**
+ * Fold this run's evidence into the ledger and decide whether a human still stands behind each
+ * licence. A hand-written row that has never been stamped is adopted once — whoever wrote it wrote
+ * it against the upstream of the day. After that the stamp governs: when it moves, the licence is
+ * BLANKED and the old answer is kept under `previous` rather than carried forward silently.
+ */
+export function reconcileLedger(ledger, evidenceByRepo) {
+  const models = {};
+  const review = [];
+  const changed = [];
+  for (const [repo, row] of Object.entries(ledger.models)) {
+    const evidence = evidenceByRepo.get(repo);
+    if (!evidence) {
+      // No evidence this run (the fetch never got far enough). Leave the row exactly as it was —
+      // silence is not a reason to withdraw a licence someone already decided.
+      models[repo] = row;
+      if (!row.licence) review.push(repo);
+      continue;
+    }
+    const stamp = stampOf(evidence);
+    const firstStamping = row.licence != null && row.stamp == null;
+    const keep = firstStamping || row.stamp === stamp;
+    const next = { role: row.role, licence: keep ? row.licence : null, stamp, evidence };
+    if (keep && row.note) next.note = row.note;
+    if (!keep) {
+      next.previous = { licence: row.licence, stamp: row.stamp ?? null };
+      changed.push(repo);
+    }
+    if (!next.licence) review.push(repo);
+    models[repo] = next;
+  }
+  return { ledger: { ...ledger, models }, review, changed };
+}
+
+/** The block the catalogue carries per entry: everything the app needs without a second lookup. */
+export function licenceFor(ledger, repo) {
+  const id = ledger.models[repo]?.licence;
+  const term = id ? ledger.terms[id] : null;
+  if (!term) return null;
+  return { id, name: term.name, url: term.url, open: term.open, summary: term.summary };
+}
 
 // --- HTTP with the mandatory rate-limit clear-error --------------------------------------------
 
@@ -139,7 +191,11 @@ async function buildEntry(seed) {
   const { repo, role } = seed;
 
   // 1. Inline GGUF metadata: total params, architecture, context window.
-  const infoRes = await hfFetch(`${HF}/api/models/${repo}?expand[]=gguf`);
+  // `cardData` + `gated` ride along with the gguf metadata — one request, not two. They are
+  // EVIDENCE for the licence ledger, never the decision: see readLedger() above.
+  const infoRes = await hfFetch(
+    `${HF}/api/models/${repo}?expand[]=gguf&expand[]=cardData&expand[]=gated&expand[]=tags`,
+  );
   if (!infoRes.ok) {
     // 5xx already retried+threw in hfFetch; a 4xx here means a curated seed is gone/renamed — a
     // maintenance signal, not a silent drop. Abort so the SEED gets fixed rather than shipped short.
@@ -148,6 +204,14 @@ async function buildEntry(seed) {
     );
   }
   const info = await infoRes.json();
+  // Captured BEFORE the qualification checks below: a repo can fail to qualify as a catalogue entry
+  // (embedding model, no curated quant, unreadable MoE header) and still need its licence reviewed,
+  // because it stays in the seed and can start qualifying at any time.
+  const evidence = evidenceOf(info);
+  const drop = (why) => {
+    console.warn(`  skip ${repo}: ${why}`);
+    return { entry: null, evidence };
+  };
   const g = info.gguf || {};
   const totalParams = Number(g.total);
   const architecture = g.architecture ? String(g.architecture) : null;
@@ -158,12 +222,10 @@ async function buildEntry(seed) {
     !architecture ||
     !Number.isFinite(contextLength)
   ) {
-    console.warn(`  skip ${repo}: incomplete GGUF metadata (params/arch/ctx)`);
-    return null;
+    return drop("incomplete GGUF metadata (params/arch/ctx)");
   }
   if (isEmbeddingOrReranker(repo, architecture)) {
-    console.warn(`  skip ${repo}: embedding/reranker (not a chat model)`);
-    return null;
+    return drop("embedding/reranker (not a chat model)");
   }
 
   // 2. File tree: per-quant sizes (shards summed) + the mmproj (projector) if any.
@@ -181,8 +243,7 @@ async function buildEntry(seed) {
     if (size) quants.push({ quant: label, file_gb: gib(size.bytes), sharded: size.sharded });
   }
   if (quants.length === 0) {
-    console.warn(`  skip ${repo}: none of the curated quants present in the tree`);
-    return null;
+    return drop("none of the curated quants present in the tree");
   }
 
   // 3. Multimodal projector: an mmproj file makes the model multimodal. A model loads ONE projector
@@ -205,14 +266,13 @@ async function buildEntry(seed) {
     if (active && active > 0 && active <= totalParams) {
       activeParams = active;
     } else {
-      console.warn(`  EXCLUDE ${repo}: MoE active-params unreadable from GGUF (decision E)`);
-      return null;
+      return drop("MoE active-params unreadable from GGUF (decision E)");
     }
   }
   // Unmodelled architectures we can't fit-score: keep the row but mark it honestly.
   if (isUnmodelledArch(architecture)) fit = "unknown";
 
-  return {
+  const entry = {
     repo,
     display_name: prettyName(repo),
     architecture,
@@ -227,6 +287,7 @@ async function buildEntry(seed) {
     quants,
     install: { ollama: null },
   };
+  return { entry, evidence };
 }
 
 // --- GGUF header parse for MoE active params ---------------------------------------------------
@@ -379,13 +440,15 @@ async function main() {
     return;
   }
 
+  const { ledger: ledgerBefore, seed: SEED } = readLedger();
   console.log(`generate-local-catalog: refreshing ${SEED.length} seed repos from Hugging Face …`);
   const entries = [];
+  const evidenceByRepo = new Map();
   for (const seed of SEED) {
     process.stdout.write(`- ${seed.repo}\n`);
-    let entry;
+    let built;
     try {
-      entry = await buildEntry(seed);
+      built = await buildEntry(seed);
     } catch (e) {
       if (e instanceof AbortRun) {
         console.error(
@@ -397,9 +460,56 @@ async function main() {
       }
       throw e;
     }
-    if (entry) entries.push(entry);
+    evidenceByRepo.set(seed.repo, built.evidence);
+    if (built.entry) entries.push(built.entry);
   }
   entries.sort((a, b) => a.parameters_b - b.parameters_b);
+
+  // The ledger is written FIRST and unconditionally: whatever happens to the catalogue, the fresh
+  // evidence is on disk for whoever has to make the call. Writing it is not the same as approving it.
+  const { ledger, review, changed } = reconcileLedger(ledgerBefore, evidenceByRepo);
+  writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2) + "\n");
+  for (const repo of changed) {
+    console.warn(
+      `  LICENCE CHANGED upstream: ${repo} — was ${ledger.models[repo].previous.licence ?? "(none)"}; ` +
+        `the recorded answer has been withdrawn`,
+    );
+  }
+
+  // Requirement (b): refuse to emit a catalogue containing a model whose terms nobody has read.
+  // The catalogue is compiled into the binary, so an unreviewed row would ship — and the UI would
+  // have nothing to show a user before telling their machine to fetch the weights.
+  const unreviewed = review.filter((repo) => entries.some((e) => e.repo === repo));
+  if (unreviewed.length > 0) {
+    console.error(
+      `\ngenerate-local-catalog: NOT writing local_models.json — ${unreviewed.length} model(s) have ` +
+        `no reviewed licence:\n` +
+        unreviewed.map((r) => `  - ${r}\n`).join("") +
+        `\nsrc-tauri/model_licences.json has been refreshed with what Hugging Face says. Read each ` +
+        `row's \`evidence\`, check the publisher's own repo where it is ambiguous (a GGUF conversion ` +
+        `copies the tag and can be stale), then fill in \`licence\` and re-run.`,
+    );
+    process.exit(1);
+  }
+  if (review.length > 0) {
+    console.warn(
+      `  ${review.length} seeded repo(s) await a licence but are not in the catalogue — not blocking: ` +
+        review.join(", "),
+    );
+  }
+  for (const entry of entries) {
+    entry.licence = licenceFor(ledger, entry.repo);
+    // A licence id that names no row in `terms` resolves to null, which would ship a catalogue the
+    // Rust side cannot even parse (`licence` is required, and every struct is deny_unknown_fields).
+    // Caught here rather than by a panic at first use.
+    if (!entry.licence) {
+      console.error(
+        `\ngenerate-local-catalog: NOT writing local_models.json — ${entry.repo} is recorded as ` +
+          `\`${ledger.models[entry.repo]?.licence}\`, which is not a row in the ledger's \`terms\` map.`,
+      );
+      process.exit(1);
+    }
+  }
 
   const hash = contentHash(entries);
   const prev = existsSync(outPath) ? JSON.parse(readFileSync(outPath, "utf8")) : null;

@@ -16,6 +16,7 @@ import {
   localLlmStatus,
   localModelRecommendations,
   probeLocalLlmPorts,
+  acceptLocalModelTerms,
   pullLocalModel,
   setLocalLlmEndpoint,
   setLocalLlmRoleModel,
@@ -69,6 +70,8 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   // Model pull (Ollama only).
   const [pulling, setPulling] = useState<string | null>(null);
   const [pullProg, setPullProg] = useState<PullProgress | null>(null);
+  /** The model whose licence terms are being shown, or null when no dialog is open. */
+  const [termsFor, setTermsFor] = useState<LocalRecommendation | null>(null);
 
   const configured = !!config?.base_url;
   // Whether the connected endpoint is an Ollama server (the only runner with a one-click pull API).
@@ -291,6 +294,39 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     );
   }
 
+  /** Download, once the terms behind this model have been shown and accepted (if they need to be).
+   *
+   *  Restricted-licence models — Gemma, Llama, the largest Qwen — carry publisher terms rather than
+   *  an open-source licence, so PM shows them first. Acceptance is remembered per LICENCE, so
+   *  reading the Gemma Terms once covers every Gemma. Open-licence models are never interrupted.
+   *
+   *  This is disclosure, not enforcement: the download is the user's own Ollama fetching the weights
+   *  from the publisher, and they could run `ollama pull` without PM at all. */
+  function requestPull(rec: LocalRecommendation) {
+    const needsTerms = !rec.licence.open && !(recs?.terms_accepted ?? []).includes(rec.licence.id);
+    if (needsTerms) {
+      setTermsFor(rec);
+      return;
+    }
+    void pull(rec);
+  }
+
+  async function acceptTermsAndPull() {
+    const rec = termsFor;
+    if (!rec) return;
+    setTermsFor(null);
+    try {
+      const accepted = await acceptLocalModelTerms(rec.licence.id);
+      setRecs((r) => (r ? { ...r, terms_accepted: accepted } : r));
+    } catch (e) {
+      // The acceptance failed to persist, so the next download of this licence asks again. That is
+      // the safe direction: never start the download on the back of a record that wasn't written.
+      setError(String(e));
+      return;
+    }
+    await pull(rec);
+  }
+
   async function pull(rec: LocalRecommendation) {
     const tag = ollamaTag(rec.install.ollama);
     if (!tag) return;
@@ -425,7 +461,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 canPull={configured && isOllama && !!ollamaTag(rec.install.ollama)}
                 pulling={pulling === rec.repo}
                 pullProg={pulling === rec.repo ? pullProg : null}
-                onPull={() => void pull(rec)}
+                onPull={() => requestPull(rec)}
                 busy={pulling !== null}
               />
             ))}
@@ -433,6 +469,35 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         ) : (
           <p className="mt-3 text-xs text-ink4">No catalog models to show.</p>
         )}
+        <ConfirmDialog
+          open={termsFor !== null}
+          title={termsFor ? `${termsFor.display_name} is under the ${termsFor.licence.name}` : ""}
+          confirmLabel="Accept and download"
+          onConfirm={() => void acceptTermsAndPull()}
+          onClose={() => setTermsFor(null)}
+        >
+          {termsFor && (
+            <>
+              <p>{termsFor.licence.summary}</p>
+              <p className="mt-2">
+                <a
+                  href={termsFor.licence.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="underline decoration-dotted underline-offset-2"
+                >
+                  Read the full terms
+                </a>
+                .
+              </p>
+              <p className="mt-2 text-ink4">
+                PM doesn't download the weights — your own Ollama fetches them from the publisher,
+                and PM can't enforce these terms either way. Accepting here records that you've read
+                them. PM won't ask again for another model under the same licence.
+              </p>
+            </>
+          )}
+        </ConfirmDialog>
         <p className="mt-3 text-xs text-faint">
           Local models don't appear in Settings → AI &amp; Models → Usage &amp; cost — that ledger
           tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no
@@ -1041,6 +1106,18 @@ function RecommendationCard({
             {rec.role_hint && (
               <span className="text-[0.625rem] text-ink4">suits {rec.role_hint}</span>
             )}
+            {/* Every row says what its weights are under. A restricted licence is the one worth
+                catching the eye, so it takes the attention colour the rest of the chips don't. */}
+            <a
+              href={rec.licence.url}
+              target="_blank"
+              rel="noreferrer noopener"
+              className={`text-[0.625rem] underline decoration-dotted underline-offset-2 ${
+                rec.licence.open ? "text-ink4" : "text-st-due"
+              }`}
+            >
+              {rec.licence.name}
+            </a>
           </div>
           {rec.gpu.kind === "split" ? (
             <div className="mt-1 space-y-1">
