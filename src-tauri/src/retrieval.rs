@@ -1031,7 +1031,12 @@ fn neutralize_citation_markers(s: &str) -> String {
 /// Neutralise a single-line source field (title / path) for the grounding prompt: collapse every
 /// control character — including the `\u{1f}` fence — to a space, then defuse forged citation
 /// markers.
-fn sanitize_source_field(s: &str) -> String {
+///
+/// `pub(crate)` because the focus router reuses it: a flag label is a single-line untrusted field of
+/// exactly this shape (a calendar event's title, mirrored verbatim from the provider), and collapsing
+/// its control characters is what stops a raw `\n` inside one forging an extra `id=` row in the
+/// router's candidate list. See [`crate::flags::render_route_request`].
+pub(crate) fn sanitize_source_field(s: &str) -> String {
     let collapsed: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

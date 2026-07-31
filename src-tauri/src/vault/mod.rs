@@ -140,6 +140,27 @@ impl Default for MarkdownPolicy {
     }
 }
 
+/// A recorded, confirmed change of a shared vault's owner: who held it, who took it, and when.
+///
+/// Written only by an explicit takeover ([`OwnerOnRekey::Claim`]) — a plain re-key carries its owner
+/// forward and leaves this field alone. It rides in `vault-meta.json` rather than a sidecar so it is
+/// MAC-covered like every other field, which is the whole point: an ownership record that the taker
+/// can quietly erase is worth nothing, and erasing this one trips the "altered outside PM" warning.
+/// Both SIDs are optional because either can be genuinely unknown — no owner was ever recorded, or
+/// the claimant's SID lookup failed at the moment of the claim (in which case the vault reads
+/// `Unknown` afterwards, and the record is the only trace that a takeover happened at all).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipTransfer {
+    /// The owner SID this vault carried before the takeover; `None` if none was recorded.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub from_sid: Option<String>,
+    /// The owner SID stamped by the takeover; `None` if the lookup failed as it was stamped.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub to_sid: Option<String>,
+    /// RFC3339, UTC. The UI formats it (DD-MM-YYYY).
+    pub at: String,
+}
+
 /// The on-disk `vault-meta.json`. Non-secret by construction — safe to sit in a
 /// shared folder (spec §2.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +189,12 @@ pub struct VaultMeta {
     /// (computed over the serialized fields) still verifies unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub owner_sid: Option<String>,
+    /// The last CONFIRMED ownership takeover, when one happened — see [`OwnershipTransfer`]. Absent on
+    /// every vault that has never had one, and absence costs zero serialized bytes
+    /// (`skip_serializing_if`), so every existing vault's stored MAC still verifies untouched and an
+    /// older build reads the file exactly as it did before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ownership_transfer: Option<OwnershipTransfer>,
     /// Keyed BLAKE3 MAC (hex) over the authenticated meta fields, under a master subkey (M-3).
     /// Absent on a legacy vault written before meta authentication; stamped on the first authenticated
     /// open and enforced thereafter. `skip_serializing_if`/`default` keep older files loading and keep
@@ -189,7 +216,8 @@ impl VaultMeta {
             kdf: None,
             verifier: None,
             markdown: MarkdownPolicy::default(),
-            owner_sid: None, // a device vault has no sharing owner
+            owner_sid: None,          // a device vault has no sharing owner
+            ownership_transfer: None, // ...so there is no ownership to have transferred either
             // Stamped lazily on the first authenticated open (the device key isn't created yet here).
             meta_mac: None,
         }
@@ -262,6 +290,75 @@ pub fn vault_ownership(meta: &VaultMeta) -> VaultOwnership {
         meta.owner_sid.as_deref(),
         current_user_sid_opt().as_deref(),
     )
+}
+
+/// What a re-key does to the vault's recorded owner.
+///
+/// Minting new metadata used to claim ownership as a side effect: [`prepare_shareable`] builds a
+/// whole new meta and, until this existed, the fresh `owner_sid` stamp from [`build_passphrase_meta`]
+/// simply stood — so any account that could unlock a shared vault became its recorded owner by
+/// changing the passphrase, silently. Every caller now says which it means, and the default across
+/// the codebase is [`Keep`](Self::Keep).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerOnRekey {
+    /// The vault keeps the owner it already had (a rotation, not a creation). On a Device source
+    /// there is nothing to keep, so the creator stamp stands — that is `create_shareable_vault`.
+    Keep,
+    /// A confirmed takeover: stamp the re-keying account as owner and record the transfer.
+    Claim,
+}
+
+/// What a re-key gate decided — see [`gate_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyGate {
+    /// Don't re-key at all. The caller returns an error before any key is derived and long before
+    /// anything is written, so nothing on disk changes and the old passphrase still opens the vault.
+    Refuse,
+    /// Go ahead, with this effect on the recorded owner.
+    Allow(OwnerOnRekey),
+}
+
+/// The pure re-key gate: given who owns the vault and whether the user explicitly confirmed a
+/// takeover, decide whether a passphrase change may proceed and what it does to the owner record.
+///
+/// Only `Joined` — a shared vault provably stamped with ANOTHER account's SID — is ever refused, and
+/// it has an escape hatch, because a vault nobody can re-key is the one unrecoverable state in this
+/// design. `Unknown` deliberately falls open: [`ownership_given`] returns it for every shareable
+/// vault off Windows (there is no SID to compare), for every vault created before ownership was
+/// recorded, and for any SID-resolution hiccup — so blocking there would deny a genuine sole owner
+/// their only re-key. It falls open to `Keep`, not to a claim, which is what stops an unowned vault
+/// being silently claimed by whoever rotates first.
+///
+/// Pure and one layer below the command on purpose: the whole rule is locked by a table test that
+/// needs no vault, no keychain and no Windows account.
+pub fn gate_for(ownership: VaultOwnership, confirm_transfer: bool) -> RekeyGate {
+    match ownership {
+        VaultOwnership::Joined if !confirm_transfer => RekeyGate::Refuse,
+        VaultOwnership::Joined => RekeyGate::Allow(OwnerOnRekey::Claim),
+        VaultOwnership::Device | VaultOwnership::Owned | VaultOwnership::Unknown => {
+            RekeyGate::Allow(OwnerOnRekey::Keep)
+        }
+    }
+}
+
+/// The make-private variant of [`gate_for`]: same `Joined` refusal, and **no hatch**.
+///
+/// Making a joined vault private is a strictly worse takeover than re-keying it — it re-keys the
+/// vault to the joiner's DEVICE key (held in their keychain alone), decrypts the Markdown, and moves
+/// the whole folder into their profile dir. Unlike a passphrase change, there is no passphrase that
+/// gets the real owner back in, so this is the one action in the vault surface with no recovery. It
+/// therefore refuses outright, exactly as `delete_shared_vault` does, and the caller points the user
+/// at leaving the vault instead — which is non-destructive and already exists.
+///
+/// The carried [`OwnerOnRekey::Keep`] is moot on the allowed path (`private_meta` clears the owner
+/// on the way to a device vault); it is `Keep` because there is nothing to claim.
+pub fn private_gate_for(ownership: VaultOwnership) -> RekeyGate {
+    match ownership {
+        VaultOwnership::Joined => RekeyGate::Refuse,
+        VaultOwnership::Device | VaultOwnership::Owned | VaultOwnership::Unknown => {
+            RekeyGate::Allow(OwnerOnRekey::Keep)
+        }
+    }
 }
 
 /// The current account's SID for the ownership check — `None` off-Windows or on lookup failure.
@@ -547,7 +644,9 @@ pub fn authenticate_meta(
 /// Reconcile a freshly-adopted vault's metadata to THIS machine after a backup restore (or a
 /// relocate-home): drop any `owner_sid` the source recorded — a Windows account SID that can't be
 /// valid on the adopting machine/account (see [`is_vault_owner`]), and which off its origin account
-/// would gate connector setup against a foreign owner — then (re-)stamp the meta MAC under `master`.
+/// would gate connector setup against a foreign owner — plus any [`OwnershipTransfer`] it carried,
+/// which names two SIDs from a machine this vault has left and would otherwise ride along forever —
+/// then (re-)stamp the meta MAC under `master`.
 /// Clearing the MAC first makes [`authenticate_meta`] treat this as a fresh stamp, so neither the
 /// cleared owner nor a keep-passphrase adopt (which preserves the source meta verbatim, cloned MAC and
 /// all) reads as "altered outside PM" on the next open. `master` MUST already be authenticated (the DB
@@ -557,6 +656,7 @@ pub fn normalize_adopted_meta(vault_root: &Path, master: &[u8; KEY_LEN]) -> Resu
         return Ok(());
     };
     meta.owner_sid = None;
+    meta.ownership_transfer = None;
     meta.meta_mac = None;
     authenticate_meta(vault_root, &meta, master)?;
     Ok(())
@@ -905,6 +1005,9 @@ fn build_passphrase_meta(
         // Record who created the shareable vault, so connector setup can be gated to the owner (a
         // joiner can't sync a connector anyway — the tokens live in the owner's per-account keychain).
         owner_sid: owner_sid_for_new_share(),
+        // A NEW vault has no history to record. A re-key that means to change hands sets this in
+        // `prepare_shareable`, which is the only place a takeover is ever written.
+        ownership_transfer: None,
         // Stamped on the first authenticated open (uniform with the device path).
         meta_mac: None,
     };
@@ -927,10 +1030,57 @@ pub fn new_passphrase(
 /// it's the same vault, re-keyed — so its keychain cache and any future links stay
 /// stable. The caller re-keys the open store with the returned key (PRAGMA rekey) and
 /// writes the metadata.
-pub fn prepare_shareable(old_meta: &VaultMeta, passphrase: &str) -> Result<(VaultMeta, Secret)> {
-    let (mut meta, master) = new_passphrase(passphrase, CALIBRATE_TARGET_MS)?;
+///
+/// **Ownership carries forward unless the caller says otherwise** ([`OwnerOnRekey`]), and this is
+/// the load-bearing half of the owner gate rather than the command-level check above it. The meta
+/// this returns is minted fresh by [`build_passphrase_meta`], which stamps the CALLING account as
+/// owner — right for a creation, and a silent takeover for a rotation. Passing `Keep` on a
+/// Passphrase source restores the old owner over that stamp, so the worst a bypassed or fallen-open
+/// gate can do is "re-keyed, ownership unchanged". The `Keep` arm is guarded on the SOURCE mode: a
+/// Device source has no owner to keep and the creator stamp stands, which is exactly
+/// `create_shareable_vault` and is why it does not regress.
+pub fn prepare_shareable(
+    old_meta: &VaultMeta,
+    passphrase: &str,
+    owner: OwnerOnRekey,
+) -> Result<(VaultMeta, Secret)> {
+    prepare_shareable_with(
+        old_meta,
+        passphrase,
+        owner,
+        kdf::calibrate(CALIBRATE_TARGET_MS),
+    )
+}
+
+/// [`prepare_shareable`] with the Argon2id cost params already chosen — split out for exactly the
+/// reason [`build_passphrase_meta`] is: the ownership rules below are what need locking down, and a
+/// real `kdf::calibrate` costs seconds per case (it derives a dozen keys to hit its 350 ms target).
+fn prepare_shareable_with(
+    old_meta: &VaultMeta,
+    passphrase: &str,
+    owner: OwnerOnRekey,
+    params: KdfParams,
+) -> Result<(VaultMeta, Secret)> {
+    let (mut meta, master) = build_passphrase_meta(passphrase, params)?;
     meta.vault_id = old_meta.vault_id.clone();
     meta.created_at = old_meta.created_at.clone();
+    match owner {
+        OwnerOnRekey::Keep if old_meta.key_mode == KeyMode::Passphrase => {
+            meta.owner_sid = old_meta.owner_sid.clone();
+            // Any earlier takeover is part of the vault's history, not of this re-key — carry it
+            // forward too, or a rotation would quietly erase the record of the last one.
+            meta.ownership_transfer = old_meta.ownership_transfer.clone();
+        }
+        // Device -> Passphrase: nothing to keep, so the creator stamp stands (see above).
+        OwnerOnRekey::Keep => {}
+        OwnerOnRekey::Claim => {
+            meta.ownership_transfer = Some(OwnershipTransfer {
+                from_sid: old_meta.owner_sid.clone(),
+                to_sid: meta.owner_sid.clone(),
+                at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    }
     Ok((meta, db_key_hex(&master)))
 }
 
@@ -1586,6 +1736,13 @@ mod tests {
         let master = [7u8; KEY_LEN];
         let mut meta = VaultMeta::new_device();
         meta.owner_sid = Some("S-1-5-21-1111111111-2222222222-3333333333-1001".into());
+        // ...and a takeover recorded on that machine, which names two SIDs of a sharing arrangement
+        // this vault has left behind. It must not ride along either.
+        meta.ownership_transfer = Some(OwnershipTransfer {
+            from_sid: Some("S-1-5-21-1111111111-2222222222-3333333333-1002".into()),
+            to_sid: meta.owner_sid.clone(),
+            at: "2026-01-02T03:04:05+00:00".into(),
+        });
         // Stamp a MAC over the owner-bearing meta, as an adopted vault would carry on disk.
         meta.meta_mac = Some(meta_mac(&meta, &master).unwrap().to_hex().to_string());
         store_meta(dir.path(), &meta).unwrap();
@@ -1594,6 +1751,10 @@ mod tests {
 
         let after = load_meta(dir.path()).unwrap().unwrap();
         assert_eq!(after.owner_sid, None, "the foreign owner SID is cleared");
+        assert_eq!(
+            after.ownership_transfer, None,
+            "and so is the foreign machine's takeover record"
+        );
         assert!(after.meta_mac.is_some(), "a fresh MAC is stamped");
         let report = authenticate_meta(dir.path(), &after, &master).unwrap();
         assert!(
@@ -1641,6 +1802,235 @@ mod tests {
              device case above is what still works there"
         );
         assert!(is_owner_given(&None, me), "the old rule still fails open");
+    }
+
+    #[test]
+    fn the_rekey_gate_refuses_only_an_unconfirmed_joiner() {
+        // All eight ownership x confirm combinations, one layer below `change_vault_passphrase`, so
+        // the two properties that make this design recoverable are locked where no vault, keychain or
+        // Windows account is needed to check them:
+        //
+        //   * exactly ONE branch refuses, and the same caller can always re-issue with `true` — so no
+        //     reachable state has nobody able to re-key;
+        //   * `Unknown` FALLS OPEN, and falls open to `Keep`. `ownership_given` returns Unknown for
+        //     every shareable vault off Windows, every vault created before ownership was recorded,
+        //     and any SID hiccup. Refusing there is the only way to reach "nobody can re-key this
+        //     vault"; claiming there is how an unowned vault gets silently taken by whoever rotates
+        //     first. Neither happens.
+        use OwnerOnRekey::{Claim, Keep};
+        use RekeyGate::{Allow, Refuse};
+        use VaultOwnership::{Device, Joined, Owned, Unknown};
+
+        assert_eq!(gate_for(Joined, false), Refuse, "the one blocking branch");
+        assert_eq!(gate_for(Joined, true), Allow(Claim), "and its escape hatch");
+
+        for ownership in [Device, Owned, Unknown] {
+            for confirm in [false, true] {
+                assert_eq!(
+                    gate_for(ownership, confirm),
+                    Allow(Keep),
+                    "{ownership:?} rotates as before and never claims, confirmed or not"
+                );
+            }
+        }
+
+        // Make-private is the same refusal with NO hatch, because it is the one action here with no
+        // way back: it re-keys to this account's device key, decrypts, and moves the folder into this
+        // profile. `delete_shared_vault` already refuses `Joined` outright for the same reason.
+        assert_eq!(private_gate_for(Joined), Refuse);
+        for ownership in [Device, Owned, Unknown] {
+            assert_eq!(
+                private_gate_for(ownership),
+                Allow(Keep),
+                "{ownership:?} may still be made private"
+            );
+        }
+    }
+
+    #[test]
+    fn re_keying_a_shared_vault_carries_its_owner_forward() {
+        // The regression test for the silent takeover, and the load-bearing half of the fix. A
+        // change-passphrase runs `prepare_shareable`, which MINTS a whole new meta — and
+        // `build_passphrase_meta` stamps the calling account as owner. Right for a creation; a silent
+        // transfer for a rotation. `Keep` must put the old owner back over that stamp, so even a
+        // bypassed or fallen-open gate can only ever produce "re-keyed, ownership unchanged".
+        let them = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let mut old = VaultMeta::new_device();
+        old.key_mode = KeyMode::Passphrase;
+        old.owner_sid = Some(them.into());
+
+        let (meta, _key) = prepare_shareable_with(
+            &old,
+            "correct horse battery staple",
+            OwnerOnRekey::Keep,
+            cheap_params(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.owner_sid.as_deref(),
+            Some(them),
+            "a rotation keeps the vault's owner — it does not stamp the account doing the rotating"
+        );
+        assert_eq!(meta.vault_id, old.vault_id, "and the vault's identity");
+        assert_eq!(
+            meta.ownership_transfer, None,
+            "a plain rotation records no transfer"
+        );
+
+        // The other half, and the reason `Unknown` can safely fall open: an UNOWNED shared vault
+        // stays unowned. Before this, whoever rotated first quietly became its owner.
+        let mut unowned = old.clone();
+        unowned.owner_sid = None;
+        let (meta, _key) = prepare_shareable_with(
+            &unowned,
+            "correct horse battery staple",
+            OwnerOnRekey::Keep,
+            cheap_params(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.owner_sid, None,
+            "no owner recorded stays no owner recorded, on every platform"
+        );
+
+        // An earlier takeover is the vault's history, not this re-key's — a rotation must not erase it.
+        let mut transferred = old.clone();
+        transferred.ownership_transfer = Some(OwnershipTransfer {
+            from_sid: Some("S-1-5-21-1111111111-2222222222-3333333333-1002".into()),
+            to_sid: Some(them.into()),
+            at: "2026-01-02T03:04:05+00:00".into(),
+        });
+        let (meta, _key) = prepare_shareable_with(
+            &transferred,
+            "correct horse battery staple",
+            OwnerOnRekey::Keep,
+            cheap_params(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.ownership_transfer, transferred.ownership_transfer,
+            "the record of the last takeover survives a later rotation"
+        );
+    }
+
+    #[test]
+    fn a_device_source_still_stamps_the_creator_and_a_claim_records_the_transfer() {
+        // `create_shareable_vault` must not regress: the `Keep` arm is guarded on the SOURCE mode, so
+        // a Device vault (which has no owner to keep) still records the account that shared it. The
+        // stale SID below is what a formerly-shareable, made-private vault could carry; it must NOT
+        // be resurrected as the new owner.
+        let stale = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let mut device = VaultMeta::new_device();
+        device.owner_sid = Some(stale.into());
+
+        let (meta, _key) = prepare_shareable_with(
+            &device,
+            "correct horse battery staple",
+            OwnerOnRekey::Keep,
+            cheap_params(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.owner_sid,
+            owner_sid_for_new_share(),
+            "sharing a device vault stamps the account doing the sharing, exactly as before"
+        );
+        assert_ne!(
+            meta.owner_sid.as_deref(),
+            Some(stale),
+            "and never inherits a stale SID from the device meta"
+        );
+        assert_eq!(
+            meta.ownership_transfer, None,
+            "a creation is not a takeover"
+        );
+
+        // A CONFIRMED takeover: the new owner is stamped and the change is written down, under the
+        // meta MAC, so it is tamper-evident rather than something the taker can quietly erase.
+        let mut shared = VaultMeta::new_device();
+        shared.key_mode = KeyMode::Passphrase;
+        shared.owner_sid = Some(stale.into());
+        let (meta, _key) = prepare_shareable_with(
+            &shared,
+            "correct horse battery staple",
+            OwnerOnRekey::Claim,
+            cheap_params(),
+        )
+        .unwrap();
+        assert_eq!(meta.owner_sid, owner_sid_for_new_share());
+        let transfer = meta
+            .ownership_transfer
+            .as_ref()
+            .expect("a claim records the transfer");
+        assert_eq!(transfer.from_sid.as_deref(), Some(stale));
+        assert_eq!(transfer.to_sid, owner_sid_for_new_share());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&transfer.at).is_ok(),
+            "the timestamp is RFC3339 so the UI can format it: {}",
+            transfer.at
+        );
+    }
+
+    /// Exactly what a build from BEFORE `ownership_transfer` existed wrote for one device vault, in
+    /// serde's declaration order (which is the order the MAC covers). A hand-written literal on
+    /// purpose: it is the one reference in this suite that does not come from the current struct, so
+    /// it is the only thing that can catch the current struct drifting away from it.
+    const PRE_FIELD_META_JSON: &str = concat!(
+        r#"{"schema":1,"vault_id":"11111111-2222-3333-4444-555555555555","#,
+        r#""created_at":"2026-01-02T03:04:05+00:00","app":"org.itsatlas.pm","key_mode":"device","#,
+        r#""db_cipher":{"cipher_page_size":4096,"kdf_iter":256000,"hmac_algorithm":"HMAC_SHA512","#,
+        r#""kdf_algorithm":"PBKDF2_HMAC_SHA512"},"#,
+        r#""markdown":{"encryption":"none","subkey":"blake3-derive-key"},"#,
+        r#""owner_sid":"S-1-5-21-1111111111-2222222222-3333333333-1001"}"#
+    );
+
+    #[test]
+    fn an_absent_ownership_transfer_costs_zero_bytes_so_an_existing_mac_still_verifies() {
+        // The compatibility pin. `meta_mac` covers the SERIALIZED meta, so a new field that always
+        // emitted would invalidate every stored MAC on disk and greet every user with "this vault's
+        // settings file was altered outside PM" on first launch after the update.
+        // `skip_serializing_if` is what stops that, and this proves it against a byte string that
+        // predates the field rather than against the struct that added it.
+        let meta: VaultMeta = serde_json::from_str(PRE_FIELD_META_JSON).unwrap();
+        assert_eq!(
+            meta.ownership_transfer, None,
+            "an absent field parses as None (the `default`), so old files still load"
+        );
+        assert_eq!(
+            serde_json::to_string(&meta).unwrap(),
+            PRE_FIELD_META_JSON,
+            "and re-serializing reproduces the pre-field bytes exactly — no new key, no reordering"
+        );
+
+        // End to end: the tag an OLD build stored, computed here straight from those pre-field bytes
+        // without going through the current struct at all, must still verify under THIS build.
+        let dir = tempfile::tempdir().unwrap();
+        let master = [9u8; KEY_LEN];
+        let subkey = blake3::derive_key(META_MAC_CONTEXT, &master);
+        let stored = blake3::keyed_hash(&subkey, PRE_FIELD_META_JSON.as_bytes());
+        let mut on_disk = meta.clone();
+        on_disk.meta_mac = Some(stored.to_hex().to_string());
+        store_meta(dir.path(), &on_disk).unwrap();
+
+        let report = authenticate_meta(dir.path(), &on_disk, &master).unwrap();
+        assert!(
+            !report.mac_mismatch,
+            "a vault that never had a takeover must not read as tampered"
+        );
+        assert!(!report.needs_warning());
+
+        // And the field really is MAC-covered once it IS set — the record cannot be erased silently.
+        let mut transferred = on_disk.clone();
+        transferred.ownership_transfer = Some(OwnershipTransfer {
+            from_sid: Some("S-1-5-21-1111111111-2222222222-3333333333-1002".into()),
+            to_sid: Some("S-1-5-21-1111111111-2222222222-3333333333-1001".into()),
+            at: "2026-01-02T03:04:05+00:00".into(),
+        });
+        assert_ne!(
+            meta_mac(&transferred, &master).unwrap(),
+            meta_mac(&on_disk, &master).unwrap(),
+            "a transfer record changes the MAC, so removing one is detectable"
+        );
     }
 
     #[test]

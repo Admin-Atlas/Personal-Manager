@@ -50,6 +50,8 @@ import { useLocalLlmStatus } from "./lib/useLocalLlmStatus";
 import { aiReady as deriveAiReady } from "./lib/aiGate";
 import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
+import { useExternalLinks } from "./lib/useExternalLinks";
+import { hydrateStoredPrefs } from "./lib/storedPrefs";
 import { useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
 
@@ -74,7 +76,6 @@ import {
   onVaultFault,
   localBetterFitNotice,
   onVaultMetaWarning,
-  openUrl,
   driveStatus,
   resumeDriveSync,
   syncDrive,
@@ -111,6 +112,30 @@ import { subscribeUntilCleanup } from "./lib/subscribe";
 import { onTeardown } from "./lib/teardown";
 import { VaultJoin } from "./components/VaultJoin";
 import { markJustJoinedVault } from "./lib/joinedVault";
+
+/**
+ * Read the user-content UI prefs — per-project milestone sorts, hidden calendars, dismissed backup
+ * banners — out of the encrypted store, and tell the already-mounted surfaces to re-read.
+ *
+ * NOT a mount effect. `AppState::conn()` errors while the vault is locked, so `get_pref` rejects
+ * until the store is open; this is called from each path that has just proved it IS open (boot past
+ * the gates, unlock, and acquiring the writer baton). `hydrateStoredPrefs` is one-shot and
+ * idempotent, so the repeats cost nothing and a rejected attempt is simply retried by the next path
+ * — a passphrase vault that boots locked would otherwise spend the whole session on defaults.
+ *
+ * The announce is what corrects surfaces that already rendered a default: Sidebar and CalendarView
+ * both subscribe to `pm:settings-changed` for the hidden-calendar set, and ProjectView does the same
+ * for the milestone prefs.
+ */
+function hydratePrefs(): void {
+  void hydrateStoredPrefs()
+    .then(() => {
+      window.dispatchEvent(new Event("pm:settings-changed"));
+    })
+    .catch(() => {
+      /* store not open — the next session-ready path retries */
+    });
+}
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -249,23 +274,9 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // External links open in the system browser. The webview can't honour an `<a target="_blank">`
-  // on its own (no shell/opener plugin), so intercept clicks on any such link app-wide and hand the
-  // URL to the OS browser via the backend (which guards to http/https). One handler covers every
-  // link — existing and future — so individual `<a>`s need no special wiring.
-  useEffect(() => {
-    function onClick(e: MouseEvent) {
-      if (e.defaultPrevented || e.button !== 0) return;
-      const anchor = (e.target as HTMLElement | null)?.closest?.("a");
-      const href = anchor?.getAttribute("href");
-      if (anchor?.target === "_blank" && href && /^https?:\/\//i.test(href)) {
-        e.preventDefault();
-        void openUrl(href).catch(() => {});
-      }
-    }
-    document.addEventListener("click", onClick);
-    return () => document.removeEventListener("click", onClick);
-  }, []);
+  // External links open in the system browser. Extracted to a hook because the briefing window's
+  // root (PopoverRoot) is not App and needs the same interception — see useExternalLinks.
+  useExternalLinks();
 
   // Idle-gate seam (F-08): treat ANY real interaction as active use, so idle-gated background jobs
   // (chat indexer, summary/title/prefs reconcile, backup, activity rollup, flag scan) back off while
@@ -364,6 +375,7 @@ export default function App() {
         }
         // Store is open past every gate — read AI readiness: a cloud key, a configured local
         // endpoint, or a prior "set up AI later" (#295). Existing keyed users pass on the key.
+        hydratePrefs();
         const ready = deriveAiReady(await aiProviderStatus());
         setAiReady(ready);
         // Defer the primed conversation's getMessages off the first-paint path (the landing view is
@@ -389,6 +401,8 @@ export default function App() {
       // vault-status failure is tolerated (null), an ai-provider-status failure surfaces via catch.
       const [vs, status] = await Promise.all([vaultStatus().catch(() => null), aiProviderStatus()]);
       setVault(vs);
+      // The locked boot skipped this — a passphrase vault reaches its stored prefs only here.
+      hydratePrefs();
       const ready = deriveAiReady(status);
       setAiReady(ready);
       // Passphrase-vault cold start also lands on Focus, so defer messages identically (F-09).
@@ -412,6 +426,8 @@ export default function App() {
         aiProviderStatus(),
       ]);
       setVaultLock(writerLock);
+      // A curtained boot returned before the gates, so this instance may not have hydrated yet.
+      hydratePrefs();
       const ready = deriveAiReady(status);
       setAiReady(ready);
       if (ready) await refreshConversations(true);

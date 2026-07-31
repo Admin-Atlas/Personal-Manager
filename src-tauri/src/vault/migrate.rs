@@ -21,7 +21,8 @@ use tauri::{AppHandle, Manager};
 
 use super::{
     access, advert, load_meta, master_from_db_key_hex, meta_path, pointer, prepare_shareable,
-    resolve, store_meta, KeyMode, MarkdownCipher, MarkdownEncryption, MarkdownPolicy, VaultMeta,
+    resolve, store_meta, KeyMode, MarkdownCipher, MarkdownEncryption, MarkdownPolicy, OwnerOnRekey,
+    VaultMeta,
 };
 use crate::error::{Error, Result};
 use crate::secret::Secret;
@@ -46,6 +47,11 @@ pub struct MigrationPlan {
     pub target_markdown: MarkdownEncryption,
     /// New vault root, or `None` to stay in place.
     pub target_location: Option<PathBuf>,
+    /// What this transition does to the vault's recorded owner. Every caller states it, and only a
+    /// confirmed takeover says anything but [`OwnerOnRekey::Keep`] — see [`prepare_shareable`].
+    /// Read ONLY on the new-passphrase path; a move / make-private / no-re-key plan reaches
+    /// [`private_meta`] or clones the old meta, both of which decide ownership for themselves.
+    pub owner: OwnerOnRekey,
 }
 
 // Manual Debug (I-03): redact the passphrase so it can never leak into a log line, while keeping the
@@ -60,6 +66,7 @@ impl std::fmt::Debug for MigrationPlan {
             )
             .field("target_markdown", &self.target_markdown)
             .field("target_location", &self.target_location)
+            .field("owner", &self.owner)
             .finish()
     }
 }
@@ -410,12 +417,15 @@ pub(crate) fn new_passphrase_for(plan: &MigrationPlan) -> Option<&str> {
 /// [`VaultMeta::new_device`]), so a stale SID a formerly-shareable vault carried is dropped here. Left
 /// in place it lingers meaninglessly and — after a cross-machine restore — could gate connector setup
 /// against a foreign account's SID (`require_vault_owner`). There is no share left to own once Device.
+/// The [`OwnershipTransfer`](super::OwnershipTransfer) record goes with it, for the same reason and in
+/// the same breath: it names two SIDs of a sharing arrangement that no longer exists.
 fn private_meta(old_meta: &VaultMeta, target_markdown: MarkdownEncryption) -> VaultMeta {
     let mut meta = old_meta.clone();
     meta.key_mode = KeyMode::Device;
     meta.kdf = None;
     meta.verifier = None;
     meta.owner_sid = None;
+    meta.ownership_transfer = None;
     // Drop the source vault's MAC so the next authenticated open stamps a fresh one (uniform with
     // `build_passphrase_meta`, which also leaves it `None`). Cloning the old tag would leave a MAC
     // that no longer covers the mutated fields — read on the next open as "altered outside PM".
@@ -437,9 +447,12 @@ fn plan_new_key_and_meta(
     match plan.target_key_mode {
         KeyMode::Passphrase => {
             match new_passphrase_for(plan) {
-                // New passphrase set: derive a new key + meta, keeping the vault id.
+                // New passphrase set: derive a new key + meta, keeping the vault id and (unless the
+                // plan says a takeover was confirmed) the vault's recorded owner.
                 // prepare_shareable also marks the Markdown encrypted (the invariant).
-                Some(pass) => Ok(prepare_shareable(old_meta, pass).map(|(m, k)| (k, m))?),
+                Some(pass) => {
+                    Ok(prepare_shareable(old_meta, pass, plan.owner).map(|(m, k)| (k, m))?)
+                }
                 // No new passphrase: a move of an already-shareable vault — keep the key.
                 None => {
                     if old_meta.key_mode != KeyMode::Passphrase {
@@ -986,6 +999,9 @@ mod tests {
             new_passphrase: pass.map(|p| zeroize::Zeroizing::new(p.to_string())),
             target_markdown: md,
             target_location: None,
+            // The default everywhere: a re-key carries its owner forward. `Claim` is reached only
+            // through the confirmed-takeover branch of `change_vault_passphrase`.
+            owner: OwnerOnRekey::Keep,
         }
     }
 
@@ -1065,6 +1081,11 @@ mod tests {
         let mut shareable = VaultMeta::new_device();
         shareable.key_mode = KeyMode::Passphrase;
         shareable.owner_sid = Some("S-1-5-21-1111111111-2222222222-3333333333-1001".into());
+        shareable.ownership_transfer = Some(super::super::OwnershipTransfer {
+            from_sid: Some("S-1-5-21-1111111111-2222222222-3333333333-1002".into()),
+            to_sid: shareable.owner_sid.clone(),
+            at: "2026-01-02T03:04:05+00:00".into(),
+        });
         shareable.markdown.encryption = MarkdownEncryption::XChaCha20Poly1305;
 
         let priv_meta = private_meta(&shareable, MarkdownEncryption::None);
@@ -1072,6 +1093,10 @@ mod tests {
         assert_eq!(
             priv_meta.owner_sid, None,
             "a device vault carries no owner SID"
+        );
+        assert_eq!(
+            priv_meta.ownership_transfer, None,
+            "and no record of a takeover of a share that no longer exists"
         );
         assert!(priv_meta.kdf.is_none());
         assert!(priv_meta.verifier.is_none());

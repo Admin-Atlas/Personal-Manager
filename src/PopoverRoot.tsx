@@ -26,6 +26,7 @@ import { closeBriefingWindow, showMainWindow } from "./lib/ipc";
 import { ThemeProvider, UserTimeProvider } from "./theme";
 import { ErrorBoundary } from "./components/ui";
 import { useEdgeResizeCursor } from "./components/ui/useEdgeResizeCursor";
+import { useExternalLinks } from "./lib/useExternalLinks";
 
 export function PopoverRoot() {
   // This window is frameless AND resizable, so on Linux it had the same invisible edges the main
@@ -34,6 +35,12 @@ export function PopoverRoot() {
   // permission granted in capabilities/briefing.json; `onResized` rides the listen permission that
   // was already there.
   useEdgeResizeCursor();
+  // The briefing body is Markdown, so `rehype-external-links` stamps `target="_blank"` on every
+  // absolute link in it — including the bare-URL autolinks remark-gfm makes from model prose. This
+  // window is not App, so it did not inherit App's interceptor and every one of those links was
+  // silently dead. `open_url` is a PM app command, not a plugin call, so capabilities/briefing.json
+  // is untouched by mounting this.
+  useExternalLinks();
   return (
     <ThemeProvider>
       <UserTimeProvider>

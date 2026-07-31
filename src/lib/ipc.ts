@@ -235,7 +235,8 @@ export const setTimeZone = (zone: string) => invoke<void>("set_time_zone", { zon
 export const getPref = (key: string) => invoke<string | null>("get_pref", { key });
 
 /** Persist a UI preference blob. The backend only accepts a fixed allowlist of keys
- *  (`appearance`, `pinboard`), so this can't touch schema-critical settings. */
+ *  (`WEBVIEW_PREFS` in settings.rs: `appearance`, `pinboard`, `dev_mode`, `map`, `project_ui`,
+ *  `milestone_ui`, `calendar_ui`, `backup_ui`), so this can't touch schema-critical settings. */
 export const setPref = (key: string, value: string) => invoke<void>("set_pref", { key, value });
 
 /** Ordered preferred chat models (first = primary). */
@@ -301,12 +302,24 @@ export const createShareableVault = (passphrase: string, targetLocation?: string
     targetLocation: targetLocation ?? null,
   });
 
-/** Change a shareable vault's passphrase: re-derive the key and re-encrypt the Markdown. */
-export const changeVaultPassphrase = (newPassphrase: string) =>
-  invoke<VaultOpOutcome>("change_vault_passphrase", { newPassphrase });
+/** Change a shareable vault's passphrase: re-derive the key and re-encrypt the Markdown.
+ *
+ *  `confirmOwnershipTransfer` is required only when `status.ownership === "joined"` — a shared vault
+ *  another Windows account created. Re-keying it locks every other account out until they're told the
+ *  new passphrase AND makes this account the recorded owner, so the backend refuses without it. It is
+ *  a deliberate speed bump against an accidental takeover, not an authorization control: pass it only
+ *  when the user has actually ticked the box. */
+export const changeVaultPassphrase = (newPassphrase: string, confirmOwnershipTransfer: boolean) =>
+  invoke<VaultOpOutcome>("change_vault_passphrase", {
+    newPassphrase,
+    confirmOwnershipTransfer,
+  });
 
 /** Make a shareable vault private again: re-key to a device key and decrypt the Markdown
- *  (also withdraws the discovery marker other accounts see). */
+ *  (also withdraws the discovery marker other accounts see). Refused outright — with no
+ *  confirmation to override it — when `status.ownership === "joined"`: it would re-key someone
+ *  else's vault to THIS account's device key and move it out of the shared folder, with no
+ *  passphrase that gets anyone back in. Leave the vault (`detachFromSharedVault`) instead. */
 export const makeVaultPrivate = () => invoke<VaultOpOutcome>("make_vault_private");
 
 /** Move the vault to another folder (e.g. a shared location), keeping key + policy.

@@ -264,6 +264,70 @@ issue comments and chat imports are all untrusted.
 never the system prompt, and keeps the system prompt byte-identical regardless of the item being
 processed.
 
+### I-19 · `safeUrl` gets the last word on a rendered URL — **Enforced**
+
+react-markdown applies `urlTransform` **after** `processor.run`, so `markdown.tsx`'s `safeUrl` runs
+*after* `rehype-sanitize`, not before it. That ordering is the whole point: the sanitizer's protocol
+allowlist bails out "allowed" on any URL with no colon, so a **schemeless** target —
+`//evil.example/x`, which the browser resolves against the page's own protocol and therefore straight
+off-origin — passes it untouched. `safeUrl` is the only layer that can see that case, and its
+protocol-relative guard must precede the `/`-prefix allowance, which would otherwise read the same
+string as same-origin-relative and hand it back verbatim.
+
+**Why.** The boundary used to justify itself with its own comment — "the sanitizer's protocol
+allowlist above is what actually neutralises a hostile href" — which is false for exactly the class
+no allowlist can match. The external-link interceptor is not a second net either: it keys on a URL
+that *has* a scheme (`is-absolute-url` rejects `//host`), so it never sees one.
+
+**Co-signers.** Anything added to `REHYPE_PLUGINS` goes *before* `rehypeSanitize`, which stays last.
+Any edit to `safeUrl` keeps the `[/\\][/\\]` guard ahead of every allowance below it. A new surface
+that renders ingested or model-authored content renders it through `<Markdown>` rather than
+reproducing a `urlTransform` of its own. `markdown.test.ts` pins the rule and the `/path`
+counter-case; `markdown.render.test.tsx` pins the resulting `href` and `src` at the DOM, so a
+regression is a red test rather than a review miss.
+
+### I-20 · A re-key carries the vault's owner forward; only a confirmed transfer changes it — **Enforced**
+
+`vault::prepare_shareable` mints a **whole new** `VaultMeta`, and `build_passphrase_meta` stamps
+`owner_sid` with the account doing the minting. Until `OwnerOnRekey` existed that stamp simply stood,
+so any account that could unlock a shared vault became its recorded owner by changing the passphrase
+— silently, with no notice to anyone. Every caller now states which it means: `Keep` copies the
+source meta's `owner_sid` and `ownership_transfer` forward on a Passphrase source, and `Claim` —
+reachable only from a takeover the user confirmed — stamps the new owner and records an
+`OwnershipTransfer` in the MAC-covered metadata. Ownership is never acquired as a side effect of
+minting metadata.
+
+**Why.** The carry-forward, not the gate, is what makes the ownership record worth anything.
+`vault_ownership` returns `Unknown` for every shareable vault off Windows, for every vault created
+before ownership was recorded, and for any SID-lookup hiccup — and the gate deliberately falls open
+there, because a vault nobody can re-key is the one unrecoverable state in this design. If `Keep` did
+not preserve the owner, that fall-open *would be* the takeover. With it, the worst a bypassed or
+fallen-open gate can produce is "re-keyed, ownership unchanged".
+
+**Co-signers.** A new path that mints a `VaultMeta` passes an explicit `OwnerOnRekey` and defaults to
+`Keep`; nothing reaches `Claim` except an action the user confirmed. A path that sheds sharing
+(`private_meta`, `normalize_adopted_meta`) clears `ownership_transfer` wherever it clears
+`owner_sid`, or the record outlives the ownership it describes. The gate decisions stay in the pure
+`gate_for` / `private_gate_for`, one layer below the command, where the whole rule is table-tested
+without a vault, a keychain or a Windows account.
+
+### I-21 · One conversion redacts a request URL, and no call site formats a raw `reqwest::Error` — **Held**
+
+`impl From<reqwest::Error> for Error` in `error.rs` is the single place a failing request's URL is
+reduced to scheme + host + port (`redact_url`), and `Error::Http` holds the error as `#[source]`
+rather than `#[from]` precisely so that conversion cannot be short-circuited by a `?`. A call site
+that formats the error itself — `e.to_string()`, or `format!("{e}")` into a `LocalFailure.detail` or
+a warning string — puts the path, query, fragment and any userinfo straight back.
+
+**Why.** Several of PM's request URLs *are* the secret: a private iCal feed URL and a Drive
+resumable-upload session both authorise by URL, and `secret.rs` already names ICS bearer URLs as in
+scope. These strings are user-visible — a toast, a connector's error field, a local-AI failure detail
+— so a leak here is a leak into wherever the user pastes them.
+
+**Co-signers.** A new HTTP call site lets `?` do the conversion. If it genuinely needs to build its
+own message, it redacts through `error::redact_url` first and never interpolates the
+`reqwest::Error` whole. Nothing re-adds `#[from]` to `Error::Http`.
+
 ---
 
 ## 6. Build tooling and dependencies

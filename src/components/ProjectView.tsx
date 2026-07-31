@@ -109,6 +109,22 @@ export function ProjectView({
   // needs every row.
   const [showCompleted, setShowCompleted] = useState(readShowCompletedMilestones);
   useEffect(() => writeShowCompletedMilestones(showCompleted), [showCompleted]);
+  // Both prefs now live in the encrypted store, which can only be read once the vault is open — so
+  // a view mounted before hydration lands (the common case at boot) started on the defaults. App
+  // announces on `pm:settings-changed` when the real values arrive; follow it, exactly as Sidebar
+  // and CalendarView do for the hidden-calendar set. The mount-effect write above cannot stamp its
+  // default over a stored value in the meantime: `writeStored` drops every pre-hydration write.
+  useEffect(() => {
+    const sync = () => {
+      setMsSort((cur) => {
+        const next = readMilestoneSort(project);
+        return next.key === cur.key && next.dir === cur.dir ? cur : next;
+      });
+      setShowCompleted(readShowCompletedMilestones());
+    };
+    window.addEventListener("pm:settings-changed", sync);
+    return () => window.removeEventListener("pm:settings-changed", sync);
+  }, [project]);
   // The right panel's width is a fraction of the window (drag the left edge to resize, stays
   // proportional on window resize), clamped so it can't get so narrow the content scrolls.
   const {

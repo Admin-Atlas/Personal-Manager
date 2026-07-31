@@ -28,6 +28,14 @@ const AUTH_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth2/v2.
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 /// Microsoft Graph base for the OneDrive connector's API calls (drive items, delta, content, /me).
 pub const GRAPH_API: &str = "https://graph.microsoft.com/v1.0";
+/// The Graph service roots PM may hand an account bearer to. PM authorises against the GLOBAL
+/// `/common` authority (see [`AUTH_ENDPOINT`]) and builds every URL from [`GRAPH_API`], and a
+/// national-cloud token is not interchangeable with a global one, so `graph.microsoft.com` is the
+/// only host that can legitimately serve one of PM's continuation links. The other documented
+/// roots — `graph.microsoft.us` (US Gov L4/GCC High), `dod-graph.microsoft.us` (US Gov L5/DoD),
+/// `microsoftgraph.chinacloudapi.cn` (China 21Vianet) — belong here only if `GRAPH_API` ever
+/// becomes configurable. Source: Microsoft Learn, "Microsoft Graph national cloud deployments".
+const GRAPH_HOSTS: &[&str] = &["graph.microsoft.com"];
 /// Read-only OneDrive scope + `offline_access` (for the refresh token) + `User.Read` (to learn which
 /// account the token grants, the Graph equivalent of Drive's `about`). Space-separated, as Graph
 /// expects. `Files.Read` covers reading file metadata AND content (index-only needs each body to
@@ -176,11 +184,43 @@ pub async fn me(token: &Token) -> Result<(String, String)> {
     Ok((email, name))
 }
 
+/// Whether `url` is one PM may attach an account bearer to: https, no userinfo, and an EXACT
+/// (case-insensitive) match on an allow-listed Graph service root ([`GRAPH_HOSTS`]). Exact host
+/// equality, never a `.microsoft.com` suffix test — a suffix rule admits every Microsoft-hosted
+/// subdomain, including user-content ones like `*.sharepoint.com`'s siblings.
+///
+/// This exists because six call sites (OneDrive delta/children/picker, Outlook calendar list and
+/// `calendarView`) follow an absolute `@odata.nextLink` / `@odata.deltaLink` that came out of a
+/// provider response BODY, i.e. data, not configuration.
+pub(crate) fn is_graph_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.host_str()
+                .is_some_and(|h| GRAPH_HOSTS.iter().any(|g| h.eq_ignore_ascii_case(g)))
+    })
+}
+
 /// Shared authorised GET: proactive refresh a minute before expiry, a single 401-retry-after-refresh
 /// (the backstop for a token revoked or expired early), and a single bounded `Retry-After` retry on a
 /// 429 throttle (Graph throttles initial enumerations harder than Drive). Returns the raw response so
 /// the caller can decode it as JSON or bytes.
+///
+/// The bearer is attached only for an allow-listed Graph host. An unexpected host is followed
+/// WITHOUT it rather than refused outright, so a surprise Microsoft CDN degrades sync instead of
+/// breaking it; the account then flags `error` on the inevitable 401 rather than silently shipping
+/// a `Files.Read`-scoped token to whoever the response body named. Note the gate applies to the
+/// INITIAL URL only — reqwest already strips `Authorization` across a cross-host redirect, which is
+/// exactly what keeps the `/content` 302 to `*.sharepoint.com` / `*.files.1drv.com` both working
+/// and safe, so redirect policy must not be touched here.
 async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response> {
+    if !is_graph_url(url) {
+        // Skips `load_token`/`do_refresh` entirely: a poisoned link costs no keychain read and
+        // can never trigger a refresh. Still DB-free, so rule #4 is unaffected.
+        eprintln!("microsoft: following a non-Graph link unauthenticated");
+        return Ok(http()?.get(url).send().await?);
+    }
     let client_id = client_id()?;
     let mut token = load_token(token_key)?;
 
@@ -399,5 +439,39 @@ mod tests {
         assert!(url.contains("state=state-abc"));
         // Public client — a secret must never appear in the authorize URL.
         assert!(!url.contains("client_secret"));
+    }
+
+    #[test]
+    fn is_graph_url_accepts_only_the_allow_listed_service_root() {
+        // The shapes PM actually follows: a delta/continuation link off the Graph root, and the
+        // same host in any casing (a hostile body can vary case freely).
+        assert!(is_graph_url(
+            "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=X"
+        ));
+        assert!(is_graph_url("https://GRAPH.MICROSOFT.COM/v1.0/me"));
+    }
+
+    #[test]
+    fn is_graph_url_rejects_the_near_miss_set() {
+        for bad in [
+            // A suffix test would admit this one — hence exact host equality.
+            "https://graph.microsoft.com.evil.example/v1.0/me",
+            // The allow-listed host present only as data inside someone else's URL.
+            "https://evil.example/v1.0/me/drive?u=https://graph.microsoft.com",
+            "http://graph.microsoft.com/v1.0/me", // cleartext
+            "https://user:pw@graph.microsoft.com/v1.0/me", // userinfo
+            "https://graph.microsoft.us/v1.0/me", // a real Graph root PM is not configured for
+            "not a url at all",
+            "",
+        ] {
+            assert!(!is_graph_url(bad), "should have been rejected: {bad}");
+        }
+    }
+
+    /// Drift pin: changing `GRAPH_API` without updating `GRAPH_HOSTS` would silently
+    /// un-authenticate every OneDrive and Outlook-calendar call rather than fail loudly.
+    #[test]
+    fn the_graph_base_url_is_itself_allow_listed() {
+        assert!(is_graph_url(GRAPH_API));
     }
 }

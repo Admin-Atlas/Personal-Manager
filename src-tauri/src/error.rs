@@ -92,8 +92,11 @@ pub enum Error {
     #[error("keychain error: {0}")]
     Keyring(#[from] keyring::Error),
 
+    /// A transport failure. Deliberately **not** `#[from]`: the hand-written
+    /// `From<reqwest::Error>` below is the one place a request URL is redacted, and no
+    /// call site may format a raw `reqwest::Error` instead (see [`redact_url`]).
     #[error("network error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[source] reqwest::Error),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -121,6 +124,39 @@ impl Error {
             Error::Vault(f) => f.code == VaultFaultCode::Denied,
             _ => false,
         }
+    }
+}
+
+/// Reduce a URL to the only part that is safe to show or log: scheme + host (+ a
+/// non-default port). A URL can BE the credential — a private iCal feed link
+/// (`/published/2/<token>`), a Drive resumable-upload session URI (`upload_id=…`), a Graph
+/// delta cursor (`token=…`) — with the secret in the path or the query, and `url::Url`'s
+/// Display prints userinfo verbatim on top of that. Everything after the authority is
+/// dropped. Mirrors `calendar::default_label`, which already treats the host as a feed
+/// URL's public projection.
+pub fn redact_url(url: &reqwest::Url) -> String {
+    // `Url::port()` is `None` for a scheme's default port, so `:443` never shows up and a
+    // deliberate `:8443` does.
+    match url.port() {
+        Some(p) => format!("{}://{}:{p}", url.scheme(), url.host_str().unwrap_or("?")),
+        None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("?")),
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    /// The ONE conversion every `?` on a `reqwest::Error` in the backend passes through.
+    /// reqwest appends `" for url ({url})"` to its own Display verbatim, so redacting the
+    /// attached URL here covers every current *and* future network call site at a stroke —
+    /// a per-call-site fix would leave the class open.
+    fn from(e: reqwest::Error) -> Self {
+        let Some(safe) = e.url().map(redact_url) else {
+            return Error::Http(e);
+        };
+        Error::Http(match reqwest::Url::parse(&safe) {
+            Ok(u) => e.without_url().with_url(u),
+            // Never panic inside an error path: an unparseable authority just loses the host.
+            Err(_) => e.without_url(),
+        })
     }
 }
 
@@ -208,6 +244,67 @@ mod tests {
         // Every other variant keeps the historical bare-string rejection shape.
         let s = serde_json::to_value(Error::Other("plain".into())).unwrap();
         assert_eq!(s, serde_json::json!("plain"));
+    }
+
+    #[test]
+    fn redact_url_keeps_only_scheme_host_and_port() {
+        let url = reqwest::Url::parse(
+            "https://user:pw@p61-caldav.icloud.com:8443/published/2/SECRET-TOKEN?upload_id=ALSO-SECRET#frag",
+        )
+        .unwrap();
+        let out = redact_url(&url);
+        assert_eq!(out, "https://p61-caldav.icloud.com:8443");
+        // The whole point: none of the bearer material survives.
+        for leaked in [
+            "SECRET-TOKEN",
+            "ALSO-SECRET",
+            "upload_id",
+            "pw",
+            "published",
+        ] {
+            assert!(!out.contains(leaked), "redact_url leaked {leaked}: {out}");
+        }
+        // A default port is not noise the user needs; a deliberate one is.
+        let plain = reqwest::Url::parse("https://graph.microsoft.com:443/v1.0/me?token=X").unwrap();
+        assert_eq!(redact_url(&plain), "https://graph.microsoft.com");
+    }
+
+    /// A deterministic offline transport failure: nothing listens on loopback port 1, so this
+    /// needs no DNS and no network. Exercises the CONVERSION, not just the helper — an
+    /// `error.rs` change that fixes only `redact_url` would still leak through `?`.
+    fn offline_send_error() -> reqwest::Error {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("blocking client builds")
+            .get("https://127.0.0.1:1/published/2/SECRET-TOKEN?upload_id=ALSO-SECRET")
+            .send()
+            .expect_err("nothing listens on loopback port 1")
+    }
+
+    #[test]
+    fn http_error_display_keeps_the_host_and_drops_the_secret() {
+        let raw = offline_send_error();
+        // Guard the fixture: if reqwest ever stops attaching the URL, the test would pass
+        // vacuously and the redaction would go unexercised.
+        assert!(
+            raw.to_string().contains("SECRET-TOKEN"),
+            "fixture no longer carries a URL, so it proves nothing: {raw}"
+        );
+        let msg = Error::from(raw).to_string();
+        assert!(msg.contains("127.0.0.1"), "host should survive: {msg}");
+        assert!(!msg.contains("SECRET-TOKEN"), "path leaked: {msg}");
+        assert!(!msg.contains("upload_id"), "query leaked: {msg}");
+    }
+
+    #[test]
+    fn http_error_serializes_to_the_webview_without_the_url_secret() {
+        // The literal rejection payload the webview receives for a network failure.
+        let v = serde_json::to_value(Error::from(offline_send_error())).unwrap();
+        let s = v.as_str().expect("non-Vault variants stay bare strings");
+        assert!(s.contains("127.0.0.1"), "host should survive: {s}");
+        assert!(!s.contains("SECRET-TOKEN"), "path leaked: {s}");
+        assert!(!s.contains("upload_id"), "query leaked: {s}");
     }
 
     #[test]

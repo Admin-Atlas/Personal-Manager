@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.0-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Links in the briefing window work again. The little always-on-top briefing renders the same Markdown as the main window but never got the piece that opens a link in your browser, so every link in it was silently dead.",
+      "If you share a vault between two accounts on one PC, changing the passphrase no longer quietly makes you its owner. PM now asks you to confirm you're taking over first, and records that it happened so it's visible rather than silent — and \"Make private\" is refused outright for a vault that isn't yours, because that one re-keys it to your account alone and moves it, with no way back in for anyone else.",
+      "Your per-project milestone sort, the calendars you've hidden and the backup notices you've dismissed now live in PM's encrypted store instead of the browser's local storage. That means they're encrypted, they're removed when you remove PM's data, and — the part you'll actually notice — they survive a backup and restore, and moving to a new machine. Until now they quietly didn't.",
+      "Error messages no longer print the whole address of something private. A calendar feed's secret URL or an upload session link could appear in full in an error you might screenshot or paste into a bug report; PM now keeps just the site name.",
+      "A few quieter hardening fixes: a link in an imported document can no longer dodge PM's URL checks by leaving off the http:// part; PM won't send your OneDrive credentials to an address that isn't Microsoft's, even if OneDrive asks it to; a local AI address is re-checked at the moment PM calls it rather than only when you saved it; the text of your calendar events is no longer placed among PM's own instructions when it decides what a note is about; and reading a photo now checks it really is a photo first.",
+    ],
+  },
+  {
     version: "3.113.5-alpha",
     date: "2026-07-31",
     highlights: [

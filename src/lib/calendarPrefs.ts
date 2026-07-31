@@ -8,6 +8,7 @@
 // `pm.focus.sort` localStorage pattern in FocusView.
 
 import { isValidTimeZone } from "../theme/timezones";
+import { readStored, writeStored } from "./storedPrefs";
 
 /** The calendar's view modes. Day = the N-day time grid with N=1 (see PR2). */
 export type CalendarViewMode = "month" | "week" | "day" | "year" | "agenda";
@@ -22,8 +23,9 @@ export type CalendarRange = "work" | "day" | "full";
 export const CALENDAR_RANGES: readonly CalendarRange[] = ["work", "day", "full"];
 
 const VIEW_KEY = "pm.calendar.view";
-const HIDDEN_KEY = "pm.calendar.hidden";
 const RANGE_KEY = "pm.calendar.range";
+/** The hidden set's home in the encrypted store — NOT a localStorage key. */
+const PREF_KEY = "calendar_ui";
 
 /** The last view the user had open, clamped to `allowed` (so a value from a newer build that isn't
  *  available yet falls back to the first allowed mode). */
@@ -50,28 +52,23 @@ export function writeView(view: CalendarViewMode): void {
   }
 }
 
-/** The set of calendar ids the user has hidden from the aggregator (visibility, not sync). */
+/** The set of calendar ids the user has hidden from the aggregator (visibility, not sync).
+ *
+ *  The ONE key in this module that is user content, not view state: a Google/Outlook calendar id is
+ *  routinely the account's email address. It therefore lives in the encrypted `settings` table under
+ *  `calendar_ui` (see storedPrefs.ts) while the other eight keys here — view, range, roster fold,
+ *  zones, bounds, day count, openOn and the cursor — stay in localStorage, which is what they are
+ *  for. */
 export function readHidden(): Set<string> {
-  try {
-    const raw = localStorage.getItem(HIDDEN_KEY);
-    if (raw) {
-      const arr: unknown = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        return new Set(arr.filter((x): x is string => typeof x === "string"));
-      }
-    }
-  } catch {
-    // Unreadable/absent — nothing hidden.
+  const arr = readStored(PREF_KEY).hidden;
+  if (Array.isArray(arr)) {
+    return new Set(arr.filter((x): x is string => typeof x === "string"));
   }
   return new Set();
 }
 
 export function writeHidden(hidden: Set<string>): void {
-  try {
-    localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden]));
-  } catch {
-    // Best-effort.
-  }
+  writeStored(PREF_KEY, { hidden: [...hidden] });
   // Two surfaces render this set at once — the sidebar block and the calendar grid — and the sidebar
   // never unmounts, so a tick in one has to reach the other. The repo's established cross-surface
   // signal rather than a second bespoke one (mirrors focusPrefs / briefingPrefs).

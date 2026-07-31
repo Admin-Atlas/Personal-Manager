@@ -282,6 +282,92 @@ fn class_rank(c: EndpointClass) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The CALL-TIME posture gate — the same verdict `set_local_llm_endpoint` enforces at save time,
+// re-asked at the I/O edge because DNS can move under a stored hostname.
+// ---------------------------------------------------------------------------------------------
+
+/// The one wording every call-time refusal uses — the four endpoint commands and the chat/background
+/// gateway alike — so a user who hits this sees one explanation rather than five phrasings. The
+/// save-time message in [`set_local_llm_endpoint`] stays separate because "won't save" is not what
+/// happened here.
+pub(crate) const CALL_TIME_REFUSAL: &str =
+    "won't send your token and chats in the clear to a public address — this endpoint's address now \
+     resolves to a public host over http. Use https, or a server on your own machine or private \
+     network.";
+
+/// Re-apply the save-time posture at CALL time. Posture is a property of the RESOLVED address, but
+/// it is only ever decided when the endpoint is saved: a stored hostname's DNS answer is free to
+/// change afterwards (a moved host, a recycled name, a rebinding record), and every path then sends
+/// the bearer token — and on the chat paths the full chat text — to whatever it now points at.
+///
+/// Refuses ONLY `(http, public)` — bit-for-bit the verdict `set_local_llm_endpoint` enforces at the
+/// storage boundary, via the same [`posture_for`]. Loopback, LAN and tunnelled (CGNAT/Tailscale)
+/// endpoints, and every https endpoint anywhere, behave exactly as before: no policy change, so no
+/// user breakage.
+///
+/// A resolution FAILURE is deliberately NOT a refusal. Failing open on "don't know" and closed only
+/// on a positive public-cleartext classification is load-bearing: making a DNS blip a refusal would
+/// cost a local-then-cloud user their cloud fallback, and an endpoint that truly cannot be resolved
+/// fails as `Refused` a moment later anyway. Do not collapse that asymmetry in a tidy-up.
+///
+/// Takes only the base URL — never the circuit breaker. A refusal is a verdict on the ADDRESS, not
+/// evidence the host is dead, so it must never be recorded as a strike.
+///
+/// **This NARROWS the window; it does not close it.** `resolve_endpoint_class` runs its own
+/// lookup and reqwest performs a second, independent one when the request is actually sent, so the
+/// gap shrinks from "unbounded since the endpoint was saved" to "between our lookup and reqwest's".
+/// Closing it needs a pinned-IP resolver and per-host clients.
+pub(crate) async fn endpoint_refused_now(base_url: &str) -> bool {
+    let Ok((scheme, host, port)) = split_scheme_host_port(base_url) else {
+        return false;
+    };
+    // An IP literal short-circuits inside `resolve_endpoint_class` with no DNS at all, so the
+    // overwhelmingly common `http://127.0.0.1:11434` case costs nothing per call.
+    let Ok(class) = resolve_endpoint_class(&host, port).await else {
+        return false;
+    };
+    posture_for(&scheme, class) == PostureVerdict::RefusePublicCleartext
+}
+
+/// The configured endpoint as the call-time gate sees it.
+enum Endpoint {
+    /// No base URL is configured.
+    Unconfigured,
+    /// Configured, gate passed: the base URL and the optional bearer token.
+    Ready(String, Option<crate::secret::Secret>),
+    /// Configured, but its address resolves public over cleartext right now — nothing may be sent.
+    Refused,
+}
+
+/// The shared prologue for every command that talks to the configured endpoint: read the stored base
+/// URL, apply the call-time gate, then fetch the token. One helper rather than four near-identical
+/// prologues, so a future caller inherits the gate by construction rather than by review — while
+/// each caller still decides what a refusal MEANS for it (a hard error for an explicit user action,
+/// a quiet degrade for a best-effort readout).
+///
+/// The token is fetched only AFTER the gate passes, so a refused endpoint costs no keychain read.
+///
+/// Ordering is load-bearing (rule #4 — the DB mutex is not reentrant): the `state.conn()` guard is
+/// scoped to the read block and dropped before the first `.await`. Never widen that block.
+async fn configured_endpoint(app: &AppHandle) -> Result<Endpoint> {
+    let base_url = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
+    };
+    let Some(base_url) = base_url else {
+        return Ok(Endpoint::Unconfigured);
+    };
+    if endpoint_refused_now(&base_url).await {
+        return Ok(Endpoint::Refused);
+    }
+    Ok(Endpoint::Ready(
+        base_url,
+        secrets::get_local_llm_endpoint_token()?,
+    ))
+}
+
 /// Whether a loopback server is ALSO reachable on this machine's LAN address (i.e. bound to
 /// 0.0.0.0). Best-effort: if the LAN address can't be determined, report not-exposed.
 async fn probe_lan_exposure(scheme: &str, port: u16, token: Option<&str>) -> bool {
@@ -441,15 +527,13 @@ fn role_routing_key(role: &str) -> Result<&'static str> {
 /// friendly message if nothing is configured or it can't be reached.
 #[tauri::command]
 pub async fn list_local_llm_models(app: AppHandle) -> Result<Vec<ServedModel>> {
-    let base_url = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
+    let (base_url, token) = match configured_endpoint(&app).await? {
+        Endpoint::Ready(base_url, token) => (base_url, token),
+        Endpoint::Unconfigured => {
+            return Err(Error::Other("no local endpoint is configured".into()))
+        }
+        Endpoint::Refused => return Err(Error::Other(CALL_TIME_REFUSAL.into())),
     };
-    let Some(base_url) = base_url else {
-        return Err(Error::Other("no local endpoint is configured".into()));
-    };
-    let token = secrets::get_local_llm_endpoint_token()?;
     let ids = openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
         .await
         .map_err(|f| {
@@ -476,15 +560,13 @@ pub async fn pull_local_model(
     model: String,
     on_event: tauri::ipc::Channel<openai_compat::PullProgress>,
 ) -> Result<()> {
-    let base_url = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
+    let (base_url, token) = match configured_endpoint(&app).await? {
+        Endpoint::Ready(base_url, token) => (base_url, token),
+        Endpoint::Unconfigured => {
+            return Err(Error::Other("no local endpoint is configured".into()))
+        }
+        Endpoint::Refused => return Err(Error::Other(CALL_TIME_REFUSAL.into())),
     };
-    let Some(base_url) = base_url else {
-        return Err(Error::Other("no local endpoint is configured".into()));
-    };
-    let token = secrets::get_local_llm_endpoint_token()?;
     openai_compat::pull_ollama_model(&base_url, &model, token.as_ref().map(|s| s.expose()), |p| {
         let _ = on_event.send(p);
     })
@@ -517,12 +599,12 @@ pub struct LocalLlmStatus {
 /// one `/v1/models` reachability probe so a fast UI poll can't hammer the user's server.
 #[tauri::command]
 pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
-    let base_url = {
+    let configured = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
+        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?.is_some()
     };
-    let Some(base_url) = base_url else {
+    if !configured {
         return Ok(LocalLlmStatus {
             configured: false,
             reachable: false,
@@ -530,7 +612,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             cooldown_remaining_s: 0,
             probed_now: false,
         });
-    };
+    }
 
     let (in_cooldown, cooldown_remaining_s) = {
         let state = app.state::<AppState>();
@@ -547,11 +629,19 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         let state = app.state::<AppState>();
         state.local_ai.probe_debounce_elapsed()
     };
+    // The prologue (and with it the call-time posture gate) runs only INSIDE the debounce: the gate
+    // may cost a DNS lookup for a hostname endpoint, and this command is polled by the UI far more
+    // often than it probes. A refused endpoint reports unreachable rather than erroring — the status
+    // chip must keep rendering — and no token is fetched or sent.
     let reachable = if probe_now {
-        let token = secrets::get_local_llm_endpoint_token()?;
-        openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
-            .await
-            .is_ok()
+        match configured_endpoint(&app).await? {
+            Endpoint::Ready(base_url, token) => {
+                openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
+                    .await
+                    .is_ok()
+            }
+            Endpoint::Refused | Endpoint::Unconfigured => false,
+        }
     } else {
         // No fresh probe this call; report "not in cooldown" as the best available liveness proxy.
         !in_cooldown
@@ -798,16 +888,15 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
             )
     });
 
-    // Models the configured endpoint already serves (best-effort — no endpoint is fine).
-    let base_url = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
-    };
-    let endpoint_configured = base_url.is_some();
+    // Models the configured endpoint already serves (best-effort — no endpoint is fine). A REFUSED
+    // endpoint degrades the same way an unreachable one already does: the tab still renders its
+    // hardware fit, catalog and on-disk models, only the served-models probe is skipped. Failing the
+    // whole command because the endpoint's address moved would be a far bigger regression than the
+    // missing section.
+    let endpoint = configured_endpoint(&app).await?;
+    let endpoint_configured = !matches!(endpoint, Endpoint::Unconfigured);
     let mut installed = Vec::new();
-    if let Some(base_url) = base_url {
-        let token = secrets::get_local_llm_endpoint_token()?;
+    if let Endpoint::Ready(base_url, token) = endpoint {
         if let Ok(models) =
             openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose())).await
         {
@@ -1247,6 +1336,57 @@ mod tests {
                 resolve_endpoint_class("8.8.8.8", 443).await.unwrap(),
                 EndpointClass::PublicRemote
             );
+        });
+    }
+
+    /// The call-time gate over IP literals (no DNS, so no network). This is the mechanical form of
+    /// the "same policy, just asked later" claim: every shape a real setup can have — loopback,
+    /// LAN, Tailscale/CGNAT, and https anywhere — is left alone, and the single combination
+    /// `set_local_llm_endpoint` already refuses at save time is the only one refused here.
+    /// `local_slot`'s `http_posture_refuses_only_public_cleartext` pins the POLICY; this pins that
+    /// the same policy now runs at the I/O edge.
+    #[test]
+    fn endpoint_refused_now_refuses_only_public_cleartext() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(
+                endpoint_refused_now("http://8.8.8.8:11434").await,
+                "cleartext to a public address is the one refusal"
+            );
+            for allowed in [
+                "http://127.0.0.1:11434",
+                "http://[::1]:11434",
+                "http://192.168.1.50:8080",
+                "http://100.100.3.4:8080", // Tailscale's CGNAT range
+                "https://8.8.8.8",         // https anywhere is fine
+            ] {
+                assert!(
+                    !endpoint_refused_now(allowed).await,
+                    "must keep working exactly as before: {allowed}"
+                );
+            }
+        });
+    }
+
+    /// Fail OPEN on anything that cannot be classified. This is the property protecting a
+    /// local-then-cloud user's fallback: making a DNS hiccup a refusal would silently cost them
+    /// their cloud arm, while an endpoint that genuinely cannot be reached already fails as
+    /// `Refused` moments later. The asymmetry — open on "don't know", closed only on a POSITIVE
+    /// public-cleartext verdict — is deliberate, and a tidy-up that collapses it reintroduces the
+    /// bug this test names.
+    #[test]
+    fn an_unclassifiable_endpoint_is_not_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // No scheme: `split_scheme_host_port` errors before any lookup is attempted.
+            assert!(!endpoint_refused_now("localhost:11434").await);
+            // A host the resolver rejects outright — resolution FAILS, and a failure is not a
+            // refusal. (Rejected locally by getaddrinfo, so this issues no DNS query.)
+            assert!(!endpoint_refused_now("http://not a host:11434").await);
         });
     }
 }

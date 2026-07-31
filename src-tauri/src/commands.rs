@@ -266,6 +266,11 @@ pub struct VaultStatus {
     /// folds away and a delete button needs. Drives hiding "Delete shared vault" for a joiner, and
     /// warning on it when ownership can't be established.
     pub ownership: vault::VaultOwnership,
+    /// The last CONFIRMED ownership takeover this vault records, if any — from/to SID and when. Read
+    /// by the Vault card, which states it in one line. The field exists so the record is not
+    /// write-only: `prepare_shareable` writes it under the meta MAC, and a stored field nothing
+    /// displays is a record nobody can act on.
+    pub ownership_transfer: Option<vault::OwnershipTransfer>,
     /// "This vault's settings file was altered outside PM", when the last open said so. The same
     /// sentence `vault://meta-warning` carries — repeated here because the boot open happens before
     /// any webview is listening, and because the condition now PERSISTS: a failed integrity check is
@@ -382,6 +387,7 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
             .as_ref()
             .map(vault::vault_ownership)
             .unwrap_or(vault::VaultOwnership::Device),
+        ownership_transfer: meta.as_ref().and_then(|m| m.ownership_transfer.clone()),
         meta_warning: state.meta_warning(),
     })
 }
@@ -479,6 +485,9 @@ pub async fn create_shareable_vault(
         new_passphrase: Some(passphrase),
         target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
         target_location: target_location.map(std::path::PathBuf::from),
+        // Device -> Passphrase. `Keep` is guarded on the SOURCE mode inside `prepare_shareable`, so a
+        // device vault has nothing to keep and this account is stamped as the creator, as it always was.
+        owner: vault::OwnerOnRekey::Keep,
     };
     let app2 = app.clone();
     let mut warnings =
@@ -505,10 +514,22 @@ fn engage_or_warn(app: &AppHandle, warnings: &mut Vec<String>) {
 /// Change a shareable vault's passphrase: re-derive the key (new salt + verifier),
 /// re-key the store, and re-encrypt the Markdown under the new subkey — one atomic,
 /// crash-recoverable migration. Only valid for an already-shareable vault.
+///
+/// **Refused for a vault another account on this PC created, unless the caller confirms a takeover.**
+/// A re-key mints whole new metadata, so before [`vault::OwnerOnRekey`] existed it also re-stamped the
+/// rotating account as owner — any joiner became the recorded owner with one button press and no
+/// notice to anyone. The ownership decision is made HERE, before a key is derived and long before
+/// `store_meta` commits it (`vault-acl-verify-then-commit`), and `confirm_ownership_transfer` is the
+/// hatch that keeps the refusal recoverable: an owner whose SID changed, or a vault whose owner has
+/// left, is one confirmed rotation away from working again. It is a webview-supplied boolean, so it is
+/// a speed bump against ACCIDENT and not an authorization control — anyone who can unlock the vault
+/// can send `true`. What it buys is that a takeover is deliberate, recorded and visible instead of
+/// silent, and (via `Keep`) that no other path can claim ownership as a side effect at all.
 #[tauri::command]
 pub async fn change_vault_passphrase(
     app: AppHandle,
     new_passphrase: String,
+    confirm_ownership_transfer: bool,
 ) -> Result<VaultOpOutcome> {
     // I-03: wipe the passphrase plaintext from memory on return.
     let new_passphrase = zeroize::Zeroizing::new(new_passphrase);
@@ -517,7 +538,7 @@ pub async fn change_vault_passphrase(
     }
     // M-4: strength floor on the new passphrase (create/change only — the unlock path is untouched).
     vault::kdf::validate_passphrase_strength(&new_passphrase)?;
-    {
+    let owner = {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
             .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
         if meta.key_mode != vault::KeyMode::Passphrase {
@@ -525,12 +546,25 @@ pub async fn change_vault_passphrase(
                 "this vault has no passphrase; make it shareable first".into(),
             ));
         }
-    }
+        match vault::gate_for(vault::vault_ownership(&meta), confirm_ownership_transfer) {
+            vault::RekeyGate::Refuse => {
+                return Err(Error::Other(
+                    "This shared vault was created by another account on this PC. Changing the \
+                     passphrase locks every other account out until you give them the new one, and \
+                     makes this account the vault's owner. Ask its owner to change it — or confirm \
+                     you're taking the vault over."
+                        .into(),
+                ));
+            }
+            vault::RekeyGate::Allow(owner) => owner,
+        }
+    };
     let plan = vault::migrate::MigrationPlan {
         target_key_mode: vault::KeyMode::Passphrase,
         new_passphrase: Some(new_passphrase),
         target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
         target_location: None,
+        owner,
     };
     let app2 = app.clone();
     let mut warnings =
@@ -556,6 +590,15 @@ fn needs_move_home(vault_root: &std::path::Path, data_dir: &std::path::Path) -> 
 /// still encrypted — so the decrypt never writes plaintext where another account could read
 /// it. Also withdraws the discovery marker and linked-accounts sidecar (inside the
 /// migration). Reverses `create_shareable_vault`; a no-op-style error if already device-only.
+///
+/// **Refused outright for a vault another account on this PC created, with no hatch** — the one place
+/// in the vault surface where that is the right answer. This is a strictly worse takeover than a
+/// passphrase change: it re-keys the vault to THIS account's device key (held in this keychain
+/// alone), decrypts the Markdown, and moves the shared folder into this profile's directory. Where a
+/// confirmed re-key leaves the displaced owner a passphrase that still opens their data, there is no
+/// passphrase here — nothing gets them back in. So it mirrors `delete_shared_vault`'s refusal exactly
+/// and points at leaving instead, which is non-destructive, reversible, and the very affordance the
+/// neighbouring move-home error already names.
 #[tauri::command]
 pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
     let data_dir = paths::data_dir(&app)?;
@@ -565,6 +608,21 @@ pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
     if meta.key_mode == vault::KeyMode::Device {
         return Err(Error::Other(
             "this vault is already private to this device".into(),
+        ));
+    }
+    // Before anything is derived, moved or decrypted. `Unknown` falls open here for the same reason
+    // it does on the re-key (see `vault::private_gate_for`): it is every shared vault off Windows and
+    // every pre-ownership vault, and refusing there would strand a genuine owner.
+    if vault::private_gate_for(vault::vault_ownership(&meta)) == vault::RekeyGate::Refuse {
+        return Err(Error::Other(
+            "This shared vault is recorded as belonging to another account on this PC, so it isn't \
+             yours to make private — doing so would re-key it to this account alone and move it out \
+             of the shared folder, with no way back in for anyone else. If you joined it, leave it \
+             with \"Use a vault on this account instead\": it stays exactly where it is for everyone \
+             still using it. If it IS yours and the recorded owner is stale — you moved domain, or \
+             the account was recreated — change the passphrase first and confirm the ownership \
+             transfer; that records you as the owner, and Make private then works."
+                .into(),
         ));
     }
     let mut warnings = Vec::new();
@@ -594,6 +652,7 @@ pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
             new_passphrase: None,
             target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
             target_location: Some(data_dir.clone()),
+            owner: vault::OwnerOnRekey::Keep,
         };
         let app2 = app.clone();
         let move_warnings =
@@ -609,6 +668,9 @@ pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
         new_passphrase: None,
         target_markdown: vault::MarkdownEncryption::None,
         target_location: None,
+        // A Device target never reaches `prepare_shareable`: `private_meta` builds the new meta and
+        // clears the owner (and any transfer record) itself.
+        owner: vault::OwnerOnRekey::Keep,
     };
     let app2 = app.clone();
     let decrypt_warnings =
@@ -643,6 +705,9 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<VaultOpOutcome
             new_passphrase: None,
             target_markdown: meta.markdown.encryption,
             target_location: Some(target),
+            // A pure move: with no new passphrase the plan clones the old meta wholesale, owner and
+            // all, so this never reaches `prepare_shareable`.
+            owner: vault::OwnerOnRekey::Keep,
         }
     };
     let app2 = app.clone();
@@ -7174,19 +7239,68 @@ pub fn read_document_image(state: State<'_, AppState>, doc_id: i64) -> Result<Op
 
     // Fallback: read the original from the path PM recorded at import. It's the user's own file, read
     // straight from disk (never encrypted — the vault copy is the only encrypted one); a missing/moved
-    // original falls through to `None` and the reader's OCR body.
+    // original falls through to `None` and the reader's OCR body — and so does a path that no longer
+    // resolves to a photo (see `photo_original`).
     if let Some(path) = source_path {
-        let p = std::path::Path::new(&path);
-        if p.is_file() {
-            if let Ok(bytes) = std::fs::read(p) {
+        if let Some((p, mime)) = photo_original(&path) {
+            if let Ok(bytes) = std::fs::read(&p) {
                 return Ok(Some(ImageData {
                     base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    mime: image_mime(&path),
+                    mime,
                 }));
             }
         }
     }
     Ok(None)
+}
+
+/// Validate the stored original path before [`read_document_image`] turns it into bytes in the
+/// webview — the one command that does. PURE (no `State`, no `AppHandle`, no DB) so the decision is
+/// unit-testable on its own, the repo idiom `classify_source_ref` below already follows. Returns the
+/// canonical path plus its MIME, or `None` for anything that isn't a photo original any more.
+///
+/// Two guards, both re-using machinery that already exists:
+///
+/// 1. [`pathguard::sanitize_source`] — the SAME function `ingest_paths` applied to this exact string
+///    when it was written. Absolute, no NUL, and canonicalizes (resolving `..`, symlink, junction
+///    and case), failing closed if the original has moved or gone. It subsumes the old `is_file()`.
+///
+/// 2. An extension gate on the **canonical** path against [`ingest::PHOTO_EXTS`]. Canonical is the
+///    load-bearing word: a symlink `shot.png -> secret.key` canonicalizes to `secret.key` and is
+///    refused, which is what closes the post-ingest swap. Without this half the guard would be
+///    justified only by its own comment — an absolute, existing `~/.ssh/id_rsa` passes step 1 fine.
+///    A `photos` row is only ever created for a `PHOTO_EXTS` file, so a resolved path naming
+///    anything else is a planted front-matter row or a swapped original, not a photo.
+///
+/// [`pathguard::is_allowed`] is deliberately NOT used here, and must not be "harmonised" onto later:
+/// it allowlists the app data dir plus the tracked local-folder roots, but photo originals are
+/// referenced-in-place from wherever the user dragged them — Desktop, Downloads, `%TEMP%` (this
+/// command's own doc comment names the temp-folder screenshot as the expected case). Applying that
+/// allowlist would drop most users' photos to the OCR body: a functional regression, not a fix.
+/// `reader_tests::photo_original_resolves_a_photo_outside_every_tracked_root` pins that.
+///
+/// Honest scope, matching `pathguard`'s own: this bounds a planted path STRING and a symlink swap.
+/// It cannot bound an attacker who already has arbitrary local write — a hard link is a real
+/// directory entry, so `shot.png` hard-linked to a secret canonicalizes to `shot.png` and passes;
+/// but that attacker could equally have copied the secret to `shot.png` outright, which no guard
+/// here could see. The containment story for local write is the encrypted store, not this function.
+fn photo_original(stored: &str) -> Option<(std::path::PathBuf, String)> {
+    let p = pathguard::sanitize_source(stored).ok()?;
+    // Kept from the pre-guard code: canonicalization proves the target exists, not that it is a
+    // regular file, and a directory named `album.png` would otherwise clear the extension gate.
+    // Safe to ask on the canonical path — there is no link left to follow at this point.
+    if !p.is_file() {
+        return None;
+    }
+    // Take the extension off the returned `PathBuf`, never off a display string: a canonical
+    // Windows path carries the `\\?\` verbatim prefix. Lower-cased to match `ingest::extension`,
+    // so a `.PNG` original keeps working.
+    let ext = p.extension()?.to_string_lossy().to_ascii_lowercase();
+    if !ingest::PHOTO_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    let mime = mime_for_ext(&ext);
+    Some((p, mime))
 }
 
 /// Best-effort image MIME from a filename extension, for the reader's `data:` URL.
@@ -7196,7 +7310,14 @@ fn image_mime(name: &str) -> String {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match ext.as_str() {
+    mime_for_ext(&ext)
+}
+
+/// The extension → MIME table, taking an already-lower-cased extension with no dot. Split out of
+/// [`image_mime`] so a caller that has already parsed the extension off a `PathBuf` reaches the same
+/// table without round-tripping through a display string.
+fn mime_for_ext(ext: &str) -> String {
+    match ext {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -7334,7 +7455,113 @@ mod vault_command_tests {
 
 #[cfg(test)]
 mod reader_tests {
-    use super::{classify_source_ref, SourceRefKind};
+    use super::{classify_source_ref, photo_original, SourceRefKind};
+
+    /// Write `name` under `dir` and hand back the string `photos.source_path` would hold.
+    fn planted(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn photo_original_accepts_every_ingestable_photo_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, want_mime) in [
+            ("shot.png", "image/png"),
+            ("scan.jpeg", "image/jpeg"),
+            ("scan.jpg", "image/jpeg"),
+            ("art.webp", "image/webp"),
+            ("phone.heic", "image/heic"),
+            // Upper-case must keep working — `ingest::extension` lower-cases, so the read side does too.
+            ("LOUD.PNG", "image/png"),
+        ] {
+            let stored = planted(dir.path(), name, b"not-really-an-image");
+            let (got, mime) = photo_original(&stored)
+                .unwrap_or_else(|| panic!("{name} should resolve as a photo original"));
+            assert_eq!(got, std::fs::canonicalize(dir.path().join(name)).unwrap());
+            assert_eq!(mime, want_mime, "{name}");
+        }
+    }
+
+    #[test]
+    fn photo_original_refuses_an_existing_non_photo() {
+        // The planted-front-matter case: a `photos` row whose `source_path` was rewritten (via a
+        // hand-edited vault file or an adopted backup) to name a secret. Every one of these EXISTS
+        // and is absolute, so `sanitize_source` alone would pass it — the extension gate is what
+        // stops the command handing the file's bytes to the webview.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["id_rsa", "notes.txt", "key.pem", "archive.tar.gz", "photo."] {
+            let stored = planted(dir.path(), name, b"secret");
+            assert!(
+                photo_original(&stored).is_none(),
+                "{name} must not resolve as a photo original"
+            );
+        }
+        // A directory named like a photo is not a file to read either.
+        let d = dir.path().join("album.png");
+        std::fs::create_dir(&d).unwrap();
+        assert!(photo_original(&d.to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn photo_original_fails_closed_on_malformed_and_missing_paths() {
+        // Inherited from `pathguard::sanitize_source`: absolute, no NUL, must canonicalize.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.png");
+        assert!(photo_original(&missing.to_string_lossy()).is_none());
+        assert!(photo_original("relative/shot.png").is_none());
+        assert!(photo_original("").is_none());
+        assert!(photo_original("has\0nul.png").is_none());
+    }
+
+    /// The post-ingest swap: `p.is_file()` used `metadata` (which follows links) and `std::fs::read`
+    /// follows them too, so replacing the original with a link to a secret used to serve the secret.
+    /// The gate runs on the CANONICAL path, so the link resolves to `secret.key` and is refused —
+    /// the name it was given is irrelevant. Unix-only because it needs an unprivileged symlink.
+    #[cfg(unix)]
+    #[test]
+    fn photo_original_refuses_a_symlink_that_resolves_to_a_non_photo() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.key");
+        std::fs::write(&secret, b"-----BEGIN PRIVATE KEY-----").unwrap();
+        let link = dir.path().join("shot.png");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        // The stored string still says `.png`; only canonicalization sees through it.
+        assert!(link.to_string_lossy().ends_with("shot.png"));
+        assert!(photo_original(&link.to_string_lossy()).is_none());
+
+        // Counterpart: a symlink that really does resolve to a photo still works, so the guard
+        // bounds the TARGET's type rather than banning links outright.
+        let real = dir.path().join("real.png");
+        std::fs::write(&real, b"png").unwrap();
+        let ok_link = dir.path().join("alias.png");
+        std::os::unix::fs::symlink(&real, &ok_link).unwrap();
+        let (got, mime) = photo_original(&ok_link.to_string_lossy()).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&real).unwrap());
+        assert_eq!(mime, "image/png");
+    }
+
+    /// REGRESSION GUARD — do not "harmonise" `photo_original` onto `pathguard::is_allowed`.
+    ///
+    /// This tempdir is neither the app data dir nor a tracked local-folder root, which is exactly
+    /// where photo originals normally live: referenced in place from Desktop, Downloads or `%TEMP%`
+    /// (`read_document_image`'s own doc comment names the temp-folder screenshot). `is_allowed`
+    /// allowlists only the data dir + `localfolder::tracked_roots`, so adopting `open_source`'s line
+    /// here would refuse the majority of real photos and silently drop the reader to the OCR body.
+    /// If this test ever goes red, the fix is to revert that change, not to relax this assertion.
+    #[test]
+    fn photo_original_resolves_a_photo_outside_every_tracked_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = planted(dir.path(), "screenshot.png", b"png-bytes");
+        let (got, mime) = photo_original(&stored)
+            .expect("a referenced-in-place original outside every tracked root must still resolve");
+        assert_eq!(
+            got,
+            std::fs::canonicalize(dir.path().join("screenshot.png")).unwrap()
+        );
+        assert_eq!(mime, "image/png");
+    }
 
     #[test]
     fn classify_source_ref_splits_web_from_local() {
@@ -9093,12 +9320,18 @@ fn adopt_restored_vault(
     let needs_migration = rehome || (target_private && restored_is_passphrase);
     if needs_migration {
         let target_location = rehome.then(|| data_dir.to_path_buf());
+        // BOTH arms pass `new_passphrase: None`, so neither reaches `prepare_shareable` and `owner`
+        // is never read on this path — it is here to satisfy the compiler, not to decide anything.
+        // Do not "fix" it to something else: the restore's ownership answer is `normalize_adopted_meta`
+        // a few lines below, which clears the owner (and any transfer record) outright, because a SID
+        // from the machine the backup came off cannot mean anything on this one.
         let plan = if target_private {
             crate::vault::migrate::MigrationPlan {
                 target_key_mode: vault::KeyMode::Device,
                 new_passphrase: None,
                 target_markdown: vault::MarkdownEncryption::None,
                 target_location,
+                owner: vault::OwnerOnRekey::Keep, // inert — see above
             }
         } else {
             crate::vault::migrate::MigrationPlan {
@@ -9106,6 +9339,7 @@ fn adopt_restored_vault(
                 new_passphrase: None, // keep the restored key — this is a location move only
                 target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
                 target_location,
+                owner: vault::OwnerOnRekey::Keep, // inert — see above
             }
         };
         warnings = crate::vault::migrate::migrate_vault(app, plan)?;
