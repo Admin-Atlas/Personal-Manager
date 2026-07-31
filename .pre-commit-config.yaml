@@ -88,6 +88,12 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: ipc-commands
+        name: every ipc.ts command name is one the backend registers
+        entry: just ipc-commands
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: script-deps
         name: scripts/ stays zero-dependency
         entry: just script-deps

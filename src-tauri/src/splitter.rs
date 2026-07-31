@@ -837,4 +837,132 @@ mod tests {
     fn empty_body_yields_no_chunks() {
         assert!(split("   \n\n  ", "Doc").is_empty());
     }
+
+    // ---- The golden ----------------------------------------------------------------------
+    //
+    // Every other test above is a SHAPE assertion — a fence isn't split, a table row stays whole,
+    // leaves fit the token window — and every one of them survives a change to where the
+    // boundaries actually fall. That is the gap this pins.
+    //
+    // WHY IT MATTERS. `SPLITTER_VERSION` feeds the retrieval config stamp (`retrieval_config.rs`),
+    // which is what a vault is compared against on open to offer a Rebuild, and it is folded into
+    // the stable chunk uid. So the architecture rests on "any change to chunking is accompanied by
+    // a version bump", and nothing enforced that. A boundary that moves silently leaves every
+    // existing vault indexed under the old chunking with no Rebuild ever offered, and citations
+    // pointing into spans that no longer exist.
+    //
+    // Either direction trips this test, which is the point: move a boundary and the uids/offsets
+    // change; bump `SPLITTER_VERSION` and the uids change too, since the version is hashed into
+    // them. There is no edit to chunking that leaves the golden untouched.
+    //
+    // The fixture is assembled from `concat!` line literals rather than one multi-line string on
+    // purpose: a raw literal would carry whatever line ending the working copy has, so a CRLF
+    // checkout would shift every byte offset and the test would pass locally and fail in CI.
+
+    /// A small document that exercises each structural path: nested headings, a table, a fenced
+    /// block, a paragraph long enough to pack into several leaves, and a non-ASCII run.
+    const GOLDEN_FIXTURE: &str = concat!(
+        "# Quarterly review\n",
+        "\n",
+        // The accents are deliberate: chunk offsets are BYTE offsets, and the reader's overlay
+        // (src/lib/chunkOverlay.ts) converts them to UTF-16 indices. An ASCII-only fixture would
+        // let a char-vs-byte regression through unnoticed.
+        "Vertriebszahlen f\u{fc}r das Quartal \u{2014} the accented run is deliberate.\n",
+        "\n",
+        "## Numbers\n",
+        "\n",
+        "| Region | Q1 | Q2 |\n",
+        "| --- | --- | --- |\n",
+        "| North | 12 | 18 |\n",
+        "| South | 9 | 14 |\n",
+        "\n",
+        "Revenue rose in both regions, though the southern team carried more of the growth\n",
+        "than the headline figure suggests, and the trend held through the quarter without\n",
+        "a single week of decline worth reporting to the board.\n",
+        "\n",
+        "### Notes\n",
+        "\n",
+        "```rust\n",
+        "fn main() {\n",
+        "    println!(\"this fence must never be split\");\n",
+        "}\n",
+        "```\n",
+        "\n",
+        "One closing paragraph, short enough to stand on its own.\n",
+    );
+
+    /// One line per chunk, in order — a diff on failure names exactly which chunk moved.
+    fn render_golden(chunks: &[Chunk]) -> String {
+        /// Same width as a uid, so the columns line up whether a chunk has a parent or not.
+        const NO_PARENT: &str = "--------------------------------";
+        let mut out = String::new();
+        for (i, c) in chunks.iter().enumerate() {
+            let mut h = Sha256::new();
+            h.update(c.embed_content.as_bytes());
+            let embed = hex16(&h.finalize()[..4]);
+            out.push_str(&format!(
+                "{i:>2} {kind:<6} [{start:>4}..{end:>4}] uid={uid} parent={parent} embed={embed} head={head}\n",
+                kind = c.kind.as_str(),
+                start = c.start_offset,
+                end = c.end_offset,
+                uid = c.uid,
+                parent = c.parent_uid.as_deref().unwrap_or(NO_PARENT),
+                head = c.heading.as_deref().unwrap_or("<none>"),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn golden_chunking_is_pinned_exactly() {
+        // If this fails you changed chunking. Bump SPLITTER_VERSION in the SAME commit (existing
+        // vaults must re-chunk), then re-pin the block below from the failure output.
+        let chunks = split_with(GOLDEN_FIXTURE, "Board pack", 24, 6);
+        let expected = concat!(
+            // The opening paragraph is the whole of its section, so it gets no parent.
+            " 0 leaf   [   0..  89] uid=b9a184234b7b129b1b4ae0d527c9828d parent=-------------------------------- embed=cc3efa88 head=Quarterly review\n",
+            // "Numbers" splits into five leaves, so it gains a parent. `embed=e3b0c442` is the
+            // sha256 of the empty string — the parent carries no embed text, by construction.
+            " 1 parent [  90.. 401] uid=e03b1cbcc135d94468385b2d4c4505e6 parent=-------------------------------- embed=e3b0c442 head=Numbers\n",
+            " 2 leaf   [  90.. 101] uid=1e7bbc80b4427d21b89eb1f4942f19a3 parent=e03b1cbcc135d94468385b2d4c4505e6 embed=324bbd83 head=Numbers\n",
+            " 3 leaf   [ 102.. 163] uid=9b7350399db695d55a3dbfa5271bd4e1 parent=e03b1cbcc135d94468385b2d4c4505e6 embed=1b8ebb40 head=Numbers\n",
+            // Leaves 3/4 and 5/6 share a boundary byte: that is the token overlap, and a change
+            // to CHUNK_OVERLAP_TOKENS' handling shows up right here.
+            " 4 leaf   [ 163.. 181] uid=48db6560681126cf90d4b40951c83737 parent=e03b1cbcc135d94468385b2d4c4505e6 embed=a32bb8c9 head=Numbers\n",
+            " 5 leaf   [ 183.. 265] uid=86e142c76f3627c6016cf4172c10116a parent=e03b1cbcc135d94468385b2d4c4505e6 embed=d17c203e head=Numbers\n",
+            " 6 leaf   [ 265.. 401] uid=80c47e774df0137505e00e1ecd6daa1a parent=e03b1cbcc135d94468385b2d4c4505e6 embed=ecd8d591 head=Numbers\n",
+            // The fence and the closing paragraph pack into one leaf — the fence is never cut.
+            " 7 leaf   [ 403.. 546] uid=c5904434493109f847e929f36a4ff073 parent=-------------------------------- embed=58b80bd9 head=Notes\n",
+        );
+        assert_eq!(render_golden(&chunks), expected);
+    }
+
+    #[test]
+    fn golden_offsets_are_valid_utf8_boundaries_into_the_body() {
+        // The reader's overlay slices the body by these offsets. A boundary landing mid-code-point
+        // panics `&body[start..end]` in Rust and silently mis-highlights in the webview, and the
+        // fixture's accented run is where that would first show.
+        let chunks = split_with(GOLDEN_FIXTURE, "Board pack", 24, 6);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(
+                GOLDEN_FIXTURE.get(c.start_offset..c.end_offset).is_some(),
+                "chunk {} spans {}..{}, which is not a char boundary",
+                c.uid,
+                c.start_offset,
+                c.end_offset,
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_chunk_sizing_is_pinned() {
+        // The golden above runs at an explicit small target so the fixture can stay readable, so
+        // it would NOT notice a change to the shipped defaults — and changing either constant
+        // re-chunks every vault just as surely as moving a boundary does. Same rule: bump
+        // SPLITTER_VERSION in the same commit, then re-pin here.
+        assert_eq!(CHUNK_TARGET_TOKENS, 256);
+        assert_eq!(CHUNK_OVERLAP_TOKENS, 32);
+        assert_eq!(BOUNDARY_STRATEGY, "recursive-structure-v1");
+    }
 }

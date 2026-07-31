@@ -335,6 +335,104 @@ fn sync_cancelled<C: CloudDriver>(app: &AppHandle) -> bool {
     C::cancel_flag(app.state::<AppState>().inner()).load(Ordering::SeqCst)
 }
 
+/// How one item's phase-2 processing ended.
+///
+/// Every arm is a decision the engine already made inline; naming them is what lets the accounting
+/// be checked without an `AppHandle`, a network round-trip, or a store — the three reasons the
+/// shared engine had no test of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemOutcome {
+    /// The change mapped to nothing we track (a trashed-then-gone id that was never indexed).
+    Unmapped,
+    /// A body was needed and the fetch produced no extractable text.
+    NoText,
+    /// The body fetch failed. `item_gone` marks a per-ITEM revoke/removal — a "Shared with me"
+    /// grant the owner pulled — as opposed to a transient, auth, or network failure.
+    FetchFailed { item_gone: bool },
+    /// The reducer's actions applied cleanly, landing in this category.
+    Applied(connector_sync::ActionKind),
+    /// The apply itself failed.
+    ApplyFailed,
+}
+
+/// What an outcome does to the pass: which counter it lands in, whether it records a user-visible
+/// issue, and whether it fails the account.
+///
+/// `fails_account` is the consequential one. An account with any failed item is finalized `error`
+/// with its delta cursor left UNADVANCED, so the failure retries next pass instead of hiding behind
+/// a misleading `ok` that has already stepped past the change it never applied (F-29). Getting that
+/// wrong for `item_gone` is what M2 fixed: one revoked shared file used to fail the whole account.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ItemEffect {
+    indexed: usize,
+    updated: usize,
+    removed: usize,
+    skipped: usize,
+    failed: usize,
+    records_issue: bool,
+    fails_account: bool,
+}
+
+/// The pure accounting rule for one item. Every outcome lands in exactly one counter.
+fn item_effect(outcome: ItemOutcome) -> ItemEffect {
+    match outcome {
+        // Nothing to do and nothing to tell the user about.
+        ItemOutcome::Unmapped => ItemEffect {
+            skipped: 1,
+            ..ItemEffect::default()
+        },
+        // We reached the file and it held nothing indexable — worth saying, not worth failing over.
+        ItemOutcome::NoText => ItemEffect {
+            skipped: 1,
+            records_issue: true,
+            ..ItemEffect::default()
+        },
+        // The account survives a file that is simply gone for this user; anything else holds the
+        // cursor so the pass retries rather than stepping past what it never saw.
+        ItemOutcome::FetchFailed { item_gone } => ItemEffect {
+            skipped: usize::from(item_gone),
+            failed: usize::from(!item_gone),
+            records_issue: true,
+            fails_account: !item_gone,
+            ..ItemEffect::default()
+        },
+        ItemOutcome::Applied(kind) => ItemEffect {
+            indexed: usize::from(kind == connector_sync::ActionKind::Indexed),
+            updated: usize::from(kind == connector_sync::ActionKind::Updated),
+            removed: usize::from(kind == connector_sync::ActionKind::Removed),
+            skipped: usize::from(kind == connector_sync::ActionKind::Other),
+            ..ItemEffect::default()
+        },
+        ItemOutcome::ApplyFailed => ItemEffect {
+            failed: 1,
+            records_issue: true,
+            fails_account: true,
+            ..ItemEffect::default()
+        },
+    }
+}
+
+/// The pass's running totals, so [`item_effect`]'s verdict is applied in one place rather than
+/// re-spelled at each of the five sites an item can end at.
+#[derive(Default)]
+struct PassCounts {
+    indexed: usize,
+    updated: usize,
+    removed: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+impl PassCounts {
+    fn add(&mut self, eff: ItemEffect) {
+        self.indexed += eff.indexed;
+        self.updated += eff.updated;
+        self.removed += eff.removed;
+        self.skipped += eff.skipped;
+        self.failed += eff.failed;
+    }
+}
+
 /// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
 fn record_issue(issues: &mut Vec<CloudSyncIssue>, truncated: &mut bool, name: &str, reason: &str) {
     if issues.len() < connector_sync::MAX_REPORT_ISSUES {
@@ -534,7 +632,7 @@ async fn run_cloud_pass<C: CloudDriver>(
     );
 
     // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
-    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
+    let mut counts = PassCounts::default();
     let mut processed = 0usize;
     // Files we attempted but couldn't index (unsupported/empty, or a fetch error), for the report.
     let mut issues: Vec<CloudSyncIssue> = Vec::new();
@@ -611,7 +709,7 @@ async fn run_cloud_pass<C: CloudDriver>(
             let (file, source_id, event) = match driver.resolve_item(app, &w.email, item)? {
                 Resolved::Skip => {
                     processed += 1;
-                    skipped += 1;
+                    counts.add(item_effect(ItemOutcome::Unmapped));
                     continue;
                 }
                 Resolved::Process {
@@ -663,7 +761,7 @@ async fn run_cloud_pass<C: CloudDriver>(
                     },
                     Ok(None) => {
                         processed += 1;
-                        skipped += 1;
+                        counts.add(item_effect(ItemOutcome::NoText));
                         record_issue(
                             &mut issues,
                             &mut issues_truncated,
@@ -692,10 +790,11 @@ async fn run_cloud_pass<C: CloudDriver>(
                         // skips just this file — recorded as an issue, account stays healthy — instead
                         // of failing the whole account. Any other error (transient/auth/network) still
                         // fails the account so its cursor is held and it retries next pass (F-29, M2).
-                        if C::is_item_gone(&e) {
-                            skipped += 1;
-                        } else {
-                            failed += 1;
+                        let eff = item_effect(ItemOutcome::FetchFailed {
+                            item_gone: C::is_item_gone(&e),
+                        });
+                        counts.add(eff);
+                        if eff.fails_account {
                             account_failed = true;
                             last_err = Some(e);
                         }
@@ -730,15 +829,10 @@ async fn run_cloud_pass<C: CloudDriver>(
             match apply {
                 Ok(dirtied) => {
                     manifest_flush.note(dirtied)?;
-                    match category {
-                        connector_sync::ActionKind::Indexed => indexed += 1,
-                        connector_sync::ActionKind::Updated => updated += 1,
-                        connector_sync::ActionKind::Removed => removed += 1,
-                        connector_sync::ActionKind::Other => skipped += 1,
-                    }
+                    counts.add(item_effect(ItemOutcome::Applied(category)));
                 }
                 Err(e) => {
-                    failed += 1;
+                    counts.add(item_effect(ItemOutcome::ApplyFailed));
                     record_issue(
                         &mut issues,
                         &mut issues_truncated,
@@ -788,11 +882,11 @@ async fn run_cloud_pass<C: CloudDriver>(
     manifest_flush.flush()?;
 
     let report = CloudSyncReport {
-        indexed,
-        updated,
-        removed,
-        skipped,
-        failed,
+        indexed: counts.indexed,
+        updated: counts.updated,
+        removed: counts.removed,
+        skipped: counts.skipped,
+        failed: counts.failed,
         cancelled,
         issues,
         issues_truncated,
@@ -808,7 +902,7 @@ async fn run_cloud_pass<C: CloudDriver>(
             return Err(e);
         }
     }
-    Ok(indexed + updated + removed)
+    Ok(counts.indexed + counts.updated + counts.removed)
 }
 
 // --- Google Drive driver -------------------------------------------------------------------------
@@ -1859,6 +1953,134 @@ mod tests {
         assert!(is_file_lock_error(&py));
         assert!(is_file_lock_error(&win));
         assert!(!is_file_lock_error(&genuine));
+    }
+
+    // ---- the shared apply engine's accounting ------------------------------------------------
+    //
+    // Everything above this line tests a helper the engine happens to call. These test the engine's
+    // own decision: what one item's outcome does to the pass, and — the part that matters — whether
+    // it holds the account's delta cursor.
+
+    /// Total of every counter, so "lands in exactly one bucket" can be asserted directly.
+    fn total(eff: ItemEffect) -> usize {
+        eff.indexed + eff.updated + eff.removed + eff.skipped + eff.failed
+    }
+
+    #[test]
+    fn every_outcome_lands_in_exactly_one_counter() {
+        // A pass whose counters don't sum to the number of items processed is a pass whose
+        // "N indexed, M skipped" line silently doesn't add up.
+        for outcome in [
+            ItemOutcome::Unmapped,
+            ItemOutcome::NoText,
+            ItemOutcome::FetchFailed { item_gone: true },
+            ItemOutcome::FetchFailed { item_gone: false },
+            ItemOutcome::Applied(connector_sync::ActionKind::Indexed),
+            ItemOutcome::Applied(connector_sync::ActionKind::Updated),
+            ItemOutcome::Applied(connector_sync::ActionKind::Removed),
+            ItemOutcome::Applied(connector_sync::ActionKind::Other),
+            ItemOutcome::ApplyFailed,
+        ] {
+            assert_eq!(
+                total(item_effect(outcome)),
+                1,
+                "{outcome:?} must count once"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_real_failure_holds_the_accounts_cursor() {
+        // The F-29 rule: an account with a failed item finalizes 'error' with its cursor
+        // UNADVANCED, so the change retries instead of being stepped over by a misleading 'ok'.
+        assert!(item_effect(ItemOutcome::ApplyFailed).fails_account);
+        assert!(item_effect(ItemOutcome::FetchFailed { item_gone: false }).fails_account);
+
+        // …and the M2 exception: one file the owner revoked must not fail the whole account, or a
+        // single withdrawn "Shared with me" grant pins the account in 'error' forever.
+        let gone = item_effect(ItemOutcome::FetchFailed { item_gone: true });
+        assert!(!gone.fails_account);
+        assert_eq!((gone.skipped, gone.failed), (1, 0));
+
+        // Nothing else ever does.
+        for benign in [
+            ItemOutcome::Unmapped,
+            ItemOutcome::NoText,
+            ItemOutcome::Applied(connector_sync::ActionKind::Other),
+        ] {
+            assert!(!item_effect(benign).fails_account, "{benign:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_the_user_never_hears_about_is_the_one_that_needed_no_work() {
+        // An issue is the only trace a file leaves in the report, so the rule is: say something
+        // whenever we reached a file and could not index it, and stay quiet when there was
+        // nothing to do. A silent fetch failure is a file that vanishes from the user's library
+        // with no explanation anywhere.
+        assert!(!item_effect(ItemOutcome::Unmapped).records_issue);
+        assert!(
+            !item_effect(ItemOutcome::Applied(connector_sync::ActionKind::Indexed)).records_issue
+        );
+        assert!(item_effect(ItemOutcome::NoText).records_issue);
+        assert!(item_effect(ItemOutcome::FetchFailed { item_gone: true }).records_issue);
+        assert!(item_effect(ItemOutcome::FetchFailed { item_gone: false }).records_issue);
+        assert!(item_effect(ItemOutcome::ApplyFailed).records_issue);
+    }
+
+    #[test]
+    fn applied_outcomes_map_to_their_own_category() {
+        let idx = item_effect(ItemOutcome::Applied(connector_sync::ActionKind::Indexed));
+        assert_eq!(
+            (idx.indexed, idx.updated, idx.removed, idx.skipped),
+            (1, 0, 0, 0)
+        );
+        let upd = item_effect(ItemOutcome::Applied(connector_sync::ActionKind::Updated));
+        assert_eq!(
+            (upd.indexed, upd.updated, upd.removed, upd.skipped),
+            (0, 1, 0, 0)
+        );
+        let rem = item_effect(ItemOutcome::Applied(connector_sync::ActionKind::Removed));
+        assert_eq!(
+            (rem.indexed, rem.updated, rem.removed, rem.skipped),
+            (0, 0, 1, 0)
+        );
+        // `Other` is real work that changed nothing citable — it counts as skipped, not indexed.
+        let oth = item_effect(ItemOutcome::Applied(connector_sync::ActionKind::Other));
+        assert_eq!(
+            (oth.indexed, oth.updated, oth.removed, oth.skipped),
+            (0, 0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn pass_counts_accumulate_across_a_mixed_account() {
+        // One account's worth of items, exactly as phase 2 would feed them in.
+        let mut counts = PassCounts::default();
+        for outcome in [
+            ItemOutcome::Applied(connector_sync::ActionKind::Indexed),
+            ItemOutcome::Applied(connector_sync::ActionKind::Indexed),
+            ItemOutcome::Applied(connector_sync::ActionKind::Updated),
+            ItemOutcome::Applied(connector_sync::ActionKind::Removed),
+            ItemOutcome::Unmapped,
+            ItemOutcome::NoText,
+            ItemOutcome::FetchFailed { item_gone: true },
+            ItemOutcome::ApplyFailed,
+        ] {
+            counts.add(item_effect(outcome));
+        }
+        assert_eq!(
+            (
+                counts.indexed,
+                counts.updated,
+                counts.removed,
+                counts.skipped,
+                counts.failed
+            ),
+            (2, 1, 1, 3, 1)
+        );
+        // The pass's own return value — what `run_detached_sync` reports as "did anything change?"
+        assert_eq!(counts.indexed + counts.updated + counts.removed, 4);
     }
 
     /// A run is one or more passes. Reporting only the last one is how a run that indexed 50 files

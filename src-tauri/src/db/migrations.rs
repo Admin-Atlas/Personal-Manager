@@ -1493,96 +1493,303 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
-    /// Rule #3 enforcement: a migration must never silently drop, clear, or rewrite user data. This
-    /// walks every migration statement and rejects a statement-LEADING destructive verb against a
-    /// persistent user-data table. It anchors on the first keyword of each line (not a substring), so
-    /// an `ON DELETE CASCADE` constraint clause inside a `CREATE TABLE` never trips it — that DELETE
-    /// is mid-line. It would have caught v19's original `DELETE FROM documents`.
+    /// Derived indexes a Rebuild can reconstruct from `documents` — safe to clear wholesale.
+    const REBUILD_CLEARABLE: &[&str] = &["chunk_vec", "chunks_fts", "chunks"];
+    /// Schema-catalog / ephemeral-state tables an UPDATE may touch without a sentinel.
+    const UPDATE_METADATA: &[&str] = &["sqlite_master", "sqlite_schema"];
+
+    /// One SQL statement out of a migration, with whether a `guard:allow` sentinel preceded it.
+    #[derive(Debug)]
+    struct Stmt {
+        /// Whitespace-normalised, comments stripped. Original case, for the failure message.
+        text: String,
+        armed: bool,
+    }
+
+    /// Split a migration into statements on `;`, dropping `--` comments and remembering whether a
+    /// `guard:allow` sentinel preceded each one.
     ///
-    /// Three narrow, principled exceptions:
-    ///   * `DELETE FROM` a rebuild-clearable derived index (`chunk_vec` / `chunks_fts` / `chunks`) — a
-    ///     Rebuild reconstructs these from `documents`, so clearing them loses nothing durable.
-    ///   * `UPDATE sqlite_master` (a `writable_schema` CHECK-relaxation patch: edits stored DDL text,
-    ///     moves no user rows) or `UPDATE connector_sources SET cursor` (a re-baseline reset — cursors
-    ///     are ephemeral sync state, not user data).
-    ///   * a statement a human has explicitly blessed with a `guard:allow` sentinel comment on the
-    ///     line(s) immediately above it — used ONLY for a rule-#3 *preserving* UPDATE (a re-key, or a
-    ///     freshly-added-column backfill that overwrites nothing). A DELETE/DROP is never excusable
-    ///     this way: user rows are re-keyed with UPDATE, never deleted.
-    #[test]
-    fn migrations_never_destroy_user_data() {
-        // Derived indexes a Rebuild can reconstruct from `documents` — safe to `DELETE FROM`.
-        const REBUILD_CLEARABLE: &[&str] = &["chunk_vec", "chunks_fts", "chunks"];
-        // Schema-catalog / ephemeral-state tables an UPDATE may touch without a sentinel.
-        const UPDATE_METADATA: &[&str] = &["sqlite_master", "sqlite_schema"];
+    /// The guard used to scan LINES, which left two holes an author could fall into without ever
+    /// meaning to: a statement that wraps onto a second line was only ever inspected by its first
+    /// line, and two statements sharing one line meant only the first was inspected at all — so
+    /// `CREATE TABLE …; DELETE FROM documents;` on one line read as a harmless CREATE.
+    ///
+    /// Quote-aware, because a `;` inside a string literal does not end a statement. It does NOT
+    /// understand trigger bodies (`BEGIN … END;` holds its own semicolons), which is why
+    /// [`rule3_violation`] rejects `CREATE TRIGGER` outright rather than mis-parsing one.
+    fn statements(migration: &str) -> Vec<Stmt> {
+        let mut out: Vec<Stmt> = Vec::new();
+        let mut buf = String::new();
+        let mut armed_next = false;
+        let mut in_string = false;
+        let mut chars = migration.chars().peekable();
 
-        for (i, migration) in super::MIGRATIONS.iter().enumerate() {
-            // A `guard:allow` sentinel comment arms the *next* statement line, then is consumed.
-            let mut armed = false;
-            for raw in migration.lines() {
-                let line = raw.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if line.starts_with("--") {
-                    if line.contains("guard:allow") {
-                        armed = true;
+        // A comment-only chunk must NOT clear a pending sentinel — that is how a sentinel written
+        // on its own line above a statement reaches the statement it is meant to bless.
+        fn flush(out: &mut Vec<Stmt>, buf: &mut String, armed: &mut bool) {
+            let text = buf.split_whitespace().collect::<Vec<_>>().join(" ");
+            buf.clear();
+            if text.is_empty() {
+                return;
+            }
+            out.push(Stmt {
+                text,
+                armed: *armed,
+            });
+            *armed = false;
+        }
+
+        while let Some(ch) = chars.next() {
+            if in_string {
+                buf.push(ch);
+                if ch == '\'' {
+                    // `''` is an escaped quote inside a literal, not the end of one.
+                    if chars.peek() == Some(&'\'') {
+                        buf.push(chars.next().unwrap());
+                    } else {
+                        in_string = false;
                     }
-                    continue; // comments never disarm a pending sentinel
                 }
-                let lower = line.to_ascii_lowercase();
-                let first = lower.split_whitespace().next().unwrap_or("");
-
-                // DROP TABLE / ALTER … DROP: table or column loss, never allowed in a migration.
-                assert!(
-                    !lower.starts_with("drop table"),
-                    "MIGRATIONS[{i}]: `DROP TABLE` destroys user data (rule #3): {line}"
-                );
-                assert!(
-                    !(first == "alter" && lower.contains(" drop ")),
-                    "MIGRATIONS[{i}]: `ALTER TABLE … DROP` loses a column (rule #3): {line}"
-                );
-
-                // DELETE FROM <t>: only the rebuild-clearable derived indexes. A sentinel does NOT
-                // excuse deleting user rows — re-key with UPDATE instead.
-                if lower.starts_with("delete from") {
-                    let table = lower.split_whitespace().nth(2).unwrap_or("");
-                    assert!(
-                        REBUILD_CLEARABLE.contains(&table),
-                        "MIGRATIONS[{i}]: `DELETE FROM {table}` removes user rows (rule #3). Only \
-                         {REBUILD_CLEARABLE:?} are rebuild-clearable; re-key with UPDATE, never DELETE."
-                    );
-                    armed = false;
-                    continue;
+                continue;
+            }
+            match ch {
+                '\'' => {
+                    in_string = true;
+                    buf.push(ch);
                 }
-
-                // UPDATE <t>: metadata / cursor resets, or an explicitly-blessed preserving write.
-                if first == "update" {
-                    // Skip an optional `OR IGNORE` / `OR REPLACE` conflict clause to find the table.
-                    let mut toks = lower.split_whitespace().skip(1).peekable();
-                    if toks.peek() == Some(&"or") {
-                        toks.next();
-                        toks.next();
+                '-' if chars.peek() == Some(&'-') => {
+                    let mut comment = String::new();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                        comment.push(c);
                     }
-                    let table = toks.next().unwrap_or("");
-                    let allowed = UPDATE_METADATA.contains(&table)
-                        || (table == "connector_sources" && lower.contains("set cursor"))
-                        || armed;
-                    assert!(
-                        allowed,
-                        "MIGRATIONS[{i}]: `UPDATE {table}` writes a persistent table with no \
-                         `guard:allow` sentinel. If it is a rule-#3 preserving re-key/backfill, mark \
-                         it; otherwise it may clobber user data: {line}"
-                    );
-                    armed = false;
-                    continue;
+                    if comment.contains("guard:allow") {
+                        armed_next = true;
+                    }
+                    buf.push(' '); // a comment separates tokens; it never joins them
                 }
-
-                // Any other statement (CREATE / INSERT / ALTER … ADD / PRAGMA / SELECT …) consumes a
-                // pending sentinel without using it, so a sentinel only ever covers the next line.
-                armed = false;
+                ';' => flush(&mut out, &mut buf, &mut armed_next),
+                _ => buf.push(ch),
             }
         }
+        flush(&mut out, &mut buf, &mut armed_next);
+        out
+    }
+
+    /// The bare table name out of the token that follows a verb.
+    ///
+    /// `REPLACE INTO chunk_vec(rowid)` tokenises the table as `chunk_vec(rowid)` — there is no
+    /// space before the paren — so a raw token comparison silently fails to match the allow-list
+    /// and reports a clearable index as a rule-#3 breach. Schema prefixes and quoted identifiers
+    /// are stripped for the same reason: the guard must key on the table, not on how it is spelt.
+    fn table_name(token: &str) -> &str {
+        let token = token.split('(').next().unwrap_or(token);
+        let token = token.rsplit('.').next().unwrap_or(token);
+        token.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+    }
+
+    /// The rule-#3 verdict for one statement: `Some(reason)` when it must not ship.
+    ///
+    /// Rule #3 is "migrations are additive — never drop or rewrite user data", and this is its only
+    /// automated enforcement. Four verbs can breach it, and the exceptions are narrow and principled:
+    ///
+    ///   * `DELETE FROM` / `REPLACE INTO` / `INSERT OR REPLACE INTO` — all three remove existing
+    ///     rows (REPLACE is a delete-then-insert, which is why it belongs here and not with INSERT).
+    ///     Allowed only against a rebuild-clearable derived index. **A sentinel never excuses one**:
+    ///     user rows are re-keyed with UPDATE, never deleted.
+    ///   * `DROP TABLE` and `ALTER … DROP` — table or column loss, never allowed.
+    ///   * `ALTER … RENAME` — the rows survive, but every reader keyed on the old identifier breaks,
+    ///     and an identifier rename is a one-way door for anyone already on the old schema.
+    ///   * `UPDATE` — allowed against the schema catalogue, against `connector_sources SET cursor`
+    ///     (ephemeral sync state, not user data), or with an explicit `guard:allow` sentinel
+    ///     covering a *preserving* re-key or a freshly-added-column backfill.
+    ///
+    /// `ON DELETE CASCADE` inside a `CREATE TABLE` is not a DELETE statement and never trips this:
+    /// the verb has to LEAD the statement.
+    fn rule3_violation(stmt: &Stmt) -> Option<String> {
+        let lower = stmt.text.to_ascii_lowercase();
+        let toks: Vec<&str> = lower.split_whitespace().collect();
+        let first = *toks.first().unwrap_or(&"");
+
+        if lower.starts_with("drop table") {
+            return Some("`DROP TABLE` destroys user data".into());
+        }
+        if first == "alter" && lower.contains(" drop ") {
+            return Some("`ALTER TABLE … DROP` loses a column".into());
+        }
+        if first == "alter" && lower.contains(" rename") {
+            return Some(
+                "`ALTER TABLE … RENAME` changes an identifier every reader is keyed on".into(),
+            );
+        }
+        if lower.starts_with("create trigger") {
+            return Some(
+                "`CREATE TRIGGER` bodies hold their own semicolons, which this guard's statement \
+                 splitter does not parse — teach it before adding one"
+                    .into(),
+            );
+        }
+
+        // The three row-removing shapes, and where each names its table.
+        let removal = if lower.starts_with("delete from") {
+            Some(("DELETE FROM", toks.get(2)))
+        } else if lower.starts_with("replace into") {
+            Some(("REPLACE INTO", toks.get(2)))
+        } else if first == "insert" && toks.get(1) == Some(&"or") && toks.get(2) == Some(&"replace")
+        {
+            Some(("INSERT OR REPLACE INTO", toks.get(4)))
+        } else {
+            None
+        };
+        if let Some((verb, table)) = removal {
+            let table = table_name(table.copied().unwrap_or(""));
+            if !REBUILD_CLEARABLE.contains(&table) {
+                return Some(format!(
+                    "`{verb} {table}` removes existing rows. Only {REBUILD_CLEARABLE:?} are \
+                     rebuild-clearable; re-key with UPDATE, never DELETE or REPLACE"
+                ));
+            }
+            return None;
+        }
+
+        if first == "update" {
+            // Skip an optional `OR IGNORE` / `OR ROLLBACK` conflict clause to find the table.
+            let table = if toks.get(1) == Some(&"or") {
+                toks.get(3)
+            } else {
+                toks.get(1)
+            };
+            let table = table_name(table.copied().unwrap_or(""));
+            let allowed = UPDATE_METADATA.contains(&table)
+                || (table == "connector_sources" && lower.contains("set cursor"))
+                || stmt.armed;
+            if !allowed {
+                return Some(format!(
+                    "`UPDATE {table}` writes a persistent table with no `guard:allow` sentinel. If \
+                     it is a rule-#3 preserving re-key/backfill, mark it; otherwise it may clobber \
+                     user data"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Rule #3 enforcement over the shipped migration list.
+    #[test]
+    fn migrations_never_destroy_user_data() {
+        let mut inspected = 0usize;
+        for (i, migration) in super::MIGRATIONS.iter().enumerate() {
+            for stmt in statements(migration) {
+                inspected += 1;
+                if let Some(why) = rule3_violation(&stmt) {
+                    panic!("MIGRATIONS[{i}]: {why} (rule #3): {}", stmt.text);
+                }
+            }
+        }
+        // A guard that inspected nothing reports the same green as one that inspected everything.
+        assert!(
+            inspected > 100,
+            "only {inspected} statements parsed out of {} migrations — the splitter has stopped \
+             matching, not the migrations gone quiet",
+            super::MIGRATIONS.len()
+        );
+    }
+
+    // ---- The guard's own tests ----------------------------------------------------------------
+    //
+    // Feeding synthetic migrations through the same two functions the real check uses, so each
+    // shape is proven to be caught rather than assumed to be.
+
+    /// The single verdict for a one-migration source string, or `None` if it is clean.
+    fn verdict(sql: &str) -> Option<String> {
+        statements(sql).iter().find_map(rule3_violation)
+    }
+
+    #[test]
+    fn guard_catches_row_removing_statements() {
+        assert!(verdict("DELETE FROM documents;")
+            .unwrap()
+            .contains("DELETE"));
+        assert!(verdict("REPLACE INTO documents(id) VALUES(1);")
+            .unwrap()
+            .contains("REPLACE INTO documents"));
+        assert!(
+            verdict("INSERT OR REPLACE INTO projects(name) SELECT name FROM old;")
+                .unwrap()
+                .contains("INSERT OR REPLACE INTO projects")
+        );
+        // …and the derived indexes a Rebuild reconstructs stay allowed. The column list here is
+        // deliberate: `chunk_vec(rowid)` tokenises as one word, and reading it as the table name
+        // is what made the first draft of this guard reject a clearable index.
+        assert!(verdict("DELETE FROM chunks_fts;").is_none());
+        assert!(verdict("REPLACE INTO chunk_vec(rowid) VALUES(1);").is_none());
+        assert!(verdict("DELETE FROM main.chunks;").is_none());
+        // A sentinel does NOT excuse a removal, unlike an UPDATE.
+        assert!(verdict("-- guard:allow\nDELETE FROM documents;").is_some());
+    }
+
+    #[test]
+    fn guard_catches_schema_loss_and_renames() {
+        assert!(verdict("DROP TABLE documents;").is_some());
+        assert!(verdict("DROP TABLE IF EXISTS documents;").is_some());
+        assert!(verdict("ALTER TABLE documents DROP COLUMN project;").is_some());
+        assert!(verdict("ALTER TABLE documents RENAME TO docs;").is_some());
+        assert!(verdict("ALTER TABLE documents RENAME COLUMN project TO home;").is_some());
+        // The additive shape this rule exists to permit.
+        assert!(verdict("ALTER TABLE documents ADD COLUMN home TEXT;").is_none());
+    }
+
+    #[test]
+    fn guard_inspects_every_statement_on_a_shared_line() {
+        // The line-anchored scan this replaced saw only the leading CREATE here and passed.
+        let sql = "CREATE TABLE t(id INTEGER); DELETE FROM documents;";
+        assert_eq!(statements(sql).len(), 2);
+        assert!(verdict(sql).unwrap().contains("DELETE FROM documents"));
+    }
+
+    #[test]
+    fn guard_reads_a_statement_that_wraps_onto_later_lines() {
+        // Only the first line used to be inspected, so the table name on line 2 was never read.
+        let sql = "UPDATE\n    documents\n    SET project = 'Unsorted';";
+        assert!(verdict(sql).unwrap().contains("UPDATE documents"));
+    }
+
+    #[test]
+    fn guard_ignores_a_semicolon_inside_a_string_literal() {
+        let sql = "INSERT INTO settings(k, v) VALUES('sep', 'a;b'); DELETE FROM documents;";
+        let stmts = statements(sql);
+        assert_eq!(stmts.len(), 2, "the quoted `;` must not split a statement");
+        assert!(verdict(sql).unwrap().contains("DELETE FROM documents"));
+    }
+
+    #[test]
+    fn guard_sentinel_covers_exactly_one_following_statement() {
+        // Blesses the backfill…
+        assert!(verdict(
+            "-- guard:allow preserving backfill\nUPDATE documents SET home = project;"
+        )
+        .is_none());
+        // …and is spent by it, so a second UPDATE behind it is not covered.
+        assert!(verdict(
+            "-- guard:allow preserving backfill\nUPDATE documents SET home = project;\n\
+             UPDATE documents SET project = NULL;"
+        )
+        .is_some());
+        // An unblessed UPDATE against a persistent table is caught.
+        assert!(verdict("UPDATE projects SET name = 'x';").is_some());
+        // The two standing exceptions need no sentinel.
+        assert!(verdict("UPDATE sqlite_master SET sql = '';").is_none());
+        assert!(verdict("UPDATE connector_sources SET cursor = NULL;").is_none());
+    }
+
+    #[test]
+    fn guard_does_not_trip_on_a_cascade_clause() {
+        // The false positive the line anchoring was introduced for; statement anchoring keeps it.
+        let sql = "CREATE TABLE calendars(\n  id TEXT PRIMARY KEY,\n  source_id TEXT REFERENCES \
+                   connector_sources(id) ON DELETE CASCADE\n);";
+        assert!(verdict(sql).is_none());
     }
 
     /// v18 lands the multi-provider calendar foundation: the `calendars` registry (cascading from a
