@@ -8,9 +8,11 @@
 //! Python is provided by a *managed venv* created on first run (spec decision):
 //! the app locates a base interpreter — the standalone one bundled with the app
 //! on Windows release builds, else a system Python — builds an isolated venv
-//! under the data directory, and pip-installs the pinned `requirements.txt`. A
-//! `.ready` marker keyed by a hash of that file lets later runs skip the slow
-//! setup.
+//! under the data directory, and pip-installs `requirements.lock` with
+//! `--require-hashes` — a fully resolved, hash-pinned set covering every transitive
+//! dependency, so an artifact whose digest does not match is refused rather than
+//! executed. A `.ready` marker keyed by a hash of the LOCK lets later runs skip the
+//! slow setup.
 //!
 //! Talking to the child is newline-delimited JSON over stdio. Requests are
 //! serialized by the `Mutex<Option<Process>>`, so each reply is the next line on
@@ -182,20 +184,24 @@ const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
 /// 3.14, so there's no compile step.
 const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pillow-heif==1.5.0"];
 
-/// The marker's expected contents — the OCR pins joined, so a future bump re-installs. Kept in sync
-/// with [`OPTIONAL_OCR_PINS`]; the `optional_ocr_marker_matches_pins` test guards the join.
-const OPTIONAL_OCR_MARKER: &str = "rapidocr==3.9.2;pillow-heif==1.5.0";
-
 /// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
 /// operations differ only in these fields, so they share one implementation each
 /// (`optional_ready` / `install_optional` / `uninstall_optional` on [`SidecarManager`]); the
 /// public per-component methods are one-line delegates.
 struct OptionalComponent {
-    /// The venv marker recording the installed pins (`.pm-tsne` / `.pm-ocr`).
+    /// The venv marker recording what is installed (`.pm-tsne` / `.pm-ocr`). Its contents are
+    /// derived by [`SidecarManager::optional_stamp`], never stored as a second literal — the
+    /// hand-kept `OPTIONAL_OCR_MARKER` copy of the joined pins used to need its own test to stop
+    /// the two drifting.
     marker: fn(&SidecarPaths) -> PathBuf,
-    /// What a current marker must hold — and what a fresh install stamps.
-    stamp: &'static str,
-    /// The `pip install` pins.
+    /// The component's hash-pinned lock, alongside `requirements.lock` in `source_dir`. This is
+    /// what pip actually installs (`--require-hashes -r <lock>`); `pins` below stays the source of
+    /// truth for WHICH packages the component is, and `just requirements-lock` fails if the two
+    /// disagree. Each optional lock is resolved AGAINST the base lock, so installing a component
+    /// on demand can never move a package the base venv is already running on.
+    lock: &'static str,
+    /// The component's top-level pins — the source of truth for its identity, mirrored into
+    /// `sidecar/requirements-optional.txt` for `just pip-audit` and into the lock's `pm-pins` stamp.
     pins: &'static [&'static str],
     /// The packages `pip uninstall` removes. Only the top-level ones: heavier transitive deps are
     /// deliberately LEFT in place so a removal can never break the base venv by pulling a package
@@ -205,14 +211,14 @@ struct OptionalComponent {
 
 const OPTIONAL_TSNE_COMPONENT: OptionalComponent = OptionalComponent {
     marker: SidecarPaths::tsne_marker,
-    stamp: OPTIONAL_TSNE_PIN,
+    lock: "requirements-tsne.lock",
     pins: &[OPTIONAL_TSNE_PIN],
     uninstall: &["openTSNE"],
 };
 
 const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     marker: SidecarPaths::ocr_marker,
-    stamp: OPTIONAL_OCR_MARKER,
+    lock: "requirements-ocr.lock",
     pins: OPTIONAL_OCR_PINS,
     uninstall: &["rapidocr", "pillow-heif"],
 };
@@ -236,8 +242,16 @@ impl SidecarPaths {
         self.source_dir.join("pm_sidecar.py")
     }
 
-    fn requirements(&self) -> PathBuf {
-        self.source_dir.join("requirements.txt")
+    /// The fully resolved, hash-pinned lock generated from `requirements.txt` — what pip actually
+    /// installs. `requirements.txt` pins only the top-level packages, so it stays the file a human
+    /// edits and `just lock-regen` regenerates this from it; nothing reads it at runtime.
+    fn lock(&self) -> PathBuf {
+        self.source_dir.join("requirements.lock")
+    }
+
+    /// An optional component's lock (see [`OptionalComponent::lock`]).
+    fn optional_lock(&self, component: &OptionalComponent) -> PathBuf {
+        self.source_dir.join(component.lock)
     }
 
     /// The venv's Python interpreter (per-OS layout).
@@ -716,8 +730,8 @@ impl SidecarManager {
         };
         // Boot status asks the SAME question every other readiness check asks — is the marker
         // CURRENT — rather than merely whether the file exists. The marker stamps the
-        // requirements hash, so bare existence goes on reporting Ready after an app update
-        // changes requirements.txt, right up until the next `ensure_installed`. In that window
+        // lock hash, so bare existence goes on reporting Ready after an app update
+        // changes the lock, right up until the next `ensure_installed`. In that window
         // chat grounding trusts `status()` and runs the NEW sidecar script against the OLD pinned
         // deps. Costs one extra `--version` probe at boot (the hash read is cheap), and a false
         // NotInstalled only means provision() re-checks — which it was going to do anyway.
@@ -858,13 +872,16 @@ impl SidecarManager {
     }
 
     fn provision(&self, on_progress: impl FnMut(f32)) -> std::result::Result<(), ProvisionError> {
-        let requirements = self.paths.requirements();
-        if !requirements.exists() {
+        // The LOCK, not requirements.txt: the lock is what pip installs. requirements.txt is the
+        // human-edited top-level list `just lock-regen` generates the lock from, and is not read
+        // at runtime at all.
+        let lock = self.paths.lock();
+        if !lock.exists() {
             return Err(ProvisionError {
                 kind: SidecarErrorKind::RequirementsMissing,
                 source: Error::Other(format!(
-                    "sidecar requirements not found at {} (is the sidecar/ folder present?)",
-                    requirements.display()
+                    "sidecar dependency lock not found at {} (is the sidecar/ folder present?)",
+                    lock.display()
                 )),
             });
         }
@@ -941,15 +958,22 @@ impl SidecarManager {
         // surviving a full "remove PM completely". Relocating it under `runtime/` would also work,
         // but the cache only earns its keep on a venv REBUILD, which is rare, so not writing it at
         // all is both smaller and simpler than tracking it. First-run download volume is unchanged.
+        // `--require-hashes`: every entry in the lock carries the SHA-256 of every artifact PyPI
+        // publishes for that version, and pip refuses anything whose digest does not match. Without
+        // it the six top-level pins were the only fixed points and every transitive dependency was
+        // whatever PyPI served that day — in the one process that opens untrusted PDFs, Office
+        // documents and images. The flag is also fail-closed in a second, useful way: it makes pip
+        // reject a lock that is not FULLY pinned, so a partially-regenerated file cannot install.
         pip.args([
             "-m",
             "pip",
             "install",
             "--disable-pip-version-check",
             "--no-cache-dir",
+            "--require-hashes",
             "-r",
         ])
-        .arg(&requirements);
+        .arg(&lock);
         clean_python_env(&mut pip);
         no_window(&mut pip);
         run_command(&mut pip, "pip install requirements").map_err(|e| ProvisionError {
@@ -975,8 +999,8 @@ impl SidecarManager {
             }
         }
 
-        // Stamp the marker with the requirements hash so we can skip next time.
-        let hash = self.requirements_hash().map_err(unknown)?;
+        // Stamp the marker with the lock's hash so we can skip next time.
+        let hash = self.lock_hash().map_err(unknown)?;
         std::fs::write(self.paths.ready_marker(), hash).map_err(unknown)?;
         Ok(())
     }
@@ -1086,8 +1110,12 @@ impl SidecarManager {
         }
     }
 
-    fn requirements_hash(&self) -> Result<String> {
-        let bytes = std::fs::read(self.paths.requirements())?;
+    /// Hash of the LOCK, which is what actually got installed. Keyed on requirements.txt before the
+    /// lock existed — which would now under-report: regenerating the lock can move a transitive
+    /// dependency without touching requirements.txt at all, and the venv would go on reporting
+    /// Ready with the old resolution in it.
+    fn lock_hash(&self) -> Result<String> {
+        let bytes = std::fs::read(self.paths.lock())?;
         Ok(crate::ingest::hex_digest(&bytes))
     }
 
@@ -1097,10 +1125,10 @@ impl SidecarManager {
             return Ok(false);
         }
         let stamped = std::fs::read_to_string(&marker).unwrap_or_default();
-        if stamped.trim() != self.requirements_hash()? {
+        if stamped.trim() != self.lock_hash()? {
             return Ok(false);
         }
-        // requirements.txt can be unchanged yet the venv's interpreter be too old
+        // The lock can be unchanged yet the venv's interpreter be too old
         // (built against macOS system 3.9, then the user installed 3.10+). Don't
         // report Ready in that case — let provision() rebuild it. This probe runs
         // only here, in the otherwise-ready branch, not on every status() poll.
@@ -1429,10 +1457,33 @@ impl SidecarManager {
 
     /// Shared readiness check for an [`OptionalComponent`]: the venv exists and the component's
     /// marker holds exactly the pinned stamp (so a pin bump reads as not-installed and re-installs).
+    /// What a current marker must hold, and what a fresh install stamps: the component's pins AND
+    /// the hash of the lock they were installed from.
+    ///
+    /// The pins alone were enough while the pins WERE the install. Now the lock is, and
+    /// regenerating it can move a component's entire transitive tree — opencv, shapely and
+    /// pyclipper for OCR, scikit-learn and scipy for t-SNE — without a single pin changing. Keyed
+    /// on pins only, an installed component would go on reporting Ready with the old, unhashed
+    /// packages still in it: exactly the gap the base venv's `.ready` marker had before it moved
+    /// onto the lock's hash.
+    fn optional_stamp(&self, component: &OptionalComponent) -> Result<String> {
+        let bytes = std::fs::read(self.paths.optional_lock(component))?;
+        Ok(format!(
+            "{};lock={}",
+            component.pins.join(";"),
+            crate::ingest::hex_digest(&bytes)
+        ))
+    }
+
     fn optional_ready(&self, component: &OptionalComponent) -> bool {
+        // No readable lock ⇒ we cannot say what is installed. Report not-ready rather than vouch
+        // for a component we can't verify; Settings → Storage can reinstall it.
+        let Ok(expected) = self.optional_stamp(component) else {
+            return false;
+        };
         self.paths.venv_python().exists()
             && std::fs::read_to_string((component.marker)(&self.paths))
-                .map(|s| s.trim() == component.stamp)
+                .map(|s| s.trim() == expected)
                 .unwrap_or(false)
     }
 
@@ -1483,14 +1534,31 @@ impl SidecarManager {
         let mut last = 0.10f32;
         // `--no-cache-dir` for the same reason as the base install: pip's cache is the largest thing
         // PM leaves outside its own folders, and nothing ever collects it.
-        let mut args: Vec<&str> = vec![
+        //
+        // `--require-hashes -r <the component's lock>` rather than the bare pins. Photo OCR is the
+        // case that makes this matter: it is the code that parses an untrusted image, and it used to
+        // arrive with its whole transitive tree (opencv, shapely, pyclipper) free-resolved at install
+        // time. The lock is also resolved against the BASE lock, so an on-demand install can no
+        // longer move a package the running venv depends on — pip was previously free to satisfy
+        // rapidocr by swapping the numpy that fastembed and onnxruntime are using.
+        let lock = self.paths.optional_lock(component);
+        if !lock.exists() {
+            return Err(Error::Other(format!(
+                "optional component lock not found at {} (is the sidecar/ folder present?)",
+                lock.display()
+            )));
+        }
+        let lock_arg = lock.to_string_lossy().into_owned();
+        let args: Vec<&str> = vec![
             "install",
             "--disable-pip-version-check",
             "--no-cache-dir",
             "--progress-bar",
             "off",
+            "--require-hashes",
+            "-r",
+            &lock_arg,
         ];
-        args.extend_from_slice(component.pins);
         run_pip_streaming(&py, &args, |line| {
             if let Some(f) = pip_phase_fraction(line, &mut downloads) {
                 if f > last {
@@ -1500,7 +1568,10 @@ impl SidecarManager {
             }
         })?;
 
-        std::fs::write((component.marker)(&self.paths), component.stamp)?;
+        std::fs::write(
+            (component.marker)(&self.paths),
+            self.optional_stamp(component)?,
+        )?;
         on_progress(1.0);
         Ok(())
     }
@@ -3093,12 +3164,40 @@ mod tests {
         );
     }
 
-    /// The OCR marker string must be exactly the pins joined by ';' — the installer writes the marker
-    /// and `optional_ocr_ready` compares it, so a drift here would silently re-install on every check
-    /// or never detect an install. Guards the hand-kept duplication of the two constants.
+    /// An optional component's marker covers its pins AND the lock they came from. The installer
+    /// writes it and `optional_ready` compares it, so a drift either silently re-installs on every
+    /// check or never detects an install at all.
+    ///
+    /// Replaces `optional_ocr_marker_matches_pins`, which guarded a hand-kept `OPTIONAL_OCR_MARKER`
+    /// duplicate of this join — deleted, since the join is now computed. The half that copy could
+    /// never have caught is the second assertion: regenerating a lock moves a component's whole
+    /// transitive tree without touching a pin, and the marker has to notice.
     #[test]
-    fn optional_ocr_marker_matches_pins() {
-        assert_eq!(OPTIONAL_OCR_PINS.join(";"), OPTIONAL_OCR_MARKER);
+    fn optional_stamp_covers_the_pins_and_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("sidecar");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let lock = source_dir.join(OPTIONAL_OCR_COMPONENT.lock);
+        std::fs::write(&lock, b"rapidocr==3.9.2 \\\n    --hash=sha256:aaa\n").unwrap();
+
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir,
+            venv_dir: dir.path().join("venv"),
+        });
+
+        let first = mgr.optional_stamp(&OPTIONAL_OCR_COMPONENT).unwrap();
+        assert!(
+            first.starts_with("rapidocr==3.9.2;pillow-heif==1.5.0;lock="),
+            "the stamp must lead with the pins joined by ';': {first}"
+        );
+
+        // Same pins, regenerated lock (a moved transitive dependency) — must invalidate the marker.
+        std::fs::write(&lock, b"rapidocr==3.9.2 \\\n    --hash=sha256:bbb\n").unwrap();
+        assert_ne!(
+            first,
+            mgr.optional_stamp(&OPTIONAL_OCR_COMPONENT).unwrap(),
+            "a regenerated lock must not go on satisfying the old marker"
+        );
     }
 
     /// L-6: the audit-only `sidecar/requirements-optional.txt` (which `just pip-audit` scans) must list
@@ -3124,6 +3223,41 @@ mod tests {
             listed, expected,
             "requirements-optional.txt must list exactly the optional pins, in order"
         );
+    }
+
+    /// Every sidecar file the app READS at runtime must be bundled, in BOTH manifests. The resource
+    /// map is an explicit allow-list — a file is shipped by being named there and by nothing else —
+    /// and `source_dir` is the repo's own `sidecar/` in dev, so a file missing from the manifests
+    /// works perfectly here and is simply absent on a user's machine. That is the same shape as the
+    /// vault-walk bug this codebase has shipped twice; the locks are new files, so they need it.
+    #[test]
+    fn every_sidecar_file_the_app_reads_is_bundled() {
+        let mut expected = vec![
+            "../sidecar/pm_sidecar.py".to_string(),
+            "../sidecar/requirements.lock".to_string(),
+        ];
+        expected.extend(
+            ALL_OPTIONAL_COMPONENTS
+                .iter()
+                .map(|c| format!("../sidecar/{}", c.lock)),
+        );
+
+        for manifest in ["tauri.conf.json", "tauri.linux.conf.json"] {
+            let path = format!("{}/{manifest}", env!("CARGO_MANIFEST_DIR"));
+            let json: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&path).expect("the bundle manifest must exist"),
+            )
+            .expect("the bundle manifest must be valid JSON");
+            let resources = json["bundle"]["resources"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{manifest} has no bundle.resources map"));
+            for key in &expected {
+                assert!(
+                    resources.contains_key(key),
+                    "{manifest} does not bundle {key} - the installed app would not have that file",
+                );
+            }
+        }
     }
 
     #[test]

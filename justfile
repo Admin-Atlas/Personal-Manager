@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -124,11 +124,12 @@ sidecar-test:
 deny:
     cd src-tauri && cargo deny check
 
-# Python dependency CVE audit (resolves + audits the pinned sidecar deps). Scans the OPTIONAL
-# OCR/t-SNE pins too (requirements-optional.txt) so an on-demand component's CVE can't ship unnoticed
-# (L-6). The optional file is audit-only — the base venv still installs from requirements.txt alone.
+# Python dependency CVE audit. Scans the LOCKS — which is every package that actually installs,
+# transitive ones included, on the base venv AND both optional components (L-6). It used to scan
+# requirements.txt, i.e. the six top-level pins only, so a CVE in (say) pdfminer.six or lxml — both
+# of which parse untrusted input — was never looked at.
 pip-audit:
-    pip-audit -r sidecar/requirements.txt -r sidecar/requirements-optional.txt
+    pip-audit -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock
 
 # JS dependency CVE audit against the npm lockfile. `moderate` (not `high`) so a moderate-rated
 # sanitizer / proto-pollution advisory in the render path can't pass green (L-7).
@@ -203,6 +204,20 @@ script-deps:
 # kept asserting the opposite.
 action-pins:
     node scripts/check-action-pins.mjs
+
+# The sidecar's dependency locks are current, fully pinned and fully hashed. Offline and
+# zero-dependency: each lock stamps the SHA-256 of every input it was generated from, and this
+# recomputes them. Also in release.yml's `guards` job — a stale lock blocks a release, not just a
+# merge, because the lock is what installs on a user's machine.
+requirements-lock:
+    node scripts/check-requirements-lock.mjs
+
+# --- generators (not part of `check`) -------------------------------------
+
+# Regenerate the sidecar dependency locks. Needs `uv` on PATH; reaches the network. Run after any
+# change to sidecar/requirements.txt or the optional pins in sidecar.rs, then commit the result.
+lock-regen:
+    node scripts/regen-sidecar-locks.mjs
 
 # --- release-only ---------------------------------------------------------
 

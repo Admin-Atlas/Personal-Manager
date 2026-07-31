@@ -93,6 +93,14 @@ jobs:
       - name: AGPL licence + source headers unmodified
         run: just headers
 
+      # A stale lock is invisible: it stays valid, pip installs it happily under
+      # --require-hashes, it is simply no longer the resolution generated from the
+      # requirements in this tag. Here as well as in pr.yml because the lock is what
+      # installs on a user's machine — that makes it a release-blocking property, not
+      # only a merge-blocking one.
+      - name: The sidecar dependency locks are current, pinned and hashed
+        run: just requirements-lock
+
   build:
     needs: guards
     strategy:
@@ -322,14 +330,19 @@ jobs:
           path: staged/*
           if-no-files-found: error
 
-  # --- sidecar-deps smoke: the pinned requirements resolve + import -------
-  # Proves requirements.txt installs and imports on each SHIPPED OS (Windows +
-  # macOS + Linux) against Python 3.12 — the version Windows and Linux BUNDLE
-  # (python-build-standalone, fetched into the bundle by scripts/fetch-python.mjs)
-  # and the floor macOS still provisions its runtime venv against. Catches a dep
-  # that can't resolve before a release does. (The bundled interpreter is a
-  # prebuilt binary, so the build runners still need no Python toolchain to
-  # compile.)
+  # --- sidecar-deps smoke: the LOCK installs, hash-verified, and imports --
+  # Proves sidecar/requirements.lock installs and imports on each SHIPPED OS
+  # (Windows + macOS + Linux) against Python 3.12 — the version Windows and Linux
+  # BUNDLE (python-build-standalone, fetched into the bundle by
+  # scripts/fetch-python.mjs) and the floor macOS still provisions its runtime venv
+  # against. Catches a dep that can't resolve before a release does. (The bundled
+  # interpreter is a prebuilt binary, so the build runners still need no Python
+  # toolchain to compile.)
+  #
+  # Installs exactly as the app does — `--require-hashes -r sidecar/requirements.lock`
+  # — so this is also the proof that the universal lock's markers select correctly on
+  # all three platforms, and that every artifact each one needs is covered by a hash.
+  # It used to install requirements.txt, which left the shipped resolution untested.
   python-smoke:
     needs: guards
     strategy:
@@ -340,14 +353,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The tag's requirements.txt, not a branch's — this smoke exists to prove
-          # the deps THIS release pins actually resolve.
+          # The tag's lock, not a branch's — this smoke exists to prove the deps THIS
+          # release pins actually resolve.
           ref: ${{ needs.guards.outputs.tag }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Clean venv → install → import sidecar deps
+      - name: Clean venv → hash-verified install → import sidecar deps
         shell: bash
         run: |
           python -m venv .smoke-venv
@@ -357,7 +370,7 @@ jobs:
             source .smoke-venv/bin/activate
           fi
           python -m pip install --upgrade pip
-          pip install -r sidecar/requirements.txt
+          pip install --require-hashes -r sidecar/requirements.lock
           python -c "import markitdown, fastembed, faster_whisper; print('sidecar deps import OK')"
 
   publish:
