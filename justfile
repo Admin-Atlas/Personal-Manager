@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version npm-licenses
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -226,12 +226,23 @@ node-version:
 npm-licenses:
     node scripts/check-npm-licenses.mjs
 
+# Every Python package the sidecar installs is under a licence someone read and accepted — the
+# third ecosystem in the job named for all three. Compares sidecar/licences.json against the locks:
+# every locked package covered, at every locked version, by a value written BY HAND. PyPI's own
+# metadata is too unreliable to normalise automatically (pillow-heif declared BSD-3-Clause while
+# classifying itself GPLv2), so the network and the review live in `just lock-regen`; this is
+# offline and reaches nothing.
+sidecar-licences:
+    node scripts/check-sidecar-licences.mjs
+
 # --- generators (not part of `check`) -------------------------------------
 
-# Regenerate the sidecar dependency locks. Needs `uv` on PATH; reaches the network. Run after any
-# change to sidecar/requirements.txt or the optional pins in sidecar.rs, then commit the result.
+# Regenerate the sidecar dependency locks and refresh the licence evidence behind them. Needs `uv`
+# on PATH; both halves reach the network. Run after any change to sidecar/requirements.txt or the
+# optional pins in sidecar.rs, review anything the second half flags, then commit the result.
 lock-regen:
     node scripts/regen-sidecar-locks.mjs
+    node scripts/regen-sidecar-licences.mjs
 
 # --- release-only ---------------------------------------------------------
 

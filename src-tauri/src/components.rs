@@ -3,7 +3,7 @@
 
 //! On-device storage inventory + a reference-counted, guarded teardown of the large, regenerable
 //! components PM downloads: the optional t-SNE stack (`openTSNE` → `scikit-learn`/`scipy`), the
-//! optional photo-OCR stack (`rapidocr`+`pillow-heif` → `opencv-python`/`shapely`/`pyclipper`), the
+//! optional photo-OCR stack (`rapidocr`+`pi-heif` → `opencv-python`/`shapely`/`pyclipper`), the
 //! Whisper speech model, and a **read-only** view of the active embedder.
 //!
 //! The photo-OCR stack is also **installable** from this inventory (the one place it's enabled or
@@ -239,7 +239,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
     );
     let (scipy_present, scipy_size) = pkg(site.as_ref(), "scipy", &["scipy", "scipy*"]);
 
-    // Optional photo-OCR stack. The top-level component bundles rapidocr + pillow-heif (the two pins
+    // Optional photo-OCR stack. The top-level component bundles rapidocr + pi-heif (the two pins
     // `uninstall_optional_ocr` removes) plus its tiny pure-Python siblings; the heavy image libraries
     // (opencv-python / shapely / pyclipper) are separate, cascade-removable children. numpy is shared
     // with the embedder and never listed. pyclipper installs no import dir, so it needs `pkg_dist`.
@@ -250,6 +250,13 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
             "rapidocr",
             "rapidocr-*",
             "rapidocr_*",
+            "pi_heif",
+            "pi_heif-*",
+            "pi_heif.libs",
+            // pillow_heif is what the component installed before the pi-heif swap. Its globs stay so
+            // an existing install is still MEASURED (and so the cascade still reclaims it) — a
+            // package that stops being listed here does not stop taking up disk, it just stops being
+            // counted, and the Storage tab quietly under-reports by ~28 MB.
             "pillow_heif",
             "pillow_heif-*",
             "pillow_heif.libs",

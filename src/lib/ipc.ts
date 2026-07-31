@@ -1213,7 +1213,7 @@ export const optionalTsneStatus = () => invoke<TsneStatus>("optional_tsne_status
 /** Install the optional t-SNE reducer into the managed venv, then recompute the layout with it. */
 export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
 
-/** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
+/** Whether the optional photo-OCR component (rapidocr + pi-heif) is installed. */
 export const optionalOcrStatus = () => invoke<OcrStatus>("optional_ocr_status");
 
 /** Install the optional photo-OCR component into the managed venv (a one-time download). Progress

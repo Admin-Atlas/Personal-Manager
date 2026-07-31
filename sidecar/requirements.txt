@@ -16,12 +16,12 @@
 # (they co-resolve to single versions — verified on the user's Python 3.14). The
 # base.en weights (~145 MB) download once on first use, like the embedding model.
 #
-# Photo OCR (rapidocr + pillow-heif) is an OPTIONAL component, NOT listed here —
+# Photo OCR (rapidocr + pi-heif) is an OPTIONAL component, NOT listed here —
 # like the t-SNE reducer, it installs on demand and is removable from Settings, so
 # the base venv stays lean for users who never ingest photos. Its pins live in Rust
 # (sidecar.rs OPTIONAL_OCR_PINS). rapidocr runs OCR on the onnxruntime fastembed
 # already ships (it pulls no runtime of its own) and downloads its small ONNX models
-# on first use; the extra image deps (opencv/shapely/pyclipper) and pillow-heif ship
+# on first use; the extra image deps (opencv/shapely/pyclipper) and pi-heif ship
 # binary wheels for both the bundled 3.12 release interpreter and dev 3.14.
 #
 #   openpyxl — spreadsheet parsing for the dedicated .xlsx/.csv ingest path (board card:

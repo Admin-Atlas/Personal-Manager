@@ -143,11 +143,11 @@ describe("readRustFacts", () => {
     const rust = [
       "const MIN_PYTHON: (u32, u32) = (3, 10);",
       'const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";',
-      'const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pillow-heif==1.5.0"];',
+      'const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pi-heif==1.4.0"];',
     ].join("\n");
     expect(readRustFacts(rust)).toEqual({
       floor: "3.10",
-      pins: { tsne: ["openTSNE==1.0.4"], ocr: ["rapidocr==3.9.2", "pillow-heif==1.5.0"] },
+      pins: { tsne: ["openTSNE==1.0.4"], ocr: ["rapidocr==3.9.2", "pi-heif==1.4.0"] },
     });
   });
 
@@ -160,14 +160,14 @@ describe("parseHeader", () => {
   it("reads the stamps, including the optional-lock ones", () => {
     const text = lock({
       inputSha: H,
-      extra: `# pm-constraint: sidecar/requirements.lock@sha256:${H2}\n# pm-pins: rapidocr==3.9.2 pillow-heif==1.5.0`,
+      extra: `# pm-constraint: sidecar/requirements.lock@sha256:${H2}\n# pm-pins: rapidocr==3.9.2 pi-heif==1.4.0`,
     });
     const header = parseHeader(text);
     expect(header.problems).toEqual([]);
     expect(header.floor).toBe("3.10");
     expect(header.input).toEqual({ path: "sidecar/requirements.txt", sha: H });
     expect(header.constraint).toEqual({ path: "sidecar/requirements.lock", sha: H2 });
-    expect(header.pins).toEqual(["rapidocr==3.9.2", "pillow-heif==1.5.0"]);
+    expect(header.pins).toEqual(["rapidocr==3.9.2", "pi-heif==1.4.0"]);
   });
 
   it("rejects a hand-written file with no stamps at all", () => {

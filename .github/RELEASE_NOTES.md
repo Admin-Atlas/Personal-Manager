@@ -157,3 +157,8 @@ drift from what is actually linked.
 PM's own third-party dependencies and their licences are listed in `THIRD-PARTY-NOTICES.txt`,
 attached to each release: the Rust crates it is built from, and the npm packages compiled
 into its interface — including the typefaces it self-hosts.
+
+The document features also install a small set of **Python packages from PyPI** the first time you
+use them — onto your machine, not inside the installer, which is why they are not in that file.
+Every one of them is recorded with its licence in `sidecar/licences.json` in the source repository,
+and a check refuses a package whose terms nobody has read.

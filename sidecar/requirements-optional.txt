@@ -6,4 +6,4 @@
 # `just pip-audit` scans it alongside requirements.txt so an OCR / t-SNE CVE can't ship unnoticed.
 openTSNE==1.0.4
 rapidocr==3.9.2
-pillow-heif==1.5.0
+pi-heif==1.4.0

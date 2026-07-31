@@ -349,3 +349,5 @@ jobs:
         run: just node-version
       - name: Every shipped npm package carries an accepted licence
         run: just npm-licenses
+      - name: Every sidecar Python package carries a reviewed licence
+        run: just sidecar-licences

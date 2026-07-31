@@ -58,21 +58,34 @@ This is the part the user cares about most. Please follow it literally.
 ---
 
 ## About the design files
-The files in this bundle are **design references created as a single HTML prototype** — they show
-intended look, structure, and behavior. They are **not production code to copy**. Your job is to
-**recreate this design language in the app's existing React/TypeScript environment**, using its
-established patterns (component library, styling approach, state). The prototype is built with
-inline styles + CSS custom properties; in the real app, express the same tokens however the
-codebase already does theming (CSS variables, a `ThemeProvider`, Tailwind config, etc.).
+This began as a handoff brief written against an interactive HTML prototype. The prototype
+(`PM.dc.html` and the `support.js` runtime that opened it) has since been **removed** — see
+"Why the prototype is gone" below. What remains is the part that stayed authoritative:
 
-- `PM.dc.html` — the current, complete design system (all four axes, all surfaces, all in-use states). **This is the source of truth.**
-- `support.js` — runtime needed to open `PM.dc.html` in a browser. Not part of the design.
-- `DESIGN_TOKENS.md` — the precise token recipe (OKLCH ramps, accent math, status colors, fonts, radii) + a framework-agnostic `themeVars()` function. **Start here when implementing theming.**
+- `DESIGN_TOKENS.md` — the precise token recipe (OKLCH ramps, accent math, status colors, fonts, radii) + a framework-agnostic `themeVars()` function. **This is the source of truth.** Start here when implementing theming.
+- This `README.md` — the design rules and rationale.
+
+Neither is production code to copy: they describe the design language, and the app expresses it
+through its own theming layer (`src/theme/`, Tailwind, CSS custom properties).
 
 > The design rules that used to live in a drop-in `CLAUDE.md` here now live in the repo's
 > [`AGENTS.md`](../AGENTS.md#design-system-v2) (`## Design system`), so they stay in context on
-> every task. The earlier three-System exploration prototype has been removed now that the
-> direction is settled — `PM.dc.html` is the single source of truth.
+> every task.
+
+### Why the prototype is gone
+
+Two reasons, and the second is the one that forced it.
+
+**It had gone stale.** `PM.dc.html` was a June snapshot. The app has moved a long way past it —
+the Accessibility tab, the Density and Contrast controls, the colour-blind-safe palette, the
+Focus panel layout — none of which the prototype shows. A reference that calls itself "the source
+of truth" while describing a version of the app that no longer exists misleads more than it helps.
+
+**`support.js` could not be licensed.** It was a 55 KB generated bundle, marked "do not edit" and
+built from a `dc-runtime` toolchain that is not in this repository and that we cannot point at.
+This repo is public and AGPL-3.0-or-later, so leaving it here meant asserting a licence over code
+we did not write and whose source we cannot supply. `support.js` existed only to open
+`PM.dc.html`, so the two left together. `DESIGN_TOKENS.md` is hand-written and unaffected.
 
 ## Fidelity
 **High-fidelity.** Final colors (as an OKLCH system), typography, spacing, radii, and interaction
@@ -198,7 +211,6 @@ simple mic glyph in the composer; replace with the codebase's icon set. Status/e
 shapes.
 
 ## Files in this bundle
-- `PM.dc.html` — current full design system (source of truth)
-- `DESIGN_TOKENS.md` — token recipe + `themeVars()`
-- `support.js` — runtime to open `PM.dc.html`
+- `DESIGN_TOKENS.md` — token recipe + `themeVars()` (the source of truth)
+- This `README.md` — the design rules and rationale
 - The design rules also live in the repo's [`AGENTS.md`](../AGENTS.md#design-system-v2).

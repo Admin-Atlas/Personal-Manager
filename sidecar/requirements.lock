@@ -17,7 +17,7 @@
 #
 # pm-lock: 1
 # pm-python-floor: 3.10
-# pm-input: sidecar/requirements.txt@sha256:26cda898933e38cd4f3f03a9d75e5b9d2ab47441637448a000005fcaa80feb43
+# pm-input: sidecar/requirements.txt@sha256:ae4ab74035853105871cf45d676ea901d02111a0b38ed1f86d39815c26f00110
 anyio==4.14.2 \
     --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494 \
     --hash=sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f

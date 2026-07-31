@@ -178,11 +178,21 @@ const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
 /// The OPTIONAL photo-OCR component, pinned. **Not** in `requirements.txt` — like t-SNE, the base
 /// venv stays lean and the user installs it on demand (see [`SidecarManager::install_optional_ocr`]).
 /// `rapidocr` runs OCR on the `onnxruntime` fastembed already ships (it pulls no runtime of its own)
-/// and downloads its small detection/recognition ONNX models on first use; `pillow-heif` adds HEIC
+/// and downloads its small detection/recognition ONNX models on first use; `pi-heif` adds HEIC
 /// decoding (Pillow itself is already present via markitdown). Both — and rapidocr's image deps
 /// (opencv/shapely/pyclipper) — ship binary wheels for the bundled 3.12 release interpreter and dev
 /// 3.14, so there's no compile step.
-const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pillow-heif==1.5.0"];
+///
+/// **`pi-heif`, not `pillow-heif`.** They are the same bindings by the same author, built from the
+/// same repository, and both expose the `register_heif_opener` the sidecar imports — but they are
+/// packaged differently, and the licence gate (`just sidecar-licences`) is what surfaced it.
+/// pillow-heif's binary wheels bundle an HEVC *encoder*, x265, so upstream's own
+/// `LICENSES_bundled.txt` reads "License for pillow-heif binary wheels: GPLv2". PM only ever
+/// DECODES a HEIC, so that encoder was never reachable — it was 22 MB of GPL-2.0 PM asked a user's
+/// machine to install for nothing, in an AGPL-3.0-or-later product it is not compatible with.
+/// pi-heif is the decode-only build of the same bindings: libheif + libde265, both LGPLv3, in a
+/// wheel a third of the size.
+const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pi-heif==1.4.0"];
 
 /// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
 /// operations differ only in these fields, so they share one implementation each
@@ -220,7 +230,11 @@ const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     marker: SidecarPaths::ocr_marker,
     lock: "requirements-ocr.lock",
     pins: OPTIONAL_OCR_PINS,
-    uninstall: &["rapidocr", "pillow-heif"],
+    // `pillow-heif` is still listed although nothing installs it any more: a user who added photo
+    // OCR before the pi-heif swap has it in their venv, and "remove photo OCR" should take it with
+    // them rather than strand 28 MB (and the GPL-2.0 x265 inside it) forever. `pip uninstall -y`
+    // skips a package that isn't installed, so this costs the common case nothing.
+    uninstall: &["rapidocr", "pi-heif", "pillow-heif"],
 };
 
 /// Every optional component, so a caller that must treat them all alike can't miss one. `provision`
@@ -1440,14 +1454,14 @@ impl SidecarManager {
         self.optional_ready(&OPTIONAL_OCR_COMPONENT)
     }
 
-    /// Install the OPTIONAL photo-OCR component (rapidocr + pillow-heif) into the managed venv on
+    /// Install the OPTIONAL photo-OCR component (rapidocr + pi-heif) into the managed venv on
     /// demand — the shared [`Self::install_optional`] flow with the OCR marker + pins.
     pub fn install_optional_ocr(&self, on_progress: impl FnMut(f32)) -> Result<()> {
         self.install_optional(&OPTIONAL_OCR_COMPONENT, on_progress)
     }
 
     /// Remove the OPTIONAL photo-OCR component (the "delete" action) — the shared
-    /// [`Self::uninstall_optional`] flow. Only rapidocr + pillow-heif are removed: the heavier
+    /// [`Self::uninstall_optional`] flow. Only rapidocr + pi-heif are removed: the heavier
     /// transitive image deps (opencv / shapely / pyclipper) are LEFT in place here; the Storage
     /// manager (components.rs) does the guarded cascade that reclaims them. Once the marker is gone,
     /// future photos ingest EXIF-only.
@@ -3187,7 +3201,7 @@ mod tests {
 
         let first = mgr.optional_stamp(&OPTIONAL_OCR_COMPONENT).unwrap();
         assert!(
-            first.starts_with("rapidocr==3.9.2;pillow-heif==1.5.0;lock="),
+            first.starts_with("rapidocr==3.9.2;pi-heif==1.4.0;lock="),
             "the stamp must lead with the pins joined by ';': {first}"
         );
 

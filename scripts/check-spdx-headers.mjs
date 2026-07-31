@@ -4,11 +4,18 @@
 // AGPL hygiene: every first-party source file carries the two-line SPDX header,
 // and the verbatim AGPL licence text is untouched.
 //
-//   1. HEADERS — each tracked .rs/.ts/.tsx/.js/.mjs/.py/.css file begins with
+//   1. HEADERS — each tracked source file begins with
 //        SPDX-FileCopyrightText: <year> <author>
 //        SPDX-License-Identifier: AGPL-3.0-or-later
-//      (generated/third-party reference under design-system-docs/ is excluded —
-//      e.g. support.js is a "do not edit" bundle and must not be re-licensed).
+//      across ELEVEN extensions and with NO exclusions. The list used to stop at seven, so the
+//      shell script CI runs, the NSIS uninstaller hook, the Vite entry HTML and the cargo-about
+//      template were held by convention alone — and about.hbs had quietly never had a header.
+//      Comment syntax differs per language (`//`, `#`, `;`, `<!-- -->`, `{{!-- --}}`); the check
+//      is syntax-agnostic because it greps the opening lines rather than parsing them.
+//
+//      The one exclusion this file used to carry — design-system-docs/, for a generated
+//      "do not edit" bundle — is gone with the bundle itself (see that folder's README).
+//      An exclusion is where an unlicensed file hides, so the gate now has none.
 //
 //   2. LICENCE.txt UNCHANGED — pinned by SHA-256. The file is the verbatim FSF
 //      AGPL-3.0 text; it must never be edited, only replaced wholesale by a future
@@ -32,21 +39,43 @@ const read = (rel) => readFileSync(join(repoRoot, rel), "utf8");
 const LICENCE_FILE = "LICENCE.txt";
 const LICENCE_SHA256 = "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0";
 
-const HEADER_EXTENSIONS = ["rs", "ts", "tsx", "js", "mjs", "py", "css"];
-// Generated bundles / third-party design reference — not first-party source.
-const HEADER_EXCLUDE = [/^design-system-docs\//];
+const HEADER_EXTENSIONS = [
+  "rs",
+  "ts",
+  "tsx",
+  "js",
+  "mjs",
+  "py",
+  "css",
+  "sh", // scripts/smoke-bundled-python.sh — the clean-profile guard release.yml runs
+  "nsh", // src-tauri/nsis/uninstall-hooks.nsh — the Windows uninstaller hook
+  "hbs", // src-tauri/about.hbs — the cargo-about template that renders the release NOTICE
+  "html", // index.html — Vite's entry document
+];
 
 const problems = [];
 
 // 1. Headers.
-const tracked = execFileSync("git", ["ls-files", ...HEADER_EXTENSIONS.map((e) => `*.${e}`)], {
-  encoding: "utf8",
-  cwd: repoRoot,
-})
-  .split("\n")
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .filter((f) => !HEADER_EXCLUDE.some((re) => re.test(f)));
+const lsFiles = (patterns) =>
+  execFileSync("git", ["ls-files", ...patterns], { encoding: "utf8", cwd: repoRoot })
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+const tracked = lsFiles(HEADER_EXTENSIONS.map((e) => `*.${e}`));
+
+// An extension that matches nothing is the failure this gate cannot otherwise see: the check goes
+// on passing while covering one file fewer, and reports a healthy total the whole time. So each
+// declared extension must still exist in the tree. If a PR legitimately removes the last file of a
+// kind, the honest fix is to drop the extension here in the same commit.
+for (const ext of HEADER_EXTENSIONS) {
+  if (lsFiles([`*.${ext}`]).length === 0) {
+    problems.push(
+      `no tracked .${ext} file — HEADER_EXTENSIONS claims to cover a kind of source that is no ` +
+        `longer in the tree; remove the extension or restore the file`,
+    );
+  }
+}
 
 let checked = 0;
 for (const f of tracked) {
@@ -118,11 +147,14 @@ for (const manifest of [null, ...PLATFORM_MANIFESTS]) {
 if (problems.length) {
   console.error("✗ spdx/licence:\n");
   for (const p of problems) console.error(`  • ${p}`);
-  console.error("\nAdd the two-line header (see an existing source file) to each flagged file.");
+  if (problems.some((p) => p.startsWith("missing header"))) {
+    console.error("\nAdd the two-line header (see an existing source file) to each flagged file.");
+  }
   process.exit(1);
 }
 
 console.log(
-  `✓ spdx/licence: ${checked} source files carry the header; ${LICENCE_FILE} unchanged and bundled ` +
-    `by every platform (${PLATFORM_MANIFESTS.length + 1} merged configs)`,
+  `✓ spdx/licence: ${checked} source files across ${HEADER_EXTENSIONS.length} extensions carry the ` +
+    `header, with no exclusions; ${LICENCE_FILE} unchanged and bundled by every platform ` +
+    `(${PLATFORM_MANIFESTS.length + 1} merged configs)`,
 );

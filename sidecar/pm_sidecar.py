@@ -597,20 +597,25 @@ def get_ocr_engine():
 
 
 def _open_image(path):
-    """Open an image with Pillow, registering the HEIC opener if pillow-heif is available. Pillow is
-    already present (a markitdown dependency); pillow-heif ships in the optional OCR component, so
+    """Open an image with Pillow, registering the HEIC opener if pi-heif is available. Pillow is
+    already present (a markitdown dependency); pi-heif ships in the optional OCR component, so
     HEIC decoding needs that component installed — a non-HEIC image opens regardless.
+
+    pi-heif rather than pillow-heif: same bindings, same author, same repository, but the
+    decode-only build. See OPTIONAL_OCR_PINS in sidecar.rs for why the encoder build had to go.
+    A venv still holding the old pillow-heif is not read here — changing the pins changes the
+    component's stamp, so PM reports photo OCR as not installed until it is re-added.
     """
     global _heif_registered
     from PIL import Image
 
     if not _heif_registered:
         try:
-            from pillow_heif import register_heif_opener
+            from pi_heif import register_heif_opener
 
             register_heif_opener()
         except Exception:
-            pass  # pillow-heif absent → HEIC won't open, every other format still does
+            pass  # pi-heif absent → HEIC won't open, every other format still does
         _heif_registered = True
     return Image.open(path)
 
@@ -708,7 +713,7 @@ def do_analyze_image(params):
     `run_ocr`). The Rust side sets `run_ocr` from whether the optional component is installed, so
     a user who declined OCR still gets dimensions + EXIF (date/location) for the metadata chunk.
     OCR output is untrusted text — `clean_text`-ed like every other string we return. An unreadable
-    image (e.g. HEIC without pillow-heif) yields nulls; Rust falls back to a filename/ingest date.
+    image (e.g. HEIC without pi-heif) yields nulls; Rust falls back to a filename/ingest date.
     """
     path = params["path"]
     _guard_file_size(path)
