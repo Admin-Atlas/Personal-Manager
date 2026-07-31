@@ -23,7 +23,7 @@
 // never committed (git-ignored and asserted-untracked by check-files-in-place).
 //
 // Integrity: the release tag, per-platform asset, and SHA-256 are pinned below
-// (taken from the release's signed SHA256SUMS). The download is verified against
+// (the digests GitHub publishes per asset). The download is verified against
 // that hash before it is unpacked — a tampered or truncated download fails
 // loudly, no trust-on-first-use.
 //
@@ -38,6 +38,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
+  renameSync,
   rmSync,
   mkdirSync,
   existsSync,
@@ -48,6 +49,9 @@ import {
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+// Node 24 decompresses zstd natively, which is what makes the licence-bearing `.tar.zst` builds
+// usable without asking every machine and every runner to install a `zstd` binary.
+import { zstdDecompressSync } from "node:zlib";
 
 // ---- the pin -------------------------------------------------------------
 // CPython 3.12 matches the `python-smoke` CI job (broad wheel availability for
@@ -59,8 +63,25 @@ const PY_VERSION = "3.12.13";
 const PBS_TAG = "20260610";
 
 // Per-platform asset + hash + the interpreter path that proves a good unpack.
-// `install_only` archives unpack to a top-level `python/` dir: `python.exe`
-// (plus Lib/, DLLs/) on Windows; `bin/python3` (plus lib/) on Linux.
+//
+// These are the `-full.tar.zst` builds, NOT `install_only.tar.gz`. The reason is licensing: the
+// runtime links OpenSSL, SQLite, libffi, liblzma, mpdecimal, bzip2, expat and zlib, and the
+// install_only archive carries only CPython's own LICENSE.txt — so PM's Windows and Linux installers
+// conveyed all of those with no copy of their licences, several of which (Apache-2.0, MIT, BSD)
+// require exactly that. The full archive ships `python/licenses/` with a file per component, taken
+// from the build we actually pin, so the attribution is read off the artifact rather than sourced
+// from someone's documentation and hoped to still be true.
+//
+// It is not the more expensive choice: zstd compresses better than gzip, so Windows is 41.4 MB
+// against 44 MB and Linux is 106.4 MB against 105.9 MB. Node 24 decompresses zstd natively
+// (`node:zlib`), so this needs no new tooling either.
+//
+// Layout differs from install_only: the full archive is `python/{install,licenses,build}/` plus
+// `python/PYTHON.json`, so the unpack below moves `install/` into place and keeps `licenses/`
+// beside it, discarding `build/` (object files and headers — a few hundred MB of nothing PM ships).
+//
+// Hashes are the digests GitHub publishes for each asset; the Windows one was additionally verified
+// against a downloaded copy byte for byte.
 //
 // Linux additionally PRUNES the tcl/tk/tkinter family after extraction. Two
 // reasons: (1) required — linuxdeploy walks every ELF in the AppDir and fails
@@ -72,15 +93,15 @@ const PBS_TAG = "20260610";
 // a re-extract on machines holding an older tree.
 const PLATFORMS = {
   win32: {
-    asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-pc-windows-msvc-install_only.tar.gz`,
-    sha256: "f5e4d9f856567493776f3d1e832c939fbaba5dcbcc5e0492a82ecfceea83b316",
+    asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-pc-windows-msvc-pgo-full.tar.zst`,
+    sha256: "cba72a21ed4e59794eb5cf4672797204b19926feee79896bc097b7416ed75e8b",
     interpreter: ["python.exe"],
   },
   linux: {
-    asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz`,
-    sha256: "c218f50baeb2c06a30c2f03db5986b2bad6ab7c8a52faad2d5a59bda0677b93a",
+    asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst`,
+    sha256: "15373dfc976a3bdd6e1855aa87f247bd71157416abf9a3091fd0acf9b50983b0",
     interpreter: ["bin", "python3"],
-    pruneRev: " prune1",
+    pruneRev: " prune3",
     prune: {
       // Exact stdlib entries (rmSync force ignores any that don't exist).
       paths: [
@@ -137,8 +158,10 @@ try {
   }
   console.log(`fetch-python: verified SHA-256 (${(bytes.length / 1048576).toFixed(1)} MB).`);
 
-  const archive = join(tmp, ASSET);
-  writeFileSync(archive, bytes);
+  // zstd, decompressed with Node's own zlib (24+) rather than a `zstd` binary nobody has installed.
+  // System `tar` handles the resulting .tar on both Windows (bsdtar) and Linux.
+  const archive = join(tmp, "python.tar");
+  writeFileSync(archive, zstdDecompressSync(bytes));
 
   // Replace any stale interpreter wholesale (e.g. after a pin bump), then unpack.
   rmSync(destDir, { recursive: true, force: true });
@@ -148,11 +171,69 @@ try {
       ? join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
       : "/usr/bin/tar";
   const tarExe = existsSync(sysTar) ? sysTar : "tar";
-  execFileSync(tarExe, ["-xzf", archive, "-C", destParent], { stdio: "inherit" });
+
+  // Unpack beside the destination — same volume, so the moves below are renames rather than copies,
+  // and a failure leaves a staging dir rather than a half-written `python/`.
+  const staging = join(destParent, ".pm-python-staging");
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(staging, { recursive: true });
+  try {
+    // `build/` is object files and headers — hundreds of MB PM never ships. Excluded at extraction
+    // so it is never written to disk at all.
+    execFileSync(tarExe, ["-xf", archive, "-C", staging, "--exclude", "python/build"], {
+      stdio: "inherit",
+    });
+
+    const unpacked = join(staging, "python");
+    const installed = join(unpacked, "install");
+    const licences = join(unpacked, "licenses");
+    if (!existsSync(installed)) {
+      throw new Error(`unpacked archive but ${installed} is missing — unexpected archive layout`);
+    }
+    // The component licences are the whole reason for the full archive; a build that stopped
+    // shipping them must fail loudly, not quietly produce an unattributed bundle.
+    if (!existsSync(licences)) {
+      throw new Error(
+        `unpacked archive but ${licences} is missing — this build carries no component licences, ` +
+          `which is the reason PM fetches the full archive rather than install_only`,
+      );
+    }
+    renameSync(installed, destDir);
+    renameSync(licences, join(destDir, "licenses"));
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
 
   if (!existsSync(exe)) {
     throw new Error(`unpacked archive but ${exe} is missing — unexpected archive layout`);
   }
+
+  // Two things PM has no use for, dropped so the tree holds only what actually runs.
+  //
+  //   * **40 `.pdb` debug-symbol files — 82 MB.** These are NOT new: the `install_only` archive
+  //     carried exactly the same 40 files, and nothing here ever pruned them, so every Windows
+  //     installer PM has shipped has contained 82 MB of Python debug symbols. Found while measuring
+  //     this change rather than by looking for it.
+  //   * **CPython's own test suite (`Lib/test/`) — 31 MB**, which the full archive keeps and
+  //     `install_only` strips. It carries the dummy certificates and private keys CPython tests TLS
+  //     with, which `just gitleaks` correctly flags (18 findings, all fixtures). Shipping a stdlib
+  //     test corpus inside PM was never wanted; the scanner objecting is a symptom, not the reason.
+  //
+  // Net effect, measured on Windows: the installed interpreter goes from 150 MB to 69 MB AND gains
+  // the component licences. The licence-bearing archive is not a cost here — it is a saving.
+  rmSync(join(destDir, "Lib", "test"), { recursive: true, force: true });
+  rmSync(join(destDir, "lib", `python${PY_VERSION.split(".").slice(0, 2).join(".")}`, "test"), {
+    recursive: true,
+    force: true,
+  });
+  let symbols = 0;
+  for (const rel of readdirSync(destDir, { recursive: true })) {
+    if (typeof rel === "string" && rel.endsWith(".pdb")) {
+      rmSync(join(destDir, rel), { force: true });
+      symbols += 1;
+    }
+  }
+  console.log(`fetch-python: dropped CPython's test suite and ${symbols} debug-symbol files.`);
 
   if (platform.prune) {
     for (const rel of platform.prune.paths) {
