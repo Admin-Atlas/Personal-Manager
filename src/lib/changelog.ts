@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.11-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Under-the-hood tidying: the machines that build and test PM have moved to the current long-term-support version of their toolchain. The previous one stopped receiving security updates in April, and PM is now built and tested on the same version it is developed on — which had quietly drifted apart.",
+    ],
+  },
+  {
     version: "3.111.10-alpha",
     date: "2026-07-31",
     highlights: [

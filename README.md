@@ -123,7 +123,7 @@ For a full tour of the architecture and the rules for working in this repo, see
 
 ## Prerequisites
 
-- **Node.js** 20+ and **Rust** (stable)
+- **Node.js** 24+ (LTS) and **Rust** (stable)
 - **Python** 3.10+ — needed for development (`tauri dev`) and as the base for the
   document sidecar's managed virtual environment, built on first use. PM finds a suitable
   interpreter automatically: `PM_PYTHON`, then versioned names (`python3.12` … `python3.10`),
