@@ -44,8 +44,23 @@ on:
 permissions:
   contents: read
 
+# A new push supersedes the previous run for this PR — the same group `pr.yml` has
+# always had, and which this lane went without. That was survivable while it fired
+# on three packaging paths; it stopped being survivable the moment the widened
+# filter above made it run on every PR. A 19-PR Dependabot batch then queued one
+# full ~25-minute AppImage build per push with nothing cancelling the superseded
+# ones, put 36 runs in flight at once, and jammed the Actions queue hard enough to
+# block merges on unrelated work.
+concurrency:
+  group: linux-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   bundle:
+    # Explicit display name: both dry-run lanes call their job `bundle`, so without
+    # this the PR check list shows two identical "bundle" rows and you cannot tell
+    # which platform failed.
+    name: linux-bundle
     # Pinned to match release.yml's Linux build leg: the runner's distro sets the
     # AppImage's glibc floor (see the matrix comment there).
     runs-on: ubuntu-22.04

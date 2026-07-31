@@ -1,0 +1,118 @@
+name: macOS bundle dry-run
+
+# The macOS twin of linux-bundle-dryrun.yml: proves the Mac packaging lane WITHOUT
+# cutting a release and WITHOUT any secret. Builds the real universal `.app` +
+# `.dmg` and asserts all three shipped artifacts exist — including the `.dmg`,
+# which is the point of the exercise.
+#
+# WHY THIS EXISTS. release.yml staged the Mac installer with `cp …/dmg/*.dmg || true`,
+# so a bundler that produced no `.dmg` published a release with an updater bundle
+# and no installer, silently. `rust-macos` in pr.yml compiles and lints the macOS
+# arm on every PR — it does not bundle — so nothing anywhere proved a Mac user
+# could actually install PM until a release had already gone out.
+#
+# WHAT IT DOES NOT PROVE, stated plainly so nobody reads more into a green run:
+#   * NOT Apple Developer-ID signing or notarization. Those need real secrets, and
+#     this is `pull_request`, which deliberately cannot see them (see pr.yml's
+#     header — `pull_request_target` would put the signing key within reach of fork
+#     code). Signing is proven at release time and by signing-dryrun.yml.
+#   * NOT the updater signature's identity. As on Linux, the key here is a
+#     THROWAWAY generated in-run — the bundler demands one because
+#     createUpdaterArtifacts is on — so this proves .sig emission WORKS, not that
+#     it matches the shipped pubkey.
+#   * NOT a bundled interpreter. Unlike Windows and Linux, macOS downloads its
+#     Python at runtime (python_fetch.rs), so there is no bundled tree to smoke.
+#
+# Runs on PRs touching the packaging surface. As with the Linux lane, version
+# lockstep means the manifests move on every PR, so in practice this runs on every
+# PR — deliberate, and one line to narrow if the wall-clock stops being worth it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src-tauri/tauri.conf.json"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/build.rs"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/fetch-python.mjs"
+      - ".github/workflows/macos-bundle-dryrun.yml"
+
+permissions:
+  contents: read
+
+# A new push supersedes the previous run for this PR. Without this, a burst of PRs
+# (a Dependabot batch is the live example) queues one full ~30-minute universal
+# build per push and jams the Actions queue for everything else.
+concurrency:
+  group: macos-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    # Explicit display name: both dry-run lanes call their job `bundle`, so without
+    # this the PR check list shows two identical "bundle" rows and you cannot tell
+    # which platform failed.
+    name: macos-bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        # zizmor impostor-commit ignore: dtolnay force-pushes `stable`, orphaning our
+        # vetted immutable pin (see release.yml for the full rationale).
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust) # zizmor: ignore[impostor-commit]
+        with:
+          toolchain: stable
+          # Both arms, because the shipped artifact is universal — exactly what
+          # release.yml's macOS leg installs.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Generate a throwaway updater signing key
+        # Same mechanism and same rationale as the Linux lane: createUpdaterArtifacts
+        # makes `tauri build` demand a private key, PRs can't see the real one, so we
+        # sign with a fresh key that never leaves this run. The key file is a SINGLE
+        # base64 line with no trailing newline, so it goes into GITHUB_ENV as a plain
+        # KEY=value line — a <<EOF heredoc would never find its delimiter.
+        run: |
+          npx tauri signer generate -w "$RUNNER_TEMP/dryrun.key" --password ""
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/dryrun.key")"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+          } >> "$GITHUB_ENV"
+
+      - name: Build the universal .app + .dmg
+        # No Apple env is defined here, so the bundle is unsigned and succeeds —
+        # the same unsigned path release.yml takes until the Apple secrets exist.
+        # --verbose so a bundler failure prints its own output rather than a
+        # one-line summary.
+        run: npm run tauri build -- --verbose --target universal-apple-darwin
+
+      - name: Assert all three shipped artifacts exist (including the .dmg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=src-tauri/target/universal-apple-darwin/release/bundle
+          ls -l "$base"/macos/ "$base"/dmg/
+          # These three are exactly what release.yml stages for macOS. The .dmg is
+          # the one that used to be optional; asserting it here is what makes the
+          # `|| true` removal in release.yml safe to rely on.
+          test -n "$(find "$base"/macos -name '*.app.tar.gz' -print -quit)"
+          test -n "$(find "$base"/macos -name '*.app.tar.gz.sig' -print -quit)"
+          test -n "$(find "$base"/dmg -name '*.dmg' -print -quit)"
+          echo "macOS bundle dry-run passed."

@@ -207,9 +207,23 @@ jobs:
       - name: Install gitleaks
         # The CLI binary (not the Action) — keeps the check identical to local
         # `just gitleaks` and avoids the Action's comment/permission surface.
+        #
+        # Downloaded to a FILE and checksummed before it is unpacked, never piped
+        # straight into /usr/local/bin. Every `uses:` in this repo is SHA-pinned (and
+        # now gated); a tarball fetched over the network was the one executable that
+        # arrived with no integrity check at all. The digest is gitleaks' own
+        # published checksums.txt entry, and moves only when the pinned version does.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        shell: bash
         run: |
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            | tar -xz -C /usr/local/bin gitleaks
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSLo "$RUNNER_TEMP/$asset" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$asset"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+          tar -xz -C /usr/local/bin -f "$RUNNER_TEMP/$asset" gitleaks
           gitleaks version
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
       - name: Scan the working tree for secrets

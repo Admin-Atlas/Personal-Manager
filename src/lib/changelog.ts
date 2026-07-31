@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.9-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "A release could go out with no Mac installer in it. If the packaging step failed to produce the .dmg file, PM shrugged and published anyway — leaving Mac users at a download page with nothing they could install. That is now a hard stop, and PM builds and checks the real Mac app on every change, the same way it already does for Linux.",
+      "Under-the-hood tidying: the release process now always builds exactly the version you asked for. Re-running a release by hand could quietly build the newest code instead of the version named — the two are usually the same, but 'usually' is not good enough for something people download.",
+      "The tools PM's build machines download are now checked against a known fingerprint before they run, and two build queues can no longer trip over each other.",
+    ],
+  },
+  {
     version: "3.111.8-alpha",
     date: "2026-07-30",
     highlights: [
