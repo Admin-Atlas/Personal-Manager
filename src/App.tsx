@@ -1214,7 +1214,12 @@ export default function App() {
                         <ProviderChip status={localAi} />
                       </div>
                     }
-                    rightTools={<RetrievalExplainPanel messages={chat.messages} />}
+                    rightTools={
+                      <RetrievalExplainPanel
+                        messages={chat.messages}
+                        conversationId={activeId ?? undefined}
+                      />
+                    }
                   />
                 </main>
               )}

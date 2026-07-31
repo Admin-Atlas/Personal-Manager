@@ -434,7 +434,13 @@ fn flush_manifest(app: &AppHandle) -> Result<()> {
     let state = app.state::<AppState>();
     let (vault_root, cipher) = state.manifest_io()?;
     let conn = state.conn()?;
-    index_only::write_synced(&conn, &vault_root, &cipher)?;
+    // The rows this flush covers are already committed, so a failure here leaves the file BEHIND the
+    // mirror. Record that before propagating: the `Drop` safety net can only log the error, and
+    // without the flag the next boot would apply the older file over the newer rows.
+    if let Err(e) = index_only::write_synced(&conn, &vault_root, &cipher) {
+        index_only::mark_manifest_stale(&conn);
+        return Err(e);
+    }
     Ok(())
 }
 

@@ -30,9 +30,12 @@ interface Props {
   /** Project scope for a project-scoped chat; omitted for the global chat. Passed straight to the
    *  retriever so the panel explains exactly what a real turn in this surface would retrieve. */
   project?: string;
+  /** The chat this panel sits under. A live turn skips this chat's own in-window turns (the model
+   *  already has them verbatim), so without it the panel would explain a wider pool than the answer. */
+  conversationId?: number;
 }
 
-export function RetrievalExplainPanel({ messages, project }: Props) {
+export function RetrievalExplainPanel({ messages, project, conversationId }: Props) {
   const { devMode } = useDevMode();
 
   const [open, setOpen] = useState(false);
@@ -73,7 +76,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
       }
       setRunning(true);
       setErr(null);
-      retrievalExplain(text, project, depth)
+      retrievalExplain(text, project, depth, conversationId)
         .then((res) => {
           setExplain(res);
           setExplainedQuery(text);
@@ -85,7 +88,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
         })
         .finally(() => setRunning(false));
     },
-    [project],
+    [project, conversationId],
   );
 
   // Load the persisted depth the first time the panel opens; seed the slider from it.

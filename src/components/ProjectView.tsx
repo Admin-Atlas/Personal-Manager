@@ -545,7 +545,13 @@ export function ProjectView({
                 <ProviderChip status={localAi} />
               </div>
             }
-            rightTools={<RetrievalExplainPanel messages={chat.messages} project={project} />}
+            rightTools={
+              <RetrievalExplainPanel
+                messages={chat.messages}
+                project={project}
+                conversationId={chat.convId ?? undefined}
+              />
+            }
           />
         </main>
 

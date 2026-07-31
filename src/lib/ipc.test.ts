@@ -140,4 +140,26 @@ describe("argument marshalling", () => {
     await ipc.setIndexingSpeed("gentle");
     expect(invokeMock).toHaveBeenCalledWith("set_indexing_speed", { speed: "gentle" });
   });
+
+  it("carries the conversation into a retrieval explain, so the panel sees the answer's pool", async () => {
+    // A live turn skips this chat's own in-window turns; without the id the panel explained a
+    // strictly WIDER corpus than the answer came from, and the diagnostician reasoned from those
+    // rows. `undefined` is the free-text Developer-mode box, where there is no turn to mirror.
+    invokeMock.mockResolvedValue({ rows: [] });
+    await ipc.retrievalExplain("where are my taxes?", "Taxes", 8, 42);
+    expect(invokeMock).toHaveBeenCalledWith("retrieval_explain", {
+      query: "where are my taxes?",
+      project: "Taxes",
+      k: 8,
+      conversationId: 42,
+    });
+
+    await ipc.retrievalExplain("free text");
+    expect(invokeMock).toHaveBeenCalledWith("retrieval_explain", {
+      query: "free text",
+      project: undefined,
+      k: undefined,
+      conversationId: undefined,
+    });
+  });
 });
