@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.111.10-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "PM's document engine now checks every piece of software it downloads against a known fingerprint before installing it. This is the part of PM that opens your PDFs, documents, spreadsheets and photos, so it is the part most worth protecting: previously it pinned the handful of main components by name and version, and accepted whatever else came along with them.",
+      "The first time you open PM after this update, it will spend a minute reinstalling that engine so everything in it is fingerprint-checked. Nothing you have added is touched — your files, vault and settings are all untouched.",
+      "If you use photo text recognition or the memory map's detailed layout, those are covered too, and each is now installed in a way that can't disturb the rest of the engine. You may see one of them listed as not installed after this update — reinstalling from Settings → Storage is quick, and usually near-instant.",
+    ],
+  },
+  {
     version: "3.111.9-alpha",
     date: "2026-07-31",
     highlights: [

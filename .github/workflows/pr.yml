@@ -318,3 +318,5 @@ jobs:
         run: just script-deps
       - name: Every workflow `uses:` is SHA-pinned
         run: just action-pins
+      - name: The sidecar dependency locks are current, pinned and hashed
+        run: just requirements-lock

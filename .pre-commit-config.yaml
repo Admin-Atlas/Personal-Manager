@@ -100,3 +100,9 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: requirements-lock
+        name: sidecar dependency locks are current, pinned and hashed
+        entry: just requirements-lock
+        language: system
+        pass_filenames: false
+        always_run: true
