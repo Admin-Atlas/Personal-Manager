@@ -407,6 +407,15 @@ jobs:
         with:
           toolchain: stable
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      # `just notice` now has an npm half as well as a Rust one, and it reads each package's own
+      # LICENSE file for the copyright line MIT and ISC require preserved — so this job needs
+      # node_modules. It fails rather than emitting a short NOTICE, which is the behaviour worth
+      # having: a partial attribution file reads as compliance.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
       - name: Install cargo-about
         # Downloaded to a FILE and checksummed before it is unpacked, never piped
         # straight into /usr/local/bin. This job holds `contents: write` and the

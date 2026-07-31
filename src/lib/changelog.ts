@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.112.1-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "PM is free software, and its licence now travels with it: a copy is installed alongside the app instead of living only in the source code. If you want to read it, it sits next to PM's program files.",
+      "The credits file that ships with each release now covers the open-source work behind PM's interface too — including the four typefaces it uses — rather than only the parts written in Rust. Several of those licences ask for exactly that, so this was owed rather than optional.",
+    ],
+  },
+  {
     version: "3.112.0-alpha",
     date: "2026-07-31",
     highlights: [

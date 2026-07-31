@@ -55,6 +55,13 @@ jobs:
         run: just frontend-test
       - name: Production bundle (vite build)
         run: just build-frontend
+      # Exercises the npm half of `just notice` — the release-only NOTICE trap, half of which was
+      # still open: `license-subset` proves the two allow-lists agree, and nothing proved the
+      # attribution actually generates. It needs node_modules for the per-package copyright lines,
+      # which is why it rides this job rather than `dependencies`. Output discarded; a missing
+      # licence text is a non-zero exit.
+      - name: Third-party NOTICE (npm half) generates
+        run: node scripts/generate-npm-notice.mjs > /dev/null
 
   # --- backend: format, clippy, check, tests (Rust) -----------------------
   rust:
@@ -255,6 +262,24 @@ jobs:
       - name: JS — npm audit
         run: just npm-audit
 
+      # The Rust half of the same trap. cargo-about renders about.hbs at RELEASE time only, so a
+      # broken template or a crate whose licence about.toml does not accept would have failed the
+      # publish job after the binaries were already built. Same checksummed install as release.yml.
+      - name: Install cargo-about
+        env:
+          CARGO_ABOUT_VERSION: "0.9.0"
+          CARGO_ABOUT_SHA256: "7a1a1bfb3ae3b6feabe9e1d6147a6b34b85bd0339bfd8b0ec11b312dee10d99a"
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSLo "$RUNNER_TEMP/$asset.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/$asset.tar.gz"
+          echo "$CARGO_ABOUT_SHA256  $RUNNER_TEMP/$asset.tar.gz" | sha256sum --check --strict
+          tar -xz -C /usr/local/bin --strip-components=1 -f "$RUNNER_TEMP/$asset.tar.gz" "$asset/cargo-about"
+      - name: Third-party NOTICE (Rust half) generates
+        run: cd src-tauri && cargo about generate about.hbs -o /dev/null
+
   # --- workflow security: zizmor over .github/workflows -------------------
   workflows:
     runs-on: ubuntu-latest
@@ -322,3 +347,5 @@ jobs:
         run: just requirements-lock
       - name: Every CI job runs the declared Node major
         run: just node-version
+      - name: Every shipped npm package carries an accepted licence
+        run: just npm-licenses

@@ -3,6 +3,7 @@
   "bundle": {
     "targets": ["appimage", "rpm", "deb"],
     "resources": {
+      "../LICENCE.txt": "LICENCE.txt",
       "../sidecar/pm_sidecar.py": "sidecar/pm_sidecar.py",
       "../sidecar/requirements.txt": "sidecar/requirements.txt",
       "../sidecar/requirements.lock": "sidecar/requirements.lock",

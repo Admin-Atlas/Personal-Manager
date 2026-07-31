@@ -75,6 +75,27 @@ if (sha !== LICENCE_SHA256) {
   );
 }
 
+// 3. The licence is CONVEYED, not merely present.
+//
+// PM is AGPL-3.0-or-later, and GPLv3 §4/§5 require the licence text to accompany the binary — not
+// just to sit in the source repository. `LICENCE.txt` lived at the repo root and was bundled into
+// nothing, so every installer PM has ever shipped conveyed the program without its licence.
+//
+// This sits with the integrity check above because they guard the same obligation from two sides:
+// that one keeps the text verbatim, this one keeps it in the box. The `resources` map is an explicit
+// allow-list, so a file ships by being named there and by nothing else.
+const BUNDLE_MANIFESTS = ["src-tauri/tauri.conf.json", "src-tauri/tauri.linux.conf.json"];
+for (const manifest of BUNDLE_MANIFESTS) {
+  const config = JSON.parse(readFileSync(join(repoRoot, manifest), "utf8"));
+  const resources = config.bundle?.resources ?? {};
+  if (!Object.prototype.hasOwnProperty.call(resources, `../${LICENCE_FILE}`)) {
+    problems.push(
+      `${manifest} does not bundle ${LICENCE_FILE} — installers built from it would convey PM ` +
+        `without the licence text the AGPL requires to accompany it`,
+    );
+  }
+}
+
 if (problems.length) {
   console.error("✗ spdx/licence:\n");
   for (const p of problems) console.error(`  • ${p}`);
@@ -82,4 +103,7 @@ if (problems.length) {
   process.exit(1);
 }
 
-console.log(`✓ spdx/licence: ${checked} source files carry the header; ${LICENCE_FILE} unchanged`);
+console.log(
+  `✓ spdx/licence: ${checked} source files carry the header; ${LICENCE_FILE} unchanged and bundled ` +
+    `by ${BUNDLE_MANIFESTS.length} manifests`,
+);

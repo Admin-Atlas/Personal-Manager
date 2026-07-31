@@ -112,3 +112,9 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: npm-licenses
+        name: every shipped npm package carries an accepted licence
+        entry: just npm-licenses
+        language: system
+        pass_filenames: false
+        always_run: true
