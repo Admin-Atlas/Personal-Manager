@@ -48,8 +48,14 @@ export function normalise(name) {
   return name.replace(/[-_.]+/g, "-").toLowerCase();
 }
 
+/**
+ * The stamp hash. CRLF is normalised away FIRST, because `.gitattributes` pins the repo to
+ * `eol=lf` while a Windows working copy can legitimately hold CRLF: hashing raw bytes stamps a
+ * digest that only the machine that generated it can reproduce, and the check then fails on every
+ * Linux runner. (Found exactly that way — the gate was green locally and red in CI within seconds.)
+ */
 export function sha256(text) {
-  return createHash("sha256").update(text, "utf8").digest("hex");
+  return createHash("sha256").update(text.replace(/\r\n/g, "\n"), "utf8").digest("hex");
 }
 
 /** The `# pm-*` stamps the generator writes. Returns partial data plus its own problems. */

@@ -30,7 +30,13 @@ const BASE_INPUT = "sidecar/requirements.txt";
 const BASE_LOCK = "sidecar/requirements.lock";
 
 const read = (rel) => readFileSync(join(ROOT, rel), "utf8");
-const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+
+// CRLF is normalised away before hashing, and check-requirements-lock.mjs does the same.
+// `.gitattributes` pins the repo to `eol=lf`, but a Windows working copy can hold CRLF — hashing
+// raw bytes stamps a digest only this machine can reproduce, and the gate then fails on every Linux
+// runner while passing here.
+const sha256 = (text) =>
+  createHash("sha256").update(text.replace(/\r\n/g, "\n"), "utf8").digest("hex");
 
 /** The `MIN_PYTHON` floor, read from Rust so the lock can never target a version PM won't use. */
 export function pythonFloor(rustSource) {

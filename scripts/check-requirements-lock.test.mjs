@@ -66,6 +66,17 @@ describe("normalise", () => {
   });
 });
 
+describe("sha256", () => {
+  it("hashes CRLF and LF identically", () => {
+    // Regression: `.gitattributes` pins the repo to eol=lf, but a Windows working copy can hold
+    // CRLF. Hashing raw bytes stamped a digest only the generating machine could reproduce — green
+    // locally, red on the Linux runner within seconds.
+    expect(sha256("markitdown==0.1.6\r\ndefusedxml==0.7.1\r\n")).toBe(
+      sha256("markitdown==0.1.6\ndefusedxml==0.7.1\n"),
+    );
+  });
+});
+
 describe("parseEntries", () => {
   it("reads a pin, its marker and its hashes", () => {
     const entries = parseEntries(
