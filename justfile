@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version npm-licenses
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -218,6 +218,14 @@ requirements-lock:
 node-version:
     node scripts/check-node-version.mjs
 
+# Every npm package that SHIPS carries an accepted licence. The npm half of what cargo-deny does
+# for crates: pr.yml's `dependencies` job was named for all three ecosystems and gated only Rust, so
+# a copyleft package arriving transitively — through a patch bump four levels down — would first
+# have been noticed as a complaint about a released binary. Offline: package-lock.json records a
+# licence for every package and marks the dev-only ones.
+npm-licenses:
+    node scripts/check-npm-licenses.mjs
+
 # --- generators (not part of `check`) -------------------------------------
 
 # Regenerate the sidecar dependency locks. Needs `uv` on PATH; reaches the network. Run after any
@@ -227,6 +235,12 @@ lock-regen:
 
 # --- release-only ---------------------------------------------------------
 
-# Regenerate the third-party licence NOTICE for the bundled Rust deps.
+# Regenerate the third-party licence NOTICE: the bundled Rust crates, then the npm packages
+# compiled into the shipped webview bundle. The second half used to be missing entirely, so 122
+# production packages — the four self-hosted @fontsource families among them — were conveyed with no
+# attribution, though MIT, ISC and OFL-1.1 all require their notices to travel with the software.
+# Needs `cargo about` AND node_modules (`npm ci`); the npm generator fails rather than emitting a
+# short NOTICE, because a partial attribution file reads as compliance.
 notice out="THIRD-PARTY-NOTICES.txt":
     cd src-tauri && cargo about generate about.hbs -o "../{{out}}"
+    node scripts/generate-npm-notice.mjs >> "{{out}}"

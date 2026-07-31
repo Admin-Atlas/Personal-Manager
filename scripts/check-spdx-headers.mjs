@@ -75,6 +75,46 @@ if (sha !== LICENCE_SHA256) {
   );
 }
 
+// 3. The licence is CONVEYED, not merely present.
+//
+// PM is AGPL-3.0-or-later, and GPLv3 §4/§5 require the licence text to accompany the binary — not
+// just to sit in the source repository. `LICENCE.txt` lived at the repo root and was bundled into
+// nothing, so every installer PM has ever shipped conveyed the program without its licence.
+//
+// This sits with the integrity check above because they guard the same obligation from two sides:
+// that one keeps the text verbatim, this one keeps it in the box. The `resources` map is an explicit
+// allow-list, so a file ships by being named there and by nothing else.
+//
+// It checks the MERGED config for each platform, not each file on its own. Tauri layers
+// `tauri.<platform>.conf.json` onto the base with `json_patch::merge` — RFC 7386 JSON Merge Patch —
+// which merges objects key by key and treats an explicit `null` as a DELETE. So a per-file check
+// would be wrong in both directions: it would demand the key be repeated in every platform file, and
+// it would still miss the one edit that actually drops the licence from a single platform.
+const PLATFORM_MANIFESTS = ["src-tauri/tauri.windows.conf.json", "src-tauri/tauri.linux.conf.json"];
+const BASE_MANIFEST = "src-tauri/tauri.conf.json";
+const readJson = (rel) => JSON.parse(readFileSync(join(repoRoot, rel), "utf8"));
+
+/** RFC 7386 merge, narrowed to what a bundle-resource map can contain. */
+function mergedResources(base, platform) {
+  const merged = { ...(base.bundle?.resources ?? {}) };
+  for (const [key, value] of Object.entries(platform?.bundle?.resources ?? {})) {
+    if (value === null) delete merged[key];
+    else merged[key] = value;
+  }
+  return merged;
+}
+
+const baseConfig = readJson(BASE_MANIFEST);
+for (const manifest of [null, ...PLATFORM_MANIFESTS]) {
+  const resources = mergedResources(baseConfig, manifest ? readJson(manifest) : null);
+  if (!Object.prototype.hasOwnProperty.call(resources, `../${LICENCE_FILE}`)) {
+    problems.push(
+      `${manifest ?? BASE_MANIFEST} builds an installer that does not bundle ${LICENCE_FILE} — it ` +
+        `would convey PM without the licence text the AGPL requires to accompany it`,
+    );
+  }
+}
+
 if (problems.length) {
   console.error("✗ spdx/licence:\n");
   for (const p of problems) console.error(`  • ${p}`);
@@ -82,4 +122,7 @@ if (problems.length) {
   process.exit(1);
 }
 
-console.log(`✓ spdx/licence: ${checked} source files carry the header; ${LICENCE_FILE} unchanged`);
+console.log(
+  `✓ spdx/licence: ${checked} source files carry the header; ${LICENCE_FILE} unchanged and bundled ` +
+    `by every platform (${PLATFORM_MANIFESTS.length + 1} merged configs)`,
+);
