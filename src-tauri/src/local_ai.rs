@@ -782,6 +782,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
                 multimodal: e.multimodal,
                 reasoning: e.reasoning,
                 install: e.install.clone(),
+                licence: e.licence.clone(),
                 fit,
                 gpu,
             }
@@ -884,6 +885,14 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         (cadence.as_setting().to_string(), due)
     };
 
+    // Which non-open licences the user has already read. Read here rather than from a second
+    // command so the UI can decide whether a row needs the terms dialog without a round trip.
+    let terms_accepted = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        accepted_terms(&conn)?
+    };
+
     Ok(Recommendations {
         hardware,
         reserve_gb: fit::reserve_gb(),
@@ -899,7 +908,45 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         disk_sources_present: disk.sources_present.clone(),
         disk_truncated: disk.truncated,
         scan_dir: scan_dir_setting(&app),
+        terms_accepted,
     })
+}
+
+/// The licence ids the user has accepted, as stored. Empty when the setting has never been written.
+///
+/// Stored comma-separated because the ids are a closed, slug-shaped set from the catalogue's own
+/// ledger (`apache-2.0`, `gemma`, `llama3.2`, …) — no separator can appear inside one.
+fn accepted_terms(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+    Ok(db::get_setting(conn, local_catalog::TERMS_ACCEPTED_KEY)?
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Record that the user has read a licence's terms. Additive and idempotent: accepting a licence
+/// that is already recorded rewrites the same set.
+///
+/// This is DISCLOSURE, not a permission system. PM downloads no weights — `pull_local_model` asks
+/// the user's own Ollama to fetch them, and the user can run `ollama pull` without PM at all. What
+/// this records is that PM showed the terms and the user said they had read them.
+#[tauri::command]
+pub async fn accept_local_model_terms(app: AppHandle, licence_id: String) -> Result<Vec<String>> {
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    let mut accepted = accepted_terms(&conn)?;
+    if !accepted.iter().any(|a| a == &licence_id) {
+        accepted.push(licence_id);
+        accepted.sort();
+        db::set_setting(
+            &conn,
+            local_catalog::TERMS_ACCEPTED_KEY,
+            &accepted.join(","),
+        )?;
+    }
+    Ok(accepted)
 }
 
 /// The extra crawl folder as stored, or `None` when unset (an empty string is how clearing it is
@@ -1053,6 +1100,9 @@ pub struct Recommendation {
     pub multimodal: bool,
     pub reasoning: Option<bool>,
     pub install: local_catalog::InstallHints,
+    /// What the weights are licensed under. Rides with the row so the UI can label every model and
+    /// show the terms before a restricted download without a second call.
+    pub licence: local_catalog::EntryLicence,
     /// The highest-quality config that fits system RAM (unchanged from before the two-budget split).
     pub fit: fit::FitResult,
     /// Whether a faster GPU-resident config is worth showing beside `fit` (#457). `Single` when there
@@ -1131,6 +1181,8 @@ pub struct Recommendations {
     pub disk_truncated: bool,
     /// The extra folder the crawl includes, when one is set.
     pub scan_dir: Option<String>,
+    /// Licence ids the user has already read and accepted, so a second Gemma does not re-ask.
+    pub terms_accepted: Vec<String>,
 }
 
 #[cfg(test)]

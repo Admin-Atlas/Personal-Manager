@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.113.0-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Every local model PM suggests now says what its weights are licensed under, right on its row, with a link to the terms. Most are properly open — Apache-2.0 or MIT — but seven are not: Google's Gemma 2 and 3, Meta's Llama 3.1 and 3.2, and the largest Qwen 2.5 come with the publisher's own conditions attached.",
+      "For those seven, PM now shows you the terms in plain language before the download starts, rather than after. Accept once and PM won't ask again for another model under the same licence; the open ones are never interrupted at all. PM doesn't fetch the weights itself — your own Ollama does — so this is PM telling you what you're agreeing to, not PM policing it.",
+    ],
+  },
+  {
     version: "3.112.3-alpha",
     date: "2026-07-31",
     highlights: [

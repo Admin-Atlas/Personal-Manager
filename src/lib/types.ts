@@ -1622,6 +1622,19 @@ export interface LocalInstallHints {
 export type LocalGpuFit =
   { kind: "single" } | { kind: "split"; fit: LocalFitResult } | { kind: "no_gpu_resident" };
 
+/** What a curated model's weights are licensed under (local_catalog.rs EntryLicence).
+ *
+ *  `open` is the field with behaviour attached: false means bespoke publisher terms rather than an
+ *  open-source licence (Gemma 2/3, Llama 3.x, the largest Qwen 2.5), and the UI shows `summary` and
+ *  asks before a download. Disclosure, not enforcement — PM fetches no weights itself. */
+export interface LocalModelLicence {
+  id: string;
+  name: string;
+  url: string;
+  open: boolean;
+  summary: string;
+}
+
 /** One curated model scored against this machine (local_ai.rs Recommendation). */
 export interface LocalRecommendation {
   repo: string;
@@ -1634,6 +1647,9 @@ export interface LocalRecommendation {
   multimodal: boolean;
   reasoning: boolean | null;
   install: LocalInstallHints;
+  /** What the weights are licensed under — labels every row, and gates the download on restricted
+   *  terms. */
+  licence: LocalModelLicence;
   /** The highest-quality config that fits system RAM (unchanged from before the two-budget split). */
   fit: LocalFitResult;
   /** Whether a faster GPU-resident config is worth showing beside `fit` (#457). */
@@ -1691,6 +1707,8 @@ export interface LocalRecommendations {
   disk_truncated: boolean;
   /** The extra folder the crawl includes, when one is set. */
   scan_dir: string | null;
+  /** Licence ids the user has already read and accepted, so a second Gemma does not re-ask. */
+  terms_accepted: string[];
 }
 
 /** A local model that would fit this machine better than the one in use (better_fit.rs Suggestion,

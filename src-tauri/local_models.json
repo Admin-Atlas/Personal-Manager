@@ -1,8 +1,8 @@
 {
-  "schema_version": 1,
-  "catalog_version": 1,
-  "content_hash": "sha256:1501993e96a5b15385013964f53fa46f5fc9e2b2ff2170dfc44c70e9d3531fc1",
-  "generated_at": "2026-07-22",
+  "schema_version": 2,
+  "catalog_version": 2,
+  "content_hash": "sha256:d6338b4c84b39657fcc3121d1696be23c18c32e8607b004262f5398db135524f",
+  "generated_at": "2026-07-31",
   "source": "huggingface-gguf",
   "entries": [
     {
@@ -26,6 +26,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -54,6 +61,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "gemma",
+        "name": "Gemma Terms of Use",
+        "url": "https://ai.google.dev/gemma/terms",
+        "open": false,
+        "summary": "Google's own terms, not an open-source licence. You may use and redistribute Gemma models commercially, but you must pass these terms on to anyone you share them with and follow Google's Prohibited Use Policy, which Google can change. Google may restrict any use it considers to be in breach."
       }
     },
     {
@@ -92,6 +106,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "llama3.2",
+        "name": "Llama 3.2 Community License",
+        "url": "https://developer.meta.com/ai/llama3_2/license/",
+        "open": false,
+        "summary": "Meta's own licence, not an open-source one. Free to use and change, including commercially, but you must display \"Built with Llama\", pass the licence on with the model, and follow Meta's Acceptable Use Policy. A product with more than 700 million monthly active users needs a separate licence from Meta."
       }
     },
     {
@@ -130,6 +151,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "gemma",
+        "name": "Gemma Terms of Use",
+        "url": "https://ai.google.dev/gemma/terms",
+        "open": false,
+        "summary": "Google's own terms, not an open-source licence. You may use and redistribute Gemma models commercially, but you must pass these terms on to anyone you share them with and follow Google's Prohibited Use Policy, which Google can change. Google may restrict any use it considers to be in breach."
       }
     },
     {
@@ -168,6 +196,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "llama3.2",
+        "name": "Llama 3.2 Community License",
+        "url": "https://developer.meta.com/ai/llama3_2/license/",
+        "open": false,
+        "summary": "Meta's own licence, not an open-source one. Free to use and change, including commercially, but you must display \"Built with Llama\", pass the licence on with the model, and follow Meta's Acceptable Use Policy. A product with more than 700 million monthly active users needs a separate licence from Meta."
       }
     },
     {
@@ -211,6 +246,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "mit",
+        "name": "MIT License",
+        "url": "https://opensource.org/license/mit",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially, as long as the copyright notice travels with it. Nothing restricts what you may use it for."
       }
     },
     {
@@ -239,6 +281,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "gemma",
+        "name": "Gemma Terms of Use",
+        "url": "https://ai.google.dev/gemma/terms",
+        "open": false,
+        "summary": "Google's own terms, not an open-source licence. You may use and redistribute Gemma models commercially, but you must pass these terms on to anyone you share them with and follow Google's Prohibited Use Policy, which Google can change. Google may restrict any use it considers to be in breach."
       }
     },
     {
@@ -282,6 +331,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -325,6 +381,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -368,6 +431,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "llama3.1",
+        "name": "Llama 3.1 Community License",
+        "url": "https://developer.meta.com/ai/llama3_1/license/",
+        "open": false,
+        "summary": "Meta's own licence, not an open-source one. Free to use and change, including commercially, but you must display \"Built with Llama\", pass the licence on with the model, and follow Meta's Acceptable Use Policy. A product with more than 700 million monthly active users needs a separate licence from Meta."
       }
     },
     {
@@ -411,6 +481,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -454,6 +531,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -497,6 +581,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -540,6 +631,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -583,6 +681,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -626,6 +731,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "open": true,
+        "summary": "A permissive open-source licence. Use, change and redistribute the model freely, including commercially; keep the notices and you are done. Nothing restricts what you may use it for."
       }
     },
     {
@@ -669,6 +781,13 @@
       ],
       "install": {
         "ollama": null
+      },
+      "licence": {
+        "id": "qwen",
+        "name": "Qwen License Agreement",
+        "url": "https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/blob/main/LICENSE",
+        "open": false,
+        "summary": "Alibaba's own licence, not an open-source one — and it governs this model even though the smaller Qwen 2.5 models are Apache-2.0. Free to use and change, including commercially, but you must keep its attribution notice and display \"Built with Qwen\" on anything you train from it. A product with more than 100 million monthly active users needs a separate licence from Alibaba."
       }
     }
   ]

@@ -1601,6 +1601,13 @@ export function pullLocalModel(
   return invoke<void>("pull_local_model", { model, onEvent: channel });
 }
 
+/** Record that the user has read a restricted model licence's terms, and get back the full accepted
+ *  set. Keyed on the LICENCE, not the model — reading the Gemma Terms once covers every Gemma. This
+ *  is disclosure, not permission: PM cannot and does not enforce a model publisher's terms. */
+export function acceptLocalModelTerms(licenceId: string): Promise<string[]> {
+  return invoke<string[]>("accept_local_model_terms", { licenceId });
+}
+
 // --- ONE-TIME orphan sweep (card #651) -------------------------------------
 // Delete these three with the `sweep` module in the release after this one.
 

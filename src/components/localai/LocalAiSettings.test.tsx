@@ -14,7 +14,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { LocalLlmConfig, LocalRecommendations, LocalServedModel } from "../../lib/types";
+import type {
+  LocalLlmConfig,
+  LocalRecommendation,
+  LocalRecommendations,
+  LocalServedModel,
+} from "../../lib/types";
 
 const checkLocalLlmEndpoint = vi.fn();
 const clearLocalLlmEndpoint = vi.fn();
@@ -28,6 +33,7 @@ const localLlmStatus = vi.fn();
 const localModelRecommendations = vi.fn();
 const probeLocalLlmPorts = vi.fn();
 const pullLocalModel = vi.fn();
+const acceptLocalModelTerms = vi.fn();
 const setLocalLlmEndpoint = vi.fn();
 const setLocalLlmRoleModel = vi.fn();
 const setLocalLlmRouting = vi.fn();
@@ -50,6 +56,7 @@ vi.mock("../../lib/ipc", () => ({
   localModelRecommendations: () => localModelRecommendations(),
   probeLocalLlmPorts: () => probeLocalLlmPorts(),
   pullLocalModel: (...a: unknown[]) => pullLocalModel(...a),
+  acceptLocalModelTerms: (...a: unknown[]) => acceptLocalModelTerms(...a),
   setLocalLlmEndpoint: (...a: unknown[]) => setLocalLlmEndpoint(...a),
   setLocalLlmRoleModel: (...a: unknown[]) => setLocalLlmRoleModel(...a),
   setLocalLlmRouting: (...a: unknown[]) => setLocalLlmRouting(...a),
@@ -129,6 +136,7 @@ const recs = (): LocalRecommendations => ({
   disk_sources_present: [],
   disk_truncated: false,
   scan_dir: null,
+  terms_accepted: [],
 });
 
 const served = (...models: LocalServedModel[]) => models;
@@ -274,5 +282,133 @@ describe("the endpoint form", () => {
     expect(await screen.findByRole("button", { name: /auto-detect/i })).toBeTruthy();
     // Nothing is configured, so there is nothing to list — the model pickers must not be shown.
     expect(listLocalLlmModels).not.toHaveBeenCalled();
+  });
+});
+
+describe("model licence terms", () => {
+  // The catalogue ships models under bespoke publisher terms (Gemma, Llama, the largest Qwen 2.5)
+  // alongside genuinely open ones. These pin the promise the UI makes about that difference.
+  //
+  // NOTE: this flow cannot be reached by clicking the real app today — every shipped catalogue entry
+  // has `install.ollama: null`, so `canPull` is false and no Download button renders. These fixtures
+  // populate it deliberately. Without them the gate would be dead code that nothing exercises.
+  const model = (over: Partial<LocalRecommendation> = {}): LocalRecommendation => ({
+    repo: "bartowski/gemma-2-2b-it-GGUF",
+    display_name: "gemma 2 2b it",
+    architecture: "gemma2",
+    role_hint: "background",
+    parameters_b: 2.61,
+    active_parameters_b: 2.61,
+    context_length: 8192,
+    multimodal: false,
+    reasoning: null,
+    install: { ollama: "ollama pull gemma2:2b" },
+    licence: {
+      id: "gemma",
+      name: "Gemma Terms of Use",
+      url: "https://ai.google.dev/gemma/terms",
+      open: false,
+      summary: "Google's own terms, not an open-source licence.",
+    },
+    fit: {
+      verdict: "comfortable",
+      quant: "Q4_K_M",
+      context: 8192,
+      kv: "f16",
+      est_memory_gb: 2.4,
+      est_tokens_per_sec: 40,
+      notes: [],
+    },
+    gpu: { kind: "single" },
+    ...over,
+  });
+
+  const openModel = () =>
+    model({
+      repo: "bartowski/Phi-3.5-mini-instruct-GGUF",
+      display_name: "Phi 3.5 mini instruct",
+      install: { ollama: "ollama pull phi3.5:3.8b" },
+      licence: {
+        id: "mit",
+        name: "MIT License",
+        url: "https://opensource.org/license/mit",
+        open: true,
+        summary: "A permissive open-source licence.",
+      },
+    });
+
+  async function withCurated(curated: LocalRecommendation[], accepted: string[] = []) {
+    localModelRecommendations.mockResolvedValue({
+      ...recs(),
+      curated,
+      terms_accepted: accepted,
+    });
+    return loaded();
+  }
+
+  it("labels every model with its licence, whatever the terms", async () => {
+    await withCurated([model(), openModel()]);
+
+    expect(await screen.findByText("Gemma Terms of Use")).toBeTruthy();
+    expect(screen.getByText("MIT License")).toBeTruthy();
+  });
+
+  it("does NOT download a restricted model until the terms are accepted", async () => {
+    // The whole point: the click must not reach the runner first and disclose second.
+    await withCurated([model()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /download/i }));
+
+    expect(await screen.findByText(/Google's own terms/)).toBeTruthy();
+    expect(pullLocalModel).not.toHaveBeenCalled();
+  });
+
+  it("downloads once the terms are accepted, and records the acceptance", async () => {
+    acceptLocalModelTerms.mockResolvedValue(["gemma"]);
+    pullLocalModel.mockResolvedValue(undefined);
+    await withCurated([model()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /download/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /accept and download/i }));
+
+    await waitFor(() =>
+      expect(pullLocalModel).toHaveBeenCalledWith("gemma2:2b", expect.anything()),
+    );
+    expect(acceptLocalModelTerms).toHaveBeenCalledWith("gemma");
+  });
+
+  it("never downloads when recording the acceptance fails", async () => {
+    // The safe direction: an acceptance that did not persist must not authorise the download, or
+    // the record and the act disagree.
+    acceptLocalModelTerms.mockRejectedValue(new Error("db is locked"));
+    await withCurated([model()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /download/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /accept and download/i }));
+
+    await waitFor(() => expect(acceptLocalModelTerms).toHaveBeenCalled());
+    expect(pullLocalModel).not.toHaveBeenCalled();
+  });
+
+  it("does not ask again for a licence already accepted", async () => {
+    pullLocalModel.mockResolvedValue(undefined);
+    await withCurated([model()], ["gemma"]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /download/i }));
+
+    await waitFor(() => expect(pullLocalModel).toHaveBeenCalled());
+    expect(acceptLocalModelTerms).not.toHaveBeenCalled();
+  });
+
+  it("never interrupts an open-licence download", async () => {
+    pullLocalModel.mockResolvedValue(undefined);
+    await withCurated([openModel()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /download/i }));
+
+    await waitFor(() =>
+      expect(pullLocalModel).toHaveBeenCalledWith("phi3.5:3.8b", expect.anything()),
+    );
+    expect(screen.queryByRole("button", { name: /accept and download/i })).toBeNull();
   });
 });

@@ -56,6 +56,31 @@ pub struct CatalogEntry {
     pub fit: FitClass,
     pub quants: Vec<CatalogQuant>,
     pub install: InstallHints,
+    /// What this model's weights are licensed under. Required, not optional: an entry with no
+    /// licence must never reach a user, and the generator refuses to write one
+    /// (`scripts/generate-local-catalog.mjs`). The decision behind each value lives in
+    /// `src-tauri/model_licences.json`; this is the resolved copy the app reads.
+    pub licence: EntryLicence,
+}
+
+/// The licence a catalogue entry's weights come under, resolved from the ledger's `terms` table so
+/// the app needs no second lookup.
+///
+/// `open` is the only field with behaviour attached: `false` means bespoke publisher terms rather
+/// than an open-source licence — Gemma 2/3, Llama 3.x, the largest Qwen 2.5 — and the UI shows
+/// `summary` and asks before a download. It is disclosure, not enforcement: PM never fetches weights
+/// itself, the user's own Ollama does, and they can pull the same model without PM entirely.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryLicence {
+    /// Hugging Face's own id where there is one (`apache-2.0`, `mit`, `gemma`, `llama3.2`, `qwen`).
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// True for a recognised open-source licence; false for bespoke publisher terms.
+    pub open: bool,
+    /// A plain-language paragraph, written for a person to read in the download dialog.
+    pub summary: String,
 }
 
 /// One downloadable quantization with its measured on-disk size.
@@ -223,6 +248,10 @@ pub const RESCAN_CADENCE_KEY: &str = "local_model_rescan_cadence";
 pub const CATALOG_VERSION_SEEN_KEY: &str = "local_model_catalog_version_seen";
 /// Settings key: the last rescan time (RFC3339), for the weekly/monthly cadences.
 pub const LAST_RESCAN_KEY: &str = "local_model_last_rescan";
+/// Settings key: which non-open licences the user has read and accepted, comma-separated licence
+/// ids. Keyed on the LICENCE, not the model — accepting the Gemma Terms once covers every Gemma
+/// model, which is what a person would expect after reading them.
+pub const TERMS_ACCEPTED_KEY: &str = "local_model_terms_accepted";
 
 /// How often to re-check the catalog for a better-fitting model. Passive — never a modal or a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +317,12 @@ mod tests {
     #[test]
     fn committed_catalog_parses_and_holds_its_invariants() {
         let cat = catalog();
-        assert!(cat.schema_version >= 1);
+        // Pinned, not `>=`: the version is decoration unless something compares it. Bumping it in
+        // the generator without landing the matching Rust change fails here rather than at runtime.
+        assert_eq!(
+            cat.schema_version, 2,
+            "catalog schema version must match what this module parses"
+        );
         assert!(
             cat.catalog_version >= 1,
             "catalog needs a monotonic version stamp"
@@ -341,7 +375,34 @@ mod tests {
                 );
                 assert!(q.file_gb > 0.0, "{}: quant {} size", e.repo, q.quant);
             }
+
+            // Every entry names a licence, and a restricted one carries the text the UI promises to
+            // show before a download. An empty summary here would mean an empty dialog there.
+            assert!(!e.licence.id.is_empty(), "{}: licence id", e.repo);
+            assert!(!e.licence.name.is_empty(), "{}: licence name", e.repo);
+            assert!(
+                e.licence.url.starts_with("https://"),
+                "{}: licence url must be https ({})",
+                e.repo,
+                e.licence.url
+            );
+            assert!(
+                !e.licence.summary.trim().is_empty(),
+                "{}: licence summary must not be empty",
+                e.repo
+            );
         }
+
+        // The catalogue genuinely holds both kinds. If this ever reads zero restricted entries, the
+        // terms flow below has quietly stopped being exercised by anything.
+        assert!(
+            cat.entries.iter().any(|e| !e.licence.open),
+            "catalog should still contain at least one restricted-terms model"
+        );
+        assert!(
+            cat.entries.iter().any(|e| e.licence.open),
+            "catalog should still contain at least one open-licence model"
+        );
     }
 
     #[test]

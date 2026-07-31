@@ -63,6 +63,13 @@ const ALLOWED = [
       "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
   },
   {
+    file: "scripts/check-model-licences.test.mjs",
+    specifier: "vitest",
+    why: "The repo's existing test runner, on the same terms as the entries around it. This gate stands between a user and a model download whose publisher terms nobody read, and the property it turns on — that the catalogue's COPY of a licence still matches the ledger a human approved — is invisible without a test that breaks it; `just frontend-test` already collects this file through a vitest include glob, so no dependency is added.",
+    pinExempt:
+      "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
+  },
+  {
     file: "scripts/generate-local-catalog.test.mjs",
     specifier: "vitest",
     why: "The repo's existing test runner, reached by a scripts/ test the same way 56 src/ tests reach it. It adds no new dependency — `just frontend-test` already runs this file via a vitest include glob.",

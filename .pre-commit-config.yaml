@@ -124,3 +124,9 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: model-licences
+        name: every catalogued local model carries a reviewed licence
+        entry: just model-licences
+        language: system
+        pass_filenames: false
+        always_run: true
