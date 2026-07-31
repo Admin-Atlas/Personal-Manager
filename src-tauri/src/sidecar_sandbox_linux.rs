@@ -43,39 +43,10 @@ use landlock::{
 use crate::sidecar::{sbx, SbxError};
 use crate::sidecar_seccomp::{build_block_inet_filter, SeccompArch, SockFilter};
 
-/// System trees the dynamic loader + native extensions (onnxruntime's `.so`, libstdc++, libgomp) need
-/// to read AND execute. Nonexistent entries (a distro without `/lib64`, etc.) are skipped at build
-/// time, so listing the superset is safe.
-const SYSTEM_RX: &[&str] = &[
-    "/usr/lib",
-    "/usr/lib64",
-    "/lib",
-    "/lib64",
-    "/usr/local/lib",
-    "/usr/local/lib64",
-];
-
-/// Read-only system data the loader, glibc, and onnxruntime consult. `/etc` is granted broadly — it is
-/// configuration, and Linux DAC still guards the secret bits (`/etc/shadow` stays unreadable). `/proc`
-/// is deliberately NARROW: only the stable, non-per-pid entries onnxruntime/glibc read, so a worker
-/// can't reach another same-uid process's `/proc/<pid>/environ`. (`/proc/self/*` is intentionally
-/// absent — a `/proc/self` rule resolves to the PARENT's pid at rule-build time and so wouldn't apply
-/// to the child anyway; python/glibc tolerate its absence, and the preflight falls open if not.)
-const SYSTEM_RO: &[&str] = &[
-    "/etc",
-    "/proc/cpuinfo",
-    "/proc/meminfo",
-    "/proc/stat",
-    "/proc/sys",
-    "/sys/devices/system/cpu",
-    "/dev/urandom",
-    "/dev/random",
-    "/dev/zero",
-];
-
-/// Read+write device/scratch that need no directory operations and MUST NOT be executable
-/// (finding #7 — a writable+executable scratch would let the worker drop and run a binary).
-const SYSTEM_RW_FILES: &[&str] = &["/dev/null"];
+// The allow-set — which directories go in which bucket — lives in `sidecar_allowset`, pure and
+// cross-platform, so it is unit-tested on every OS including the Windows dev box where none of the
+// Landlock machinery below even compiles. This file keeps the half that genuinely is Linux and
+// genuinely is I/O: opening each path with `O_PATH` and folding it into a kernel ruleset.
 
 /// The Landlock ruleset (the raw owned fd) plus the seccomp program and the staging dir, built once and
 /// reused for every worker spawn. `ruleset_fd == None` means the kernel lacks Landlock (best-effort
@@ -129,42 +100,16 @@ impl Sandbox {
         })?;
         let filter = build_block_inet_filter(arch);
 
-        // The base interpreter: grant its `bin` dir (`base_python_home` — needed to EXECUTE the real
-        // interpreter that the venv's python is a launcher/symlink for) and its sibling `lib` dir (the
-        // standard library + `libpython`), NOT the whole install root. Granting the grandparent would
-        // expose `$HOME` / the vault when the interpreter is a rootless install like
-        // `~/.local/bin/python3` (whose grandparent `~/.local` holds PM's data dir). For a system
-        // interpreter (`/usr/bin`) the `lib` sibling is `/usr/lib`, already in `SYSTEM_RX`.
-        let mut rx: Vec<PathBuf> = vec![
-            venv_dir.to_path_buf(),
-            base_python_home.to_path_buf(),
-            script_dir.to_path_buf(),
-        ];
-        if let Some(base_lib) = base_python_home.parent().map(|p| p.join("lib")) {
-            rx.push(base_lib);
-        }
-        rx.extend(SYSTEM_RX.iter().map(PathBuf::from));
+        let allow = crate::sidecar_allowset::allow_set(crate::sidecar_allowset::SandboxPaths {
+            venv_dir,
+            base_python_home,
+            models_dir,
+            script_dir,
+            staging_dir: &staging_dir,
+        });
 
-        // Read-only: model cache + system config/info.
-        let mut ro: Vec<PathBuf> = vec![models_dir.to_path_buf()];
-        ro.extend(SYSTEM_RO.iter().map(PathBuf::from));
-
-        // Read+write, no execute: staging (input copies + TMPDIR) and POSIX shared memory (finding #7 —
-        // granted write WITHOUT execute), plus the device files that need writing (/dev/null).
-        let mut rw: Vec<PathBuf> = vec![staging_dir.clone(), PathBuf::from("/dev/shm")];
-        rw.extend(SYSTEM_RW_FILES.iter().map(PathBuf::from));
-
-        let ruleset_fd = build_landlock_ruleset(&rx, &ro, &rw)?;
-
-        // The concise "what the worker can see" set for the readout: the app-specific dirs (system
-        // RX/RO paths are implied and omitted to keep the readout legible).
-        let granted = vec![
-            venv_dir.to_path_buf(),
-            base_python_home.to_path_buf(),
-            models_dir.to_path_buf(),
-            script_dir.to_path_buf(),
-            staging_dir.clone(),
-        ];
+        let ruleset_fd = build_landlock_ruleset(&allow.rx, &allow.ro, &allow.rw)?;
+        let granted = allow.granted;
 
         Ok(Sandbox {
             staging_dir,

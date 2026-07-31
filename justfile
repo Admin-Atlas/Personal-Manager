@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences model-licences
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set ipc-commands script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences model-licences
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -190,6 +190,13 @@ ci-membership:
 # mixed), so a new table can't land without a declared owner of truth for a future sync.
 sync-set:
     node scripts/check-sync-set.mjs
+
+# Every command name src/lib/ipc.ts invokes is one the backend registers, and every registered
+# command is reachable from a wrapper. The names are bare string literals on both sides, so nothing
+# else compares them: a renamed Rust command surfaces as a runtime "command not found" the first
+# time that particular screen is opened, which can be a release later.
+ipc-commands:
+    node scripts/check-ipc-commands.mjs
 
 # scripts/ stays zero-dependency (INVARIANTS.md I-18): node: builtins and repo-relative paths only,
 # plus a small allowlist of justified exceptions inside the check itself. Not taste — pr.yml's

@@ -21,9 +21,16 @@ function utf8Len(codePoint: number): number {
 
 /**
  * Build a byte-offset → UTF-16-index mapper for `body`, precomputed in a single pass so many lookups
- * share the work. Offsets are expected to land on code-point boundaries (chunk edges are block-aligned);
- * an offset that falls inside a multi-byte code point resolves to that code point's start, and an
- * out-of-range offset clamps to 0 or the string length.
+ * share the work. Offsets are expected to land on code-point boundaries (chunk edges are block-aligned,
+ * and the splitter's own golden test pins that they are); an out-of-range offset clamps to 0 or the
+ * string length.
+ *
+ * An offset that falls INSIDE a multi-byte code point resolves FORWARD, to the start of the next one —
+ * the binary search finds the first code point starting at or after `byteOffset`. So a straddling
+ * character belongs to the chunk that ends on it, not the one that begins on it. Either rule keeps
+ * adjacent chunks seamless (a shared boundary maps to a single index, so nothing is lost or shown
+ * twice); this one is written down because the two differ in which chunk gets the character, and the
+ * comment here used to claim the opposite of what the code does.
  */
 export function makeByteToChar(body: string): (byteOffset: number) => number {
   const codePoints = Array.from(body); // splits on code points, not UTF-16 units

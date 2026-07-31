@@ -70,6 +70,20 @@ const ALLOWED = [
       "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
   },
   {
+    file: "scripts/check-ipc-commands.test.mjs",
+    specifier: "vitest",
+    why: "The repo's existing test runner, on the same terms as the entries around it. This gate's whole substance is its extraction, and the extraction was wrong twice before it ran clean — each time by silently skipping a real call site and then reporting its command as missing from the backend. A gate that can stop seeing part of its subject has to be tested against the shapes that broke it; `just frontend-test` already collects this file through a vitest include glob, so no dependency is added.",
+    pinExempt:
+      "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
+  },
+  {
+    file: "scripts/gates-inspect-something.test.mjs",
+    specifier: "vitest",
+    why: "The repo's existing test runner, on the same terms as the entries around it. This is the floor under every other gate — each one already PRINTED how much it inspected, and not one FAILED on a zero, so a glob typo or a moved directory would have left a gate scanning nothing and still reporting green; `just frontend-test` already collects this file through a vitest include glob, so no dependency is added.",
+    pinExempt:
+      "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
+  },
+  {
     file: "scripts/generate-local-catalog.test.mjs",
     specifier: "vitest",
     why: "The repo's existing test runner, reached by a scripts/ test the same way 56 src/ tests reach it. It adds no new dependency — `just frontend-test` already runs this file via a vitest include glob.",

@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.113.1-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Under-the-hood tidying. Several parts of PM that quietly do the most important work — deciding how a document is cut into searchable pieces, packing your backup, and applying what a cloud sync found — now have automatic checks that would catch a mistake in them before it reached you. The one that matters most catches a change to how documents are split that forgets to tell PM to re-index: without it, PM would go on searching an old map of your library and never say so.",
+      "The safety rule that stops an update from ever deleting or rewriting your existing data now reads each database instruction properly, rather than only the first line of each. Three ways of quietly overwriting rows that it used to miss are now refused outright.",
+      "PM also now checks, on every change, that every screen is asking the app for something the app can actually do — a mismatch used to surface as an error the first time you opened one particular screen, sometimes a release later.",
+    ],
+  },
+  {
     version: "3.113.0-alpha",
     date: "2026-07-31",
     highlights: [

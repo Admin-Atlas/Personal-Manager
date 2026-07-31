@@ -273,7 +273,37 @@ mod tests {
     use crate::backup::pack::{pack, PackInputs};
     use std::sync::atomic::AtomicBool;
 
-    // A device-mode vault fixture: a real (tiny) encrypted DB + a meta + a markdown file,
+    /// Every durable file a real vault holds, relative to the vault root, with its bytes.
+    ///
+    /// The fixture used to be a single flat `vault/note.md`, which meant `collect_tree`'s
+    /// recursion and both `push_optional` calls in pack.rs were dead code as far as the suite was
+    /// concerned — a backup that silently dropped the chats subfolder, the photo originals, or
+    /// either encrypted sidecar would have passed all three round-trip tests. The bytes are
+    /// deliberately non-UTF-8 for the photo, because a photo original is a byte file and a
+    /// text-mode copy would corrupt it invisibly.
+    fn vault_contents() -> Vec<(&'static str, &'static [u8])> {
+        vec![
+            ("vault/note.md", b"# hello\n\nbody" as &[u8]),
+            // A nested level — the only thing that exercises collect_tree's recursion.
+            (
+                "vault/chats/chat-01-01-2026-a.md",
+                b"# chat\n\n**You:** hi\n",
+            ),
+            // A photo original: raw bytes, not text, under a second subfolder.
+            (
+                "vault/photos/0f1e2d3c.png.pmenc",
+                &[0x00, 0x01, 0xff, 0xfe, 0x80, 0x0a, 0x0d, 0x1a],
+            ),
+            // The two always-encrypted sidecars pack.rs pushes optionally.
+            (crate::entities::RULES_FILENAME, b"\x01encrypted-rules"),
+            (
+                crate::index_only::MANIFEST_FILENAME,
+                b"\x01encrypted-manifest",
+            ),
+        ]
+    }
+
+    // A device-mode vault fixture: a real (tiny) encrypted DB + a meta + the tree above,
     // packed and then restored, proving the archive is self-describing and portable.
     fn make_source_vault(dir: &Path) -> (vault::VaultMeta, String) {
         std::fs::create_dir_all(dir).unwrap();
@@ -286,10 +316,11 @@ mod tests {
             conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
                 .unwrap();
         }
-        // A markdown file in the vault subfolder.
-        let md_dir = dir.join("vault");
-        std::fs::create_dir_all(&md_dir).unwrap();
-        std::fs::write(md_dir.join("note.md"), b"# hello\n\nbody").unwrap();
+        for (rel, bytes) in vault_contents() {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
         (meta, key_hex)
     }
 
@@ -353,9 +384,16 @@ mod tests {
         let conn = db::open(&target.join("pm.sqlite"), outcome.db_key_hex.expose()).unwrap();
         let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(x, 42);
-        // The markdown came across.
-        let md = std::fs::read(target.join("vault").join("note.md")).unwrap();
-        assert_eq!(md, b"# hello\n\nbody");
+
+        // Every durable file came across byte-identically — the nested chat, the photo original's
+        // raw bytes, and both encrypted sidecars, not just the one flat markdown file.
+        for (rel, expected) in vault_contents() {
+            let got = std::fs::read(target.join(rel))
+                .unwrap_or_else(|e| panic!("{rel} did not survive the round trip: {e}"));
+            assert_eq!(got, expected, "{rel} came back with different bytes");
+        }
+        // …and the metadata that makes the restored vault self-describing.
+        assert!(target.join(vault::META_FILENAME).exists());
     }
 
     #[test]

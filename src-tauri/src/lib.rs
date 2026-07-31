@@ -85,6 +85,11 @@ mod secret;
 mod secrets;
 mod settings;
 mod sidecar;
+// The confinement's allow-set (which directories the worker may read / execute / write) is pure and
+// platform-agnostic, so it is unit-tested everywhere — including the Windows dev box, where nothing
+// else in `sidecar_sandbox_linux` compiles. Only the Linux sandbox consumes it, so it's dead code
+// elsewhere; same arrangement as `sidecar_seccomp` below.
+mod sidecar_allowset;
 #[cfg(windows)]
 mod sidecar_sandbox;
 #[cfg(all(

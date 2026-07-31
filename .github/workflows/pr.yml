@@ -339,6 +339,8 @@ jobs:
         run: just ci-membership
       - name: Sync-set register covers every table
         run: just sync-set
+      - name: Every ipc.ts command name is one the backend registers
+        run: just ipc-commands
       - name: scripts/ stays zero-dependency (allowlisted exceptions only)
         run: just script-deps
       - name: Every workflow `uses:` is SHA-pinned
