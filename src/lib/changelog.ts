@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.14-alpha",
+    date: "2026-08-01",
+    highlights: [
+      'Week view opens on a proper Monday-to-Sunday week again. Leaving the Calendar tab and coming back set the first column to today, every time, so from Wednesday onwards you were looking at a week that began mid-week — with no way to get the ordinary grid back short of pressing Today. It opens on the Monday of the current week now, which is the same shape Today gives you. If you would rather it picked up exactly where you left it, start day and all, that is what "open where I left off" in Settings has always been for, and it now covers the week\'s shape too.',
+      "The Calendar's sideways scroll works. Nudging the grid horizontally to shift a day at a time was announced back in 3.88 for both the Calendar tab and Focus, but on the Calendar tab it was never actually connected to anything — only the Focus grid has ever responded. It is connected now, and it no longer depends on the grid happening to be on screen at the instant the tab loads, which could leave the gesture dead for the rest of the session. Mice that report scrolling in lines rather than pixels — where a whole notch counted for a single pixel against a threshold of 55 — are handled too.",
+      'Opening the Calendar tab no longer overwrites where you left off. If you have "open where I left off" turned on, simply visiting the tab used to record today as the place you\'d left, so it could only ever take you back to your last visit rather than the day you actually navigated to.',
+    ],
+  },
+  {
     version: "3.114.13-alpha",
     date: "2026-08-01",
     highlights: [

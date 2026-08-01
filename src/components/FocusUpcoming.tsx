@@ -23,7 +23,7 @@
 // (listAllCalendarEvents) so days either side of today are populated. Synced events only — the same
 // set the agenda shows — with no first-party overlays (milestones live on the Calendar tab).
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AgendaEvent, Calendar, CalendarEvent } from "../lib/types";
 import { listAllCalendarEvents } from "../lib/ipc";
 import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
@@ -86,10 +86,9 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   // component state (not persisted) so the window never jumps under you mid-session, and "Upcoming"
   // always opens on today.
   const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()));
-  // The swipe target for the days grid — the hook needs a real element to bind a non-passive
-  // wheel listener to.
-  const gridRef = useRef<HTMLDivElement>(null);
-  useHorizontalWheelShift(gridRef, (d) => setAnchor((a) => addDays(a, d)), mode === "week");
+  // The swipe target for the days grid. A callback ref, so it binds whenever the node actually
+  // exists rather than only if it happened to be mounted when an effect first ran.
+  const gridRef = useHorizontalWheelShift((d) => setAnchor((a) => addDays(a, d)), mode === "week");
   const [allEvents, setAllEvents] = useState<CalendarEvent[]>(() => cachedAllEvents);
   // The open detail popup, anchored at the clicked row/card (null = closed). Same component and same
   // behaviour as the Calendar tab — but with none of its overlay routing, because this card injects

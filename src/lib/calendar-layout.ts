@@ -81,6 +81,17 @@ export function addDays(d: Date, n: number): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
 }
 
+/**
+ * The Monday of the week containing `d` — the ordinary Monday-to-Sunday shape.
+ *
+ * Monday-indexed like the rest of PM's calendar maths, which already works in `(getDay() + 6) % 7`.
+ * Week view's day window can be swiped to start on any weekday; this is what "the conventional
+ * grid" means, and it is both what the Calendar tab opens on and what `Today` snaps back to.
+ */
+export function startOfWeek(d: Date): Date {
+  return addDays(startOfDay(d), -((d.getDay() + 6) % 7));
+}
+
 /** Local `YYYY-MM-DD` key for bucketing events into days. */
 export function dayKey(d: Date): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;

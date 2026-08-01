@@ -55,6 +55,7 @@ import {
   occurrenceKey,
   PINBOARD_CALENDAR_ID,
   startOfDay,
+  startOfWeek,
 } from "../../lib/calendar-layout";
 import { pinboardEntries, type PinboardEntry } from "../../lib/pinboard/calendarEntries";
 import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
@@ -90,12 +91,6 @@ let cachedEvents: CalendarEvent[] = [];
 let cachedOverview: CalendarOverview | null = null;
 let cachedMilestones: Milestone[] = [];
 let cachedPinboard: PinboardEntry[] = [];
-
-/** Monday-first start of the week containing `d`. */
-function startOfWeek(d: Date): Date {
-  const dow = (d.getDay() + 6) % 7;
-  return addDays(startOfDay(d), -dow);
-}
 
 /** How many days the grid shows for a view. Week is 7 by definition; Day is the user's chosen
  *  width (1-6). Anything else isn't a day grid. */
@@ -196,16 +191,35 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // Where the calendar opens: today, or wherever it was left. Read once at mount — flipping the
   // setting later should change the NEXT open, not teleport the view out from under you.
   const [cursor, setCursor] = useState<Date>(() => {
+    // `openOn` is the whole of "remember where I was", start day included: Week view's leftmost
+    // column IS the cursor's day, so restoring the cursor restores the shape for free.
     if (readOpenOn() === "last") return readCursorDay() ?? new Date();
+    // With remembering OFF, Week view opens on the ordinary Monday-to-Sunday week containing today —
+    // the same shape `Today` snaps to. #558 dropped this snap from the seed while making the window
+    // day-steppable and replaced it with nothing, so the seed fell through to a bare `new Date()`
+    // and the leftmost column became *today* on every mount. Restoring the snap is the fix; a
+    // remembered start day is NOT, because it re-shapes the week for someone who has switched
+    // remembering off (see calendarPrefs' note on the deleted `pm.calendar.weekStart`).
+    if (view === "week") return startOfWeek(new Date());
     return new Date();
   });
   // How wide the Day view is (1-6). Week is always 7.
   const [dayCount, setDayCount] = useState<number>(readDayCount);
-  // Persist the cursor on every move, whatever the openOn setting says — so turning "where I left
+  // Persist the cursor on every MOVE, whatever the openOn setting says — so turning "where I left
   // off" on works from that moment rather than only after the next navigation.
-  useEffect(() => writeCursorDay(cursor), [cursor]);
-  // The day grid's swipe target; the wheel hook needs a real element to bind a non-passive listener.
-  const gridRef = useRef<HTMLDivElement>(null);
+  //
+  // Skipping the first run matters: this effect also fires on mount, and in the default
+  // `openOn: 'today'` mode the mount value is simply today — so merely opening the Calendar tab
+  // stamped today over the day the user had actually left, and "where I left off" could only ever
+  // restore the last tab visit rather than the last place they navigated to.
+  const cursorWritten = useRef(false);
+  useEffect(() => {
+    if (!cursorWritten.current) {
+      cursorWritten.current = true;
+      return;
+    }
+    writeCursorDay(cursor);
+  }, [cursor]);
   const [loading, setLoading] = useState(cachedOverview === null);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -363,8 +377,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [view],
   );
   // One day per step, in the direction of travel: a swipe left (positive deltaX) moves forward.
-  useHorizontalWheelShift(
-    gridRef,
+  // Both gestures move the cursor and nothing else — `writeCursorDay` below is what remembers it,
+  // and `openOn` decides whether that memory is ever read back.
+  const gridRef = useHorizontalWheelShift(
     (days) => setCursor((c) => addDays(c, days)),
     view === "day" || view === "week",
   );
@@ -760,16 +775,24 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           </p>
         </div>
       ) : (
-        // key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the keyframe
-        // name doesn't resolve, so this is a no-op (the motion lives in index.css, not JS). The day
-        // component of the key (from the minute tick) remounts the body when the date rolls over at
-        // midnight, so every view's "today" highlight advances without an interaction.
-        <div
-          key={`${view}:${dayKey(startOfDay(now))}`}
-          className="flex min-h-0 flex-1 flex-col"
-          style={{ animation: "pm-fade-up 0.25s ease-out" }}
-        >
-          {renderBody()}
+        // The swipe target. `ref={gridRef}` was missing entirely until now, so the Calendar tab's
+        // horizontal swipe had never once fired despite the v3.88.0 notes advertising it here
+        // alongside Focus's. Note WHERE this branch sits: it renders only once `overview` has
+        // resolved, which is why `useHorizontalWheelShift` hands back a CALLBACK ref — an effect
+        // would have run at mount, found nothing, and never looked again (see its header).
+        <div ref={gridRef} className="flex min-h-0 flex-1 flex-col">
+          {/* key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the
+              keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not
+              JS). The day component of the key (from the minute tick) remounts the body when the
+              date rolls over at midnight, so every view's "today" highlight advances without an
+              interaction. */}
+          <div
+            key={`${view}:${dayKey(startOfDay(now))}`}
+            className="flex min-h-0 flex-1 flex-col"
+            style={{ animation: "pm-fade-up 0.25s ease-out" }}
+          >
+            {renderBody()}
+          </div>
         </div>
       )}
 

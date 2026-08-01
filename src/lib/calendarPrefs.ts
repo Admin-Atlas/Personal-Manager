@@ -56,9 +56,9 @@ export function writeView(view: CalendarViewMode): void {
  *
  *  The ONE key in this module that is user content, not view state: a Google/Outlook calendar id is
  *  routinely the account's email address. It therefore lives in the encrypted `settings` table under
- *  `calendar_ui` (see storedPrefs.ts) while the other eight keys here — view, range, roster fold,
- *  zones, bounds, day count, openOn and the cursor — stay in localStorage, which is what they are
- *  for. */
+ *  `calendar_ui` (see storedPrefs.ts) while the other nine keys here — view, range, roster fold,
+ *  zones, bounds, day count, openOn and the cursor — stay in localStorage, which is
+ *  what they are for. */
 export function readHidden(): Set<string> {
   const arr = readStored(PREF_KEY).hidden;
   if (Array.isArray(arr)) {
@@ -274,11 +274,20 @@ export function writeDayCount(n: number): void {
   }
 }
 
-/** Whether the calendar opens on today or wherever it was left. */
+/** Whether the calendar opens on today or wherever it was left.
+ *
+ *  THIS IS THE ONLY CONTROL FOR REMEMBERING WHERE THE CALENDAR WAS, and that is deliberate. Week
+ *  view's leftmost column is simply the cursor's day, so "which weekday the week starts on" is not
+ *  separate state — it is one component of the position this setting already governs. A short-lived
+ *  `pm.calendar.weekStart` key remembered that component on its own and was removed within a day of
+ *  shipping: it re-shaped the week for a user who had deliberately switched remembering OFF, which
+ *  is exactly the parallel-memory-beside-an-existing-control that `one control, one home` forbids.
+ *  Anything that wants to persist a slice of the cursor belongs here, behind this toggle. */
 export type CalendarOpenOn = "today" | "last";
 
 /** Defaults to `today`: opening on a date you last looked at weeks ago, with no memory of having
- *  left it there, reads as the calendar being broken. Opt in from Settings. */
+ *  left it there, reads as the calendar being broken. Opt in from Settings. With it off, Week view
+ *  opens on the ordinary Monday-to-Sunday week containing today — the same shape `Today` snaps to. */
 export function readOpenOn(): CalendarOpenOn {
   try {
     return localStorage.getItem(OPEN_ON_KEY) === "last" ? "last" : "today";

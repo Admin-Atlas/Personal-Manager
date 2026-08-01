@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { accumulateShift, isHorizontalGesture, WHEEL_STEP_PX } from "./wheelShift";
+import {
+  accumulateShift,
+  horizontalPixels,
+  isHorizontalGesture,
+  WHEEL_STEP_PX,
+} from "./wheelShift";
 
 const S = WHEEL_STEP_PX;
 
@@ -50,6 +55,27 @@ describe("accumulateShift", () => {
     const fwd = accumulateShift(0, S);
     const back = accumulateShift(fwd.carry, -S);
     expect(fwd.steps + back.steps).toBe(0);
+  });
+});
+
+describe("horizontalPixels — the threshold is in pixels, so the delta must be too", () => {
+  it("passes a pixel delta through untouched", () => {
+    expect(horizontalPixels({ deltaX: 120, deltaMode: 0 })).toBe(120);
+    expect(horizontalPixels({ deltaX: -37.5, deltaMode: 0 })).toBe(-37.5);
+  });
+
+  it("scales a LINE delta, which is otherwise ~55x too small to ever cross a step", () => {
+    // A line-mode notch reports deltaX: 1. Compared raw against WHEEL_STEP_PX it takes 55 notches
+    // to move one day, which is indistinguishable from the gesture not working at all.
+    expect(horizontalPixels({ deltaX: 1, deltaMode: 1 })).toBe(16);
+    expect(accumulateShift(0, horizontalPixels({ deltaX: 4, deltaMode: 1 })).steps).toBe(1);
+    expect(accumulateShift(0, { deltaX: 4, deltaMode: 1 }.deltaX).steps).toBe(0); // the old maths
+  });
+
+  it("keeps a PAGE delta to a sane jump rather than an unbounded one", () => {
+    // Capped downstream at MAX_STEPS_PER_EVENT regardless; this just keeps the sign and magnitude
+    // meaningful instead of treating "one page" as one pixel.
+    expect(accumulateShift(0, horizontalPixels({ deltaX: -1, deltaMode: 2 })).steps).toBe(-3);
   });
 });
 
