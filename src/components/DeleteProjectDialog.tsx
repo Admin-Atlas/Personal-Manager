@@ -44,7 +44,7 @@ function Choice<T extends string>({
   return (
     <label
       htmlFor={id}
-      className="flex cursor-pointer items-start gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 hover:bg-bg2"
+      className="flex cursor-pointer items-start gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 hover:bg-surface"
     >
       <input
         id={id}

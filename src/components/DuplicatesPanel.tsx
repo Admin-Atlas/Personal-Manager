@@ -69,7 +69,7 @@ function SideCard({
       <button
         type="button"
         onClick={onOpen}
-        className="block w-full text-left text-sm font-medium text-ink1 hover:underline"
+        className="block w-full text-left text-sm font-medium text-ink hover:underline"
       >
         {doc.title}
       </button>

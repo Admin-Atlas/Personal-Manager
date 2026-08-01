@@ -17,6 +17,7 @@ import {
   parseLocal,
   startOfDay,
 } from "../../../lib/calendar-layout";
+import { scrollBehavior } from "../../../theme";
 import { cn } from "../../ui";
 import { MiniMonth, type MiniSpan } from "../parts/MiniMonth";
 import { COL_GAP_PX, ROW_GAP_PX } from "../parts/useYearGridLayout";
@@ -125,7 +126,7 @@ export function YearView({ cursor, events, onSelectDay, onFocusDate }: Props) {
       const el = scrollRef.current;
       if (!el) return;
       programmaticRef.current = true;
-      el.scrollTo({ top: row * rowStride, behavior: smooth ? "smooth" : "auto" });
+      el.scrollTo({ top: row * rowStride, behavior: scrollBehavior(smooth) });
       const clear = () => {
         programmaticRef.current = false;
         el.removeEventListener("scrollend", clear);

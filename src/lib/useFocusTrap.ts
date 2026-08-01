@@ -12,8 +12,23 @@
 //
 // Pure DOM + refs, so it unit-tests in jsdom: jsdom doesn't move focus on a real Tab keypress, but
 // it does honour programmatic `.focus()` and dispatched keydown events, which is all this relies on.
+//
+// NESTED DIALOGS: a trap stands down while a deeper modal dialog holds focus. `Modal` does not
+// portal, so a dialog opened from inside another one is a DOM DESCENDANT of it and the same
+// bubbling keydown reaches both traps. Without this rule the outer trap also runs and wraps Tab
+// against the union of BOTH dialogs' focusables — so Tab off the last button of a confirmation
+// lands somewhere in the window behind it. See lib/useDialogLayer.ts for the Escape half of the
+// same problem.
 
 import { useEffect, useRef, type RefObject } from "react";
+
+/** A modal dialog nested inside `container` currently holds focus, so this trap is not the one in
+ *  charge. Matches on the ARIA that makes a dialog modal rather than on a component, so a
+ *  hand-rolled overlay that declares the same semantics is honoured too. */
+function deeperDialogHasFocus(container: HTMLElement): boolean {
+  const nested = container.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
+  return Array.from(nested).some((el) => el.contains(document.activeElement));
+}
 
 const FOCUSABLE = [
   "a[href]",
@@ -53,6 +68,7 @@ export function useFocusTrap(active: boolean, containerRef: RefObject<HTMLElemen
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Tab") return;
+      if (deeperDialogHasFocus(container)) return;
       const items = focusable(container);
       if (items.length === 0) {
         e.preventDefault();

@@ -66,6 +66,8 @@ export type { UserTime } from "./UserTimeContext";
 export { useDepth } from "./depth";
 export type { DepthState } from "./depth";
 
+export { prefersReducedMotion, scrollBehavior } from "./motion";
+
 export { graphColor } from "./graphPalette";
 
 export {

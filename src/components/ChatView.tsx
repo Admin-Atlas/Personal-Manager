@@ -19,7 +19,7 @@ import type {
   Message,
   PromptMessage,
 } from "../lib/types";
-import { useDepth } from "../theme";
+import { scrollBehavior, useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
 import { Markdown } from "../lib/markdown";
@@ -562,7 +562,7 @@ const MessageBlock = memo(function MessageBlock({
   const jumpToSource = (n: number) => {
     const el = itemRefs.current[n - 1];
     if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "nearest" });
     setFlash(n);
     window.setTimeout(() => setFlash((cur) => (cur === n ? null : cur)), 1500);
   };
@@ -672,7 +672,7 @@ export function ChatView({
   // window and nothing scrolls it back. "nearest" moves only what actually needs to move, which for a
   // pinned-to-bottom transcript is the chat's own scroller and nothing else.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    endRef.current?.scrollIntoView({ behavior: scrollBehavior(), block: "nearest" });
   }, [messages]);
   // While a reply streams, only stay pinned to the bottom if the user is ALREADY near it — so they can
   // scroll up to read earlier turns mid-stream without being dragged back down every token (F-50).
@@ -692,7 +692,7 @@ export function ChatView({
     const el = blockRefs.current.get(focusTurn.id);
     if (!el) return; // turns not loaded yet — the messages-dep re-run will catch it
     lastNonceRef.current = focusTurn.nonce;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
     setFlashMsg(focusTurn.id);
     const clear = window.setTimeout(
       () => setFlashMsg((cur) => (cur === focusTurn.id ? null : cur)),

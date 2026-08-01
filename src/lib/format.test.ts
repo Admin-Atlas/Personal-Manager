@@ -3,10 +3,12 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  formatBytes,
   formatDate,
   formatDateOnly,
   formatDateLocal,
   formatDateTime,
+  formatGib,
   formatSyncedShort,
   formatWhen,
 } from "./format";
@@ -105,5 +107,76 @@ describe("formatSyncedShort", () => {
 
   it("is empty for an unparseable value", () => {
     expect(formatSyncedShort("garbage", now)).toBe("");
+  });
+});
+
+// The one byte formatter. Four existed — this one, StorageSettings' `formatSize`, and LocalAiSettings'
+// `fmtGb`/`fmtBytes` — and `fmtBytes` was DECIMAL while everything it sat next to was binary, so the
+// same model read "4.7 GB" as it downloaded and "4.3 GB" the instant it landed. The base is the whole
+// point of this suite: every `*_gb` figure crossing IPC is already GiB by design (`hardware.rs`'s
+// `GIB`, `local_disk.rs::bytes_to_gb`, the catalog's `file_gb`), and `fit.rs` compares those three
+// against each other — so a decimal presentation contradicts the numbers underneath it.
+
+describe("formatBytes", () => {
+  it("steps in binary, not decimal", () => {
+    expect(formatBytes(1024)).toBe("1 KB");
+    expect(formatBytes(1024 ** 2)).toBe("1 MB");
+    expect(formatBytes(1024 ** 3)).toBe("1.0 GB");
+    expect(formatBytes(1024 ** 4)).toBe("1.0 TB");
+  });
+
+  it("prints the byte count that used to read 4.7 GB as 4.3 GB", () => {
+    // The regression net for the whole finding: this is a real Ollama pull size, and it now agrees
+    // to the digit with the on-disk card and the catalog that scored the fit.
+    expect(formatBytes(4_661_211_808)).toBe("4.3 GB");
+    expect(formatBytes(8_988_110_656)).toBe("8.4 GB");
+  });
+
+  it("promotes instead of rounding to a full unit", () => {
+    // Round FIRST, then promote. The old version rounded within the unit it had already chosen, so
+    // one byte under a boundary printed "1024 KB" and "1024 GB" — units that do not exist.
+    expect(formatBytes(1024 ** 2 - 1)).toBe("1 MB");
+    expect(formatBytes(1024 ** 4 - 1)).toBe("1.0 TB");
+    expect(formatBytes(1023)).toBe("1023 B");
+  });
+
+  it("gives one decimal from GB up and whole numbers below", () => {
+    expect(formatBytes(152_043_520)).toBe("145 MB");
+    expect(formatBytes(98_304)).toBe("96 KB");
+    expect(formatBytes(12)).toBe("12 B");
+  });
+
+  it("survives the degenerate inputs it now has to, as the pull-progress formatter", () => {
+    // `fmtBytes` was called with a nullable `completed_bytes`, so the shared function inherits every
+    // shape the stream can produce. `formatBytes(-5)` used to return the literal "NaN undefined".
+    expect(formatBytes(null)).toBe("—");
+    expect(formatBytes(undefined)).toBe("—");
+    expect(formatBytes(NaN)).toBe("—");
+    expect(formatBytes(Infinity)).toBe("—");
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(-5)).toBe("0 B");
+  });
+});
+
+describe("formatGib", () => {
+  it("is byte-identical to the old fmtGb at every value the hardware grid shows", () => {
+    // The six `*_gb` call sites must not churn: this is the no-change contract.
+    expect(formatGib(16)).toBe("16.0 GB");
+    expect(formatGib(8.4)).toBe("8.4 GB");
+    expect(formatGib(128)).toBe("128.0 GB");
+    expect(formatGib(4.34)).toBe("4.3 GB");
+  });
+
+  it("changes only where the old output was wrong", () => {
+    // "0.0 GB free of 16.0 GB" read as zero on a machine under memory pressure.
+    expect(formatGib(0.04)).toBe("41 MB");
+    expect(formatGib(0.4)).toBe("410 MB");
+    expect(formatGib(1500)).toBe("1.5 TB");
+  });
+
+  it("renders an absent figure as an em dash", () => {
+    expect(formatGib(null)).toBe("—");
+    expect(formatGib(undefined)).toBe("—");
+    expect(formatGib(0)).toBe("0 B");
   });
 });

@@ -41,6 +41,7 @@ import type {
   LocalServedModel,
   PullProgress,
 } from "../../lib/types";
+import { formatBytes, formatGib } from "../../lib/format";
 import { ollamaGuide } from "../../lib/workbenchGuide";
 import { Button, Collapsible, ConfirmDialog, Input, SectionInfo, Select } from "../ui";
 
@@ -874,7 +875,7 @@ function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
         <FitBadge verdict={model.fit.verdict} />
       </div>
       <p className="mt-0.5 text-xs text-ink4">
-        {DISK_SOURCE_LABEL[model.source]} · {fmtGb(model.size_gb)}
+        {DISK_SOURCE_LABEL[model.source]} · {formatGib(model.size_gb)}
         {model.quant ? ` · ${model.quant}` : ""}
         {model.shards > 1 ? ` · ${model.shards} files` : ""}
       </p>
@@ -919,17 +920,6 @@ function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
   );
 }
 
-function fmtGb(n: number | null): string {
-  return n == null ? "—" : `${n.toFixed(1)} GB`;
-}
-
-function fmtBytes(n: number | null | undefined): string {
-  if (n == null) return "—";
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`;
-  return `${(n / 1e3).toFixed(0)} KB`;
-}
-
 /** The `ollama pull <tag>` install hint reduced to just the tag (for the pull API / a copy button). */
 function ollamaTag(hint: string | null): string | null {
   if (!hint) return null;
@@ -940,7 +930,7 @@ function ollamaTag(hint: string | null): string | null {
 function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
   const h = recs.hardware;
   const rows: Array<[string, string]> = [
-    ["Memory", `${fmtGb(h.available_ram_gb)} free of ${fmtGb(h.total_ram_gb)}`],
+    ["Memory", `${formatGib(h.available_ram_gb)} free of ${formatGib(h.total_ram_gb)}`],
     [
       "Processor",
       `${h.cpu_brand ?? "—"}${h.cpu_cores ? ` · ${h.cpu_cores} cores` : ""}${h.cpu_threads ? ` / ${h.cpu_threads} threads` : ""}`,
@@ -948,10 +938,10 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
     [
       "Graphics",
       h.gpu_name
-        ? `${h.gpu_name}${h.vram_gb ? ` · ${fmtGb(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}${h.gpu_bandwidth_gbps ? ` · ~${h.gpu_bandwidth_gbps.toFixed(0)} GB/s` : ""}`
+        ? `${h.gpu_name}${h.vram_gb ? ` · ${formatGib(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}${h.gpu_bandwidth_gbps ? ` · ~${h.gpu_bandwidth_gbps.toFixed(0)} GB/s` : ""}`
         : "No dedicated GPU detected",
     ],
-    ["Free disk", fmtGb(h.disk_free_gb)],
+    ["Free disk", formatGib(h.disk_free_gb)],
   ];
   return (
     <div className="mt-3">
@@ -1046,7 +1036,7 @@ function ConfigMetrics({ fit }: { fit: LocalFitResult }) {
       {fit.context != null && <span>{(fit.context / 1024).toFixed(0)}k ctx</span>}
       {fit.kv === "q8_0" && <span>q8_0 KV</span>}
       {fit.est_tokens_per_sec != null && <span>~{fit.est_tokens_per_sec.toFixed(0)} tok/s</span>}
-      {fit.est_memory_gb != null && <span>{fmtGb(fit.est_memory_gb)}</span>}
+      {fit.est_memory_gb != null && <span>{formatGib(fit.est_memory_gb)}</span>}
     </>
   );
 }
@@ -1151,7 +1141,7 @@ function RecommendationCard({
               {f.est_tokens_per_sec != null && (
                 <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>
               )}
-              {f.est_memory_gb != null && <span>{fmtGb(f.est_memory_gb)}</span>}
+              {f.est_memory_gb != null && <span>{formatGib(f.est_memory_gb)}</span>}
             </div>
           )}
         </div>
@@ -1182,7 +1172,7 @@ function RecommendationCard({
           <p className="mt-1 font-mono text-[0.625rem] text-ink4">
             {pullProg?.status ?? "starting…"}
             {pullProg?.total_bytes
-              ? ` · ${fmtBytes(pullProg.completed_bytes)} / ${fmtBytes(pullProg.total_bytes)}`
+              ? ` · ${formatBytes(pullProg.completed_bytes)} / ${formatBytes(pullProg.total_bytes)}`
               : ""}
           </p>
         </div>

@@ -58,7 +58,7 @@ import { usePinboard } from "../lib/pinboard/usePinboard";
 import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
 import type { CellPoint, Rect, TimelineItem, Widget } from "../lib/pinboard/types";
 import type { Milestone, MilestoneStatus } from "../lib/types";
-import { useDepth } from "../theme";
+import { scrollBehavior, useDepth } from "../theme";
 import { DateField } from "./DateField";
 // The status vocabulary + the "what does a pre-status row read as" fallback live with the project
 // milestone list, so the two surfaces can never drift into offering different options.
@@ -415,7 +415,7 @@ export function PinboardView() {
           ? Math.max(0, px.x - PAD)
           : left;
       if (nextTop !== top || nextLeft !== left) {
-        el.scrollTo({ top: nextTop, left: nextLeft, behavior: "smooth" });
+        el.scrollTo({ top: nextTop, left: nextLeft, behavior: scrollBehavior() });
       }
     }
     setPendingScrollId(null);

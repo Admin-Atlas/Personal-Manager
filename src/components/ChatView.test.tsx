@@ -41,7 +41,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   Element.prototype.scrollIntoView = scrollIntoView;
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  delete document.documentElement.dataset.reducedMotion;
+});
 
 function message(id: number) {
   return {
@@ -74,6 +77,36 @@ describe("snapping to the newest turn", () => {
     rerender(<ChatView messages={[message(1)]} streaming="partial answer" />);
     for (const call of scrollIntoView.mock.calls) {
       expect(call[0]?.block).toBe("nearest");
+    }
+  });
+});
+
+describe("Reduced motion", () => {
+  // The autoscroll was hard-coded `behavior: "smooth"`, which bypasses CSS entirely — `index.css`'s
+  // `scroll-behavior: auto !important` is only consulted when `behavior` is "auto", so the in-app
+  // Accessibility → Motion → "Reduced" setting could not reach it and never had. The `../theme` mock
+  // above spreads the real module, so `scrollBehavior` here is the real helper reading the real DOM
+  // stamp — which is precisely why it needed no addition to that partial `useTheme` mock.
+  it("snaps instantly under the in-app setting, without losing the nearest-scroller guarantee", () => {
+    document.documentElement.dataset.reducedMotion = "on";
+    render(<ChatView messages={[message(1)]} streaming={null} />);
+    expect(scrollIntoView).toHaveBeenCalled();
+    for (const call of scrollIntoView.mock.calls) {
+      expect(
+        call[0]?.behavior,
+        "an explicit smooth scroll ignores the Reduced motion setting",
+      ).toBe("auto");
+      // Pinned together on purpose: the two guarantees live in the same options object, and a fix
+      // to one has already been the way the other got dropped.
+      expect(call[0]?.block).toBe("nearest");
+    }
+  });
+
+  it("glides when nothing asks for reduced motion", () => {
+    render(<ChatView messages={[message(1)]} streaming={null} />);
+    expect(scrollIntoView).toHaveBeenCalled();
+    for (const call of scrollIntoView.mock.calls) {
+      expect(call[0]?.behavior).toBe("smooth");
     }
   });
 });

@@ -125,12 +125,45 @@ export function shortModel(id: string): string {
   return slash >= 0 ? id.slice(slash + 1) : id;
 }
 
-/** A byte count as an exact human size ("1.4 GB"). (StorageSettings keeps its own `formatSize` —
- *  that one deliberately floors at MB and marks estimates with `~`.) */
-export function formatBytes(n: number): string {
-  if (!n) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
-  const v = n / Math.pow(1024, i);
-  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+/** 2^30 — the base every `*_gb` figure crossing the IPC boundary is already in (`hardware.rs`'s
+ *  `GIB`, `local_disk.rs::bytes_to_gb`, the catalog's `file_gb`), and `fit.rs` compares those three
+ *  against each other. A GB float is converted BACK to bytes here, never re-scaled. */
+const GIB = 1024 ** 3;
+
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
+
+/**
+ * A byte count as a human size. **Binary** steps (1 KB = 1024 B) under the short SI labels, because
+ * that is what the machine says: Windows Explorer and Task Manager, macOS's memory readout, and PM's
+ * own fit maths all count in powers of 1024. Decimal here made the same model read "4.7 GB" while it
+ * downloaded and "4.3 GB" the instant it landed on disk — a same-screen contradiction.
+ *
+ * One decimal place from GB up, whole numbers below. Nullish/non-finite render as an em dash; zero
+ * and below as "0 B" (the old version returned the literal string "NaN undefined" for a negative).
+ *
+ * This is the ONE byte formatter. Three others existed — `StorageSettings.formatSize`, and
+ * LocalAiSettings' `fmtGb`/`fmtBytes` — and the decimal one was the defect. {@link formatGib} is the
+ * adapter for a figure the backend already divided; `formatSize` survives only as the `~`-prefix
+ * copy decision wrapped around this.
+ */
+export function formatBytes(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n <= 0) return "0 B";
+  // Round FIRST, then promote, so 1 048 575 B is "1 MB" and never "1024 KB".
+  const show = (v: number, i: number) => (i >= 3 ? Number(v.toFixed(1)) : Math.round(v));
+  let i = 0;
+  let v = n;
+  while (i < BYTE_UNITS.length - 1 && show(v, i) >= 1024) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${show(v, i).toFixed(i >= 3 ? 1 : 0)} ${BYTE_UNITS[i]}`;
+}
+
+/** {@link formatBytes} for a figure the backend already expressed in GB — the `*_gb` family (RAM,
+ *  VRAM, free disk, a model's weights). Goes back through {@link GIB} rather than re-deriving a
+ *  scale, so a nearly-full disk reads "410 MB" instead of the old "0.4 GB", and a big volume reads
+ *  "1.5 TB" instead of "1500.0 GB". Unchanged at every ordinary value: 16 → "16.0 GB". */
+export function formatGib(gb: number | null | undefined): string {
+  return gb == null || !Number.isFinite(gb) ? "—" : formatBytes(gb * GIB);
 }

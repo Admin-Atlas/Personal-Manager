@@ -12,7 +12,7 @@ import {
 } from "../../lib/ipc";
 import type { LanguageOptions } from "../../lib/types";
 import { RebuildProgress } from "../RebuildProgress";
-import { ConfirmDialog, SectionInfo, SegmentedControl, Toggle } from "../ui";
+import { Callout, ConfirmDialog, SectionInfo, SegmentedControl, Toggle } from "../ui";
 import { ResetLink } from "./ResetControls";
 
 /** The Search Settings tab: the vault's search language (with the guided re-index on a populated
@@ -115,18 +115,7 @@ export function SearchSettings() {
 
   return (
     <>
-      {error && (
-        <div
-          className="mt-4 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            color: "var(--st-due)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-4">{error}</Callout>}
 
       <div className="mt-4 border-t border-border pt-4">
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">

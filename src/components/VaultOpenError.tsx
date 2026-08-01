@@ -21,7 +21,7 @@ import { useState } from "react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { detachFromSharedVault, resetAfterOpenError, retryOpenVault } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
-import { Button, Input } from "./ui";
+import { Button, Callout, Input } from "./ui";
 import { DetachConfirm, RepairAccessButton } from "./VaultRecovery";
 
 /** The phrase the user types to arm the destructive "Start fresh" recovery. */
@@ -123,12 +123,9 @@ export function VaultOpenError({
       </div>
 
       {error && (
-        <p
-          className="max-w-xs break-words rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="max-w-xs break-words">
           {error}
-        </p>
+        </Callout>
       )}
 
       {/* Denied leads with Repair (the data is fine; the permissions are the problem). */}

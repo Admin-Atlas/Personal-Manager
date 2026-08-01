@@ -56,19 +56,7 @@ export function ConfirmDialog({
           <Button variant="tertiary" onClick={onClose} disabled={busy}>
             {cancelLabel}
           </Button>
-          <Button
-            variant="primary"
-            onClick={onConfirm}
-            disabled={busy}
-            style={
-              danger && !busy
-                ? {
-                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                    color: "var(--st-due)",
-                  }
-                : undefined
-            }
-          >
+          <Button variant={danger ? "danger" : "primary"} onClick={onConfirm} disabled={busy}>
             {busy ? "Working…" : confirmLabel}
           </Button>
         </div>

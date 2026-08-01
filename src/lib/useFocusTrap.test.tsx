@@ -87,3 +87,67 @@ describe("useFocusTrap", () => {
     expect(document.activeElement).toBe(opener);
   });
 });
+
+// Nested dialogs. Modal does not portal, so a dialog opened from inside another one is a DOM
+// DESCENDANT of it and the same bubbling keydown reaches both traps. This is what makes
+// Settings-as-a-Modal safe: Settings contains its own unsaved-changes guard, the per-tab reset
+// confirmations, the re-index progress and the three remove-my-data steps.
+
+function NestedHarness({ innerButtons = 2 }: { innerButtons?: number }) {
+  const outer = useRef<HTMLDivElement>(null);
+  const inner = useRef<HTMLDivElement>(null);
+  useFocusTrap(true, outer);
+  useFocusTrap(true, inner);
+  return (
+    <div ref={outer} role="dialog" aria-modal="true" tabIndex={-1} data-testid="outer">
+      <button data-testid="outer-first">outer first</button>
+      <button data-testid="outer-last">outer last</button>
+      <div ref={inner} role="dialog" aria-modal="true" tabIndex={-1} data-testid="inner">
+        <button data-testid="inner-first">inner first</button>
+        {innerButtons > 1 && <button data-testid="inner-last">inner last</button>}
+      </div>
+    </div>
+  );
+}
+
+describe("useFocusTrap with a nested dialog", () => {
+  it("keeps Tab inside a one-button nested dialog", () => {
+    // The case where the outer trap does real damage. A confirmation whose only focusable is its
+    // Confirm button, rendered last inside the dialog behind it: the inner trap refocuses its one
+    // button, and the outer trap — whose own focusable list ENDS with that same button — then reads
+    // it as "the last element" and wraps focus to the outer dialog's first control. One Tab and the
+    // user is behind the confirmation they were answering.
+    const { getByTestId } = render(<NestedHarness innerButtons={1} />);
+    const only = getByTestId("inner-first");
+    only.focus();
+    fireEvent.keyDown(only, { key: "Tab" });
+    expect(document.activeElement).toBe(only);
+    expect(document.activeElement).not.toBe(getByTestId("outer-first"));
+  });
+
+  it("wraps Tab against the inner dialog's own focusables", () => {
+    const { getByTestId } = render(<NestedHarness />);
+    const innerLast = getByTestId("inner-last");
+    innerLast.focus();
+    fireEvent.keyDown(innerLast, { key: "Tab" });
+    expect(document.activeElement).toBe(getByTestId("inner-first"));
+  });
+
+  it("wraps Shift+Tab against the inner dialog too", () => {
+    const { getByTestId } = render(<NestedHarness />);
+    const innerFirst = getByTestId("inner-first");
+    innerFirst.focus();
+    fireEvent.keyDown(innerFirst, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(getByTestId("inner-last"));
+  });
+
+  it("leaves the outer trap in charge while focus is outside the nested dialog", () => {
+    const { getByTestId } = render(<NestedHarness />);
+    // Focus outside the inner dialog: the stand-down rule must not apply, so the outer trap still
+    // wraps at its own edge (its last focusable happens to be the inner dialog's last button).
+    const outerFirst = getByTestId("outer-first");
+    outerFirst.focus();
+    fireEvent.keyDown(outerFirst, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(getByTestId("inner-last"));
+  });
+});

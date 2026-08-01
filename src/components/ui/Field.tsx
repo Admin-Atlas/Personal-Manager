@@ -7,13 +7,25 @@
 // associated (`aria-describedby`) and announced (`role="alert"`). `Field` is the common vertical
 // layout built on the hook; reach for the hook directly when a surface needs its own layout (e.g. the
 // centered vault-unlock gate, which keeps a visually-hidden label so nothing changes on screen).
+//
+// The hook returns BOTH association mechanisms because PM's controls need both. `htmlFor` reaches a
+// labelable element (`input`, `select`, `textarea`) and nothing else — but 21 of the Settings
+// controls are `role="switch"` buttons or `role="group"` divs, which are not labelable, so an
+// emitted `htmlFor` is simply inert for them. `aria-labelledby` is the one mechanism correct for
+// switch, group, select and input alike, so `labelProps` now carries an `id` for it to point at.
+// `SettingRow` is the other consumer of that pair; this is the single id-minting core they share.
 
 import { useId, type ReactNode } from "react";
 import { cn } from "./cn";
 
 export interface FieldA11y {
-  labelProps: { htmlFor: string };
-  controlProps: { id: string; "aria-invalid"?: true; "aria-describedby"?: string };
+  labelProps: { htmlFor: string; id: string };
+  controlProps: {
+    id: string;
+    "aria-labelledby": string;
+    "aria-invalid"?: true;
+    "aria-describedby"?: string;
+  };
   errorProps: { id: string; role: "alert" };
   descriptionProps: { id: string };
 }
@@ -24,15 +36,17 @@ export function useFieldA11y({
 }: { error?: ReactNode; description?: ReactNode } = {}): FieldA11y {
   const base = useId();
   const id = `${base}-control`;
+  const labelId = `${base}-label`;
   const errorId = `${base}-error`;
   const descId = `${base}-desc`;
   const describedBy = [description ? descId : null, error ? errorId : null]
     .filter(Boolean)
     .join(" ");
   return {
-    labelProps: { htmlFor: id },
+    labelProps: { htmlFor: id, id: labelId },
     controlProps: {
       id,
+      "aria-labelledby": labelId,
       ...(error ? { "aria-invalid": true as const } : {}),
       ...(describedBy ? { "aria-describedby": describedBy } : {}),
     },
