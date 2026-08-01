@@ -6,7 +6,7 @@
 // shell behind `useDevMode()`. Read-only — a DevPanel only ever displays state, never mutates it.
 
 import type { ReactNode } from "react";
-import { Card } from "../ui";
+import { Card, SectionLabel } from "../ui";
 
 export interface DevPanelProps {
   title: string;
@@ -23,9 +23,7 @@ export function DevPanel({ title, subtitle, actions, helpId, children, className
     <Card className={`p-4 ${className ?? ""}`}>
       <div className="flex items-start justify-between gap-3" data-help={helpId}>
         <div>
-          <h3 className="font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            {title}
-          </h3>
+          <SectionLabel as="h3">{title}</SectionLabel>
           {subtitle && <p className="mt-0.5 text-xs text-ink4">{subtitle}</p>}
         </div>
         {actions && <div className="shrink-0">{actions}</div>}

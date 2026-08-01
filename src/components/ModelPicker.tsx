@@ -128,11 +128,12 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
               </span>
               <Button
                 variant="tertiary"
+                size="xs"
                 onClick={() =>
                   setSort((s) => (s === "default" ? "asc" : s === "asc" ? "desc" : "default"))
                 }
                 title="Sort by input price"
-                className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] normal-case tracking-normal hover:bg-surface"
+                className="normal-case tracking-normal hover:bg-surface"
               >
                 Sort: {sort === "asc" ? "price ↑" : sort === "desc" ? "price ↓" : "default"}
               </Button>

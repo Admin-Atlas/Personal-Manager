@@ -16,7 +16,7 @@ import { IS_LINUX } from "../../lib/setupGuide";
 import type { AppLockStatus } from "../../lib/types";
 import { RemovePmData } from "../RemovePmData";
 import { VaultCard } from "../VaultCard";
-import { Button, SectionInfo, Toggle } from "../ui";
+import { Button, Callout, SectionInfo, Toggle } from "../ui";
 
 /** The Data & Security Settings tab. Self-contained: the app-lock toggle and the export/reveal
  *  actions each persist/run immediately through their own IPC calls, so there's nothing to batch —
@@ -96,18 +96,7 @@ export function DataSecuritySettings() {
 
   return (
     <>
-      {error && (
-        <div
-          className="mt-4 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            color: "var(--st-due)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-4">{error}</Callout>}
 
       <div
         id="sec-data-applock"

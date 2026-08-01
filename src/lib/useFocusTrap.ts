@@ -30,12 +30,19 @@ function deeperDialogHasFocus(container: HTMLElement): boolean {
   return Array.from(nested).some((el) => el.contains(document.activeElement));
 }
 
+// TAB-REACHABLE, not merely focusable. `tabindex="-1"` means "focusable by script, not by Tab", so
+// an element carrying it is never a stop the trap should wrap against — and the generic arm below
+// always said so while the five element arms did not. The command palette is where that inconsistency
+// bites: its result rows are `<button tabIndex={-1}>` driven by `aria-activedescendant`, so the trap
+// counted them as stops, decided the input was neither first nor last, and let the very first Tab
+// walk straight out of the dialog. With them excluded the input is the only stop and Tab refocuses
+// it, which is what a palette should do.
 const FOCUSABLE = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
+  'a[href]:not([tabindex="-1"])',
+  'button:not([disabled]):not([tabindex="-1"])',
+  'input:not([disabled]):not([tabindex="-1"])',
+  'select:not([disabled]):not([tabindex="-1"])',
+  'textarea:not([disabled]):not([tabindex="-1"])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
 

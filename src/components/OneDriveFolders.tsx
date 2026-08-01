@@ -94,6 +94,7 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
   return (
     <div className="mt-2 space-y-3" data-help="settings-onedrive-scope">
       <SegmentedControl
+        ariaLabel="OneDrive scope"
         value={whole ? "whole" : "folders"}
         onChange={(v) => setWhole(v === "whole")}
         options={[

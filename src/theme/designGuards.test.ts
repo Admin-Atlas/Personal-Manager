@@ -22,10 +22,12 @@
 // `scripts/**/*.test.mjs` lane is plain Node, is outside the frontend tsconfig, and is already
 // collected by the same `just frontend-test` (`check-files-in-place.mjs:141`).
 //
-// THE ALLOW-LIST PATTERN: each rule below carries the set of files that still break it. That set is
-// a to-do list CI keeps honest, and it may only ever SHRINK. A new file breaking the rule fails
-// immediately; an entry that has been fixed fails as stale. Converting a file means deleting its
-// line, which is the smallest possible reminder that the conversion is not finished.
+// THE ALLOW-LIST PATTERN, and why no rule below uses it any more: each rule shipped carrying the
+// set of files that still broke it — a to-do list CI kept honest, asserted in BOTH directions so a
+// fixed entry failed as stale and the list could only ever shrink. Both lists are now empty, so
+// each rule states its final form directly and there is no longer a line to add yourself to. A new
+// rule that lands mid-conversion should bring the two-directional helper back with it rather than
+// asserting only that nothing NEW offends, which is how an allow-list rots into a lie.
 
 import { describe, expect, it } from "vitest";
 
@@ -45,15 +47,6 @@ function filesContaining(needle: string): string[] {
   return SOURCES.filter(([, text]) => text.includes(needle)).map(([path]) => path);
 }
 
-/** Both directions at once: nothing outside the allow-list breaks the rule, and no allow-list entry
- *  has quietly been fixed. Without the second half the list rots into a lie. */
-function expectOnly(offenders: string[], allowed: Set<string>) {
-  expect({
-    unexpected: offenders.filter((f) => !allowed.has(f)),
-    stale: [...allowed].filter((f) => !offenders.includes(f)),
-  }).toEqual({ unexpected: [], stale: [] });
-}
-
 // ---------------------------------------------------------------------------------------------
 // The Settings section head. One class string, 27 hand-written copies across 10 files, and 30 of
 // the 32 rendered heads were `<label>` elements naming nothing. `ui/SectionLabel.tsx` owns it now.
@@ -61,32 +54,14 @@ function expectOnly(offenders: string[], allowed: Set<string>) {
 
 const HEAD_RECIPE = "font-mono text-xs font-medium uppercase tracking-wide text-ink3";
 
-/** Files still hand-writing the section-head recipe, pending the settings-markup conversion. */
-const UNCONVERTED_HEADS = new Set([
-  "src/components/BackupSettings.tsx",
-  "src/components/ConnectorsSettings.tsx",
-  "src/components/SettingsView.tsx",
-  "src/components/dev/DevPanel.tsx",
-  "src/components/localai/LocalAiSettings.tsx",
-  "src/components/settings/AccessibilitySettings.tsx",
-  "src/components/settings/AiModelsSettings.tsx",
-  "src/components/settings/DeveloperSettings.tsx",
-  "src/components/settings/GeneralSettings.tsx",
-  "src/components/settings/SearchSettings.tsx",
-]);
-
+// The ten-file allow-list this rule shipped with is GONE, not emptied: all 32 rendered heads now go
+// through `SectionLabel`, so the rule states its final form directly. A file that retypes the recipe
+// fails on the equality below — there is no longer a line to add yourself to.
 describe("the section-head recipe has one home", () => {
   const offenders = filesContaining(HEAD_RECIPE);
 
-  it("is written in SectionLabel.tsx", () => {
-    expect(offenders).toContain("src/components/ui/SectionLabel.tsx");
-  });
-
-  it("is written nowhere else except the files still awaiting conversion", () => {
-    expectOnly(
-      offenders.filter((f) => f !== "src/components/ui/SectionLabel.tsx"),
-      UNCONVERTED_HEADS,
-    );
+  it("is written in SectionLabel.tsx and nowhere else", () => {
+    expect(offenders).toEqual(["src/components/ui/SectionLabel.tsx"]);
   });
 });
 
@@ -95,23 +70,13 @@ describe("the section-head recipe has one home", () => {
 // `aria-label` is announced as bare "dialog" — which is what 12 of PM's 19 dialogs did, including
 // "Remove this data?", "Final confirmation", "Delete <project>" and "Remove this tag?".
 //
-// This is the ratchet standing in for a required-prop union: `ModalProps` cannot demand a name
-// until every existing call site has one, so until then a NEW unnamed `<Modal>` fails HERE. Going
-// through `Dialog` needs no entry — its `title` is required and it wires the name itself.
+// The nine-file allow-list this rule shipped with is GONE, not emptied: `ModalProps` is now
+// `ModalBaseProps & ({ labelledBy } | { label })`, so an unnamed `<Modal>` no longer compiles and
+// the primary enforcement is `tsc`, not this scan. What is left here is the backstop that survives
+// the type being loosened — if the union is ever relaxed back to two optionals, the offending call
+// site still fails HERE rather than shipping silent. Going through `Dialog` cannot offend at all:
+// its `title` is required and it wires the name itself.
 // ---------------------------------------------------------------------------------------------
-
-/** Files still opening a `<Modal>` with neither `labelledBy` nor `label`. */
-const UNNAMED_DIALOGS = new Set([
-  "src/components/ContextMeter.tsx",
-  "src/components/DeleteProjectDialog.tsx",
-  "src/components/MergeProjectDialog.tsx",
-  "src/components/PinboardView.tsx",
-  "src/components/RebuildProgress.tsx",
-  "src/components/RemovePmData.tsx",
-  "src/components/TeachPreferences.tsx",
-  "src/components/TeachTags.tsx",
-  "src/components/TeachView.tsx",
-]);
 
 /** The opening `<Modal …>` tag only — brace-depth aware, so a `>` inside an arrow function in an
  *  attribute does not end it early and a `label=` on a CHILD element cannot be mistaken for one. */
@@ -137,12 +102,15 @@ describe("every dialog has an accessible name", () => {
   }).map(([path]) => path);
 
   it("finds the dialogs it is meant to be scanning", () => {
-    // A scan of an empty set passes. Pin that the matcher still sees PM's dialogs at all.
-    const withModals = SOURCES.filter(([, t]) => /<Modal[\s>]/.test(t)).length;
-    expect(withModals).toBeGreaterThan(10);
+    // A scan of an empty set passes, and after the conversion nearly every dialog reaches Modal
+    // through `Dialog`. Pin that the matcher still sees the ones that remain — `Dialog` itself,
+    // and the folder board that names itself with `label`.
+    const withModals = SOURCES.filter(([, t]) => /<Modal[\s>]/.test(t)).map(([p]) => p);
+    expect(withModals).toContain("src/components/ui/Dialog.tsx");
+    expect(withModals).toContain("src/components/PinboardView.tsx");
   });
 
-  it("has no unnamed <Modal> outside the known, shrinking allow-list", () => {
-    expectOnly(offenders, UNNAMED_DIALOGS);
+  it("has no unnamed <Modal> anywhere in the tree", () => {
+    expect(offenders).toEqual([]);
   });
 });

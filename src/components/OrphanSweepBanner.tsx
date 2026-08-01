@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 
 import { deleteOrphanFiles, dismissOrphanSweep, scanOrphanFiles } from "../lib/ipc";
 import type { SweepPlan } from "../lib/types";
-import { Button, Modal } from "./ui";
+import { Button, Dialog } from "./ui";
 
 /**
  * **ONE-TIME cleanup — DELETE THIS FILE in the release after the one that ships it** (the follow-up
@@ -92,57 +92,52 @@ export function OrphanSweepBanner() {
         </Button>
       </Notice>
 
-      <Modal
+      <Dialog
         open={open}
         onClose={() => (busy ? undefined : setOpen(false))}
         widthClassName="max-w-lg"
-        labelledBy="orphan-sweep-title"
-      >
-        <div className="p-5">
-          <h2 id="orphan-sweep-title" className="font-head text-base font-semibold text-ink">
-            Remove {files}?
-          </h2>
-
-          <p className="mt-2 text-sm leading-relaxed text-ink3">
-            These were left in your vault when you deleted the documents they belonged to. PM no
-            longer has any record of them, so it can only show you the file names.
-          </p>
-
-          <ul className="mt-3 max-h-56 overflow-y-auto rounded border border-border bg-surface p-2 font-mono text-xs text-ink3">
-            {plan.orphans.map((path) => (
-              <li key={path} className="truncate py-0.5">
-                {path}
-              </li>
-            ))}
-          </ul>
-
-          <p className="mt-3 text-sm leading-relaxed text-ink2">
-            <strong className="font-semibold text-ink">Back up your vault first.</strong> This
-            permanently deletes these files from disk. It cannot be undone from inside PM, and a
-            backup is the only way back.
-          </p>
-
-          <p className="mt-2 text-sm leading-relaxed text-ink4">
-            PM will not touch anything still in use: your documents, chats and photos, your
-            settings, or the encrypted files that hold your classifications.
-          </p>
-
-          {error && (
-            <p role="alert" className="mt-3 text-sm text-st-due">
-              {error}
-            </p>
-          )}
-
-          <div className="mt-5 flex justify-end gap-2">
+        title={`Remove ${files}?`}
+        footer={
+          <>
             <Button variant="tertiary" onClick={() => setOpen(false)} disabled={busy}>
               Cancel
             </Button>
             <Button variant="primary" onClick={() => void run()} disabled={busy}>
               {busy ? "Deleting…" : `Delete ${files}`}
             </Button>
-          </div>
-        </div>
-      </Modal>
+          </>
+        }
+      >
+        <p className="mt-2 text-sm leading-relaxed text-ink3">
+          These were left in your vault when you deleted the documents they belonged to. PM no
+          longer has any record of them, so it can only show you the file names.
+        </p>
+
+        <ul className="mt-3 max-h-56 overflow-y-auto rounded border border-border bg-surface p-2 font-mono text-xs text-ink3">
+          {plan.orphans.map((path) => (
+            <li key={path} className="truncate py-0.5">
+              {path}
+            </li>
+          ))}
+        </ul>
+
+        <p className="mt-3 text-sm leading-relaxed text-ink2">
+          <strong className="font-semibold text-ink">Back up your vault first.</strong> This
+          permanently deletes these files from disk. It cannot be undone from inside PM, and a
+          backup is the only way back.
+        </p>
+
+        <p className="mt-2 text-sm leading-relaxed text-ink4">
+          PM will not touch anything still in use: your documents, chats and photos, your settings,
+          or the encrypted files that hold your classifications.
+        </p>
+
+        {error && (
+          <p role="alert" className="mt-3 text-sm text-st-due">
+            {error}
+          </p>
+        )}
+      </Dialog>
     </>
   );
 }

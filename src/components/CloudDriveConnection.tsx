@@ -31,7 +31,7 @@ import type {
 } from "../lib/types";
 import { useDetachedSync } from "../lib/useDetachedSync";
 import { formatWhen } from "../lib/format";
-import { Button, Collapsible, ConfirmDialog, SectionInfo } from "./ui";
+import { Button, Callout, Collapsible, ConfirmDialog, SectionInfo } from "./ui";
 import { SyncProgress } from "./SyncProgress";
 import { SyncReport } from "./SyncReport";
 import { ConnectorItemRow } from "./ConnectorItemRow";
@@ -317,12 +317,10 @@ export function CloudDriveConnection({
                       // reason to revisit — so on the one visit where it IS on screen it has to read
                       // as something to act on. The same condition puts a dot on the Connectors tab
                       // and the sidebar's Settings row, so it can be found at all.
-                      <div
-                        className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-[var(--radius-sm)] border px-2.5 py-2"
-                        style={{
-                          borderColor: "color-mix(in oklab, var(--accent) 35%, transparent)",
-                          background: "color-mix(in oklab, var(--accent) 10%, transparent)",
-                        }}
+                      <Callout
+                        tone="info"
+                        body="ink"
+                        className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2"
                       >
                         <div className="min-w-0 flex-1">
                           <p className="text-xs font-medium text-ink2">
@@ -338,13 +336,14 @@ export function CloudDriveConnection({
                             the existing Drive grant (prompt=select_account → pick this email). */}
                         <Button
                           variant="secondary"
+                          size="sm"
                           onClick={connect}
                           disabled={anyBusy}
-                          className="shrink-0 text-xs"
+                          className="shrink-0"
                         >
                           Reconnect for Sheets
                         </Button>
-                      </div>
+                      </Callout>
                     )}
                   </ConnectorItemRow>
                   {/* Not gated on `state === "ok"`. Hiding the scope picker the moment a sync
@@ -408,7 +407,6 @@ export function CloudDriveConnection({
               variant={accounts.length === 0 ? "primary" : "secondary"}
               onClick={connect}
               disabled={busy != null}
-              className="disabled:opacity-40"
             >
               {busy === "connect"
                 ? `Waiting for ${meta.signInName}…`
@@ -436,12 +434,9 @@ export function CloudDriveConnection({
       )}
 
       {error && (
-        <p
-          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="mt-2">
           {error}
-        </p>
+        </Callout>
       )}
 
       {/* The connector's standing explanation, folded at the foot so the account list and the

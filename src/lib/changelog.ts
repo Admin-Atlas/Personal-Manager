@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.2-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Forgetting your backup passphrase now asks first, and says what it costs. It was a single click that could not be undone — PM keeps no other copy, so every backup you already have becomes permanently unreadable — and it quietly switched automatic backups off at the same time without telling you. Disconnecting a backup destination now asks too, the way every other connector already did.",
+      "Every notice and warning in PM now speaks with one voice, and all of them are announced to screen readers. Around forty-five of them had been written by hand, one at a time, which is why the same kind of warning came in five slightly different shades — and why most of them said nothing at all when something failed.",
+      'Every dialog now has a name a screen reader can read out; twelve of them had none, so they announced as just "dialog". Settings and the command palette are now proper dialogs too, which means Escape closes them from anywhere rather than only while the search box has focus, and your place on the page is restored when they close.',
+      "Buttons across the app now use one set of sizes. Many small buttons had been asking to be small and silently rendering at full size, so a number of toolbars and rows are a little tighter and more consistent than before.",
+      "Settings labels are now properly attached to the controls they name, and a few switches were announcing different words than the ones printed beside them.",
+    ],
+  },
+  {
     version: "3.114.1-alpha",
     date: "2026-08-01",
     highlights: [

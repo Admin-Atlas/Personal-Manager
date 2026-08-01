@@ -58,18 +58,15 @@ export function ConnectorItemRow({
           <p className="mt-0.5 truncate text-xs text-ink4">{meta}</p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <Button
-            onClick={onSync}
-            disabled={syncDisabled}
-            className="px-2 py-1 text-xs disabled:opacity-40"
-          >
+          <Button size="sm" onClick={onSync} disabled={syncDisabled}>
             {syncingThis ? "Syncing…" : queued ? "Queued" : "Sync now"}
           </Button>
           <Button
             variant="tertiary"
+            size="sm"
             onClick={onAction}
             disabled={actionDisabled}
-            className="px-2 py-1 text-xs hover:text-st-due"
+            className="hover:text-st-due"
           >
             {actionLabel}
           </Button>

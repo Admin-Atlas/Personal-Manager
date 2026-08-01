@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   getSettings,
   hasOpenRouterKey,
@@ -36,7 +36,18 @@ import { deviceTimeZone, scrollBehavior } from "../theme";
 import { SETTINGS_GROUPS, sectionsFor, type SettingsTab } from "./settings/registry";
 import { useSettingsPending } from "../lib/settingsPending";
 import { SavedTick } from "./settings/SavedTick";
-import { Button, cn, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl } from "./ui";
+import {
+  Button,
+  Callout,
+  cn,
+  Collapsible,
+  ConfirmDialog,
+  Input,
+  Modal,
+  NavItem,
+  SectionLabel,
+  SegmentedControl,
+} from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -64,6 +75,10 @@ export function SettingsView({
   sheetsNudge,
   onBetterFitChange,
 }: Props) {
+  // The window's own heading, wired to the dialog through `labelledBy` so a screen reader announces
+  // "Settings, dialog" instead of a bare "dialog". Minted above the onboarding early return because
+  // hooks cannot be conditional; onboarding is not a dialog and never reads it.
+  const titleId = useId();
   const [key, setKey] = useState("");
   // First-run AI-provider choice (#295): a cloud key, or a local model on this device. The local
   // pane reports readiness (an endpoint + a chat model configured) up through `localReady`.
@@ -311,9 +326,7 @@ export function SettingsView({
           </p>
 
           <div className="mt-5 border-t border-border pt-4">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              AI provider
-            </label>
+            <SectionLabel>AI provider</SectionLabel>
             <p className="mt-1 text-xs leading-relaxed text-ink4">
               PM needs an AI model to power chat and the behind-the-scenes work. Use a cloud
               provider through OpenRouter, or run a model on this device — you can also set this up
@@ -321,6 +334,7 @@ export function SettingsView({
             </p>
             <div className="mt-3">
               <SegmentedControl
+                ariaLabel="AI provider"
                 value={aiMode}
                 onChange={setAiMode}
                 options={[
@@ -393,9 +407,7 @@ export function SettingsView({
 
           {joinedVault ? (
             <div className="mt-5 border-t border-border pt-4">
-              <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                Your vault
-              </label>
+              <SectionLabel>Your vault</SectionLabel>
               <p className="mt-1 text-xs text-ink4">
                 You're connected to the shared vault — its documents, chats, and projects are
                 already here, and its search language travels with it.
@@ -414,9 +426,7 @@ export function SettingsView({
             </div>
           ) : (
             <div className="mt-5 border-t border-border pt-4">
-              <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                Your vault
-              </label>
+              <SectionLabel>Your vault</SectionLabel>
               <p className="mt-1 text-xs text-ink4">
                 Your documents and notes live in one encrypted store on this device — the key stays
                 in this device's keychain, so there's nothing to remember.
@@ -431,15 +441,14 @@ export function SettingsView({
 
           {!joinedVault && langOpts && langOpts.options.length > 1 && (
             <div className="mt-5 border-t border-border pt-4">
-              <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                Search language
-              </label>
+              <SectionLabel>Search language</SectionLabel>
               <p className="mt-1 text-xs text-ink4">
                 How your library is searched. Pick the one that matches your content — not basic vs
                 advanced, just which fits.
               </p>
               <div className="mt-3">
                 <SegmentedControl
+                  ariaLabel="Search language"
                   value={embedderId}
                   onChange={setEmbedderId}
                   options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
@@ -464,12 +473,9 @@ export function SettingsView({
           )}
 
           {error && (
-            <p
-              className="mt-3 rounded-[var(--radius)] px-3 py-2 text-sm text-st-due"
-              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-            >
+            <Callout as="p" size="md" className="mt-3">
               {error}
-            </p>
+            </Callout>
           )}
 
           <div className="mt-6 flex items-center justify-between gap-2">
@@ -495,176 +501,179 @@ export function SettingsView({
 
   // ── Settings: a left-rail, tabbed surface. State + Save are shared across all tabs. ──────────
   return (
-    // Clicking the backdrop closes Settings, through the same guard as Done. mouseDOWN, not click:
-    // a click fires on the element the pointer is released over, so releasing outside after
-    // starting a text selection or a slider drag INSIDE the panel would otherwise close the window
-    // mid-gesture. The target check keeps it to the backdrop itself, never a click that merely
-    // bubbled up from the panel.
-    <div
-      className="flex h-full items-center justify-center p-6"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) requestClose();
-      }}
+    // Settings is a dialog, and now says so. It was a hand-rolled panel with NO `role="dialog"`, no
+    // accessible name, no focus trap, no focus restore and — the one users could feel — no Escape at
+    // all, sitting under a scrim App.tsx supplied a level up. `Modal` brings all of that, and its
+    // scrim-mousedown guard is the same `e.target === e.currentTarget` check this hand-rolled one
+    // used (mouseDOWN, not click, so releasing outside after a text selection or a slider drag that
+    // STARTED inside can't close the window mid-gesture).
+    //
+    // The matching deletion is App.tsx's own scrim wrapper: Modal brings its own, and two would
+    // double-darken. What stays there is `SettingsPendingProvider`, which is not a dialog concern.
+    <Modal
+      open
+      onClose={requestClose}
+      widthClassName="max-w-3xl"
+      heightClassName="max-h-[90vh]"
+      // The rail and the content pane each scroll; the window itself must not.
+      overflowClassName="overflow-hidden"
+      className="flex flex-col"
+      labelledBy={titleId}
     >
-      <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-[var(--radius)] border border-border bg-panel shadow-xl">
-        {/* The window header carries the title only. Its old subtitle ("your API key lives in the
-            OS keychain…") was AI-tab material shown on every tab; it now sits in that tab's
-            "About your API keys" disclosure, next to the keys it describes. */}
-        <div className="shrink-0 border-b border-border px-6 py-4">
-          <h1 className="font-head text-lg font-semibold text-ink">Settings</h1>
-        </div>
+      {/* The window header carries the title only. Its old subtitle ("your API key lives in the
+          OS keychain…") was AI-tab material shown on every tab; it now sits in that tab's
+          "About your API keys" disclosure, next to the keys it describes. */}
+      <div className="shrink-0 border-b border-border px-6 py-4">
+        <h1 id={titleId} className="font-head text-lg font-semibold text-ink">
+          Settings
+        </h1>
+      </div>
 
-        <div className="flex min-h-0 flex-1">
-          <nav className="w-52 shrink-0 overflow-y-auto border-r border-border p-3">
-            {SETTINGS_GROUPS.map((group, gi) => {
-              const headerId = group.header
-                ? `settings-group-${group.header.toLowerCase()}`
-                : undefined;
-              return (
-                <div
-                  key={group.header ?? "top"}
-                  className={gi > 0 ? "mt-4" : undefined}
-                  role={group.header ? "group" : undefined}
-                  aria-labelledby={headerId}
-                >
-                  {group.header && (
-                    <div
-                      id={headerId}
-                      className="px-3 pb-1 font-mono text-[0.625rem] font-medium uppercase tracking-wider text-ink4"
-                    >
-                      {group.header}
-                    </div>
-                  )}
-                  <div className="flex flex-col gap-0.5">
-                    {group.tabs.map((t) => {
-                      const active = tab === t.id;
-                      return (
-                        <div key={t.id}>
-                          <NavItem
-                            active={active}
-                            onClick={() => selectTab(t.id)}
-                            leading={<t.Icon className="h-4 w-4" />}
-                            trailing={
-                              // The same quiet dot the sidebar's Settings row carries (#437), so
-                              // following one leads to the other rather than to a dead end.
-                              betterFit && t.id === "localai" ? (
-                                <AttentionDot label="A better-fitting local model is available" />
-                              ) : sheetsNudge && t.id === "connectors" ? (
-                                <AttentionDot label="A Google account needs reconnecting to index Sheets" />
-                              ) : undefined
-                            }
-                          >
-                            {t.label}
-                          </NavItem>
-                          {/* The active tab's sub-nav: it animates open via the grid 0fr↔1fr trick and
+      <div className="flex min-h-0 flex-1">
+        <nav className="w-52 shrink-0 overflow-y-auto border-r border-border p-3">
+          {SETTINGS_GROUPS.map((group, gi) => {
+            const headerId = group.header
+              ? `settings-group-${group.header.toLowerCase()}`
+              : undefined;
+            return (
+              <div
+                key={group.header ?? "top"}
+                className={gi > 0 ? "mt-4" : undefined}
+                role={group.header ? "group" : undefined}
+                aria-labelledby={headerId}
+              >
+                {group.header && (
+                  <div
+                    id={headerId}
+                    className="px-3 pb-1 font-mono text-[0.625rem] font-medium uppercase tracking-wider text-ink4"
+                  >
+                    {group.header}
+                  </div>
+                )}
+                <div className="flex flex-col gap-0.5">
+                  {group.tabs.map((t) => {
+                    const active = tab === t.id;
+                    return (
+                      <div key={t.id}>
+                        <NavItem
+                          active={active}
+                          onClick={() => selectTab(t.id)}
+                          leading={<t.Icon className="h-4 w-4" />}
+                          trailing={
+                            // The same quiet dot the sidebar's Settings row carries (#437), so
+                            // following one leads to the other rather than to a dead end.
+                            betterFit && t.id === "localai" ? (
+                              <AttentionDot label="A better-fitting local model is available" />
+                            ) : sheetsNudge && t.id === "connectors" ? (
+                              <AttentionDot label="A Google account needs reconnecting to index Sheets" />
+                            ) : undefined
+                          }
+                        >
+                          {t.label}
+                        </NavItem>
+                        {/* The active tab's sub-nav: it animates open via the grid 0fr↔1fr trick and
                             is kept mounted-but-collapsed (and non-interactive) for the others, so
                             switching tabs slides smoothly. Tabs with no sections render nothing. */}
-                          {t.sections.length > 0 && (
-                            <div
-                              className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
-                              style={{ gridTemplateRows: active ? "1fr" : "0fr" }}
-                            >
-                              <div className="overflow-hidden">
-                                <div
-                                  className={cn(
-                                    "mt-0.5 flex flex-col gap-0.5 pb-1 pl-6",
-                                    !active && "pointer-events-none",
-                                  )}
-                                  aria-hidden={!active}
-                                >
-                                  {t.sections.map((s) => (
-                                    <button
-                                      key={s.id}
-                                      type="button"
-                                      tabIndex={active ? 0 : -1}
-                                      onClick={() => scrollToSection(s.id)}
-                                      className={cn(
-                                        "truncate border-l-2 py-1 pl-3 text-left text-xs transition-colors",
-                                        active && activeSectionId === s.id
-                                          ? "border-accent text-ink"
-                                          : "border-transparent text-ink4 hover:text-ink2",
-                                      )}
-                                    >
-                                      {s.label}
-                                    </button>
-                                  ))}
-                                </div>
+                        {t.sections.length > 0 && (
+                          <div
+                            className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
+                            style={{ gridTemplateRows: active ? "1fr" : "0fr" }}
+                          >
+                            <div className="overflow-hidden">
+                              <div
+                                className={cn(
+                                  "mt-0.5 flex flex-col gap-0.5 pb-1 pl-6",
+                                  !active && "pointer-events-none",
+                                )}
+                                aria-hidden={!active}
+                              >
+                                {t.sections.map((s) => (
+                                  <button
+                                    key={s.id}
+                                    type="button"
+                                    tabIndex={active ? 0 : -1}
+                                    onClick={() => scrollToSection(s.id)}
+                                    className={cn(
+                                      "truncate border-l-2 py-1 pl-3 text-left text-xs transition-colors",
+                                      active && activeSectionId === s.id
+                                        ? "border-accent text-ink"
+                                        : "border-transparent text-ink4 hover:text-ink2",
+                                    )}
+                                  >
+                                    {s.label}
+                                  </button>
+                                ))}
                               </div>
                             </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
-          </nav>
+              </div>
+            );
+          })}
+        </nav>
 
-          <div
-            ref={contentRef}
-            className="min-w-0 flex-1 overflow-y-auto px-6 py-4 [&>*:first-child]:mt-0 [&>*:first-child]:border-t-0 [&>*:first-child]:pt-0"
-          >
-            {tab === "general" && <GeneralSettings />}
+        <div
+          ref={contentRef}
+          className="min-w-0 flex-1 overflow-y-auto px-6 py-4 [&>*:first-child]:mt-0 [&>*:first-child]:border-t-0 [&>*:first-child]:pt-0"
+        >
+          {tab === "general" && <GeneralSettings />}
 
-            {tab === "accessibility" && <AccessibilitySettings />}
+          {tab === "accessibility" && <AccessibilitySettings />}
 
-            {tab === "ai" && (
-              <AiModelsSettings
-                onOpenTeach={onOpenTeach}
-                onOpenLocalAi={() => selectTab("localai")}
-              />
-            )}
-
-            {tab === "localai" && <LocalAiSettings onBetterFitChange={onBetterFitChange} />}
-
-            {tab === "search" && <SearchSettings />}
-
-            {tab === "connectors" && (
-              <>
-                <ConnectorsSettings
-                  indexingSpeed={indexingSpeed}
-                  onChangeIndexingSpeed={(s) => void changeIndexingSpeed(s)}
-                />
-              </>
-            )}
-
-            {tab === "data" && <DataSecuritySettings />}
-
-            {tab === "backup" && <BackupSettings />}
-
-            {tab === "storage" && (
-              <StorageSettings onNavigate={(t) => selectTab(t as SettingsTab)} />
-            )}
-
-            {tab === "developer" && <DeveloperSettings onOpenDev={onOpenDev} />}
-          </div>
-        </div>
-
-        <div className="shrink-0 border-t border-border px-6 py-4">
-          {error && (
-            <p
-              className="mb-3 rounded-[var(--radius)] px-3 py-2 text-sm text-st-due"
-              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-            >
-              {error}
-            </p>
+          {tab === "ai" && (
+            <AiModelsSettings
+              onOpenTeach={onOpenTeach}
+              onOpenLocalAi={() => selectTab("localai")}
+            />
           )}
-          {/* Save sits beside Done deliberately. Almost nothing here needs it — the tabs write on
+
+          {tab === "localai" && <LocalAiSettings onBetterFitChange={onBetterFitChange} />}
+
+          {tab === "search" && <SearchSettings />}
+
+          {tab === "connectors" && (
+            <>
+              <ConnectorsSettings
+                indexingSpeed={indexingSpeed}
+                onChangeIndexingSpeed={(s) => void changeIndexingSpeed(s)}
+              />
+            </>
+          )}
+
+          {tab === "data" && <DataSecuritySettings />}
+
+          {tab === "backup" && <BackupSettings />}
+
+          {tab === "storage" && <StorageSettings onNavigate={(t) => selectTab(t as SettingsTab)} />}
+
+          {tab === "developer" && <DeveloperSettings onOpenDev={onOpenDev} />}
+        </div>
+      </div>
+
+      <div className="shrink-0 border-t border-border px-6 py-4">
+        {error && (
+          <Callout as="p" size="md" className="mb-3">
+            {error}
+          </Callout>
+        )}
+        {/* Save sits beside Done deliberately. Almost nothing here needs it — the tabs write on
               change — but a settings window with no Save reads as a settings window that hasn't
               saved, and the button is also the one place a deferred draft (the backup schedule) can
               be committed without hunting for its own control. Pressing it always acknowledges,
               even with nothing to commit. */}
-          <div className="flex items-center justify-between gap-3">
-            <SavedTick pendingLabels={pending?.labelsForTab(tab) ?? []} savedAt={savedAt} />
-            <div className="flex shrink-0 items-center gap-2">
-              <Button variant="secondary" onClick={() => void saveNow()}>
-                Save
-              </Button>
-              <Button variant="primary" onClick={requestClose}>
-                Done
-              </Button>
-            </div>
+        <div className="flex items-center justify-between gap-3">
+          <SavedTick pendingLabels={pending?.labelsForTab(tab) ?? []} savedAt={savedAt} />
+          <div className="flex shrink-0 items-center gap-2">
+            <Button variant="secondary" onClick={() => void saveNow()}>
+              Save
+            </Button>
+            <Button variant="primary" onClick={requestClose}>
+              Done
+            </Button>
           </div>
         </div>
       </div>
@@ -672,7 +681,14 @@ export function SettingsView({
       {/* Two choices, not three, and Save is not one of them. The Save button is right there in the
           footer the dialog is covering, so offering "save and continue" here would duplicate it and
           make the destructive path the quiet one. Cancel puts you back on the tab with the draft
-          intact and the button in front of you. */}
+          intact and the button in front of you.
+
+          It renders INSIDE the Settings dialog, not beside it, and that placement is load-bearing:
+          `useDialogLayer`'s topmost rule is DOM containment, so a guard mounted as a SIBLING would
+          not shadow Settings and one Escape would dismiss the guard AND close the window — driving
+          straight through the check `requestClose` exists to make. Same for every other dialog a tab
+          opens (the per-tab reset confirmations, the re-index progress, the three remove-my-data
+          steps): they are all descendants of this one now. */}
       <ConfirmDialog
         open={leaveGuard !== null}
         title="This tab has changes you haven't saved"
@@ -694,7 +710,7 @@ export function SettingsView({
         </ul>
         <p className="mt-2">Stay here and press Save to keep them.</p>
       </ConfirmDialog>
-    </div>
+    </Modal>
   );
 }
 

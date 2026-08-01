@@ -24,7 +24,7 @@
 import { useEffect, useRef, useState } from "react";
 import { onIngestProgress, rebuildIndex } from "../lib/ipc";
 import type { IngestEvent } from "../lib/types";
-import { Button, Collapsible, Modal } from "./ui";
+import { Button, Collapsible, Dialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 
 interface Props {
@@ -139,64 +139,58 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
   const running = phase === "running";
 
   return (
-    <Modal open={open} onClose={running ? () => {} : onClose} widthClassName="max-w-md">
-      <div className="p-6">
-        <h2 className="font-head text-base font-semibold text-ink">
-          {title ?? "Re-indexing your vault"}
-        </h2>
-        {subtitle && <p className="mt-1 text-xs text-ink4">{subtitle}</p>}
+    <Dialog
+      open={open}
+      onClose={running ? () => {} : onClose}
+      widthClassName="max-w-md"
+      title={title ?? "Re-indexing your vault"}
+      subtitle={subtitle}
+      // `undefined`, not `false`: Dialog renders the footer row whenever it is given anything but
+      // null/undefined, and a `false` here would paint an empty `mt-5` gap while the rebuild runs.
+      footer={
+        running ? undefined : (
+          <Button variant="primary" onClick={onClose}>
+            {phase === "error" ? "Close" : "Done"}
+          </Button>
+        )
+      }
+    >
+      {running && (
+        <IngestProgress className="mt-4" label="Re-indexing" processed={processed} total={total} />
+      )}
+      {prep && <p className="mt-3 text-sm text-ink3">{prep}</p>}
 
-        {running && (
-          <IngestProgress
-            className="mt-4"
-            label="Re-indexing"
-            processed={processed}
-            total={total}
-          />
-        )}
-        {prep && <p className="mt-3 text-sm text-ink3">{prep}</p>}
+      {files.length > 0 && (
+        <div className="mt-3">
+          <Collapsible title="Files" meta={`${files.length}`} defaultOpen={false}>
+            <ul className="max-h-40 overflow-y-auto pt-1">
+              {files.map((name, i) => (
+                <li key={i} className="truncate px-1 py-0.5 text-xs text-ink3">
+                  {name}
+                </li>
+              ))}
+            </ul>
+          </Collapsible>
+        </div>
+      )}
 
-        {files.length > 0 && (
-          <div className="mt-3">
-            <Collapsible title="Files" meta={`${files.length}`} defaultOpen={false}>
-              <ul className="max-h-40 overflow-y-auto pt-1">
-                {files.map((name, i) => (
-                  <li key={i} className="truncate px-1 py-0.5 text-xs text-ink3">
-                    {name}
-                  </li>
-                ))}
-              </ul>
-            </Collapsible>
-          </div>
-        )}
-
-        {phase === "done" && failedCount === 0 && (
-          <p className="mt-4 text-sm text-[var(--st-quick)]">
-            Done — your library is re-indexed with the new search language.
-          </p>
-        )}
-        {phase === "done" && failedCount > 0 && (
-          <p className="mt-4 text-sm text-st-due">
-            Re-indexed, but {failedCount} item{failedCount === 1 ? "" : "s"} couldn&apos;t be
-            restored this time — they&apos;ll be picked up on the next sync or rebuild. Nothing was
-            removed.
-          </p>
-        )}
-        {phase === "error" && (
-          <p className="mt-4 text-sm text-st-due">
-            {error} You can try again once you&apos;re back online — your documents weren&apos;t
-            touched.
-          </p>
-        )}
-
-        {!running && (
-          <div className="mt-5 flex justify-end">
-            <Button variant="primary" onClick={onClose}>
-              {phase === "error" ? "Close" : "Done"}
-            </Button>
-          </div>
-        )}
-      </div>
-    </Modal>
+      {phase === "done" && failedCount === 0 && (
+        <p className="mt-4 text-sm text-[var(--st-quick)]">
+          Done — your library is re-indexed with the new search language.
+        </p>
+      )}
+      {phase === "done" && failedCount > 0 && (
+        <p className="mt-4 text-sm text-st-due">
+          Re-indexed, but {failedCount} item{failedCount === 1 ? "" : "s"} couldn&apos;t be restored
+          this time — they&apos;ll be picked up on the next sync or rebuild. Nothing was removed.
+        </p>
+      )}
+      {phase === "error" && (
+        <p className="mt-4 text-sm text-st-due">
+          {error} You can try again once you&apos;re back online — your documents weren&apos;t
+          touched.
+        </p>
+      )}
+    </Dialog>
   );
 }

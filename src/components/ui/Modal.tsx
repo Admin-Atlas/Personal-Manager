@@ -49,25 +49,35 @@ export interface ModalBaseProps {
   /** "center" (default) or "top" — a search palette hangs from the top of the window rather than
    *  sitting in the middle of it. */
   placement?: ModalPlacement;
+  /** Registry id for help mode. Lands as `data-help` on the DIALOG element, same as `SettingRow`.
+   *  It has to be the dialog itself and not a wrapper inside it: `HelpOverlay` resolves a hovered
+   *  element with `closest("[data-help]")`, but `.help-mode [data-help]:hover` also draws the
+   *  outline that TELLS you there is help here — and an element with no box of its own paints no
+   *  outline. The command palette is the one dialog in the tree with a registry entry. */
+  helpId?: string;
 }
 
-/** How the dialog gets its accessible name. A `role="dialog"` with neither is announced as just
- *  "dialog", which is what 12 of PM's 19 dialogs do today — including every remove / delete / merge
- *  confirmation, whose headings are sitting in the DOM one line below the `<Modal>`, unwired.
+/** How the dialog gets its accessible name — REQUIRED, as an either/or. A `role="dialog"` with
+ *  neither is announced as just "dialog", which is what 12 of PM's 19 dialogs did before this batch,
+ *  including every remove / delete / merge confirmation, whose headings were sitting in the DOM one
+ *  line below the `<Modal>`, unwired.
  *
  *  Prefer `labelledBy`, pointing at the heading already on screen, so the name cannot drift from
  *  the visible title (WCAG 2.5.3). `label` is the escape hatch for a dialog whose "title" is not a
- *  heading — PinboardView's folder board, whose title is an editable `<input>`.
+ *  heading — PinboardView's folder board, whose title is an editable `<input>`, is the only one in
+ *  the tree.
  *
- *  Both are optional ONLY until those 12 call sites are converted; the moment they are, this
- *  becomes `{ labelledBy: string } | { label: string }` and an unnamed dialog is a `tsc` failure
- *  rather than a silent `undefined`. `Dialog` already requires a `title` and mints the id itself, so
- *  anything going through the shell is named by construction, and `theme/designGuards.test.ts`
- *  holds the ratchet in the meantime: a NEW unnamed `<Modal>` fails the suite. */
-export interface ModalNameProps {
-  labelledBy?: string;
-  label?: string;
-}
+ *  This is a union, not two optionals, and that is the whole point of the batch: the NEXT unnamed
+ *  dialog is a `tsc` failure rather than an audit finding. Nearly nothing should reach for it
+ *  directly — `Dialog` requires a `title`, mints the id and wires `labelledBy` itself, so anything
+ *  going through the shell is named by construction.
+ *
+ *  The `?: never` arms make it exclusive, and are also what lets the implementation destructure
+ *  both names off a union type: a property TypeScript can see on every member is a property it will
+ *  let you read. Passing both would be meaningless anyway — `aria-labelledby` wins the accessible-
+ *  name computation outright, so an `aria-label` alongside it is dead text nobody hears. */
+export type ModalNameProps =
+  { labelledBy: string; label?: never } | { label: string; labelledBy?: never };
 
 export type ModalProps = ModalBaseProps & ModalNameProps;
 
@@ -81,6 +91,7 @@ export function Modal({
   style,
   className,
   placement = "center",
+  helpId,
   labelledBy,
   label,
 }: ModalProps) {
@@ -129,6 +140,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={labelledBy}
         aria-label={label}
+        data-help={helpId}
         tabIndex={-1}
         style={style}
         className={cn(

@@ -16,7 +16,7 @@ import { chatContextStatus, compressChat, revertCompress } from "../lib/ipc";
 import type { CompressResult, ContextStatus } from "../lib/types";
 import { useDepth } from "../theme/depth";
 import { Markdown } from "../lib/markdown";
-import { Button, Modal } from "./ui";
+import { Button, Dialog } from "./ui";
 import { Popover } from "./ui";
 
 interface Props {
@@ -246,33 +246,37 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
       </Popover>
 
       {/* HITL verify: compression is already applied; show what was condensed so the user can Undo. */}
-      <Modal open={preview != null} onClose={() => setPreview(null)} widthClassName="max-w-md">
-        <div className="p-5">
-          <h2 className="font-head text-base font-semibold text-ink">
-            Compressed — here&rsquo;s what was condensed
-          </h2>
-          <p className="mt-1 text-xs text-ink4">
+      <Dialog
+        open={preview != null}
+        onClose={() => setPreview(null)}
+        widthClassName="max-w-md"
+        title="Compressed — here’s what was condensed"
+        subtitle={
+          <>
             The older turns were folded into the running summary
             {preview && preview.reclaimed_est > 0
               ? `, reclaiming about ${formatTokens(preview.reclaimed_est)} tokens`
               : ""}
             . Your full conversation is still kept word-for-word in your vault.
-          </p>
-          {preview?.condensed_bullets && (
-            <div className="pm-inline-md mt-3 max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-border bg-panel p-3 text-sm text-ink2">
-              <Markdown>{preview.condensed_bullets}</Markdown>
-            </div>
-          )}
-          <div className="mt-5 flex justify-end gap-2">
+          </>
+        }
+        footer={
+          <>
             <Button variant="tertiary" onClick={handleUndo} disabled={reverting}>
               {reverting ? "Undoing…" : "Undo"}
             </Button>
             <Button variant="primary" onClick={() => setPreview(null)} disabled={reverting}>
               Keep
             </Button>
+          </>
+        }
+      >
+        {preview?.condensed_bullets && (
+          <div className="pm-inline-md mt-3 max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-border bg-panel p-3 text-sm text-ink2">
+            <Markdown>{preview.condensed_bullets}</Markdown>
           </div>
-        </div>
-      </Modal>
+        )}
+      </Dialog>
     </>
   );
 }

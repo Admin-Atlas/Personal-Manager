@@ -54,10 +54,15 @@ import type {
   RestoreSummary,
 } from "../lib/types";
 import { formatDateTime } from "../lib/format";
-import { isOpaquePhase, describeFailures } from "../lib/backup";
+import {
+  BACKUP_FREQUENCY_LABEL,
+  describeFailures,
+  describeForgetConsequences,
+  isOpaquePhase,
+} from "../lib/backup";
 import { readReconcileDismissed, writeReconcileDismissed } from "../lib/backupPrefs";
 import { useRegisterPending } from "../lib/settingsPending";
-import { Button, Input, SectionInfo, Select } from "./ui";
+import { Button, ConfirmDialog, Input, SectionInfo, SectionLabel, Select } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { IngestProgress } from "./IngestProgress";
 
@@ -68,13 +73,6 @@ const PHASE_LABEL: Record<BackupPhase, string> = {
   download: "Downloading",
   restore: "Decrypting & unpacking",
   validate: "Verifying",
-};
-
-const FREQ_LABEL: Record<BackupSchedule["frequency"], string> = {
-  off: "Off",
-  daily: "Daily",
-  weekly: "Weekly",
-  monthly: "Monthly",
 };
 
 export function BackupSettings() {
@@ -150,6 +148,12 @@ export function BackupSettings() {
     proton: null,
     gdrive: null,
   });
+
+  // The three one-way doors on this panel, each behind its own confirmation. Disconnect shares one
+  // piece of state across both destinations because only one of the two dialogs can ever be open;
+  // if that ever stops being true, split it rather than widening the union.
+  const [confirmForget, setConfirmForget] = useState(false);
+  const [confirmDisconnect, setConfirmDisconnect] = useState<"proton" | "gdrive" | null>(null);
 
   // This vault's archive-name prefix, so we can count only THIS vault's archives at a shared
   // destination for the "you have more backups than keep-last-N" reconciliation banner. Loaded once.
@@ -331,8 +335,19 @@ export function BackupSettings() {
   // exclusive in the UI — e.g. Disconnect must be disabled during an upload it would kill.
   const busy = running || protonBusy || gdriveBusy;
   const passphraseStored = schedule?.passphrase_stored ?? false;
+  // The cadence half of what "Forget" costs — null when there is no schedule to lose, so the
+  // confirmation never warns about losing something the user hasn't got.
+  const forgetConsequence = describeForgetConsequences(schedule?.frequency ?? "off");
   const protonConnected = !!(proton?.installed && conn?.connected);
   const gdriveGranted = !!gdrive?.has_write_scope;
+  // Whether the account set up for BACKUP is also connected as a read-only Drive source. It decides
+  // what disconnecting costs: the backend only deletes the keychain token when the account is not
+  // also a connector (`backup_gdrive_disconnect`), so one case keeps working and the other needs a
+  // fresh `drive.file` grant. Case-insensitive, matching the backend's `eq_ignore_ascii_case`.
+  const gdriveAccount = gdrive?.account ?? null;
+  const gdriveAlsoConnector =
+    gdriveAccount !== null &&
+    (gdrive?.accounts ?? []).some((a) => a.email.toLowerCase() === gdriveAccount.toLowerCase());
   const showStatus = !!schedule && (schedule.frequency !== "off" || !!schedule.last_backup_at);
   // The destinations a scheduled run would push to, for the status summary line.
   const enabledDestinations = [
@@ -398,6 +413,12 @@ export function BackupSettings() {
     try {
       await forgetBackupPassphrase();
       await refreshSchedule();
+      // Narrate the side effect, don't just warn about it beforehand. The command turns the cadence
+      // off as well as dropping the secret (deliberately — see `describeForgetConsequences`), and
+      // this used to say nothing at all on success: the only feedback was the panel mutating.
+      setMessage(
+        "Passphrase forgotten. Automatic backups are off; the backups you already have are unchanged.",
+      );
     } catch (e) {
       setScheduleSaveError(String(e));
     } finally {
@@ -802,7 +823,7 @@ export function BackupSettings() {
               <dd className="text-right">
                 {schedule.frequency === "off"
                   ? "Off"
-                  : `${FREQ_LABEL[schedule.frequency]} → ${
+                  : `${BACKUP_FREQUENCY_LABEL[schedule.frequency]} → ${
                       enabledDestinations.length ? enabledDestinations.join(", ") : "no destination"
                     }`}
               </dd>
@@ -905,9 +926,7 @@ export function BackupSettings() {
 
       {/* --- 1 · Backup passphrase --- */}
       <div className="mt-5">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Backup passphrase
-        </label>
+        <SectionLabel>Backup passphrase</SectionLabel>
         <p className="mt-1 text-xs text-ink4">
           This passphrase is the only thing that can unlock a backup later — there&rsquo;s no
           recovery if you lose it, so store it somewhere safe (a password manager).
@@ -937,7 +956,11 @@ export function BackupSettings() {
           {passphraseStored ? (
             <div className="flex items-center justify-between gap-2 text-xs">
               <span className="text-st-quick">Passphrase remembered on this device</span>
-              <Button variant="tertiary" onClick={doForgetPass} disabled={savingSchedule || busy}>
+              <Button
+                variant="tertiary"
+                onClick={() => setConfirmForget(true)}
+                disabled={savingSchedule || busy}
+              >
                 Forget
               </Button>
             </div>
@@ -968,9 +991,7 @@ export function BackupSettings() {
 
       {/* --- 2 · Save a backup now --- */}
       <div className="mt-6">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Save a backup now
-        </label>
+        <SectionLabel>Save a backup now</SectionLabel>
         <div className="mt-2 flex max-w-sm flex-col gap-2">
           <div className="flex flex-wrap gap-2">
             <Button variant="primary" onClick={doBackup} disabled={!backupValid}>
@@ -1010,9 +1031,7 @@ export function BackupSettings() {
 
       {/* --- Restore a backup --- */}
       <div className="mt-6">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Restore a backup
-        </label>
+        <SectionLabel>Restore a backup</SectionLabel>
         <div className="mt-2 flex max-w-sm flex-col gap-2">
           <div className="flex items-center gap-2">
             <Button variant="secondary" onClick={chooseRestoreFile} disabled={running}>
@@ -1057,9 +1076,7 @@ export function BackupSettings() {
 
       {/* --- Proton Drive (off-machine destination + automatic backups) --- */}
       <div className="mt-6">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Proton Drive
-        </label>
+        <SectionLabel>Proton Drive</SectionLabel>
         {proton === null ? (
           <p className="mt-2 text-xs text-ink4">Checking for the Proton Drive CLI&hellip;</p>
         ) : !proton.installed ? (
@@ -1113,7 +1130,11 @@ export function BackupSettings() {
                   </p>
                 )}
               </div>
-              <Button variant="tertiary" onClick={doProtonDisconnect} disabled={busy}>
+              <Button
+                variant="tertiary"
+                onClick={() => setConfirmDisconnect("proton")}
+                disabled={busy}
+              >
                 Disconnect
               </Button>
             </div>
@@ -1224,9 +1245,7 @@ export function BackupSettings() {
       {/* --- Google Drive (off-machine destination via the Drive API — already connected, so this
           only grants the one extra write permission and reflects status; no install flow) --- */}
       <div className="mt-6">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Google Drive
-        </label>
+        <SectionLabel>Google Drive</SectionLabel>
         {gdrive === null ? (
           <p className="mt-2 text-xs text-ink4">Checking your Google Drive connection&hellip;</p>
         ) : !gdriveGranted ? (
@@ -1281,7 +1300,11 @@ export function BackupSettings() {
                   </p>
                 )}
               </div>
-              <Button variant="tertiary" onClick={doGdriveDisconnect} disabled={busy}>
+              <Button
+                variant="tertiary"
+                onClick={() => setConfirmDisconnect("gdrive")}
+                disabled={busy}
+              >
                 Disconnect
               </Button>
             </div>
@@ -1392,9 +1415,7 @@ export function BackupSettings() {
 
       {/* --- Automatic backups — one schedule fans out to every destination you turn on --- */}
       <div className="mt-6 border-t border-border pt-4">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Automatic backups
-        </label>
+        <SectionLabel>Automatic backups</SectionLabel>
         {scheduleError ? (
           <div className="mt-2 flex items-center gap-2">
             <span className="text-xs text-st-due">Couldn&rsquo;t load the schedule.</span>
@@ -1521,6 +1542,104 @@ export function BackupSettings() {
           </p>
         </SectionInfo>
       </div>
+
+      {/* Forgetting the passphrase is the sharpest door on this panel and it was a single unguarded
+          click. The dialog names the two things that actually happen rather than asking "are you
+          sure": the archives may become unreadable, and the schedule is switched off. It does not
+          say "gone forever" — on macOS the keychain entry is still visible in Keychain Access, so
+          the true claim is that PM keeps no other copy and cannot show it to you. */}
+      <ConfirmDialog
+        open={confirmForget}
+        title="Forget the passphrase and turn off automatic backups?"
+        danger
+        confirmLabel="Forget passphrase"
+        onConfirm={() => {
+          // Close BEFORE awaiting: a keychain failure surfaces through `scheduleSaveError`, which
+          // renders outside this dialog, so awaiting first would strand the overlay over it.
+          setConfirmForget(false);
+          void doForgetPass();
+        }}
+        onClose={() => setConfirmForget(false)}
+      >
+        <p>
+          PM keeps no other copy of this passphrase and can&rsquo;t show it to you. If it
+          isn&rsquo;t written down somewhere else, every backup you&rsquo;ve already made — on this
+          computer, Proton Drive and Google Drive — becomes permanently unreadable.
+        </p>
+        {forgetConsequence && <p className="mt-2">{forgetConsequence}</p>}
+        <p className="mt-2">
+          Your app lock is a different secret — this doesn&rsquo;t affect getting into PM.
+        </p>
+      </ConfirmDialog>
+
+      {/* Disconnect, on the pattern every read connector already uses (CloudDriveConnection,
+          CalendarConnection, LocalFolderConnection, IcsFeedSubscription): what is KEPT first, what
+          stops second, and the per-destination caveat last. This panel was the only one in the app
+          holding a Disconnect with no confirmation at all. */}
+      <ConfirmDialog
+        open={confirmDisconnect !== null}
+        title={
+          confirmDisconnect === "gdrive"
+            ? "Disconnect Google Drive backups?"
+            : "Disconnect Proton Drive?"
+        }
+        danger
+        confirmLabel="Disconnect"
+        onConfirm={() => {
+          const which = confirmDisconnect;
+          setConfirmDisconnect(null);
+          if (which === "proton") void doProtonDisconnect();
+          else if (which === "gdrive") void doGdriveDisconnect();
+        }}
+        onClose={() => setConfirmDisconnect(null)}
+      >
+        {confirmDisconnect === "gdrive" ? (
+          <>
+            <p>
+              The backups already on your Google Drive are kept — nothing is deleted. PM stops
+              backing up there: scheduled runs and the trimming that keeps only your most recent
+              backups stop, and you can&rsquo;t restore from Drive until you grant access again.
+            </p>
+            {gdriveAlsoConnector ? (
+              <p className="mt-2">
+                This account is also connected as a read-only source, so its sign-in is kept and
+                that connector keeps working.
+              </p>
+            ) : (
+              // Hedged deliberately. Disconnect forgets PM's token WITHOUT revoking the grant at
+              // Google's end, so the old per-file authority may or may not survive a re-approval —
+              // PM's own Drive code assumes it does not (a 403 appNotAuthorizedToFile on archives
+              // an earlier grant uploaded). Neither over-promise nor stay silent about it.
+              <p className="mt-2">
+                PM&rsquo;s Drive sign-in for this account is deleted. Granting access again runs a
+                fresh approval, and Google&rsquo;s permission covers only the files the current
+                approval created — so PM may no longer be able to trim or replace the archives it
+                uploaded before. They stay in your Drive either way.
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <p>
+              The backups already on your Proton Drive are kept — nothing is deleted. PM stops
+              backing up there: scheduled runs and the trimming that keeps only your most recent
+              backups stop, and you can&rsquo;t restore from Proton until you sign in again.
+            </p>
+            {/* True at HEAD and worth saying: `proton_disconnect` does not clear
+                `backup_proton_enabled` (which defaults to true), so the schedule keeps advertising
+                a destination the scheduler will skip. Clearing the flag is a backend change and a
+                separate decision; telling the truth about it is not. */}
+            <p className="mt-2">
+              Automatic backups keep listing Proton Drive until you untick it under &ldquo;Automatic
+              backups&rdquo; — a scheduled run skips a destination it can&rsquo;t reach.
+            </p>
+            <p className="mt-2">
+              This signs the Proton Drive command-line tool out on this computer, so anything else
+              using it is signed out too.
+            </p>
+          </>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }

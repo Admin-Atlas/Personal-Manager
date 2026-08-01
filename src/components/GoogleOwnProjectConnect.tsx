@@ -3,7 +3,7 @@
 
 import { useState } from "react";
 import { connectDrive, connectGoogleCalendarAccount } from "../lib/ipc";
-import { Button, Input } from "./ui";
+import { Button, Callout, Input } from "./ui";
 
 /**
  * **Connect a Google account with its OWN Cloud project** — the Advanced-Protection path.
@@ -88,18 +88,10 @@ export function GoogleOwnProjectConnect({
           <Button
             onClick={submit}
             disabled={disabled || busy || !clientId.trim() || !clientSecret.trim()}
-            className="disabled:opacity-40"
           >
             {busy ? "Waiting for Google…" : "Connect with this project"}
           </Button>
-          {error && (
-            <p
-              className="rounded-[var(--radius)] px-2 py-1.5 text-xs text-st-due"
-              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-            >
-              {error}
-            </p>
-          )}
+          {error && <Callout as="p">{error}</Callout>}
         </div>
       )}
     </div>

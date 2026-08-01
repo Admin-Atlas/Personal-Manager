@@ -151,3 +151,39 @@ describe("useFocusTrap with a nested dialog", () => {
     expect(document.activeElement).toBe(getByTestId("inner-last"));
   });
 });
+
+// A dialog whose interactive children are deliberately NOT tab stops. The command palette is the
+// one in the tree: its result rows are `<button tabIndex={-1}>`, selected through
+// `aria-activedescendant` from the input rather than by tabbing.
+
+function ActivedescendantHarness() {
+  const ref = useRef<HTMLDivElement>(null);
+  useFocusTrap(true, ref);
+  return (
+    <div ref={ref} role="dialog" aria-modal="true" tabIndex={-1} data-testid="dialog">
+      <input data-testid="query" />
+      <button data-testid="row-1" tabIndex={-1}>
+        row 1
+      </button>
+      <button data-testid="row-2" tabIndex={-1}>
+        row 2
+      </button>
+    </div>
+  );
+}
+
+describe("useFocusTrap with tabindex=-1 children", () => {
+  it("counts only TAB-REACHABLE elements, so Tab cannot walk out of the dialog", () => {
+    // With `tabindex="-1"` elements counted as stops, the input was neither first nor last, the
+    // trap declined to act, and the browser's own Tab skipped every row and left the dialog — the
+    // exact escape that made the palette's Escape handler unreachable before it wore Modal.
+    const { getByTestId } = render(<ActivedescendantHarness />);
+    const query = getByTestId("query");
+    expect(document.activeElement).toBe(query);
+
+    fireEvent.keyDown(query, { key: "Tab" });
+    expect(document.activeElement).toBe(query);
+    fireEvent.keyDown(query, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(query);
+  });
+});

@@ -13,7 +13,7 @@ import {
 import type { CalendarOverview, EventKind, IcsFeedInfo } from "../lib/types";
 import { formatWhen } from "../lib/format";
 import { useBusyRun } from "../lib/useBusyRun";
-import { Button, ConfirmDialog, Input, Select } from "./ui";
+import { Button, Callout, ConfirmDialog, Input, Select } from "./ui";
 
 /**
  * The **zero-auth calendar subscription**: paste a calendar's private "secret address in iCal format".
@@ -189,9 +189,10 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
                 )}
                 <Button
                   variant="tertiary"
+                  size="sm"
                   onClick={() => setConfirm({ id: f.id, label: f.label })}
                   disabled={busy != null}
-                  className="shrink-0 px-2 py-0.5 text-xs hover:text-st-due"
+                  className="shrink-0 hover:text-st-due"
                 >
                   Remove
                 </Button>
@@ -215,11 +216,7 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
           onChange={(e) => setFeedUrl(e.target.value)}
           placeholder="Paste the calendar’s iCal/ICS URL (https://…)"
         />
-        <Button
-          onClick={addFeed}
-          disabled={busy != null || !feedUrl.trim()}
-          className="disabled:opacity-40"
-        >
+        <Button onClick={addFeed} disabled={busy != null || !feedUrl.trim()}>
           {busy === "add-feed" ? "Adding…" : "Add feed"}
         </Button>
       </div>
@@ -231,11 +228,7 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
               ? `Last synced ${formatWhen(overview.last_sync)} · ${overview.window_days} days ahead`
               : `Not synced yet · ${overview?.window_days ?? 21} days ahead`}
           </p>
-          <Button
-            onClick={sync}
-            disabled={busy != null}
-            className="px-2 py-1 text-xs disabled:opacity-40"
-          >
+          <Button size="sm" onClick={sync} disabled={busy != null}>
             {busy === "sync" ? "Syncing…" : "Sync now"}
           </Button>
         </div>
@@ -243,12 +236,9 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
 
       {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
       {error && (
-        <p
-          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="mt-2">
           {error}
-        </p>
+        </Callout>
       )}
 
       <ConfirmDialog

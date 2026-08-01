@@ -15,7 +15,7 @@ import { useSidebarSplit } from "../lib/useSidebarSplit";
 import { idleSince } from "../lib/chatSession";
 import type { ProjectChat } from "../lib/useProjectChat";
 import type { Document, LocalLlmStatus, Milestone } from "../lib/types";
-import { Button } from "./ui";
+import { Button, Callout } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { LinkedBadge, ProjectPicker, projectsOf } from "./ProjectPicker";
 import { MilestoneList } from "./MilestoneList";
@@ -492,16 +492,9 @@ export function ProjectView({
       <div className={`flex flex-1 overflow-hidden ${resizing ? "select-none" : ""}`}>
         <main className="flex min-w-0 flex-1 flex-col" data-help="project-chat">
           {chat.error && (
-            <div
-              className="border-b px-4 py-2 text-sm"
-              style={{
-                color: "var(--st-due)",
-                borderColor: "color-mix(in oklab, var(--st-due) 40%, transparent)",
-                background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-              }}
-            >
+            <Callout variant="strip" size="md">
               {chat.error}
-            </div>
+            </Callout>
           )}
           {chat.fallback && (
             <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
@@ -522,7 +515,7 @@ export function ProjectView({
             >
               <span>This conversation has been idle since {idleDate}. Start a new one?</span>
               <div className="flex shrink-0 items-center gap-3">
-                <Button variant="secondary" onClick={chat.newChat} className="px-2 py-1 text-xs">
+                <Button variant="secondary" size="sm" onClick={chat.newChat}>
                   New chat
                 </Button>
                 <button

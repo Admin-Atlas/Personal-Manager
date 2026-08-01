@@ -17,7 +17,7 @@ import { useState } from "react";
 import { acknowledgeDeletedSharedVault, repairVaultAccess } from "../lib/ipc";
 import type { DeletedVaultNotice as DeletedNotice, VaultStatus } from "../lib/types";
 import { formatDateOnly } from "../lib/format";
-import { Button, Modal } from "./ui";
+import { Button, Callout, Dialog } from "./ui";
 
 /** The admin fallback recipe for `path`, shown when in-app repair fails. `%USERNAME%`
  *  is expanded by the user's own shell, so the line is copyable as-is. */
@@ -167,12 +167,9 @@ export function DeletedVaultNotice({
         </p>
       </div>
       {error && (
-        <p
-          className="max-w-xs break-words rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="max-w-xs break-words">
           {error}
-        </p>
+        </Callout>
       )}
       <Button variant="primary" disabled={busy} onClick={() => void acknowledge()}>
         {busy ? "Switching…" : "Continue"}
@@ -198,26 +195,13 @@ export function DetachConfirm({
   const setAside = status?.has_set_aside_vault ?? false;
   const folder = status?.pointed_root;
   return (
-    <Modal
+    <Dialog
       open={open}
       onClose={onClose}
-      labelledBy="detach-confirm-title"
       widthClassName="max-w-md"
-    >
-      <div className="space-y-3 p-6">
-        <h1 id="detach-confirm-title" className="font-head text-lg font-semibold text-ink">
-          Switch to a vault on this account?
-        </h1>
-        <p className="text-sm text-ink2">
-          {setAside
-            ? "PM will switch back to the vault that was set aside on this account when you joined the shared one."
-            : "PM will start a new, empty vault on this account — the shared vault's contents won't be in it."}
-        </p>
-        <p className="text-xs text-ink4">
-          Nothing{folder ? ` in ${folder}` : " in the shared folder"} is deleted. You can rejoin it
-          any time from Settings → Vault with the passphrase.
-        </p>
-        <div className="flex justify-end gap-2 pt-1">
+      title="Switch to a vault on this account?"
+      footer={
+        <>
           <Button variant="tertiary" onClick={onClose}>
             Cancel
           </Button>
@@ -230,8 +214,18 @@ export function DetachConfirm({
           >
             Switch vault
           </Button>
-        </div>
-      </div>
-    </Modal>
+        </>
+      }
+    >
+      <p className="mt-2 text-sm text-ink2">
+        {setAside
+          ? "PM will switch back to the vault that was set aside on this account when you joined the shared one."
+          : "PM will start a new, empty vault on this account — the shared vault's contents won't be in it."}
+      </p>
+      <p className="mt-3 text-xs text-ink4">
+        Nothing{folder ? ` in ${folder}` : " in the shared folder"} is deleted. You can rejoin it
+        any time from Settings → Vault with the passphrase.
+      </p>
+    </Dialog>
   );
 }

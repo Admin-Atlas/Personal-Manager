@@ -11,7 +11,7 @@ import { useState } from "react";
 import { detachFromSharedVault, unlockVault, vaultFaultOf } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
 import { paddedPassphraseHint } from "../lib/vaultPassphrase";
-import { Button, Input, useFieldA11y } from "./ui";
+import { Button, Callout, Input, useFieldA11y } from "./ui";
 import { DetachConfirm, RepairAccessButton } from "./VaultRecovery";
 
 export function VaultUnlock({
@@ -128,14 +128,12 @@ export function VaultUnlock({
           disabled={busy}
           {...field.controlProps}
         />
+        {/* `live={false}` because `errorProps` is the authority here: it carries both the
+            `role="alert"` AND the id that the control's `aria-describedby` points at. */}
         {error && (
-          <p
-            {...field.errorProps}
-            className="rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
+          <Callout as="p" live={false} {...field.errorProps}>
             {error}
-          </p>
+          </Callout>
         )}
         <Button variant="primary" type="submit" disabled={busy || pass.trim().length === 0}>
           {busy ? "Unlocking…" : "Unlock"}

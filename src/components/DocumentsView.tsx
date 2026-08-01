@@ -1208,13 +1208,14 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                               <div className="flex justify-end gap-2 pt-1">
                                 <Button
                                   variant="tertiary"
+                                  size="sm"
                                   onClick={() => setEditingId(null)}
-                                  className="px-2 py-1 text-xs"
                                 >
                                   Cancel
                                 </Button>
                                 <Button
                                   variant="primary"
+                                  size="sm"
                                   onClick={() => void saveMeta(doc)}
                                   disabled={
                                     savingEdit ||
@@ -1227,7 +1228,6 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                                       projectsOf(doc).join("\u0000") &&
                                       editDraft.importance === doc.importance)
                                   }
-                                  className="px-2 py-1 text-xs"
                                 >
                                   {savingEdit ? "Saving…" : "Save"}
                                 </Button>

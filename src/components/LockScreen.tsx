@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { unlockApp } from "../lib/ipc";
-import { Button } from "./ui";
+import { Button, Callout } from "./ui";
 
 /** verifying = OS prompt up; canceled = user dismissed/failed (device can verify, just retry);
  *  error = the verifier couldn't run (offer the escape). */
@@ -80,12 +80,9 @@ export function LockScreen({ onUnlocked }: { onUnlocked: () => void }) {
       </div>
 
       {phase === "error" && detail && (
-        <p
-          className="max-w-xs rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="max-w-xs">
           {detail}
-        </p>
+        </Callout>
       )}
 
       <div className="flex flex-col items-center gap-2">

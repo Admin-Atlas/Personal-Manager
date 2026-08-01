@@ -72,3 +72,52 @@ describe("useRestoreFocus", () => {
     expect(document.activeElement).toBe(getByTestId("opener"));
   });
 });
+
+// A singleton panel that is re-POINTED at a new opener without closing in between — the calendar's
+// event popover, driven from selection state. Keyed re-capture is opt-in precisely because it is
+// wrong for Popover, where a re-render must never move "the opener" (the case above).
+function KeyedHarness({ openerKey }: { openerKey: string }) {
+  const restore = useRestoreFocus(true, openerKey);
+  return (
+    <>
+      <button data-testid="chip-a">A</button>
+      <button data-testid="chip-b">B</button>
+      <div data-testid="panel">
+        <button data-testid="close" onClick={restore}>
+          close
+        </button>
+      </div>
+    </>
+  );
+}
+
+// The harness renders the chips itself, so the very first mount can only ever capture <body> —
+// nothing is focused yet. Every case below therefore establishes its opener the way the real panel
+// does: focus a chip, then re-key.
+describe("useRestoreFocus — keyed to the opener", () => {
+  it("re-captures when the key changes, so the panel points at the CURRENT opener", () => {
+    const { getByTestId, rerender } = render(<KeyedHarness openerKey="0" />);
+    getByTestId("chip-a").focus();
+    rerender(<KeyedHarness openerKey="a" />);
+    // Opened from A, then re-pointed at B without ever closing.
+    getByTestId("chip-b").focus();
+    rerender(<KeyedHarness openerKey="b" />);
+
+    getByTestId("close").focus();
+    fireEvent.click(getByTestId("close"));
+    expect(document.activeElement).toBe(getByTestId("chip-b"));
+  });
+
+  it("does not re-capture on a re-render that keeps the same key", () => {
+    const { getByTestId, rerender } = render(<KeyedHarness openerKey="0" />);
+    getByTestId("chip-a").focus();
+    rerender(<KeyedHarness openerKey="a" />);
+    // A re-render while focus sits inside the panel must not re-point the opener at the panel's own
+    // button — the same latent bug the unkeyed case guards against.
+    getByTestId("close").focus();
+    rerender(<KeyedHarness openerKey="a" />);
+
+    fireEvent.click(getByTestId("close"));
+    expect(document.activeElement).toBe(getByTestId("chip-a"));
+  });
+});

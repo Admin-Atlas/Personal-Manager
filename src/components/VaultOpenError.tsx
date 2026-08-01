@@ -202,17 +202,9 @@ export function VaultOpenError({
               Cancel
             </Button>
             <Button
-              variant="primary"
+              variant="danger"
               disabled={resetting || confirmText !== RESET_PHRASE}
               onClick={() => void startFresh()}
-              style={
-                confirmText === RESET_PHRASE
-                  ? {
-                      background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                      color: "var(--st-due)",
-                    }
-                  : undefined
-              }
             >
               {resetting ? "Starting fresh…" : "Delete vault & start fresh"}
             </Button>

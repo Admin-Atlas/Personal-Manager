@@ -43,11 +43,11 @@ function RefreshButton({ busy, onRefresh }: { busy: boolean; onRefresh: () => vo
   return (
     <Button
       variant="tertiary"
+      size="sm"
       onClick={onRefresh}
       disabled={busy}
       title="Regenerate today's briefing from your current projects and calendar"
       aria-label={busy ? "Regenerating today's briefing" : "Regenerate today's briefing"}
-      className="flex items-center gap-1 px-2 py-0.5 text-xs"
     >
       <RefreshIcon spinning={busy} />
       <span>{busy ? "Refreshing…" : "Refresh"}</span>

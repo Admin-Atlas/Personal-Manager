@@ -14,6 +14,7 @@ import { createContext, useCallback, useContext, useEffect, useState, type React
 import type { Document } from "./types";
 import { getDocument, vaultStatus } from "./ipc";
 import { DocumentReader } from "../components/DocumentReader";
+import { Callout, TONE_MIX, TONE_TOKEN } from "../components/ui";
 
 interface ReaderState {
   /** The document the reader is currently showing, or null when closed. */
@@ -88,26 +89,30 @@ export function ReaderProvider({
       value={{ current, openReader, openReaderById, closeReader, missing, dismissMissing }}
     >
       {children}
+      {/* The one callout that overrides the tone surface, and the reason `Callout` lets the
+          caller's `style` win: this floats OVER page content, so its background is mixed into
+          `--bg` rather than `transparent` or the text behind it shows through. Everything else —
+          the border ratio, the tone, the live region — still comes from the primitive. */}
       {missing && (
-        <div
-          role="status"
-          className="fixed bottom-4 left-1/2 z-50 max-w-md -translate-x-1/2 rounded-[var(--radius)] border px-4 py-3 text-sm text-ink2 shadow-lg"
+        <Callout
+          tone="warning"
+          size="md"
+          body="ink"
+          live
+          className="fixed bottom-4 left-1/2 z-50 flex max-w-md -translate-x-1/2 items-start justify-between gap-3 text-ink2 shadow-lg"
           style={{
-            borderColor: "color-mix(in oklab, var(--st-look) 35%, transparent)",
-            background: "color-mix(in oklab, var(--st-look) 14%, var(--bg))",
+            background: `color-mix(in oklab, var(${TONE_TOKEN.warning}) ${TONE_MIX.surface}%, var(--bg))`,
           }}
         >
-          <div className="flex items-start justify-between gap-3">
-            <span>{missing}</span>
-            <button
-              onClick={dismissMissing}
-              aria-label="Dismiss"
-              className="shrink-0 text-ink4 hover:text-ink"
-            >
-              ×
-            </button>
-          </div>
-        </div>
+          <span>{missing}</span>
+          <button
+            onClick={dismissMissing}
+            aria-label="Dismiss"
+            className="shrink-0 text-ink4 hover:text-ink"
+          >
+            ×
+          </button>
+        </Callout>
       )}
       {current && (
         <DocumentReader

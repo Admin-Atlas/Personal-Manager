@@ -32,7 +32,7 @@ import {
 } from "../lib/ipc";
 import { findSimilarTags } from "../lib/tagSimilarity";
 import type { RetagScope, TagProposalRow, TagSummary } from "../lib/types";
-import { Button, Card, Input, Modal } from "./ui";
+import { Button, Card, Dialog, Input } from "./ui";
 
 export function TeachTags() {
   const [tags, setTags] = useState<TagSummary[]>([]);
@@ -353,16 +353,21 @@ export function TeachTags() {
       )}
 
       {/* Both confirmations name the scale, because both rewrite vault files with no undo. */}
-      <Modal open={deleting != null} onClose={() => (busy ? undefined : setDeleting(null))}>
+      {/* The body stays inside the `deleting &&` guard rather than being hoisted into the shell:
+          every line of it reads the row being removed, and `open` alone would not narrow it. */}
+      <Dialog
+        open={deleting != null}
+        onClose={() => (busy ? undefined : setDeleting(null))}
+        title="Remove this tag?"
+      >
         {deleting && (
-          <div className="p-5">
-            <h2 className="font-head text-base font-semibold text-ink">Remove this tag?</h2>
+          <>
             <p className="mt-2 text-sm leading-relaxed text-ink3">
               <span className="text-ink">{deleting.name}</span> comes off {deleting.documents}{" "}
               document{deleting.documents === 1 ? "" : "s"}, in your vault as well as here. Nothing
               else about them changes, and no files are deleted — but this can&apos;t be undone.
             </p>
-            <div className="mt-4 flex justify-end gap-2">
+            <div className="mt-5 flex justify-end gap-2">
               <Button variant="tertiary" onClick={() => setDeleting(null)} disabled={busy}>
                 Cancel
               </Button>
@@ -377,14 +382,17 @@ export function TeachTags() {
                 Remove it
               </Button>
             </div>
-          </div>
+          </>
         )}
-      </Modal>
+      </Dialog>
 
-      <Modal open={renaming != null} onClose={() => (busy ? undefined : setRenaming(null))}>
+      <Dialog
+        open={renaming != null}
+        onClose={() => (busy ? undefined : setRenaming(null))}
+        title="Rename this tag"
+      >
         {renaming && (
-          <div className="p-5">
-            <h2 className="font-head text-base font-semibold text-ink">Rename this tag</h2>
+          <>
             <p className="mt-2 text-sm leading-relaxed text-ink3">
               Changes <span className="text-ink">{renaming.from}</span> on every document that
               carries it. If the new name is already a tag, the two are folded into one.
@@ -396,7 +404,7 @@ export function TeachTags() {
               className="mt-3"
               autoFocus
             />
-            <div className="mt-4 flex justify-end gap-2">
+            <div className="mt-5 flex justify-end gap-2">
               <Button variant="tertiary" onClick={() => setRenaming(null)} disabled={busy}>
                 Cancel
               </Button>
@@ -413,9 +421,9 @@ export function TeachTags() {
                 Rename
               </Button>
             </div>
-          </div>
+          </>
         )}
-      </Modal>
+      </Dialog>
     </section>
   );
 }

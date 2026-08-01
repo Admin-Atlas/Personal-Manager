@@ -3,7 +3,7 @@
 
 import type { ChatFallback } from "../lib/types";
 import { shortModel } from "../lib/format";
-import { IconButton } from "./ui";
+import { Callout, IconButton } from "./ui";
 
 /**
  * Map the backend fallback slug (`ChatEvent::Fallback.reason`, e.g. `hard_failure:timeout` /
@@ -50,15 +50,7 @@ export function FallbackStrip({
   onDismiss: () => void;
 }) {
   return (
-    <div
-      role="status"
-      className="flex items-center gap-2 border-b px-4 py-2 text-sm"
-      style={{
-        color: "var(--st-look)",
-        borderColor: "color-mix(in oklab, var(--st-look) 40%, transparent)",
-        background: "color-mix(in oklab, var(--st-look) 12%, transparent)",
-      }}
-    >
+    <Callout tone="warning" variant="strip" size="md" live className="flex items-center gap-2">
       <span className="min-w-0 flex-1">
         This reply came from the cloud — {fallbackCopy(fallback.reason)}
         {fallback.to_model ? ` (via ${shortModel(fallback.to_model)})` : ""}.
@@ -66,6 +58,6 @@ export function FallbackStrip({
       <IconButton label="Dismiss" variant="subtle" onClick={onDismiss} className="shrink-0">
         ✕
       </IconButton>
-    </div>
+    </Callout>
   );
 }

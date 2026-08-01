@@ -17,7 +17,7 @@
 import { useState } from "react";
 import { deleteDocument } from "../lib/ipc";
 import type { Document } from "../lib/types";
-import { ConfirmDialog } from "./ui";
+import { Callout, ConfirmDialog } from "./ui";
 
 /** Which deletion this document gets.
  *
@@ -98,16 +98,9 @@ export function DeleteDocumentDialog({
         click through.
       </p>
       {error && (
-        <p
-          role="alert"
-          className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-          }}
-        >
+        <Callout as="p" size="md" className="mt-3">
           {error}
-        </p>
+        </Callout>
       )}
     </ConfirmDialog>
   );

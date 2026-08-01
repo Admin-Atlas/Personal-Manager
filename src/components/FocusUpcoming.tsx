@@ -207,6 +207,7 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
           Upcoming
         </h2>
         <SegmentedControl
+          ariaLabel="Upcoming view"
           value={mode}
           onChange={changeMode}
           options={[
@@ -255,6 +256,7 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
             </div>
             <div className="flex items-center gap-1.5">
               <SegmentedControl
+                ariaLabel="Days to show"
                 value={String(days)}
                 onChange={(v) => changeDays(Number(v))}
                 options={FOCUS_UPCOMING_DAY_CHOICES.map((n) => ({

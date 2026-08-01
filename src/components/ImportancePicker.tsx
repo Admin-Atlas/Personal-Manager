@@ -28,6 +28,7 @@ export function ImportancePicker({
 }) {
   return (
     <SegmentedControl
+      ariaLabel="Importance"
       options={IMPORTANCE_OPTIONS}
       value={value ?? ""}
       onChange={(key) => onChange(key as Importance)}

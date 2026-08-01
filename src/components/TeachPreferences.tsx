@@ -20,7 +20,17 @@ import type { Entity, Preference } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { DevRaw } from "./dev/DevRaw";
-import { Button, Card, ConfirmDialog, Input, Modal, Select, Skeleton, Textarea } from "./ui";
+import {
+  Button,
+  Callout,
+  Card,
+  ConfirmDialog,
+  Dialog,
+  Input,
+  Select,
+  Skeleton,
+  Textarea,
+} from "./ui";
 
 const SCOPE_GLOBAL = "global";
 const SCOPE_PROJECT = "project";
@@ -34,11 +44,6 @@ interface FormState {
 }
 
 const EMPTY_FORM: FormState = { scope: SCOPE_GLOBAL, entityId: null, condition: "", value: "" };
-
-const dangerBox = {
-  borderColor: "color-mix(in oklab, var(--st-due) 40%, transparent)",
-  background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-} as const;
 
 /** The Preferences section, rendered inside the Teach tab below the project list. `projects` is the
  *  Teach tab's already-loaded entity list, reused for the project picker (no extra query). */
@@ -130,12 +135,9 @@ export function TeachPreferences({ projects }: { projects: Entity[] }) {
       </div>
 
       {error && (
-        <div
-          className="mt-3 rounded-[var(--radius)] border px-3 py-2 text-sm text-st-due"
-          style={dangerBox}
-        >
+        <Callout size="md" className="mt-3">
           {error}
-        </div>
+        </Callout>
       )}
 
       {prefs.length === 0 ? (
@@ -345,117 +347,117 @@ function PreferenceModal({
   const incomplete = !form.value.trim() || (form.scope === SCOPE_PROJECT && form.entityId == null);
 
   return (
-    <Modal open onClose={busy ? () => {} : onCancel} widthClassName="max-w-lg">
-      <div className="p-5">
-        <h2 className="font-head text-base font-semibold text-ink">
-          {isEdit ? "Edit preference" : "Add a preference"}
-        </h2>
-
-        {!isEdit && (
-          <>
-            <div className="mt-4" data-help="teach-pref-nl">
-              <label className="block text-xs text-ink3">In your own words</label>
-              <div className="mt-1 flex gap-2">
-                <Input
-                  value={sentence}
-                  onChange={(e) => setSentence(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void parse();
-                    }
-                  }}
-                  placeholder="e.g. file invoices under Finances"
-                  className="flex-1"
-                  disabled={parsing}
-                />
-                <Button
-                  variant="secondary"
-                  onClick={() => void parse()}
-                  disabled={parsing || !sentence.trim()}
-                >
-                  {parsing ? "Reading…" : "Fill in"}
-                </Button>
-              </div>
-              {parseError && <p className="mt-1 text-xs text-st-due">{parseError}</p>}
-              <p className="mt-1 text-xs text-faint">
-                PM turns it into the fields below — check them before saving.
-              </p>
-            </div>
-            <div className="my-4 border-t border-rule" />
-          </>
-        )}
-
-        <div className="flex flex-col gap-3">
-          <div>
-            <label className="block text-xs text-ink3">Applies</label>
-            <Select
-              className="mt-1 w-full"
-              value={form.scope}
-              onChange={(e) => set({ scope: e.target.value })}
-            >
-              <option value={SCOPE_GLOBAL}>Everywhere</option>
-              <option value={SCOPE_PROJECT}>To one project</option>
-              <option value={SCOPE_CONTEXT}>In a situation</option>
-            </Select>
-          </div>
-
-          {form.scope === SCOPE_PROJECT && (
-            <div>
-              <label className="block text-xs text-ink3">Project</label>
-              <Select
-                className="mt-1 w-full"
-                value={form.entityId ?? ""}
-                onChange={(e) => set({ entityId: e.target.value ? Number(e.target.value) : null })}
-              >
-                <option value="">Choose a project…</option>
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.canonical_name}
-                  </option>
-                ))}
-              </Select>
-              {projects.length === 0 && (
-                <p className="mt-1 text-xs text-faint">
-                  No projects yet — file some documents first, or pick a different scope.
-                </p>
-              )}
-            </div>
-          )}
-
-          {form.scope === SCOPE_CONTEXT && (
-            <div>
-              <label className="block text-xs text-ink3">When</label>
-              <Input
-                className="mt-1 w-full"
-                value={form.condition}
-                onChange={(e) => set({ condition: e.target.value })}
-                placeholder="during work hours"
-              />
-            </div>
-          )}
-
-          <div>
-            <label className="block text-xs text-ink3">Preference</label>
-            <Textarea
-              className="mt-1"
-              rows={2}
-              value={form.value}
-              onChange={(e) => set({ value: e.target.value })}
-              placeholder="keep replies short and to the point"
-            />
-          </div>
-        </div>
-
-        <div className="mt-5 flex justify-end gap-2">
+    <Dialog
+      open
+      onClose={busy ? () => {} : onCancel}
+      widthClassName="max-w-lg"
+      title={isEdit ? "Edit preference" : "Add a preference"}
+      footer={
+        <>
           <Button variant="tertiary" onClick={onCancel} disabled={busy}>
             Cancel
           </Button>
           <Button variant="primary" onClick={() => onSave(form)} disabled={busy || incomplete}>
             {busy ? "Saving…" : isEdit ? "Save" : "Add preference"}
           </Button>
+        </>
+      }
+    >
+      {!isEdit && (
+        <>
+          <div className="mt-4" data-help="teach-pref-nl">
+            <label className="block text-xs text-ink3">In your own words</label>
+            <div className="mt-1 flex gap-2">
+              <Input
+                value={sentence}
+                onChange={(e) => setSentence(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void parse();
+                  }
+                }}
+                placeholder="e.g. file invoices under Finances"
+                className="flex-1"
+                disabled={parsing}
+              />
+              <Button
+                variant="secondary"
+                onClick={() => void parse()}
+                disabled={parsing || !sentence.trim()}
+              >
+                {parsing ? "Reading…" : "Fill in"}
+              </Button>
+            </div>
+            {parseError && <p className="mt-1 text-xs text-st-due">{parseError}</p>}
+            <p className="mt-1 text-xs text-faint">
+              PM turns it into the fields below — check them before saving.
+            </p>
+          </div>
+          <div className="my-4 border-t border-rule" />
+        </>
+      )}
+
+      <div className="flex flex-col gap-3">
+        <div>
+          <label className="block text-xs text-ink3">Applies</label>
+          <Select
+            className="mt-1 w-full"
+            value={form.scope}
+            onChange={(e) => set({ scope: e.target.value })}
+          >
+            <option value={SCOPE_GLOBAL}>Everywhere</option>
+            <option value={SCOPE_PROJECT}>To one project</option>
+            <option value={SCOPE_CONTEXT}>In a situation</option>
+          </Select>
+        </div>
+
+        {form.scope === SCOPE_PROJECT && (
+          <div>
+            <label className="block text-xs text-ink3">Project</label>
+            <Select
+              className="mt-1 w-full"
+              value={form.entityId ?? ""}
+              onChange={(e) => set({ entityId: e.target.value ? Number(e.target.value) : null })}
+            >
+              <option value="">Choose a project…</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.canonical_name}
+                </option>
+              ))}
+            </Select>
+            {projects.length === 0 && (
+              <p className="mt-1 text-xs text-faint">
+                No projects yet — file some documents first, or pick a different scope.
+              </p>
+            )}
+          </div>
+        )}
+
+        {form.scope === SCOPE_CONTEXT && (
+          <div>
+            <label className="block text-xs text-ink3">When</label>
+            <Input
+              className="mt-1 w-full"
+              value={form.condition}
+              onChange={(e) => set({ condition: e.target.value })}
+              placeholder="during work hours"
+            />
+          </div>
+        )}
+
+        <div>
+          <label className="block text-xs text-ink3">Preference</label>
+          <Textarea
+            className="mt-1"
+            rows={2}
+            value={form.value}
+            onChange={(e) => set({ value: e.target.value })}
+            placeholder="keep replies short and to the point"
+          />
         </div>
       </div>
-    </Modal>
+    </Dialog>
   );
 }

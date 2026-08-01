@@ -22,7 +22,16 @@ import {
 import type { CostSummary, Settings } from "../../lib/types";
 import { IngestProgress } from "../IngestProgress";
 import { ModelListEditor } from "../ModelListEditor";
-import { Button, Input, SectionInfo, Textarea, Toggle, VisuallyHidden } from "../ui";
+import {
+  Button,
+  Callout,
+  Input,
+  SectionInfo,
+  SectionLabel,
+  Textarea,
+  Toggle,
+  VisuallyHidden,
+} from "../ui";
 import { TabResetSection } from "./ResetControls";
 import { readReviewAiEnabled, writeReviewAiEnabled } from "../../lib/reviewPrefs";
 
@@ -250,18 +259,7 @@ export function AiModelsSettings({
 
   return (
     <>
-      {error && (
-        <div
-          className="mt-4 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            color: "var(--st-due)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-4">{error}</Callout>}
 
       <label
         id="sec-ai-keys"
@@ -366,9 +364,7 @@ export function AiModelsSettings({
       <div id="sec-ai-review" data-settings-section className="mt-5 border-t border-border pt-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Filing suggestions
-            </label>
+            <SectionLabel>Filing suggestions</SectionLabel>
             <p className="mt-1 text-xs text-ink4">
               Let PM propose a project, tags and importance for each new item in Review — a real
               help when you're importing a lot. Off by default; uses the background model above. You
@@ -384,12 +380,7 @@ export function AiModelsSettings({
       </div>
 
       <div id="sec-ai-memory" data-settings-section className="mt-5 border-t border-border pt-4">
-        <label
-          htmlFor="ai-memory-paste"
-          className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3"
-        >
-          Import AI memory
-        </label>
+        <SectionLabel htmlFor="ai-memory-paste">Import AI memory</SectionLabel>
         <p className="mt-1 text-xs text-ink4">
           Bringing preferences over from ChatGPT, Gemini or Claude? Copy the prompt below, run it in
           that AI, then paste its reply here. PM turns it into preference records you review and
@@ -399,7 +390,7 @@ export function AiModelsSettings({
         <div className="mt-3 rounded-[var(--radius-sm)] border border-border2 bg-surface p-2">
           <div className="flex items-start justify-between gap-2">
             <p className="min-w-0 flex-1 text-xs text-ink3">{IMPORT_PROMPT}</p>
-            <Button variant="tertiary" className="shrink-0 text-xs" onClick={copyPrompt}>
+            <Button variant="tertiary" size="sm" className="shrink-0" onClick={copyPrompt}>
               {promptCopied ? "Copied ✓" : "Copy"}
             </Button>
           </div>
@@ -464,19 +455,20 @@ export function AiModelsSettings({
           className="mt-5 border-t border-border pt-4"
           data-help="settings-usage-cost"
         >
-          <div className="flex items-center justify-between">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Usage &amp; cost
-            </label>
-            <Button
-              variant="tertiary"
-              onClick={refreshPrices}
-              disabled={refreshingPrices}
-              className="px-2 py-0.5 text-xs"
-            >
-              {refreshingPrices ? "Refreshing…" : "Refresh prices"}
-            </Button>
-          </div>
+          <SectionLabel
+            action={
+              <Button
+                variant="tertiary"
+                size="sm"
+                onClick={refreshPrices}
+                disabled={refreshingPrices}
+              >
+                {refreshingPrices ? "Refreshing…" : "Refresh prices"}
+              </Button>
+            }
+          >
+            Usage &amp; cost
+          </SectionLabel>
           {/* The "Spend & breakdown" Collapsible is gone: it hid your own numbers
               behind a caret (and unfolded them only for Power), while its `meta` slot
               leaked the 30d total back out to prove the point. The totals and the

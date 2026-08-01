@@ -12,7 +12,7 @@ import { useState } from "react";
 import { adoptSharedVault, vaultFaultOf } from "../lib/ipc";
 import type { SharedVaultAd } from "../lib/types";
 import { paddedPassphraseHint } from "../lib/vaultPassphrase";
-import { Button, Input } from "./ui";
+import { Button, Callout, Input } from "./ui";
 
 /** The join-failure story by classified fault code — a joiner-persona message for each
  *  distinct cause, so "the owner hasn't added you" is never read as "wrong passphrase"
@@ -151,14 +151,7 @@ export function VaultJoin({
           onChange={(e) => setPass(e.target.value)}
           disabled={busy}
         />
-        {error && (
-          <p
-            className="rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
-            {error}
-          </p>
-        )}
+        {error && <Callout as="p">{error}</Callout>}
         <Button variant="primary" type="submit" disabled={busy || pass.length === 0}>
           {busy ? "Joining…" : "Join this vault"}
         </Button>

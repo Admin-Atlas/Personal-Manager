@@ -13,7 +13,7 @@ import {
 import type { Document, Importance, MetadataProposal, ReviewDecision } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
-import { Button, Card, Input } from "./ui";
+import { Button, Callout, Card, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
@@ -606,15 +606,9 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-3xl px-6 py-6">
           {error && (
-            <div
-              className="mb-4 rounded-[var(--radius)] border px-3 py-2 text-sm text-st-due"
-              style={{
-                borderColor: "color-mix(in oklab, var(--st-due) 40%, transparent)",
-                background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-              }}
-            >
+            <Callout size="md" className="mb-4">
               {error}
-            </div>
+            </Callout>
           )}
 
           {/* Suggestions off (the fresh-install default): nudge to turn them on — a big help when
@@ -744,9 +738,10 @@ function ReviewRow({
           {doc.source_type === "chat" && <ChatBadge />}
           <Button
             variant="secondary"
+            size="sm"
             onClick={onApprove}
             disabled={disabled}
-            className="shrink-0 px-2 py-1 text-xs"
+            className="shrink-0"
             data-help="review-approve-one"
             title={
               awaiting

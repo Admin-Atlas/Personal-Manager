@@ -12,7 +12,7 @@
 // the primary action becomes "report it" rather than "retry" or "fix your setup".
 
 import { useEffect, useState } from "react";
-import { Button, Card, Collapsible, Modal } from "./ui";
+import { Button, Card, Collapsible, Dialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 import { useDepth } from "../theme";
 import type { SidecarStatus } from "../lib/types";
@@ -106,76 +106,18 @@ export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Pr
   const reportUrl = isPackagingBug ? buildReportUrl(rawMessage) : null;
 
   return (
-    <Modal
+    <Dialog
       open={open}
       onClose={onClose}
-      labelledBy="doc-engine-guide-title"
+      chrome="bar"
+      title={guide.title}
       widthClassName="max-w-xl"
-      className="flex max-h-[80vh] flex-col"
-    >
-      <div className="flex items-center justify-between border-b border-border px-6 py-4">
-        <h1 id="doc-engine-guide-title" className="font-head text-lg font-semibold text-ink">
-          {guide.title}
-        </h1>
-        <Button variant="tertiary" onClick={onClose}>
-          Close
-        </Button>
-      </div>
-
-      <div className="flex-1 overflow-y-auto px-6 py-4">
-        <p className="text-sm text-ink2">{guide.summary}</p>
-
-        <Card className="mt-4 p-4">
-          <ol className="space-y-3">
-            {guide.steps.map((step, i) => (
-              <li key={i} className="flex gap-3 text-sm text-ink2">
-                <span className="mt-0.5 select-none font-mono text-xs text-ink4">{i + 1}.</span>
-                <span>{withCode(step)}</span>
-              </li>
-            ))}
-          </ol>
-        </Card>
-
-        {showDownload && (
-          <IngestProgress
-            mode="percent"
-            processed={Math.round(downloadFrac * 100)}
-            total={100}
-            label="Downloading Python"
-            className="mt-4"
-          />
-        )}
-
-        {rawMessage && (
-          <div className="mt-4">
-            <Collapsible title="Technical details" defaultOpen={showPower}>
-              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
-                {rawMessage}
-              </pre>
-            </Collapsible>
-          </div>
-        )}
-
-        {isPackagingBug && showPower && (
-          <div className="mt-4">
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink4">
-              Diagnostic commands
-            </p>
-            <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
-              {[
-                "# list the bundled interpreter's files",
-                'Get-ChildItem -Recurse "$env:LOCALAPPDATA\\PM\\python" | Select FullName',
-                "",
-                "# confirm it can import its own standard library",
-                '& "$env:LOCALAPPDATA\\PM\\python\\python.exe" -c "import encodings, venv, ssl"',
-              ].join("\n")}
-            </pre>
-          </div>
-        )}
-      </div>
-
-      <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
-        {reportUrl ? (
+      // Through the height seam, not `className`: `cn()` is a plain joiner, so the old
+      // `max-h-[80vh]` sat alongside Modal's own `max-h-[85vh]` and stylesheet order picked the
+      // winner. The seam replaces the default outright — same fix WhatsNew took.
+      heightClassName="max-h-[80vh]"
+      footer={
+        reportUrl ? (
           <>
             <Button variant="tertiary" onClick={onRetry} disabled={busy}>
               {busy ? "Working…" : "Retry anyway"}
@@ -193,8 +135,58 @@ export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Pr
           <Button variant="primary" onClick={onRetry} disabled={busy}>
             {busy ? "Working…" : actionLabel}
           </Button>
-        )}
-      </div>
-    </Modal>
+        )
+      }
+    >
+      <p className="text-sm text-ink2">{guide.summary}</p>
+
+      <Card className="mt-4 p-4">
+        <ol className="space-y-3">
+          {guide.steps.map((step, i) => (
+            <li key={i} className="flex gap-3 text-sm text-ink2">
+              <span className="mt-0.5 select-none font-mono text-xs text-ink4">{i + 1}.</span>
+              <span>{withCode(step)}</span>
+            </li>
+          ))}
+        </ol>
+      </Card>
+
+      {showDownload && (
+        <IngestProgress
+          mode="percent"
+          processed={Math.round(downloadFrac * 100)}
+          total={100}
+          label="Downloading Python"
+          className="mt-4"
+        />
+      )}
+
+      {rawMessage && (
+        <div className="mt-4">
+          <Collapsible title="Technical details" defaultOpen={showPower}>
+            <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
+              {rawMessage}
+            </pre>
+          </Collapsible>
+        </div>
+      )}
+
+      {isPackagingBug && showPower && (
+        <div className="mt-4">
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink4">
+            Diagnostic commands
+          </p>
+          <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
+            {[
+              "# list the bundled interpreter's files",
+              'Get-ChildItem -Recurse "$env:LOCALAPPDATA\\PM\\python" | Select FullName',
+              "",
+              "# confirm it can import its own standard library",
+              '& "$env:LOCALAPPDATA\\PM\\python\\python.exe" -c "import encodings, venv, ssl"',
+            ].join("\n")}
+          </pre>
+        </div>
+      )}
+    </Dialog>
   );
 }

@@ -82,27 +82,28 @@ export function ModelListEditor({
             <div className="flex shrink-0 items-center">
               <Button
                 variant="tertiary"
+                size="xs"
                 onClick={() => move(i, -1)}
                 disabled={i === 0}
                 title="Move up"
-                className="px-1.5 py-0.5 disabled:opacity-30"
               >
                 ↑
               </Button>
               <Button
                 variant="tertiary"
+                size="xs"
                 onClick={() => move(i, 1)}
                 disabled={i === models.length - 1}
                 title="Move down"
-                className="px-1.5 py-0.5 disabled:opacity-30"
               >
                 ↓
               </Button>
               <Button
                 variant="tertiary"
+                size="xs"
                 onClick={() => remove(id)}
                 title="Remove"
-                className="px-1.5 py-0.5 hover:text-st-blocked"
+                className="hover:text-st-blocked"
               >
                 ×
               </Button>

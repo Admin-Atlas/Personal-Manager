@@ -35,7 +35,7 @@ import {
 import { formatBytes } from "../lib/format";
 import { beginTeardown } from "../lib/teardown";
 import type { WipeReport } from "../lib/types";
-import { Button, Input, Modal } from "./ui";
+import { Button, Callout, Dialog, Input } from "./ui";
 
 interface Props {
   /** Whether the OS can run a Windows Hello / Touch ID check (from app-lock status). When true, the
@@ -384,14 +384,11 @@ export function RemovePmData({ biometricAvailable }: Props) {
           </div>
 
           {vaultForcedByKeychain && (
-            <p
-              className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-              style={{ background: "color-mix(in oklab, var(--st-due) 12%, transparent)" }}
-            >
+            <Callout as="p" className="mt-2">
               Removing your saved keys also removes the vault &amp; database — the database&apos;s
               only key lives in the keychain, so the store can&apos;t be kept without it. Both are
               permanent.
-            </p>
+            </Callout>
           )}
 
           {/* Backups sit apart — PM won't delete them here on purpose. */}
@@ -426,269 +423,258 @@ export function RemovePmData({ biometricAvailable }: Props) {
       )}
 
       {/* Step 3 — "Are you sure?": itemise the selection + consequences. */}
-      <Modal
+      <Dialog
         open={stage === "confirm"}
         onClose={verifying ? () => {} : () => setStage("select")}
         widthClassName="max-w-md"
-      >
-        <div className="p-5">
-          <h2 className="font-head text-base font-semibold text-st-due">Remove this data?</h2>
-          <p className="mt-2 text-sm text-ink3">
-            You&apos;re about to remove the following from this machine:
-          </p>
-          <ul className="mt-3 space-y-2">
-            {selectedItems.map((item) => (
-              <li key={item.key} className="text-sm">
-                <span className={`font-medium ${item.danger ? "text-st-due" : "text-ink2"}`}>
-                  {item.label}
-                </span>
-                <span className="mt-0.5 block text-xs text-ink4">{item.consequence}</span>
-              </li>
-            ))}
-          </ul>
-          {vaultForcedByKeychain && (
-            <p className="mt-3 text-xs text-st-due">
-              Removing your saved keys removes the vault &amp; database along with them — the
-              database&apos;s only key is in the keychain, so it can&apos;t be kept.
-            </p>
-          )}
-          {sel.vaultAndDb && (
-            <p className="mt-3 text-xs font-medium text-st-due">
-              Your vault and database can&apos;t be recovered once removed. If you haven&apos;t
-              already backed them up, do that first.
-            </p>
-          )}
-          {(sel.vaultAndDb || sel.keychain) && (
-            <p className="mt-3 text-xs text-ink4">
-              This can&apos;t be undone, and PM will close afterwards.
-            </p>
-          )}
-          {error && <p className="mt-3 text-xs text-st-due">{error}</p>}
-          <div className="mt-5 flex justify-end gap-2">
+        tone="danger"
+        title="Remove this data?"
+        footer={
+          <>
             <Button variant="tertiary" onClick={() => setStage("select")} disabled={verifying}>
               Back
             </Button>
-            <Button
-              variant="primary"
-              onClick={() => void proceedFromConfirm()}
-              disabled={verifying}
-              style={{
-                background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                color: "var(--st-due)",
-              }}
-            >
+            <Button variant="danger" onClick={() => void proceedFromConfirm()} disabled={verifying}>
               {verifying ? "Verifying…" : "Continue to deletion"}
             </Button>
-          </div>
-        </div>
-      </Modal>
+          </>
+        }
+      >
+        <p className="mt-2 text-sm text-ink3">
+          You&apos;re about to remove the following from this machine:
+        </p>
+        <ul className="mt-3 space-y-2">
+          {selectedItems.map((item) => (
+            <li key={item.key} className="text-sm">
+              <span className={`font-medium ${item.danger ? "text-st-due" : "text-ink2"}`}>
+                {item.label}
+              </span>
+              <span className="mt-0.5 block text-xs text-ink4">{item.consequence}</span>
+            </li>
+          ))}
+        </ul>
+        {vaultForcedByKeychain && (
+          <p className="mt-3 text-xs text-st-due">
+            Removing your saved keys removes the vault &amp; database along with them — the
+            database&apos;s only key is in the keychain, so it can&apos;t be kept.
+          </p>
+        )}
+        {sel.vaultAndDb && (
+          <p className="mt-3 text-xs font-medium text-st-due">
+            Your vault and database can&apos;t be recovered once removed. If you haven&apos;t
+            already backed them up, do that first.
+          </p>
+        )}
+        {(sel.vaultAndDb || sel.keychain) && (
+          <p className="mt-3 text-xs text-ink4">
+            This can&apos;t be undone, and PM will close afterwards.
+          </p>
+        )}
+        {error && <p className="mt-3 text-xs text-st-due">{error}</p>}
+      </Dialog>
 
       {/* Step 5 — type-to-confirm. */}
-      <Modal open={stage === "type"} onClose={() => setStage("select")} widthClassName="max-w-md">
-        <div className="p-5">
-          <h2 className="font-head text-base font-semibold text-st-due">Final confirmation</h2>
-          <p className="mt-2 text-sm text-ink3">
-            Type <span className="font-mono font-medium text-ink2">{CONFIRM_PHRASE}</span> to
-            confirm you want to permanently remove the selected data.
-          </p>
-          <Input
-            value={confirmText}
-            onChange={(e) => setConfirmText(e.target.value)}
-            placeholder={CONFIRM_PHRASE}
-            autoFocus
-            autoComplete="off"
-            className="mt-3"
-          />
-          {error && <p className="mt-3 text-xs text-st-due">{error}</p>}
-          <div className="mt-5 flex justify-end gap-2">
+      <Dialog
+        open={stage === "type"}
+        onClose={() => setStage("select")}
+        widthClassName="max-w-md"
+        tone="danger"
+        title="Final confirmation"
+        footer={
+          <>
             <Button variant="tertiary" onClick={() => setStage("select")}>
               Cancel
             </Button>
             <Button
-              variant="primary"
+              variant="danger"
               disabled={confirmText !== CONFIRM_PHRASE}
               onClick={() => void runWipe()}
-              style={
-                confirmText === CONFIRM_PHRASE
-                  ? {
-                      background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                      color: "var(--st-due)",
-                    }
-                  : undefined
-              }
             >
               Delete PM data
             </Button>
-          </div>
-        </div>
-      </Modal>
+          </>
+        }
+      >
+        <p className="mt-2 text-sm text-ink3">
+          Type <span className="font-mono font-medium text-ink2">{CONFIRM_PHRASE}</span> to confirm
+          you want to permanently remove the selected data.
+        </p>
+        <Input
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder={CONFIRM_PHRASE}
+          autoFocus
+          autoComplete="off"
+          className="mt-3"
+        />
+        {error && <p className="mt-3 text-xs text-st-due">{error}</p>}
+      </Dialog>
 
       {/* Working / done. */}
-      <Modal
+      <Dialog
         open={stage === "working" || stage === "done"}
+        // Deliberately undismissable, and safe to leave that way: the card chrome paints no Close
+        // button of its own, so the shell adds no exit this step exists to withhold.
         onClose={() => {}}
         widthClassName="max-w-md"
+        title={
+          stage === "working"
+            ? "Removing…"
+            : report?.fullPurge
+              ? macFinish || manualFinish
+                ? // Nothing further runs on its own here — the app bundle is the user's to
+                  // remove — so don't claim an in-progress removal that isn't happening.
+                  "PM removed from this machine"
+                : "Removing PM from this machine…"
+              : "PM data removed"
+        }
+        footer={
+          stage === "done" ? (
+            macFinish ? (
+              <>
+                <Button variant="secondary" onClick={() => void revealApp()}>
+                  Show PM in Finder
+                </Button>
+                <Button variant="primary" onClick={() => void quitApp()}>
+                  Close PM
+                </Button>
+              </>
+            ) : manualFinish ? (
+              <Button variant="primary" onClick={() => void quitApp()}>
+                Close PM
+              </Button>
+            ) : report?.fullPurge ? (
+              <Button
+                variant="primary"
+                onClick={() => void (uninstallHint ? quitApp() : finishUninstall())}
+              >
+                {uninstallHint ? "Close PM" : "Finish uninstall"}
+              </Button>
+            ) : report?.quitRequired ? (
+              <Button variant="primary" onClick={() => void quitApp()}>
+                Close PM
+              </Button>
+            ) : sel.localStorage ? (
+              <Button variant="primary" onClick={() => window.location.reload()}>
+                Reload
+              </Button>
+            ) : (
+              <Button variant="primary" onClick={reset}>
+                Done
+              </Button>
+            )
+          ) : undefined
+        }
       >
-        <div className="p-5">
-          {stage === "working" ? (
-            <>
-              <h2 className="font-head text-base font-semibold text-ink">Removing…</h2>
-              <p className="mt-2 text-sm text-ink3">
-                Clearing the selected data{sel.keychain ? " and revoking access" : ""}. This can
-                take a moment.
-              </p>
-            </>
-          ) : (
-            <>
-              <h2 className="font-head text-base font-semibold text-ink">
-                {report?.fullPurge
-                  ? macFinish || manualFinish
-                    ? // Nothing further runs on its own here — the app bundle is the user's to
-                      // remove — so don't claim an in-progress removal that isn't happening.
-                      "PM removed from this machine"
-                    : "Removing PM from this machine…"
-                  : "PM data removed"}
-              </h2>
-              <ul className="mt-3 space-y-1 text-sm text-ink3">
-                {(report?.removed ?? []).map((r) => (
-                  <li key={r}>• {r}</li>
-                ))}
-                {/* The backend lists this itself once it has removed the OS-level store behind the
+        {stage === "working" ? (
+          <p className="mt-2 text-sm text-ink3">
+            Clearing the selected data{sel.keychain ? " and revoking access" : ""}. This can take a
+            moment.
+          </p>
+        ) : (
+          <>
+            <ul className="mt-3 space-y-1 text-sm text-ink3">
+              {(report?.removed ?? []).map((r) => (
+                <li key={r}>• {r}</li>
+              ))}
+              {/* The backend lists this itself once it has removed the OS-level store behind the
                     webview (macOS). Only fill in where it didn't, so it's never listed twice. */}
-                {sel.localStorage && !report?.osLeftoversRemoved && <li>• App preferences</li>}
-              </ul>
-              {report && (
-                <div className="mt-3 space-y-1 text-xs text-ink4">
-                  {report.freedBytes > 0 && <p>Freed about {formatBytes(report.freedBytes)}.</p>}
-                  {report.keychainDeleted > 0 && (
-                    <p>{report.keychainDeleted} saved key(s) removed from the keychain.</p>
-                  )}
-                  {report.googleRevoked > 0 && (
-                    <p>
-                      {report.googleRevoked} Google sign-in(s) revoked
-                      {report.googleRevokeFailures > 0
-                        ? ` (${report.googleRevokeFailures} couldn't be reached, but were removed locally)`
-                        : ""}
-                      .
-                    </p>
-                  )}
-                  {report.microsoftAccounts.length > 0 && (
-                    <p className="text-st-due">
-                      Finish removing PM&apos;s access to {report.microsoftAccounts.join(", ")} at{" "}
-                      <a
-                        href={MICROSOFT_APPS_URL}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="underline hover:brightness-110"
-                      >
-                        account.live.com
-                      </a>
-                      .
-                    </p>
-                  )}
-                </div>
-              )}
-              {/* Anything PM knows about and left, with the path spelled out. Deliberately above
-                  the "your data is gone" lines below, because when this list is non-empty those
-                  lines are only true of the folders PM owns. */}
-              {(report?.couldNotRemove.length ?? 0) > 0 && (
-                <div className="mt-3 rounded-[var(--radius-sm)] border border-st-due p-3">
-                  <p className="text-xs font-medium text-st-due">
-                    PM did not remove these &mdash; they are yours to delete
+              {sel.localStorage && !report?.osLeftoversRemoved && <li>• App preferences</li>}
+            </ul>
+            {report && (
+              <div className="mt-3 space-y-1 text-xs text-ink4">
+                {report.freedBytes > 0 && <p>Freed about {formatBytes(report.freedBytes)}.</p>}
+                {report.keychainDeleted > 0 && (
+                  <p>{report.keychainDeleted} saved key(s) removed from the keychain.</p>
+                )}
+                {report.googleRevoked > 0 && (
+                  <p>
+                    {report.googleRevoked} Google sign-in(s) revoked
+                    {report.googleRevokeFailures > 0
+                      ? ` (${report.googleRevokeFailures} couldn't be reached, but were removed locally)`
+                      : ""}
+                    .
                   </p>
-                  <ul className="mt-2 space-y-2">
-                    {report?.couldNotRemove.map((l) => (
-                      <li key={l.path} className="text-xs text-ink3">
-                        <span className="block break-all font-medium text-ink2">{l.path}</span>
-                        <span className="text-ink4">{l.reason}.</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {report?.fullPurge &&
-                (macFinish ? (
-                  // macOS: everything PM wrote is gone, but the .app is the user's to bin.
-                  <>
-                    <p className="mt-3 text-xs text-ink3">
-                      PM has removed everything it stored on this Mac
-                      {(report?.couldNotRemove.length ?? 0) > 0
-                        ? " except what's listed above"
-                        : ""}
-                      . macOS has no uninstaller, so the last step is yours: drag{" "}
-                      <span className="font-medium text-ink2">PM</span> from Applications to the
-                      Trash.
-                    </p>
-                    {/* A failed reveal must still say so — the instruction above is the real
-                        deliverable, and Finder is only a convenience on top of it. */}
-                    {uninstallHint && (
-                      <p className="mt-2 text-xs text-st-due">
-                        Couldn’t open Finder for you — find PM in Applications yourself.
-                      </p>
-                    )}
-                  </>
-                ) : manualFinish ? (
-                  <p className="mt-3 text-xs text-ink3">
-                    PM has removed everything it stored
-                    {(report?.couldNotRemove.length ?? 0) > 0 ? " except what's listed above" : ""}.
-                    Remove the app itself the way you installed it — your package manager, or by
-                    deleting the AppImage.
+                )}
+                {report.microsoftAccounts.length > 0 && (
+                  <p className="text-st-due">
+                    Finish removing PM&apos;s access to {report.microsoftAccounts.join(", ")} at{" "}
+                    <a
+                      href={MICROSOFT_APPS_URL}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline hover:brightness-110"
+                    >
+                      account.live.com
+                    </a>
+                    .
                   </p>
-                ) : uninstallHint ? (
-                  <p className="mt-3 text-xs text-st-due">
-                    Your data is removed. Finish uninstalling PM through your operating system to
-                    clear the last of it.
-                  </p>
-                ) : actionRequired ? (
-                  <p className="mt-3 text-xs text-ink3">
-                    Your data is gone. Finish the access step noted above first, then choose “Finish
-                    uninstall” to remove PM completely and close it.
-                  </p>
-                ) : (
-                  <p className="mt-3 text-xs text-ink4">
-                    Your data is gone. Finishing the uninstall now — this window will close, and the
-                    uninstaller clears the rest.
-                  </p>
-                ))}
-              <div className="mt-5 flex justify-end gap-2">
-                {macFinish ? (
-                  <>
-                    <Button variant="secondary" onClick={() => void revealApp()}>
-                      Show PM in Finder
-                    </Button>
-                    <Button variant="primary" onClick={() => void quitApp()}>
-                      Close PM
-                    </Button>
-                  </>
-                ) : manualFinish ? (
-                  <Button variant="primary" onClick={() => void quitApp()}>
-                    Close PM
-                  </Button>
-                ) : report?.fullPurge ? (
-                  <Button
-                    variant="primary"
-                    onClick={() => void (uninstallHint ? quitApp() : finishUninstall())}
-                  >
-                    {uninstallHint ? "Close PM" : "Finish uninstall"}
-                  </Button>
-                ) : report?.quitRequired ? (
-                  <Button variant="primary" onClick={() => void quitApp()}>
-                    Close PM
-                  </Button>
-                ) : sel.localStorage ? (
-                  <Button variant="primary" onClick={() => window.location.reload()}>
-                    Reload
-                  </Button>
-                ) : (
-                  <Button variant="primary" onClick={reset}>
-                    Done
-                  </Button>
                 )}
               </div>
-            </>
-          )}
-        </div>
-      </Modal>
+            )}
+            {/* Anything PM knows about and left, with the path spelled out. Deliberately above
+                  the "your data is gone" lines below, because when this list is non-empty those
+                  lines are only true of the folders PM owns. */}
+            {(report?.couldNotRemove.length ?? 0) > 0 && (
+              <div className="mt-3 rounded-[var(--radius-sm)] border border-st-due p-3">
+                <p className="text-xs font-medium text-st-due">
+                  PM did not remove these &mdash; they are yours to delete
+                </p>
+                <ul className="mt-2 space-y-2">
+                  {report?.couldNotRemove.map((l) => (
+                    <li key={l.path} className="text-xs text-ink3">
+                      <span className="block break-all font-medium text-ink2">{l.path}</span>
+                      <span className="text-ink4">{l.reason}.</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {report?.fullPurge &&
+              (macFinish ? (
+                // macOS: everything PM wrote is gone, but the .app is the user's to bin.
+                <>
+                  <p className="mt-3 text-xs text-ink3">
+                    PM has removed everything it stored on this Mac
+                    {(report?.couldNotRemove.length ?? 0) > 0 ? " except what's listed above" : ""}.
+                    macOS has no uninstaller, so the last step is yours: drag{" "}
+                    <span className="font-medium text-ink2">PM</span> from Applications to the
+                    Trash.
+                  </p>
+                  {/* A failed reveal must still say so — the instruction above is the real
+                        deliverable, and Finder is only a convenience on top of it. */}
+                  {uninstallHint && (
+                    <p className="mt-2 text-xs text-st-due">
+                      Couldn’t open Finder for you — find PM in Applications yourself.
+                    </p>
+                  )}
+                </>
+              ) : manualFinish ? (
+                <p className="mt-3 text-xs text-ink3">
+                  PM has removed everything it stored
+                  {(report?.couldNotRemove.length ?? 0) > 0 ? " except what's listed above" : ""}.
+                  Remove the app itself the way you installed it — your package manager, or by
+                  deleting the AppImage.
+                </p>
+              ) : uninstallHint ? (
+                <p className="mt-3 text-xs text-st-due">
+                  Your data is removed. Finish uninstalling PM through your operating system to
+                  clear the last of it.
+                </p>
+              ) : actionRequired ? (
+                <p className="mt-3 text-xs text-ink3">
+                  Your data is gone. Finish the access step noted above first, then choose “Finish
+                  uninstall” to remove PM completely and close it.
+                </p>
+              ) : (
+                <p className="mt-3 text-xs text-ink4">
+                  Your data is gone. Finishing the uninstall now — this window will close, and the
+                  uninstaller clears the rest.
+                </p>
+              ))}
+          </>
+        )}
+      </Dialog>
     </div>
   );
 }

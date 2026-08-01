@@ -66,7 +66,7 @@ import {
   useTheme,
   useUserTime,
 } from "../../theme";
-import { Skeleton } from "../ui";
+import { Callout, Skeleton } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
 import { CalendarEventPopover } from "./parts/CalendarEventPopover";
 import { CalendarHeader } from "./CalendarHeader";
@@ -726,12 +726,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       {isTerminal && <TerminalChrome view={view} label={label} count={chromeCount} />}
 
       {error && (
-        <div
-          className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout variant="strip" size="md" className="font-ui">
           {error}
-        </div>
+        </Callout>
       )}
 
       {eventsFailed && !error && (
