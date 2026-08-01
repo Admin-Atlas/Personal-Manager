@@ -437,6 +437,38 @@ mod tests {
 
     const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
+    /// Pins the on-disk encoding of a boolean setting, not just the round-trip. The point is the
+    /// middle assertion: the stored value is the bare string `"true"` / `"false"`. Several call
+    /// sites used to hand-roll `set_setting(k, if v { "true" } else { "false" })`, and this is what
+    /// makes replacing them with [`set_bool`] a checked refactor rather than an asserted one — if
+    /// the helper ever changes its literals, every one of those settings flips meaning on upgrade.
+    #[test]
+    fn a_boolean_setting_is_stored_as_the_bare_word_true_or_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("bools.sqlite"), KEY).unwrap();
+
+        set_bool(&conn, "probe", true).unwrap();
+        assert_eq!(
+            get_setting(&conn, "probe").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(get_bool(&conn, "probe", false).unwrap());
+
+        set_bool(&conn, "probe", false).unwrap();
+        assert_eq!(
+            get_setting(&conn, "probe").unwrap().as_deref(),
+            Some("false")
+        );
+        assert!(!get_bool(&conn, "probe", true).unwrap());
+
+        // Absent and unparseable both fall back to the caller's default — the documented contract
+        // that `backup::schedule::setting_bool` does NOT share (it reads a non-canonical value as
+        // false). Left as two readers deliberately; see the note on that function.
+        assert!(get_bool(&conn, "never-written", true).unwrap());
+        set_setting(&conn, "probe", "yes").unwrap();
+        assert!(get_bool(&conn, "probe", true).unwrap());
+    }
+
     #[test]
     fn encrypted_store_supports_vectors_and_keyword_search() {
         let dir = tempfile::tempdir().unwrap();

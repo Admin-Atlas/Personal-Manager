@@ -189,12 +189,20 @@ fn enumerate_sources(inputs: &PackInputs) -> Result<Vec<Source>> {
 
     // vault-meta.json + the DB snapshot are required; the two always-encrypted sidecars
     // are optional (a fresh vault may not have written them yet).
+    //
+    // The archive ENTRY names are the layout constants, not independent wire-format strings: a
+    // restore rebuilds each entry verbatim under its staging root and then renames that root into
+    // place, after which `vault::resolve_layout` opens `<root>/pm.sqlite` and `load_meta` reads
+    // `<root>/vault-meta.json`. The names are therefore already forced equal to the on-disk ones —
+    // the two sidecars below have always spelled it this way. Consequence to keep in view: renaming
+    // [`vault::DB_FILENAME`] or [`vault::META_FILENAME`] changes the archive format, so it needs a
+    // `manifest::SCHEMA` decision, not just a rename.
     push_required(
         &mut out,
         &inputs.vault_root.join(vault::META_FILENAME),
-        "vault-meta.json",
+        vault::META_FILENAME,
     )?;
-    push_required(&mut out, &inputs.db_snapshot, "pm.sqlite")?;
+    push_required(&mut out, &inputs.db_snapshot, vault::DB_FILENAME)?;
     push_optional(
         &mut out,
         &inputs.vault_root.join(crate::entities::RULES_FILENAME),

@@ -1729,6 +1729,16 @@ pub fn rebuild(
             conn.execute_batch(
                 "DELETE FROM chunks_fts; DELETE FROM chunk_vec; DELETE FROM chunks; DELETE FROM documents;",
             )?;
+            // A wholesale delete orphans EVERY tag at once, by cascade, and the per-document prune in
+            // `tags::set_document_projects` can never reach them: a tag whose documents are all gone is
+            // in no surviving document's leaving-set. Re-filing heals the tags the vault still names —
+            // it re-interns them — but a label no file mentions any more would linger forever, in the
+            // pickers and in the cached filing prompt. Swept here, immediately after the wipe that
+            // created them, rather than at the end of the run: a rebuild commits one transaction per
+            // document, so a sweep deferred to the end is one a crash can skip entirely, and there is no
+            // boot-time or periodic registry GC to catch what it missed.
+            crate::tags::prune_orphan_project_tags(&conn)?;
+            crate::tags::prune_orphan_group_tags(&conn)?;
         }
         crate::db::ensure_vec_dim(&conn, embedder.dimension)?;
     }
@@ -2691,7 +2701,16 @@ pub(crate) fn clear_document_chunks(tx: &Connection, doc_id: i64) -> Result<()> 
 /// cascades in the *delete-documents* direction, but we delete bottom-up. Caller owns the transaction.
 pub(crate) fn delete_document(tx: &Connection, doc_id: i64) -> Result<()> {
     clear_document_chunks(tx, doc_id)?;
+    // Snapshot the registry rows this document holds BEFORE it goes: `document_tags` cascades off
+    // `documents`, so afterwards nothing can say which tags just lost a member. Filing prunes the
+    // tags each write orphans (`tags::set_document_projects`), and a DELETE is the other way a tag
+    // loses its last document — the one the filing writer can never see. Left unpruned a label
+    // lingers in every picker AND in the cached filing prompt, where the model reads it as
+    // established vocabulary and re-mints it onto new documents. Inside the caller's transaction, so
+    // the orphaning and the prune commit or roll back together.
+    let held = crate::tags::document_tag_ids(tx, doc_id)?;
     tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])?;
+    crate::tags::prune_orphan_tags_by_id(tx, &held)?;
     Ok(())
 }
 
@@ -5316,6 +5335,127 @@ mod tests {
         delete_document(&tx, kept).unwrap();
         tx.commit().unwrap();
         assert_eq!(saved_photo_original(&conn, kept).unwrap(), None);
+    }
+
+    /// v50 exists to take `WHERE reviewed = 0` off a full table scan — a read the sidebar badge
+    /// fires on every view change, over rows each carrying a ~500-char `stored_summary`, every page
+    /// of it decrypted. Pinned as a PLAN, not a duration: a wall-clock assertion would be flaky on a
+    /// low-RAM box, and the plan is the durable claim.
+    #[test]
+    fn the_review_badge_reads_a_covering_index_and_the_library_listing_still_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows.join(" | ")
+        };
+
+        // Must stay byte-identical to `review_queue_count`'s statement.
+        let badge = plan("SELECT count(*) FROM documents WHERE reviewed = 0");
+        assert!(
+            badge.contains("COVERING INDEX idx_documents_reviewed"),
+            "the badge must not touch the table at all; plan was: {badge}"
+        );
+
+        // The guard that matters. `list_documents` returns the WHOLE table, so a sequential scan plus
+        // a temp b-tree is already its optimal plan. Widening v50 to carry the listing's sort keys
+        // looks strictly better and measured 2x slower on a fresh import — see the v50 comment. If
+        // this assertion starts failing, the index grew columns it must not have.
+        let listing = plan(&format!(
+            "SELECT {DOCUMENT_COLUMNS} FROM documents d ORDER BY d.ingested_at DESC, d.id DESC"
+        ));
+        assert!(
+            !listing.contains("idx_documents_reviewed"),
+            "the whole-library listing must still scan; plan was: {listing}"
+        );
+    }
+
+    /// v50 is behaviour-neutral, checked rather than asserted: an index changes no result, and
+    /// `ORDER BY d.ingested_at DESC, d.id DESC` is a total order, so no tie can drift either.
+    #[test]
+    fn the_review_queue_reads_the_same_rows_with_and_without_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, reviewed, ingested_at) VALUES \
+                 (1,'a.md','A','ha',0,'2026-01-03T00:00:00Z'), \
+                 (2,'b.md','B','hb',1,'2026-01-02T00:00:00Z'), \
+                 (3,'c.md','C','hc',0,'2026-01-02T00:00:00Z'), \
+                 (4,'d.md','D','hd',0,'2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let queued = |c: &Connection| -> Vec<i64> {
+            review_queue(c).unwrap().into_iter().map(|d| d.id).collect()
+        };
+
+        assert_eq!(queued(&conn), vec![1, 3, 4]);
+        assert_eq!(review_queue_count(&conn).unwrap(), 3);
+
+        conn.execute("DROP INDEX idx_documents_reviewed", [])
+            .unwrap();
+        assert_eq!(queued(&conn), vec![1, 3, 4], "same ids, same order");
+        assert_eq!(review_queue_count(&conn).unwrap(), 3);
+    }
+
+    /// A DELETE is the other way a tag loses its last document, and it is the one the filing writer
+    /// can never see: `document_tags` cascades off `documents`, so afterwards nothing is left to say
+    /// which tags just went empty. It used to be healed by accident — every filing anywhere in the
+    /// store ran a whole-registry sweep — which meant the label stayed in every picker AND in the
+    /// CACHED filing prompt, where the model reads it as established vocabulary and re-mints it onto
+    /// new documents, until something unrelated was next filed. It must be gone at the deletion.
+    #[test]
+    fn deleting_the_last_document_carrying_a_label_retires_it_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        conn.execute("INSERT INTO projects(name) VALUES ('Kept Triage')", [])
+            .unwrap();
+        let seed = |vp: &str, hash: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash, project) \
+                 VALUES (?1,'T',?2,'Alpha')",
+                params![vp, hash],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let a = seed("a.md", "ha");
+        let b = seed("b.md", "hb");
+        crate::tags::set_document_projects(&conn, a, "Alpha", &["Kept Triage".into()]).unwrap();
+        crate::tags::set_document_projects(&conn, b, "Alpha", &[]).unwrap();
+        crate::tags::set_document_group_tags(&conn, a, &["tax".into(), "draft".into()]).unwrap();
+        crate::tags::set_document_group_tags(&conn, b, &["draft".into()]).unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        delete_document(&tx, a).unwrap();
+        tx.commit().unwrap();
+
+        let names: Vec<String> = crate::tags::list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !names.contains(&"tax".to_string()),
+            "the label only the deleted document carried is retired with it"
+        );
+        assert!(
+            names.contains(&"draft".to_string()),
+            "a label another document still carries survives"
+        );
+        assert!(
+            names.contains(&"Alpha".to_string()),
+            "and so does the project the survivor is filed in"
+        );
+        assert!(
+            names.contains(&"Kept Triage".to_string()),
+            "an empty-but-real project outlives its last document — it has a triage row"
+        );
     }
 
     #[test]

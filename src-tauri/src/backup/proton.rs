@@ -645,8 +645,8 @@ pub(crate) fn upload_archive(
 }
 
 /// Download one archive (by bare name) into `dest_dir`. The CLI writes it as `dest_dir/<name>`.
-/// `cancel` makes the (longest) Download phase interruptible; the live caller is the direct
-/// `restore_from_proton` path — the enum destination's download arm passes `None` (see there).
+/// `cancel` makes the (longest) Download phase interruptible, and every caller reaches this through
+/// `BackupDestination::download`, which threads the shared `backup_cancel` flag.
 pub(crate) fn download_archive(
     cli: &Path,
     name: &str,

@@ -24,6 +24,7 @@
 
 use rusqlite::{named_params, params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::calendar::{self, CalendarMatch};
 use crate::error::Result;
@@ -124,24 +125,34 @@ pub fn compute_auto_importance(s: &ImportanceSignals) -> Option<&'static str> {
     })
 }
 
-/// How many *other* projects depend on `name` — i.e. name it as their `blocked_by`.
-/// Case-insensitive via `.to_lowercase()` (not `eq_ignore_ascii_case` — see `set_metadata`'s
-/// Café/CAFÉ note). `edges` is every project's own (name, blocked_by).
+/// How many *other* projects depend on each project — i.e. name it as their `blocked_by` —
+/// for the whole graph in ONE pass, keyed by LOWERCASED project name. A name absent from the
+/// map has zero dependents.
 ///
-/// `parent` was the other input until #278 retired it. The old dedupe (a project naming
-/// `name` via *both* fields counted once) is gone with it — with one field there is one
+/// Case-insensitive via `.to_lowercase()` (not `eq_ignore_ascii_case`, and NOT `tags::normalize`,
+/// which is deliberately ASCII-only to agree byte-for-byte with SQLite's non-ICU `lower()` — see
+/// `set_metadata`'s Café/CAFÉ note). `edges` is every project's own (name, blocked_by).
+///
+/// `parent` was the other input until #278 retired it. The old dedupe (a project naming a
+/// target via *both* fields counted once) is gone with it — with one field there is one
 /// edge per project by construction, so no dedupe is possible or needed.
-pub fn count_dependents(name: &str, edges: &[(String, Option<String>)]) -> u32 {
-    let name_lc = name.to_lowercase();
-    edges
-        .iter()
-        .filter(|(n, blocked_by)| {
-            n.to_lowercase() != name_lc
-                && blocked_by
-                    .as_deref()
-                    .is_some_and(|b| b.to_lowercase() == name_lc)
-        })
-        .count() as u32
+///
+/// Identical to the old per-target scan by construction, not by inspection: an edge `(n, Some(b))`
+/// counted toward target `T` iff `lower(b) == lower(T)` AND `lower(n) != lower(T)`; given the first,
+/// the second is exactly `lower(n) != lower(b)`, which does not mention `T` at all. So the self-edge
+/// drops once, at edge time, and every target becomes a lookup. Note the key discipline differs from
+/// the sibling `milestones_by_project` map a line below its call site, which keys on the exact name.
+pub fn dependent_counts(edges: &[(String, Option<String>)]) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for (name, blocked_by) in edges {
+        let Some(blocker) = blocked_by.as_deref().map(str::to_lowercase) else {
+            continue;
+        };
+        if name.to_lowercase() != blocker {
+            *counts.entry(blocker).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// One row of the focus view: a project, its derived status, and the raw signals
@@ -258,11 +269,14 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     drop(stmt);
 
     // Every project's own (name, blocked_by), snapshotted before the loop below consumes
-    // `raw` by value — the structural graph `count_dependents` reduces per project.
+    // `raw` by value — the structural graph the dependent counts reduce.
     let edges: Vec<(String, Option<String>)> = raw
         .iter()
         .map(|(name, _, _, _, _, blocked_by, _, _)| (name.clone(), blocked_by.clone()))
         .collect();
+    // Reduced ONCE, like `milestones::all_by_project` on the next statement. Asking per project
+    // rescanned the whole graph N times, each comparison heap-allocating two Unicode case-folds.
+    let dependents_by_project = dependent_counts(&edges);
 
     // All milestones, resolved (calendar-linked dates synced) and grouped by project, in
     // one pass — the milestone set is what now drives the status (card 7).
@@ -306,7 +320,10 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             blocked_by: blocked_by.as_deref(),
         });
         let auto_importance = compute_auto_importance(&ImportanceSignals {
-            dependents: count_dependents(&name, &edges),
+            dependents: dependents_by_project
+                .get(&name.to_lowercase())
+                .copied()
+                .unwrap_or(0),
             days_since_activity: dsince,
         })
         .map(str::to_string);
@@ -1078,6 +1095,9 @@ mod tests {
     /// `blocked_by` is the sole dependency edge since #278. The old fixture also covered a
     /// project naming the target through BOTH fields ("counts once, not twice"); with one
     /// field that case is unrepresentable, so the dedupe assertion retires with `parent`.
+    ///
+    /// Same fixture and same three values as the per-target form this replaced, so a regression
+    /// here means the one-pass reduction is not the identity it claims to be.
     #[test]
     fn count_dependents_excludes_self_and_ignores_case() {
         let edges = vec![
@@ -1088,9 +1108,23 @@ mod tests {
             ("Child C".to_string(), Some("atlas".into())),
             ("Unrelated".to_string(), Some("Other".into())),
         ];
-        assert_eq!(count_dependents("Atlas", &edges), 3);
-        assert_eq!(count_dependents("Other", &edges), 1);
-        assert_eq!(count_dependents("Nobody", &edges), 0);
+        let counts = dependent_counts(&edges);
+        assert_eq!(counts.get("atlas").copied().unwrap_or(0), 3);
+        assert_eq!(counts.get("other").copied().unwrap_or(0), 1);
+        // A target nobody names is absent from the map, which the call site reads as zero.
+        assert_eq!(counts.get("nobody").copied().unwrap_or(0), 0);
+    }
+
+    /// The fold is Unicode, deliberately. `tags::normalize` is `to_ascii_lowercase` so it agrees
+    /// byte-for-byte with SQLite's non-ICU `lower()`; reusing it here would score this edge 0 and
+    /// could move a project's auto-importance tier — a product change wearing a refactor's clothes.
+    #[test]
+    fn dependent_counts_fold_non_ascii_names() {
+        let edges = vec![
+            ("CAFÉ".to_string(), None),
+            ("Child".to_string(), Some("café".into())),
+        ];
+        assert_eq!(dependent_counts(&edges).get("café").copied(), Some(1));
     }
 
     #[test]

@@ -1415,6 +1415,33 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE messages ADD COLUMN retrieved_config_stamp TEXT; -- retrieval config at ANSWER time
     ALTER TABLE retrieval_feedback ADD COLUMN chunk_uids  TEXT;  -- JSON array: Rebuild-stable identities
     "#,
+    // v50: index the review-queue predicate. `documents` carries indexes on entity_id, source_id and
+    // source_type but nothing on `reviewed`, so answering `WHERE reviewed = 0` reads the table
+    // end-to-end — every page decrypted, each row carrying a ~500-char `stored_summary` — to produce
+    // one integer for the sidebar badge, on EVERY view change (App.tsx keys the refresh on `view`).
+    // `review::unreviewed_titles` and the review queue itself read the same predicate.
+    //
+    // ONE column, ASC, no sort keys, and that is deliberate — do not "improve" it. Adding the
+    // listing's sort keys (`reviewed, ingested_at DESC, id DESC`), or the partial index on
+    // `WHERE reviewed = 0`, does remove `USE TEMP B-TREE FOR ORDER BY` and looks strictly better;
+    // both were measured 2x SLOWER on `review_queue` at 50% unreviewed (114 ms vs 55 ms at 20k
+    // documents), because the planner then walks the queue in index order with a rowid lookup per
+    // row. A fresh import is exactly the 50%-unreviewed case — i.e. when the queue matters most. A
+    // bare index on `ingested_at` is worse still: it captures `list_documents`, which reads the WHOLE
+    // table, and doubles it. The sort stays a temp b-tree by choice.
+    //
+    // Single column also makes this COVERING for the badge count: `SEARCH documents USING COVERING
+    // INDEX idx_documents_reviewed` — no table access at all.
+    //
+    // `IF NOT EXISTS` follows v48's `CREATE TABLE IF NOT EXISTS tag_proposals` precedent: the
+    // db-ladder teardown tests rewind `user_version` to 9/10 WITHOUT dropping post-v9 schema and then
+    // replay every rung. A bare `CREATE INDEX` would abort that replay. (`reviewed` is a pre-v9
+    // column neither teardown drops, so the index blocks none of their `ALTER TABLE ... DROP COLUMN`
+    // statements — SQLite refuses to drop an indexed column, which is why those teardowns already
+    // drop `idx_documents_source_id` / `idx_documents_source_type` first.)
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_documents_reviewed ON documents(reviewed);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1470,7 +1497,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 49,
+            version, 50,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1496,7 +1523,8 @@ mod tests {
              tag registry + M:N project membership is v46; \
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
-             Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49)"
+             Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
+             documents.reviewed index for the review queue is v50)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

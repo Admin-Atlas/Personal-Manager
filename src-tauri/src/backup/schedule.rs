@@ -55,6 +55,16 @@ pub const BACKUP_GDRIVE_ACCOUNT_KEY: &str = "backup_gdrive_account";
 
 /// Read a boolean setting: `"true"` → true, any other present value → false, absent (or a read
 /// error) → `default`.
+///
+/// The second reader of the `"true"`/`"false"` encoding [`db::set_bool`] writes, and it is NOT
+/// equivalent to that encoding's documented reader [`db::get_bool`]: on a present-but-non-canonical
+/// value `get_bool` returns `default` while this returns false, and this swallows a DB read error
+/// into `default` where `get_bool` propagates it. That matters most for
+/// [`BACKUP_PROTON_ENABLED_KEY`], whose default is `true` — a corrupt value reads "Proton backups
+/// off" here and "on" there. Unreachable today (every writer of these keys goes through
+/// `db::set_bool`, so only a canonical literal can be stored), so the divergence is latent, and
+/// collapsing the two readers is a semantics decision rather than a cleanup — deliberately left
+/// alone here.
 pub fn setting_bool(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
     match db::get_setting(conn, key) {
         Ok(Some(v)) => v == "true",
@@ -67,7 +77,7 @@ pub fn setting_bool(conn: &rusqlite::Connection, key: &str, default: bool) -> bo
 /// `gdrive_enabled` pointed at a now-tokenless account and every scheduled run fails on it. Additive to
 /// the existing disconnect path; leaves Proton untouched.
 pub fn clear_gdrive_destination(conn: &rusqlite::Connection) -> crate::error::Result<()> {
-    db::set_setting(conn, BACKUP_GDRIVE_ENABLED_KEY, "false")?;
+    db::set_bool(conn, BACKUP_GDRIVE_ENABLED_KEY, false)?;
     db::set_setting(conn, BACKUP_GDRIVE_ACCOUNT_KEY, "")?;
     Ok(())
 }

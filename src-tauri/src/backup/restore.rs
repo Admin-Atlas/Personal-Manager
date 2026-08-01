@@ -210,8 +210,11 @@ pub fn restore(
         )));
     }
 
-    // The restored DB must open with the embedded key and pass an integrity check.
-    let db_path = staging_path.join("pm.sqlite");
+    // The restored DB must open with the embedded key and pass an integrity check. The staging tree
+    // is promoted into the vault root verbatim below, so the archive entry name IS the on-disk name
+    // — hence the layout constant here and at the packing end (`pack::enumerate_sources`), rather
+    // than a retyped literal that could drift from it.
+    let db_path = staging_path.join(vault::DB_FILENAME);
     {
         let conn = db::open(&db_path, &man.db_key_hex)
             .map_err(|e| Error::Other(format!("the restored database could not be opened: {e}")))?;

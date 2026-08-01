@@ -1033,11 +1033,9 @@ pub fn adopt_shared_vault(
                 .into(),
         ));
     }
-    let resolved = vault::ResolvedVault {
-        vault_root: root.clone(),
-        db_path: root.join("pm.sqlite"),
-        markdown_dir: root.join("vault"),
-    };
+    // The layout of a folder we are about to adopt is the same rule as our own, with no pointer to
+    // consult — `resolve_layout` is pure (unlike `vault::resolve`, which creates directories).
+    let resolved = vault::resolve_layout(&root, None);
     let (conn, key, meta_report) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
     let mut warnings = Vec::new();
     // Cache-first is deliberate: a cache failure costs one passphrase prompt next
@@ -1320,11 +1318,7 @@ pub fn repair_vault_access(app: AppHandle, state: State<'_, AppState>) -> Result
         // A watcher-raised fault on a still-open session: the folder answers again.
         state.set_vault_fault(None);
     } else {
-        let resolved = vault::ResolvedVault {
-            vault_root: root.clone(),
-            db_path: root.join("pm.sqlite"),
-            markdown_dir: root.join("vault"),
-        };
+        let resolved = vault::resolve_layout(&root, None);
         if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &meta)? {
             // open_session clears the carried fault (the one healing choke point).
             state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
@@ -3994,20 +3988,7 @@ pub async fn commit_retag(app: AppHandle, document_ids: Vec<i64>) -> Result<usiz
             Ok(applied)
         })();
 
-        match result {
-            Ok(applied) => match tx.commit() {
-                Ok(()) => Ok(applied),
-                Err(e) => {
-                    ingest::restore_vault_files(written);
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                drop(tx);
-                ingest::restore_vault_files(written);
-                Err(e)
-            }
-        }
+        finish_vault_transaction(tx, written, None, result)
     })
     .await
     .map_err(|e| Error::Other(format!("re-tag commit task panicked: {e}")))?
@@ -4120,7 +4101,7 @@ pub async fn delete_tag(app: AppHandle, name: String) -> Result<usize> {
             Ok(applied)
         })();
 
-        finish_tag_rewrite(tx, written, result)
+        finish_vault_transaction(tx, written, None, result)
     })
     .await
     .map_err(|e| Error::Other(format!("tag delete task panicked: {e}")))?
@@ -4187,34 +4168,72 @@ pub async fn rename_tag(app: AppHandle, old: String, new: String) -> Result<usiz
             Ok(applied)
         })();
 
-        finish_tag_rewrite(tx, written, result)
+        finish_vault_transaction(tx, written, None, result)
     })
     .await
     .map_err(|e| Error::Other(format!("tag rename task panicked: {e}")))?
 }
 
-/// Commit a bulk tag rewrite, or roll back BOTH the DB and every vault file it touched.
+/// Commit a pass that rewrote vault files inside `tx`, or roll BOTH halves back — the DB *and*
+/// every file the pass touched.
 ///
 /// Shared because getting this wrong is silent: a committed DB with reverted files (or the reverse)
 /// leaves the mirror and the truth disagreeing, and nothing reports it until a Rebuild quietly
-/// resurrects the old tags.
-fn finish_tag_rewrite(
+/// resurrects the old data. It went wrong exactly that way — `commit_review` hand-rolled this tail
+/// and wrote the rules file with a bare `?`, so a disk-full or AV-locked vault rolled the database
+/// back while leaving a whole review pass rewritten on disk, which the next Rebuild then adopted.
+/// One tail, so there is one place to get it right.
+///
+/// `rules` is `Some((vault_root, cipher))` for the passes that also mutate the entity mirror. The
+/// rules file is written from the still-uncommitted mirror BEFORE `tx.commit()` deliberately — a
+/// captured rule must be exactly as durable as the commit that created it — and is put back if the
+/// commit then fails. Reading the mirror is inside the same guarded region as writing it: both sit
+/// on the file-already-rewritten side of the commit, so both owe the same rollback.
+///
+/// Takes `tx` BY VALUE on purpose: `set_document_metadata` reads `conn` after the tail, which only
+/// compiles because consuming the transaction releases the borrow. `&mut Transaction` breaks it.
+///
+/// Deliberately does NOT cover after-commit work (`spawn_entity_mutation`'s `unlink` /
+/// `forget_sources`). Those are irreversible and wait for a durable commit by decision — see
+/// [`MutationFiles`] — and folding an irreversible step into a helper named for rollback is how the
+/// original bug happened.
+fn finish_vault_transaction<T>(
     tx: rusqlite::Transaction<'_>,
     written: Vec<(std::path::PathBuf, Vec<u8>)>,
-    result: Result<usize>,
-) -> Result<usize> {
-    match result {
-        Ok(applied) => match tx.commit() {
-            Ok(()) => Ok(applied),
-            Err(e) => {
-                ingest::restore_vault_files(written);
-                Err(e.into())
-            }
-        },
+    rules: Option<(&std::path::Path, &entities::RulesCipher)>,
+    result: Result<T>,
+) -> Result<T> {
+    let applied = match result {
+        Ok(applied) => applied,
         Err(e) => {
-            drop(tx);
+            drop(tx); // roll back the DB side
             ingest::restore_vault_files(written);
-            Err(e)
+            return Err(e);
+        }
+    };
+    let prior_rules = match rules {
+        Some((vault_root, cipher)) => {
+            match entities::rules_from_mirror(&tx)
+                .and_then(|r| entities::write_rules_file(vault_root, cipher, &r))
+            {
+                Ok(prior) => Some((vault_root, prior)),
+                Err(e) => {
+                    drop(tx);
+                    ingest::restore_vault_files(written);
+                    return Err(e);
+                }
+            }
+        }
+        None => None,
+    };
+    match tx.commit() {
+        Ok(()) => Ok(applied),
+        Err(e) => {
+            if let Some((vault_root, prior)) = prior_rules {
+                entities::restore_rules_file(vault_root, &prior);
+            }
+            ingest::restore_vault_files(written);
+            Err(e.into())
         }
     }
 }
@@ -4336,27 +4355,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
             Ok(logged)
         })();
 
-        match result {
-            Ok(logged) => {
-                // Write the portable rules file from the (uncommitted) mirror first, so a captured
-                // rule is as durable as the commit; restore it if the commit then fails.
-                let rules = entities::rules_from_mirror(&tx)?;
-                let prior_rules = entities::write_rules_file(&vault_root, &rules_cipher, &rules)?;
-                match tx.commit() {
-                    Ok(()) => Ok(logged),
-                    Err(e) => {
-                        entities::restore_rules_file(&vault_root, &prior_rules);
-                        ingest::restore_vault_files(written);
-                        Err(e.into())
-                    }
-                }
-            }
-            Err(e) => {
-                drop(tx); // roll back the DB side
-                ingest::restore_vault_files(written);
-                Err(e)
-            }
-        }
+        finish_vault_transaction(tx, written, Some((&vault_root, &rules_cipher)), result)
     })
     .await
     .map_err(|e| Error::Other(format!("commit task panicked: {e}")))??;
@@ -4465,29 +4464,9 @@ pub async fn set_document_metadata(
             Ok(())
         })();
 
-        if let Err(e) = work {
-            drop(tx);
-            ingest::restore_vault_files(written);
-            return Err(e);
-        }
-        // Persist the rules file (the resolve above may have created an entity) before committing.
-        let prior_rules = match entities::write_rules_file(
-            &vault_root,
-            &rules_cipher,
-            &entities::rules_from_mirror(&tx)?,
-        ) {
-            Ok(prior) => prior,
-            Err(e) => {
-                drop(tx);
-                ingest::restore_vault_files(written);
-                return Err(e);
-            }
-        };
-        if let Err(e) = tx.commit() {
-            entities::restore_rules_file(&vault_root, &prior_rules);
-            ingest::restore_vault_files(written);
-            return Err(e.into());
-        }
+        // The rules file is persisted inside the tail (the resolve above may have created an
+        // entity). The helper CONSUMES `tx`, which is what releases the borrow `conn` needs below.
+        finish_vault_transaction(tx, written, Some((&vault_root, &rules_cipher)), work)?;
         ingest::load_document(&conn, document_id)
     })
     .await
@@ -4552,35 +4531,15 @@ where
         // has always kept its snapshot list outside the fallible section for this reason; this is
         // the same shape, made the rule for every mutation that rides this path.
         let mut files = MutationFiles::default();
-        if let Err(e) = work(
+        let done = work(
             &tx,
             &vault,
             &cipher,
             &vault_root,
             &manifest_cipher,
             &mut files,
-        ) {
-            drop(tx);
-            ingest::restore_vault_files(files.written);
-            return Err(e);
-        }
-        let prior_rules = match entities::write_rules_file(
-            &vault_root,
-            &rules_cipher,
-            &entities::rules_from_mirror(&tx)?,
-        ) {
-            Ok(prior) => prior,
-            Err(e) => {
-                drop(tx);
-                ingest::restore_vault_files(files.written);
-                return Err(e);
-            }
-        };
-        if let Err(e) = tx.commit() {
-            entities::restore_rules_file(&vault_root, &prior_rules);
-            ingest::restore_vault_files(files.written);
-            return Err(e.into());
-        }
+        );
+        finish_vault_transaction(tx, files.written, Some((&vault_root, &rules_cipher)), done)?;
         // Committed: the deletions are now safe to make real. Best-effort by contract — see the
         // `MutationFiles` note; a file that outlives its row is reclaimed by the next Rebuild.
         for path in files.unlink {
@@ -6679,7 +6638,7 @@ pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
 /// Register a local folder to index (the path comes from the frontend's native folder picker). Returns
 /// the folder's stable key; the UI then triggers a sync. Idempotent — re-adding reactivates the row.
 #[tauri::command]
-pub fn add_local_folder(app: AppHandle, path: String) -> Result<String> {
+pub fn add_local_folder(state: State<'_, AppState>, path: String) -> Result<String> {
     // L-5: the path is a webview string (from the native picker, but a compromised webview could
     // supply any path). Require a real, absolute, well-formed location before we register a root
     // whose whole subtree we then walk and read.
@@ -6688,15 +6647,13 @@ pub fn add_local_folder(app: AppHandle, path: String) -> Result<String> {
     if !root.is_dir() {
         return Err(Error::Other("That path isn't a folder we can read.".into()));
     }
-    let state = app.state::<AppState>();
     let conn = state.conn()?;
     localfolder::add_folder(&conn, &root)
 }
 
 /// Stop tracking a local folder: its items stay findable (flagged `unreachable`), the registry row drops.
 #[tauri::command]
-pub fn remove_local_folder(app: AppHandle, key: String) -> Result<()> {
-    let state = app.state::<AppState>();
+pub fn remove_local_folder(state: State<'_, AppState>, key: String) -> Result<()> {
     let conn = state.conn()?;
     localfolder::remove_folder(&conn, &key)
 }
@@ -6712,12 +6669,13 @@ pub fn list_local_folders(state: State<'_, AppState>) -> Result<Vec<localfolder:
 /// inside a tracked folder — one lazy level of the local folder picker.
 #[tauri::command]
 pub fn list_local_subfolders(
-    app: AppHandle,
+    state: State<'_, AppState>,
     key: String,
     rel: Option<String>,
 ) -> Result<Vec<localfolder::LocalSubfolder>> {
+    // The block is load-bearing, not style: it drops the DB guard before `list_subfolders` walks
+    // the filesystem, so a slow or unreachable disk never holds the connection lock.
     let root = {
-        let state = app.state::<AppState>();
         let conn = state.conn()?;
         localfolder::folder_root(&conn, &key)?
     };
@@ -6730,8 +6688,11 @@ pub fn list_local_subfolders(
 /// Persist a tracked folder's excluded subfolders (root-relative paths). The UI follows this with a
 /// `sync_local` to apply it (soft-remove now-excluded files, re-index any un-excluded ones).
 #[tauri::command]
-pub fn set_local_excludes(app: AppHandle, key: String, exclude: Vec<String>) -> Result<()> {
-    let state = app.state::<AppState>();
+pub fn set_local_excludes(
+    state: State<'_, AppState>,
+    key: String,
+    exclude: Vec<String>,
+) -> Result<()> {
     let conn = state.conn()?;
     localfolder::set_excludes(&conn, &key, &exclude)
 }
@@ -8838,7 +8799,7 @@ pub async fn export_all_data(
     // A temp *directory* (not file) so `VACUUM INTO` writes a fresh file into an empty
     // dir — it refuses a pre-existing target. The dir (and snapshot) is removed on drop.
     let tmp = tempfile::Builder::new().prefix("pm-export-").tempdir()?;
-    let snapshot = tmp.path().join("pm.sqlite");
+    let snapshot = tmp.path().join(vault::DB_FILENAME);
     let data_dir = paths::data_dir(&app)?;
     let dest = dest_path;
     // Snapshot + zip on the blocking pool (F-42): a `VACUUM INTO` can copy a multi-GB store, so on
@@ -8922,7 +8883,9 @@ fn write_export_zip(
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    zip.start_file("pm.sqlite", opts)?;
+    // The zip entry name is the layout constant, like the `.pmbackup` entry names: this archive is a
+    // same-machine copy of the vault folder, so the member has to be called what the file is called.
+    zip.start_file(vault::DB_FILENAME, opts)?;
     let mut snap = std::fs::File::open(db_snapshot)?;
     std::io::copy(&mut snap, &mut zip)?;
 
@@ -9035,22 +8998,13 @@ pub async fn create_local_backup(
     pathguard::sanitize_destination(&dest_path)?;
     // M-4: strength floor before packing — the archive embeds the raw DB key and is portable.
     vault::kdf::validate_passphrase_strength(&passphrase)?;
-    let _busy = BusyGuard::acquire(&state.backup_busy)
-        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
-    state.backup_cancel.store(false, Ordering::SeqCst);
-    emit_backup_progress(
-        &app,
-        BackupEvent::Phase {
-            phase: BackupPhase::Snapshot,
-            fraction: 0.0,
-        },
-    );
+    let _busy = begin_backup_run(&app, &state, BackupPhase::Snapshot)?;
 
     // Consistent, encrypted DB snapshot under the lock; drop the guard before the slow work.
     let tmp = tempfile::Builder::new()
         .prefix("pm-backup-snap-")
         .tempdir()?;
-    let snapshot = tmp.path().join("pm.sqlite");
+    let snapshot = tmp.path().join(vault::DB_FILENAME);
     {
         // Snapshot on the blocking pool (F-42): a `VACUUM INTO` of a multi-GB store must not pin a
         // tokio worker or hold the DB mutex on the async runtime. The guard is acquired and dropped
@@ -9140,8 +9094,10 @@ pub async fn create_local_backup(
 /// Restore a `.pmbackup` into a fresh folder under the data dir. Validated end-to-end
 /// (the DB opens with the embedded key and passes an integrity check) before anything is
 /// promoted, so a wrong passphrase or a corrupt archive never touches the live vault. On
-/// success the restored vault's key is seeded into this device's keychain; the returned
-/// summary lets the UI offer "switch to it now" (see [`switch_to_vault`]).
+/// success the restored vault's key is stashed IN MEMORY only (see [`finalize_restore`]) and the
+/// returned summary lets the UI offer "switch to it now" — [`switch_to_vault`] is the commit point
+/// that promotes the key to the keychain, so inspecting a restore never overwrites the live
+/// vault's cached key.
 #[tauri::command]
 pub async fn restore_local_backup(
     app: AppHandle,
@@ -9150,30 +9106,15 @@ pub async fn restore_local_backup(
     passphrase: String,
 ) -> Result<RestoreSummary> {
     // I-03: wipe the backup passphrase plaintext from memory on return (see `create_local_backup`).
-    let passphrase = zeroize::Zeroizing::new(passphrase);
-    if passphrase.is_empty() {
-        return Err(Error::Other("the backup passphrase is required".into()));
-    }
-    let _busy = BusyGuard::acquire(&state.backup_busy)
-        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
-    state.backup_cancel.store(false, Ordering::SeqCst);
-    emit_backup_progress(
-        &app,
-        BackupEvent::Phase {
-            phase: BackupPhase::Restore,
-            fraction: 0.0,
-        },
-    );
+    let passphrase = require_backup_passphrase(passphrase)?;
+    // Opens on `Restore`, not `Download`: the archive is already on this machine.
+    let _busy = begin_backup_run(&app, &state, BackupPhase::Restore)?;
 
     // L-5: `src_path` is a webview string pointing at an existing `.pmbackup` — require a real,
     // absolute, well-formed location before we open and validate the archive.
     pathguard::sanitize_source(&src_path)?;
     let src = std::path::PathBuf::from(src_path);
-    let data_dir = paths::data_dir(&app)?;
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let target = data_dir
-        .join(crate::wipe::RESTORE_STAGING_DIR)
-        .join(format!("restore-{ts}"));
+    let target = restore_staging_target(&app)?;
 
     let app2 = app.clone();
     let target2 = target.clone();
@@ -9191,11 +9132,6 @@ pub async fn restore_local_backup(
     Ok(finalize_restore(&app, &state, outcome))
 }
 
-/// Point this profile at a restored (or otherwise relocated) vault folder and open it.
-/// This is the deliberate commit point of a restore: it promotes the key stashed in memory
-/// by `restore_local_backup` into this device's keychain (`vault_key::<id>`), then opens.
-/// Works for a device-source vault too — no passphrase is needed because the restore
-/// recovered the key.
 /// Whether an open store holds anything the user put there — the test standing between a restore and
 /// [`crate::vault::migrate::delete_vault_artifacts`], so it errs towards "yes" at every step.
 ///
@@ -9265,7 +9201,7 @@ fn home_is_pristine(data_dir: &std::path::Path) -> Result<bool> {
     let Some(key) = vault::current_db_key(&meta)? else {
         return Ok(false); // can't resolve its key → treat as real, leave it alone
     };
-    let Ok(conn) = crate::db::open(&data_dir.join("pm.sqlite"), key.expose()) else {
+    let Ok(conn) = crate::db::open(&data_dir.join(vault::DB_FILENAME), key.expose()) else {
         return Ok(false); // unreadable → treat as real, never clobber
     };
     Ok(!db_holds_user_data(&conn))
@@ -9394,11 +9330,7 @@ pub async fn switch_to_vault(
     if let Some(key) = pending {
         secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
     }
-    let resolved = vault::ResolvedVault {
-        db_path: root.join("pm.sqlite"),
-        markdown_dir: root.join("vault"),
-        vault_root: root.clone(),
-    };
+    let resolved = vault::resolve_layout(&root, None);
     let (conn, master, report) = vault::open_at_boot(&resolved, &meta)?.ok_or_else(|| {
         Error::Other(
             "this vault's key isn't available on this device; restore it from a backup first"
@@ -9715,19 +9647,10 @@ pub(crate) async fn run_backup(
     // reference — holding it across the `.await` below is fine, whereas an owned `app` would make
     // this future self-referential.
     let state = app.state::<AppState>();
-    let _busy = BusyGuard::acquire(&state.backup_busy)
-        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
-    state.backup_cancel.store(false, Ordering::SeqCst);
-    emit_backup_progress(
-        app,
-        BackupEvent::Phase {
-            phase: BackupPhase::Snapshot,
-            fraction: 0.0,
-        },
-    );
+    let _busy = begin_backup_run(app, &state, BackupPhase::Snapshot)?;
 
     let tmp = tempfile::Builder::new().prefix("pm-backup-").tempdir()?;
-    let snapshot = tmp.path().join("pm.sqlite");
+    let snapshot = tmp.path().join(vault::DB_FILENAME);
     {
         // Snapshot on the blocking pool (F-42): a `VACUUM INTO` of a multi-GB store must not pin a
         // tokio worker or hold the DB mutex on the async runtime. The guard is acquired and dropped
@@ -10067,59 +9990,120 @@ pub async fn restore_from_proton(
     passphrase: String,
 ) -> Result<RestoreSummary> {
     // I-03/L-1: wipe the passphrase plaintext on return (it is consumed by the blocking restore below).
-    let passphrase = zeroize::Zeroizing::new(passphrase);
-    if passphrase.is_empty() {
-        return Err(Error::Other("the backup passphrase is required".into()));
-    }
-    let cli = require_proton_cli(&state)?;
-    let _busy = BusyGuard::acquire(&state.backup_busy)
-        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
-    state.backup_cancel.store(false, Ordering::SeqCst);
+    let passphrase = require_backup_passphrase(passphrase)?;
+    let dest = BackupDestination::Proton {
+        cli: require_proton_cli(&state)?,
+    };
+    let _busy = begin_backup_run(&app, &state, BackupPhase::Download)?;
+    let target = restore_staging_target(&app)?;
+
+    // The download goes through the destination enum (which threads `backup_cancel` into the CLI
+    // child, F-13) rather than calling `proton::download_archive` directly, so Proton and Drive
+    // restores now differ only in the destination value. Both steps are reported through
+    // `unwrap_restore_result` because they used to sit inside the same blocking task as the restore
+    // itself: a failure here must still emit the detached `Failed` event and still read a
+    // user-initiated Cancel as "Restore cancelled." rather than as the incidental IO error.
+    let dl = unwrap_restore_result(&app, &state, restore_scratch_dir(&dest))?;
+    unwrap_restore_result(&app, &state, dest.download(&app, &name, dl.path()).await)?;
     emit_backup_progress(
         &app,
         BackupEvent::Phase {
             phase: BackupPhase::Download,
-            fraction: 0.0,
+            fraction: 1.0,
         },
     );
 
-    let data_dir = paths::data_dir(&app)?;
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let target = data_dir
-        .join(crate::wipe::RESTORE_STAGING_DIR)
-        .join(format!("restore-{ts}"));
-
     let app2 = app.clone();
     let target2 = target.clone();
+    let local = dl.path().join(&name);
     let result = tokio::task::spawn_blocking(move || {
         let st = app2.state::<AppState>();
         let report = |phase, fraction| {
             emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
         };
-        // Pull the archive into a scratch dir that outlives the restore (dropped at return).
-        let dl = tempfile::Builder::new()
-            .prefix("pm-restore-proton-")
-            .tempdir()?;
-        crate::backup::proton::download_archive(&cli, &name, dl.path(), Some(&st.backup_cancel))?;
-        report(BackupPhase::Download, 1.0);
-        let local = dl.path().join(&name);
         backup::restore::restore(&local, &passphrase, &target2, report, &st.backup_cancel)
     })
     .await
     .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
+    // Only now: `dl` owns the downloaded archive the task above just read.
+    drop(dl);
 
     let outcome = unwrap_restore_result(&app, &state, result)?;
     Ok(finalize_restore(&app, &state, outcome))
 }
 
-/// Unwrap a finished restore task's result: on failure, report a user-initiated cancel as a
+/// Reject an empty backup passphrase, and take ownership of the plaintext so it is zeroized on
+/// return whichever way the caller leaves (I-03/L-1). Shared by the three restore commands, which
+/// are the callers that require an already-existing archive's passphrase — `create_local_backup`
+/// deliberately keeps its own wording ("a backup passphrase is required": it is minting one).
+fn require_backup_passphrase(passphrase: String) -> Result<zeroize::Zeroizing<String>> {
+    let passphrase = zeroize::Zeroizing::new(passphrase);
+    if passphrase.is_empty() {
+        return Err(Error::Other("the backup passphrase is required".into()));
+    }
+    Ok(passphrase)
+}
+
+/// Open a backup or restore run: win the single-flight guard, clear the stale cancel flag, and emit
+/// the opening phase at 0.0. Every backup/restore entry point does exactly these three things.
+///
+/// The guard is RETURNED, never dropped here — bind it (`let _busy = …`) so RAII release still
+/// happens at the end of the caller. Binding it to `_` would release `backup_busy` immediately and
+/// let two runs race into the same staging tree.
+///
+/// `phase` is a parameter because the opening phase is user-visible progress copy and the callers
+/// legitimately differ: a local restore opens on `Restore` (there is nothing to download), the two
+/// remote restores on `Download`, and the backup paths on `Snapshot`.
+fn begin_backup_run<'a>(
+    app: &AppHandle,
+    state: &'a AppState,
+    phase: BackupPhase,
+) -> Result<BusyGuard<'a>> {
+    let busy = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+    state.backup_cancel.store(false, Ordering::SeqCst);
+    emit_backup_progress(
+        app,
+        BackupEvent::Phase {
+            phase,
+            fraction: 0.0,
+        },
+    );
+    Ok(busy)
+}
+
+/// The staging folder a restore run builds into: `<data_dir>/restored-vaults/restore-<UTC stamp>`.
+///
+/// One place, because `adopt_restored_vault` gates its DESTRUCTIVE re-home (it vacates the default
+/// home) on the target still sitting under exactly this prefix, and `wipe::sweep_restore_staging`
+/// reaps the same tree at boot. A caller that minted a different shape would silently lose
+/// re-homing and leave a decryptable copy behind the GC.
+fn restore_staging_target(app: &AppHandle) -> Result<std::path::PathBuf> {
+    let data_dir = paths::data_dir(app)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    Ok(data_dir
+        .join(crate::wipe::RESTORE_STAGING_DIR)
+        .join(format!("restore-{ts}")))
+}
+
+/// A scratch directory for a remote restore to download into, named for the destination so a
+/// leftover temp folder is attributable. The archive must outlive the download, so the caller owns
+/// the `TempDir` and drops it only after the restore has read the file out of it.
+fn restore_scratch_dir(dest: &BackupDestination) -> Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix(&format!("pm-restore-{}-", dest.kind()))
+        .tempdir()?)
+}
+
+/// Unwrap a finished restore step's result: on failure, report a user-initiated cancel as a
 /// cancel (not whatever incidental error the pipeline hit when the flag flipped), emit the
 /// detached `Failed` event, and surface the error. Shared by all three restore commands.
-fn unwrap_restore_result(
-    app: &AppHandle,
-    state: &AppState,
-    result: Result<crate::backup::restore::RestoreOutcome>,
-) -> Result<crate::backup::restore::RestoreOutcome> {
+///
+/// Generic over the step's payload because the Proton path routes its scratch-dir and download
+/// failures through here too — they used to be `?`s inside the same blocking task as the restore,
+/// so this is what keeps that command's error reporting byte-identical after the download moved to
+/// the async side.
+fn unwrap_restore_result<T>(app: &AppHandle, state: &AppState, result: Result<T>) -> Result<T> {
     result.map_err(|e| {
         let msg = if state.backup_cancel.load(Ordering::SeqCst) {
             "Restore cancelled.".to_string()
@@ -10248,7 +10232,7 @@ pub async fn backup_gdrive_connect(
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, &learned_email)?;
-    crate::db::set_setting(&conn, BACKUP_GDRIVE_ENABLED_KEY, "true")?;
+    crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, true)?;
     read_gdrive_status(&conn)
 }
 
@@ -10261,7 +10245,7 @@ pub fn backup_gdrive_disconnect(state: State<'_, AppState>) -> Result<()> {
     let conn = state.conn()?;
     let account =
         crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?.filter(|s| !s.is_empty());
-    crate::db::set_setting(&conn, BACKUP_GDRIVE_ENABLED_KEY, "false")?;
+    crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false)?;
     crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, "")?;
     if let Some(email) = account {
         let is_read_connector = crate::drive::list_accounts(&conn)?
@@ -10329,37 +10313,23 @@ pub async fn restore_from_gdrive(
     passphrase: String,
 ) -> Result<RestoreSummary> {
     // I-03/L-1: wipe the passphrase plaintext on return (it is consumed by the blocking restore below).
-    let passphrase = zeroize::Zeroizing::new(passphrase);
-    if passphrase.is_empty() {
-        return Err(Error::Other("the backup passphrase is required".into()));
-    }
-    let token_key = gdrive_backup_token_key(&app)?;
-    let _busy = BusyGuard::acquire(&state.backup_busy)
-        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
-    state.backup_cancel.store(false, Ordering::SeqCst);
-    emit_backup_progress(
-        &app,
-        BackupEvent::Phase {
-            phase: BackupPhase::Download,
-            fraction: 0.0,
-        },
-    );
-
-    let data_dir = paths::data_dir(&app)?;
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let target = data_dir
-        .join(crate::wipe::RESTORE_STAGING_DIR)
-        .join(format!("restore-{ts}"));
+    let passphrase = require_backup_passphrase(passphrase)?;
+    let dest = BackupDestination::GoogleDrive {
+        token_key: gdrive_backup_token_key(&app)?,
+    };
+    let _busy = begin_backup_run(&app, &state, BackupPhase::Download)?;
+    let target = restore_staging_target(&app)?;
 
     // Pull the archive into a scratch dir (async — the Drive download is native async) that
     // outlives the blocking restore below.
-    let dl = tempfile::Builder::new()
-        .prefix("pm-restore-gdrive-")
-        .tempdir()?;
-    if let Err(e) = (BackupDestination::GoogleDrive { token_key })
-        .download(&name, dl.path())
-        .await
-    {
+    //
+    // The two failure tails below are deliberately NOT the ones the Proton command uses, and both
+    // divergences are pre-existing: a scratch-dir failure here returns with no terminal `Failed`
+    // event (leaving the panel on its last phase), and the download failure reports the raw error
+    // even when the user pressed Cancel. Unifying them would change what this command emits, so it
+    // is left for a fix that can carry a changelog line rather than folded into a refactor.
+    let dl = restore_scratch_dir(&dest)?;
+    if let Err(e) = dest.download(&app, &name, dl.path()).await {
         let msg = e.to_string();
         emit_backup_progress(
             &app,
@@ -10424,16 +10394,8 @@ pub fn set_backup_destinations(
             ));
         }
     }
-    crate::db::set_setting(
-        &conn,
-        BACKUP_PROTON_ENABLED_KEY,
-        if proton_enabled { "true" } else { "false" },
-    )?;
-    crate::db::set_setting(
-        &conn,
-        BACKUP_GDRIVE_ENABLED_KEY,
-        if gdrive_enabled { "true" } else { "false" },
-    )?;
+    crate::db::set_bool(&conn, BACKUP_PROTON_ENABLED_KEY, proton_enabled)?;
+    crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, gdrive_enabled)?;
     Ok(())
 }
 
@@ -11063,5 +11025,142 @@ mod tests {
         set_conversation_project_inner(&conn, id, Some("Atlas".into())).unwrap();
         set_conversation_project_inner(&conn, id, Some("   ".into())).unwrap();
         assert_eq!(project_of(&conn), None);
+    }
+
+    // --- finish_vault_transaction: the one tail every vault-mutating pass rides ---
+    //
+    // These are the batch's only coverage of a rollback that spans BOTH halves. There was none
+    // before, which is how `commit_review` came to write the rules file with a bare `?` — a
+    // failure there rolled the DB back and left the vault rewritten, and the vault is what the next
+    // Rebuild believes.
+
+    const TAIL_DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// A store mid-pass: one document row, and its truth file already rewritten with the prior
+    /// bytes snapshotted exactly the way every caller builds `written`.
+    fn vault_tail_fixture() -> (
+        tempfile::TempDir,
+        Connection,
+        Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TAIL_DB_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, project, tags, reviewed) \
+             VALUES (1, 'doc.md', 'T', 'h', 'Unsorted', '[]', 0)",
+            [],
+        )
+        .unwrap();
+        let doc = dir.path().join("doc.md");
+        std::fs::write(&doc, b"PRIOR").unwrap();
+        let prior = std::fs::read(&doc).unwrap();
+        std::fs::write(&doc, b"REWRITTEN").unwrap();
+        (dir, conn, vec![(doc, prior)])
+    }
+
+    fn tail_project_of(conn: &Connection) -> String {
+        conn.query_row("SELECT project FROM documents WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn tail_cipher() -> entities::RulesCipher {
+        entities::RulesCipher::from_master("test-vault", &[7u8; 32])
+    }
+
+    #[test]
+    fn a_failed_pass_rolls_back_the_db_and_puts_every_file_back() {
+        let (_dir, mut conn, written) = vault_tail_fixture();
+        let doc = written[0].0.clone();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute("UPDATE documents SET project = 'Finances' WHERE id = 1", [])
+            .unwrap();
+        let work: Result<usize> = Err(Error::Other("the pass failed".into()));
+        assert!(finish_vault_transaction(tx, written, None, work).is_err());
+
+        assert_eq!(std::fs::read(&doc).unwrap(), b"PRIOR");
+        assert_eq!(tail_project_of(&conn), "Unsorted");
+    }
+
+    #[test]
+    fn a_clean_commit_keeps_the_rewrites_and_leaves_the_rules_file_in_place() {
+        let (dir, mut conn, written) = vault_tail_fixture();
+        let doc = written[0].0.clone();
+        let cipher = tail_cipher();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute("UPDATE documents SET project = 'Finances' WHERE id = 1", [])
+            .unwrap();
+        let applied =
+            finish_vault_transaction(tx, written, Some((dir.path(), &cipher)), Ok(3usize)).unwrap();
+
+        assert_eq!(applied, 3);
+        assert_eq!(std::fs::read(&doc).unwrap(), b"REWRITTEN");
+        assert_eq!(tail_project_of(&conn), "Finances");
+        assert!(
+            entities::rules_path(dir.path()).exists(),
+            "a successful pass persists the rules file it wrote"
+        );
+    }
+
+    /// THE regression net: a rules-file write that fails after the vault is already rewritten must
+    /// take the files back with it. `commit_review` used a bare `?` here, so the DB rolled back
+    /// while every rewritten document kept its new project/tags/`reviewed: true` — and because the
+    /// vault is truth (I-02), the next Rebuild adopted a review pass the database had rejected. The
+    /// user saw only "the commit failed".
+    #[test]
+    fn a_failed_rules_write_takes_the_vault_files_back_with_it() {
+        let (dir, mut conn, written) = vault_tail_fixture();
+        let doc = written[0].0.clone();
+        let cipher = tail_cipher();
+
+        // A vault root that is a FILE: `entities.pmrules` cannot be created inside it on any
+        // platform, which is the portable stand-in for the real causes (disk full, AV lock,
+        // permissions).
+        let unwritable_root = dir.path().join("not-a-directory");
+        std::fs::write(&unwritable_root, b"x").unwrap();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute("UPDATE documents SET project = 'Finances' WHERE id = 1", [])
+            .unwrap();
+        let out =
+            finish_vault_transaction(tx, written, Some((&unwritable_root, &cipher)), Ok(1usize));
+
+        assert!(out.is_err(), "the write failure must surface");
+        assert_eq!(
+            std::fs::read(&doc).unwrap(),
+            b"PRIOR",
+            "the vault must not keep a pass the database rejected"
+        );
+        assert_eq!(tail_project_of(&conn), "Unsorted");
+    }
+
+    /// The same hole one step earlier, and it was present in all three hand-rolled tails: reading
+    /// the mirror is on the files-already-rewritten side of the commit, so it owes the same
+    /// rollback as writing it.
+    #[test]
+    fn a_failed_mirror_read_takes_the_vault_files_back_with_it() {
+        let (dir, mut conn, written) = vault_tail_fixture();
+        let doc = written[0].0.clone();
+        let cipher = tail_cipher();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute("UPDATE documents SET project = 'Finances' WHERE id = 1", [])
+            .unwrap();
+        // Transactional DDL: `rules_from_mirror` can no longer prepare its SELECT, and the drop
+        // itself rolls back with everything else.
+        tx.execute("DROP TABLE entities", []).unwrap();
+
+        let out = finish_vault_transaction(tx, written, Some((dir.path(), &cipher)), Ok(1usize));
+
+        assert!(out.is_err());
+        assert_eq!(std::fs::read(&doc).unwrap(), b"PRIOR");
+        assert_eq!(tail_project_of(&conn), "Unsorted");
+        assert!(
+            !entities::rules_path(dir.path()).exists(),
+            "nothing should have been written before the read failed"
+        );
     }
 }

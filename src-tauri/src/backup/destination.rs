@@ -102,17 +102,29 @@ impl BackupDestination {
         }
     }
 
-    /// Pull the archive named `name` into `dest_dir` (written as `dest_dir/<name>`).
-    pub async fn download(&self, name: &str, dest_dir: &Path) -> Result<()> {
+    /// Pull the archive named `name` into `dest_dir` (written as `dest_dir/<name>`). `app` is
+    /// threaded for the same reason [`Self::upload`] takes it: the Proton arm re-derives the shared
+    /// `backup_cancel` flag inside its blocking task so a mid-download Cancel kills and reaps the
+    /// CLI child (F-13) instead of waiting out the whole transfer. The Google arm ignores it — the
+    /// Drive download takes no cancel flag today (see `gdrive::download_archive`), which is why
+    /// Cancel is inert for the length of a Drive restore's Download phase.
+    ///
+    /// This arm used to hard-code `cancel: None` and carry a comment saying it was never exercised,
+    /// because `restore_from_proton` called `proton::download_archive` directly. That made the enum
+    /// the weak path: routing the live restore through it as it stood would have silently deleted
+    /// PM's only mid-download cancellation. The flag is threaded here so the two are the same path.
+    pub async fn download(&self, app: &AppHandle, name: &str, dest_dir: &Path) -> Result<()> {
         match self {
             Self::Proton { cli } => {
-                let (cli, name, dest) = (cli.clone(), name.to_string(), dest_dir.to_path_buf());
-                // `None`: this enum arm is never exercised — live Proton restore uses the direct
-                // `proton::download_archive` call in `restore_from_proton`, which threads the real
-                // cancel flag. Passing `None` keeps this dead arm compiling + timeout-bounded without
-                // dragging an AppHandle into an otherwise-cold path.
+                let (cli, name, dest, app) = (
+                    cli.clone(),
+                    name.to_string(),
+                    dest_dir.to_path_buf(),
+                    app.clone(),
+                );
                 spawn_blocking_result(move || {
-                    super::proton::download_archive(&cli, &name, &dest, None)
+                    let st = app.state::<AppState>();
+                    super::proton::download_archive(&cli, &name, &dest, Some(&st.backup_cancel))
                 })
                 .await
             }
@@ -156,6 +168,33 @@ mod tests {
             }
             .kind(),
             "gdrive"
+        );
+    }
+
+    #[test]
+    fn kind_spells_the_restore_scratch_prefixes_the_two_commands_used_to_hardcode() {
+        // `commands::restore_scratch_dir` mints `pm-restore-<kind>-`. Both restore commands used to
+        // retype that prefix; the literals below are what they said, so this is the pin that makes
+        // the substitution a rename-free refactor rather than an eyeballed one.
+        assert_eq!(
+            format!(
+                "pm-restore-{}-",
+                BackupDestination::Proton {
+                    cli: PathBuf::from("proton-drive")
+                }
+                .kind()
+            ),
+            "pm-restore-proton-"
+        );
+        assert_eq!(
+            format!(
+                "pm-restore-{}-",
+                BackupDestination::GoogleDrive {
+                    token_key: "google_oauth_token_drive::me@x.com".into()
+                }
+                .kind()
+            ),
+            "pm-restore-gdrive-"
         );
     }
 }
