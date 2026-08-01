@@ -94,6 +94,7 @@ import type {
   ReviewDecision,
   RetagEvent,
   RetagScope,
+  RetagJobState,
   RetentionOutcome,
   ReviewEvent,
   TagProposalRow,
@@ -720,15 +721,18 @@ export const retagScope = () => invoke<RetagScope>("retag_scope");
 export const proposeRetagVocabulary = () => invoke<string[]>("propose_retag_vocabulary");
 
 /** Label every document from the given (user-approved) vocabulary. STAGES proposals only —
- *  nothing is written until `commitRetag`. */
-export function applyRetagVocabulary(
-  vocabulary: string[],
-  onEvent: (event: RetagEvent) => void,
-): Promise<void> {
-  const channel = new Channel<RetagEvent>();
-  channel.onmessage = onEvent;
-  return invoke<void>("apply_retag_vocabulary", { vocabulary, onEvent: channel });
-}
+ *  nothing is written until `commitRetag`.
+ *
+ *  Takes NO callback: progress goes out globally on `retag://progress` ({@link onRetagProgress}),
+ *  because a per-call Channel is only heard by the component that invoked the command — and the tab
+ *  router unmounts that component. Do not re-add one alongside the global emit; both live at once
+ *  would count every batch twice. */
+export const applyRetagVocabulary = (vocabulary: string[]) =>
+  invoke<void>("apply_retag_vocabulary", { vocabulary });
+
+/** The re-tag pass's live snapshot — read on mount to rejoin a pass that is still running, or to
+ *  collect the vocabulary/result of one that finished while this view was unmounted. */
+export const retagStatus = () => invoke<RetagJobState>("retag_status");
 
 /** Remove a free-form tag from every document that carries it — vault, mirror and registry.
  *  Returns how many documents were rewritten. */
@@ -1063,6 +1067,13 @@ export const resumeRebuild = () => invoke<boolean>("resume_rebuild");
  *  firing after that view unmounts). */
 export const onIngestProgress = (handler: (e: IngestEvent) => void): Promise<UnlistenFn> =>
   listen<IngestEvent>("ingest://progress", (e) => handler(e.payload));
+
+/** Subscribe to global re-tag progress. Global for the same reason as `onIngestProgress`: the pass
+ *  runs on an owned AppHandle and outlives the Teach tab that started it, so the audience must not
+ *  be tied to that tab's lifetime. Pair with {@link retagStatus} on mount to rejoin a run already
+ *  in flight. */
+export const onRetagProgress = (handler: (e: RetagEvent) => void): Promise<UnlistenFn> =>
+  listen<RetagEvent>("retag://progress", (e) => handler(e.payload));
 
 /** Subscribe to live document arrivals — one per newly-committed, unreviewed document, emitted by
  *  every connector sync and by drag-and-drop import. Unlike `onIngestProgress` this reports rows
