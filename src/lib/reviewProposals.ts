@@ -127,8 +127,10 @@ export function withProposalRun(fn: () => Promise<void>): Promise<void> {
     .catch(() => {})
     .then(() => {
       if (current === tracked) current = null;
+      notifyRun();
     });
   current = tracked;
+  notifyRun();
   return run;
 }
 
@@ -153,6 +155,44 @@ const ARRIVAL_FLUSH_MS = 1500;
 let arrivalQueue: number[] = [];
 let arrivalTimer: ReturnType<typeof setTimeout> | null = null;
 let draining = false;
+
+const runListeners = new Set<(pending: boolean) => void>();
+
+/**
+ * True while ANY suggestion work is outstanding: a run in flight (the Review tab's own or a
+ * background one), a drain mid-loop, or arrivals still waiting out the flush debounce.
+ *
+ * The Review tab gates Approve on this. Filing a row before its suggestion lands commits the
+ * document's blank pre-review values and drops it out of the queue for good — and the view's own
+ * `proposing` flag can't see that, because a background run is not its run.
+ *
+ * All three terms are needed. `current` alone misses the 1.5 s debounce before a batch even starts;
+ * `draining` alone misses the Review tab's own run; and `draining` is what holds this true across
+ * the per-batch gaps in the drain loop, where `current` momentarily flips back to null.
+ *
+ * FAIL-OPEN is the load-bearing property: `drainArrivals` and `runProposalsAfterSync` swallow their
+ * errors, so a flag that could stick true would disable Approve for the rest of the session — worse
+ * than the bug it fixes. Every exit path clears it (the drain's `finally`, including both
+ * `arrivalQueue = []` bail-outs, and `withProposalRun`'s `.then`).
+ */
+export function proposalsPending(): boolean {
+  return current !== null || draining || arrivalQueue.length > 0;
+}
+
+/** Watch {@link proposalsPending} change. Returns an unsubscribe. Re-read the predicate on
+ *  (re)subscribe: StrictMode tears an effect's subscription down and back up, and a transition in
+ *  that gap would otherwise be missed — which reads as a randomly stuck button. */
+export function subscribeToProposalRun(fn: (pending: boolean) => void): () => void {
+  runListeners.add(fn);
+  return () => {
+    runListeners.delete(fn);
+  };
+}
+
+function notifyRun(): void {
+  const pending = proposalsPending();
+  for (const fn of runListeners) fn(pending);
+}
 
 function scheduleArrivalFlush(): void {
   if (arrivalTimer !== null) return;
@@ -194,6 +234,9 @@ export function proposeOnArrival(documents: Document[]): void {
   } else {
     scheduleArrivalFlush();
   }
+  // Suggestions are owed from HERE, not from when the first batch goes — the debounce is up to
+  // 1.5 s, and a Review tab that let Approve through during it would file the blank row.
+  notifyRun();
 }
 
 /** Work the arrival queue down a batch at a time. One drainer at a time — documents landing while
@@ -237,22 +280,38 @@ async function drainArrivals(): Promise<void> {
       }
     }
   } catch {
-    // Background convenience — never surfaced. (A failing `aiProviderStatus` lands here.)
+    // Background convenience — never surfaced. A failing `aiProviderStatus` lands here: a store
+    // closed under us by the writer-baton curtain, say. Drop the queue for the same reason the batch
+    // failure above does — the `finally` re-arms the flush timer, so leaving the queue populated
+    // turns a failure that isn't going away into a permanent 1.5 s retry loop, each pass costing an
+    // IPC round-trip and a key-store probe. The post-sync sweep and the Review tab re-derive.
+    arrivalQueue = [];
   } finally {
     draining = false;
     // Documents that landed as this drain was ending would otherwise sit with no drainer running
     // and no timer armed.
     if (arrivalQueue.length > 0) scheduleArrivalFlush();
+    notifyRun();
   }
 }
 
-/** Drop the pending arrival state. For tests, and for a vault lock — arrivals from a previous vault
- *  must never be proposed into a different one. */
+/**
+ * Drop the buffered arrival state — for tests, and for the writer-baton curtain, where the backend
+ * closes the store under a still-mounted webview (`vault://curtain`).
+ *
+ * NOT for a vault swap, which the old comment here claimed: every path that points PM at a different
+ * store reloads the webview, so module state cannot survive one and there is nothing to guard.
+ *
+ * `proposalCache` is deliberately KEPT. The baton comes back to the same vault, so clearing it would
+ * re-bill every pending suggestion on each hand-off — which is the one thing that cache exists to
+ * prevent.
+ */
 export function resetArrivalProposals(): void {
   if (arrivalTimer !== null) clearTimeout(arrivalTimer);
   arrivalTimer = null;
   arrivalQueue = [];
   draining = false;
+  notifyRun();
 }
 
 /**

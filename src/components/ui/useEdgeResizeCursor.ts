@@ -27,6 +27,7 @@
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { edgeAt, type WindowEdge } from "../../lib/windowEdge";
+import { subscribeUntilCleanup } from "../../lib/subscribe";
 
 /** Matches `BORDERLESS_RESIZE_INSET` in tauri-runtime-wry's `undecorated_resizing`. */
 const RESIZE_INSET = 5;
@@ -89,7 +90,6 @@ export function useEdgeResizeCursor(): void {
     const onLeave = () => apply(null);
 
     const win = getCurrentWindow();
-    let unlisten: (() => void) | undefined;
     const syncMaximized = () => {
       win
         .isMaximized()
@@ -100,12 +100,7 @@ export function useEdgeResizeCursor(): void {
         .catch(() => {});
     };
     syncMaximized();
-    win
-      .onResized(syncMaximized)
-      .then((fn) => {
-        unlisten = fn;
-      })
-      .catch(() => {});
+    const offResize = subscribeUntilCleanup(() => win.onResized(syncMaximized));
 
     window.addEventListener("mousemove", onMove, { passive: true });
     document.addEventListener("mouseleave", onLeave);
@@ -114,7 +109,7 @@ export function useEdgeResizeCursor(): void {
       window.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseleave", onLeave);
       root.classList.remove(...EDGE_CLASSES);
-      unlisten?.();
+      offResize();
     };
   }, []);
 }

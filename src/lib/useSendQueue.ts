@@ -13,7 +13,10 @@
 //   * a failed send **stops the queue** and puts its message back at the head. Continuing would be the
 //     one way to genuinely break alternation: if a turn failed after its user message was inserted but
 //     before the reply, the next send hits the alternation guard and errors too. Stopping also means a
-//     dead API key doesn't burn the whole queue against it, one message at a time;
+//     dead API key doesn't burn the whole queue against it, one message at a time. The one carve-out
+//     is a failure that lands after the user has already left that conversation: there the message is
+//     dropped rather than re-queued, because the queue it would go back into belongs to a different
+//     chat (see `generation`);
 //   * nothing is dropped and nothing is reordered — a stopped queue keeps everything, in sequence,
 //     for the user to resume or delete.
 //
@@ -97,6 +100,11 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
   // Dispatch is paused while an editor is open. A ref, not state: the drain loop tests it between
   // awaits, and a value captured when the loop started would be stale by exactly the moment it matters.
   const held = useRef(false);
+  // Bumped by `clear()`, and by nothing else. A send already in flight when the conversation changed
+  // belongs to a chat that is no longer on screen, and emptying the array cannot reach it — its
+  // message is a closure local inside the drain loop, removed before the await. Compared, never
+  // counted, so two overlapping conversation switches can't confuse it.
+  const generation = useRef(0);
   const nextId = useRef(1);
   const sendRef = useRef(send);
   sendRef.current = send;
@@ -119,8 +127,17 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
         // still waiting.
         pending.current = rest;
         publish();
+        const gen = generation.current;
         const ok = await sendRef.current(head.text);
         if (!ok) {
+          // The user left that conversation mid-send. Dropping this message is the call `clear`
+          // already made for everything behind it; re-queueing would deliver it into the chat that
+          // replaced it, and stalling would name a failure in a chat that is gone. `continue`, NOT
+          // `return`: anything the new conversation queued while this send was awaiting has no
+          // runner of its own — the `draining` guard made its `enqueue`'s `drain()` a no-op, and
+          // `clear()` starts no loop — so returning would strand it silently with `stalled` false.
+          // Alternation is safe either way: `assert_user_turn_allowed` is per-conversation.
+          if (gen !== generation.current) continue;
           // Back at the head, so order survives a failure and the user resumes from where it broke.
           pending.current = [head, ...pending.current];
           publish();
@@ -194,6 +211,9 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
     // A hold belongs to an editor that is going away with the conversation; leaving it set would
     // freeze the next chat's queue with nothing on screen to explain why.
     held.current = false;
+    // Anything already in flight was written for the conversation being left — see `drain`. Only
+    // here, so an ordinary failure (and its retry) keeps behaving exactly as it always has.
+    generation.current += 1;
   }, [publish]);
 
   return {

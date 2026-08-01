@@ -43,7 +43,19 @@ const EXCERPT_CHARS: usize = 2000;
 /// comparable. #578 should have bumped this and did not — caught here rather than left, since a
 /// missed bump silently mixes two pipelines in one accuracy readout and no later query can
 /// separate them.
-pub const FILING_PIPELINE_VERSION: i64 = 2;
+///
+/// Version 3 (2026-07-31) repairs the seed gate #607 silently disarmed: first-import proposals moved
+/// onto five-document arrival batches, and the gate was measuring THAT count against a store-wide
+/// threshold of 20, so it could never open and a fresh store's first import fragmented exactly as
+/// before. The gate now measures the store's unreviewed backlog, and the vocabulary the first batch
+/// settles on is persisted (see [`SEED_VOCAB_KEY`]) so one import files against ONE vocabulary.
+///
+/// **v3 differs from v2 on TWO axes at once**, deliberately, because they shipped together: the
+/// repaired seed gate changes what is PROPOSED, and the [`log_corrections`] guard changes which rows
+/// are LOGGED (a hand-filed row with no proposal stopped inventing a correction of nothing). A later
+/// per-source accuracy readout must therefore not read the 2 → 3 step as single-cause: v3 has both a
+/// different proposal pipeline and a smaller, truer correction population.
+pub const FILING_PIPELINE_VERSION: i64 = 3;
 
 /// The AI's proposed organisation for a document, shown in the Review view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,6 +148,88 @@ pub fn drop_cached_proposal(conn: &Connection, document_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The tag vocabulary the first batch of a fresh store's first import settled on, as a JSON array.
+///
+/// Read ONLY while `common_group_tags` is empty, so it self-retires the moment the user commits a
+/// review that establishes a real vocabulary. Persisting it is what keeps a 200-file import at ONE
+/// billable vocabulary call instead of forty — and, just as importantly, keeps every batch of that
+/// import filing against the SAME list, which is the whole point of seeding (#581).
+///
+/// Residual, accepted: a user who commits every review with all tags stripped keeps being offered
+/// the stale seed. Machine-guessed and regenerable; it rides in a `.pmbackup` verbatim, harmlessly,
+/// since a restored store only reads it while it still has no group tags of its own.
+pub const SEED_VOCAB_KEY: &str = "filing_seed_vocabulary";
+
+/// Fewest unreviewed documents in the STORE before a seed call is worth making. Below it a handful
+/// of documents cannot show a theme, and the labels would be as one-off as the ones being avoided.
+pub const SEED_VOCAB_MIN_DOCS: usize = 20;
+
+/// Titles of everything awaiting review — the store-wide view the seed call needs. The sibling of
+/// `ingest::review_queue_count`, which asks the same question by count. Titles only: bounded in
+/// width by construction, and capped in count downstream by `retag::sample_titles`.
+pub fn unreviewed_titles(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT title FROM documents WHERE reviewed = 0 ORDER BY id")?;
+    let titles = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(titles)
+}
+
+/// What the seed gate decided for one `propose_metadata` call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SeedPlan {
+    /// An earlier batch of this same import already paid for the store-wide call. Reuse its
+    /// vocabulary verbatim: one import must file against ONE list, and a re-ask would both re-bill
+    /// and disagree with the batches already filed.
+    Reuse(Vec<String>),
+    /// Ask the model for a store-wide vocabulary, then persist it under [`SEED_VOCAB_KEY`].
+    Ask,
+    /// Nothing to seed — file against whatever vocabulary the store already has.
+    None,
+}
+
+/// Decide whether this call seeds a tag vocabulary, reuses one, or does neither.
+///
+/// Extracted as a pure function on purpose. Its one caller is an async `#[tauri::command]`, so the
+/// branch is unreachable from a test in place — which is exactly how #607 disarmed it unnoticed:
+/// moving first-import proposals onto five-document arrival batches left the gate comparing a
+/// per-call count against a store-wide threshold, so it could never open again.
+///
+/// `backlog` is therefore the STORE's unreviewed count, never this call's. `pending` is only asked
+/// one question — is there anything to propose for? — so a call that will make no proposals never
+/// pays for a seed.
+pub fn seed_plan(
+    tags_empty: bool,
+    pending: usize,
+    backlog: usize,
+    stored: Option<&str>,
+) -> SeedPlan {
+    // An existing vocabulary is the USER's; replacing it with a freshly-invented one would be the
+    // opposite of the point.
+    if !tags_empty || pending == 0 {
+        return SeedPlan::None;
+    }
+    let seeded: Option<Vec<String>> = stored
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .map(|v| {
+            v.into_iter()
+                .filter(|t| !t.trim().is_empty())
+                .collect::<Vec<String>>()
+        })
+        .filter(|v| !v.is_empty());
+    if let Some(seeded) = seeded {
+        return SeedPlan::Reuse(seeded);
+    }
+    // A stored value that is blank or unreadable falls through to a fresh ask rather than filing the
+    // import against "(none yet)" — best-effort is the shipped contract, and a silent no-op here
+    // would reintroduce the fragmentation for the whole import.
+    if backlog >= SEED_VOCAB_MIN_DOCS {
+        SeedPlan::Ask
+    } else {
+        SeedPlan::None
+    }
+}
+
 /// Streamed to the UI as proposals come back (mirrors `IngestEvent`).
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -161,6 +255,14 @@ pub struct ReviewDecision {
     pub proposed_project: String,
     pub proposed_tags: Vec<String>,
     pub proposed_importance: Option<String>,
+    /// Whether a proposal was actually on screen for this row. With suggestions off (the default),
+    /// or before the model has answered, the `proposed_*` fields above just mirror the document's
+    /// own stored values — there is no proposal, so there is nothing to correct.
+    ///
+    /// `#[serde(default)]` → false, so a caller that doesn't say fails closed to "nothing to
+    /// correct". An additive IPC widening; no migration, and no stored row carries this.
+    #[serde(default)]
+    pub had_proposal: bool,
 }
 
 /// How many documents to classify per model call. Every document costs ~`EXCERPT_CHARS` of user
@@ -457,6 +559,15 @@ fn extract_json_array(raw: &str) -> Option<&str> {
 /// Log a `corrections` row for each field the user changed from the proposal.
 /// Returns how many were logged. Pure synchronous DB work.
 pub fn log_corrections(conn: &Connection, d: &ReviewDecision, title: &str) -> Result<usize> {
+    // A correction is the DIFFERENCE between what the pipeline proposed and what the user chose.
+    // With no proposal there is no difference to record: the Review view reports the document's own
+    // stored values as `proposed_*`, so a hand-filed row — the DEFAULT path, since AI suggestions
+    // ship off — logged its own values as a correction of nothing, stamped with the pipeline version
+    // and byte-identical to a real one. The rows already written stay: no value identifies a fake
+    // one (DECISIONS 2026-07-26 §3), so a purge would be guesswork over the user's data.
+    if !d.had_proposal {
+        return Ok(0);
+    }
     let mut n = 0;
     if d.project != d.proposed_project {
         insert_correction(
@@ -538,6 +649,14 @@ fn same_tags(a: &[String], b: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    /// A throwaway encrypted store, mirroring `commands`'s test fixture.
+    fn temp_db() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), key).unwrap();
+        (dir, conn)
+    }
+
     #[test]
     fn parses_fenced_json_and_normalizes_importance() {
         let raw = "```json\n{\"proposals\": [{\"index\": 1, \"project\": \"Finances\", \
@@ -573,9 +692,7 @@ mod tests {
     /// failure the column exists to prevent.
     #[test]
     fn corrections_are_stamped_with_the_pipeline_version() {
-        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        let dir = tempfile::tempdir().unwrap();
-        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let (_dir, conn) = temp_db();
         conn.execute(
             "INSERT INTO documents(id, vault_path, title, content_hash) \
              VALUES (1, 'vault/a.md', 'A', 'h')",
@@ -592,6 +709,8 @@ mod tests {
             proposed_project: "Finances".into(),
             proposed_tags: vec![],
             proposed_importance: None,
+            // There WAS a proposal here — this is the regression pin that the AI path still logs.
+            had_proposal: true,
         };
         assert_eq!(log_corrections(&conn, &d, "A").unwrap(), 3);
 
@@ -606,13 +725,56 @@ mod tests {
         assert_eq!((n, stamped), (3, 3), "every logged field carries the stamp");
     }
 
+    /// A row with no proposal behind it has nothing to correct: `decisionFor` reports the document's
+    /// own stored values as `proposed_*`, so before this guard a hand-filed document (the DEFAULT
+    /// path — AI suggestions ship off) wrote corrections of a proposal that never existed,
+    /// indistinguishable from real ones.
+    #[test]
+    fn a_row_without_a_proposal_logs_no_correction() {
+        let (_dir, conn) = temp_db();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash) \
+             VALUES (1, 'vault/a.md', 'A', 'h')",
+            [],
+        )
+        .unwrap();
+
+        // Same fixture as above — all three fields differ — but nothing proposed them.
+        let d = ReviewDecision {
+            document_id: 1,
+            project: "Atlas".into(),
+            tags: vec!["tax".into()],
+            importance: Some("high".into()),
+            proposed_project: "Unsorted".into(),
+            proposed_tags: vec![],
+            proposed_importance: None,
+            had_proposal: false,
+        };
+        assert_eq!(log_corrections(&conn, &d, "A").unwrap(), 0);
+
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM corrections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a hand-filed row writes no correction row at all");
+    }
+
+    /// `#[serde(default)]` is the fail-closed half: a caller that predates the field (or omits it)
+    /// must read as "no proposal", never as "log everything".
+    #[test]
+    fn an_omitted_had_proposal_fails_closed() {
+        let d: ReviewDecision = serde_json::from_str(
+            r#"{"document_id":1,"project":"Atlas","tags":[],"importance":null,
+                "proposed_project":"Unsorted","proposed_tags":[],"proposed_importance":null}"#,
+        )
+        .unwrap();
+        assert!(!d.had_proposal);
+    }
+
     /// A row predating the column stays NULL — "unlabelable", never silently attributed to a
     /// pipeline that didn't write it. Windowing by version must be able to exclude these.
     #[test]
     fn pre_stamp_rows_stay_null_and_are_separable() {
-        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        let dir = tempfile::tempdir().unwrap();
-        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let (_dir, conn) = temp_db();
         conn.execute(
             "INSERT INTO corrections(document_id, field, before_val, after_val, title) \
              VALUES (NULL, 'project', '\"a\"', '\"b\"', 'legacy')",
@@ -636,6 +798,76 @@ mod tests {
             &["b".into(), "a".into()]
         ));
         assert!(!same_tags(&["a".into()], &["a".into(), "b".into()]));
+    }
+
+    /// The seed's view is the whole review queue, in a stable order, and it stops at the queue —
+    /// a reviewed document's title says nothing about what still needs filing.
+    #[test]
+    fn unreviewed_titles_reads_the_whole_queue_and_only_the_queue() {
+        let (_dir, conn) = temp_db();
+        assert!(
+            unreviewed_titles(&conn).unwrap().is_empty(),
+            "a fresh store has no backlog, so it can never reach the threshold",
+        );
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, reviewed) VALUES \
+                 (1, 'vault/a.md', 'A', 'ha', 0), \
+                 (2, 'vault/b.md', 'B', 'hb', 1), \
+                 (3, 'vault/c.md', 'C', 'hc', 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            unreviewed_titles(&conn).unwrap(),
+            vec!["A".to_string(), "C".to_string()],
+        );
+    }
+
+    /// **The regression that matters.** This is the exact shape the live arrival path produces since
+    /// #607: five documents in this call, two hundred waiting in the store. The old gate read the
+    /// five and never opened; the repaired one reads the backlog.
+    #[test]
+    fn a_five_document_arrival_batch_still_seeds_from_the_stores_backlog() {
+        assert_eq!(seed_plan(true, 5, 200, None), SeedPlan::Ask);
+    }
+
+    /// The other half: once the first batch has paid, every later batch of the same import reuses
+    /// what it settled on. One vocabulary call per import, not one per five documents — and one
+    /// vocabulary for the whole import, which is the point of seeding at all.
+    #[test]
+    fn a_stored_seed_is_reused_rather_than_re_asked() {
+        let stored = serde_json::to_string(&["tax", "invoice"]).unwrap();
+        assert_eq!(
+            seed_plan(true, 5, 200, Some(&stored)),
+            SeedPlan::Reuse(vec!["tax".to_string(), "invoice".to_string()]),
+        );
+    }
+
+    /// Two negatives. An existing vocabulary is the user's, so it is never replaced; and below the
+    /// threshold there is no theme to find, so there is nothing worth billing for.
+    #[test]
+    fn an_existing_vocabulary_and_a_small_backlog_both_seed_nothing() {
+        assert_eq!(seed_plan(false, 5, 200, None), SeedPlan::None);
+        assert_eq!(
+            seed_plan(true, 5, SEED_VOCAB_MIN_DOCS - 1, None),
+            SeedPlan::None,
+        );
+        // Nothing to propose for ⇒ nothing to seed, whatever the backlog says.
+        assert_eq!(seed_plan(true, 0, 200, None), SeedPlan::None);
+    }
+
+    /// A stored value that says nothing usable must fall through to a fresh ask, never file the
+    /// import against "(none yet)" — that would spend the whole import on the fragmentation the
+    /// seed exists to prevent, silently.
+    #[test]
+    fn an_unusable_stored_seed_falls_through_to_asking() {
+        for stored in ["", "   ", "[]", "[\"\", \"  \"]", "not json", "{\"a\":1}"] {
+            assert_eq!(
+                seed_plan(true, 5, 200, Some(stored)),
+                SeedPlan::Ask,
+                "stored value {stored:?} must not be filed against",
+            );
+        }
     }
 
     fn projects() -> Vec<String> {
@@ -682,6 +914,42 @@ mod tests {
         );
         // ...and the two user messages genuinely do differ, so the test isn't vacuous.
         assert_ne!(a[1].content, b[1].content);
+    }
+
+    /// The same invariant across one IMPORT's batches, which is what the persisted seed buys. The
+    /// first batch asks for a vocabulary; every later batch reads it back from `SEED_VOCAB_KEY` and
+    /// gets a byte-identical system message — so the `cache_control` breakpoint still pays (#509).
+    /// Re-asking per batch would break both halves at once: a fresh bill and a fresh prefix.
+    #[test]
+    fn a_seeded_vocabulary_keeps_the_cached_prefix_identical_across_an_imports_batches() {
+        // What the first batch's seed call settled on, as it is persisted.
+        let seeded = vec!["tax".to_string(), "invoice".to_string()];
+        let stored = serde_json::to_string(&seeded).unwrap();
+
+        let SeedPlan::Reuse(later) = seed_plan(true, 5, 200, Some(&stored)) else {
+            panic!("a later batch of the same import must reuse the stored vocabulary");
+        };
+
+        let first = build_messages(
+            &[doc("a.pdf", "body a", Some("Taxes"))],
+            &projects(),
+            &seeded,
+            None,
+        );
+        let second = build_messages(
+            &[
+                doc("b.pdf", "body b", None),
+                doc("c.pdf", "body c", Some("Receipts")),
+            ],
+            &projects(),
+            &later,
+            None,
+        );
+        assert_eq!(
+            first[0].content, second[0].content,
+            "one import files against one vocabulary, so its cached prefix must not move",
+        );
+        assert!(first[0].content.contains("Tags to use: tax, invoice"));
     }
 
     /// Tags earn their keep by grouping, and a model shown no vocabulary invents a fresh one per

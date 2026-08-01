@@ -5,7 +5,7 @@ import React, { lazy, Suspense } from "react";
 import ReactDOM from "react-dom/client";
 import { ThemeProvider, UserTimeProvider } from "./theme";
 import { CapabilityProvider } from "./lib/capabilities";
-import { TitleBar } from "./components/ui";
+import { ErrorBoundary, TitleBar } from "./components/ui";
 import { PopoverRoot } from "./PopoverRoot";
 import "./theme/fonts";
 import "./index.css";
@@ -30,9 +30,17 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
             <div className="flex h-full flex-col">
               <TitleBar />
               <div className="min-h-0 flex-1">
-                <Suspense fallback={null}>
-                  <App />
-                </Suspense>
+                {/* INSIDE the providers (the fallback's Button reads useTheme, which throws without
+                    one) and OUTSIDE Suspense, so a failed `./App` chunk load is caught too — today
+                    that is a permanently blank, unclosable frameless window. TitleBar stays outside
+                    by construction, so the window can always be dragged and closed. This also
+                    covers App's pre-view screens and its overlays, which the boundary inside App
+                    never sees. */}
+                <ErrorBoundary what="Personal Manager">
+                  <Suspense fallback={null}>
+                    <App />
+                  </Suspense>
+                </ErrorBoundary>
               </div>
             </div>
           </CapabilityProvider>

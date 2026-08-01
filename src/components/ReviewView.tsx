@@ -23,9 +23,11 @@ import { readReviewAiEnabled, writeReviewAiEnabled } from "../lib/reviewPrefs";
 import {
   currentProposalRun,
   proposalCache,
+  proposalsPending,
   pruneProposalCache,
   publishProposal,
   seedReviewEdit,
+  subscribeToProposalRun,
   subscribeToProposals,
   withProposalRun,
 } from "../lib/reviewProposals";
@@ -65,6 +67,10 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   const [edits, setEdits] = useState<Record<number, Edit>>({});
   const [projects, setProjects] = useState<string[]>([]);
   const [proposing, setProposing] = useState(false);
+  // Whether a proposal run this view didn't start is outstanding — an arrival batch, or the sweep
+  // after a connector sync. Seeded from the shared module rather than `false`, so opening Review
+  // mid-sync starts out knowing.
+  const [bgProposing, setBgProposing] = useState(proposalsPending);
   const [committing, setCommitting] = useState(false);
   // Documents being filed one at a time via a row's own Approve button (distinct from the bulk
   // "Approve all") — tracked per id so each such row shows its own progress without disabling
@@ -90,6 +96,33 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   // a superseded run (or after the view is gone) can't write stale proposals.
   const runRef = useRef(0);
   useEffect(() => () => void runRef.current++, []);
+
+  // A background run never touches `proposing` — it isn't this view's run — so Approve has to be
+  // gated on suggestions being outstanding whoever asked for them. Filing a row before its
+  // suggestion lands commits the document's blank pre-review values and drops it out of the queue
+  // for good, so the shared module's in-flight state is mirrored here.
+  useEffect(() => {
+    // Re-read on (re)subscribe: StrictMode tears an effect's subscription down and straight back
+    // up, and a transition landing in that gap would otherwise be missed — which reads as a
+    // randomly stuck button rather than as a bug.
+    setBgProposing(proposalsPending());
+    return subscribeToProposalRun(setBgProposing);
+  }, []);
+
+  /** Suggestion work is outstanding somewhere — this view's run, an arrival batch, or the sweep. */
+  const busy = proposing || bgProposing;
+  /** This row's own suggestion is still coming. It becomes approvable the moment ITS proposal
+   *  lands, not when the whole batch finishes. */
+  const awaiting = (id: number) => busy && !proposals[id];
+  // What "Approve all" would file right now: rows still awaiting a suggestion are held back, and the
+  // rest file normally — so a 200-file sync never leaves the button dead for minutes. Inlines
+  // `awaiting` rather than calling it: that function is rebuilt every render, so naming it as a
+  // dependency would defeat the memo.
+  const approvable = useMemo(
+    () => queue.filter((d) => !(busy && !proposals[d.id])),
+    [queue, proposals, busy],
+  );
+  const heldBack = queue.length - approvable.length;
 
   useEffect(() => {
     void load();
@@ -120,9 +153,25 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   // New arrivals join the queue live, so a sync fills Review in front of the user instead of
   // presenting a finished list only once the whole run ends. Every landed document is by definition
   // unreviewed (the backend filters), so it belongs in the queue.
+  //
+  // Seeding `edits` here is what makes "every row in `queue` has an entry in `edits`" a real
+  // invariant rather than a coincidence of load ordering — and it is a crash fix, not tidiness.
+  // `updateEdit` spreads `prev[id]`, so one keystroke in an unseeded row's Project field produces a
+  // partial `{project}` with no tags; `ReviewRow`'s `value = edit ?? {…}` then stops falling back
+  // and `<TagEditor tags={undefined}>` throws on `tags.map`. With suggestions off (the default) an
+  // arrival is never seeded by the proposal subscription either, so this needs no race at all.
   useEffect(() => {
     return onDocumentsLanded((landed) => {
       setQueue((prev) => mergeLandings(prev, landed));
+      setEdits((prev) => {
+        const next = { ...prev };
+        for (const d of landed) {
+          // A re-emit of the same document must not undo a hand-edit or a streamed seed.
+          if (next[d.id]) continue;
+          next[d.id] = seedReviewEdit(editCache.get(d.id), proposalCache.get(d.id), d);
+        }
+        return next;
+      });
     });
   }, []);
 
@@ -132,14 +181,21 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       // See DocumentsView: capture the sequence before the await so a document landing during it
       // isn't lost to the wholesale `setQueue` below.
       const since = landingSeq();
-      const [q, p, cached] = await Promise.all([reviewQueue(), listProjects(), cachedProposals()]);
-      const q2 = mergeLandings(q, landingsSince(since));
-      setQueue(q2);
+      const [queried, p, cached] = await Promise.all([
+        reviewQueue(),
+        listProjects(),
+        cachedProposals(),
+      ]);
+      const merged = mergeLandings(queried, landingsSince(since));
+      setQueue(merged);
       setProjects(p);
-      // Prune cache entries for documents that have left the queue (committed/removed elsewhere).
-      // Keyed on the merged queue, not the query result — a document that landed during the await
-      // is in the queue, so its cached proposal must not be pruned as "no longer present".
-      const ids = new Set(q2.map((d) => d.id));
+      // EVERYTHING below is keyed on the merged queue, never on the query result: a document that
+      // landed during the await is on screen, so pruning, seeding and the propose set must all count
+      // it. Half of this function used to read the pre-merge list, which meant such a document was
+      // rendered with no seeded edit (one keystroke away from throwing in TagEditor), had the
+      // proposal this very function had just cached painted away, and was left out of the `missing`
+      // backstop — so it sat on "Awaiting proposal…" until something reloaded the tab.
+      const ids = new Set(merged.map((d) => d.id));
       pruneProposalCache(ids);
       for (const id of [...editCache.keys()]) if (!ids.has(id)) editCache.delete(id);
       // Hydrate the in-memory cache from the persisted proposals so a restart repaints what the model
@@ -154,16 +210,16 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       // Restore any cached proposals/edits; seed the rest from each document's current values.
       const restored: Record<number, MetadataProposal> = {};
       const seededEdits: Record<number, Edit> = {};
-      for (const d of q) {
-        const cached = proposalCache.get(d.id);
-        if (cached) restored[d.id] = cached;
-        seededEdits[d.id] = seedReviewEdit(editCache.get(d.id), cached, d);
+      for (const d of merged) {
+        const hit = proposalCache.get(d.id);
+        if (hit) restored[d.id] = hit;
+        seededEdits[d.id] = seedReviewEdit(editCache.get(d.id), hit, d);
       }
       setProposals(restored);
       setEdits(seededEdits);
       // Only ask the model for documents we don't already have a proposal for — so peeking at the
       // tab (or a few new items arriving) never re-runs proposals the model already produced.
-      const missing = q.filter((d) => !proposalCache.has(d.id)).map((d) => d.id);
+      const missing = merged.filter((d) => !proposalCache.has(d.id)).map((d) => d.id);
       // Only ask the model when suggestions are turned on — otherwise the user files these by hand.
       if (missing.length > 0 && readReviewAiEnabled()) await runProposals(missing);
     } catch (e) {
@@ -270,21 +326,38 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       proposed_project: proposal ? proposal.project : doc.project,
       proposed_tags: proposal ? proposal.tags : doc.tags,
       proposed_importance: proposal ? proposal.importance : doc.importance,
+      // The `proposed_*` mirrors above stay as they are — the backend's alias capture reads that
+      // baseline. This says whether they mean anything: with no proposal they are just the
+      // document's own values, so there is no difference for the backend to log as a correction.
+      had_proposal: !!proposal,
     };
   }
 
+  // File everything that is ready. Rows still awaiting a suggestion are left behind rather than
+  // filed blind, so the teardown has to be selective: a wholesale `setQueue([])` would take those
+  // rows off the screen while they stayed `reviewed = 0` in the store — invisible and unfilable.
   async function approveAll() {
-    if (queue.length === 0 || proposing || committingIds.size > 0) return;
+    if (approvable.length === 0 || committing || committingIds.size > 0) return;
     setCommitting(true);
     setError(null);
     try {
-      await commitReview(queue.map(decisionFor));
-      for (const d of queue) {
-        proposalCache.delete(d.id);
-        editCache.delete(d.id);
+      await commitReview(approvable.map(decisionFor));
+      const done = new Set(approvable.map((d) => d.id));
+      for (const id of done) {
+        proposalCache.delete(id);
+        editCache.delete(id);
       }
-      setQueue([]);
-      setProposals({});
+      setQueue((q) => q.filter((d) => !done.has(d.id)));
+      setProposals((prev) => {
+        const next = { ...prev };
+        for (const id of done) delete next[id];
+        return next;
+      });
+      setEdits((prev) => {
+        const next = { ...prev };
+        for (const id of done) delete next[id];
+        return next;
+      });
       onChanged();
     } catch (e) {
       setError(String(e));
@@ -300,7 +373,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     // bail on `proposing` alone while the button stayed enabled for any row that already had its
     // proposal — so mid-run the button looked live and silently did nothing. A row whose proposal
     // has arrived is complete and can be filed; only one still waiting on the model is blocked.
-    if (committing || committingIds.has(doc.id) || (proposing && !proposals[doc.id])) return;
+    if (committing || committingIds.has(doc.id) || awaiting(doc.id)) return;
     setCommittingIds((s) => new Set(s).add(doc.id));
     setError(null);
     try {
@@ -366,12 +439,14 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     return map;
   }, [queue]);
 
-  /** The other in-queue documents sharing `doc`'s folder (excluding itself); empty when it has none. */
+  /** The other in-queue documents sharing `doc`'s folder (excluding itself); empty when it has none.
+   *  Siblings still awaiting a suggestion are excluded, so the panel's count is what it will
+   *  actually file rather than an offer to file rows it must not touch. */
   function folderSiblings(doc: Document): Document[] {
     const key = folderKeyOf(doc);
     if (!key) return [];
     const ids = new Set(folderGroups.get(key) ?? []);
-    return queue.filter((d) => d.id !== doc.id && ids.has(d.id));
+    return queue.filter((d) => d.id !== doc.id && ids.has(d.id) && !awaiting(d.id));
   }
 
   /** The project a row would apply to its folder — trimmed, and only when it's a real one (the button
@@ -400,7 +475,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     const project = folderApplyProject(doc);
     if (!project) return;
     const ids = [doc.id, ...siblingIds];
-    if (proposing || committing || ids.some((id) => committingIds.has(id))) return;
+    if (ids.some(awaiting) || committing || ids.some((id) => committingIds.has(id))) return;
     setCommittingIds((s) => {
       const next = new Set(s);
       ids.forEach((id) => next.add(id));
@@ -455,7 +530,8 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
           proposal={proposals[doc.id]}
           edit={edits[doc.id]}
           committing={committingIds.has(doc.id)}
-          disabled={committing || committingIds.has(doc.id) || (proposing && !proposals[doc.id])}
+          awaiting={awaiting(doc.id)}
+          disabled={committing || committingIds.has(doc.id) || awaiting(doc.id)}
           noSuggestions={!aiEnabled || !!aiError}
           folderApplyCount={canApply && !panel ? siblings.length : 0}
           folderName={doc.source_parent_folder_name}
@@ -487,7 +563,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
           <p className="text-xs text-ink3">
             {queue.length === 0
               ? "Nothing to review"
-              : `${queue.length} to review${proposing ? " · proposing…" : ""}`}
+              : `${queue.length} to review${busy ? " · proposing…" : ""}`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -495,20 +571,34 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
             variant="tertiary"
             onClick={() => void repropose()}
             disabled={
-              proposing || committing || committingIds.size > 0 || queue.length === 0 || !aiEnabled
+              busy || committing || committingIds.size > 0 || queue.length === 0 || !aiEnabled
             }
             data-help="review-repropose"
             title="Re-run the AI proposals"
           >
             Re-propose
           </Button>
+          {/* Stays clickable during a background run and names its scope instead. A blanket-disabled
+              Approve-all would sit dead for the length of a 200-file sync with nothing on screen
+              saying why; held-back rows are the ones whose suggestion is still coming. */}
           <Button
             variant="primary"
             onClick={approveAll}
-            disabled={proposing || committing || committingIds.size > 0 || queue.length === 0}
+            disabled={approvable.length === 0 || committing || committingIds.size > 0}
+            title={
+              heldBack === 0
+                ? undefined
+                : approvable.length === 0
+                  ? "Waiting for AI suggestions…"
+                  : `${heldBack} still waiting on a suggestion`
+            }
             data-help="review-approve-all"
           >
-            {committing ? "Saving…" : "Approve all"}
+            {committing
+              ? "Saving…"
+              : heldBack > 0
+                ? `Approve ${approvable.length} ready`
+                : "Approve all"}
           </Button>
         </div>
       </header>
@@ -597,6 +687,7 @@ function ReviewRow({
   proposal,
   edit,
   committing,
+  awaiting,
   disabled,
   noSuggestions,
   folderApplyCount,
@@ -610,6 +701,10 @@ function ReviewRow({
   edit?: Edit;
   /** This row is being filed by its own Approve button (drives its "Saving…" label). */
   committing: boolean;
+  /** This row's own suggestion is still coming — the reason Approve is unavailable, as opposed to a
+   *  commit being in flight. A disabled control has no other affordance, so it becomes the button's
+   *  tooltip (the row already prints "Awaiting proposal…" below the title). */
+  awaiting: boolean;
   /** Approve is unavailable — this row's own proposal is still streaming, or a commit is in flight.
    *  A row becomes approvable the moment ITS proposal lands, not when the whole batch finishes. */
   disabled: boolean;
@@ -653,7 +748,11 @@ function ReviewRow({
             disabled={disabled}
             className="shrink-0 px-2 py-1 text-xs"
             data-help="review-approve-one"
-            title="File just this document with the values shown"
+            title={
+              awaiting
+                ? "Waiting for this file's suggestion"
+                : "File just this document with the values shown"
+            }
           >
             {committing ? "Saving…" : "Approve"}
           </Button>

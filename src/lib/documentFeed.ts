@@ -87,8 +87,18 @@ export function pushLanding(document: Document): void {
   if (timer === null) timer = setTimeout(flush, COALESCE_MS);
 }
 
-/** Drop all buffered state. For tests, and for a vault lock — arrivals from a previous vault must
- *  never be replayed into a different one. */
+/**
+ * Drop all buffered state — for tests, and for the writer-baton curtain, where the backend closes
+ * the store under a still-mounted webview (`vault://curtain`).
+ *
+ * NOT for a vault swap, which the old comment here claimed: every path that points PM at a different
+ * store reloads the webview, so no buffered arrival can outlive one.
+ *
+ * This resets `seq` to 0, which is safe only because the curtain gate short-circuits ABOVE the whole
+ * app tree — every view holding a captured `landingSeq()` is unmounted by then. Render the curtain
+ * as an overlay instead of an early return and a captured seq would survive this reset, so
+ * `landingsSince` would under-report: exactly the lost update the sequence exists to close.
+ */
 export function resetDocumentFeed(): void {
   if (timer !== null) clearTimeout(timer);
   timer = null;

@@ -3382,9 +3382,9 @@ pub async fn propose_metadata(
         folder: Option<String>,
     }
 
-    // Gather the documents + existing projects + tags + learned profile under a short
-    // lock, then drop it before any network call (rule #4).
-    let (pending, projects, tags, profile) = {
+    // Gather the documents + existing projects + tags + learned profile (+ the seed inputs) under a
+    // short lock, then drop it before any network call (rule #4).
+    let (pending, projects, tags, profile, backlog_titles, stored_seed) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         // Global + context filing preferences only: the target project isn't chosen until the model
@@ -3398,6 +3398,18 @@ pub async fn propose_metadata(
         // than coining a near-duplicate. Grouping is the entire point of a label, and a label that
         // groups one document does nothing.
         let tags = crate::tags::common_group_tags(&conn)?;
+        // The seed decision below is about the STORE, not this call: since #607 the live arrival
+        // path proposes five documents at a time, so a per-call count can never reach the threshold.
+        // Both reads are skipped entirely once the store has a vocabulary of its own — which is the
+        // only case where the seed can matter.
+        let (backlog_titles, stored_seed) = if tags.is_empty() {
+            (
+                review::unreviewed_titles(&conn)?,
+                db::get_setting(&conn, review::SEED_VOCAB_KEY)?,
+            )
+        } else {
+            (Vec::new(), None)
+        };
         let pending = {
             // Body sent to the filing model. For an index-only doc the chunks' `content` column is a
             // fixed placeholder (`INDEX_ONLY_BODY_PLACEHOLDER` — the body bytes are never stored), so
@@ -3449,7 +3461,14 @@ pub async fn propose_metadata(
                 .collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
-        (pending, projects, tags, profile)
+        (
+            pending,
+            projects,
+            tags,
+            profile,
+            backlog_titles,
+            stored_seed,
+        )
     };
 
     let mut proposed = 0;
@@ -3463,32 +3482,59 @@ pub async fn propose_metadata(
     // on day one, and repairable only by a paid pass the user has to know to run.
     //
     // Seeding closes that. One cheap titles-only call — the same one the re-tag pass uses — chooses
-    // a vocabulary with ALL the pending documents in view, and the run files against it. Only when
-    // there is nothing established to reuse: an existing vocabulary is the user's, and replacing it
-    // with a freshly-invented one would be the opposite of the point.
+    // a vocabulary with EVERY unreviewed document in view, and the whole import files against it.
+    // Only when there is nothing established to reuse: an existing vocabulary is the user's, and
+    // replacing it with a freshly-invented one would be the opposite of the point.
     //
     // Best-effort: a failed or unusable seed leaves the run exactly as it behaved before this
     // existed. Below the threshold it is not worth a call — a handful of documents cannot show a
     // theme, and the labels would be as one-off as the ones being avoided.
-    const SEED_VOCAB_MIN_DOCS: usize = 20;
-    let tags = if tags.is_empty() && pending.len() >= SEED_VOCAB_MIN_DOCS {
-        let titles: Vec<String> = pending.iter().map(|p| p.title.clone()).collect();
-        let max = retag::vocab_max(pending.len());
-        let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
-        match llm_gateway::complete(&app, &plan, &messages, false).await {
-            Ok(outcome) => {
-                let seeded = retag::parse_vocabulary(&outcome.completion.text, max);
-                usage_rows.push((
-                    outcome.completion.model.clone(),
-                    outcome.completion.usage,
-                    outcome.meta,
-                ));
-                seeded
+    //
+    // Both the threshold and the titles are measured against the STORE's unreviewed backlog, not
+    // this call's slice of it. #607 moved first-import proposals onto five-document arrival batches,
+    // which left the old `pending.len()` gate comparing 5 against 20: it could never open, and the
+    // fragmentation #581 exists to prevent came back untouched. Persisting what the first batch
+    // settles on is the other half — without it the repaired gate would bill one vocabulary call per
+    // five documents AND hand each batch a different list, which is worse than the bug.
+    let tags = match review::seed_plan(
+        tags.is_empty(),
+        pending.len(),
+        backlog_titles.len(),
+        stored_seed.as_deref(),
+    ) {
+        review::SeedPlan::None => tags,
+        review::SeedPlan::Reuse(seeded) => seeded,
+        review::SeedPlan::Ask => {
+            let max = retag::vocab_max(backlog_titles.len());
+            let messages = retag::vocabulary_messages(&retag::sample_titles(&backlog_titles), max);
+            match llm_gateway::complete(&app, &plan, &messages, false).await {
+                Ok(outcome) => {
+                    let seeded = retag::parse_vocabulary(&outcome.completion.text, max);
+                    usage_rows.push((
+                        outcome.completion.model.clone(),
+                        outcome.completion.usage,
+                        outcome.meta,
+                    ));
+                    if !seeded.is_empty() {
+                        // Its OWN scope, and taken after the model call has returned: the DB mutex
+                        // is non-reentrant and must never be held across an await (rule #4).
+                        let state = app.state::<AppState>();
+                        let conn = state.conn()?;
+                        if let Err(e) = db::set_setting(
+                            &conn,
+                            review::SEED_VOCAB_KEY,
+                            &serde_json::to_string(&seeded).unwrap_or_default(),
+                        ) {
+                            // Logged rather than swallowed: this one write is the only thing between
+                            // a 200-file import and forty billable vocabulary calls.
+                            eprintln!("review: seed vocabulary not persisted ({e})");
+                        }
+                    }
+                    seeded
+                }
+                Err(_) => Vec::new(),
             }
-            Err(_) => Vec::new(),
         }
-    } else {
-        tags
     };
 
     // Documents are classified a batch at a time: one call proposes for several, which is where
@@ -4294,6 +4340,11 @@ pub async fn set_document_metadata(
                 proposed_project: cur_project,
                 proposed_tags: serde_json::from_str(&cur_tags_json).unwrap_or_default(),
                 proposed_importance: cur_importance,
+                // This path keeps logging: unlike a hand-filed review row, the values it compares
+                // against are the document's genuine stored before-state, so the difference is a
+                // real after-the-fact correction. (The field is named for the Review view's case,
+                // which is where it decides anything.)
+                had_proposal: true,
             };
             review::log_corrections(&tx, &decision, &title)?;
             // Resolve to the canonical name + entity (a typed-in new project creates one), write the

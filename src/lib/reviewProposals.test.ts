@@ -5,9 +5,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   proposalCache,
+  proposalsPending,
   proposeOnArrival,
   resetArrivalProposals,
   seedReviewEdit,
+  subscribeToProposalRun,
   withProposalRun,
 } from "./reviewProposals";
 import { REVIEW_AI_KEY } from "./reviewPrefs";
@@ -114,6 +116,30 @@ describe("withProposalRun", () => {
     await expect(bad).rejects.toThrow("boom");
     await expect(withProposalRun(async () => {})).resolves.toBeUndefined();
   });
+
+  it("reports both edges of a run, and never drops the flag between a run and its joiner", async () => {
+    // The Review tab holds this in state, so a false observed BETWEEN two chained runs is a window
+    // in which Approve goes live and files a row whose suggestion is still coming.
+    await vi.waitFor(() => expect(proposalsPending()).toBe(false));
+    const seen: boolean[] = [];
+    const off = subscribeToProposalRun((pending) => seen.push(pending));
+    try {
+      let releaseFirst: () => void = () => {};
+      const first = withProposalRun(async () => {
+        await new Promise<void>((r) => (releaseFirst = r));
+      });
+      const second = withProposalRun(async () => {});
+      releaseFirst();
+      await Promise.all([first, second]);
+      await vi.waitFor(() => expect(proposalsPending()).toBe(false));
+    } finally {
+      off();
+    }
+    expect(seen[0]).toBe(true);
+    expect(seen[seen.length - 1]).toBe(false);
+    // Everything before the last edge is true: the joiner re-emits rather than letting the flag fall.
+    expect(seen.slice(0, -1).every(Boolean)).toBe(true);
+  });
 });
 
 // Suggestions used to be triggered by a sync FINISHING and nothing else, so a file the live watcher
@@ -209,5 +235,98 @@ describe("proposeOnArrival", () => {
     await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(1));
     await new Promise((r) => setTimeout(r, 0));
     expect(proposeMetadata).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops after ONE attempt when the provider check itself keeps failing", async () => {
+    // The writer-baton curtain closes the store under a still-mounted webview, so
+    // `aiProviderStatus` rejects for as long as the curtain is up. That lands in the drain's outer
+    // catch, which used to leave the queue populated — so the `finally` re-armed the flush timer and
+    // the whole thing became a 1.5 s retry loop, an IPC round-trip and a key-store probe each pass.
+    vi.useFakeTimers();
+    try {
+      aiProviderStatus.mockRejectedValue(new Error("the vault is locked"));
+      proposeOnArrival(Array.from({ length: 5 }, (_, i) => landed(i + 1)));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(aiProviderStatus).toHaveBeenCalledTimes(1);
+      expect(proposeMetadata).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("arms nothing further when the arrival state is reset mid-drain", async () => {
+    vi.useFakeTimers();
+    try {
+      let release: () => void = () => {};
+      proposeMetadata.mockImplementation(() => new Promise<void>((r) => (release = r)));
+      proposeOnArrival(Array.from({ length: 12 }, (_, i) => landed(i + 1)));
+      await vi.advanceTimersByTimeAsync(10);
+      expect(proposeMetadata).toHaveBeenCalledTimes(1); // batch one, still in flight
+
+      resetArrivalProposals();
+      release();
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(proposeMetadata).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the proposal cache across a reset", () => {
+    // The deliberate exclusion: the reset is for the writer baton, which comes back to the SAME
+    // vault. Clearing the cache here would re-bill every pending suggestion on each hand-off.
+    proposalCache.set(7, proposal);
+    resetArrivalProposals();
+    expect(proposalCache.get(7)).toBe(proposal);
+  });
+
+  // What the Review tab reads to decide whether Approve may fire. Getting it STUCK TRUE would
+  // disable Approve for the rest of the session, so every case here is also a fail-open check.
+  describe("proposalsPending", () => {
+    it("is true from the moment an arrival is queued, not from when the batch goes", async () => {
+      // The 1.5 s debounce is the window a run-promise-only flag would miss entirely — and the one
+      // a single dropped file spends its whole life in.
+      await vi.waitFor(() => expect(proposalsPending()).toBe(false));
+      proposeOnArrival([landed(1)]);
+      expect(proposalsPending()).toBe(true);
+    });
+
+    it("holds across the gaps between batches of one drain", async () => {
+      // `current` flips back to null between batches; `draining` is what keeps this true, which is
+      // why it is in the predicate.
+      const releases: (() => void)[] = [];
+      proposeMetadata.mockImplementation(
+        () => new Promise<void>((resolve) => releases.push(resolve)),
+      );
+      proposeOnArrival(Array.from({ length: 11 }, (_, i) => landed(i + 1)));
+
+      await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(1));
+      expect(proposalsPending()).toBe(true);
+      releases[0]();
+      await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(2));
+      expect(proposalsPending()).toBe(true);
+      releases[1]();
+      await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(3));
+      expect(proposalsPending()).toBe(true);
+
+      releases[2]();
+      await vi.waitFor(() => expect(proposalsPending()).toBe(false));
+    });
+
+    it("clears when a drain gives up, so a dead background run can't wedge Approve", async () => {
+      proposeMetadata.mockRejectedValueOnce(new Error("no credits"));
+      proposeOnArrival(Array.from({ length: 12 }, (_, i) => landed(i + 1)));
+      await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(proposalsPending()).toBe(false));
+    });
+
+    it("clears on reset", async () => {
+      await vi.waitFor(() => expect(proposalsPending()).toBe(false));
+      proposeOnArrival([landed(1)]);
+      expect(proposalsPending()).toBe(true);
+      resetArrivalProposals();
+      expect(proposalsPending()).toBe(false);
+    });
   });
 });

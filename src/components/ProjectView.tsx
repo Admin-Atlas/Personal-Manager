@@ -96,11 +96,12 @@ export function ProjectView({
   // How the Milestones panel is ordered — deadline (soonest first) by default, remembered per device
   // FOR THIS PROJECT. Display-only: the backend sort_order is untouched (governing() reads it).
   //
-  // App renders <ProjectView> without a `key`, so switching from project A to project B does NOT
-  // remount this component — a lazy useState initialiser would never re-run and B would inherit A's
-  // sort. Hence the explicit re-read on `project`. And the write lives in the toggle rather than in a
-  // `[msSort]` effect: an effect would fire AFTER the project changed and stamp the previous
-  // project's sort under the new project's name.
+  // Do NOT rely on a remount to re-read this. App's view boundary is keyed on the open project, so
+  // today switching from A to B does remount — but that key exists to stop a crashed project
+  // poisoning the next one, not to reset state here, and any change to it would silently leave B
+  // inheriting A's sort through a lazy initialiser that never re-runs. Hence the explicit re-read on
+  // `project`. And the write lives in the toggle rather than in a `[msSort]` effect: an effect would
+  // fire AFTER the project changed and stamp the previous project's sort under the new one's name.
   const [msSort, setMsSort] = useState<MsSort>(() => readMilestoneSort(project));
   useEffect(() => setMsSort(readMilestoneSort(project)), [project]);
   // Whether completed ("met") milestones are shown; default true — the scroll-to-next below tucks

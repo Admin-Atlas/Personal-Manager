@@ -24,6 +24,7 @@ import { BriefingProvider } from "./lib/briefing";
 import { Briefing } from "./components/Briefing";
 import { closeBriefingWindow, showMainWindow } from "./lib/ipc";
 import { ThemeProvider, UserTimeProvider } from "./theme";
+import { ErrorBoundary } from "./components/ui";
 import { useEdgeResizeCursor } from "./components/ui/useEdgeResizeCursor";
 
 export function PopoverRoot() {
@@ -88,7 +89,11 @@ export function PopoverRoot() {
             {/* overflow-hidden, not -y-auto: with `fill` the Briefing owns its own scroller, and
                 nesting two would give this frameless window a second scrollbar. */}
             <div className="min-h-0 flex-1 overflow-hidden px-3 py-2">
-              <Briefing variant="panel" fill />
+              {/* The body only — the drag strip above stays outside, so a throw in the briefing
+                  can never take this frameless window's only way to be moved or closed. */}
+              <ErrorBoundary what="The briefing">
+                <Briefing variant="panel" fill />
+              </ErrorBoundary>
             </div>
           </div>
         </BriefingProvider>
