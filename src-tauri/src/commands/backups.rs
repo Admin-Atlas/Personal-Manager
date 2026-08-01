@@ -41,6 +41,12 @@ fn emit_backup_progress(app: &AppHandle, ev: BackupEvent) {
                 snap.phase = Some(*phase);
                 snap.fraction = *fraction;
                 snap.last_error = None;
+                // …and drop the PREVIOUS run's outcome with it. Without this, a panel mounted
+                // mid-run replayed the last run's partial-failure banner underneath a live
+                // progress bar. Unconditional is fine here (unlike `started_at_ms` above, which
+                // must be edge-triggered): clearing is idempotent, and nothing reads
+                // `last_report` while a run is in flight.
+                snap.last_report = None;
             }
             BackupEvent::Finished { report } => {
                 snap.running = false;
@@ -168,6 +174,7 @@ pub async fn create_local_backup(
                         target_dir: None,
                         created_at: None,
                         failed_destinations: Vec::new(),
+                        retention_notes: Vec::new(),
                     },
                 },
             );
@@ -462,6 +469,26 @@ pub async fn switch_to_vault(
     // "switch" to the vault that's now already active.
     if let Ok(mut snap) = state.backup_state.lock() {
         snap.pending_restore = None;
+    }
+    Ok(())
+}
+
+/// Acknowledge the last run's outcome, so its banner stops coming back.
+///
+/// The partial-failure banner is a REPLAY: `backup_status` hands the mount effect the stored
+/// `last_report`, and only a new run ever overwrote it. Nothing re-derived it from reality, so a
+/// user who fixed the problem out-of-band — deleting the extra archives in Drive, say — kept being
+/// told about a failure that no longer existed, across tab switches and app restarts alike. A
+/// frontend-only dismiss cannot fix that; the next mount replays it.
+///
+/// Acknowledge rather than re-check, deliberately: PM cannot cheaply re-verify a genuine upload
+/// failure (that would mean uploading again), so "I've seen this" is the honest primitive. The
+/// retention half IS re-derivable and heals itself against a fresh listing instead — see
+/// `RetentionNote::over_limit`.
+#[tauri::command]
+pub fn clear_backup_report(state: State<'_, AppState>) -> Result<()> {
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.last_report = None;
     }
     Ok(())
 }
@@ -834,6 +861,10 @@ pub(crate) async fn run_backup(
     let mut any_ok = false;
     let mut succeeded: Vec<&'static str> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    // Kept apart from `failures` deliberately: retention trouble happens INSIDE the per-destination
+    // success arm, so it can never mean "this destination failed". Conflating them is what made a
+    // clean backup report a failure.
+    let mut retention_notes: Vec<crate::backup::RetentionNote> = Vec::new();
     for (i, dest) in targets.iter().enumerate() {
         // Honour Cancel between destinations (F-13): a hit during one upload stops the fan-out
         // before the next starts. With no destination yet succeeded, `any_ok` stays false and the
@@ -862,15 +893,25 @@ pub(crate) async fn run_backup(
                 if let Some(keep_n) = retention {
                     // A retention problem never fails the backup — the archive is already safely
                     // uploaded — but it must not be invisible either, or old archives pile up in
-                    // silence until the reconciliation banner notices. Route it to
-                    // `failed_destinations`, which the UI already shows as a non-blocking banner.
+                    // silence until the reconciliation banner notices.
+                    //
+                    // These used to be pushed into `failures`, which is the vec the UI renders as
+                    // "Backed up, but N destinations failed". So a destination whose upload had
+                    // SUCCEEDED was reported as having failed, and the sentence the user read
+                    // described something that never happened. They get their own field now:
+                    // `over_limit` marks the count fact, which a later listing can heal, apart
+                    // from a trim that errored, which it cannot.
                     match dest.apply_retention(keep_n as usize, &prefix).await {
                         Ok(o) if o.skipped > 0 => {
-                            failures.push(format!(
-                                "{}: {}",
-                                dest.label(),
-                                retention_refusal_message(o.skipped)
-                            ));
+                            retention_notes.push(crate::backup::RetentionNote {
+                                kind: dest.kind().to_string(),
+                                message: format!(
+                                    "{}: {}",
+                                    dest.label(),
+                                    retention_refusal_message(o.skipped)
+                                ),
+                                over_limit: true,
+                            });
                         }
                         Ok(o) if o.trashed > 0 => {
                             eprintln!(
@@ -880,10 +921,14 @@ pub(crate) async fn run_backup(
                             )
                         }
                         Ok(_) => {}
-                        Err(e) => failures.push(format!(
-                            "{}: trimming old backups failed: {e}",
-                            dest.label()
-                        )),
+                        Err(e) => retention_notes.push(crate::backup::RetentionNote {
+                            kind: dest.kind().to_string(),
+                            message: format!("{}: trimming old backups failed: {e}", dest.label()),
+                            // A transport failure, not a count fact — a fresh listing showing the
+                            // destination under its limit says nothing about whether the trim
+                            // would work now, so this must never be auto-suppressed.
+                            over_limit: false,
+                        }),
                     }
                 }
             }
@@ -924,6 +969,8 @@ pub(crate) async fn run_backup(
                     // F-22: surface the partial failure so the UI can show a non-blocking banner rather
                     // than a silent success. Empty on a clean run.
                     failed_destinations: failures.clone(),
+                    // Separate sentence, separate field: these destinations were backed up fine.
+                    retention_notes: retention_notes.clone(),
                 },
             },
         );
@@ -1253,6 +1300,7 @@ fn finalize_restore(
                 target_dir: Some(summary.target_dir.clone()),
                 created_at: Some(outcome.created_at),
                 failed_destinations: Vec::new(),
+                retention_notes: Vec::new(),
             },
         },
     );

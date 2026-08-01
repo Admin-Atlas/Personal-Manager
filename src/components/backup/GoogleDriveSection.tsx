@@ -10,6 +10,7 @@
 
 import type { ReactNode } from "react";
 
+import type { BackupPhase } from "../../lib/types";
 import { Button, SectionInfo, SectionLabel, Select } from "../ui";
 import { CloudDestinationPanel } from "./CloudDestinationPanel";
 import type { UseGdriveBackup } from "./useGdriveBackup";
@@ -19,6 +20,9 @@ export interface GoogleDriveSectionProps {
   /** The panel-wide "any op in flight" gate — `running || protonBusy || gdriveBusy`. */
   busy: boolean;
   running: boolean;
+  /** Live progress when the run in flight is THIS destination's; null otherwise. Passed straight
+   *  to `CloudDestinationPanel`, which renders the bar beside the button that started it. */
+  progress: { phase: BackupPhase | null; fraction: number; startedAt: number | null } | null;
   passphraseStored: boolean;
   keepN: number | null;
   banner: ReactNode;
@@ -31,6 +35,7 @@ export function GoogleDriveSection({
   state,
   busy,
   running,
+  progress,
   passphraseStored,
   keepN,
   banner,
@@ -109,6 +114,7 @@ export function GoogleDriveSection({
           passphraseStored={passphraseStored}
           keepN={keepN}
           running={running}
+          progress={progress}
           busy={busy}
           onBackupNow={onBackupNow}
           listError={gdriveListError}

@@ -135,8 +135,32 @@ pub struct BackupReport {
     /// Destinations that failed this run while at least one other succeeded (F-22), as
     /// `"<label>: <error>"` strings — the UI shows a non-blocking "backed up, but X failed" banner.
     /// Empty on a clean run and always empty for a restore.
+    ///
+    /// Genuine UPLOAD failures only. A keep-last-N prune that could not trim is NOT one of these —
+    /// it used to be pushed into the same vec, so a destination whose archive uploaded perfectly
+    /// was reported as "destination failed". Those go in `retention_notes`.
     #[serde(default)]
     pub failed_destinations: Vec<String>,
+    /// Retention (keep-last-N) trouble on a destination whose upload SUCCEEDED: either older
+    /// archives that could not be trimmed, or a trim that errored. Reported in its own sentence,
+    /// never under the "destination failed" headline, because the backup did reach the destination.
+    #[serde(default)]
+    pub retention_notes: Vec<RetentionNote>,
+}
+
+/// One destination's retention trouble. Carries `BackupDestination::kind()` — the stable machine
+/// key — rather than the user-facing label, so the UI can match a note against that destination's
+/// live listing without string-matching a name that is allowed to be reworded.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionNote {
+    /// `"proton"` / `"gdrive"` — `BackupDestination::kind()`.
+    pub kind: String,
+    /// Ready-to-show sentence, already naming the destination.
+    pub message: String,
+    /// Whether this is a count fact (archives are over the limit and could not be trimmed) rather
+    /// than a transport failure. Only a count fact may be auto-suppressed once a fresh listing
+    /// shows the destination back under its limit — a failed trim is not healed by the count.
+    pub over_limit: bool,
 }
 
 /// A progress event broadcast on the global `backup://progress` channel. Detached from

@@ -40,6 +40,7 @@ vi.mock("../lib/ipc", () => ({
   backupStatus: () => backupStatus(),
   backupToGdrive: vi.fn(),
   backupToProton: vi.fn(),
+  clearBackupReport: vi.fn(),
   createLocalBackup: vi.fn(),
   forgetBackupPassphrase: () => forgetBackupPassphrase(),
   getBackupSchedule: () => getBackupSchedule(),

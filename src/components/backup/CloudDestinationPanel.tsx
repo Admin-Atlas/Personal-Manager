@@ -12,8 +12,11 @@
 
 import type { ReactNode } from "react";
 
-import type { BackupEntry } from "../../lib/types";
+import type { BackupEntry, BackupPhase } from "../../lib/types";
+import { archiveStampIso } from "../../lib/backup";
+import { formatBytes, formatDateTime } from "../../lib/format";
 import { Button, Input } from "../ui";
+import { BackupRunProgress } from "./BackupRunProgress";
 
 export interface CloudDestinationPanelProps {
   /** "Proton Drive" / "Google Drive" — also spoken in the archive-list head and the hint copy. */
@@ -27,6 +30,10 @@ export interface CloudDestinationPanelProps {
   running: boolean;
   busy: boolean;
   onBackupNow: () => void;
+  /** Live progress for a run started HERE — `null` when the run belongs to another destination.
+   *  The tab-level bar sits ~800px above this button, so pressing it produced no visible feedback;
+   *  the gate is what stops one destination's run painting under the other's button. */
+  progress: { phase: BackupPhase | null; fraction: number; startedAt: number | null } | null;
   listError: string | null;
   onRetryList: () => void;
   backups: BackupEntry[] | null;
@@ -49,6 +56,7 @@ export function CloudDestinationPanel({
   running,
   busy,
   onBackupNow,
+  progress,
   listError,
   onRetryList,
   backups,
@@ -76,13 +84,26 @@ export function CloudDestinationPanel({
         </Button>
       </div>
       {passphraseStored ? (
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-xs text-ink4">
-            Backs up with your remembered passphrase and keeps the last {keepN}.
-          </p>
-          <Button variant="secondary" onClick={onBackupNow} disabled={busy} className="shrink-0">
-            {running ? "Backing up…" : "Back up now"}
-          </Button>
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs text-ink4">
+              Backs up with your remembered passphrase and keeps the last {keepN}.
+            </p>
+            <Button variant="secondary" onClick={onBackupNow} disabled={busy} className="shrink-0">
+              {running ? "Backing up…" : "Back up now"}
+            </Button>
+          </div>
+          {/* Stop lives on the tab-level instance only — two would be ambiguous to a reader and
+              to the section-scoped tests, which resolve controls from a section heading. */}
+          {progress && (
+            <BackupRunProgress
+              running={running}
+              phase={progress.phase}
+              fraction={progress.fraction}
+              startedAt={progress.startedAt}
+              showStop={false}
+            />
+          )}
         </div>
       ) : (
         <p className="text-xs text-ink4">
@@ -107,24 +128,53 @@ export function CloudDestinationPanel({
           <p className="mt-1 text-xs text-ink4">No backups yet.</p>
         ) : (
           <ul className="mt-1 flex flex-col gap-1">
-            {backups.map((b) => (
-              <li key={b.name} className="flex items-center justify-between gap-2 text-xs">
-                <span className="min-w-0 truncate text-ink3" title={b.name}>
-                  {b.name}
-                </span>
-                <Button
-                  variant="tertiary"
-                  onClick={() => {
-                    setRestoreName(b.name);
-                    setRestorePass("");
-                    onClearRestored();
-                  }}
-                  disabled={busy}
+            {backups.map((b) => {
+              // WHEN leads, because that is the only thing distinguishing one archive from
+              // another. The backend name is `pm-backup-<vault-id>-<stamp>.pmbackup` — 68
+              // characters with the timestamp LAST, so a truncating span removed precisely the
+              // date the row exists to convey. The name is load-bearing (retention sort key and
+              // the restore argument) and is not renamed; it is read instead, and demoted to the
+              // second line where it may truncate harmlessly.
+              const iso = archiveStampIso(b.name);
+              return (
+                <li
+                  key={b.name}
+                  className="flex min-w-0 items-center justify-between gap-2 text-xs"
                 >
-                  Restore
-                </Button>
-              </li>
-            ))}
+                  <span className="min-w-0 flex-1">
+                    {/* A foreign .pmbackup can sit in the same folder (the listing filters on
+                        extension alone), so an unparsed name still renders — never drop a row. */}
+                    {iso ? (
+                      <>
+                        {/* Local wall clock from a UTC stamp: near midnight this can show a
+                            different date from the one embedded in the name still visible on
+                            hover. Harmless — the transform is monotonic, so newest-first holds. */}
+                        <span className="block text-ink2">{formatDateTime(iso)}</span>
+                        <span className="block truncate text-ink4" title={b.name}>
+                          {formatBytes(b.size)} · {b.name}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="block truncate text-ink3" title={b.name}>
+                        {b.name}
+                      </span>
+                    )}
+                  </span>
+                  <Button
+                    variant="tertiary"
+                    className="shrink-0"
+                    onClick={() => {
+                      setRestoreName(b.name);
+                      setRestorePass("");
+                      onClearRestored();
+                    }}
+                    disabled={busy}
+                  >
+                    Restore
+                  </Button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>

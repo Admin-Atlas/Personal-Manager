@@ -34,16 +34,22 @@ import {
   backupArchivePrefix,
   backupNow,
   backupStatus,
+  clearBackupReport,
   createLocalBackup,
   onBackupProgress,
   pruneOwnBackups,
   setBackupPassphrase,
   setBackupSchedule,
 } from "../lib/ipc";
-import type { BackupPhase, PassphraseScore, RestoreSummary } from "../lib/types";
-import { describeFailures, describeForgetConsequences } from "../lib/backup";
+import type { BackupPhase, PassphraseScore, RestoreSummary, RetentionNote } from "../lib/types";
+import {
+  describeFailures,
+  describeForgetConsequences,
+  localSaveStamp,
+  visibleRetentionNotes,
+} from "../lib/backup";
 import { readReconcileDismissed, writeReconcileDismissed } from "../lib/backupPrefs";
-import { SectionInfo } from "./ui";
+import { Button, SectionInfo } from "./ui";
 import { AutomaticBackupsSection } from "./backup/AutomaticBackupsSection";
 import { BackupPassphraseSection } from "./backup/BackupPassphraseSection";
 import { BackupRunProgress } from "./backup/BackupRunProgress";
@@ -69,11 +75,19 @@ export function BackupSettings() {
   // reopening this panel mid-op doesn't restart the elapsed timer. The backend stamps it
   // edge-triggered on idle -> running, so it survives every phase transition.
   const [startedAt, setStartedAt] = useState<number | null>(null);
+  // WHICH destination the running backup is for. `BackupEvent` carries no destination (types.ts),
+  // and running/phase/fraction are global — so a per-section progress bar needs this or a
+  // Proton-only run paints "Uploading" under Google Drive's button too. Set by the call site that
+  // started the run, which is the only place that knows.
+  const [activeDest, setActiveDest] = useState<"proton" | "gdrive" | "local" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   // Non-blocking "backed up, but some destinations failed" banner (F-22): distinct from `error`
   // (the whole op failed) and `message` (clean success). Set from a finished run's report.
   const [warning, setWarning] = useState<string | null>(null);
+  // Retention trouble is tracked apart from `warning`: those destinations were backed up fine, and
+  // unlike a genuine upload failure this half can be re-derived from a fresh listing.
+  const [retentionNotes, setRetentionNotes] = useState<RetentionNote[]>([]);
 
   // The passphrase that locks every backup (manual saves read it directly; "Remember on this
   // device" additionally stows it in the keychain for unattended scheduled runs).
@@ -173,7 +187,10 @@ export function BackupSettings() {
         if (s.last_error) setError(s.last_error);
         // Re-surface a partial-failure banner from the last finished run (F-22), so navigating
         // away and back doesn't lose "backed up, but Google Drive failed".
-        if (s.last_report) setWarning(describeFailures(s.last_report.failed_destinations));
+        if (s.last_report) {
+          setWarning(describeFailures(s.last_report.failed_destinations));
+          setRetentionNotes(s.last_report.retention_notes ?? []);
+        }
         // Re-offer the "switch to the restored vault" button after the panel was closed and
         // reopened: the backend still holds the staged restore (key + summary) for this session,
         // so we don't make the user redo the whole restore just because the UI unmounted.
@@ -191,18 +208,22 @@ export function BackupSettings() {
         // stamp comes from the snapshot fetch above; this just covers a mount that beat it.
         setStartedAt((prev) => prev ?? Date.now());
         setWarning(null); // a fresh run started — drop any stale partial-failure banner
+        setRetentionNotes([]);
       } else if (e.type === "finished") {
         setRunning(false);
         setPhase(null);
         setFraction(1);
         setStartedAt(null);
+        setActiveDest(null);
         // F-22: some destinations may have failed while others succeeded (a partial success the
         // backend still reports as "finished"). Surface them non-blockingly; null clears cleanly.
         setWarning(describeFailures(e.report.failed_destinations));
+        setRetentionNotes(e.report.retention_notes ?? []);
       } else if (e.type === "failed") {
         setRunning(false);
         setPhase(null);
         setStartedAt(null);
+        setActiveDest(null);
         setError(e.message);
       }
     });
@@ -237,6 +258,27 @@ export function BackupSettings() {
   const protonOverLimit = protonOwnCount !== null && keepN !== null && protonOwnCount > keepN;
   const gdriveOverLimit = gdriveOwnCount !== null && keepN !== null && gdriveOwnCount > keepN;
 
+  // Is this destination STILL over its limit? Three answers, and `null` (unknown) is the important
+  // one: a count is null while the listing is loading, when the request threw, and when the write
+  // scope is missing. Collapsing any of those to "not over the limit" would suppress a true warning
+  // exactly when PM can least see the destination, so they stay null and the note stays up.
+  function stillOverLimit(kind: string): boolean | null {
+    const own = kind === "proton" ? protonOwnCount : kind === "gdrive" ? gdriveOwnCount : null;
+    if (own === null || keepN === null) return null;
+    return own > keepN;
+  }
+  // Deleting the extra archives at the destination therefore clears its note on the next visit,
+  // with no new IPC and no polling — which is the case that made this banner feel stuck.
+  const liveRetentionNotes = visibleRetentionNotes(retentionNotes, stillOverLimit);
+
+  async function dismissLastReport() {
+    setWarning(null);
+    setRetentionNotes([]);
+    // The banner is served from the BACKEND snapshot on every mount, so clearing local state alone
+    // brings it straight back on the next tab switch — which is the reported bug.
+    await clearBackupReport().catch(() => {});
+  }
+
   async function doRememberPass() {
     if (!backupValid) return;
     setError(null);
@@ -259,7 +301,11 @@ export function BackupSettings() {
     let dest: string | null;
     try {
       dest = await saveFileDialog({
-        defaultPath: "personal-manager-backup.pmbackup",
+        // Stamped like the cloud archives, so a folder of local saves is orderable and a second
+        // save doesn't silently offer to overwrite the first. Compact UTC (not the DD-MM-YYYY
+        // house format) because a colon-free, lexically sortable name is the whole point here.
+        // Nothing parses this string — the user can still rename it in the dialog.
+        defaultPath: `personal-manager-backup-${localSaveStamp()}.pmbackup`,
         filters: [{ name: "PM encrypted backup", extensions: ["pmbackup"] }],
       });
     } catch (e) {
@@ -290,6 +336,7 @@ export function BackupSettings() {
     setMessage(null);
     try {
       setRunning(true);
+      setActiveDest(kind);
       await backupNow(kind);
       setMessage(kind === "proton" ? "Backed up to Proton Drive." : "Backed up to Google Drive.");
       if (kind === "proton") await refreshProton();
@@ -299,6 +346,7 @@ export function BackupSettings() {
       setError(String(e));
     } finally {
       setRunning(false);
+      setActiveDest(null);
     }
   }
 
@@ -421,10 +469,24 @@ export function BackupSettings() {
 
       {error && <p className="mt-2 break-words text-xs text-st-due">{error}</p>}
       {/* F-22: a partial success (some destinations failed, at least one succeeded) — a non-blocking
-          notice in the shared warning-box idiom, kept separate from `error` (whole op failed). */}
-      {warning && (
+          notice in the shared warning-box idiom, kept separate from `error` (whole op failed).
+          Dismiss is required, not decoration: this box is REPLAYED from the backend snapshot on
+          every mount, and only a new run ever overwrote it, so a user who repaired the problem
+          out-of-band was told about it forever. PM cannot cheaply re-verify an upload failure, so
+          acknowledging is the honest primitive — the retention half below heals itself instead. */}
+      {(warning || liveRetentionNotes.length > 0) && (
         <div className="mt-2 break-words rounded-[var(--radius)] border px-3 py-2 text-sm text-st-due">
-          {warning}
+          {warning && <p>{warning}</p>}
+          {liveRetentionNotes.map((n) => (
+            <p key={`${n.kind}:${n.message}`} className={warning ? "mt-1" : undefined}>
+              Backed up. {n.message}
+            </p>
+          ))}
+          <div className="mt-2 flex justify-end">
+            <Button variant="tertiary" onClick={() => void dismissLastReport()}>
+              Dismiss
+            </Button>
+          </div>
         </div>
       )}
       {message && <p className="mt-2 break-all text-xs text-st-quick">{message}</p>}
@@ -476,6 +538,7 @@ export function BackupSettings() {
         keepN={keepN}
         banner={reconcileBanner("proton")}
         onDisconnect={() => setConfirmDisconnect("proton")}
+        progress={activeDest === "proton" ? { phase, fraction, startedAt } : null}
         onBackupNow={() => void doBackupNow("proton")}
         onClearRestored={() => setRestored(null)}
       />
@@ -490,6 +553,7 @@ export function BackupSettings() {
         keepN={keepN}
         banner={reconcileBanner("gdrive")}
         onDisconnect={() => setConfirmDisconnect("gdrive")}
+        progress={activeDest === "gdrive" ? { phase, fraction, startedAt } : null}
         onBackupNow={() => void doBackupNow("gdrive")}
         onClearRestored={() => setRestored(null)}
       />
