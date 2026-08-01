@@ -135,6 +135,75 @@ describe("segmentByLeaves", () => {
     ]);
     expect(segs.map((s) => s.chunkId)).toEqual([3]);
   });
+
+  // WHY THESE EXIST. The splitter re-seeds each new leaf with the trailing whole units of the one it
+  // just flushed (CHUNK_OVERLAP_TOKENS), so stored leaf ranges genuinely overlap — `start_offset` of
+  // leaf N+1 is strictly less than `end_offset` of leaf N. That is deliberate and retrieval depends
+  // on it; the reader is the layer that has to adapt, by clipping. Before the clip, the overlay
+  // rendered the shared run twice: once at the tail of one band, once at the head of the next, so
+  // "Show chunks" showed different text from the same document with the toggle off.
+
+  it("tiles overlapping leaves, so the shared run is rendered exactly once", () => {
+    // THE regression property. Two leaves whose ranges overlap (leaf 2 starts inside leaf 1, exactly
+    // as overlap_seed produces): the concatenation must be the source span, byte for byte.
+    const body = "0123456789abcdefghij";
+    const segs = segmentByLeaves(body, [
+      leaf({ id: 1, ordinal: 0, start_offset: 0, end_offset: 12 }),
+      leaf({ id: 2, ordinal: 1, start_offset: 8, end_offset: 20 }),
+    ]);
+    expect(segs.map((s) => s.text).join("")).toBe(body.slice(0, 20));
+    // The overlapped run "89ab" belongs to the EARLIER chunk — the same rule makeByteToChar uses for
+    // a straddling code point. Flipping that attribution is a decision, not a tidy-up.
+    expect(segs[0].text).toBe("0123456789ab");
+    expect(segs[1].text).toBe("cdefghij");
+  });
+
+  it("does not repeat a shared paragraph across two bands", () => {
+    // The realistic shape: leaf 1 = paragraphs 0-1, leaf 2 = paragraphs 1-2 (whole-unit overlap).
+    const paras = ["First paragraph here.", "Second paragraph here.", "Third paragraph here."];
+    const body = paras.join("\n\n");
+    const p1Start = utf8Bytes(paras[0] + "\n\n");
+    const p1End = p1Start + utf8Bytes(paras[1]);
+    const segs = segmentByLeaves(body, [
+      leaf({ id: 1, ordinal: 0, start_offset: 0, end_offset: p1End }),
+      leaf({ id: 2, ordinal: 1, start_offset: p1Start, end_offset: utf8Bytes(body) }),
+    ]);
+    expect(segs[1].text.startsWith(paras[1])).toBe(false);
+    const all = segs.map((s) => s.text).join("");
+    expect(all).toBe(body);
+    expect(all.split(paras[1]).length - 1).toBe(1); // paragraph 1 occurs exactly once
+  });
+
+  it("clips on a non-ASCII body without re-introducing byte/char drift", () => {
+    // Clipping composes with the byte→char mapping: the cursor is a UTF-16 index, the offsets are
+    // bytes, and mixing the two up is exactly the class of bug this module exists to prevent.
+    const body = "Café ☕ naïve 😀 résumé done";
+    const mid = utf8Bytes("Café ☕ naïve "); // inside leaf 1, start of leaf 2
+    const segs = segmentByLeaves(body, [
+      leaf({ id: 1, ordinal: 0, start_offset: 0, end_offset: utf8Bytes("Café ☕ naïve 😀") }),
+      leaf({ id: 2, ordinal: 1, start_offset: mid, end_offset: utf8Bytes(body) }),
+    ]);
+    expect(segs.map((s) => s.text).join("")).toBe(body);
+    expect(segs[0].text).toBe("Café ☕ naïve 😀");
+    expect(segs[1].text).toBe(" résumé done");
+  });
+
+  it("yields an empty band, not a reversed slice, for a leaf inside its predecessor", () => {
+    // Monotonic end offsets make this unreachable from the splitter; it pins the Math.max, because
+    // body.slice(hi, lo) silently returns "" from the wrong reasoning and a negative range would
+    // otherwise surface as text taken from somewhere else entirely.
+    const body = "alpha beta gamma";
+    const segs = segmentByLeaves(body, [
+      leaf({ id: 1, ordinal: 0, start_offset: 0, end_offset: 16 }),
+      leaf({ id: 2, ordinal: 1, start_offset: 6, end_offset: 10 }),
+      leaf({ id: 3, ordinal: 2, start_offset: 11, end_offset: 16 }),
+    ]);
+    // Every leaf still gets a band — the overlay promises a 1:1 chunk→band mapping.
+    expect(segs.map((s) => s.chunkId)).toEqual([1, 2, 3]);
+    expect(segs[1].text).toBe("");
+    expect(segs[2].text).toBe("");
+    expect(segs.map((s) => s.text).join("")).toBe(body);
+  });
 });
 
 describe("shadeLeaves and parentGroupStarts", () => {

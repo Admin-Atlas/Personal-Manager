@@ -723,6 +723,36 @@ mod tests {
     }
 
     #[test]
+    fn packed_leaves_really_do_overlap() {
+        // The overlap is a CONTRACT another layer depends on, and nothing pinned it: the golden
+        // exercises only `split_oversized`, which tiles exactly (`start == prev_end`), so the
+        // overlap path could break without moving a single pinned byte. The reader's chunk overlay
+        // (src/lib/chunkOverlay.ts) clips consecutive leaves against each other precisely because
+        // this holds — the shared run must be rendered once, not twice. If this test ever fails,
+        // the clip is not wrong, but its comment about why it exists has stopped being true.
+        let para = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let body = vec![para; 40].join("\n\n");
+        let chunks = split_with(&body, "Doc", 50, 10);
+        let leaves: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Leaf)
+            .collect();
+        assert!(leaves.len() > 1, "should split into multiple leaves");
+        let overlapping = leaves
+            .windows(2)
+            .filter(|w| w[1].start_offset < w[0].end_offset)
+            .count();
+        assert!(
+            overlapping > 0,
+            "no adjacent leaf pair overlaps; offsets: {:?}",
+            leaves
+                .iter()
+                .map(|c| (c.start_offset, c.end_offset))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn oversized_single_block_is_split_to_target() {
         // One paragraph far over the budget, no internal blank lines → must still be broken up.
         let big = (0..400)
@@ -926,8 +956,14 @@ mod tests {
             " 1 parent [  90.. 401] uid=e03b1cbcc135d94468385b2d4c4505e6 parent=-------------------------------- embed=e3b0c442 head=Numbers\n",
             " 2 leaf   [  90.. 101] uid=1e7bbc80b4427d21b89eb1f4942f19a3 parent=e03b1cbcc135d94468385b2d4c4505e6 embed=324bbd83 head=Numbers\n",
             " 3 leaf   [ 102.. 163] uid=9b7350399db695d55a3dbfa5271bd4e1 parent=e03b1cbcc135d94468385b2d4c4505e6 embed=1b8ebb40 head=Numbers\n",
-            // Leaves 3/4 and 5/6 share a boundary byte: that is the token overlap, and a change
-            // to CHUNK_OVERLAP_TOKENS' handling shows up right here.
+            // Leaves 3/4 and 5/6 share a boundary byte EXACTLY (163..163, 265..265): that is
+            // `split_oversized` tiling one over-budget unit — the 4-row table and the 3-line
+            // paragraph — and NOT the token overlap. `overlap_seed` emits `start < prev_end`,
+            // never `start == prev_end`, and no leaf here does, so this golden pins zero overlap
+            // and would not move if the overlap path broke. The overlap contract is pinned
+            // separately by `packed_leaves_really_do_overlap`; the comment here used to claim
+            // otherwise, which is how the reader's double-render went unnoticed (the overlay
+            // clips against exactly this property — src/lib/chunkOverlay.ts).
             " 4 leaf   [ 163.. 181] uid=48db6560681126cf90d4b40951c83737 parent=e03b1cbcc135d94468385b2d4c4505e6 embed=a32bb8c9 head=Numbers\n",
             " 5 leaf   [ 183.. 265] uid=86e142c76f3627c6016cf4172c10116a parent=e03b1cbcc135d94468385b2d4c4505e6 embed=d17c203e head=Numbers\n",
             " 6 leaf   [ 265.. 401] uid=80c47e774df0137505e00e1ecd6daa1a parent=e03b1cbcc135d94468385b2d4c4505e6 embed=ecd8d591 head=Numbers\n",

@@ -206,8 +206,22 @@ fn enumerate_sources(inputs: &PackInputs) -> Result<Vec<Source>> {
         crate::index_only::MANIFEST_FILENAME,
     )?;
 
-    if inputs.markdown_dir.is_dir() {
-        collect_tree(&mut out, &inputs.markdown_dir, "vault")?;
+    // The same NotFound-vs-Err split as `push_optional` above, and for a much larger stake. `is_dir()`
+    // is `metadata(..).map(..).unwrap_or(false)`, so a permission denial, an I/O error or a synced
+    // share dropping mid-run read as "this vault has no Markdown" — and the archive then packed,
+    // verified and reported success with the ENTIRE vault missing. A backup may only omit what it can
+    // prove is not there.
+    match std::fs::metadata(&inputs.markdown_dir) {
+        Ok(m) if m.is_dir() => collect_tree(&mut out, &inputs.markdown_dir, "vault")?,
+        // Provably nothing to pack: no vault folder yet, or something that is not a directory sitting
+        // under the name (which `is_dir()` also skipped, and which `collect_tree` could not walk).
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::Other(format!(
+                "backup could not read the vault folder: {e}"
+            )))
+        }
     }
     Ok(out)
 }

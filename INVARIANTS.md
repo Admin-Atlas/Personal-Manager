@@ -231,6 +231,12 @@ considered against all six:
 **Why.** A walk that misses a subdirectory does not error — it silently excludes those files from
 whatever it was for. A re-key that skips a subdirectory strands the files in it permanently.
 
+A walk's completeness is cleared by an unreadable *entry* as well as an unreadable *directory*.
+`Path::is_file()` and `Path::is_dir()` are `metadata(..).map(..).unwrap_or(false)` — they return
+`false` both for "this is not that" and for "the stat failed" — so **they are banned inside a vault
+walk**. Use `ingest::probe`, which distinguishes them: only `NotFound` may be read as an absence,
+because a deletion decision may only ever be made on a *provable* absence.
+
 **Co-signers.** A PR that adds a file kind or a subdirectory to the vault walks this list and
 states, per row, whether it applies. A new walker is added to the table.
 

@@ -203,11 +203,13 @@ pub(crate) fn apply_event(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
             ingested,
             skipped,
             failed,
+            unreadable,
         } => {
             snap.last_report = Some(crate::IngestReport {
                 ingested: *ingested,
                 skipped: *skipped,
                 failed: *failed,
+                unreadable: *unreadable,
             });
         }
         IngestEvent::Started { name, .. } => push_recent(
@@ -311,6 +313,14 @@ pub enum IngestEvent {
         ingested: usize,
         skipped: usize,
         failed: usize,
+        /// Entries the enumeration could not read — a folder that would not open, a directory entry
+        /// that errored, a path whose stat was refused. Separate from `failed`, which counts files
+        /// PM saw and could not index: these were never seen at all, so they are in none of the other
+        /// three counters and are absent from `Counted { total }` as well. Without it the summary
+        /// sentence claims a clean run over a walk that quietly lost most of the drop.
+        ///
+        /// Counted in *entries*, not files: one unopenable directory is 1, however much sits inside.
+        unreadable: usize,
     },
 }
 
@@ -353,7 +363,7 @@ pub fn run(
     // The vault's Markdown dir + cipher for this whole run (they don't change mid-run).
     // Snapshotting up front means we never hold the vault lock across a sidecar call.
     let (vault, cipher) = state.markdown_io()?;
-    let files = collect_files(&inputs);
+    let (files, unreadable) = collect_files(&inputs);
     let _ = on_event.send(IngestEvent::Counted { total: files.len() });
 
     // If the vault has no documents yet, everything this run indexes is produced under the
@@ -424,6 +434,7 @@ pub fn run(
         ingested,
         skipped,
         failed,
+        unreadable,
     });
     Ok(())
 }
@@ -433,8 +444,9 @@ pub fn run(
 #[allow(clippy::large_enum_variant)]
 enum Outcome {
     /// Indexed, with an optional note about something that went wrong WITHOUT stopping the file
-    /// landing — today only "OCR was asked for and did not run" (see [`ingest_photo`]). It rides
-    /// the terminal event rather than a log line because the document itself looks perfectly
+    /// landing — "OCR was asked for and did not run", and "the vault copy of the original could not
+    /// be saved" (both [`ingest_photo`]; [`join_warnings`] folds them, since either can fire alone).
+    /// It rides the terminal event rather than a log line because the document itself looks perfectly
     /// normal afterwards; nothing else would ever tell the user.
     Indexed {
         document: Document,
@@ -560,9 +572,10 @@ fn ingest_one(
 /// the identity (SHA-256 = both the dedupe `content_hash` and `photos.file_hash`), so a moved/renamed
 /// file still dedupes. OCR is requested only when the optional component is installed; declining it
 /// still ingests the photo with its EXIF metadata chunk. With `copy_photos_to_vault`, the original is
-/// copied into `vault/photos/` first (following the vault cipher) and recorded on the `photos` row —
-/// this also applies on a dedupe hit (a re-drop with the opt-in newly checked saves the copy without
-/// re-indexing).
+/// copied into `vault/photos/` (following the vault cipher) and recorded on the `photos` row — this
+/// also applies on a dedupe hit (a re-drop with the opt-in newly checked saves the copy without
+/// re-indexing). On the fresh path that copy happens **after** the index commits and cannot fail the
+/// import; see the comment at the call.
 fn ingest_photo(
     state: &AppState,
     gateway: &ModelGateway<'_>,
@@ -643,10 +656,11 @@ fn ingest_photo(
         ocr_text.as_deref().unwrap_or(""),
     );
 
-    // Opt-in: copy the original into vault/photos/ (per the vault cipher) before writing the record.
+    // Opt-in: PREDICT where the copy will go. No IO here — the copy itself happens after the index
+    // commits, below. The name is deterministic from the hash, the extension and the cipher's policy,
+    // and [`photo_copy_rel_path`] is the single expression that computes it for both.
     let (saved_to_vault, image_vault_path) = if opts.copy_photos_to_vault {
-        let rel = copy_original_to_vault(vault, cipher, &bytes, &file_hash, ext)?;
-        (true, Some(rel))
+        (true, Some(photo_copy_rel_path(cipher, &file_hash, ext)))
     } else {
         (false, None)
     };
@@ -700,7 +714,8 @@ fn ingest_photo(
         source_path: Some(path.to_string_lossy().into()),
         vault_path: vault_name,
         title,
-        content_hash: file_hash,
+        // Cloned, not moved: the post-commit vault copy below still names the file by this hash.
+        content_hash: file_hash.clone(),
         ext: ext.map(str::to_string),
         byte_size: Some(byte_size),
         created_at: Some(capture_date),
@@ -722,10 +737,54 @@ fn ingest_photo(
         Some(&photo),
         None,
     )?;
+
+    // The copy runs LAST, after the document is committed, and deliberately without `?`.
+    //
+    // It used to run before the split/embed/vault-write/index above, any of which can fail — and on
+    // that failure `index_fresh_document` removed the Markdown it had written while nothing removed
+    // the photo blob. The blob is content-addressed, so after the rollback no document row, no photos
+    // row and no vault file named its hash: `find_saved_photo_copy` could never adopt it, the document
+    // walks exclude `photos/`, and no view could show it. PM reported a failed import and silently kept
+    // an encrypted copy of the user's picture forever.
+    //
+    // The polarity this accepts, plainly: the database may now claim a copy that is not there. That is
+    // the better direction and it is a decision, not an oversight. A leftover blob is adopted by
+    // nothing and visible to no one; a dangling pointer is announced here as a warning on the file's
+    // Activity row, degrades openly in every reader (`read_document_image` falls back to the source
+    // file), and heals the moment the same image is re-dropped with the opt-in still ticked. Note it
+    // does NOT self-heal on a Rebuild — `heal_photo_copy` early-returns while `saved_to_vault` is
+    // true — which is exactly why the warning at the moment of failure has to be user-visible.
+    //
+    // `bytes` is still the buffer read at the top (the one that produced `file_hash`); do not
+    // "optimise" this into a re-read, since the source file may have moved by now.
+    let mut copy_warning = None;
+    if saved_to_vault {
+        if let Err(e) = copy_original_to_vault(vault, cipher, &bytes, &file_hash, ext) {
+            eprintln!(
+                "ingest: photo indexed but its vault copy could not be saved: {} ({e})",
+                path.display()
+            );
+            copy_warning = Some(
+                "the copy of the original could not be saved to the vault, so keep the file where \
+                 it is"
+                    .to_string(),
+            );
+        }
+    }
+
     Ok(Outcome::Indexed {
         document,
-        warning: ocr_warning,
+        // `warning` is single-valued, so JOIN rather than assign: a photo whose OCR failed AND whose
+        // copy failed must not have the first note silently overwritten by the second.
+        warning: join_warnings([ocr_warning, copy_warning]),
     })
+}
+
+/// Fold several optional notes into the one `warning` slot [`Outcome::Indexed`] carries, dropping the
+/// empties. Separate function so "both things went wrong" cannot be lost to a plain assignment.
+fn join_warnings(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let joined: Vec<String> = parts.into_iter().flatten().collect();
+    (!joined.is_empty()).then(|| joined.join("; "))
 }
 
 /// Ingest one spreadsheet: parse it values-only via the sidecar, shape it into a synthetic Markdown
@@ -1365,6 +1424,22 @@ pub fn ingest_note_document(
     Ok(document)
 }
 
+/// Where a saved photo original for `file_hash` goes, vault-relative — the string that lands on the
+/// `photos` row and in the document's front-matter.
+///
+/// Pure, and the ONLY expression allowed to compute that name: [`ingest_photo`] now writes the row
+/// and the front-matter before the copy exists (so a copy failure cannot lose an indexed document),
+/// which means the prediction and the write have to agree byte for byte. They agree because the write
+/// is built from this. And the stake is higher than a wrong pointer: the on-disk name is the AAD stem
+/// (`MarkdownCipher::aad_stem`), so a name that drifted by one character yields a blob that cannot be
+/// decrypted at all.
+fn photo_copy_rel_path(cipher: &MarkdownCipher, file_hash: &str, ext: Option<&str>) -> String {
+    format!(
+        "{PHOTOS_SUBDIR}/{}",
+        cipher.on_disk_name(&photo_copy_base_name(file_hash, ext))
+    )
+}
+
 /// Copy a photo's original bytes into `vault/photos/<hash>.<ext>` following the vault cipher (so an
 /// encrypted vault keeps the image encrypted at rest). Returns the vault-relative on-disk path stored
 /// on the `photos` row. Named by content hash so re-saving the same image is idempotent.
@@ -1375,11 +1450,12 @@ fn copy_original_to_vault(
     file_hash: &str,
     ext: Option<&str>,
 ) -> Result<String> {
-    let dir = vault.join(PHOTOS_SUBDIR);
-    std::fs::create_dir_all(&dir)?;
-    let on_disk = cipher.on_disk_name(&photo_copy_base_name(file_hash, ext));
-    cipher.write_bytes_to(&dir.join(&on_disk), bytes)?;
-    Ok(format!("{PHOTOS_SUBDIR}/{on_disk}"))
+    std::fs::create_dir_all(vault.join(PHOTOS_SUBDIR))?;
+    // Derived from [`photo_copy_rel_path`] rather than recomputed, so the name written and the name
+    // stored can never be two expressions that drift apart.
+    let rel = photo_copy_rel_path(cipher, file_hash, ext);
+    cipher.write_bytes_to(&vault.join(&rel), bytes)?;
+    Ok(rel)
 }
 
 /// The logical (pre-`.pmenc`) filename of a saved photo original. Content-addressed, so re-saving
@@ -1400,6 +1476,10 @@ fn find_saved_photo_copy(vault: &Path, file_hash: &str, ext: Option<&str>) -> Op
     let base = photo_copy_base_name(file_hash, ext);
     let encrypted = format!("{base}{}", crate::vault::ENCRYPTED_SUFFIX);
     [base, encrypted].into_iter().find_map(|name| {
+        // `is_file()` stays here on purpose, unlike every vault WALK: this is a best-effort heal
+        // probe, `heal_photo_copy` treats `None` as "no heal" and never clears an existing pointer,
+        // so a read failure lands on the pre-heal status quo. Hardening it turns a repair into a
+        // hard failure.
         vault
             .join(PHOTOS_SUBDIR)
             .join(&name)
@@ -1483,10 +1563,41 @@ impl FileState {
     }
 }
 
+/// Stat one path for a walk that must not confuse "it isn't there" with "I couldn't look".
+///
+/// The same three-way split [`FileState`] makes for the sweep, but handing back the metadata a walk
+/// needs to tell a file from a directory: `Ok(Some(meta))` = read it, `Ok(None)` = the filesystem
+/// positively reported no such path (a PROVABLE absence), `Err` = we could not tell.
+///
+/// This exists because [`Path::is_file`] and [`Path::is_dir`] are `metadata(..).map(..).unwrap_or(false)`:
+/// inside a walk they fold a permission denial, an I/O error, a network share that dropped mid-pass and
+/// a genuinely absent file into one `false`, and the entry then simply vanishes from the enumeration
+/// with no trace. Every downstream decision — reap, re-key, export, back up — is made on that
+/// enumeration, so the distinction has to survive it. `NotFound` is the only error kind that is safe to
+/// read as absence, which is exactly the rule [`FileState`] documents.
+pub(crate) fn probe(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    // Deliberately `metadata`, not `symlink_metadata`: the walks index what a link POINTS AT, so a
+    // dangling symlink resolves to `NotFound` — provably nothing to read, not a failure to look.
+    classify_probe(std::fs::metadata(path))
+}
+
+/// The rule [`probe`] applies, as a free function so "which error kinds may be read as absence" is
+/// testable without a filesystem that can be made to fail on demand. `NotFound` is the only one.
+fn classify_probe<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// May the sweep delete anything at all? Only on a **provably complete** walk — every vault dir entry
 /// enumerated. A partial walk can mean the vault root itself only half-read, where "we never saw it" is
 /// not "the user deleted it"; sweeping on that picture could delete most of the library. Withholding it
 /// costs nothing: the next complete pass reaps instead.
+///
+/// Kept as a `bool` although the walks now hand back a COUNT: every caller passes `unreadable == 0`,
+/// and the question this answers is genuinely binary — one entry unread is as disqualifying as fifty.
 ///
 /// Deliberately NOT gated on per-document failures. A document that failed this pass still has its vault
 /// file sitting there, so [`plan_reap`] keeps it on presence alone — a failure endangers no reap
@@ -1524,13 +1635,18 @@ fn stored_pass(conn: &Connection, vault_path: &str) -> Result<Option<Option<Stri
         .optional()?)
 }
 
+/// Re-index every Markdown file in the vault. Returns `(ingested, skipped, failed, unreadable)` —
+/// the fourth is the vault walk's own count of entries it could not read ([`walk_vault_markdown`]),
+/// which is what the caller puts on the terminal `Finished` so a partial rebuild does not report a
+/// clean run. It is deliberately NOT folded into `failed`: `failed` is what withholds the retrieval
+/// stamp, and an unreadable *entry* is not a document that failed to rebuild.
 pub fn rebuild(
     app: &AppHandle,
     on_event: &ProgressSink,
     extra_total: usize,
     pass: &str,
     on_pass_start: &dyn Fn() -> Result<()>,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize)> {
     let state = app.state::<AppState>();
 
     // Indexing is active use — hold the idle chat-indexer (card 7B) off so it doesn't contend with it.
@@ -1617,7 +1733,10 @@ pub fn rebuild(
     // (`.md.pmenc`) files; the cipher decides per file how to read them (read-by-magic). An
     // unreadable dir entry no longer just disappears: it makes the picture PARTIAL, which withholds the
     // final sweep (see [`may_reap`]) — "we never saw it" must never be mistaken for "the user deleted it".
-    let (files, complete) = walk_vault_markdown(&vault)?;
+    // The walk hands back a count so the same fact also reaches the user on `Finished`, instead of only
+    // silently deferring a reap they were never told about.
+    let (files, unreadable) = walk_vault_markdown(&vault)?;
+    let complete = unreadable == 0;
     on_event.send(IngestEvent::Counted {
         total: files.len() + extra_total,
     });
@@ -1763,7 +1882,7 @@ pub fn rebuild(
 
     // The terminal `Finished` is sent by the caller (`commands::rebuild_index`) AFTER it has run the
     // async full-body re-index of index-only items; hand back the counts so it can fold them in.
-    Ok((ingested, skipped, failed))
+    Ok((ingested, skipped, failed, unreadable))
 }
 
 fn rebuild_one(
@@ -3720,17 +3839,30 @@ pub(crate) fn symlink_escapes_root(path: &Path, root: &Path) -> bool {
     }
 }
 
-/// Recursively collect files from the given paths (folders are walked).
-fn collect_files(inputs: &[String]) -> Vec<PathBuf> {
+/// Recursively collect files from the given paths (folders are walked), plus a count of the entries
+/// the walk could not read.
+///
+/// The count is not bookkeeping: `run` sends `Counted { total: files.len() }` and finishes with counters
+/// tallied only inside the loop over that list, so anything this walk drops is missing from the total
+/// AND from the summary. Without it, a drop of 400 files where one locked subfolder held 388 of them
+/// reports "Done — 12 ingested, 0 skipped, 0 failed" and reads as a complete import.
+fn collect_files(inputs: &[String]) -> (Vec<PathBuf>, usize) {
     let mut files = Vec::new();
+    let mut unreadable = 0usize;
     for input in inputs {
         let root = Path::new(input);
-        collect_into(root, root, &mut files, 0);
+        collect_into(root, root, &mut files, &mut unreadable, 0);
     }
-    files
+    (files, unreadable)
 }
 
-fn collect_into(root: &Path, path: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+fn collect_into(
+    root: &Path,
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    unreadable: &mut usize,
+    depth: usize,
+) {
     if out.len() >= MAX_COLLECTED_FILES {
         return;
     }
@@ -3748,20 +3880,46 @@ fn collect_into(root: &Path, path: &Path, out: &mut Vec<PathBuf>, depth: usize) 
         if depth >= MAX_WALK_DEPTH {
             return;
         }
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                collect_into(root, &entry.path(), out, depth + 1);
-                if out.len() >= MAX_COLLECTED_FILES {
-                    break;
+        match std::fs::read_dir(path) {
+            Ok(entries) => {
+                for entry in entries {
+                    // An entry the directory listing itself could not produce. `.flatten()` used to
+                    // drop it, so a single bad inode removed a file from the import with no trace.
+                    let Ok(entry) = entry else {
+                        *unreadable += 1;
+                        continue;
+                    };
+                    collect_into(root, &entry.path(), out, unreadable, depth + 1);
+                    if out.len() >= MAX_COLLECTED_FILES {
+                        break;
+                    }
                 }
             }
+            // The folder is there and will not open (permissions, an ACL, a share that dropped): its
+            // whole subtree is unknown. It counts as ONE entry we could not read, never as the N files
+            // that may sit beneath it — that number is unknowable by definition, which is why the user
+            // is told "items", not "files".
+            Err(_) => *unreadable += 1,
         }
     } else if path.is_file() {
         // L-2: a symlinked file that resolves outside the dropped tree would pull unrelated content
         // into the index — skip it. (A file the user drops *directly* is its own root, so it stays.)
+        // Deliberately NOT counted: a refused symlink is a security decision working as designed, not
+        // a read failure, and reporting it would alarm the user about a correctly-handled link.
         if !symlink_escapes_root(path, root) {
             out.push(path.to_path_buf());
         }
+    } else {
+        // Neither a directory nor a file. `is_dir()`/`is_file()` are `metadata(..).unwrap_or(false)`,
+        // so this arm is both "the path is genuinely gone" (deleted or renamed between the drop and
+        // the import) and "its stat was refused", indistinguishable from here — and both mean the user
+        // asked for something they will not get. Count it rather than let it vanish from a total the
+        // summary is computed from.
+        //
+        // This is also where the `symlink_metadata` probe above lands when IT fails: that `if let Ok`
+        // falls through into this very chain, so the error is already counted here. Do not add a
+        // second branch up there.
+        *unreadable += 1;
     }
 }
 
@@ -3810,39 +3968,54 @@ pub(crate) struct VaultFile {
 /// Recursion is an explicit allow-list ([`MARKDOWN_SUBDIRS`]), never "descend everywhere" — see
 /// [`PHOTOS_SUBDIR`].
 ///
-/// The completeness flag is the sweep's data-loss guard ([`may_reap`]) and is **conservative in one
-/// direction only**: any dir entry that fails to read makes it `false`, because "we never saw it"
-/// must never be read as "the user deleted it". A missing subfolder is not incompleteness — a vault
-/// with no chats yet simply has no `chats/`.
-pub(crate) fn walk_vault_markdown(vault: &Path) -> Result<(Vec<VaultFile>, bool)> {
+/// The count is the sweep's data-loss guard ([`may_reap`], via `unreadable == 0`) and is
+/// **conservative in one direction only**: any dir entry that fails to read raises it, because "we
+/// never saw it" must never be read as "the user deleted it". A missing subfolder is not
+/// incompleteness — a vault with no chats yet simply has no `chats/`.
+///
+/// Returns a COUNT rather than the `bool` it carried until Batch K, so the same number can be shown
+/// to the user ("N items could not be read") instead of only silently withholding a reap. The two
+/// are exactly equivalent — every site that cleared the old flag increments this — so `complete` is
+/// `unreadable == 0` at each caller. One unopenable directory counts as **one** entry, never as the
+/// N files that might sit under it; that number is unknowable by definition.
+pub(crate) fn walk_vault_markdown(vault: &Path) -> Result<(Vec<VaultFile>, usize)> {
     let mut files = Vec::new();
-    let mut complete = true;
+    let mut unreadable = 0usize;
     // The root's own failure propagates: an unreadable vault root is not a partial picture, it is a
     // broken vault, and every caller wants to hear about that rather than act on nothing.
-    collect_dir(vault, None, &mut files, &mut complete, is_vault_markdown)?;
+    collect_dir(vault, None, &mut files, &mut unreadable, is_vault_markdown)?;
     for sub in MARKDOWN_SUBDIRS {
         let dir = vault.join(sub);
-        if !dir.is_dir() {
-            continue;
+        match probe(&dir) {
+            Ok(Some(meta)) if meta.is_dir() => {}
+            // Provably no such subfolder (or something that isn't a directory sitting under the
+            // name): absence, not incompleteness. `is_dir()` gave the same answer here for BOTH
+            // readings, so a `chats/` we merely couldn't stat used to be skipped as "not there".
+            Ok(_) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         }
-        // A subfolder that exists but won't open is exactly the "couldn't tell" case: withhold the
-        // sweep rather than propagate, so a locked folder costs one deferred reap, never a deletion.
+        // A subfolder that exists but won't open is exactly the "couldn't tell" case: raise the count
+        // rather than propagate, so a locked folder costs one deferred reap, never a deletion.
         if collect_dir(
             &dir,
             Some(sub),
             &mut files,
-            &mut complete,
+            &mut unreadable,
             is_vault_markdown,
         )
         .is_err()
         {
-            complete = false;
+            unreadable += 1;
         }
     }
-    Ok((files, complete))
+    Ok((files, unreadable))
 }
 
-/// Every "keep a copy" original under [`PHOTOS_SUBDIR`], and whether the walk saw all of them.
+/// Every "keep a copy" original under [`PHOTOS_SUBDIR`], plus how many entries the walk could not
+/// read — same counter, same meaning and same conservatism as [`walk_vault_markdown`]'s.
 ///
 /// Deliberately NOT folded into [`walk_vault_markdown`]: [`is_vault_markdown`] accepts any `.pmenc`,
 /// so a photos-inclusive document walk would hand every saved photo to the rebuild sweep as a
@@ -3851,44 +4024,74 @@ pub(crate) fn walk_vault_markdown(vault: &Path) -> Result<(Vec<VaultFile>, bool)
 ///
 /// The `keep` predicate is an allow-list, not a catch-all: only the encrypted originals and the
 /// plaintext photo extensions. Anything else under `photos/` is left alone rather than swept.
-pub(crate) fn walk_vault_photos(vault: &Path) -> Result<(Vec<VaultFile>, bool)> {
+pub(crate) fn walk_vault_photos(vault: &Path) -> Result<(Vec<VaultFile>, usize)> {
     let mut files = Vec::new();
-    let mut complete = true;
+    let mut unreadable = 0usize;
     let dir = vault.join(PHOTOS_SUBDIR);
-    // No photos folder is not incompleteness — a vault where nobody kept a copy simply has none.
-    if !dir.is_dir() {
-        return Ok((files, complete));
+    match probe(&dir) {
+        Ok(Some(meta)) if meta.is_dir() => {}
+        // No photos folder is not incompleteness — a vault where nobody kept a copy simply has none.
+        Ok(_) => return Ok((files, unreadable)),
+        // But a `photos/` we could not stat is NOT "nobody kept a copy": the sweep would then see
+        // every saved original as an orphan-free vault and the re-key would leave them all behind.
+        Err(_) => return Ok((files, 1)),
     }
-    if collect_dir(&dir, Some(PHOTOS_SUBDIR), &mut files, &mut complete, |p| {
-        matches!(extension(p).as_deref(), Some("pmenc"))
-            || extension(p)
-                .as_deref()
-                .is_some_and(|e| PHOTO_EXTS.contains(&e))
-    })
+    if collect_dir(
+        &dir,
+        Some(PHOTOS_SUBDIR),
+        &mut files,
+        &mut unreadable,
+        |p| {
+            matches!(extension(p).as_deref(), Some("pmenc"))
+                || extension(p)
+                    .as_deref()
+                    .is_some_and(|e| PHOTO_EXTS.contains(&e))
+        },
+    )
     .is_err()
     {
-        complete = false;
+        unreadable += 1;
     }
-    Ok((files, complete))
+    Ok((files, unreadable))
 }
 
 /// One directory's files matching `keep`, appended to `out` with `prefix` (if any) joined by `/`. An
-/// unreadable entry clears `complete` instead of failing the walk.
+/// entry the walk cannot read increments `unreadable` instead of failing the walk.
 fn collect_dir(
     dir: &Path,
     prefix: Option<&str>,
     out: &mut Vec<VaultFile>,
-    complete: &mut bool,
+    unreadable: &mut usize,
     keep: impl Fn(&Path) -> bool,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else {
-            *complete = false;
+            *unreadable += 1;
             continue;
         };
         let path = entry.path();
-        if !path.is_file() || !keep(&path) {
+        // `keep` FIRST, and it must stay first. It is a pure test of the name, so a path this walk
+        // was never going to take (a `.tmp`, a photo original under the document walk) is dropped
+        // without a stat — and, more to the point, a stat failure on a file we would have ignored
+        // anyway must not withhold the sweep from every file we did read.
+        if !keep(&path) {
             continue;
+        }
+        match probe(&path) {
+            Ok(Some(meta)) if meta.is_file() => {}
+            // Either not a file (a directory whose name happens to pass `keep`), or provably absent —
+            // `read_dir` listed it and it is already gone, which is an ordinary race with a writer
+            // removing a temp file, or a dangling symlink. Neither is "I couldn't tell", so neither
+            // makes the enumeration partial.
+            Ok(_) => continue,
+            // Permission denied, an I/O error, a share that dropped mid-walk. We did not learn whether
+            // this file exists, so the walk is no longer provably complete: `Path::is_file()` used to
+            // answer `false` here and the entry vanished, which is how a locked folder could read as
+            // "the user deleted all of these".
+            Err(_) => {
+                *unreadable += 1;
+                continue;
+            }
         }
         let name = file_name(&path);
         let rel = match prefix {
@@ -3907,6 +4110,27 @@ fn rel_with_name(rel: &str, name: &str) -> String {
         Some(i) => format!("{}/{name}", &rel[..i]),
         None => name.to_string(),
     }
+}
+
+/// The refusal both halves of a key migration return when they cannot see the whole vault.
+///
+/// `detail` names what could not be read; everything after it is the same for every caller, and has
+/// to be, because the state the user is left in is the same. [`crate::vault::migrate::recover`] runs
+/// at LAUNCH only, so an `Err` out of [`convert_vault_files`] rolls nothing back in-process: the DB
+/// has already been re-keyed (`migrate.rs`, `db::rekey`) and the vault has not, and the journal's
+/// backup is only restored on the next start. Without the restart sentence the user is sitting on a
+/// database under the new key and a vault under the old one, with nothing on screen explaining why
+/// their notes stopped opening.
+///
+/// Refusing is the trade this batch takes deliberately: a refusal is retryable, an orphaned file
+/// under a discarded key is not.
+fn rekey_refusal(detail: String) -> Error {
+    Error::Other(format!(
+        "The key change was stopped because {detail}. Re-encoding the rest would leave those files \
+         encrypted under the old key for good, so PM stopped instead. Restart PM before using the \
+         vault — the change is only rolled back on the next launch — then try again once the vault \
+         folder is readable."
+    ))
 }
 
 /// Bring every Markdown file in `dir` into `write_with`'s policy, in place: decode each
@@ -3929,6 +4153,8 @@ fn rel_with_name(rel: &str, name: &str) -> String {
 /// name and split the transcript in two — both stamped with the same `chat_conversation_id`, which
 /// a later Rebuild then fights over on `documents.vault_path`'s UNIQUE. Found auditing #281; the
 /// same statement pair fixes it.
+///
+/// **Fails closed on an incomplete walk** — see [`rekey_refusal`].
 pub(crate) fn convert_markdown(
     conn: &Connection,
     dir: &Path,
@@ -3936,7 +4162,17 @@ pub(crate) fn convert_markdown(
     write_with: &MarkdownCipher,
 ) -> Result<usize> {
     let mut changed = 0usize;
-    let (files, _complete) = walk_vault_markdown(dir)?;
+    let (files, unreadable) = walk_vault_markdown(dir)?;
+    // Refuse BEFORE the loop rewrites anything. Re-keying whatever the walk happened to see leaves
+    // every entry it could not read encrypted under the OLD subkey — with no row, no error and no
+    // second chance once that key is discarded. This is the I-15 row the flag exists for, and until
+    // Batch K the count was thrown away here (`_complete`), so the migration reported success.
+    if unreadable > 0 {
+        return Err(rekey_refusal(format!(
+            "{unreadable} item(s) in the vault folder at {} could not be read",
+            dir.display()
+        )));
+    }
     for file in files {
         let old_name = file_name(&file.path);
         let new_name = write_with.on_disk_name(&MarkdownCipher::logical_name(&old_name));
@@ -4015,26 +4251,57 @@ pub(crate) fn convert_vault_files(
 /// that locate a copy by name must therefore try both forms — see [`find_saved_photo_copy`].
 ///
 /// Takes no `Connection`: it writes no rows, so it stays outside the migration's transaction.
+///
+/// **Fails closed on anything it cannot read** — see [`rekey_refusal`]. This half had three separate
+/// holes, all the same one: a `photos/` that would not stat read as "nobody kept a copy", an entry
+/// that would not read was filtered away, and a file that would not stat was skipped as "not a file".
 pub(crate) fn convert_photo_originals(
     dir: &Path,
     read_with: &MarkdownCipher,
     write_with: &MarkdownCipher,
 ) -> Result<usize> {
     let photos = dir.join(PHOTOS_SUBDIR);
-    if !photos.is_dir() {
-        return Ok(0);
+    let unlistable = |e: &dyn std::fmt::Display| {
+        rekey_refusal(format!(
+            "the saved photo originals at {} could not be listed: {e}",
+            photos.display()
+        ))
+    };
+    match probe(&photos) {
+        Ok(Some(meta)) if meta.is_dir() => {}
+        // Provably no `photos/` (or something that is not a directory under the name): nobody kept a
+        // copy, so there is nothing here to re-encode. Absence, not incompleteness.
+        Ok(_) => return Ok(0),
+        // A `photos/` we could not stat is NOT "nobody kept a copy" — `is_dir()` answered `false` to
+        // both readings, and the migration then committed the new key with every saved original left
+        // under the old one. The copy the user kept precisely so they could delete the original.
+        Err(e) => return Err(unlistable(&e)),
     }
     let mut changed = 0usize;
     // Collect BEFORE writing. The write is now a temp file plus a rename (`vault::write_atomic`), so
     // each iteration adds and removes a directory entry — and enumerating a directory while it is
     // being mutated is explicitly unspecified on Windows, which can hand the loop its own staging
     // file or skip a photo entirely. `walk_vault_markdown` already materialises for the same reason.
-    let entries: Vec<PathBuf> = std::fs::read_dir(&photos)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
+    //
+    // An entry that fails to read is propagated, not filtered away: `filter_map(|e| e.ok())` stranded
+    // one photo at a time, which is the whole-folder orphan above in miniature.
+    let entries: Vec<PathBuf> = std::fs::read_dir(&photos)
+        .map_err(|e| unlistable(&e))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<PathBuf>>>()
+        .map_err(|e| unlistable(&e))?;
     for path in entries {
-        if !path.is_file() {
-            continue;
+        match probe(&path) {
+            Ok(Some(meta)) if meta.is_file() => {}
+            // Not a file, or gone between the listing and now (a provable absence — there is nothing
+            // left to strand under the old key).
+            Ok(_) => continue,
+            Err(e) => {
+                return Err(rekey_refusal(format!(
+                    "{} could not be read: {e}",
+                    path.display()
+                )))
+            }
         }
         let raw = std::fs::read(&path)?;
         // "Already in the exact target form" minus the name (see above): the same encryption state
@@ -4052,6 +4319,23 @@ pub(crate) fn convert_photo_originals(
     Ok(changed)
 }
 
+/// The refusal the plaintext export returns rather than hand over a folder that looks complete.
+///
+/// [`export_plaintext`]'s own doc records the rule: a hatch that silently drops files is worse than
+/// no hatch, because the user checks the folder, sees documents in it, and stops looking. An
+/// unreadable entry is exactly that case — the export cannot list what it left out, so it must not
+/// produce the folder at all. `detail` names what could not be read.
+///
+/// Unlike [`rekey_refusal`] this says nothing about restarting: no key moved and no state needs
+/// restoring, so the only useful instruction is to retry once the vault folder is readable.
+fn export_refusal(detail: String) -> Error {
+    Error::Other(format!(
+        "The plaintext export was stopped because {detail}. A folder quietly missing files it does \
+         not mention still looks like a complete copy of your library, so PM stopped rather than \
+         finish one. Delete anything it wrote and try again once the vault folder is readable."
+    ))
+}
+
 /// Export every Markdown file in `vault` to `dest` as plaintext `.md`, decrypting
 /// encrypted files with `cipher` and dropping the `.pmenc` suffix. Returns the count
 /// written. The core of the "never locked in" escape hatch — kept here (next to the
@@ -4061,14 +4345,25 @@ pub(crate) fn convert_photo_originals(
 /// avalanching into one directory beside the documents. An escape hatch that silently dropped
 /// every chat — which is what a root-only walk would now do — would be worse than no hatch:
 /// it looks complete.
+///
+/// For that same reason it **fails closed** on a walk that could not read part of the vault — see
+/// [`export_refusal`] — rather than hand back a folder short of files it does not mention.
 pub(crate) fn export_plaintext(
     vault: &Path,
     cipher: &MarkdownCipher,
     dest: &Path,
 ) -> Result<usize> {
+    // Walk BEFORE creating `dest`, so a refusal leaves not even an empty folder behind to be mistaken
+    // for an export that produced nothing.
+    let (files, unreadable) = walk_vault_markdown(vault)?;
+    if unreadable > 0 {
+        return Err(export_refusal(format!(
+            "{unreadable} item(s) in the vault folder at {} could not be read",
+            vault.display()
+        )));
+    }
     std::fs::create_dir_all(dest)?;
     let mut written = 0usize;
-    let (files, _complete) = walk_vault_markdown(vault)?;
     for file in files {
         // Decrypt-if-needed, then write under the logical `.md` name (no `.pmenc`), in the same
         // relative folder it came from.
@@ -4087,13 +4382,35 @@ pub(crate) fn export_plaintext(
     // escape hatch only tells the truth if they come out too — under their real `.png`/`.jpg` name,
     // which is what makes the exported folder openable by anything other than PM.
     let photos = vault.join(PHOTOS_SUBDIR);
-    if photos.is_dir() {
+    let has_photos = match probe(&photos) {
+        Ok(Some(meta)) => meta.is_dir(),
+        // No `photos/` at all — nobody kept a copy, so there is nothing to free.
+        Ok(None) => false,
+        // But a `photos/` we could not stat would have read as "no photos" and produced an export
+        // silently missing every saved original — the files the user was told they could delete the
+        // source of. `entry?` below already propagates for the same reason.
+        Err(e) => {
+            return Err(export_refusal(format!(
+                "the saved photo originals at {} could not be read: {e}",
+                photos.display()
+            )))
+        }
+    };
+    if has_photos {
         let out_dir = dest.join(PHOTOS_SUBDIR);
         std::fs::create_dir_all(&out_dir)?;
         for entry in std::fs::read_dir(&photos)? {
             let path = entry?.path();
-            if !path.is_file() {
-                continue;
+            match probe(&path) {
+                Ok(Some(meta)) if meta.is_file() => {}
+                // Not a file, or gone since the listing — nothing to export either way.
+                Ok(_) => continue,
+                Err(e) => {
+                    return Err(export_refusal(format!(
+                        "{} could not be read: {e}",
+                        path.display()
+                    )))
+                }
             }
             let bytes = cipher.read_bytes(&path)?;
             let out_name = MarkdownCipher::logical_name(&file_name(&path));
@@ -4324,7 +4641,8 @@ mod tests {
     #[test]
     fn snapshot_keeps_the_final_report_for_a_tab_that_returns_after_it_finished() {
         // The live event only reaches a mounted listener; someone who came back afterwards still
-        // needs to see how it went, so the counts live in the snapshot too.
+        // needs to see how it went, so the counts live in the snapshot too. `unreadable` included:
+        // "the run was partial" is the one number a returning user must not be shown as a zero.
         let mut snap = crate::IngestJobState::default();
         apply_event(
             &mut snap,
@@ -4332,10 +4650,19 @@ mod tests {
                 ingested: 5,
                 skipped: 1,
                 failed: 2,
+                unreadable: 3,
             },
         );
         let report = snap.last_report.expect("a finished run reports its counts");
-        assert_eq!((report.ingested, report.skipped, report.failed), (5, 1, 2));
+        assert_eq!(
+            (
+                report.ingested,
+                report.skipped,
+                report.failed,
+                report.unreadable
+            ),
+            (5, 1, 2, 3)
+        );
     }
 
     #[test]
@@ -4425,6 +4752,259 @@ mod tests {
         assert!(
             !symlink_escapes_root(&local, &root),
             "a symlink pointing inside root is allowed"
+        );
+    }
+
+    #[test]
+    fn probe_tells_a_provable_absence_from_a_failure_to_look() {
+        // The primitive every walk in this file now stands on. `Path::is_file()` answers `false` to
+        // both questions at once; this must not.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.txt");
+        std::fs::write(&f, b"x").unwrap();
+
+        assert!(
+            probe(&f).unwrap().is_some_and(|m| m.is_file()),
+            "a real file comes back with its metadata"
+        );
+        assert!(probe(dir.path()).unwrap().is_some_and(|m| m.is_dir()));
+        assert!(
+            probe(&dir.path().join("nope.txt")).unwrap().is_none(),
+            "NotFound is a PROVABLE absence — the one error kind a walk may act on"
+        );
+
+        // The arm that matters most and that no portable filesystem can be made to produce on demand:
+        // anything other than NotFound stays an `Err`, so a refused stat can never be read as "gone".
+        use std::io::ErrorKind;
+        assert!(classify_probe::<()>(Err(ErrorKind::PermissionDenied.into())).is_err());
+        assert!(classify_probe::<()>(Err(ErrorKind::Other.into())).is_err());
+        assert!(classify_probe::<()>(Err(ErrorKind::TimedOut.into())).is_err());
+        assert!(classify_probe::<()>(Err(ErrorKind::NotFound.into()))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_dropped_path_that_vanished_is_counted_unreadable() {
+        // A path the user dropped that is no longer there by the time the walk reaches it — moved or
+        // deleted between the drop and the import. Before Batch K it fell off the `is_dir`/`is_file`
+        // chain with no `else`, so it was missing from `Counted { total }` AND from every counter in
+        // the summary: the import reported a clean run over a file it never opened.
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = dir.path().join("moved-away.md");
+        let (files, unreadable) = collect_files(&[ghost.to_string_lossy().into_owned()]);
+        assert!(files.is_empty());
+        assert_eq!(
+            unreadable, 1,
+            "the drop must be reported, not silently lost"
+        );
+    }
+
+    #[test]
+    fn a_clean_drop_reports_nothing_unreadable() {
+        // The regression fence on the new `else` arm: an ordinary nested folder must count ZERO. A
+        // counter that inflates on the happy path would put "could not be read" on every import and
+        // the user would learn to ignore the one that matters.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("sub").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("sub").join("b.md"), "b").unwrap();
+        std::fs::write(nested.join("c.md"), "c").unwrap();
+
+        let (files, unreadable) = collect_files(&[dir.path().to_string_lossy().into_owned()]);
+        assert_eq!(files.len(), 3);
+        assert_eq!(unreadable, 0, "a walk that read everything reports nothing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_drop_folder_that_will_not_open_is_one_unreadable_entry_and_its_siblings_still_import() {
+        // The locked-folder case itself: drop 400 files, one subfolder refuses to open, and the run
+        // used to report "Done — 12 ingested, 0 skipped, 0 failed". Unix-gated because Windows ACL
+        // manipulation in a unit test is unreliable; the portable fence is the vanished-path test.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("drop");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(root.join("visible.md"), "ok").unwrap();
+        std::fs::write(locked.join("hidden-1.md"), "x").unwrap();
+        std::fs::write(locked.join("hidden-2.md"), "y").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (files, unreadable) = collect_files(&[root.to_string_lossy().into_owned()]);
+        // Restore before asserting, so a failure still leaves a removable tempdir behind.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(files.len(), 1, "the readable sibling still imports");
+        assert_eq!(
+            unreadable, 1,
+            "one unopenable folder is ONE entry, never the two files inside it — that number is \
+             unknowable by definition, which is why the user is told 'items'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_subfolder_that_will_not_open_withholds_the_sweep() {
+        // I-15's whole point. A `chats/` that exists but refuses to open must not read as "the user
+        // deleted every chat": the walk reports it, `may_reap` withholds the reap, and the next
+        // complete pass does the deleting.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let chats = vault.join(CHATS_SUBDIR);
+        std::fs::create_dir_all(&chats).unwrap();
+        std::fs::write(vault.join("report-01-07-2026-ff00.md"), "doc").unwrap();
+        std::fs::write(chats.join("chat-28-06-2026-abc123def456.md"), "chat").unwrap();
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let walked = walk_vault_markdown(&vault);
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (files, unreadable) = walked.unwrap();
+        assert_eq!(files.len(), 1, "the root document is still enumerated");
+        assert_eq!(unreadable, 1);
+        assert!(
+            !may_reap(unreadable == 0),
+            "a partial picture must never sweep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_file_whose_stat_is_refused_withholds_the_sweep() {
+        // `collect_dir` itself, one level below the test above. A directory with read but no execute
+        // permission LISTS its entries and refuses to stat any of them — which is exactly the shape
+        // `path.is_file()` collapsed into "not a file", making each entry vanish from the walk. The
+        // whole vault would then look deleted to the sweep.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let chats = vault.join(CHATS_SUBDIR);
+        std::fs::create_dir_all(&chats).unwrap();
+        std::fs::write(chats.join("chat-28-06-2026-abc123def456.md"), "chat").unwrap();
+        // r-- : `read_dir` succeeds, `metadata` on each entry does not.
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let walked = walk_vault_markdown(&vault);
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (files, unreadable) = walked.unwrap();
+        assert!(files.is_empty());
+        assert_eq!(
+            unreadable, 1,
+            "an entry we could not stat is not an absent one"
+        );
+        assert!(!may_reap(unreadable == 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_keeps_the_walk_complete() {
+        // THE regression pin. `NotFound` is a provable absence, so a broken link is nothing to hold
+        // back for — and it must not be, because a walk that counted it would withhold EVERY future
+        // sweep for as long as the link sat there. One broken link, no reap, ever.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("report-01-07-2026-ff00.md"), "doc").unwrap();
+        symlink(vault.join("no-such-target.md"), vault.join("dangling.md")).unwrap();
+
+        let (files, unreadable) = walk_vault_markdown(&vault).unwrap();
+        assert_eq!(files.len(), 1, "the broken link is not a document to index");
+        assert_eq!(unreadable, 0, "provably nothing there ⇒ nothing was missed");
+        assert!(may_reap(unreadable == 0));
+
+        // Same rule on the drop walk: a broken link inside a dropped folder is not an import failure.
+        let (dropped, drop_unreadable) = collect_files(&[vault.to_string_lossy().into_owned()]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(drop_unreadable, 0);
+    }
+
+    /// A vault holding one readable root document and a `chats/` that exists but will not open — the
+    /// shape both fail-closed tests below need. Returns the vault root and the readable document's
+    /// path; the caller must restore the permissions before asserting (a panic would otherwise leave
+    /// an undeletable temp dir behind).
+    #[cfg(unix)]
+    fn vault_with_an_unopenable_chats_folder(root: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = root.join("vault");
+        let chats = vault.join(CHATS_SUBDIR);
+        std::fs::create_dir_all(&chats).unwrap();
+        let readable = vault.join("report-01-07-2026-ff00.md");
+        std::fs::write(&readable, "the sibling that must survive").unwrap();
+        std::fs::write(chats.join("chat-28-06-2026-abc123def456.md"), "chat").unwrap();
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o000)).unwrap();
+        (vault, readable)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rekey_over_a_vault_it_cannot_fully_read_refuses_and_rewrites_nothing() {
+        // The orphan pin, and the reason this fails CLOSED. Re-keying what the walk happened to see
+        // leaves the rest under the old subkey forever — unreadable by the app that wrote it, with no
+        // row and no error. Before Batch K the completeness flag was discarded here (`_complete`) and
+        // the migration reported success.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, readable) = vault_with_an_unopenable_chats_folder(dir.path());
+        let chats = vault.join(CHATS_SUBDIR);
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        let old = MarkdownCipher::plaintext("vault-1");
+        let new = MarkdownCipher::for_test_encrypted("vault-1");
+
+        let result = convert_markdown(&conn, &vault, &old, &new);
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result
+            .expect_err("an incompletely enumerated vault must not be re-keyed")
+            .to_string();
+        assert!(
+            err.contains("could not be read"),
+            "names what stopped it: {err}"
+        );
+        assert!(
+            err.contains("Restart PM"),
+            "`recover` is launch-only, so without this the user sits on a re-keyed DB and an \
+             old-key vault with no visible reason: {err}"
+        );
+        // And it refused BEFORE touching a file: the readable sibling is untouched, still plaintext,
+        // still under the OLD cipher — not half a vault re-encoded around the hole.
+        assert_eq!(
+            old.read(&readable).unwrap(),
+            "the sibling that must survive"
+        );
+        assert!(
+            !vault.join("report-01-07-2026-ff00.md.pmenc").exists(),
+            "nothing may be rewritten before the refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_export_over_a_vault_it_cannot_fully_read_refuses_and_writes_nothing() {
+        // The escape hatch's own doc: a folder that looks complete is worse than no folder. It cannot
+        // list what it left out, so it must not produce the folder at all.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, _) = vault_with_an_unopenable_chats_folder(dir.path());
+        let chats = vault.join(CHATS_SUBDIR);
+        let dest = dir.path().join("export");
+
+        let result = export_plaintext(&vault, &MarkdownCipher::plaintext("vault-1"), &dest);
+        std::fs::set_permissions(&chats, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result
+            .expect_err("a partial vault must not export")
+            .to_string();
+        assert!(err.contains("could not be read"), "got: {err}");
+        assert!(
+            !dest.exists(),
+            "the walk runs first, so a refusal leaves not even an empty folder to mistake for an \
+             export that found nothing"
         );
     }
 
@@ -4853,10 +5433,10 @@ mod tests {
         .unwrap();
         std::fs::write(vault.join("scratch.tmp"), "ignore").unwrap();
 
-        let (files, complete) = walk_vault_markdown(&vault).unwrap();
+        let (files, unreadable) = walk_vault_markdown(&vault).unwrap();
         let collected: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
 
-        assert!(complete, "nothing unreadable ⇒ the sweep may run");
+        assert_eq!(unreadable, 0, "nothing unreadable ⇒ the sweep may run");
         assert!(collected.contains(&"report-01-07-2026-ff00.md".to_string()));
         assert!(collected.contains(&"chats/chat-28-06-2026-abc123def456.md".to_string()));
         assert!(collected.contains(&"chats/chat-28-06-2026-def456abc123.md.pmenc".to_string()));
@@ -4903,10 +5483,13 @@ mod tests {
         std::fs::create_dir_all(&vault).unwrap();
         std::fs::write(vault.join("report-01-07-2026-ff00.md"), "doc").unwrap();
 
-        let (files, complete) = walk_vault_markdown(&vault).unwrap();
+        let (files, unreadable) = walk_vault_markdown(&vault).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(complete, "a missing subfolder is not an unreadable one");
-        assert!(may_reap(complete));
+        assert_eq!(
+            unreadable, 0,
+            "a missing subfolder is not an unreadable one"
+        );
+        assert!(may_reap(unreadable == 0));
     }
 
     #[test]
@@ -5138,6 +5721,11 @@ mod tests {
         // The rebuild-determinism guarantee for photos: a photo's synthetic body + front-matter block
         // must reconstruct the SAME `photos` record on a Rebuild (and survive a metadata edit, which
         // re-renders through the same path) — without re-running OCR. No sidecar needed.
+        //
+        // The `vault_path` is the PREDICTED one an encrypted vault stores (`ingest_photo` writes the
+        // block before the copy exists), so this also pins that the prediction survives the
+        // render → parse → row round trip a Rebuild performs, `.pmenc` suffix and all.
+        let cipher = MarkdownCipher::for_test_encrypted("vault-1");
         let rec = PhotoRecord {
             source_path: Some("/imgs/Screenshot 2026-03-12.png".into()),
             source_type: PhotoSourceType::Screenshot,
@@ -5145,7 +5733,7 @@ mod tests {
             file_hash: "deadbeefcafe".into(),
             ocr_text: Some("Total due £42.00".into()),
             saved_to_vault: true,
-            vault_path: Some("photos/deadbeefcafe.png".into()),
+            vault_path: Some(photo_copy_rel_path(&cipher, "deadbeefcafe", Some("png"))),
             width: Some(1170),
             height: Some(2532),
             lat: Some(55.95),
@@ -5186,6 +5774,20 @@ mod tests {
         let recovered = photo_from_fields(&fields, &rec.file_hash, parsed_body)
             .expect("a photo block reconstructs a record");
         assert_eq!(recovered, rec, "the photos record round-trips exactly");
+
+        // …and the name that came back out is the one a copy on disk actually answers to. If the
+        // prediction ever drifted from what `copy_original_to_vault` writes, the front-matter would
+        // point at a file no heal probe could find — and, since the on-disk name is the AAD stem, at
+        // a blob that could not be decrypted even if it were found.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(PHOTOS_SUBDIR)).unwrap();
+        std::fs::write(vault.join(recovered.vault_path.as_deref().unwrap()), b"png").unwrap();
+        assert_eq!(
+            find_saved_photo_copy(&vault, &rec.file_hash, Some("png")),
+            recovered.vault_path,
+            "the round-tripped path is exactly the name the heal probe looks for"
+        );
 
         // A plain document carries no block → no record (unchanged behaviour).
         let plain = render_markdown(
@@ -5608,6 +6210,69 @@ mod tests {
         );
         // A hash with no copy on disk stays unhealed rather than inventing a path.
         assert_eq!(find_saved_photo_copy(&vault2, "other", Some("png")), None);
+    }
+
+    #[test]
+    fn photo_copy_rel_path_is_byte_exactly_what_the_copy_writes() {
+        // THE load-bearing invariant of doing the copy after the index commits: the `photos` row and
+        // the front-matter are written from the PREDICTION, so a prediction that differs from the
+        // written name by one character does not merely dangle — the name is the AAD stem
+        // (`MarkdownCipher::aad_stem`), so the blob would not decrypt even once found. Both policies,
+        // because the `.pmenc` suffix is exactly where the two expressions could drift.
+        for cipher in [
+            MarkdownCipher::plaintext("vault-1"),
+            MarkdownCipher::for_test_encrypted("vault-1"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault = dir.path().join("vault");
+            std::fs::create_dir_all(&vault).unwrap();
+            let bytes = b"\x89PNG\r\n\x1a\n not really a png".to_vec();
+
+            let predicted = photo_copy_rel_path(&cipher, "abc123", Some("png"));
+            let written = copy_original_to_vault(&vault, &cipher, &bytes, "abc123", Some("png"))
+                .expect("the copy is written");
+
+            assert_eq!(
+                predicted, written,
+                "prediction and write are one expression"
+            );
+            assert!(
+                vault.join(&predicted).is_file(),
+                "the predicted path names a real file: {predicted}"
+            );
+            // The whole point: readable back. Under encryption this only holds if the AAD stem the
+            // writer used is the stem the predicted name yields.
+            assert_eq!(
+                cipher.read_bytes(&vault.join(&predicted)).unwrap(),
+                bytes,
+                "a drifted name yields an undecryptable blob, not just a wrong pointer"
+            );
+            // And the heal probe finds it under the same name, whichever policy wrote it.
+            assert_eq!(
+                find_saved_photo_copy(&vault, "abc123", Some("png")).as_deref(),
+                Some(predicted.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn a_photo_that_lost_both_its_ocr_and_its_copy_reports_both() {
+        // `Outcome::Indexed.warning` is single-valued and now has two producers, so a plain assignment
+        // would silently drop the OCR note when the vault copy fails on the same photo.
+        assert_eq!(join_warnings([None, None]), None);
+        assert_eq!(
+            join_warnings([Some("no OCR".into()), None]).as_deref(),
+            Some("no OCR")
+        );
+        assert_eq!(
+            join_warnings([None, Some("no copy".into())]).as_deref(),
+            Some("no copy")
+        );
+        assert_eq!(
+            join_warnings([Some("no OCR".into()), Some("no copy".into())]).as_deref(),
+            Some("no OCR; no copy"),
+            "both survive, in the order they happened"
+        );
     }
 
     #[test]

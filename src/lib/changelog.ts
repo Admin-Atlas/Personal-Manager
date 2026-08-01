@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.113.5-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "An import no longer reports a clean run over files it never managed to open. Drop in a folder where one subfolder is locked — by another program, by a permission, by a drive that went away — and PM used to reach 100% and say nothing was skipped. It now says how many items it couldn't read.",
+      "Changing your vault passphrase, or exporting everything as plain text, now stops rather than half-finishing if PM can't read part of the vault. A file it can't see would previously have been left behind under the old key, unopenable. It now refuses before touching anything and tells you what it couldn't read.",
+      "A backup can no longer quietly leave your whole vault out of the archive. If PM couldn't read the vault folder it treated it as \"there isn't one\", packed the rest, verified it and called it done.",
+      "Saving a photo now writes your copy of the original after the photo is safely indexed rather than before, so a failure part-way through no longer leaves an unreferenced file sitting in the vault. If the copy itself fails you're told, on that document.",
+      "In the document reader, text that sits in the overlap between two passages is no longer shown twice. The passages PM searches deliberately overlap a little; the reader was drawing both. A side effect worth knowing: the alternating bands now cover unequal amounts of text, so band height was never — and is now visibly not — a guide to how big a passage is.",
+    ],
+  },
+  {
     version: "3.113.4-alpha",
     date: "2026-07-31",
     highlights: [

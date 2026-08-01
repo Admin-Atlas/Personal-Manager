@@ -292,6 +292,10 @@ pub struct IngestReport {
     pub ingested: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Entries the vault walk could not read (`IngestEvent::Finished::unreadable`). Carried here too,
+    /// not just on the live event, because the returning-tab snapshot is the ONLY thing a user who
+    /// switched away sees — and "the run was partial" is precisely the part they must not miss.
+    pub unreadable: usize,
 }
 
 // The three detached-sync snapshots share their single-flight lifecycle through
