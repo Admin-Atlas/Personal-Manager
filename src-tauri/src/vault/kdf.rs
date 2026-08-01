@@ -317,12 +317,12 @@ mod tests {
     /// Every function in the crate that calls [`validate_passphrase_strength`], as
     /// `(file, enclosing fn)`. Changing this list is a deliberate act, not a merge artefact.
     const STRENGTH_CALL_SITES: &[(&str, &str)] = &[
-        ("commands.rs", "create_shareable_vault"),
-        ("commands.rs", "change_vault_passphrase"),
-        ("commands.rs", "create_local_backup"),
-        ("commands.rs", "set_backup_passphrase"),
-        ("commands.rs", "backup_to_proton"),
-        ("commands.rs", "backup_to_gdrive"),
+        ("vaults.rs", "create_shareable_vault"),
+        ("vaults.rs", "change_vault_passphrase"),
+        ("backups.rs", "create_local_backup"),
+        ("backups.rs", "set_backup_passphrase"),
+        ("backups.rs", "backup_to_proton"),
+        ("backups.rs", "backup_to_gdrive"),
     ];
 
     /// Functions the floor must NEVER be reachable from. Implied by the list above, but named so a
