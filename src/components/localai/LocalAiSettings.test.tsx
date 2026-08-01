@@ -283,6 +283,18 @@ describe("the endpoint form", () => {
     // Nothing is configured, so there is nothing to list — the model pickers must not be shown.
     expect(listLocalLlmModels).not.toHaveBeenCalled();
   });
+
+  it("names both fields by their visible labels, not by their placeholders", async () => {
+    // Both labels sat above their Input with no `htmlFor`, so the placeholder was the last-resort
+    // accessible name — and a placeholder stops being the name the moment you type. The queries
+    // below are the accname computation, which is the only thing that settles this.
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    render(<LocalAiSettings />);
+
+    expect(await screen.findByLabelText("Endpoint URL")).toBeTruthy();
+    expect(screen.getByLabelText(/^Token/)).toBeTruthy();
+    expect(screen.queryByLabelText("http://localhost:11434")).toBeNull();
+  });
 });
 
 describe("model licence terms", () => {

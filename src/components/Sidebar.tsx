@@ -33,7 +33,7 @@ const SHORTCUT_HINT =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform) ? "⌘K" : "Ctrl K";
 
 /** One foldable section of the Chats tab's sidebar, with a count and its own empty state. The
- *  heading keeps the mono/uppercase/faint treatment the single "Conversations" label had, so the
+ *  heading keeps the mono/uppercase/ink4 treatment the single "Conversations" label had, so the
  *  two sections read as the same furniture rather than a new kind of thing.
  *
  *  The fold is remembered per device (lib/chatPrefs). It has to be: this whole block is gated on
@@ -72,9 +72,9 @@ function ChatSection({
         writeChatSectionOpen(id, next);
       }}
       meta={count > 0 ? count : undefined}
-      title={<span className="font-mono text-xs uppercase tracking-wide text-faint">{title}</span>}
+      title={<span className="font-mono text-xs uppercase tracking-wide text-ink4">{title}</span>}
     >
-      {count === 0 ? <p className="px-2 py-2 text-xs text-faint">{empty}</p> : children}
+      {count === 0 ? <p className="px-2 py-2 text-xs text-ink4">{empty}</p> : children}
     </Collapsible>
   );
 }
@@ -317,7 +317,7 @@ export function Sidebar({
           className="flex w-full items-center justify-between rounded-[var(--radius-sm)] border border-border bg-surface px-3 py-1.5 text-left text-sm text-ink4 hover:text-ink2"
         >
           <span>Search…</span>
-          <span className="ml-2 shrink-0 font-mono text-xs text-faint">{SHORTCUT_HINT}</span>
+          <span className="ml-2 shrink-0 font-mono text-xs text-ink4">{SHORTCUT_HINT}</span>
         </button>
       </div>
 
@@ -485,7 +485,7 @@ export function Sidebar({
                   control; the only other route was the "this conversation has been idle — start a new
                   one?" prompt in ProjectView, which by definition isn't there when you want it. */}
               <div className="flex items-center justify-between gap-1 px-2 pb-1 pt-2">
-                <p className="min-w-0 truncate font-mono text-xs uppercase tracking-wide text-faint">
+                <p className="min-w-0 truncate font-mono text-xs uppercase tracking-wide text-ink4">
                   Conversations
                 </p>
                 <button
@@ -498,7 +498,7 @@ export function Sidebar({
                 </button>
               </div>
               {conversations.length === 0 && (
-                <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
+                <p className="px-2 py-2 text-xs text-ink4">No conversations yet.</p>
               )}
               {conversations.map((c) => (
                 <ConversationRow
@@ -640,7 +640,7 @@ export function Sidebar({
 function ModelRow({ role, id, fallbacks }: { role: string; id: string | null; fallbacks: number }) {
   return (
     <div className="flex items-center gap-1.5 text-xs leading-5">
-      <span className="w-9 shrink-0 font-mono text-faint">{role}</span>
+      <span className="w-9 shrink-0 font-mono text-ink4">{role}</span>
       <span className="min-w-0 flex-1 truncate text-ink3" title={id ?? "Using the default model"}>
         {id ? shortModel(id) : "default"}
       </span>
@@ -671,7 +671,7 @@ function LocalRow({ status }: { status: LocalLlmStatus | null }) {
         : "unreachable";
   return (
     <div className="flex items-center gap-1.5 text-xs leading-5">
-      <span className="w-9 shrink-0 font-mono text-faint">Local</span>
+      <span className="w-9 shrink-0 font-mono text-ink4">Local</span>
       <span
         className="min-w-0 flex-1 truncate"
         style={{ color: `var(${LOCAL_STATE_TOKEN[state]})` }}

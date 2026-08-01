@@ -107,7 +107,7 @@ export function CalendarSourceList({
       {/* The first-party overlays — pseudo-calendars you can show/hide like any synced one. Shown even
           with no calendars connected, since milestones and pinboard entries exist independently. */}
       <div className="mb-1">
-        <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[0.625rem] uppercase tracking-wide text-faint">
+        <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
           Personal Manager
         </p>
         <ul>
@@ -132,7 +132,7 @@ export function CalendarSourceList({
       ) : (
         groups.map((g) => (
           <div key={g.key} className="mb-1 last:mb-0">
-            <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[0.625rem] uppercase tracking-wide text-faint">
+            <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
               {g.label}
             </p>
             <ul>

@@ -30,6 +30,7 @@ import {
   Select,
   Skeleton,
   Textarea,
+  useFieldA11y,
 } from "./ui";
 
 const SCOPE_GLOBAL = "global";
@@ -320,6 +321,22 @@ function PreferenceModal({
   const [parsing, setParsing] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
 
+  // Five label/control pairs that named nothing. The natural-language field also owns the dialog's
+  // two loose paragraphs: the "PM turns it into the fields below" hint is its `description`, and the
+  // parse failure its `error` — which is what gives that failure a `role="alert"`. Until now a
+  // mis-parse rendered silently, so a blind user pressed "Fill in", nothing was announced, and the
+  // fields below simply did not change.
+  const parseHint = "PM turns it into the fields below — check them before saving.";
+  const noProjectsHint =
+    projects.length === 0
+      ? "No projects yet — file some documents first, or pick a different scope."
+      : null;
+  const sentenceField = useFieldA11y({ description: parseHint, error: parseError });
+  const scopeField = useFieldA11y();
+  const projectField = useFieldA11y({ description: noProjectsHint });
+  const conditionField = useFieldA11y();
+  const valueField = useFieldA11y();
+
   const set = (patch: Partial<FormState>) => setForm((f) => ({ ...f, ...patch }));
 
   // The "in your own words" path: a model call turns one sentence into the fields below, which the
@@ -366,9 +383,12 @@ function PreferenceModal({
       {!isEdit && (
         <>
           <div className="mt-4" data-help="teach-pref-nl">
-            <label className="block text-xs text-ink3">In your own words</label>
+            <label {...sentenceField.labelProps} className="block text-xs text-ink3">
+              In your own words
+            </label>
             <div className="mt-1 flex gap-2">
               <Input
+                {...sentenceField.controlProps}
                 value={sentence}
                 onChange={(e) => setSentence(e.target.value)}
                 onKeyDown={(e) => {
@@ -389,9 +409,13 @@ function PreferenceModal({
                 {parsing ? "Reading…" : "Fill in"}
               </Button>
             </div>
-            {parseError && <p className="mt-1 text-xs text-st-due">{parseError}</p>}
-            <p className="mt-1 text-xs text-faint">
-              PM turns it into the fields below — check them before saving.
+            {parseError && (
+              <p {...sentenceField.errorProps} className="mt-1 text-xs text-st-due">
+                {parseError}
+              </p>
+            )}
+            <p {...sentenceField.descriptionProps} className="mt-1 text-xs text-ink4">
+              {parseHint}
             </p>
           </div>
           <div className="my-4 border-t border-rule" />
@@ -400,8 +424,11 @@ function PreferenceModal({
 
       <div className="flex flex-col gap-3">
         <div>
-          <label className="block text-xs text-ink3">Applies</label>
+          <label {...scopeField.labelProps} className="block text-xs text-ink3">
+            Applies
+          </label>
           <Select
+            {...scopeField.controlProps}
             className="mt-1 w-full"
             value={form.scope}
             onChange={(e) => set({ scope: e.target.value })}
@@ -414,8 +441,11 @@ function PreferenceModal({
 
         {form.scope === SCOPE_PROJECT && (
           <div>
-            <label className="block text-xs text-ink3">Project</label>
+            <label {...projectField.labelProps} className="block text-xs text-ink3">
+              Project
+            </label>
             <Select
+              {...projectField.controlProps}
               className="mt-1 w-full"
               value={form.entityId ?? ""}
               onChange={(e) => set({ entityId: e.target.value ? Number(e.target.value) : null })}
@@ -427,9 +457,9 @@ function PreferenceModal({
                 </option>
               ))}
             </Select>
-            {projects.length === 0 && (
-              <p className="mt-1 text-xs text-faint">
-                No projects yet — file some documents first, or pick a different scope.
+            {noProjectsHint && (
+              <p {...projectField.descriptionProps} className="mt-1 text-xs text-ink4">
+                {noProjectsHint}
               </p>
             )}
           </div>
@@ -437,8 +467,11 @@ function PreferenceModal({
 
         {form.scope === SCOPE_CONTEXT && (
           <div>
-            <label className="block text-xs text-ink3">When</label>
+            <label {...conditionField.labelProps} className="block text-xs text-ink3">
+              When
+            </label>
             <Input
+              {...conditionField.controlProps}
               className="mt-1 w-full"
               value={form.condition}
               onChange={(e) => set({ condition: e.target.value })}
@@ -448,8 +481,11 @@ function PreferenceModal({
         )}
 
         <div>
-          <label className="block text-xs text-ink3">Preference</label>
+          <label {...valueField.labelProps} className="block text-xs text-ink3">
+            Preference
+          </label>
           <Textarea
+            {...valueField.controlProps}
             className="mt-1"
             rows={2}
             value={form.value}

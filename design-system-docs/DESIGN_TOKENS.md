@@ -54,8 +54,14 @@ terminal.light   bg[.967,.010] panel[.945,.011] surface[.934,.011] border[.860,.
 ```
 
 Role intent: `bg` = window/main; `panel` = titlebar/sidebar; `surface` = cards/raised; `border` =
-hairlines; `border2` = stronger border / control outline; `rule` = faint row dividers; `ink`→`faint`
+hairlines; `border2` = stronger border / control outline; `rule` = faint row dividers; `ink`→`ink4`
 = text from primary to faintest.
+
+`faint` is **not** a text tier. It is the decorative/disabled role — separators, placeholder glyphs,
+and the `disabled:` colour of a control — and it is the one role no Contrast level lifts, so it
+renders as low as 1.67:1 and must never carry text a reader is expected to read. Anything
+informational stops at `ink4`, which every Contrast level holds to 4.5:1.
+`src/theme/designGuards.test.ts` enforces this with a named allow-list.
 
 ---
 
@@ -100,17 +106,29 @@ label on a filled accent → `--accent-ink`; subtle tint behind something → `-
 
 ## 4. Status colors (semantic — NOT accent-tied)
 
-Order: `due, blocked, quick, look, part, track`. Separate dark/light sets per System (light is
-deepened for contrast on white). Tokens: `--st-due`, `--st-blocked`, `--st-quick`, `--st-look`,
-`--st-part`, `--st-track`.
+Order: `due, blocked, quick, look, part, track`. Separate dark/light sets per System. Tokens:
+`--st-due`, `--st-blocked`, `--st-quick`, `--st-look`, `--st-part`, `--st-track`.
+
+These are **text** colours (error messages, `role="alert"` copy, status chips) as much as they are
+fills, so the light rows are calibrated to clear WCAG AA (4.5:1) — built to 4.6:1 — against the
+worst background they can land on. That is `surface`, the *darkest* of `bg/panel/surface` in light
+mode, under whichever accent hue drives it lowest; `bg` is the lightest and therefore the most
+forgiving. Note that a contrast axis cannot save them: the status row is emitted verbatim and is
+byte-identical at every contrast level.
+
+Deepening holds each colour's OKLab hue, and its chroma except where sRGB clips it. The competing
+rule is that the six stay distinguishable from **each other** — a row pushed uniformly toward one
+lightness passes AA and destroys the taxonomy — so each row's minimum pairwise OKLab ΔE is held at
+or above where it started, with one measured exception (slate's `due`/`blocked`, −4.7%). Dark rows
+already clear comfortably (worst 5.20:1) and are untouched.
 
 ```
 editorial.dark   #e0856a #c789a4 #9aab66 #d2a24e #7fa3a0 #9a8f80
-editorial.light  #c2553a #a8547a #6f7d3a #b07d2a #4f7a76 #6f6457
+editorial.light  #b2472c #a14e74 #626f2c #8f6000 #3a726e #6f6457
 slate.dark       #ff8088 #ff93b4 #5fd6a0 #ffc266 #79c0ff #9aa0ad
-slate.light      #d83a4a #c43a78 #1f8a5b #b5781f #2f6fb5 #5f6470
+slate.light      #ca2a3f #be3473 #007b4d #965f01 #2d6db3 #5f6470
 terminal.dark    #f7768e #bb9af7 #9ece6a #e0af68 #7dcfff #82867f
-terminal.light   #c23a52 #7a52c0 #4a8a2a #9a6a1a #2a6a9a #5a5e57
+terminal.light   #bc344d #7950be #36750e #8d5e03 #2a6a9a #5a5e57
 ```
 
 Status taxonomy (labels are the design's vocabulary; map to your real states):

@@ -174,7 +174,7 @@ export function DeletedVaultNotice({
       <Button variant="primary" disabled={busy} onClick={() => void acknowledge()}>
         {busy ? "Switching…" : "Continue"}
       </Button>
-      <p className="max-w-sm break-all text-xs text-faint">{notice.folder}</p>
+      <p className="max-w-sm break-all text-xs text-ink4">{notice.folder}</p>
     </div>
   );
 }

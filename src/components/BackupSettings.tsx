@@ -799,7 +799,7 @@ export function BackupSettings() {
 
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-backup">
-      <label className="block text-sm font-medium text-ink2">Encrypted backup</label>
+      <h2 className="block text-sm font-medium text-ink2">Encrypted backup</h2>
       {/* The no-recovery sentence stays inline and unfoldable — the one line whose absence
           costs a vault. The description of what a backup *is* folds beneath it. */}
       <p className="mt-1 text-sm text-ink3">

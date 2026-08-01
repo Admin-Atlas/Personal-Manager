@@ -25,7 +25,7 @@ export type Depth = "min" | "standard" | "power";
  *  `standard` on the next read (see ThemeContext). */
 export type Density = "standard" | "comfortable";
 /** Contrast level (Accessibility). `aa` is the default and lifts the lowest text tier to WCAG 1.4.3
- *  AA (4.5:1); `high` reaches AAA (7:1) for body text and firms up the faint text + borders. Applied
+ *  AA (4.5:1); `high` reaches AAA (7:1) for body text and firms up `faint` + the borders. Applied
  *  by boost() in tokens.ts. See {@link CONTRASTS}.
  *
  *  `legacy` (PM's original, softer ramp) is gone for the same reason `compact` is — see above. */
@@ -41,6 +41,9 @@ export type Role =
   | "ink2"
   | "ink3"
   | "ink4"
+  /** DECORATIVE/DISABLED ONLY — separators, placeholder glyphs, `disabled:` control colour. It is
+   *  the one role `aa` does not lift (see CONTRAST_SHIFT in tokens.ts), so it renders as low as
+   *  1.67:1: the TEXT ramp is `ink`→`ink4`, and `designGuards.test.ts` keeps it that way. */
   | "faint";
 export type StatusKey = "due" | "blocked" | "quick" | "look" | "part" | "track";
 
@@ -282,29 +285,68 @@ export const MONO_RAMP: Record<Mode, Record<Role, number>> = {
   },
 };
 
-// Semantic status colours (NOT accent-tied). Order matches STATUS_KEYS; light is deepened for
-// contrast on near-white.
+// Semantic status colours (NOT accent-tied). Order matches STATUS_KEYS.
+//
+// The light rows are CALIBRATED, not eyeballed. Every value clears WCAG 1.4.3 AA (4.5:1) *as text*
+// against the worst background it can land on, and is built to 4.6:1 so hex quantisation or a later
+// ramp nudge cannot silently re-break it. The worst background is `surface` — the DARKEST of
+// bg/panel/surface in light mode, so the one that gives dark text the least to work against — taken
+// under whichever accent hue drives that System's surface lowest. Not `bg`: bg is the *lightest*
+// surface and therefore the most forgiving. contrast.test.ts measures every accent, so the choice is
+// pinned rather than trusted.
+//
+// Why this cannot be left to the contrast axis: boost() is applied to the neutral ramp only, and
+// themeVars emits --st-* verbatim, so `aa` and `high` produce byte-identical status colours. High
+// contrast rescues nothing here — a status colour that fails is failing at every setting the app
+// offers, and these render at text-xs so the 3:1 large-text exemption never applies either.
+//
+// Deepening holds each colour's OKLab HUE (max drift across the whole table is 0.9°) and holds its
+// chroma except where sRGB clips it. The second, competing constraint is that the six stay
+// distinguishable from EACH OTHER: a row pushed uniformly toward one lightness would pass AA and
+// destroy the taxonomy, which is the worse outcome. So each row's minimum pairwise OKLab ΔE is held
+// at or above where it started — editorial 0.0727 → 0.0743, terminal 0.1095 unchanged. `part` is the
+// visible consequence of that rule: deepening it at constant chroma would have made editorial's
+// already-tightest pair (part/track) 14% tighter, so it gains chroma (0.048 → 0.060) instead.
+//
+// The one exception, measured and accepted: slate's due/blocked narrows 0.0793 → 0.0756 (−4.7%),
+// because `due` had to drop 0.040 L to reach AA while `blocked` needed only 0.017, converging their
+// lightness. Buying it back meant deepening `blocked` a further 0.025 L — twice the move AA asked
+// for — to gain 0.0037 ΔE between two colours already 23° apart in hue at chroma 0.18+. Declined:
+// the cost is a visible colour change, the gain is below any perceptual threshold.
+//
+// Dark rows are deliberately untouched: their worst case is already 5.20:1.
 export const STATUS: Record<System, Record<Mode, readonly string[]>> = {
   editorial: {
     dark: ["#e0856a", "#c789a4", "#9aab66", "#d2a24e", "#7fa3a0", "#9a8f80"],
-    light: ["#c2553a", "#a8547a", "#6f7d3a", "#b07d2a", "#4f7a76", "#6f6457"],
+    light: ["#b2472c", "#a14e74", "#626f2c", "#8f6000", "#3a726e", "#6f6457"],
   },
   slate: {
     dark: ["#ff8088", "#ff93b4", "#5fd6a0", "#ffc266", "#79c0ff", "#9aa0ad"],
-    light: ["#d83a4a", "#c43a78", "#1f8a5b", "#b5781f", "#2f6fb5", "#5f6470"],
+    light: ["#ca2a3f", "#be3473", "#007b4d", "#965f01", "#2d6db3", "#5f6470"],
   },
   terminal: {
     dark: ["#f7768e", "#bb9af7", "#9ece6a", "#e0af68", "#7dcfff", "#82867f"],
-    light: ["#c23a52", "#7a52c0", "#4a8a2a", "#9a6a1a", "#2a6a9a", "#5a5e57"],
+    light: ["#bc344d", "#7950be", "#36750e", "#8d5e03", "#2a6a9a", "#5a5e57"],
   },
 };
 
 // Colour-blind-safe semantic status colours (Okabe–Ito-derived), swapped in by themeVars when the
 // colour-blind axis is on. One set per Mode — System-independent, because CVD distinctness is
 // universal — with order matching STATUS_KEYS (due, blocked, quick, look, part, track). The classic
-// red/green confusion (due vs quick) is broken by pairing vermillion-orange with bluish-green, and
-// each entry is tuned to read as text on the mode's --bg. Not accent-tied, like STATUS above.
+// red/green confusion (due vs quick) is broken by pairing vermillion-orange with bluish-green. Not
+// accent-tied, like STATUS above.
+//
+// The light row follows the same AA calibration as STATUS.light, with one extra move that needs its
+// reason recorded. Being System-independent, it is measured against the worst surface across ALL
+// three Systems. `due` sits at hue 42.5°, where sRGB runs out of chroma before 4.6:1 is reachable
+// above L 0.535 — so deepening it to pass AA necessarily walks it toward `look`, and that pair is
+// the tightest in the row *and* the orange-vs-amber pair CVD users are most likely to confuse.
+// Leaving it there cost 17% of that gap (ΔE 0.1081 → 0.0897). `look` is therefore deepened too
+// (0.508 → 0.471 L, same hue) even though it already passed at 4.86:1, purely to hold the gap: the
+// row's whole purpose is distinguishability, so trading it away inside a contrast fix would be a
+// regression on the one axis this table exists to serve. Its chroma was already at the sRGB cusp
+// (zero headroom at L 0.508), so lightness was the only lever. Net: ΔE 0.1081 → 0.1090.
 export const STATUS_CVD: Record<Mode, readonly string[]> = {
   dark: ["#ef8a5c", "#e58fc4", "#3fc99b", "#eab44e", "#63abe6", "#a6adba"],
-  light: ["#c24e12", "#a2497f", "#0e7c58", "#8a5a00", "#1f6fb5", "#5f6470"],
+  light: ["#b44300", "#a1487e", "#007653", "#7c5100", "#186ab0", "#5f6470"],
 };

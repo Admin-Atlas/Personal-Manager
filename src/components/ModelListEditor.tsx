@@ -54,7 +54,7 @@ export function ModelListEditor({
   return (
     <div data-help={helpId}>
       <div className="flex items-center justify-between gap-2">
-        <label className="block text-sm font-medium text-ink2">{label}</label>
+        <h2 className="block text-sm font-medium text-ink2">{label}</h2>
         {onReset && <ResetLink onReset={onReset} />}
       </div>
 
@@ -77,7 +77,7 @@ export function ModelListEditor({
                 Primary
               </span>
             ) : (
-              <span className="shrink-0 text-[0.625rem] text-faint">fallback {i}</span>
+              <span className="shrink-0 text-[0.625rem] text-ink4">fallback {i}</span>
             )}
             <div className="flex shrink-0 items-center">
               <Button

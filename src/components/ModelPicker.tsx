@@ -122,7 +122,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
 
           {/* Count, a price-sort toggle, and the column hint for the prices. */}
           {models && !error && (
-            <div className="flex items-center gap-2 px-3 py-1 font-mono text-[0.625rem] uppercase tracking-wide text-faint">
+            <div className="flex items-center gap-2 px-3 py-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
               <span>
                 {filtered.length} model{filtered.length === 1 ? "" : "s"}
               </span>
@@ -193,7 +193,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
               ))}
 
             {!loading && !error && filtered.length > MAX_SHOWN && (
-              <div className="px-3 py-2 text-center text-xs text-faint">
+              <div className="px-3 py-2 text-center text-xs text-ink4">
                 {filtered.length - MAX_SHOWN} more — keep typing to narrow it down.
               </div>
             )}

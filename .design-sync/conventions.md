@@ -44,20 +44,24 @@ the theme changes, so they stay on-brand. **Never use raw Tailwind palette color
 | Family | Classes |
 |---|---|
 | Backgrounds | `bg-bg` `bg-panel` `bg-surface` `bg-accent` `bg-accent-soft` |
-| Text | `text-ink` `text-ink2` `text-ink3` `text-ink4` `text-faint` `text-accent-text` `text-accent-ink` |
+| Text | `text-ink` `text-ink2` `text-ink3` `text-ink4` `text-accent-text` `text-accent-ink` |
 | Borders | `border-border` `border-border2` `border-rule` `border-accent` |
 | Fonts | `font-head` (display) `font-ui` (body/controls) `font-mono` (numbers, ids, meta) |
 | Radius | `rounded-[var(--radius)]` `rounded-[var(--radius-sm)]` |
 
-Status colors are **semantic** (not accent-tied). There are no `text-st-*` utility classes — render
-status with the `StatusBadge` component, or apply the raw variable inline:
-`style={{ color: "var(--st-blocked)" }}`. Variables: `--st-due` `--st-blocked` `--st-quick`
-`--st-look` `--st-part` `--st-track`.
+Status colors are **semantic** (not accent-tied). Render status with the `StatusBadge` component, or
+use the mapped utilities — `text-st-*`, `bg-st-*` and `border-st-*` all exist (`--color-st-*` is in
+`@theme inline`). The raw variable inline also works: `style={{ color: "var(--st-blocked)" }}`.
+Variables: `--st-due` `--st-blocked` `--st-quick` `--st-look` `--st-part` `--st-track`.
 
 Role intent: `bg` = window · `panel` = titlebar/sidebar · `surface` = cards/raised · `border` =
-hairline · `border2` = control outline · `rule` = faint row divider · `ink`→`faint` = text primary
+hairline · `border2` = control outline · `rule` = faint row divider · `ink`→`ink4` = text primary
 to faintest. Accent rule of thumb: fill/dot/border → `bg-accent`/`border-accent`; colored text →
 `text-accent-text`; label on a filled accent → `text-accent-ink`; subtle tint → `bg-accent-soft`.
+
+`--faint` is deliberately absent from the text list. It is the decorative/disabled role — separators,
+placeholder glyphs, `disabled:` control colour — and no Contrast level lifts it, so it can render as
+low as 1.67:1. Text a reader is meant to read stops at `ink4`.
 
 ## Where the truth lives
 

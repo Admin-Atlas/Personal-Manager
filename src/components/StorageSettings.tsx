@@ -148,7 +148,7 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
   return (
     <div data-help="settings-storage">
       <div className="flex items-baseline justify-between">
-        <label className="block text-sm font-medium text-ink2">On-device components</label>
+        <h2 className="block text-sm font-medium text-ink2">On-device components</h2>
         {report && (
           <span className="shrink-0 font-mono text-xs text-ink3">
             {formatSize(report.total_bytes, false)} total

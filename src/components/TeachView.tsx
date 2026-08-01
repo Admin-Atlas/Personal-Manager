@@ -24,7 +24,7 @@ import { useDepth } from "../theme";
 import { TeachPreferences } from "./TeachPreferences";
 import { TeachTags } from "./TeachTags";
 import { DevRaw } from "./dev/DevRaw";
-import { Button, Callout, Card, Dialog, Input, Select, Skeleton } from "./ui";
+import { Button, Callout, Card, Dialog, Input, Select, Skeleton, useFieldA11y } from "./ui";
 
 /** The always-present fallback bucket; we don't nudge merges for it. */
 const UNSORTED = "Unsorted";
@@ -45,6 +45,9 @@ export function TeachView() {
   // The merge modal: the entity being folded away, and the chosen survivor.
   const [mergeSource, setMergeSource] = useState<Entity | null>(null);
   const [mergeTargetId, setMergeTargetId] = useState<number | null>(null);
+  // The merge dialog's survivor picker. Minted here rather than in the dialog's JSX because that
+  // JSX is a conditional branch, and it is the last unnamed combobox in the Teach surface.
+  const mergeTargetField = useFieldA11y();
 
   async function load() {
     setError(null);
@@ -271,8 +274,11 @@ export function TeachView() {
               </Callout>
             )}
 
-            <label className="mt-4 block text-xs text-ink3">Keep this project</label>
+            <label {...mergeTargetField.labelProps} className="mt-4 block text-xs text-ink3">
+              Keep this project
+            </label>
             <Select
+              {...mergeTargetField.controlProps}
               value={mergeTargetId ?? ""}
               onChange={(e) => setMergeTargetId(e.target.value ? Number(e.target.value) : null)}
               className="mt-1 w-full"
@@ -436,7 +442,7 @@ function EntityCard({
           <p className="pb-1.5 text-xs text-ink4">Also known as</p>
           <div className="flex flex-wrap items-center gap-1.5">
             {variants.length === 0 && aliasing == null && (
-              <span className="text-xs text-faint">No other names yet.</span>
+              <span className="text-xs text-ink4">No other names yet.</span>
             )}
             {variants.map((alias) => (
               <span

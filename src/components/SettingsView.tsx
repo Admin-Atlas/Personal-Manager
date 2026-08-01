@@ -47,6 +47,7 @@ import {
   NavItem,
   SectionLabel,
   SegmentedControl,
+  useFieldA11y,
 } from "./ui";
 
 interface Props {
@@ -79,6 +80,9 @@ export function SettingsView({
   // "Settings, dialog" instead of a bare "dialog". Minted above the onboarding early return because
   // hooks cannot be conditional; onboarding is not a dialog and never reads it.
   const titleId = useId();
+  // Onboarding's OpenRouter key field. Minted here for the same reason `titleId` is — hooks cannot
+  // be conditional — and used ~290 lines below, in the wizard's cloud pane.
+  const keyField = useFieldA11y();
   const [key, setKey] = useState("");
   // First-run AI-provider choice (#295): a cloud key, or a local model on this device. The local
   // pane reports readiness (an endpoint + a chat model configured) up through `localReady`.
@@ -361,8 +365,11 @@ export function SettingsView({
                 and PM sends Zero-Data-Retention on every request.
               </p>
 
-              <label className="mt-3 block text-sm font-medium text-ink2">OpenRouter API key</label>
+              <label {...keyField.labelProps} className="mt-3 block text-sm font-medium text-ink2">
+                OpenRouter API key
+              </label>
               <Input
+                {...keyField.controlProps}
                 type="password"
                 autoComplete="off"
                 data-help="settings-api-key"
@@ -431,7 +438,7 @@ export function SettingsView({
                 Your documents and notes live in one encrypted store on this device — the key stays
                 in this device's keychain, so there's nothing to remember.
               </p>
-              <p className="mt-2 text-xs text-faint">
+              <p className="mt-2 text-xs text-ink4">
                 Want to open the same vault from another Windows account on this PC? Set that up
                 anytime after setup under Settings → Data &amp; Security → Share with other
                 accounts.
@@ -464,7 +471,7 @@ export function SettingsView({
                   <LanguageCompareTable />
                 </Collapsible>
               </div>
-              <p className="mt-3 text-xs text-faint">
+              <p className="mt-3 text-xs text-ink4">
                 You can switch a vault&apos;s language later in Settings — it re-indexes your
                 library to do so (quick on a small vault, longer on a large one). Your original
                 files are never touched or lost.
