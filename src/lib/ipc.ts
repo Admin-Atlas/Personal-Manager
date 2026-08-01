@@ -214,6 +214,15 @@ export const setDuplicateCheck = (enabled: boolean) =>
  *  near-identical embeddings. On demand only, and it reports — nothing is deleted or merged. */
 export const scanDuplicates = () => invoke<DuplicateReport>("scan_duplicates");
 
+/** Record that the user looked at a pair and is keeping both, so it stops being re-offered. The
+ *  report is recomputed from scratch on every scan and writes nothing back, so without this a
+ *  decision already made came back on every scan forever. */
+export const dismissDuplicatePair = (a: number, b: number) =>
+  invoke<void>("dismiss_duplicate_pair", { a, b });
+
+/** Un-hide every dismissed pair — a narrowing the user made is one they can undo. */
+export const restoreDuplicateDismissals = () => invoke<void>("restore_duplicate_dismissals");
+
 /** Set the indexing-speed preference: "fast" (max throughput) or "gentle" (paced for low-end
  *  machines). Applies to the next Drive sync / file import. */
 export const setIndexingSpeed = (speed: "fast" | "gentle") =>

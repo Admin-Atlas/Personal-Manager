@@ -1885,6 +1885,9 @@ export interface DuplicateReport {
    *  than swallowed: "nothing found" from a half-run scan is a claim PM hasn't earned. */
   similarity_skipped: boolean;
   similarity_limit: number;
+  /** Pairs hidden because the user already chose to keep both — reported, never silently
+   *  subtracted. */
+  dismissed: number;
 }
 
 /** ONE-TIME cleanup (card #651) — delete this block with the sweep in the next release.

@@ -51,6 +51,7 @@ Two rules that fall out of the classes:
 | `project_activity_daily` | derived | Per-(project, day, kind) compaction of the above. |
 | `corrections` | truth | The user's filing corrections, stamped with the pipeline version that produced the original. A learning signal; not recomputable. |
 | `document_proposals` | derived | Explicitly a regenerable cache of the Review tab's AI proposals — dropped as a document leaves the queue. Re-deriving is a **billable** model call. |
+| `duplicate_dismissals` | device | A decision the user made about their own library, not a fact about it: "I looked at these two and I am keeping both." Deliberately NOT truth — it is meaningless without the exact `documents.id` pair it references, which a rebuild on another machine would not reproduce, and re-offering a dismissed pair on a new machine is a harmless prompt rather than a loss. |
 | `tag_proposals` | derived | Staging for a whole-library re-tag pass (#580) — a billable model call to re-derive, and empty in the steady state. Kept out of `document_proposals` on purpose: that one is committed by the review path, which writes project + importance together. |
 | `retrieval_feedback` | truth | Relevance signal the user gave, stamped with the retrieval config it was given under. |
 | `preferences` | truth | The structured preference model. **No portable mirror exists today** — this is the largest gap in the current picture; see Open decisions. |

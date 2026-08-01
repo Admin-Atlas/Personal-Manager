@@ -332,6 +332,52 @@ pub struct DuplicateReport {
     /// claim PM has not earned.
     pub similarity_skipped: bool,
     pub similarity_limit: usize,
+    /// Pairs hidden because the user already chose to keep both. Reported rather than silently
+    /// subtracted: a narrowed result the user cannot see the shape of is the same defect as the
+    /// skipped-similarity case above.
+    pub dismissed: usize,
+}
+
+/// The pairs the user has already decided to keep, lower-id first to match [`ordered`].
+fn load_dismissals(conn: &Connection) -> Result<std::collections::HashSet<(i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT a_document_id, b_document_id FROM duplicate_dismissals")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
+/// Record that the user looked at a pair and is keeping both.
+///
+/// Without this the report was stateless by construction — `scan_duplicates` recomputes everything
+/// and writes nothing back, and the only "resolved" state was a component-local set cleared at the
+/// top of every scan. So a decision the user had already made was re-offered on every scan forever.
+#[tauri::command]
+pub fn dismiss_duplicate_pair(
+    state: tauri::State<'_, crate::AppState>,
+    a: i64,
+    b: i64,
+) -> Result<()> {
+    let conn = state.conn()?;
+    let (lo, hi) = ordered(a, b);
+    conn.execute(
+        "INSERT OR IGNORE INTO duplicate_dismissals (a_document_id, b_document_id, dismissed_at)
+         VALUES (?1, ?2, ?3)",
+        // chrono directly, NOT a helper that takes `&AppState`: the connection guard is already
+        // held here, and re-entering `state.conn()` on a non-reentrant mutex self-deadlocks.
+        rusqlite::params![lo, hi, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Un-hide every dismissed pair, so a narrowing the user made is one they can undo.
+#[tauri::command]
+pub fn restore_duplicate_dismissals(state: tauri::State<'_, crate::AppState>) -> Result<()> {
+    let conn = state.conn()?;
+    conn.execute("DELETE FROM duplicate_dismissals", [])?;
+    Ok(())
 }
 
 /// Scan the whole library for documents the user has twice (#282).
@@ -352,9 +398,17 @@ pub async fn scan_duplicates(app: tauri::AppHandle) -> Result<DuplicateReport> {
         let with_vectors = docs.iter().filter(|d| d.vector.is_some()).count();
         let similarity_skipped = with_vectors > MAX_SIMILARITY_DOCUMENTS;
         let pairs = pair_up(&docs, MAX_SIMILARITY_DOCUMENTS);
+        let dismissals = load_dismissals(&conn)?;
+        let mut dismissed = 0usize;
 
         let mut out = Vec::with_capacity(pairs.len());
         for p in pairs {
+            // `pair_up` already emits ids lower-first, and the table stores them the same way, so
+            // one lookup settles a pair whichever way round it was discovered.
+            if dismissals.contains(&ordered(p.a, p.b)) {
+                dismissed += 1;
+                continue;
+            }
             // A row deleted between the sweep and this load is not an error — drop the pair. Both
             // sides must resolve, or there is nothing to compare on screen.
             let (Ok(a), Ok(b)) = (
@@ -375,6 +429,7 @@ pub async fn scan_duplicates(app: tauri::AppHandle) -> Result<DuplicateReport> {
             pairs: out,
             similarity_skipped,
             similarity_limit: MAX_SIMILARITY_DOCUMENTS,
+            dismissed,
         })
     })
     .await

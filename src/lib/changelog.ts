@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.116.0-alpha",
+    date: "2026-08-01",
+    highlights: [
+      'The duplicate check now tells you which is which. Two copies of one file used to render identically — same title, the same "indexed from a connected account" sentence, the same project, the same date — on the one screen that asks you to delete one of them. Each side now says where it actually came from: which Google account, or that it was shared with you, or which shared drive, or OneDrive, or this device — plus the folder it sits in, and the time it was added rather than just the day. All of that was already known and simply wasn\'t being shown.',
+      'You can now say "keep both", and PM will remember. Until now the only options were to delete one or to be asked about the pair again on every single check — the report is worked out from scratch each time and remembered nothing, which is why running a check after a rebuild looked like it had found the same duplicates all over again. It had; it just had no way to know you\'d already decided. PM always says how many pairs are hidden and offers them back, so nothing is quietly dropped from the list.',
+      "PM now says that it compares what's inside a document, not what it's called. A file you renamed still matches its original, which is correct and deliberate — but with nothing explaining it, a correct match read as a mistake.",
+    ],
+  },
+  {
     version: "3.115.0-alpha",
     date: "2026-08-01",
     highlights: [

@@ -417,7 +417,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "documents-duplicates": {
     title: "Checking for duplicates",
-    body: "Looks through your whole library for documents that appear twice — the same file imported more than once, or one you hold locally that also lives in a connected account. Each pair says why PM flagged it: 'start identically' is a fact about the text, 'read very alike' is a judgement, and both together is as sure as it gets. Open either document to check before you act. 'Remove this one' names the document it removes and leaves the other alone; for something in a connected account, PM drops only its own pointer and never touches the file at the provider. On a very large library PM compares openings only and tells you so, rather than reporting a clean result it didn't earn.",
+    body: "Looks through your whole library for documents that appear twice — the same file imported more than once, or one you hold locally that also lives in a connected account. PM compares what is inside a document, never what it is called, so a renamed copy still matches and two files sharing a name but not their contents do not. Each pair says why PM flagged it: 'start identically' is a fact about the text, 'read very alike' is a judgement with a threshold behind it. Open either document to check before you act. 'Remove this one' names the document it removes and leaves the other alone; for something in a connected account, PM drops only its own pointer and never touches the file at the provider. On a very large library PM compares openings only and tells you so, rather than reporting a clean result it didn't earn.",
   },
   "settings-data": {
     title: "Data",
