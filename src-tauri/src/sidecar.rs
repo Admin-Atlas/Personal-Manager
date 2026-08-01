@@ -636,6 +636,15 @@ pub enum SandboxReport {
 trait ChildControl: Send {
     fn kill(&mut self);
     fn wait(&mut self);
+    /// Non-blocking reap probe: `true` once the child is really gone and its process-table slot has
+    /// been released, `false` for "still dying, ask again". The bounded counterpart of [`wait`], used
+    /// by [`reap_within`] so a `Drop` never blocks on a child that refuses to die.
+    ///
+    /// An error counts as `true`: a child we can no longer query is one we can never reap, so
+    /// re-probing it would only burn the budget.
+    ///
+    /// [`wait`]: ChildControl::wait
+    fn try_reap(&mut self) -> bool;
 }
 
 /// The ordinary, unconfined backend: a `std::process::Child` whose stdio has been taken out into the
@@ -647,6 +656,49 @@ impl ChildControl for StdChild {
     }
     fn wait(&mut self) {
         let _ = self.0.wait();
+    }
+    fn try_reap(&mut self) -> bool {
+        // `try_wait` is `waitpid(WNOHANG)` on Unix: `Ok(Some(_))` means the child exited AND was
+        // reaped (std caches the status, so a later `wait` is a no-op rather than a second syscall).
+        // `Ok(None)` is the only "still running" answer; an `Err` is effectively ECHILD — already
+        // reaped by someone else, nothing left to wait for.
+        !matches!(self.0.try_wait(), Ok(None))
+    }
+}
+
+/// How long [`Process::drop`] waits for the child it just killed to actually die.
+///
+/// Bounded on purpose. A `Drop` that can block forever is a worse defect than the zombie it exists to
+/// prevent: this `Drop` runs while the manager's `proc` mutex is held (the respawn path at the IO-error
+/// branch of `request`) and on a tokio worker (the wipe's [`SidecarManager::prepare_for_runtime_removal`]),
+/// so an unbounded wait on a child stuck in uninterruptible sleep — Linux D state on a stalled network
+/// mount, where even SIGKILL is only delivered once the process leaves D — would freeze the sidecar, and
+/// on the wipe path the UI, for the rest of the session. A kill is unblockable in every other case, so the
+/// child is normally gone in tens of milliseconds: this is a ceiling, not a latency.
+const REAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// How often [`reap_within`] re-probes inside [`REAP_BUDGET`].
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Reap an already-killed child, giving up after `budget`. `true` if it was reaped in time.
+///
+/// A free function over the trait, with the timing passed in, so the give-up behaviour is unit-testable
+/// against a stub — the reaping syscall itself is not (see the tests).
+fn reap_within(
+    control: &mut dyn ChildControl,
+    budget: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        // Probe first: the kill has usually already landed by the time we get here.
+        if control.try_reap() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
     }
 }
 
@@ -661,6 +713,29 @@ struct Process {
 impl Drop for Process {
     fn drop(&mut self) {
         self.control.kill();
+        // Then REAP it. `kill` alone leaves a killed-but-unwaited child as a zombie in the Unix
+        // process table for the life of the app, and every respawn route funnels through this one
+        // `Drop`: the IO-error branch of `request` (`*guard = None`, the common case — a crashed or
+        // OOM-killed worker), the two confined-preflight fall-opens on Linux/macOS (which leak TWO
+        // per spawn on a box where confinement is permanently broken, since `fall_open` memoises
+        // nothing), and the wipe's `prepare_for_runtime_removal`. The read watchdog is the one path
+        // that already did this by hand (`control.kill(); control.wait();`), which is why a
+        // timeout-driven respawn never leaked; the second reap here is then a no-op.
+        //
+        // Windows has no zombies, but it gets the other half: `TerminateProcess` is asynchronous, so
+        // waiting is what makes `prepare_for_runtime_removal` actually deliver its stated purpose —
+        // the interpreter's file locks are released before `wipe` deletes `runtime/`, instead of
+        // racing it and being papered over by `remove_dir_all_retrying`'s 3×200 ms back-off.
+        //
+        // Bounded, never blocking — see [`REAP_BUDGET`]. Giving up re-leaks the zombie, but only for
+        // a child that cannot be killed at all, and a hung `Drop` under the `proc` mutex would take
+        // the whole sidecar down with it.
+        if !reap_within(self.control.as_mut(), REAP_BUDGET, REAP_POLL) {
+            eprintln!(
+                "sidecar: the killed worker had not exited after {REAP_BUDGET:?}; \
+                 continuing without reaping it"
+            );
+        }
     }
 }
 
@@ -2710,6 +2785,9 @@ impl ChildControl for crate::sidecar_sandbox::ConfinedChild {
     fn wait(&mut self) {
         crate::sidecar_sandbox::ConfinedChild::wait(self);
     }
+    fn try_reap(&mut self) -> bool {
+        crate::sidecar_sandbox::ConfinedChild::try_reap(self)
+    }
 }
 
 /// The base interpreter a venv was built from, read from its `pyvenv.cfg` `home =` line (stripping the
@@ -2921,6 +2999,107 @@ fn no_window(_command: &mut Command) {}
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A [`ChildControl`] that records what the lifecycle did to it and can be told how stubbornly to
+    /// die, so the `Drop` contract and the give-up behaviour are pinned without spawning a real
+    /// interpreter. The reaping syscall itself (`waitpid` / `WaitForSingleObject`) is NOT covered by
+    /// these tests and cannot be, portably — Windows has no zombie to observe at all.
+    struct RecordingControl {
+        log: Arc<Mutex<Vec<&'static str>>>,
+        /// How many `try_reap` probes report "still dying" before the child is reported gone.
+        probes_before_exit: usize,
+    }
+
+    impl RecordingControl {
+        fn new(log: &Arc<Mutex<Vec<&'static str>>>, probes_before_exit: usize) -> Self {
+            Self {
+                log: Arc::clone(log),
+                probes_before_exit,
+            }
+        }
+    }
+
+    impl ChildControl for RecordingControl {
+        fn kill(&mut self) {
+            self.log.lock().unwrap().push("kill");
+        }
+        fn wait(&mut self) {
+            self.log.lock().unwrap().push("wait");
+        }
+        fn try_reap(&mut self) -> bool {
+            self.log.lock().unwrap().push("try_reap");
+            if self.probes_before_exit == 0 {
+                return true;
+            }
+            self.probes_before_exit -= 1;
+            false
+        }
+    }
+
+    #[test]
+    fn dropping_a_process_kills_the_child_and_then_reaps_it() {
+        // The whole defect in one assertion: `Drop` used to call only `kill()`, so on Unix every
+        // respawn (an IO error, a failed confined preflight, the wipe teardown) left a zombie for the
+        // life of the app. The ORDER is pinned too — probing before killing would just spin out the
+        // budget against a healthy worker.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        drop(Process {
+            stdin: Box::new(std::io::sink()),
+            stdout: Box::new(std::io::empty()),
+            control: Box::new(RecordingControl::new(&log, 0)),
+        });
+
+        assert_eq!(&*log.lock().unwrap(), &["kill", "try_reap"]);
+    }
+
+    #[test]
+    fn the_reap_keeps_probing_until_the_child_is_gone() {
+        // A kill is not instantaneous — TerminateProcess is asynchronous and a multi-GB Python RSS
+        // takes real time to tear down — so one probe is not enough.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut control = RecordingControl::new(&log, 3);
+
+        assert!(reap_within(
+            &mut control,
+            Duration::from_secs(30),
+            Duration::from_millis(1)
+        ));
+        assert_eq!(
+            log.lock().unwrap().len(),
+            4,
+            "three 'still dying' answers, then the one that reports it gone"
+        );
+    }
+
+    #[test]
+    fn the_reap_gives_up_rather_than_hanging_on_a_child_that_never_dies() {
+        // The reason this is a bounded wait and not the `wait()` the trait already has. `Process::drop`
+        // runs under the manager's `proc` mutex and, on the wipe path, on a tokio worker; a child in
+        // uninterruptible sleep would otherwise hang it there for the rest of the session. Re-leaking
+        // one zombie is the strictly better failure.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut control = RecordingControl::new(&log, usize::MAX);
+
+        let started = Instant::now();
+        let reaped = reap_within(
+            &mut control,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        );
+        let took = started.elapsed();
+
+        assert!(!reaped, "a child that never exits is never reaped");
+        assert!(
+            took < Duration::from_secs(10),
+            "the wait must return on its own; it took {took:?}"
+        );
+        assert!(
+            log.lock().unwrap().len() > 1,
+            "and it really did re-probe rather than give up after the first miss"
+        );
+    }
 
     /// End-to-end smoke test of the Windows AppContainer confinement (issue #286 PR2b): spawn the REAL
     /// worker confined, `ping` it over the raw pipes, then convert a text file through the staging path,

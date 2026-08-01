@@ -433,8 +433,10 @@ pub struct AppState {
     /// component-local and resets on remount, which made that reachable by simply switching tabs and
     /// clicking again.
     pub ingest_busy: AtomicBool,
-    /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
-    /// the Map can show progress and a second request folds into the running one. See `layout`.
+    /// Snapshot of the semantic-map layout precompute (the reducer that ran + the last error), so the
+    /// Map can show what produced the cached coordinates and surface a failure. The single-flight
+    /// claim itself is NOT here — it is [`AppState::layout_busy`], so a panicked or dropped pass
+    /// releases it. See `layout`.
     pub layout_job: Mutex<layout::LayoutJobState>,
     /// When the user was last active (a chat send / an ingest). The idle chat-indexer (`chat_index`)
     /// reads this so it only runs during a lull and never competes with active use.
@@ -450,14 +452,38 @@ pub struct AppState {
     /// Single-flight guard shared by the chat-preference eager nudge and the launch catch-up
     /// (`chat_prefs`), so a per-conversation extraction and a full reconcile never overlap.
     pub prefs_busy: AtomicBool,
+    /// Single-flight guard for the semantic-layout precompute, shared by the idle launch pass, the
+    /// Map-open prioritise, and the two component-change recomputes (t-SNE installed / a storage
+    /// component removed), so a second request folds into the running one instead of stacking a
+    /// second reducer run. It is also what `semantic_layout` reports as `computing`.
+    ///
+    /// An `AtomicBool` reached through [`BusyGuard`] rather than a `running` field on
+    /// [`layout::LayoutJobState`]: the flag has to survive a panicking or dropped pass (F-43), and a
+    /// bool behind a `Mutex` additionally wedges on poison — reading idle forever while refusing
+    /// forever.
+    pub layout_busy: AtomicBool,
     /// Snapshot of the currently-running encrypted backup / restore, so the Backup settings UI can
     /// resume showing progress after the user navigates away and back (the sibling of `drive_sync`).
     pub backup_state: Mutex<BackupState>,
     /// Cooperative stop flag for the running backup/restore. `stop_backup` sets it; the pack/restore
     /// loop checks it between reads and aborts. Reset at the start of each op.
     pub backup_cancel: AtomicBool,
-    /// Single-flight guard so a manual backup, a manual restore, and (later) a scheduled backup can
-    /// never overlap and contend for the DB snapshot / archive file.
+    /// Single-flight guard so a manual backup, a manual restore, and a scheduled backup can never
+    /// overlap and contend for the DB snapshot / archive file.
+    ///
+    /// It carries a DATA-SAFETY property as well as that UX one: `wipe::wipe_pm_data` takes this
+    /// guard for the whole erase, so while it is set no backup or restore can start, and an erase
+    /// requested while one IS in flight is refused outright. Without that, an upload finishing after
+    /// "Remove PM data" reported success would leave a fully decryptable `.pmbackup` of the erased
+    /// vault on a remote (it embeds the DB key, so it restores anywhere with the passphrase the user
+    /// still knows), and a restore finishing after it would strand one in `restored-vaults/`.
+    /// Anything that widens the set of doors taking this guard must keep that sentence true.
+    ///
+    /// Reach it through [`BusyGuard`], never a bare `load` — a check-then-act read loses the race by
+    /// construction, because the scheduler does a DB read and an async Proton probe between
+    /// `ready_to_backup` and the acquire inside `run_backup`. Note also that `BackupState.running`
+    /// (the display snapshot) is NOT this: `emit_backup_progress` clears it on `Finished`/`Failed`
+    /// while the guard is still held and the run is still winding down, so it is a UI hint only.
     pub backup_busy: AtomicBool,
     /// Keys recovered by a restore, held in memory (never the keychain) keyed by the restored
     /// folder, until the user explicitly switches to that vault. Deferring the keychain write to the
@@ -519,9 +545,9 @@ pub(crate) fn session_unavailable_message(fault: Option<&error::VaultFault>) -> 
 /// Single-flight guard with RAII release. [`BusyGuard::acquire`] returns `Some` if it flipped the flag
 /// `false → true` (this caller won the single-flight), or `None` if another pass already holds it. The flag
 /// resets to `false` when the guard drops — crucially including an unwinding panic, unlike a trailing
-/// `store(false)`. A background task (title / summary / prefs / index sweep) that panics mid-op therefore
-/// can't leave its subsystem's flag stuck `true`, which would otherwise silently wedge that feature (its
-/// eager nudge AND its scheduler both short-circuit on the flag) until the app restarts.
+/// `store(false)`. A background task (title / summary / prefs / index sweep / layout precompute) that panics
+/// mid-op therefore can't leave its subsystem's flag stuck `true`, which would otherwise silently wedge that
+/// feature (its eager nudge AND its scheduler both short-circuit on the flag) until the app restarts.
 pub(crate) struct BusyGuard<'a>(&'a AtomicBool);
 
 impl<'a> BusyGuard<'a> {
@@ -1237,6 +1263,7 @@ pub fn run() {
                 summary_busy: AtomicBool::new(false),
                 title_busy: AtomicBool::new(false),
                 prefs_busy: AtomicBool::new(false),
+                layout_busy: AtomicBool::new(false),
                 backup_state: Mutex::new(BackupState::default()),
                 backup_cancel: AtomicBool::new(false),
                 backup_busy: AtomicBool::new(false),
@@ -1684,5 +1711,70 @@ mod tests {
         let msg = session_unavailable_message(Some(&other));
         assert!(msg.contains("disk I/O error"));
         assert!(msg.contains("Settings"));
+    }
+
+    #[test]
+    fn busy_guard_admits_one_holder_and_reopens_the_slot_on_drop() {
+        // Eight callers across seven flags stake single-flight on this type and, since the erase
+        // joined them, one stakes a DATA-SAFETY property on it: `wipe_pm_data` refuses while a backup or
+        // restore holds `backup_busy`, and holds it itself so none can start mid-erase. Both halves
+        // are exactly the three assertions below, and neither was pinned anywhere before.
+        let flag = AtomicBool::new(false);
+
+        let first = BusyGuard::acquire(&flag).expect("an idle flag admits the first caller");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "winning the guard must publish the claim, so a later `load` sees it"
+        );
+        assert!(
+            BusyGuard::acquire(&flag).is_none(),
+            "a second caller must lose while the first holds it — this is the whole gate"
+        );
+
+        drop(first);
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping the guard must clear the flag, not merely release the guard"
+        );
+        let second = BusyGuard::acquire(&flag);
+        assert!(
+            second.is_some(),
+            "the slot must be reusable after a clean release, or one backup would wedge every later one"
+        );
+        drop(second);
+
+        // Guards on different flags are independent — a held `backup_busy` must not stand down the
+        // rebuild or the chat sweeps, which is only true because the guard borrows ONE flag.
+        let other = AtomicBool::new(false);
+        let _held = BusyGuard::acquire(&flag).unwrap();
+        assert!(BusyGuard::acquire(&other).is_some());
+    }
+
+    #[test]
+    fn busy_guard_releases_when_the_holder_panics() {
+        // The F-43 regression for this type. A hand-rolled `store(false)` at the tail of the run is
+        // skipped by an unwinding panic, which pins the flag `true` for the rest of the session:
+        // every later backup, restore and — now — every "Remove PM data" would refuse until the app
+        // restarts, with no way for the user to clear it. RAII release is what makes that
+        // unreachable, so it is pinned here rather than left to the type's doc comment.
+        let flag = AtomicBool::new(false);
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // the deliberate panic below isn't a test failure
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = BusyGuard::acquire(&flag).expect("the flag starts idle");
+            panic!("the pass dies mid-run");
+        }));
+        std::panic::set_hook(hook);
+
+        assert!(unwound.is_err(), "the panic really unwound past the guard");
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "an unwinding panic must still clear the flag"
+        );
+        assert!(
+            BusyGuard::acquire(&flag).is_some(),
+            "and the subsystem must be usable again without an app restart"
+        );
     }
 }

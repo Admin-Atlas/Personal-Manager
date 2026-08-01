@@ -30,7 +30,8 @@ use std::process::Command;
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
+    CloseHandle, LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
+    HLOCAL, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::Isolation::{
@@ -333,6 +334,14 @@ impl ConfinedChild {
         unsafe {
             let _ = WaitForSingleObject(self.process, INFINITE);
         }
+    }
+
+    /// Non-blocking liveness probe: `true` once the process object is signalled, i.e. the worker has
+    /// exited. A zero timeout makes this the bounded counterpart of [`ConfinedChild::wait`], which the
+    /// sidecar's `Drop` polls so it can never block on a worker that refuses to die. Anything other
+    /// than `WAIT_TIMEOUT` (including `WAIT_FAILED` on a handle we can no longer query) counts as gone.
+    pub fn try_reap(&mut self) -> bool {
+        unsafe { WaitForSingleObject(self.process, 0) != WAIT_TIMEOUT }
     }
 }
 
