@@ -32,7 +32,7 @@ import { OnboardingLocalConnect } from "./onboarding/OnboardingLocalConnect";
 import { StorageSettings } from "./StorageSettings";
 import type { LanguageOptions } from "../lib/types";
 import { useScrollSpy } from "../lib/useScrollSpy";
-import { deviceTimeZone } from "../theme";
+import { deviceTimeZone, scrollBehavior } from "../theme";
 import { SETTINGS_GROUPS, sectionsFor, type SettingsTab } from "./settings/registry";
 import { useSettingsPending } from "../lib/settingsPending";
 import { SavedTick } from "./settings/SavedTick";
@@ -161,8 +161,7 @@ export function SettingsView({
   function scrollToSection(id: string) {
     const el = contentRef.current?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
     if (!el) return;
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "start" });
     el.classList.remove("pm-locate");
     void el.offsetWidth; // force a reflow so the re-added class restarts the animation
     el.classList.add("pm-locate");

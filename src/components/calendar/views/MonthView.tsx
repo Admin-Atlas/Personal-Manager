@@ -18,7 +18,7 @@ import {
   startOfDay,
 } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
-import { useDepth } from "../../../theme";
+import { scrollBehavior, useDepth } from "../../../theme";
 import { cn } from "../../ui";
 import { EventChip } from "../parts/EventChip";
 import { SourceDot } from "../parts/SourceDot";
@@ -122,7 +122,7 @@ export function MonthView({
       const el = scrollRef.current;
       if (!el || weekH === 0) return;
       programmaticRef.current = true;
-      el.scrollTo({ top: idx * weekH, behavior: smooth ? "smooth" : "auto" });
+      el.scrollTo({ top: idx * weekH, behavior: scrollBehavior(smooth) });
       const clear = () => {
         programmaticRef.current = false;
         el.removeEventListener("scrollend", clear);

@@ -9,27 +9,56 @@
 // keeps today's 20px track while still offering a 24px target; `comfortable` grows both. The var
 // fallbacks match the `standard` (compliant) default, so the switch is correct even before the
 // theme effect first runs.
+//
+// NAMING is a required union, never two optionals: the switch renders no text of its own, so a
+// switch with neither prop is an unnamed control and must not compile. `ariaLabel` is a string the
+// author TYPES; the `aria-*` props are the ones a caller SPREADS from `SettingRow`/`useFieldA11y`,
+// which is why they keep their DOM names — one spread then serves Toggle, SegmentedControl, Select
+// and Input alike, and the label text is written in exactly one place. Prefer the spread inside
+// Settings: 7 hand-typed `ariaLabel`s announced words the visible label did not contain, which is a
+// WCAG 2.5.3 Label-in-Name failure ("click Models in use" does nothing today).
 
 import { cn } from "./cn";
 
-export interface ToggleProps {
+interface ToggleBaseProps {
   checked: boolean;
   onChange: (next: boolean) => void;
-  /** Required: the switch renders no text of its own, so this is its only name. */
-  ariaLabel: string;
   disabled?: boolean;
   /** Native tooltip — used to explain why a disabled switch is unavailable. */
   title?: string;
   className?: string;
+  /** Spread from `SettingRow`/`useFieldA11y`; a labelable wrapper can then point at the switch. */
+  id?: string;
+  "aria-describedby"?: string;
 }
 
-export function Toggle({ checked, onChange, ariaLabel, disabled, title, className }: ToggleProps) {
+export type ToggleProps = ToggleBaseProps &
+  (
+    | { ariaLabel: string; "aria-labelledby"?: never }
+    /** Named by the visible label a `SettingRow` (or `Field`) already renders. */
+    | { "aria-labelledby": string; ariaLabel?: never }
+  );
+
+export function Toggle({
+  checked,
+  onChange,
+  ariaLabel,
+  disabled,
+  title,
+  className,
+  id,
+  "aria-labelledby": ariaLabelledBy,
+  "aria-describedby": ariaDescribedBy,
+}: ToggleProps) {
   return (
     <button
       type="button"
       role="switch"
+      id={id}
       aria-checked={checked}
       aria-label={ariaLabel}
+      aria-labelledby={ariaLabelledBy}
+      aria-describedby={ariaDescribedBy}
       title={title}
       disabled={disabled}
       onClick={() => onChange(!checked)}

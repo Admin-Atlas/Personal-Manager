@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.1-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "PM now honours Reduced motion everywhere, and honours your own Reduced-motion setting as well as your system's. Several places still scrolled smoothly whatever you'd asked for — jumping to a chat message, the pinboard, the settings pane, and moving through months and years in the calendar. They're instant now if you've asked for that.",
+      "Sizes in gigabytes are all measured the same way. One place counted a gigabyte as a billion bytes while everywhere else counted it the way your operating system does, so a model download's progress didn't match the size shown on its card. Small sizes also read properly now — a 96 KB component said \"0 MB\" before.",
+      "Error and warning notices are now announced to screen readers. Most of them simply weren't, which meant that if something failed, nothing was said and the app looked idle — including on the screens for getting back into your vault, where it matters most.",
+      "Under the hood, the parts PM had been re-typing by hand — notices, dialog framing, the label-and-control rows in Settings — are now single shared pieces. That's invisible today, but it's what stops the same notice being five slightly different colours and stops the next dialog shipping without a name a screen reader can read.",
+    ],
+  },
+  {
     version: "3.114.0-alpha",
     date: "2026-08-01",
     highlights: [

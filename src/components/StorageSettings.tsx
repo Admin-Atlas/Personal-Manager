@@ -18,14 +18,17 @@ import {
   removeStorageComponent,
 } from "../lib/ipc";
 import type { StorageComponent, StorageReport } from "../lib/types";
+import { formatBytes } from "../lib/format";
+import { prefersReducedMotion, scrollBehavior } from "../theme";
 import { Button, ConfirmDialog, SectionInfo } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 
-/** Human-friendly size; estimates are prefixed with "~". */
+/** Human-friendly size; estimates are prefixed with "~". An *estimated* zero is unknown, not empty.
+ *  The formatting itself is {@link formatBytes} — this is only the copy decision around it. The old
+ *  local version floored at MB, so every sub-MB component (pyclipper) rendered a useless "0 MB". */
 function formatSize(bytes: number, approximate: boolean): string {
   if (bytes <= 0) return approximate ? "—" : "0 MB";
-  const mb = bytes / (1024 * 1024);
-  const s = mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+  const s = formatBytes(bytes);
   return approximate ? `~${s}` : s;
 }
 
@@ -106,8 +109,11 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
 
   function scrollTo(anchor: string) {
     const el = document.getElementById(`storage-${anchor}`);
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
-    el?.animate?.([{ opacity: 0.4 }, { opacity: 1 }], { duration: 600 });
+    el?.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
+    // A Web Animations flash, so `index.css`'s `animation-duration: 0.001ms !important` cannot reach
+    // it — that property governs CSS animations only. Gate it in JS or Reduced motion misses it.
+    if (!prefersReducedMotion())
+      el?.animate?.([{ opacity: 0.4 }, { opacity: 1 }], { duration: 600 });
   }
 
   function confirmRemove() {

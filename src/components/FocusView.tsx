@@ -42,6 +42,7 @@ import {
 } from "../lib/focusSort";
 import {
   Button,
+  Callout,
   Card,
   Input,
   Popover,
@@ -493,15 +494,9 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
           }`}
         >
           {error && (
-            <div
-              className="mb-4 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
-              style={{
-                borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-                background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-              }}
-            >
+            <Callout size="md" className="mb-4">
               {error}
-            </div>
+            </Callout>
           )}
           {layout === "split" ? (
             // Two columns on a wide screen (briefing/actions/agenda | project list) with a draggable
@@ -877,18 +872,7 @@ function MetaEditor({
         </div>
       </div>
 
-      {error && (
-        <div
-          role="alert"
-          className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-st-due"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-3">{error}</Callout>}
 
       <div className="mt-3 flex justify-end gap-2">
         <Button variant="primary" onClick={save} disabled={saving}>

@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "./cn";
+import { useRestoreFocus } from "../../lib/useRestoreFocus";
 
 /** Breathing room kept between a clipping-escaped panel and the window edge. */
 const MARGIN = 8;
@@ -72,7 +73,9 @@ export function Popover({
   // frame so it never flashes at 0,0.
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   // The element focused when we opened, so Escape can hand focus back to the trigger (not the body).
-  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  // Shared with the calendar's own event panel, which cannot use this component (it is a singleton
+  // anchored to a DOMRect, not a trigger render prop) but needs exactly this behaviour.
+  const restoreFocus = useRestoreFocus(open);
 
   const setOpen = useCallback(
     (v: boolean) => {
@@ -83,11 +86,11 @@ export function Popover({
   );
 
   const close = useCallback(
-    (restoreFocus: boolean) => {
+    (shouldRestoreFocus: boolean) => {
       setOpen(false);
-      if (restoreFocus && restoreFocusRef.current) restoreFocusRef.current.focus();
+      if (shouldRestoreFocus) restoreFocus();
     },
-    [setOpen],
+    [setOpen, restoreFocus],
   );
 
   // Place the escaped panel against the trigger: clamp horizontally, honour `side`, and flip to the
@@ -147,7 +150,6 @@ export function Popover({
 
   useEffect(() => {
     if (!open) return;
-    restoreFocusRef.current = document.activeElement as HTMLElement | null;
     const onDown = (e: MouseEvent) => {
       // Outside click already moves focus, so don't yank it back. A portalled panel is NOT a DOM
       // descendant of the root, so it has to be tested separately or every click inside the panel
