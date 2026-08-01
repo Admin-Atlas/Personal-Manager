@@ -234,6 +234,16 @@ pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()
     // this one command so the ~40 incidental boot accessors still get a single attempt between them.
     secrets::rearm_for_retry();
     let resolved = vault::resolve(&app)?;
+    // Boot refuses to open a store that has been removed from under it; Retry must refuse
+    // for the same reason, or the very next click re-creates the empty library that
+    // `StoreMissing` exists to prevent — `db::open` creates the file it is handed.
+    // `create_replacement_store` is the deliberate way past this, and it is the only one.
+    let data_dir = paths::data_dir(&app)?;
+    if vault::inspect_store_presence(&resolved, &data_dir) == vault::StorePresence::Missing {
+        let fault = vault::store_missing_fault(&resolved.db_path);
+        state.set_vault_fault(Some(fault.clone()));
+        return Err(Error::Vault(fault));
+    }
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
     match vault::open_at_boot(&resolved, &meta) {
@@ -252,6 +262,63 @@ pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()
         }
         Err(e) => {
             // Re-arm with the fresh story so the surface shows the current failure.
+            state.set_vault_fault(Some(VaultFault::from_error("open the vault", &e)));
+            Err(e)
+        }
+    }
+}
+
+/// Create a fresh, empty store after boot reported [`VaultFaultCode::StoreMissing`] — the
+/// deliberate, and only, way past that refusal.
+///
+/// **This deletes nothing.** It is the non-destructive counterpart to
+/// `wipe::reset_after_open_error`: the Markdown vault, the metadata, the keychain secrets
+/// and any surviving sidecars are all left exactly where they are, so a user who takes this
+/// route can still restore a recovered `pm.sqlite` over the top, or rebuild the index from
+/// the Markdown that is the source of truth. All it does is stop refusing to open, and let
+/// `db::open` create the file as it normally would.
+///
+/// Gated on the carried fault actually being `StoreMissing`, so it cannot be used as a
+/// general "make a new database" door from any other failure — a wrong key or a corrupt
+/// file must keep going to their own recovery, which is where the data still is.
+#[tauri::command]
+pub fn create_replacement_store(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    let Some(fault) = state.vault_fault() else {
+        return Err(Error::Other(
+            "The vault opened normally — there's no missing store to replace.".into(),
+        ));
+    };
+    if fault.code != VaultFaultCode::StoreMissing {
+        return Err(Error::Other(
+            "This vault didn't fail because its store is missing, so creating an empty one \
+             would not help — and could leave recoverable data behind. Use the recovery \
+             options offered for this failure instead."
+                .into(),
+        ));
+    }
+    let resolved = vault::resolve(&app)?;
+    // Reuse the surviving metadata when there is any: it carries the vault id, the KDF salt
+    // and the passphrase verifier, so the new store stays part of the SAME vault and a
+    // recovered pm.sqlite still opens against it. Only a vault with no metadata left at all
+    // gets a freshly minted device meta.
+    let meta = match vault::load_meta(&resolved.vault_root)? {
+        Some(meta) => meta,
+        None => vault::ensure_device_meta(&resolved.vault_root)?,
+    };
+    match vault::open_at_boot(&resolved, &meta) {
+        Ok(Some((conn, master, report))) => {
+            state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+            state.note_meta_report(&report);
+            lock_session::engage(&app)?;
+            Ok(())
+        }
+        // A passphrase vault whose key isn't cached: the store now exists, and the unlock
+        // prompt takes it from here.
+        Ok(None) => {
+            state.set_vault_fault(None);
+            Ok(())
+        }
+        Err(e) => {
             state.set_vault_fault(Some(VaultFault::from_error("open the vault", &e)));
             Err(e)
         }

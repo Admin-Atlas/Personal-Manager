@@ -1131,7 +1131,19 @@ pub fn run() {
             };
             let boot_meta = vault::boot_meta_decision(pointer_present, meta_load)
                 .map_err(error::Error::Vault)?;
+            // Has the store been removed from under us? `db::open` would CREATE a missing
+            // pm.sqlite and migrate it, presenting an empty library as a healthy one — so
+            // this is decided BEFORE any open, and before `ensure_device_meta` writes the
+            // metadata that would itself become evidence of use. A pointed vault that has
+            // gone missing keeps its own richer fault below.
+            let store_gone = vault::inspect_store_presence(&resolved, &data_dir)
+                == vault::StorePresence::Missing;
             let open_attempt = match boot_meta {
+                vault::BootMeta::UseExisting(_) | vault::BootMeta::CreateDeviceDefault
+                    if store_gone =>
+                {
+                    Err(vault::store_missing_fault(&resolved.db_path))
+                }
                 vault::BootMeta::UseExisting(meta) => Ok(*meta),
                 vault::BootMeta::CreateDeviceDefault => {
                     Ok(vault::ensure_device_meta(&resolved.vault_root)?)
@@ -1436,6 +1448,7 @@ pub fn run() {
             commands::unlock_app,
             commands::vault_status,
             commands::retry_open_vault,
+            commands::create_replacement_store,
             commands::create_shareable_vault,
             commands::change_vault_passphrase,
             commands::make_vault_private,

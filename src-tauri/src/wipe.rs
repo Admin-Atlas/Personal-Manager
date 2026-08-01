@@ -1234,6 +1234,14 @@ fn reset_refusal(fault: &crate::error::VaultFault) -> Option<&'static str> {
              nothing needs deleting. Use Repair access (Settings → Vault) instead.",
         );
     }
+    if fault.code == crate::error::VaultFaultCode::StoreMissing {
+        return Some(
+            "PM's store file isn't there to delete — and this reset would also remove the \
+             Markdown vault, which may be the only remaining copy of your notes and the one \
+             thing a Rebuild could restore your library from. Use \"Start a new empty store\" \
+             instead; it deletes nothing.",
+        );
+    }
     if !is_genuine_brick(&fault.message) {
         return Some(
             "The vault file looks momentarily unavailable — often antivirus or Windows Search \
@@ -1619,6 +1627,19 @@ mod tests {
             crate::db::WRONG_KEY_OR_CORRUPT_MSG,
         );
         assert_eq!(reset_refusal(&brick), None);
+    }
+
+    #[test]
+    fn a_missing_store_never_arms_the_reset() {
+        // There is no unreadable store to delete, and this path would take the Markdown
+        // vault with it — the one copy of the notes a Rebuild could restore the library
+        // from. Pinned with the brick literal in the message too, so the refusal can't be
+        // bypassed by message drift the way the code check can't be.
+        let missing = fault_with(
+            crate::error::VaultFaultCode::StoreMissing,
+            crate::db::WRONG_KEY_OR_CORRUPT_MSG,
+        );
+        assert!(reset_refusal(&missing).unwrap().contains("empty store"));
     }
 
     #[test]

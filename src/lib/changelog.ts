@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.10-alpha",
+    date: "2026-08-01",
+    highlights: [
+      'If PM\'s library file ever goes missing, PM now says so instead of quietly starting over. Until now, a store that had been deleted or moved from outside PM — by a disk cleanup, a restore that went sideways, a stray drag — was simply re-created empty on the next launch, and PM opened looking perfectly normal with nothing in it. Everything kept outside that one file, like your themes and your saved keys, survived, which made it look even more like your documents had vanished. PM now stops, names the missing file, and tells you plainly that it hasn\'t deleted or re-created anything, so you can put the file back or restore a backup first. If you\'d rather carry on, "Start a new empty store" does exactly that and deletes nothing — your notes, your vault settings and your sign-ins all stay put, so a recovered file still opens and Rebuild can put your library back from the notes in your vault. The old "Start fresh" is refused for this, because there is nothing broken to delete and it would take your notes with it.',
+      '"Start fresh" now says that it deletes your notes too. It always did — the wording only mentioned the vault and promised your keys and sign-ins were kept, which read as though the notes were safe.',
+      "The Developer tab tells you when it can't read the database, rather than showing you an empty table list that looks exactly like a database with nothing in it.",
+    ],
+  },
+  {
     version: "3.114.9-alpha",
     release: true,
     date: "2026-08-01",

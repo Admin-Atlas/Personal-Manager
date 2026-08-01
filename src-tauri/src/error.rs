@@ -18,6 +18,14 @@ pub enum VaultFaultCode {
     NotFound,
     /// The folder answers but holds no PM vault (no `vault-meta.json`).
     NoVault,
+    /// The vault is here — settings, Markdown, or both — but `pm.sqlite` is gone.
+    /// Distinct from [`Self::NoVault`] because the recovery is the opposite one:
+    /// nothing may be deleted, and the store must NOT be silently re-created.
+    /// `rusqlite::Connection::open` CREATES a missing file, so without this code an
+    /// erased store comes back as a fresh, fully-migrated, empty library that looks
+    /// healthy — the "all my documents vanished" report this classification exists to
+    /// stop. See [`crate::vault::store_presence`].
+    StoreMissing,
     /// The passphrase verifier rejected the derived key — the folder and metadata are fine.
     WrongPassphrase,
     /// The verifier accepted the key but the store itself won't open — damaged files.

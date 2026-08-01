@@ -296,6 +296,23 @@ pub(crate) fn delete_vault_artifacts(root: &Path) {
 /// held their files. Removed once the move commits.
 const VAULT_MARKER: &str = ".pm-vault";
 
+/// Whether two paths name the same directory, for the one comparison in [`recover`] that decides
+/// whether to DELETE the source vault. Canonicalises both sides — `wipe::sweep_restore_staging`
+/// already does this deliberately, and on macOS `/var` vs `/private/var` and case-insensitive
+/// APFS make a raw `PathBuf` comparison read not-equal for a single directory.
+///
+/// A side that won't canonicalise falls back to raw equality rather than bailing: a pre-commit
+/// abort frequently never created the target at all, so `canonicalize` failing there is the
+/// NORMAL case, and it correctly reads as "not the same directory" — which takes the
+/// marker-gated discard arm. Bailing instead would leave the journal in place to replay on
+/// every boot, forever.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => a == b,
+    }
+}
+
 /// Discard a migration's partial destination copy WITHOUT ever removing a folder that isn't provably
 /// ours. The [`VAULT_MARKER`] is checked FIRST: no marker ⇒ we touch nothing at all — critically,
 /// because a crashed Phase-A migration's journal still names the target even though nothing was ever
@@ -966,11 +983,12 @@ pub fn recover(app: &AppHandle) -> Result<()> {
             }
         }
         // The in-place phase already committed; only the move was in flight. The pointer
-        // is the source of truth for whether it finished.
+        // is the source of truth for whether it finished. Compared with `same_dir`, not
+        // `==`: this decides whether to DELETE the source vault.
         MigrationStage::Relocating => {
             let now = resolve(app)?.vault_root;
             match journal.target_location.as_ref() {
-                Some(target) if &now == target => {
+                Some(target) if same_dir(&now, target) => {
                     delete_vault_artifacts(&journal.from_root);
                     // Committed to `target`; drop any leftover in-flight marker from the live vault.
                     let _ = std::fs::remove_file(target.join(VAULT_MARKER));
@@ -991,6 +1009,32 @@ pub fn recover(app: &AppHandle) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_dir_survives_a_target_that_was_never_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("vault");
+        std::fs::create_dir_all(&real).unwrap();
+
+        // A real directory equals itself however it is spelled — this is the whole point on
+        // macOS, where /var and /private/var name one directory and APFS is case-folding.
+        assert!(same_dir(&real, &real));
+        assert!(same_dir(&real, &tmp.path().join("vault")));
+        // Two different real directories are not the same one.
+        let other = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(!same_dir(&real, &other));
+
+        // The load-bearing case: an aborted relocation usually never created the target, so
+        // `canonicalize` FAILS there. That must read as "did not commit" (take the
+        // marker-gated discard arm), never as an error that bails and leaves the journal to
+        // replay on every boot forever.
+        let never_made = tmp.path().join("was-never-created");
+        assert!(!same_dir(&real, &never_made));
+        // …and a path equal to itself still matches even when neither side resolves, so a
+        // committed move to an unreadable location isn't mistaken for an abort.
+        assert!(same_dir(&never_made, &never_made));
+    }
 
     fn plan(mode: KeyMode, pass: Option<&str>, md: MarkdownEncryption) -> MigrationPlan {
         MigrationPlan {

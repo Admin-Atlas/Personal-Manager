@@ -291,6 +291,12 @@ export const vaultStatus = () => invoke<VaultStatus>("vault_status");
  *  rejects with the fresh error if it still can't open. */
 export const retryOpenVault = () => invoke<void>("retry_open_vault");
 
+/** Create a fresh, empty store after PM found `pm.sqlite` missing. Deletes nothing — the
+ *  Markdown vault, the metadata and the saved keys are all left in place, so a recovered
+ *  store can still be restored over the top and a Rebuild can reconstruct the index from
+ *  the Markdown. Only accepted while the carried fault is `store-missing`. */
+export const createReplacementStore = () => invoke<void>("create_replacement_store");
+
 /** Convert this device vault into a shareable, passphrase-protected one (re-keys the
  *  store and encrypts the Markdown via the one migration routine). Pass `targetLocation`
  *  to also move it to a cross-account-reachable folder in the SAME crash-recoverable
