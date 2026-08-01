@@ -515,9 +515,9 @@ export function PinboardView() {
           )}
           <Button
             variant="secondary"
+            size="sm"
             onClick={handleAddNote}
             disabled={load !== "ready"}
-            className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-note"
           >
             + Note
@@ -525,9 +525,9 @@ export function PinboardView() {
           {/* Notes and timelines are both available at every density. */}
           <Button
             variant="secondary"
+            size="sm"
             onClick={handleAddTimeline}
             disabled={load !== "ready"}
-            className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-timeline"
           >
             + Timeline
@@ -535,9 +535,9 @@ export function PinboardView() {
           {/* An empty folder, made deliberately — the counterpart to stacking two cards to fold them. */}
           <Button
             variant="secondary"
+            size="sm"
             onClick={handleAddFolder}
             disabled={load !== "ready"}
-            className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-folder"
           >
             + Folder
@@ -563,11 +563,7 @@ export function PinboardView() {
                   Your board is still saved — PM just couldn&rsquo;t read it, so it won&rsquo;t
                   change anything until it can.
                 </p>
-                <Button
-                  variant="secondary"
-                  onClick={retryLoad}
-                  className="mt-3 px-2.5 py-1 text-xs"
-                >
+                <Button variant="secondary" size="sm" onClick={retryLoad} className="mt-3">
                   Retry
                 </Button>
               </div>
@@ -643,6 +639,10 @@ export function PinboardView() {
               <Modal
                 open
                 onClose={() => setExpandedFolderId(null)}
+                // The one dialog that names itself with `label` rather than `labelledBy`: its title
+                // is an editable <input>, not a heading, so there is no element whose text stays
+                // the name. Falls back to the placeholder the input shows when it is empty.
+                label={expandedFolder.title?.trim() || "Folder"}
                 // A share of the board, replacing Modal's own width/height/overflow defaults rather
                 // than competing with them. `overlaySize` (above) is 80% of the window-sized board,
                 // clamped to the scrim so it always fits.
@@ -1593,6 +1593,7 @@ function FolderPanelHeader({
         className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-sm font-medium text-ink2 placeholder:text-ink4 focus:outline-none focus:ring-0"
       />
       <SegmentedControl
+        ariaLabel="How this folder opens"
         value={folder.expandMode ?? "inline"}
         onChange={(m) => onChange(folder.id, { expandMode: m })}
         options={[

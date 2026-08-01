@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { isDevBuild, useDevMode } from "../../lib/capabilities";
-import { Button, SectionInfo, Toggle } from "../ui";
+import { Button, SectionInfo, SectionLabel, SettingRow, Toggle } from "../ui";
 
 /** The Developer-mode Settings tab. Fully self-contained: `devMode` is a runtime switch that persists
  *  itself through `useDevMode`, so there's nothing to save here. `onOpenDev` jumps to the Dev tab. */
@@ -10,13 +10,10 @@ export function DeveloperSettings({ onOpenDev }: { onOpenDev?: () => void }) {
   const { devMode, setDevMode } = useDevMode();
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-developer">
-      <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-        Developer mode
-      </label>
-      <div className="mt-3 flex items-center justify-between gap-3">
-        <span className="text-sm text-ink2">Developer mode</span>
-        <Toggle checked={devMode} onChange={setDevMode} ariaLabel="Developer mode" />
-      </div>
+      <SectionLabel>Developer mode</SectionLabel>
+      <SettingRow label="Developer mode">
+        {(a11y) => <Toggle {...a11y} checked={devMode} onChange={setDevMode} />}
+      </SettingRow>
       <div className="mt-3 flex items-center justify-between gap-3 text-xs">
         <span className="text-ink3">Signals</span>
         <span className="font-mono text-ink4">

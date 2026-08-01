@@ -49,7 +49,17 @@ import {
   useTheme,
 } from "../../theme";
 import { IngestProgress } from "../IngestProgress";
-import { Button, Input, SectionInfo, SegmentedControl, Select, Toggle } from "../ui";
+import {
+  Button,
+  Callout,
+  Input,
+  SectionInfo,
+  SectionLabel,
+  SegmentedControl,
+  Select,
+  SettingRow,
+  Toggle,
+} from "../ui";
 import { ResetLink, TabResetSection } from "./ResetControls";
 
 /** The General Settings tab: appearance (system/mode/accent/depth/location), the memory-map defaults,
@@ -324,18 +334,7 @@ export function GeneralSettings() {
 
   return (
     <>
-      {error && (
-        <div
-          className="mt-4 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            color: "var(--st-due)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-4">{error}</Callout>}
 
       <div
         id="sec-general-appearance"
@@ -343,57 +342,62 @@ export function GeneralSettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-appearance"
       >
-        <div className="flex items-center justify-between gap-2">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Appearance
-          </label>
-          {!appearanceIsDefault && <ResetLink onReset={resetAppearance} label="Reset appearance" />}
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">System</span>
-          <SegmentedControl
-            value={system}
-            onChange={setSystem}
-            options={[
-              {
-                value: "editorial",
-                label: "Editorial",
-                title: "Editorial — serif headings, warm paper tones",
-              },
-              {
-                value: "slate",
-                label: "Slate",
-                title: "Slate — clean sans, cool neutrals (default)",
-              },
-              {
-                value: "terminal",
-                label: "Terminal",
-                title: "Terminal — monospace, high contrast",
-              },
-            ]}
-          />
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Mode</span>
-          <SegmentedControl
-            value={modePref}
-            onChange={setModePref}
-            options={[
-              { value: "light", label: "Light" },
-              { value: "dark", label: "Dark" },
-              {
-                value: "system",
-                label: "System",
-                title: "Follow your device's light/dark setting",
-              },
-              {
-                value: "auto",
-                label: "Auto",
-                title: "Follow sunrise and sunset at your location",
-              },
-            ]}
-          />
-        </div>
+        <SectionLabel
+          action={
+            !appearanceIsDefault && <ResetLink onReset={resetAppearance} label="Reset appearance" />
+          }
+        >
+          Appearance
+        </SectionLabel>
+        <SettingRow label="System">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={system}
+              onChange={setSystem}
+              options={[
+                {
+                  value: "editorial",
+                  label: "Editorial",
+                  title: "Editorial — serif headings, warm paper tones",
+                },
+                {
+                  value: "slate",
+                  label: "Slate",
+                  title: "Slate — clean sans, cool neutrals (default)",
+                },
+                {
+                  value: "terminal",
+                  label: "Terminal",
+                  title: "Terminal — monospace, high contrast",
+                },
+              ]}
+            />
+          )}
+        </SettingRow>
+        <SettingRow label="Mode">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={modePref}
+              onChange={setModePref}
+              options={[
+                { value: "light", label: "Light" },
+                { value: "dark", label: "Dark" },
+                {
+                  value: "system",
+                  label: "System",
+                  title: "Follow your device's light/dark setting",
+                },
+                {
+                  value: "auto",
+                  label: "Auto",
+                  title: "Follow sunrise and sunset at your location",
+                },
+              ]}
+            />
+          )}
+        </SettingRow>
         {modePref === "system" && (
           <p className="mt-1.5 text-xs text-ink4">
             Following your device's light/dark setting — currently{" "}
@@ -449,119 +453,104 @@ export function GeneralSettings() {
             </div>
           </>
         )}
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Depth</span>
-          <SegmentedControl
-            value={depth}
-            onChange={setDepth}
-            options={[
-              { value: "min", label: "Min" },
-              { value: "standard", label: "Standard" },
-              { value: "power", label: "Power" },
-            ]}
-          />
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Accent</span>
-          <div className="flex items-center gap-1.5">
-            {ACCENTS[system].map((hex) => {
-              const isMono = hex === MONO_ACCENT;
-              const name = accentName(hex);
-              return (
-                <button
-                  key={hex}
-                  type="button"
-                  aria-label={isMono ? "Monochrome (Eigengrau)" : `Accent: ${name}`}
-                  title={isMono ? "Monochrome — Eigengrau base, white text & accents" : name}
-                  onClick={() => setAccent(hex)}
-                  style={{
-                    background: isMono ? EIGENGRAU : hex,
-                    // The Eigengrau swatch is near-black; a white rim makes it legible and
-                    // signals the "white accents" treatment.
-                    border: isMono ? "1px solid rgba(255,255,255,0.55)" : undefined,
-                  }}
-                  className={`relative h-5 w-5 rounded-full transition before:absolute before:-inset-[2px] before:content-[''] ${
-                    accent === hex
-                      ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
-                      : ""
-                  }`}
-                />
-              );
-            })}
-          </div>
-        </div>
+        <SettingRow label="Depth">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={depth}
+              onChange={setDepth}
+              options={[
+                { value: "min", label: "Min" },
+                { value: "standard", label: "Standard" },
+                { value: "power", label: "Power" },
+              ]}
+            />
+          )}
+        </SettingRow>
+        <SettingRow label="Accent">
+          {(a11y) => (
+            <div {...a11y} role="group" className="flex items-center gap-1.5">
+              {ACCENTS[system].map((hex) => {
+                const isMono = hex === MONO_ACCENT;
+                const name = accentName(hex);
+                return (
+                  <button
+                    key={hex}
+                    type="button"
+                    aria-label={isMono ? "Monochrome (Eigengrau)" : `Accent: ${name}`}
+                    title={isMono ? "Monochrome — Eigengrau base, white text & accents" : name}
+                    onClick={() => setAccent(hex)}
+                    style={{
+                      background: isMono ? EIGENGRAU : hex,
+                      // The Eigengrau swatch is near-black; a white rim makes it legible and
+                      // signals the "white accents" treatment.
+                      border: isMono ? "1px solid rgba(255,255,255,0.55)" : undefined,
+                    }}
+                    className={`relative h-5 w-5 rounded-full transition before:absolute before:-inset-[2px] before:content-[''] ${
+                      accent === hex
+                        ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
+                        : ""
+                    }`}
+                  />
+                );
+              })}
+            </div>
+          )}
+        </SettingRow>
         {/* Text size — mirrored from the Accessibility tab (one setter). A mainstream comfort control,
             not only an accessibility need, so it's surfaced here too. */}
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Text size</span>
-          <SegmentedControl
-            value={fontScale}
-            onChange={setFontScale}
-            options={[
-              { value: "small", label: "Small", title: "90%" },
-              { value: "default", label: "Default", title: "100%" },
-              { value: "large", label: "Large", title: "115%" },
-              { value: "xlarge", label: "XL", title: "130%" },
-            ]}
-          />
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-pinboard-confirm-delete"
+        <SettingRow label="Text size">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={fontScale}
+              onChange={setFontScale}
+              options={[
+                { value: "small", label: "Small", title: "90%" },
+                { value: "default", label: "Default", title: "100%" },
+                { value: "large", label: "Large", title: "115%" },
+                { value: "xlarge", label: "XL", title: "130%" },
+              ]}
+            />
+          )}
+        </SettingRow>
+        <SettingRow
+          label="Confirm before deleting a pinboard card"
+          helpId="settings-pinboard-confirm-delete"
+          aside={!confirmDeleteIsDefault && <ResetLink onReset={resetConfirmDelete} />}
         >
-          <span className="text-sm text-ink2">Confirm before deleting a pinboard card</span>
-          <div className="flex items-center gap-2">
-            {!confirmDeleteIsDefault && <ResetLink onReset={resetConfirmDelete} />}
+          {(a11y) => (
             <Toggle
+              {...a11y}
               checked={confirmDelete}
               onChange={(on) => {
                 setConfirmDelete(on);
                 writeConfirmDelete(on);
               }}
-              ariaLabel="Ask before deleting a note or timeline"
             />
-          </div>
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-teach-tab"
-        >
-          <span className="text-sm text-ink2">Review &amp; Teach tabs</span>
-          <Toggle
-            checked={teachVisible}
-            onChange={setTeachVisible}
-            ariaLabel="Show the Review and Teach tabs"
-          />
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3" data-help="settings-map-tab">
-          <span className="text-sm text-ink2">Map tab</span>
-          <Toggle checked={mapVisible} onChange={setMapVisible} ariaLabel="Show the Map tab" />
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-calendar-open-on"
-        >
-          <span className="text-sm text-ink2">Calendar opens where you left it</span>
-          <Toggle
-            checked={openOnLast}
-            onChange={(v) => {
-              setOpenOnLast(v);
-              writeOpenOn(v ? "last" : "today");
-            }}
-            ariaLabel="Open the calendar where you left it instead of on today"
-          />
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-models-footer"
-        >
-          <span className="text-sm text-ink2">Models in use</span>
-          <Toggle
-            checked={modelsVisible}
-            onChange={setModelsVisible}
-            ariaLabel="Show which AI models are in use"
-          />
-        </div>
+          )}
+        </SettingRow>
+        <SettingRow label="Review & Teach tabs" helpId="settings-teach-tab">
+          {(a11y) => <Toggle {...a11y} checked={teachVisible} onChange={setTeachVisible} />}
+        </SettingRow>
+        <SettingRow label="Map tab" helpId="settings-map-tab">
+          {(a11y) => <Toggle {...a11y} checked={mapVisible} onChange={setMapVisible} />}
+        </SettingRow>
+        <SettingRow label="Calendar opens where you left it" helpId="settings-calendar-open-on">
+          {(a11y) => (
+            <Toggle
+              {...a11y}
+              checked={openOnLast}
+              onChange={(v) => {
+                setOpenOnLast(v);
+                writeOpenOn(v ? "last" : "today");
+              }}
+            />
+          )}
+        </SettingRow>
+        <SettingRow label="Models in use" helpId="settings-models-footer">
+          {(a11y) => <Toggle {...a11y} checked={modelsVisible} onChange={setModelsVisible} />}
+        </SettingRow>
         {/* Appearance's explanation folds into this one disclosure at the foot. The auto-mode status
             line and its "couldn't find your location" fallback stay inline above: they're a readout
             and a gating hint, not explanation.
@@ -622,49 +611,37 @@ export function GeneralSettings() {
         data-settings-section
         className="mt-5 border-t border-border pt-4"
       >
-        <div className="flex items-center justify-between gap-2">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Focus
-          </label>
-          {!focusIsDefault && <ResetLink onReset={resetFocus} label="Reset Focus" />}
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-briefing-sidebar"
+        <SectionLabel
+          action={!focusIsDefault && <ResetLink onReset={resetFocus} label="Reset Focus" />}
         >
-          <span className="text-sm text-ink2">Show today&rsquo;s briefing in the sidebar</span>
-          <Toggle
-            checked={briefingSidebar}
-            onChange={changeBriefingSidebar}
-            ariaLabel="Show today's briefing in the sidebar"
-          />
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-briefing-window"
-        >
-          <span className="text-sm text-ink2">Floating briefing</span>
-          <SegmentedControl
-            value={briefingFloat}
-            onChange={changeBriefingFloat}
-            options={[
-              { value: "off", label: "Off" },
-              { value: "inApp", label: "Inside PM", title: "A panel inside PM's own window" },
-              {
-                value: "onTop",
-                label: "Always on top",
-                title: "A separate window that floats over other apps",
-              },
-            ]}
-          />
-        </div>
-        <div
-          className="mt-3 flex items-center justify-between gap-3"
-          data-help="settings-tray-icon"
-        >
-          <span className="text-sm text-ink2">Tray / menu bar icon</span>
-          <Toggle checked={trayOn} onChange={changeTray} ariaLabel="Show a tray or menu bar icon" />
-        </div>
+          Focus
+        </SectionLabel>
+        <SettingRow label="Show today’s briefing in the sidebar" helpId="settings-briefing-sidebar">
+          {(a11y) => (
+            <Toggle {...a11y} checked={briefingSidebar} onChange={changeBriefingSidebar} />
+          )}
+        </SettingRow>
+        <SettingRow label="Floating briefing" helpId="settings-briefing-window">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={briefingFloat}
+              onChange={changeBriefingFloat}
+              options={[
+                { value: "off", label: "Off" },
+                { value: "inApp", label: "Inside PM", title: "A panel inside PM's own window" },
+                {
+                  value: "onTop",
+                  label: "Always on top",
+                  title: "A separate window that floats over other apps",
+                },
+              ]}
+            />
+          )}
+        </SettingRow>
+        <SettingRow label="Tray / menu bar icon" helpId="settings-tray-icon">
+          {(a11y) => <Toggle {...a11y} checked={trayOn} onChange={changeTray} />}
+        </SettingRow>
         <SectionInfo helpId="settings-focus">
           <p>
             The Focus tab&rsquo;s own layout, Upcoming and panel controls live on the tab itself,
@@ -681,64 +658,64 @@ export function GeneralSettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-memory-map"
       >
-        <div className="flex items-center justify-between gap-2">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Memory map
-          </label>
-          {!mapIsDefault && <ResetLink onReset={resetMap} label="Reset map" />}
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Default grouping</span>
-          <SegmentedControl
-            value={mapGrouping}
-            onChange={changeMapGrouping}
-            options={[
-              { value: "project", label: "By project" },
-              { value: "semantic", label: "Semantic" },
-            ]}
-          />
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Project cohesion</span>
-          <Select
-            value={String(mapCohesion)}
-            onChange={(e) => changeMapCohesion(Number(e.target.value))}
-          >
-            <option value="0">Off</option>
-            <option value="0.15">Low</option>
-            <option value="0.3">Medium</option>
-            <option value="0.5">High</option>
-          </Select>
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Maximum nodes</span>
-          <Select
-            value={String(mapNodeCap)}
-            onChange={(e) => changeMapNodeCap(Number(e.target.value))}
-          >
-            {[200, 500, 1000, 2000, 3500, 5000].map((n) => (
-              <option key={n} value={n}>
-                {n.toLocaleString()}
-              </option>
-            ))}
-          </Select>
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Enhanced layout (t-SNE)</span>
-          {tsneInstalled === null ? (
-            <span className="text-xs text-ink4">…</span>
-          ) : tsneInstalled ? (
-            <Toggle
-              checked={mapTsneEnabled}
-              onChange={changeTsneEnabled}
-              ariaLabel="Use the enhanced t-SNE layout"
+        <SectionLabel action={!mapIsDefault && <ResetLink onReset={resetMap} label="Reset map" />}>
+          Memory map
+        </SectionLabel>
+        <SettingRow label="Default grouping">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={mapGrouping}
+              onChange={changeMapGrouping}
+              options={[
+                { value: "project", label: "By project" },
+                { value: "semantic", label: "Semantic" },
+              ]}
             />
-          ) : (
-            <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
-              {installingTsne ? "Downloading…" : "Download"}
-            </Button>
           )}
-        </div>
+        </SettingRow>
+        <SettingRow label="Project cohesion">
+          {(a11y) => (
+            <Select
+              {...a11y}
+              value={String(mapCohesion)}
+              onChange={(e) => changeMapCohesion(Number(e.target.value))}
+            >
+              <option value="0">Off</option>
+              <option value="0.15">Low</option>
+              <option value="0.3">Medium</option>
+              <option value="0.5">High</option>
+            </Select>
+          )}
+        </SettingRow>
+        <SettingRow label="Maximum nodes">
+          {(a11y) => (
+            <Select
+              {...a11y}
+              value={String(mapNodeCap)}
+              onChange={(e) => changeMapNodeCap(Number(e.target.value))}
+            >
+              {[200, 500, 1000, 2000, 3500, 5000].map((n) => (
+                <option key={n} value={n}>
+                  {n.toLocaleString()}
+                </option>
+              ))}
+            </Select>
+          )}
+        </SettingRow>
+        <SettingRow label="Enhanced layout (t-SNE)">
+          {(a11y) =>
+            tsneInstalled === null ? (
+              <span className="text-xs text-ink4">…</span>
+            ) : tsneInstalled ? (
+              <Toggle {...a11y} checked={mapTsneEnabled} onChange={changeTsneEnabled} />
+            ) : (
+              <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
+                {installingTsne ? "Downloading…" : "Download"}
+              </Button>
+            )
+          }
+        </SettingRow>
         {installingTsne && (
           <IngestProgress
             mode="percent"
@@ -767,35 +744,37 @@ export function GeneralSettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-timezone"
       >
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Time zone
-        </label>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Detection</span>
-          <SegmentedControl
-            value={tzAuto ? "auto" : "manual"}
-            onChange={(v) => changeTz(v === "auto", timeZone)}
-            options={[
-              { value: "auto", label: "Auto" },
-              { value: "manual", label: "Manual" },
-            ]}
-          />
-        </div>
+        <SectionLabel>Time zone</SectionLabel>
+        <SettingRow label="Detection">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={tzAuto ? "auto" : "manual"}
+              onChange={(v) => changeTz(v === "auto", timeZone)}
+              options={[
+                { value: "auto", label: "Auto" },
+                { value: "manual", label: "Manual" },
+              ]}
+            />
+          )}
+        </SettingRow>
         {!tzAuto && (
-          <div className="mt-3 flex items-center justify-between gap-3">
-            <span className="text-sm text-ink2">Zone</span>
-            <Select
-              value={timeZone}
-              onChange={(e) => changeTz(false, e.target.value)}
-              className="max-w-[14rem]"
-            >
-              {allTimeZones().map((z) => (
-                <option key={z} value={z}>
-                  {z}
-                </option>
-              ))}
-            </Select>
-          </div>
+          <SettingRow label="Zone">
+            {(a11y) => (
+              <Select
+                {...a11y}
+                value={timeZone}
+                onChange={(e) => changeTz(false, e.target.value)}
+                className="max-w-[14rem]"
+              >
+                {allTimeZones().map((z) => (
+                  <option key={z} value={z}>
+                    {z}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </SettingRow>
         )}
         {/* The zone in force is a readout — it stays visible; only what the zone *means* folds away. */}
         <p className="mt-2 text-xs text-faint">

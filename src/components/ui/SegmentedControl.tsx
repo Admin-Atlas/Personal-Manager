@@ -11,8 +11,9 @@
 // `aria-describedby` / `id` keep their DOM names because they are what a caller SPREADS from
 // `SettingRow`, so one object names Toggle, SegmentedControl, Select and Input alike.
 //
-// The name is optional only because 26 call sites predate it. Once each has one, make it a required
-// union the way `Toggle` already does — the pattern is there to copy.
+// NAMING is now a required union, the way `Toggle`'s is: all 26 call sites carry a name (11 through
+// a `SettingRow` spread, 15 typed), so a group with neither prop no longer compiles. That is the
+// point at which the rule stops depending on anyone remembering it.
 
 import type { ReactNode } from "react";
 import { cn } from "./cn";
@@ -23,18 +24,21 @@ export interface SegOption<T extends string> {
   title?: string;
 }
 
-export interface SegmentedControlProps<T extends string> {
+interface SegmentedControlBaseProps<T extends string> {
   options: ReadonlyArray<SegOption<T>>;
   value: T;
   onChange: (value: T) => void;
   className?: string;
-  /** The group's accessible name, typed at the call site. */
-  ariaLabel?: string;
   id?: string;
-  /** Spread from `SettingRow`/`useFieldA11y` — names the group from the visible row label. */
-  "aria-labelledby"?: string;
   "aria-describedby"?: string;
 }
+
+export type SegmentedControlProps<T extends string> = SegmentedControlBaseProps<T> &
+  (
+    | { ariaLabel: string; "aria-labelledby"?: never }
+    /** Spread from `SettingRow`/`useFieldA11y` — names the group from the visible row label. */
+    | { "aria-labelledby": string; ariaLabel?: never }
+  );
 
 export function SegmentedControl<T extends string>({
   options,

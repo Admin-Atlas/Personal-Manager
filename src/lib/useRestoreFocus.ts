@@ -20,21 +20,36 @@
 // Capturing on the false→true EDGE also fixes a latent bug in the version this replaces: Popover
 // re-captured inside an effect whose deps included a callback identity, so a parent re-render while
 // the panel was open could quietly re-point "the opener" at something inside the panel.
+//
+// `openerKey` is the second, rarer edge: a SINGLETON panel that is re-pointed at a new opener
+// without closing first. `CalendarEventPopover` is one — activating another event chip from the
+// KEYBOARD swaps `event`/`anchor` on the mounted instance (the mouse path unmounts it first, via the
+// outside-mousedown dismissal, so only the keyboard reaches this). Without the key, "the opener"
+// stays the first chip the user ever clicked, and Escape hands focus back to an event they left
+// several chips ago. The default `undefined` never changes, so a caller that doesn't pass one —
+// Popover — keeps exactly the mount-edge behaviour above.
 
 import { useCallback, useRef } from "react";
 
 /**
  * @param active whether the panel is open.
+ * @param openerKey identifies WHICH opener the panel currently belongs to. Re-captures whenever it
+ *        changes while open, compared by `Object.is`. Omit for a panel that closes between openers.
  * @returns `restore()` — focus the element that was focused when the panel opened, if it is still
  *          in the document. Safe to call more than once, and a no-op when nothing was captured.
  */
-export function useRestoreFocus(active: boolean): () => void {
+export function useRestoreFocus(active: boolean, openerKey?: unknown): () => void {
   const openerRef = useRef<HTMLElement | null>(null);
   const wasActive = useRef(false);
-  if (active && !wasActive.current) {
+  // Seeded WITH the first key, so the mount capture below is the `!wasActive` one and a panel that
+  // opens already keyed doesn't capture twice.
+  const lastKey = useRef(openerKey);
+  const reKeyed = !Object.is(lastKey.current, openerKey);
+  if (active && (!wasActive.current || reKeyed)) {
     openerRef.current = document.activeElement as HTMLElement | null;
   }
   wasActive.current = active;
+  lastKey.current = openerKey;
 
   return useCallback(() => {
     const opener = openerRef.current;

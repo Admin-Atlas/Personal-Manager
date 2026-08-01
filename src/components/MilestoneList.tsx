@@ -14,7 +14,7 @@ import {
 import { formatDateOnly } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import { DateField } from "./DateField";
-import { Button, Input, Select } from "./ui";
+import { Button, Callout, Input, Select } from "./ui";
 
 /** Display order + labels for the progress control, coarsest-first (mirrors `milestones::STATUSES`). */
 export const MILESTONE_STATUSES: readonly { value: MilestoneStatus; label: string }[] = [
@@ -116,18 +116,7 @@ export function MilestoneList({
 
 /** A calm inline error line for a milestone mutation that the backend rejected. */
 function MilestoneError({ message }: { message: string }) {
-  return (
-    <p
-      role="alert"
-      className="rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-st-due"
-      style={{
-        borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-        background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-      }}
-    >
-      {message}
-    </p>
-  );
+  return <Callout as="p">{message}</Callout>;
 }
 
 /** A calm read-only line per milestone — used at lower depth where editing is hidden. */
@@ -236,6 +225,7 @@ function MilestoneRow({
         />
         <Button
           variant="tertiary"
+          size="xs"
           onClick={() =>
             void runMutation(async () => {
               await deleteMilestone(m.id);
@@ -243,7 +233,7 @@ function MilestoneRow({
             }, onError)
           }
           title="Remove milestone"
-          className="shrink-0 px-1.5 py-0.5 hover:text-st-blocked"
+          className="shrink-0 hover:text-st-blocked"
         >
           ×
         </Button>
@@ -267,6 +257,7 @@ function MilestoneRow({
             {m.event_missing && <span className="shrink-0 text-st-due">⚠</span>}
             <Button
               variant="tertiary"
+              size="xs"
               onClick={() =>
                 void runMutation(async () => {
                   await setMilestoneEvent(m.id, null, m.due_date?.slice(0, 10) ?? null);
@@ -274,7 +265,7 @@ function MilestoneRow({
                 }, onError)
               }
               title="Unlink from calendar — the date becomes editable, but it can't be re-linked"
-              className="shrink-0 px-1 py-0.5 text-[0.625rem]"
+              className="shrink-0"
             >
               Unlink
             </Button>
@@ -320,19 +311,19 @@ function MilestoneRow({
           <div className="flex shrink-0 items-center">
             <Button
               variant="tertiary"
+              size="xs"
               onClick={() => onMove(-1)}
               disabled={isFirst}
               title="Move up"
-              className="px-1.5 py-0.5 disabled:opacity-30"
             >
               ↑
             </Button>
             <Button
               variant="tertiary"
+              size="xs"
               onClick={() => onMove(1)}
               disabled={isLast}
               title="Move down"
-              className="px-1.5 py-0.5 disabled:opacity-30"
             >
               ↓
             </Button>
@@ -392,9 +383,10 @@ function AddMilestone({
       />
       <Button
         variant="secondary"
+        size="sm"
         onClick={add}
         disabled={busy || (!label.trim() && !date)}
-        className="shrink-0 px-2 py-0.5 text-xs"
+        className="shrink-0"
       >
         Add
       </Button>

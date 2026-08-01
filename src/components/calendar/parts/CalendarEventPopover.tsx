@@ -9,17 +9,22 @@
 // viewport, dismissed by click-outside or Escape. The description is the one piece of untrusted
 // provider text, so it renders ONLY through the sanitising Markdown boundary.
 //
+// A NON-MODAL dialog, and staying one: it takes initial focus and hands focus back on Escape/Close
+// (`useRestoreFocus`), but no focus trap and no `aria-modal` — the calendar behind it stays live and
+// clicking another event is how you move between them. See the focus block in the body.
+//
 // Every action here is conditional on the event actually having somewhere to go: "Open in Project"
 // only with a linked milestone, the source link only with an `html_link`. There is deliberately no
 // "Open in Pinboard" — this popup opens for SYNCED events only (CalendarView routes its two
 // first-party overlays, milestones and pinboard entries, straight to their own destination on click),
 // so that button pointed at the Pinboard from every event that had nothing to do with it.
 
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { formatClock, formatDateLocal } from "../../../lib/format";
 import { parseLocal } from "../../../lib/calendar-layout";
+import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
 import { Button, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
@@ -147,10 +152,41 @@ export function CalendarEventPopover({
     setPos({ left, top });
   }, [anchor]);
 
+  // Focus handling for a NON-MODAL dialog. This panel is deliberately not a `Modal`: there is no
+  // scrim, the calendar behind it stays live, and clicking a different event dismisses this one and
+  // opens that one — so a focus TRAP and `aria-modal` would both be wrong, and this file's own test
+  // asserts that they stay absent. What it does owe is the other half: it declares `role="dialog"`
+  // and never moved focus into itself, so a keyboard user who opened it with Enter was still on the
+  // chip, with the panel rendered LAST in the calendar's DOM — reaching its own Close / "Join the
+  // call" buttons meant tabbing through every remaining event in the grid.
+  //
+  // The opener is keyed to `anchor`, not to mount: the mouse path unmounts the panel between events
+  // (the outside-mousedown dismissal below fires first), but the keyboard path re-points the mounted
+  // instance at a new chip, and a mount-only capture would hand focus back to the first chip of the
+  // session. See `useRestoreFocus`.
+  const restoreFocus = useRestoreFocus(true, anchor);
+
+  // Escape and the Close button leave focus nowhere, so they hand it back. An outside click has
+  // already moved focus to whatever was clicked, so it deliberately does not.
+  const dismiss = useCallback(() => {
+    restoreFocus();
+    onClose();
+  }, [restoreFocus, onClose]);
+
+  // Move focus onto the panel once it has been PLACED. Keyed on `pos`, which is only set after the
+  // measuring layout effect above: until then the panel is `visibility: hidden`, and a hidden
+  // element cannot take focus.
+  useEffect(() => {
+    if (!pos) return;
+    const el = panelRef.current;
+    // Never steal focus back from a child the user has already reached.
+    if (el && !el.contains(document.activeElement)) el.focus();
+  }, [pos]);
+
   // Dismiss on Escape or a click/tap outside the panel.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") dismiss();
     };
     const onDown = (e: MouseEvent) => {
       if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
@@ -161,7 +197,7 @@ export function CalendarEventPopover({
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("mousedown", onDown);
     };
-  }, [onClose]);
+  }, [dismiss, onClose]);
 
   // Load any PM flags anchored on this event's UID.
   useEffect(() => {
@@ -186,8 +222,10 @@ export function CalendarEventPopover({
     <div
       ref={panelRef}
       role="dialog"
+      // No `aria-modal`: the calendar behind this stays live and Tab must be able to leave.
       aria-label={event.summary}
-      className="fixed z-50 flex max-h-[75vh] w-[340px] flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl"
+      tabIndex={-1}
+      className="fixed z-50 flex max-h-[75vh] w-[340px] flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl focus:outline-none"
       style={{
         left: pos?.left ?? anchor.left,
         top: pos?.top ?? anchor.bottom + 6,
@@ -206,7 +244,7 @@ export function CalendarEventPopover({
             <span className="truncate">{calendar?.name ?? "Calendar"}</span>
           </div>
         </div>
-        <IconButton label="Close" onClick={onClose} className="shrink-0">
+        <IconButton label="Close" onClick={dismiss} className="shrink-0">
           ×
         </IconButton>
       </div>
@@ -295,18 +333,14 @@ export function CalendarEventPopover({
       {/* Actions */}
       <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2.5">
         {event.html_link && (
-          <Button
-            variant="secondary"
-            className="text-xs"
-            onClick={() => void openUrl(event.html_link!)}
-          >
+          <Button variant="secondary" size="sm" onClick={() => void openUrl(event.html_link!)}>
             {sourceLabel(calendar?.provider)}
           </Button>
         )}
         {milestone && onOpenProject && (
           <Button
             variant="tertiary"
-            className="text-xs"
+            size="sm"
             onClick={() => onOpenProject(milestone.project_name)}
           >
             Open in Project

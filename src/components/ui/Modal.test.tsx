@@ -96,6 +96,48 @@ describe("Modal", () => {
     expect(inner).toHaveBeenCalledTimes(1);
   });
 
+  it("cannot be rendered without an accessible name", () => {
+    // The point of the whole batch, and the reason `designGuards`' allow-list could be deleted:
+    // this is a `tsc` failure now, not an audit finding. Enforced by the check gate's
+    // `tsc --noEmit` — if the union were relaxed back to two optionals, the directive would go
+    // unused and the typecheck would fail on THIS line.
+    const unnamed = (
+      // @ts-expect-error a Modal with neither labelledBy nor label is announced as bare "dialog"
+      <Modal open onClose={noop}>
+        <p>body</p>
+      </Modal>
+    );
+    expect(unnamed).toBeTruthy();
+
+    const bothNames = (
+      // @ts-expect-error the two are exclusive: aria-labelledby wins outright, so an aria-label
+      // alongside it is text nobody ever hears
+      <Modal open onClose={noop} labelledBy="t" label="x">
+        <h2 id="t">Move conversation</h2>
+      </Modal>
+    );
+    expect(bothNames).toBeTruthy();
+  });
+
+  it("puts helpId on the dialog element, where help mode can outline it", () => {
+    // Not on a wrapper inside: `.help-mode [data-help]:hover` draws the outline that tells you help
+    // is there, and an element with no box of its own paints none. Omitted, it emits no attribute at
+    // all rather than an empty one — `closest("[data-help]")` matches on presence.
+    const { getByRole, rerender } = render(
+      <Modal open onClose={noop} label="Command palette" helpId="command-palette">
+        <p>body</p>
+      </Modal>,
+    );
+    expect(getByRole("dialog").getAttribute("data-help")).toBe("command-palette");
+
+    rerender(
+      <Modal open onClose={noop} label="Command palette">
+        <p>body</p>
+      </Modal>,
+    );
+    expect(getByRole("dialog").hasAttribute("data-help")).toBe(false);
+  });
+
   it("renders nothing when closed, and deregisters so a sibling dialog is topmost again", () => {
     const onClose = vi.fn();
     const { queryByRole } = render(

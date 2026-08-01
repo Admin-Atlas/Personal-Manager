@@ -29,7 +29,7 @@ import {
   type PositionedNode,
 } from "../lib/mapLayout";
 import { IngestProgress } from "./IngestProgress";
-import { Select, Skeleton } from "./ui";
+import { Callout, Select, Skeleton } from "./ui";
 import type { Document, SemanticLayout } from "../lib/types";
 import { useReader } from "../lib/reader";
 import { graphColor, useTheme, useDepth } from "../theme";
@@ -714,17 +714,11 @@ export function GraphView() {
       )}
 
       <div className="relative flex-1 overflow-hidden" data-help="graph-canvas" ref={wrapRef}>
+        {/* Positioning stays here; only the framing moved to the primitive. */}
         {error && (
-          <div
-            className="absolute left-4 top-4 z-10 rounded-[var(--radius-sm)] border px-3 py-2 text-sm"
-            style={{
-              borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-              background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-              color: "var(--st-due)",
-            }}
-          >
+          <Callout size="md" className="absolute left-4 top-4 z-10">
             {error}
-          </div>
+          </Callout>
         )}
 
         {loading ? (

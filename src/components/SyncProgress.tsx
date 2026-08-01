@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Button, ConfirmDialog } from "./ui";
+import { Button, Callout, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 
 /**
@@ -46,23 +46,22 @@ export function SyncProgress({
           Indexing keeps running in the background — you can leave this page and come back later;
           we’ll keep working.
         </p>
-        <div
-          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-ink3"
-          style={{ background: "color-mix(in oklab, var(--st-due) 12%, transparent)" }}
-        >
+        {/* Standing prose about what Stop does, not a failure — so it stays silent. */}
+        <Callout body="ink" live={false} className="mt-2 text-ink3">
           {sizeQuestion} <span className="text-ink2">Stopping keeps everything indexed so far</span>{" "}
           — those files stay searchable; the rest just won’t be indexed until you sync again.
           <div className="mt-2">
             <Button
               variant="tertiary"
+              size="sm"
               onClick={() => setConfirmStop(true)}
               disabled={stopping}
-              className="px-2 py-1 text-xs hover:text-st-due disabled:opacity-40"
+              className="hover:text-st-due"
             >
               {stopping ? "Stopping…" : "Stop indexing"}
             </Button>
           </div>
-        </div>
+        </Callout>
       </div>
 
       <ConfirmDialog

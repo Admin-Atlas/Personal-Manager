@@ -43,7 +43,16 @@ import type {
 } from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
 import { ollamaGuide } from "../../lib/workbenchGuide";
-import { Button, Collapsible, ConfirmDialog, Input, SectionInfo, Select } from "../ui";
+import {
+  Button,
+  Callout,
+  Collapsible,
+  ConfirmDialog,
+  Input,
+  SectionInfo,
+  SectionLabel,
+  Select,
+} from "../ui";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
  *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
@@ -352,31 +361,13 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
 
   return (
     <>
-      {error && (
-        <div
-          className="mt-4 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            color: "var(--st-due)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-4">{error}</Callout>}
 
       {/* A better-fitting model is available (#437). A passive strip at the top of the tab — the
           quiet counterpart to the dots on the sidebar and the settings nav, and the thing they
           lead to. Never a modal, never a gate: dismissing it is always enough. */}
       {betterFit && (
-        <div
-          role="status"
-          className="mt-4 flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--accent) 40%, transparent)",
-            background: "color-mix(in oklab, var(--accent) 10%, transparent)",
-          }}
-        >
+        <Callout tone="info" body="ink" live className="mt-4 flex flex-wrap items-center gap-2">
           <span className="min-w-0 flex-1 text-ink2">
             <span className="text-ink">{betterFit.display_name}</span>{" "}
             {betterFit.already_downloaded
@@ -384,14 +375,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               : "would fit your machine better than"}{" "}
             {betterFit.replaces}.
           </span>
-          <Button
-            variant="tertiary"
-            onClick={() => void dismissBetterFit()}
-            className="px-2 py-0.5 text-xs"
-          >
+          <Button variant="tertiary" size="sm" onClick={() => void dismissBetterFit()}>
             Dismiss
           </Button>
-        </div>
+        </Callout>
       )}
 
       {/* ── Your machine ─────────────────────────────────────────────────────────────────── */}
@@ -401,19 +388,20 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         data-help="settings-localai-machine"
         className="mt-5 border-t border-border pt-4"
       >
-        <div className="flex items-center justify-between">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Your machine
-          </label>
-          <Button
-            variant="tertiary"
-            onClick={() => void rescan()}
-            disabled={rescanning}
-            className="px-2 py-0.5 text-xs"
-          >
-            {rescanning ? "Scanning…" : "Re-scan"}
-          </Button>
-        </div>
+        <SectionLabel
+          action={
+            <Button
+              variant="tertiary"
+              size="sm"
+              onClick={() => void rescan()}
+              disabled={rescanning}
+            >
+              {rescanning ? "Scanning…" : "Re-scan"}
+            </Button>
+          }
+        >
+          Your machine
+        </SectionLabel>
         {loading ? (
           <p className="mt-2 text-xs text-ink4">Scanning your hardware…</p>
         ) : recs ? (
@@ -437,16 +425,20 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         data-help="settings-localai-models"
         className="mt-5 border-t border-border pt-4"
       >
-        <div className="flex items-baseline justify-between gap-2">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Recommended models
-          </label>
-          {!loading && recs && recs.curated.length > 0 && (
-            <span className="shrink-0 text-[0.6875rem] text-ink4">
-              {recs.curated.length} in the catalog
-            </span>
-          )}
-        </div>
+        <SectionLabel
+          align="baseline"
+          action={
+            !loading &&
+            recs &&
+            recs.curated.length > 0 && (
+              <span className="shrink-0 text-[0.6875rem] text-ink4">
+                {recs.curated.length} in the catalog
+              </span>
+            )
+          }
+        >
+          Recommended models
+        </SectionLabel>
         <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
           <NumbersGuide />
         </Collapsible>
@@ -531,16 +523,20 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         data-help="settings-localai-downloaded"
         className="mt-5 border-t border-border pt-4"
       >
-        <div className="flex items-baseline justify-between gap-2">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Already downloaded
-          </label>
-          {!loading && recs && recs.on_disk.length > 0 && (
-            <span className="shrink-0 text-[0.6875rem] text-ink4">
-              {recs.on_disk.length} on this device
-            </span>
-          )}
-        </div>
+        <SectionLabel
+          align="baseline"
+          action={
+            !loading &&
+            recs &&
+            recs.on_disk.length > 0 && (
+              <span className="shrink-0 text-[0.6875rem] text-ink4">
+                {recs.on_disk.length} on this device
+              </span>
+            )
+          }
+        >
+          Already downloaded
+        </SectionLabel>
         {loading ? (
           <p className="mt-2 text-xs text-ink4">Looking for downloaded models…</p>
         ) : recs ? (
@@ -574,12 +570,9 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         data-help="settings-localai-endpoint"
         className="mt-5 border-t border-border pt-4"
       >
-        <div className="flex items-center justify-between">
-          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-            Connect an endpoint
-          </label>
-          {configured && <StatusChip status={status} />}
-        </div>
+        <SectionLabel action={configured && <StatusChip status={status} />}>
+          Connect an endpoint
+        </SectionLabel>
         {/* Which runners PM supports, stated up front and in BOTH states — this is a gating fact
             (what you need to have installed), not prose to fold away. */}
         <p className="mt-1.5 text-xs text-ink4">
@@ -732,9 +725,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         data-help="settings-localai-roles"
         className="mt-5 border-t border-border pt-4"
       >
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Assign roles
-        </label>
+        <SectionLabel>Assign roles</SectionLabel>
         {!configured ? (
           <p className="mt-2 text-xs text-ink4">
             Connect an endpoint above to route PM's chat or background work to a local model.
@@ -851,13 +842,13 @@ export function DownloadedModels({
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <Button variant="tertiary" onClick={onPickFolder} className="px-2 py-0.5 text-xs">
+        <Button variant="tertiary" size="sm" onClick={onPickFolder}>
           {recs.scan_dir ? "Change folder…" : "Also look in a folder…"}
         </Button>
         {recs.scan_dir && (
           <>
             <span className="min-w-0 break-all text-xs text-ink4">{recs.scan_dir}</span>
-            <Button variant="tertiary" onClick={onClearFolder} className="px-2 py-0.5 text-xs">
+            <Button variant="tertiary" size="sm" onClick={onClearFolder}>
               Stop looking there
             </Button>
           </>
@@ -1151,9 +1142,9 @@ function RecommendationCard({
           ) : canPull ? (
             <Button
               variant="secondary"
+              size="sm"
               onClick={onPull}
               disabled={busy || f.verdict === "stay_on_cloud"}
-              className="text-xs"
             >
               {pulling ? "Downloading…" : "Download"}
             </Button>
@@ -1185,8 +1176,8 @@ function RecommendationCard({
           </code>
           <Button
             variant="tertiary"
+            size="sm"
             onClick={() => void navigator.clipboard?.writeText(`ollama pull ${tag}`)}
-            className="px-2 py-0.5 text-xs"
           >
             Copy
           </Button>

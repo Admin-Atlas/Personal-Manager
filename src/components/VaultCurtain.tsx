@@ -10,7 +10,7 @@
 import { useState } from "react";
 import { continueHere, forceTakeVault } from "../lib/ipc";
 import type { VaultLockStatus } from "../lib/types";
-import { Button } from "./ui";
+import { Button, Callout } from "./ui";
 
 export function VaultCurtain({
   status,
@@ -70,12 +70,7 @@ export function VaultCurtain({
 
       {status.stale ? (
         <div className="flex max-w-sm flex-col items-center gap-2">
-          <p
-            className="rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
-            The other instance may not have saved its last change.
-          </p>
+          <Callout as="p">The other instance may not have saved its last change.</Callout>
           <Button variant="primary" disabled={busy} onClick={() => run(forceTakeVault, false)}>
             {busy ? "Taking over…" : "Take over here"}
           </Button>

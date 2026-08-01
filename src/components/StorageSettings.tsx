@@ -20,7 +20,7 @@ import {
 import type { StorageComponent, StorageReport } from "../lib/types";
 import { formatBytes } from "../lib/format";
 import { prefersReducedMotion, scrollBehavior } from "../theme";
-import { Button, ConfirmDialog, SectionInfo } from "./ui";
+import { Button, Callout, ConfirmDialog, SectionInfo } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 
 /** Human-friendly size; estimates are prefixed with "~". An *estimated* zero is unknown, not empty.
@@ -156,18 +156,7 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
         )}
       </div>
 
-      {error && (
-        <div
-          className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
-          style={{
-            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
-            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            color: "var(--st-due)",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <Callout className="mt-3">{error}</Callout>}
 
       <div className="mt-3 divide-y divide-border rounded-[var(--radius)] border border-border">
         {report?.components.map((c) => (

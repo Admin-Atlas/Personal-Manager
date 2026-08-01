@@ -420,6 +420,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
           {/* Split puts the briefing/actions/agenda beside the project list; stacked is one column.
               Hidden below lg, where the layout collapses to one column regardless. */}
           <SegmentedControl
+            ariaLabel="Focus layout"
             className="hidden lg:inline-flex"
             value={layout}
             onChange={changeLayout}
@@ -751,10 +752,10 @@ function MetaEditor({
         <div className="mb-3">
           <Button
             variant="tertiary"
+            size="sm"
             onClick={onSuggest}
             disabled={suggestDisabled}
             data-help="focus-suggest"
-            className="text-xs"
             title="Let the AI propose a size, parent, blocker and deadline for this project"
           >
             {suggesting ? "Suggesting…" : "Suggest attributes (AI)"}
@@ -762,13 +763,7 @@ function MetaEditor({
         </div>
       )}
       {proposal && (
-        <div
-          className="mb-3 rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-accent-text"
-          style={{
-            borderColor: "color-mix(in oklab, var(--accent) 35%, transparent)",
-            background: "color-mix(in oklab, var(--accent) 10%, transparent)",
-          }}
-        >
+        <Callout tone="info" className="mb-3">
           <div className="mb-1 flex items-center justify-between">
             <span className="font-medium">AI suggestion</span>
             <button
@@ -785,7 +780,7 @@ function MetaEditor({
             {proposal.deadline ? ` · due ${formatDateOnly(proposal.deadline.slice(0, 10))}` : ""}
           </p>
           {proposal.reasoning && <p className="mt-1 text-ink4">{proposal.reasoning}</p>}
-        </div>
+        </Callout>
       )}
 
       <div className="grid grid-cols-2 gap-3">
@@ -1071,20 +1066,10 @@ function ConfirmRow({
     <div className="mt-2 flex items-center justify-between gap-3 text-sm text-ink3">
       <span className="min-w-0">{prompt}</span>
       <span className="flex shrink-0 gap-2">
-        <Button
-          variant="primary"
-          onClick={onConfirm}
-          disabled={busy}
-          className="px-2 py-0.5 text-xs"
-        >
+        <Button variant="primary" size="sm" onClick={onConfirm} disabled={busy}>
           {confirmLabel}
         </Button>
-        <Button
-          variant="tertiary"
-          onClick={onCancel}
-          disabled={busy}
-          className="px-2 py-0.5 text-xs"
-        >
+        <Button variant="tertiary" size="sm" onClick={onCancel} disabled={busy}>
           Cancel
         </Button>
       </span>

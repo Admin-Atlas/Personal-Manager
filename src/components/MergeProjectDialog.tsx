@@ -15,7 +15,7 @@
 import { useEffect, useState } from "react";
 import { mergeProjectPreview, mergeProjects } from "../lib/ipc";
 import type { MergePreview } from "../lib/types";
-import { Button, Modal, Select } from "./ui";
+import { Button, Callout, Dialog, Select } from "./ui";
 
 /** The live counts as one plain clause, omitting zeros so a project with no milestones doesn't
  *  read "0 milestones". `null` when nothing moves at all — saying so is more honest than an
@@ -97,106 +97,94 @@ export function MergeProjectDialog({
   }
 
   return (
-    <Modal open onClose={() => (busy ? undefined : onClose())} widthClassName="max-w-md">
-      <div className="p-5">
-        <h2 className="font-head text-base font-semibold text-ink">Merge into another project</h2>
-        <p className="mt-2 text-sm leading-relaxed text-ink3">
-          Fold <span className="font-medium text-ink2">{project}</span> into a project it was always
-          part of. Everything it holds moves across, and{" "}
-          <span className="font-medium text-ink2">{project}</span> is permanently deleted.
-        </p>
-
-        <label className="mt-4 block text-xs text-ink3" htmlFor="merge-target">
-          Keep this project
-        </label>
-        <Select
-          id="merge-target"
-          value={target}
-          onChange={(e) => {
-            setTarget(e.target.value);
-            setTyped("");
-          }}
-          className="mt-1 w-full"
-          disabled={busy}
-        >
-          <option value="">Choose a project…</option>
-          {otherProjects.map((p) => (
-            <option key={p} value={p}>
-              {p}
-            </option>
-          ))}
-        </Select>
-
-        {previewError && (
-          <p
-            role="alert"
-            className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
-            style={{
-              borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-              background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-            }}
-          >
-            {previewError}
-          </p>
-        )}
-
-        {preview && (
-          <>
-            {/* The honest preview: counted from the rows the merge itself will move. */}
-            <p className="mt-4 text-sm leading-relaxed text-ink3">
-              {moves ? (
-                <>
-                  <span className="font-medium text-ink2">{moves}</span> will move to{" "}
-                  <span className="font-medium text-ink2">{preview.into_canonical}</span>.
-                </>
-              ) : (
-                <>
-                  <span className="font-medium text-ink2">{project}</span> is empty — nothing will
-                  move to <span className="font-medium text-ink2">{preview.into_canonical}</span>.
-                </>
-              )}{" "}
-              Its deadlines, manual priority and activity history are deleted with it. This
-              can&rsquo;t be undone from inside PM.
-            </p>
-
-            <label className="mt-4 block text-xs text-ink3" htmlFor="merge-confirm">
-              Type <span className="font-medium text-ink2">{preview.into_canonical}</span> to
-              confirm
-            </label>
-            <input
-              id="merge-confirm"
-              value={typed}
-              onChange={(e) => setTyped(e.target.value)}
-              autoComplete="off"
-              spellCheck={false}
-              disabled={busy}
-              className="mt-1 w-full rounded-[var(--radius-sm)] border border-border2 bg-transparent px-2 py-1 text-sm text-ink outline-none focus:border-accent"
-            />
-          </>
-        )}
-
-        {error && (
-          <p
-            role="alert"
-            className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
-            style={{
-              borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-              background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-            }}
-          >
-            {error}
-          </p>
-        )}
-
-        <div className="mt-5 flex justify-end gap-2">
+    <Dialog
+      open
+      onClose={() => (busy ? undefined : onClose())}
+      widthClassName="max-w-md"
+      title="Merge into another project"
+      footer={
+        <>
           <Button variant="tertiary" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
           <Button variant="primary" onClick={() => void run()} disabled={!confirmed || busy}>
             {busy ? "Merging…" : "Merge and delete"}
           </Button>
-        </div>
-      </div>
-    </Modal>
+        </>
+      }
+    >
+      <p className="mt-2 text-sm leading-relaxed text-ink3">
+        Fold <span className="font-medium text-ink2">{project}</span> into a project it was always
+        part of. Everything it holds moves across, and{" "}
+        <span className="font-medium text-ink2">{project}</span> is permanently deleted.
+      </p>
+
+      <label className="mt-4 block text-xs text-ink3" htmlFor="merge-target">
+        Keep this project
+      </label>
+      <Select
+        id="merge-target"
+        value={target}
+        onChange={(e) => {
+          setTarget(e.target.value);
+          setTyped("");
+        }}
+        className="mt-1 w-full"
+        disabled={busy}
+      >
+        <option value="">Choose a project…</option>
+        {otherProjects.map((p) => (
+          <option key={p} value={p}>
+            {p}
+          </option>
+        ))}
+      </Select>
+
+      {previewError && (
+        <Callout as="p" size="md" className="mt-3">
+          {previewError}
+        </Callout>
+      )}
+
+      {preview && (
+        <>
+          {/* The honest preview: counted from the rows the merge itself will move. */}
+          <p className="mt-4 text-sm leading-relaxed text-ink3">
+            {moves ? (
+              <>
+                <span className="font-medium text-ink2">{moves}</span> will move to{" "}
+                <span className="font-medium text-ink2">{preview.into_canonical}</span>.
+              </>
+            ) : (
+              <>
+                <span className="font-medium text-ink2">{project}</span> is empty — nothing will
+                move to <span className="font-medium text-ink2">{preview.into_canonical}</span>.
+              </>
+            )}{" "}
+            Its deadlines, manual priority and activity history are deleted with it. This
+            can&rsquo;t be undone from inside PM.
+          </p>
+
+          <label className="mt-4 block text-xs text-ink3" htmlFor="merge-confirm">
+            Type <span className="font-medium text-ink2">{preview.into_canonical}</span> to confirm
+          </label>
+          <input
+            id="merge-confirm"
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+            disabled={busy}
+            className="mt-1 w-full rounded-[var(--radius-sm)] border border-border2 bg-transparent px-2 py-1 text-sm text-ink outline-none focus:border-accent"
+          />
+        </>
+      )}
+
+      {error && (
+        <Callout as="p" size="md" className="mt-3">
+          {error}
+        </Callout>
+      )}
+    </Dialog>
   );
 }

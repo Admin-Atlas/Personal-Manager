@@ -34,7 +34,7 @@ import { VaultOpenError } from "./components/VaultOpenError";
 import { DeletedVaultNotice } from "./components/VaultRecovery";
 import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
-import { ErrorBoundary, Skeleton } from "./components/ui";
+import { Callout, ErrorBoundary, Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { ReaderProvider } from "./lib/reader";
 import { BriefingProvider } from "./lib/briefing";
@@ -1048,11 +1048,7 @@ export default function App() {
               </div>
             )}
             {vaultFaultNotice && (
-              <div
-                role="alert"
-                className="flex items-start justify-between gap-3 border-b border-border px-4 py-2 text-sm text-st-due"
-                style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-              >
+              <Callout variant="strip" size="md" className="flex items-start justify-between gap-3">
                 <span>{vaultFaultNotice} You can fix this from Settings → Vault.</span>
                 <button
                   className="shrink-0 font-medium underline underline-offset-2"
@@ -1060,7 +1056,7 @@ export default function App() {
                 >
                   Dismiss
                 </button>
-              </div>
+              </Callout>
             )}
             <div
               className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
@@ -1190,14 +1186,9 @@ export default function App() {
                 ) : (
                   <main className="flex h-full flex-1 flex-col">
                     {chat.error && (
-                      <div
-                        className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
-                        style={{
-                          background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                        }}
-                      >
+                      <Callout variant="strip" size="md" className="font-ui">
                         {chat.error}
-                      </div>
+                      </Callout>
                     )}
                     {chat.fallback && (
                       <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
@@ -1264,32 +1255,34 @@ export default function App() {
               </ErrorBoundary>
 
               {showSettings && (
-                <div className="absolute inset-0 z-50" style={{ background: "var(--scrim)" }}>
-                  {/* The provider sits ABOVE SettingsView, not inside it: the controls that defer
-                      their write are several levels down (a tab's own component) while the thing
-                      that acts on them — the footer's Save and the leave guard — is SettingsView
-                      itself, so both sides need a context neither of them owns. */}
-                  <SettingsPendingProvider>
-                    <SettingsView
-                      onboarding={false}
-                      onClose={() => {
-                        setShowSettings(false);
-                        refreshSettings();
-                      }}
-                      onOpenDev={() => {
-                        setShowSettings(false);
-                        setView("dev");
-                      }}
-                      onOpenTeach={() => {
-                        setShowSettings(false);
-                        setView("teach");
-                      }}
-                      betterFit={betterFit}
-                      sheetsNudge={sheetsNudge}
-                      onBetterFitChange={() => void refreshBetterFit()}
-                    />
-                  </SettingsPendingProvider>
-                </div>
+                // No scrim wrapper: SettingsView is a Modal now and brings its own (kept below the
+                // title bar, like WhatsNew below). The one that used to be here double-darkened the
+                // moment it did — the exact trap the WhatsNew comment warns about.
+                //
+                // The provider sits ABOVE SettingsView, not inside it: the controls that defer
+                // their write are several levels down (a tab's own component) while the thing that
+                // acts on them — the footer's Save and the leave guard — is SettingsView itself, so
+                // both sides need a context neither of them owns.
+                <SettingsPendingProvider>
+                  <SettingsView
+                    onboarding={false}
+                    onClose={() => {
+                      setShowSettings(false);
+                      refreshSettings();
+                    }}
+                    onOpenDev={() => {
+                      setShowSettings(false);
+                      setView("dev");
+                    }}
+                    onOpenTeach={() => {
+                      setShowSettings(false);
+                      setView("teach");
+                    }}
+                    betterFit={betterFit}
+                    sheetsNudge={sheetsNudge}
+                    onBetterFitChange={() => void refreshBetterFit()}
+                  />
+                </SettingsPendingProvider>
               )}
 
               {/* WhatsNew renders its own Modal (scrim + centering, kept below the title bar), so it

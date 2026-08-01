@@ -52,8 +52,9 @@ export function HelpOverlay() {
           Settings button in view. */}
       <Button
         variant="secondary"
+        size="sm"
         onClick={() => setEnabled(false)}
-        className="fixed bottom-4 right-4 z-[60] text-xs shadow-lg"
+        className="fixed bottom-4 right-4 z-[60] shadow-lg"
       >
         Exit help mode
       </Button>

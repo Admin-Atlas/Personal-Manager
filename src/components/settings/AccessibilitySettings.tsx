@@ -12,7 +12,7 @@
 // the picker only invited someone to pick one. Everyone lands on AA / Standard (see ThemeContext for
 // how a stored value migrates), and the copy below no longer mentions the levels that are gone.
 
-import { SectionInfo, SegmentedControl, Toggle } from "../ui";
+import { SectionInfo, SectionLabel, SegmentedControl, SettingRow, Toggle } from "../ui";
 import { useTheme, type FontScale, type Density, type Contrast } from "../../theme";
 import { ResetLink, TabResetSection } from "./ResetControls";
 
@@ -39,9 +39,6 @@ const CONTRAST_OPTIONS: ReadonlyArray<{ value: Contrast; label: string; title: s
   { value: "high", label: "High", title: "AAA — 7:1 body text, firmer borders" },
 ];
 
-const SECTION_HEAD = "block font-mono text-xs font-medium uppercase tracking-wide text-ink3";
-const ROW = "mt-3 flex items-center justify-between gap-3";
-
 export function AccessibilitySettings() {
   const {
     fontScale,
@@ -63,14 +60,21 @@ export function AccessibilitySettings() {
   return (
     <>
       <div id="sec-a11y-text" data-settings-section className="pt-1">
-        <div className="flex items-center justify-between gap-2">
-          <label className={SECTION_HEAD}>Text size</label>
-          {fontScale !== "default" && <ResetLink onReset={() => setFontScale("default")} />}
-        </div>
-        <div className={ROW}>
-          <span className="text-sm text-ink2">Size</span>
-          <SegmentedControl value={fontScale} onChange={setFontScale} options={FONT_SIZE_OPTIONS} />
-        </div>
+        <SectionLabel
+          action={fontScale !== "default" && <ResetLink onReset={() => setFontScale("default")} />}
+        >
+          Text size
+        </SectionLabel>
+        <SettingRow label="Size">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={fontScale}
+              onChange={setFontScale}
+              options={FONT_SIZE_OPTIONS}
+            />
+          )}
+        </SettingRow>
         <SectionInfo helpId="settings-a11y-text">
           <p>
             Scales all of PM's text and spacing together, like your browser's zoom — it's the same
@@ -85,14 +89,19 @@ export function AccessibilitySettings() {
         data-settings-section
         className="mt-5 border-t border-border pt-4"
       >
-        <div className="flex items-center justify-between gap-2">
-          <label className={SECTION_HEAD}>Contrast</label>
-          {contrast !== "aa" && <ResetLink onReset={() => setContrast("aa")} />}
-        </div>
-        <div className={ROW}>
-          <span className="text-sm text-ink2">Text &amp; edge contrast</span>
-          <SegmentedControl value={contrast} onChange={setContrast} options={CONTRAST_OPTIONS} />
-        </div>
+        <SectionLabel action={contrast !== "aa" && <ResetLink onReset={() => setContrast("aa")} />}>
+          Contrast
+        </SectionLabel>
+        <SettingRow label="Text & edge contrast">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={contrast}
+              onChange={setContrast}
+              options={CONTRAST_OPTIONS}
+            />
+          )}
+        </SettingRow>
         <SectionInfo helpId="settings-a11y-contrast">
           <p>
             Sets how strongly PM's text and edges stand out from the background. “AA” is the default
@@ -104,14 +113,21 @@ export function AccessibilitySettings() {
       </div>
 
       <div id="sec-a11y-density" data-settings-section className="mt-5 border-t border-border pt-4">
-        <div className="flex items-center justify-between gap-2">
-          <label className={SECTION_HEAD}>Controls &amp; touch targets</label>
-          {density !== "standard" && <ResetLink onReset={() => setDensity("standard")} />}
-        </div>
-        <div className={ROW}>
-          <span className="text-sm text-ink2">Density</span>
-          <SegmentedControl value={density} onChange={setDensity} options={DENSITY_OPTIONS} />
-        </div>
+        <SectionLabel
+          action={density !== "standard" && <ResetLink onReset={() => setDensity("standard")} />}
+        >
+          Controls &amp; touch targets
+        </SectionLabel>
+        <SettingRow label="Density">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={density}
+              onChange={setDensity}
+              options={DENSITY_OPTIONS}
+            />
+          )}
+        </SettingRow>
         <SectionInfo helpId="settings-a11y-density">
           <p>
             Sets how large PM's controls and their tap/click targets are. “Standard” is the default
@@ -122,21 +138,26 @@ export function AccessibilitySettings() {
       </div>
 
       <div id="sec-a11y-motion" data-settings-section className="mt-5 border-t border-border pt-4">
-        <div className="flex items-center justify-between gap-2">
-          <label className={SECTION_HEAD}>Motion</label>
-          {reduceMotion && <ResetLink onReset={() => setReduceMotion(false)} />}
-        </div>
-        <div className={ROW}>
-          <span className="text-sm text-ink2">Animations</span>
-          <SegmentedControl
-            value={reduceMotion ? "reduced" : "system"}
-            onChange={(v) => setReduceMotion(v === "reduced")}
-            options={[
-              { value: "system", label: "System", title: "Follow your device's motion setting" },
-              { value: "reduced", label: "Reduced", title: "Turn animations and transitions off" },
-            ]}
-          />
-        </div>
+        <SectionLabel action={reduceMotion && <ResetLink onReset={() => setReduceMotion(false)} />}>
+          Motion
+        </SectionLabel>
+        <SettingRow label="Animations">
+          {(a11y) => (
+            <SegmentedControl
+              {...a11y}
+              value={reduceMotion ? "reduced" : "system"}
+              onChange={(v) => setReduceMotion(v === "reduced")}
+              options={[
+                { value: "system", label: "System", title: "Follow your device's motion setting" },
+                {
+                  value: "reduced",
+                  label: "Reduced",
+                  title: "Turn animations and transitions off",
+                },
+              ]}
+            />
+          )}
+        </SettingRow>
         <SectionInfo helpId="settings-a11y-motion">
           <p>
             “System” follows your device's reduce-motion setting. “Reduced” turns PM's animations
@@ -146,18 +167,12 @@ export function AccessibilitySettings() {
       </div>
 
       <div id="sec-a11y-font" data-settings-section className="mt-5 border-t border-border pt-4">
-        <div className="flex items-center justify-between gap-2">
-          <label className={SECTION_HEAD}>Legible font</label>
-          {legibleFont && <ResetLink onReset={() => setLegibleFont(false)} />}
-        </div>
-        <div className={ROW}>
-          <span className="text-sm text-ink2">Use Atkinson Hyperlegible</span>
-          <Toggle
-            checked={legibleFont}
-            onChange={setLegibleFont}
-            ariaLabel="Use the Atkinson Hyperlegible font"
-          />
-        </div>
+        <SectionLabel action={legibleFont && <ResetLink onReset={() => setLegibleFont(false)} />}>
+          Legible font
+        </SectionLabel>
+        <SettingRow label="Use Atkinson Hyperlegible">
+          {(a11y) => <Toggle {...a11y} checked={legibleFont} onChange={setLegibleFont} />}
+        </SettingRow>
         <SectionInfo helpId="settings-a11y-font">
           <p>
             Switches PM's interface and heading text to Atkinson Hyperlegible — a typeface designed
@@ -168,18 +183,12 @@ export function AccessibilitySettings() {
       </div>
 
       <div id="sec-a11y-color" data-settings-section className="mt-5 border-t border-border pt-4">
-        <div className="flex items-center justify-between gap-2">
-          <label className={SECTION_HEAD}>Colour</label>
-          {colorblind && <ResetLink onReset={() => setColorblind(false)} />}
-        </div>
-        <div className={ROW}>
-          <span className="text-sm text-ink2">Colour-blind-safe palette</span>
-          <Toggle
-            checked={colorblind}
-            onChange={setColorblind}
-            ariaLabel="Use the colour-blind-safe palette"
-          />
-        </div>
+        <SectionLabel action={colorblind && <ResetLink onReset={() => setColorblind(false)} />}>
+          Colour
+        </SectionLabel>
+        <SettingRow label="Colour-blind-safe palette">
+          {(a11y) => <Toggle {...a11y} checked={colorblind} onChange={setColorblind} />}
+        </SettingRow>
         <SectionInfo helpId="settings-a11y-color">
           <p>
             Swaps the colours PM uses to tell things apart — status badges (Due soon, Blocked, Quick

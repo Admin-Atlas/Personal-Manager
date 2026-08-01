@@ -191,6 +191,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
         {scope.my_drive && (
           <div className="mt-2 pl-5">
             <SegmentedControl
+              ariaLabel="My Drive scope"
               value={myWhole ? "whole" : "folders"}
               onChange={(v) => setMyDriveWhole(v === "whole")}
               options={[
@@ -267,6 +268,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
                   {sel != null && (
                     <div className="mt-2 pl-5">
                       <SegmentedControl
+                        ariaLabel={`${d.name} scope`}
                         value={whole ? "whole" : "folders"}
                         onChange={(v) => setWhole(d.id, v === "whole")}
                         options={[
@@ -322,6 +324,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
         {scope.shared_with_me && (
           <div className="mt-2 pl-5">
             <SegmentedControl
+              ariaLabel="Shared with me scope"
               value={swmWhole ? "whole" : "choose"}
               onChange={(v) => setSwmWhole(v === "whole")}
               options={[
@@ -500,6 +503,7 @@ function SharedWithMeRoots({
         <span className="flex items-center gap-2">
           {roots.length > VISIBLE_ROOTS && <span>scroll for more</span>}
           <SegmentedControl
+            ariaLabel="Sort shared items"
             value={rootSort}
             onChange={setRootSort}
             options={[

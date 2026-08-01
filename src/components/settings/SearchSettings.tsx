@@ -12,7 +12,15 @@ import {
 } from "../../lib/ipc";
 import type { LanguageOptions } from "../../lib/types";
 import { RebuildProgress } from "../RebuildProgress";
-import { Callout, ConfirmDialog, SectionInfo, SegmentedControl, Toggle } from "../ui";
+import {
+  Callout,
+  ConfirmDialog,
+  SectionInfo,
+  SectionLabel,
+  SegmentedControl,
+  SettingRow,
+  Toggle,
+} from "../ui";
 import { ResetLink } from "./ResetControls";
 
 /** The Search Settings tab: the vault's search language (with the guided re-index on a populated
@@ -118,9 +126,7 @@ export function SearchSettings() {
       {error && <Callout className="mt-4">{error}</Callout>}
 
       <div className="mt-4 border-t border-border pt-4">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Search
-        </label>
+        <SectionLabel>Search</SectionLabel>
         {langOpts && langOpts.options.length > 1 && (
           <div className="mt-2">
             <div className="flex items-center justify-between gap-3">
@@ -131,6 +137,7 @@ export function SearchSettings() {
                 </span>
               </p>
               <SegmentedControl
+                ariaLabel="Search language"
                 value={embedderId}
                 onChange={requestLanguageSwitch}
                 options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
@@ -139,20 +146,19 @@ export function SearchSettings() {
             {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
           </div>
         )}
-        <div className="mt-3 flex items-start justify-between gap-3">
-          <label className="block text-sm font-medium text-ink2">Re-rank search results</label>
-          <div className="flex items-center gap-2">
-            {reranking !== rerankingDefault && (
+        <SettingRow
+          label="Re-rank search results"
+          emphasis="strong"
+          aside={
+            reranking !== rerankingDefault && (
               <ResetLink onReset={() => void toggleReranking(rerankingDefault)} />
-            )}
-            <Toggle
-              checked={reranking}
-              onChange={(v) => void toggleReranking(v)}
-              ariaLabel="Re-rank search results"
-              className="mt-0.5"
-            />
-          </div>
-        </div>
+            )
+          }
+        >
+          {(a11y) => (
+            <Toggle {...a11y} checked={reranking} onChange={(v) => void toggleReranking(v)} />
+          )}
+        </SettingRow>
         {/* Both of the section's paragraphs in one disclosure at the foot. Folding the
             "switching re-indexes your library" note is safe *because* the confirm dialog
             restates it at the moment it bites — and nothing here is lost either way

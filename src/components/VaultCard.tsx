@@ -24,7 +24,7 @@ import {
   vaultStatus,
 } from "../lib/ipc";
 import type { PassphraseScore, VaultStatus } from "../lib/types";
-import { Button, Input, SectionInfo } from "./ui";
+import { Button, Callout, Input, SectionInfo } from "./ui";
 import { formatDate } from "../lib/format";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { ShareVaultWizard } from "./ShareVaultWizard";
@@ -209,12 +209,9 @@ export function VaultCard() {
           only report their operations failing. */}
       {status?.fault && (
         <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
-          <p
-            className="break-words rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
+          <Callout as="p" className="break-words">
             {status.fault.message}
-          </p>
+          </Callout>
           {status.fault.code === "denied" && (
             <RepairAccessButton
               path={status.fault.path ?? status.pointed_root ?? null}
@@ -311,12 +308,10 @@ export function VaultCard() {
               </p>
               {/* A joiner re-keying a vault someone else created also becomes its recorded owner —
                   the backend refuses without this box, which is a speed bump against doing it by
-                  accident, not an authorization control. */}
+                  accident, not an authorization control. `live={false}` on the frame because the
+                  inner <p> is already the alert: two nested live regions say it twice. */}
               {joined && (
-                <div
-                  className="space-y-2 rounded-[var(--radius)] px-3 py-2"
-                  style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-                >
+                <Callout body="ink" live={false} className="space-y-2">
                   <p className="text-xs text-st-due" role="alert">
                     This shared vault was created by another account on this PC. Changing its
                     passphrase locks everyone else out until you tell them the new one, and makes
@@ -336,7 +331,7 @@ export function VaultCard() {
                       passphrase from me.
                     </span>
                   </label>
-                </div>
+                </Callout>
               )}
               <Input
                 type="password"
@@ -465,15 +460,7 @@ export function VaultCard() {
                 Back up anything you still want first. This cannot be undone, and PM keeps no copy.
               </p>
               <div className="flex gap-2">
-                <Button
-                  variant="primary"
-                  disabled={busy}
-                  onClick={() => void deleteShared()}
-                  style={{
-                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                    color: "var(--st-due)",
-                  }}
-                >
+                <Button variant="danger" disabled={busy} onClick={() => void deleteShared()}>
                   {busy ? "Deleting…" : "Delete for everyone"}
                 </Button>
                 <Button variant="tertiary" onClick={reset} disabled={busy}>

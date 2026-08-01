@@ -66,7 +66,7 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
           >
             Get the update
           </a>
-          <Button variant="tertiary" onClick={update.dismiss} className="px-2 py-1 text-xs">
+          <Button variant="tertiary" size="sm" onClick={update.dismiss}>
             Later
           </Button>
         </span>
@@ -91,7 +91,7 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
               ? `${label} couldn't install`
               : `${label} ready`}
         </span>
-        <Button variant="tertiary" onClick={update.restart} className="px-2 py-0.5">
+        <Button variant="tertiary" size="sm" onClick={update.restart}>
           {sacBlocked ? "Try again" : "Restart to update"}
         </Button>
       </div>
@@ -109,10 +109,10 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
           manual download will not run while it is on.
         </span>
         <span className={actions}>
-          <Button variant="primary" onClick={update.restart} className="px-2.5 py-1 text-xs">
+          <Button variant="primary" size="sm" onClick={update.restart}>
             Restart
           </Button>
-          <Button variant="tertiary" onClick={update.dismiss} className="px-2 py-1 text-xs">
+          <Button variant="tertiary" size="sm" onClick={update.dismiss}>
             Later
           </Button>
         </span>
@@ -138,7 +138,7 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
           >
             Download it manually
           </a>
-          <Button variant="tertiary" onClick={update.restart} className="px-2 py-1 text-xs">
+          <Button variant="tertiary" size="sm" onClick={update.restart}>
             Try again
           </Button>
         </span>
@@ -150,10 +150,10 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
     <div className={shell}>
       <span>{label} is ready to install.</span>
       <span className={actions}>
-        <Button variant="primary" onClick={update.restart} className="px-2.5 py-1 text-xs">
+        <Button variant="primary" size="sm" onClick={update.restart}>
           Restart now
         </Button>
-        <Button variant="tertiary" onClick={update.dismiss} className="px-2 py-1 text-xs">
+        <Button variant="tertiary" size="sm" onClick={update.dismiss}>
           Later
         </Button>
       </span>

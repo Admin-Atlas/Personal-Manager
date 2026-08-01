@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listConversations, listDocuments, listProjectOverviews } from "../lib/ipc";
 import type { Conversation, Document, ProjectOverview } from "../lib/types";
 import type { View } from "./Sidebar";
-import { STATUS_LABEL } from "./ui";
+import { Modal, STATUS_LABEL } from "./ui";
 import { useDepth, useTheme } from "../theme";
 
 interface Props {
@@ -239,105 +239,114 @@ export function CommandPalette({
     } else if (e.key === "Enter") {
       e.preventDefault();
       flat[active]?.activate();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      onClose();
     }
+    // Escape is deliberately NOT here. It used to be, bound to this input alone — so one Tab out of
+    // the input (the options are `tabIndex={-1}`, so Tab leaves the palette entirely) made Escape
+    // dead, because a keydown on a background control never bubbles back to it. `Modal` listens on
+    // `window`, which works from any focus position.
   }
 
   let flatIndex = -1;
 
   return (
-    <div
-      className="absolute inset-0 z-50 flex justify-center pt-[12vh]"
-      style={{ background: "var(--scrim)" }}
-      onMouseDown={onClose}
+    // The dialog SHELL is `Modal` — scrim, `role="dialog"`, `aria-modal`, Escape from any focus
+    // position, the focus trap and focus restore. This used to be a hand-rolled overlay that had
+    // none of those except a half-Escape; `placement="top"` is the one thing a palette needs that a
+    // centred dialog doesn't, and it exists so this could stop being a copy.
+    <Modal
+      open
+      onClose={onClose}
+      placement="top"
+      widthClassName="max-w-xl"
+      heightClassName="h-fit max-h-[70vh]"
+      overflowClassName="overflow-hidden"
+      className="flex flex-col"
+      // The help anchor rides the dialog element itself — help mode outlines the hovered
+      // `[data-help]`, and a wrapper inside the panel would either paint no outline (no box) or
+      // have to re-derive the `h-fit` + `flex-1` sizing this dialog already owns.
+      helpId="command-palette"
+      // The name is on the dialog, not the input: `aria-label` on a combobox names the FIELD.
+      label="Command palette"
     >
+      <input
+        ref={inputRef}
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setActive(0);
+        }}
+        onKeyDown={onKeyDown}
+        role="combobox"
+        aria-label="Search projects, files and conversations"
+        aria-expanded={flat.length > 0}
+        aria-controls="pm-cmdk-listbox"
+        aria-autocomplete="list"
+        aria-activedescendant={flat.length > 0 ? `pm-cmdk-opt-${active}` : undefined}
+        placeholder="Jump to a project, file, conversation…"
+        className="w-full border-b border-border bg-transparent px-4 py-3 text-sm text-ink placeholder:text-ink4 focus:outline-none"
+      />
+
       <div
-        className="flex h-fit max-h-[70vh] w-full max-w-xl flex-col overflow-hidden rounded-[var(--radius)] border border-border bg-surface shadow-2xl"
-        data-help="command-palette"
-        onMouseDown={(e) => e.stopPropagation()}
+        ref={listRef}
+        role="listbox"
+        id="pm-cmdk-listbox"
+        aria-label="Results"
+        className="flex-1 overflow-y-auto py-1"
       >
-        <input
-          ref={inputRef}
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            setActive(0);
-          }}
-          onKeyDown={onKeyDown}
-          role="combobox"
-          aria-label="Search projects, files and conversations"
-          aria-expanded={flat.length > 0}
-          aria-controls="pm-cmdk-listbox"
-          aria-autocomplete="list"
-          aria-activedescendant={flat.length > 0 ? `pm-cmdk-opt-${active}` : undefined}
-          placeholder="Jump to a project, file, conversation…"
-          className="w-full border-b border-border bg-transparent px-4 py-3 text-sm text-ink placeholder:text-ink4 focus:outline-none"
-        />
-
-        <div
-          ref={listRef}
-          role="listbox"
-          id="pm-cmdk-listbox"
-          aria-label="Results"
-          className="flex-1 overflow-y-auto py-1"
-        >
-          {flat.length === 0 ? (
-            <p className="px-4 py-6 text-center text-sm text-ink4">No matches.</p>
-          ) : (
-            groups.map((group) => (
-              <div key={group.kind} role="group" aria-label={KIND_HEADING[group.kind]}>
-                <p className="px-3 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-ink4">
-                  {KIND_HEADING[group.kind]}
-                </p>
-                {group.items.map((item) => {
-                  flatIndex++;
-                  const idx = flatIndex;
-                  return (
-                    <button
-                      key={item.id}
-                      data-palette-index={idx}
-                      id={`pm-cmdk-opt-${idx}`}
-                      role="option"
-                      aria-selected={idx === active}
-                      // Arrow keys drive selection from the input via aria-activedescendant, so the
-                      // options aren't separate tab stops; mouse click still activates.
-                      tabIndex={-1}
-                      onMouseMove={() => setActive(idx)}
-                      onClick={item.activate}
-                      className={`flex w-full items-center gap-3 px-3 py-2 text-left ${
-                        idx === active ? "bg-accent-soft" : "hover:bg-surface"
-                      }`}
-                    >
-                      <span className="w-12 shrink-0 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
-                        {KIND_BADGE[item.kind]}
+        {flat.length === 0 ? (
+          <p className="px-4 py-6 text-center text-sm text-ink4">No matches.</p>
+        ) : (
+          groups.map((group) => (
+            <div key={group.kind} role="group" aria-label={KIND_HEADING[group.kind]}>
+              <p className="px-3 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-ink4">
+                {KIND_HEADING[group.kind]}
+              </p>
+              {group.items.map((item) => {
+                flatIndex++;
+                const idx = flatIndex;
+                return (
+                  <button
+                    key={item.id}
+                    data-palette-index={idx}
+                    id={`pm-cmdk-opt-${idx}`}
+                    role="option"
+                    aria-selected={idx === active}
+                    // Arrow keys drive selection from the input via aria-activedescendant, so the
+                    // options aren't separate tab stops; mouse click still activates.
+                    tabIndex={-1}
+                    onMouseMove={() => setActive(idx)}
+                    onClick={item.activate}
+                    className={`flex w-full items-center gap-3 px-3 py-2 text-left ${
+                      idx === active ? "bg-accent-soft" : "hover:bg-surface"
+                    }`}
+                  >
+                    <span className="w-12 shrink-0 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
+                      {KIND_BADGE[item.kind]}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm text-ink" title={item.label}>
+                      {item.label}
+                    </span>
+                    {item.sublabel && (
+                      <span className="shrink-0 truncate text-xs text-ink3" title={item.sublabel}>
+                        {item.sublabel}
                       </span>
-                      <span className="min-w-0 flex-1 truncate text-sm text-ink" title={item.label}>
-                        {item.label}
-                      </span>
-                      {item.sublabel && (
-                        <span className="shrink-0 truncate text-xs text-ink3" title={item.sublabel}>
-                          {item.sublabel}
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            ))
-          )}
-        </div>
-
-        {showPower && (
-          <div className="flex items-center gap-3 border-t border-border px-3 py-1.5 text-[0.6875rem] text-ink4">
-            <span>↑↓ navigate</span>
-            <span>↵ open</span>
-            <span>esc close</span>
-          </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ))
         )}
       </div>
-    </div>
+
+      {showPower && (
+        <div className="flex items-center gap-3 border-t border-border px-3 py-1.5 text-[0.6875rem] text-ink4">
+          <span>↑↓ navigate</span>
+          <span>↵ open</span>
+          <span>esc close</span>
+        </div>
+      )}
+    </Modal>
   );
 }
 

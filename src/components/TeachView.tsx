@@ -24,7 +24,7 @@ import { useDepth } from "../theme";
 import { TeachPreferences } from "./TeachPreferences";
 import { TeachTags } from "./TeachTags";
 import { DevRaw } from "./dev/DevRaw";
-import { Button, Card, Input, Modal, Select, Skeleton } from "./ui";
+import { Button, Callout, Card, Dialog, Input, Select, Skeleton } from "./ui";
 
 /** The always-present fallback bucket; we don't nudge merges for it. */
 const UNSORTED = "Unsorted";
@@ -142,15 +142,9 @@ export function TeachView() {
           </p>
 
           {error && (
-            <div
-              className="mb-4 rounded-[var(--radius)] border px-3 py-2 text-sm text-st-due"
-              style={{
-                borderColor: "color-mix(in oklab, var(--st-due) 40%, transparent)",
-                background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-              }}
-            >
+            <Callout size="md" className="mb-4">
               {error}
-            </div>
+            </Callout>
           )}
 
           {entities == null ? (
@@ -250,14 +244,16 @@ export function TeachView() {
         </div>
       </div>
 
-      <Modal
+      {/* The body stays inside the `mergeSource &&` guard rather than being hoisted into the shell:
+          every line of it names the project being folded away. */}
+      <Dialog
         open={mergeSource != null}
         onClose={() => (busy ? undefined : setMergeSource(null))}
         widthClassName="max-w-md"
+        title="Merge projects"
       >
         {mergeSource && (
-          <div className="p-5">
-            <h2 className="font-head text-base font-semibold text-ink">Merge projects</h2>
+          <>
             <p className="mt-2 text-sm leading-relaxed text-ink3">
               Fold <span className="font-medium text-ink2">{mergeSource.canonical_name}</span> into
               another project. Its {docCount(docCounts[mergeSource.canonical_name] ?? 0)} and all
@@ -266,18 +262,13 @@ export function TeachView() {
               disappears.
             </p>
 
+            {/* `live={false}`: standing prose about what Unsorted is, not a failure report. */}
             {mergeSource.canonical_name === UNSORTED && (
-              <p
-                className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
-                style={{
-                  borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
-                  background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
-                }}
-              >
+              <Callout as="p" size="md" live={false} className="mt-3">
                 Unsorted is PM&rsquo;s inbox — it can&rsquo;t be merged into another project.
                 Everything new lands here first, so folding it away would empty your inbox into that
                 project.
-              </p>
+              </Callout>
             )}
 
             <label className="mt-4 block text-xs text-ink3">Keep this project</label>
@@ -312,9 +303,9 @@ export function TeachView() {
                     : "Merge"}
               </Button>
             </div>
-          </div>
+          </>
         )}
-      </Modal>
+      </Dialog>
     </div>
   );
 }

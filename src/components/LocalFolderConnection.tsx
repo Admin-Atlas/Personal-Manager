@@ -18,7 +18,7 @@ import {
 import type { LocalFolder } from "../lib/types";
 import { useDetachedSync } from "../lib/useDetachedSync";
 import { formatWhen } from "../lib/format";
-import { Button, ConfirmDialog } from "./ui";
+import { Button, Callout, ConfirmDialog } from "./ui";
 import { FolderPicker } from "./FolderPicker";
 import { SyncProgress } from "./SyncProgress";
 import { SyncReport } from "./SyncReport";
@@ -182,7 +182,6 @@ export function LocalFolderConnection() {
           variant={folders.length === 0 ? "primary" : "secondary"}
           onClick={add}
           disabled={busy != null}
-          className="disabled:opacity-40"
         >
           {busy === "add"
             ? "Adding…"
@@ -197,12 +196,9 @@ export function LocalFolderConnection() {
       )}
 
       {error && (
-        <p
-          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="mt-2">
           {error}
-        </p>
+        </Callout>
       )}
 
       <ConfirmDialog

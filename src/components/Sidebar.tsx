@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { CalendarOverview, Conversation, LocalLlmStatus } from "../lib/types";
 import { calendarOverview, listProjects } from "../lib/ipc";
 import { shortModel } from "../lib/format";
@@ -10,7 +10,7 @@ import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme, sourceColors, sourceShapeIndex } from "../theme";
 import { CalendarSourceList } from "./calendar/CalendarSourceList";
-import { Button, Collapsible, ConfirmDialog, Modal, NavItem, Select } from "./ui";
+import { Button, Collapsible, ConfirmDialog, Dialog, NavItem, Select } from "./ui";
 import { globalChats, projectChats } from "../lib/chatNav";
 import { Briefing } from "./Briefing";
 import { readBriefingInSidebar, subscribeBriefingPrefs } from "../lib/briefingPrefs";
@@ -695,7 +695,6 @@ function MoveConversationDialog({
   onClose: () => void;
   onMove: (project: string | null) => void;
 }) {
-  const titleId = useId();
   // null = still loading the project list; [] = loaded, none exist yet.
   const [projects, setProjects] = useState<string[] | null>(null);
   const current = conversation.project ?? "";
@@ -721,31 +720,13 @@ function MoveConversationDialog({
         : projects;
 
   return (
-    <Modal open onClose={onClose} labelledBy={titleId} widthClassName="max-w-md">
-      <div className="p-5">
-        <h2 id={titleId} className="font-head text-base font-semibold text-ink">
-          Move conversation
-        </h2>
-        <p className="mt-2 text-sm leading-relaxed text-ink3">
-          Choose where “{conversation.title}” lives. A project chat searches only that project’s
-          files; a global chat searches everything. Past messages stay put — only where it’s filed
-          changes.
-        </p>
-        <Select
-          className="mt-4 w-full"
-          value={target}
-          onChange={(e) => setTarget(e.target.value)}
-          disabled={projects == null}
-          aria-label="Destination project"
-        >
-          <option value="">No project (global)</option>
-          {options.map((p) => (
-            <option key={p} value={p}>
-              {p}
-            </option>
-          ))}
-        </Select>
-        <div className="mt-5 flex justify-end gap-2">
+    <Dialog
+      open
+      onClose={onClose}
+      widthClassName="max-w-md"
+      title="Move conversation"
+      footer={
+        <>
           <Button variant="tertiary" onClick={onClose}>
             Cancel
           </Button>
@@ -756,9 +737,29 @@ function MoveConversationDialog({
           >
             Move
           </Button>
-        </div>
-      </div>
-    </Modal>
+        </>
+      }
+    >
+      <p className="mt-2 text-sm leading-relaxed text-ink3">
+        Choose where “{conversation.title}” lives. A project chat searches only that project’s
+        files; a global chat searches everything. Past messages stay put — only where it’s filed
+        changes.
+      </p>
+      <Select
+        className="mt-4 w-full"
+        value={target}
+        onChange={(e) => setTarget(e.target.value)}
+        disabled={projects == null}
+        aria-label="Destination project"
+      >
+        <option value="">No project (global)</option>
+        {options.map((p) => (
+          <option key={p} value={p}>
+            {p}
+          </option>
+        ))}
+      </Select>
+    </Dialog>
   );
 }
 

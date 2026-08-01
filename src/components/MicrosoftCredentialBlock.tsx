@@ -4,7 +4,7 @@
 import { useState } from "react";
 import { clearMicrosoftClient, setMicrosoftClient } from "../lib/ipc";
 import { useBusyRun } from "../lib/useBusyRun";
-import { Button, ConfirmDialog, Input } from "./ui";
+import { Button, Callout, ConfirmDialog, Input } from "./ui";
 
 /**
  * The shared **BYO Microsoft OAuth client** credential block — one Microsoft Entra "Mobile & desktop"
@@ -77,11 +77,7 @@ export function MicrosoftCredentialBlock({
               onChange={(e) => setClientId(e.target.value)}
               placeholder="Application (client) ID"
             />
-            <Button
-              onClick={saveCreds}
-              disabled={busy != null || !clientId.trim()}
-              className="disabled:opacity-40"
-            >
+            <Button onClick={saveCreds} disabled={busy != null || !clientId.trim()}>
               {busy === "save" ? "Saving…" : "Save client ID"}
             </Button>
           </div>
@@ -90,9 +86,9 @@ export function MicrosoftCredentialBlock({
         <div className="mt-2">
           <Button
             variant="tertiary"
+            size="sm"
             onClick={() => setConfirmClear(true)}
             disabled={busy != null}
-            className="px-2 py-1.5 text-xs"
           >
             Clear client ID
           </Button>
@@ -100,12 +96,9 @@ export function MicrosoftCredentialBlock({
       )}
 
       {error && (
-        <p
-          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
+        <Callout as="p" className="mt-2">
           {error}
-        </p>
+        </Callout>
       )}
 
       <ConfirmDialog

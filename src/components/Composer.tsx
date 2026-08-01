@@ -289,12 +289,7 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
             }
             className="flex-1 px-4 py-2"
           />
-          <Button
-            variant="primary"
-            onClick={submit}
-            disabled={disabled || !text.trim()}
-            className="px-4 py-2"
-          >
+          <Button variant="primary" size="lg" onClick={submit} disabled={disabled || !text.trim()}>
             {busy ? "Queue" : "Send"}
           </Button>
         </div>

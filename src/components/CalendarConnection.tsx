@@ -17,7 +17,7 @@ import type { Calendar, CalendarAccount, CalendarOverview, EventKind } from "../
 import { useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
 import { useBusyRun } from "../lib/useBusyRun";
-import { Button, ConfirmDialog, Select, Skeleton } from "./ui";
+import { Button, Callout, ConfirmDialog, Select, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
@@ -259,11 +259,7 @@ export function CalendarConnection({
                 : `Not synced yet · ${overview?.window_days ?? 21} days ahead`}
             </p>
             {accounts.length > 0 && (
-              <Button
-                onClick={sync}
-                disabled={busy != null}
-                className="px-2 py-1 text-xs disabled:opacity-40"
-              >
+              <Button size="sm" onClick={sync} disabled={busy != null}>
                 {busy === "sync" || busy === "select" ? "Syncing…" : "Sync now"}
               </Button>
             )}
@@ -274,7 +270,6 @@ export function CalendarConnection({
               variant={accounts.length === 0 ? "primary" : "secondary"}
               onClick={connect}
               disabled={busy != null}
-              className="disabled:opacity-40"
             >
               {busy === "connect"
                 ? `Waiting for ${meta.sign_in.split(" ")[0]}…`
@@ -311,10 +306,7 @@ export function CalendarConnection({
       )}
       {error &&
         (apiDisabled ? (
-          <div
-            className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
+          <Callout className="mt-2">
             <p>
               Your Google account is connected, but the{" "}
               <span className="font-medium">Google Calendar API</span> isn&apos;t enabled in your
@@ -331,14 +323,11 @@ export function CalendarConnection({
               </a>{" "}
               (with your project selected), give it a minute, then Sync again.
             </p>
-          </div>
+          </Callout>
         ) : (
-          <p
-            className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
+          <Callout as="p" className="mt-2">
             {error}
-          </p>
+          </Callout>
         ))}
 
       {devMode && overview && (
@@ -437,9 +426,10 @@ function AccountBlock({
         </div>
         <Button
           variant="tertiary"
+          size="sm"
           onClick={onDisconnect}
           disabled={busy}
-          className="shrink-0 px-2 py-1 text-xs hover:text-st-due"
+          className="shrink-0 hover:text-st-due"
         >
           Disconnect
         </Button>

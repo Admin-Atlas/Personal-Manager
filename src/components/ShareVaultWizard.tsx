@@ -23,7 +23,7 @@ import {
   vaultFaultOf,
 } from "../lib/ipc";
 import type { LocalAccount, PassphraseScore, VaultStatus } from "../lib/types";
-import { Button, Card, Collapsible, Input, Modal } from "./ui";
+import { Button, Card, Collapsible, Dialog, Input } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { RepairAccessButton } from "./VaultRecovery";
 
@@ -179,119 +179,171 @@ export function ShareVaultWizard({ open, onClose, status, onChanged }: Props) {
   }
 
   return (
-    <Modal
+    <Dialog
       open={open}
       onClose={onClose}
-      labelledBy="share-vault-wizard-title"
+      chrome="bar"
+      eyebrow={`Step ${stepIndex} of ${steps.length} · ${stepTitles[step]}`}
+      title="Share this vault with other accounts"
+      // The last step has nothing left to abandon, so "Cancel" would misname it.
+      closeLabel={step === "done" ? "Close" : "Cancel"}
       widthClassName="max-w-xl"
-      className="flex max-h-[85vh] flex-col"
     >
-      <div className="flex items-center justify-between border-b border-border px-6 py-4">
-        <div>
-          <p className="font-mono text-xs uppercase tracking-wide text-ink4">
-            Step {stepIndex} of {steps.length} · {stepTitles[step]}
+      {step === "passphrase" && (
+        <div className="space-y-2">
+          <p className="text-sm text-ink2">
+            This passphrase becomes the vault's key. Anyone who knows it can open the vault, and it
+            can't be recovered — so make it strong, and share it privately with the people you
+            trust.
           </p>
-          <h1 id="share-vault-wizard-title" className="font-head text-lg font-semibold text-ink">
-            Share this vault with other accounts
-          </h1>
+          <Input
+            type="password"
+            placeholder="Passphrase"
+            value={pass}
+            onChange={(e) => setPass(e.target.value)}
+            autoFocus
+          />
+          <Input
+            type="password"
+            placeholder="Confirm passphrase"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+          />
+          <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
+          <div className="pt-2">
+            <Button
+              variant="primary"
+              disabled={!passphrasesMatch || !strongEnough}
+              onClick={() => setStep("location")}
+            >
+              Continue
+            </Button>
+          </div>
         </div>
-        <Button variant="tertiary" onClick={onClose}>
-          {step === "done" ? "Close" : "Cancel"}
-        </Button>
-      </div>
+      )}
 
-      <div className="flex-1 overflow-y-auto px-6 py-4">
-        {step === "passphrase" && (
-          <div className="space-y-2">
-            <p className="text-sm text-ink2">
-              This passphrase becomes the vault's key. Anyone who knows it can open the vault, and
-              it can't be recovered — so make it strong, and share it privately with the people you
-              trust.
+      {step === "location" && (
+        <div className="space-y-2">
+          <p className="text-sm text-ink2">
+            The vault moves to a folder every account on this PC can reach — that's what makes
+            sharing actually work. The suggested spot is right for almost everyone.
+          </p>
+          {location ? (
+            <p className="break-all rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
+              {location}
             </p>
-            <Input
-              type="password"
-              placeholder="Passphrase"
-              value={pass}
-              onChange={(e) => setPass(e.target.value)}
-              autoFocus
-            />
-            <Input
-              type="password"
-              placeholder="Confirm passphrase"
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-            />
-            <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
-            <div className="pt-2">
-              <Button
-                variant="primary"
-                disabled={!passphrasesMatch || !strongEnough}
-                onClick={() => setStep("location")}
-              >
-                Continue
+          ) : (
+            <p className="text-xs text-ink4">
+              No suggested spot on this system — pick a folder that other accounts can reach.
+            </p>
+          )}
+          {!suggestedWritable && (
+            <p className="text-xs text-st-due">
+              PM couldn't confirm it can write there — you can still try, or pick another folder.
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-2 pt-2">
+            <Button variant="primary" disabled={busy || !location} onClick={commitShare}>
+              {busy ? "Sharing…" : isFreshShare ? "Share vault" : "Continue"}
+            </Button>
+            <Button variant="tertiary" onClick={pickFolder} disabled={busy}>
+              Choose a different folder…
+            </Button>
+            {/* A fresh share can step back to fix a passphrase the backend rejected. */}
+            {isFreshShare && (
+              <Button variant="tertiary" onClick={() => setStep("passphrase")} disabled={busy}>
+                Back
               </Button>
-            </div>
-          </div>
-        )}
-
-        {step === "location" && (
-          <div className="space-y-2">
-            <p className="text-sm text-ink2">
-              The vault moves to a folder every account on this PC can reach — that's what makes
-              sharing actually work. The suggested spot is right for almost everyone.
-            </p>
-            {location ? (
-              <p className="break-all rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
-                {location}
-              </p>
-            ) : (
-              <p className="text-xs text-ink4">
-                No suggested spot on this system — pick a folder that other accounts can reach.
-              </p>
             )}
-            {!suggestedWritable && (
-              <p className="text-xs text-st-due">
-                PM couldn't confirm it can write there — you can still try, or pick another folder.
-              </p>
-            )}
-            <div className="flex flex-wrap items-center gap-2 pt-2">
-              <Button variant="primary" disabled={busy || !location} onClick={commitShare}>
-                {busy ? "Sharing…" : isFreshShare ? "Share vault" : "Continue"}
-              </Button>
-              <Button variant="tertiary" onClick={pickFolder} disabled={busy}>
-                Choose a different folder…
-              </Button>
-              {/* A fresh share can step back to fix a passphrase the backend rejected. */}
-              {isFreshShare && (
-                <Button variant="tertiary" onClick={() => setStep("passphrase")} disabled={busy}>
-                  Back
-                </Button>
-              )}
-            </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {step === "accounts" && (
-          <div className="space-y-3">
-            <p className="text-sm text-ink2">
-              Pick the accounts that should be able to open the vault. You can add more later from
-              this same screen.
-            </p>
-            {accounts.length > 0 ? (
-              <div className="space-y-2">
-                {accounts.map((a) => {
-                  const state = linkStates[a.sid];
-                  return (
-                    <div
-                      key={a.sid}
-                      className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border2 px-3 py-2"
+      {step === "accounts" && (
+        <div className="space-y-3">
+          <p className="text-sm text-ink2">
+            Pick the accounts that should be able to open the vault. You can add more later from
+            this same screen.
+          </p>
+          {accounts.length > 0 ? (
+            <div className="space-y-2">
+              {accounts.map((a) => {
+                const state = linkStates[a.sid];
+                return (
+                  <div
+                    key={a.sid}
+                    className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border2 px-3 py-2"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-sm text-ink2">{a.name}</p>
+                      {(state?.kind === "error" || state?.kind === "denied") && (
+                        <p className="break-all text-xs text-st-due">{state.message}</p>
+                      )}
+                      {state?.kind === "denied" && (
+                        <div className="mt-2">
+                          <RepairAccessButton
+                            path={location}
+                            onRepaired={() => setLinkStates({})}
+                            variant="secondary"
+                          />
+                        </div>
+                      )}
+                    </div>
+                    <Button
+                      variant="secondary"
+                      disabled={busy || state?.kind === "linked"}
+                      onClick={() => link(a.sid, a.sid)}
                     >
-                      <div className="min-w-0">
-                        <p className="truncate text-sm text-ink2">{a.name}</p>
-                        {(state?.kind === "error" || state?.kind === "denied") && (
-                          <p className="break-all text-xs text-st-due">{state.message}</p>
-                        )}
-                        {state?.kind === "denied" && (
+                      {state?.kind === "linked" ? "Added ✓" : "Add"}
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="text-xs text-ink4">
+              PM couldn't list this PC's accounts — add one by name or SID below.
+            </p>
+          )}
+          <Collapsible title="Account not listed? Enter a name or SID">
+            <div className="mt-2 space-y-2">
+              <p className="text-xs text-ink4">
+                Enter the account's <strong>name</strong> (like{" "}
+                <span className="font-mono">PC\alice</span>) or its <strong>SID</strong> (
+                <span className="font-mono">S-1-5-21-…</span>, survives renames). To find either,
+                open <strong>PowerShell</strong> (Win+X → Terminal) and run:
+              </p>
+              <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
+                Get-LocalUser | Select Name, SID
+              </pre>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Account name or SID"
+                  value={manualAccount}
+                  onChange={(e) => setManualAccount(e.target.value)}
+                />
+                <Button
+                  variant="secondary"
+                  disabled={busy || manualAccount.trim().length === 0}
+                  onClick={() => {
+                    const value = manualAccount.trim();
+                    setManualAccount("");
+                    void link(value, value);
+                  }}
+                >
+                  Add
+                </Button>
+              </div>
+              {manualAccount.trim().length === 0 &&
+                Object.entries(linkStates)
+                  .filter(([key]) => !accounts.some((a) => a.sid === key))
+                  .map(([key, state]) =>
+                    state.kind === "error" || state.kind === "denied" ? (
+                      <div key={key}>
+                        <p className="break-all text-xs text-st-due">
+                          {key}: {state.message}
+                        </p>
+                        {state.kind === "denied" && (
                           <div className="mt-2">
                             <RepairAccessButton
                               path={location}
@@ -301,123 +353,58 @@ export function ShareVaultWizard({ open, onClose, status, onChanged }: Props) {
                           </div>
                         )}
                       </div>
-                      <Button
-                        variant="secondary"
-                        disabled={busy || state?.kind === "linked"}
-                        onClick={() => link(a.sid, a.sid)}
-                      >
-                        {state?.kind === "linked" ? "Added ✓" : "Add"}
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <p className="text-xs text-ink4">
-                PM couldn't list this PC's accounts — add one by name or SID below.
-              </p>
-            )}
-            <Collapsible title="Account not listed? Enter a name or SID">
-              <div className="mt-2 space-y-2">
-                <p className="text-xs text-ink4">
-                  Enter the account's <strong>name</strong> (like{" "}
-                  <span className="font-mono">PC\alice</span>) or its <strong>SID</strong> (
-                  <span className="font-mono">S-1-5-21-…</span>, survives renames). To find either,
-                  open <strong>PowerShell</strong> (Win+X → Terminal) and run:
-                </p>
-                <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
-                  Get-LocalUser | Select Name, SID
-                </pre>
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="Account name or SID"
-                    value={manualAccount}
-                    onChange={(e) => setManualAccount(e.target.value)}
-                  />
-                  <Button
-                    variant="secondary"
-                    disabled={busy || manualAccount.trim().length === 0}
-                    onClick={() => {
-                      const value = manualAccount.trim();
-                      setManualAccount("");
-                      void link(value, value);
-                    }}
-                  >
-                    Add
-                  </Button>
-                </div>
-                {manualAccount.trim().length === 0 &&
-                  Object.entries(linkStates)
-                    .filter(([key]) => !accounts.some((a) => a.sid === key))
-                    .map(([key, state]) =>
-                      state.kind === "error" || state.kind === "denied" ? (
-                        <div key={key}>
-                          <p className="break-all text-xs text-st-due">
-                            {key}: {state.message}
-                          </p>
-                          {state.kind === "denied" && (
-                            <div className="mt-2">
-                              <RepairAccessButton
-                                path={location}
-                                onRepaired={() => setLinkStates({})}
-                                variant="secondary"
-                              />
-                            </div>
-                          )}
-                        </div>
-                      ) : null,
-                    )}
-              </div>
-            </Collapsible>
-            <div className="flex items-center gap-3 pt-1">
-              <Button variant="primary" disabled={busy} onClick={() => setStep("done")}>
-                {linkedAny ? "Continue" : "I'll add accounts later"}
-              </Button>
+                    ) : null,
+                  )}
             </div>
-            {!linkedAny && (
-              <p className="text-xs text-ink4">
-                Until an account is added here, Windows won't let it open the vault folder.
-              </p>
-            )}
+          </Collapsible>
+          <div className="flex items-center gap-3 pt-1">
+            <Button variant="primary" disabled={busy} onClick={() => setStep("done")}>
+              {linkedAny ? "Continue" : "I'll add accounts later"}
+            </Button>
           </div>
-        )}
-
-        {step === "done" && (
-          <div className="space-y-3">
-            <p className="text-sm text-ink2">All set — here's what happens on the other account:</p>
-            <Card className="p-4">
-              <ol className="space-y-3">
-                {[
-                  "Sign in to Windows as them and open Personal Manager (install it first if needed).",
-                  "PM spots this shared vault and offers to join it — they enter the passphrase you just chose.",
-                  "They add their own OpenRouter key. Keys and sign-ins never travel between Windows accounts.",
-                  "They reconnect any cloud accounts and calendars as themselves — everything already indexed is there waiting.",
-                ].map((line, i) => (
-                  <li key={i} className="flex gap-3 text-sm text-ink2">
-                    <span className="mt-0.5 select-none font-mono text-xs text-ink4">{i + 1}.</span>
-                    <span>{line}</span>
-                  </li>
-                ))}
-              </ol>
-            </Card>
+          {!linkedAny && (
             <p className="text-xs text-ink4">
-              Only one account writes at a time — if PM is open here when they join, they'll be
-              offered a hand-over, and you'll get it back the same way.
+              Until an account is added here, Windows won't let it open the vault folder.
             </p>
-          </div>
-        )}
+          )}
+        </div>
+      )}
 
-        {warnings.length > 0 && (
-          <div className="mt-4 space-y-1">
-            {warnings.map((w, i) => (
-              <p key={i} className="break-all text-xs text-ink4">
-                {w}
-              </p>
-            ))}
-          </div>
-        )}
-        {error && <p className="mt-4 break-all text-xs text-st-due">{error}</p>}
-      </div>
-    </Modal>
+      {step === "done" && (
+        <div className="space-y-3">
+          <p className="text-sm text-ink2">All set — here's what happens on the other account:</p>
+          <Card className="p-4">
+            <ol className="space-y-3">
+              {[
+                "Sign in to Windows as them and open Personal Manager (install it first if needed).",
+                "PM spots this shared vault and offers to join it — they enter the passphrase you just chose.",
+                "They add their own OpenRouter key. Keys and sign-ins never travel between Windows accounts.",
+                "They reconnect any cloud accounts and calendars as themselves — everything already indexed is there waiting.",
+              ].map((line, i) => (
+                <li key={i} className="flex gap-3 text-sm text-ink2">
+                  <span className="mt-0.5 select-none font-mono text-xs text-ink4">{i + 1}.</span>
+                  <span>{line}</span>
+                </li>
+              ))}
+            </ol>
+          </Card>
+          <p className="text-xs text-ink4">
+            Only one account writes at a time — if PM is open here when they join, they'll be
+            offered a hand-over, and you'll get it back the same way.
+          </p>
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="mt-4 space-y-1">
+          {warnings.map((w, i) => (
+            <p key={i} className="break-all text-xs text-ink4">
+              {w}
+            </p>
+          ))}
+        </div>
+      )}
+      {error && <p className="mt-4 break-all text-xs text-st-due">{error}</p>}
+    </Dialog>
   );
 }

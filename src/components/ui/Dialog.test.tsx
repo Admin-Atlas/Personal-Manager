@@ -17,6 +17,7 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", mode: "dark", accent: "mono", depth: "standard" }),
 }));
 
+import { ConfirmDialog } from "./ConfirmDialog";
 import { Dialog } from "./Dialog";
 import { TONE_TEXT_TOKEN } from "./tone";
 
@@ -98,6 +99,39 @@ describe("Dialog", () => {
     expect(heading.className).not.toContain("text-ink");
   });
 
+  it("tones the bar chrome's heading the same way, and defaults back to text-ink", () => {
+    const { getByRole, rerender } = render(
+      <Dialog open onClose={noop} chrome="bar" tone="danger" title="Remove this data?">
+        <p>body</p>
+      </Dialog>,
+    );
+    let heading = getByRole("heading", { level: 1 });
+    expect(heading.style.color).toBe(`var(${TONE_TEXT_TOKEN.danger})`);
+
+    rerender(
+      <Dialog open onClose={noop} chrome="bar" title="Remove this data?">
+        <p>body</p>
+      </Dialog>,
+    );
+    heading = getByRole("heading", { level: 1 });
+    expect(heading.style.color).toBe("");
+    expect(heading.className).toContain("text-ink");
+  });
+
+  it("tones the heading and nothing else — the shell is chrome, not a message", () => {
+    // A `danger` dialog must not tint its own surface the way a Callout does: the two remove-my-data
+    // steps are ordinary cards carrying a red HEADING, and a red panel behind them would read as an
+    // error that had already happened rather than a decision still being asked for.
+    const { getByRole } = render(
+      <Dialog open onClose={noop} tone="danger" title="Remove this data?">
+        <p className="mt-2">body</p>
+      </Dialog>,
+    );
+    const dialog = getByRole("dialog");
+    expect(dialog.className).toContain("bg-surface");
+    expect(dialog.getAttribute("style") ?? "").not.toContain("--st-due");
+  });
+
   it("gives the card chrome no Close affordance of its own", () => {
     // One of the remove-my-data steps is deliberately undismissable; a shell-supplied Close button
     // would hand back the exit it exists to withhold.
@@ -173,5 +207,78 @@ describe("Dialog", () => {
       </Dialog>
     );
     expect(withoutTitle).toBeTruthy();
+  });
+});
+
+// ConfirmDialog is now a PRESET over Dialog's card chrome rather than a second copy of it. These
+// assert the part that is still its own — the two-button shape and what `busy`/`danger` do — plus
+// the one thing the rewrite must not have dropped on the way: the accessible name.
+describe("ConfirmDialog", () => {
+  it("is named by its title, through the preset", () => {
+    const { getByRole } = render(
+      <ConfirmDialog open title="Rebuild the index?" onConfirm={noop} onClose={noop}>
+        Everything is re-read from your vault.
+      </ConfirmDialog>,
+    );
+    expect(getByRole("dialog", { name: "Rebuild the index?" })).toBeTruthy();
+    expect(getByRole("heading", { level: 2, name: "Rebuild the index?" })).toBeTruthy();
+  });
+
+  it("puts Cancel before Confirm, and wires each to its own handler", () => {
+    const onConfirm = vi.fn();
+    const onClose = vi.fn();
+    const { getAllByRole, getByRole } = render(
+      <ConfirmDialog
+        open
+        title="Disconnect?"
+        confirmLabel="Disconnect"
+        cancelLabel="Keep it"
+        onConfirm={onConfirm}
+        onClose={onClose}
+      />,
+    );
+    expect(getAllByRole("button").map((b) => b.textContent)).toEqual(["Keep it", "Disconnect"]);
+
+    fireEvent.click(getByRole("button", { name: "Keep it" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
+
+    fireEvent.click(getByRole("button", { name: "Disconnect" }));
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("tints the confirm BUTTON for `danger`, not the heading", () => {
+    // The destructive thing is the action. Tinting the title as well would double-count it — and
+    // `Dialog tone="danger"` is reserved for the dialogs whose subject, not whose button, is the
+    // danger (RemovePmData's two steps).
+    const { getByRole } = render(
+      <ConfirmDialog open title="Delete this preference?" danger onConfirm={noop} onClose={noop} />,
+    );
+    expect(getByRole("button", { name: "Confirm" }).className).toContain("--st-due");
+    expect(getByRole("heading", { level: 2 }).style.color).toBe("");
+  });
+
+  it("blocks every exit while busy", () => {
+    // Not just cosmetic: the action is already running, and an Escape that closed the dialog would
+    // leave the user with no sight of an operation they cannot cancel.
+    const onClose = vi.fn();
+    const { getAllByRole, getByRole } = render(
+      <ConfirmDialog open title="Removing…" busy onConfirm={noop} onClose={onClose} />,
+    );
+    expect(getAllByRole("button").every((b) => (b as HTMLButtonElement).disabled)).toBe(true);
+    expect(getByRole("button", { name: "Working…" })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.mouseDown(getByRole("dialog").parentElement!);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("renders no body wrapper when it has no children", () => {
+    const { getByRole } = render(
+      <ConfirmDialog open title="Are you sure?" onConfirm={noop} onClose={noop} />,
+    );
+    // Title, then straight to the footer — an empty `mt-2` block would open a gap under the heading.
+    const card = getByRole("heading", { level: 2 }).parentElement!;
+    expect(card.children.length).toBe(2);
   });
 });

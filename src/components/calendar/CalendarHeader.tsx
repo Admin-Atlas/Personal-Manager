@@ -148,7 +148,12 @@ export function CalendarHeader({
           </>
         )}
         {viewOptions.length > 1 && (
-          <SegmentedControl options={viewOptions} value={view} onChange={onViewChange} />
+          <SegmentedControl
+            ariaLabel="Calendar view"
+            options={viewOptions}
+            value={view}
+            onChange={onViewChange}
+          />
         )}
         {/* The "Calendars x/x" dropdown used to sit here. It now lives in the left sidebar, listing
             every calendar inline instead of behind a button — one control, one home, so it is NOT

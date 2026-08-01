@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
-import { Button, Collapsible, SectionInfo, SegmentedControl } from "./ui";
+import { Button, Collapsible, SectionInfo, SectionLabel, SegmentedControl } from "./ui";
 import { clearJustJoinedVault, justJoinedVault } from "../lib/joinedVault";
 import { CalendarConnection } from "./CalendarConnection";
 import { CloudDriveConnection } from "./CloudDriveConnection";
@@ -315,11 +315,7 @@ function ConnectorGroup({
     <Collapsible
       className="mt-4 rounded-[var(--radius)] border border-border p-3"
       defaultOpen={!minimal}
-      title={
-        <span className="font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          {title}
-        </span>
-      }
+      title={<SectionLabel as="span">{title}</SectionLabel>}
     >
       <div className="mt-3">{children}</div>
       {blurb && (
@@ -357,6 +353,7 @@ function IndexingSpeedControl({
       <div className="flex items-start justify-between gap-3">
         <label className="block text-sm font-medium text-ink2">Indexing speed</label>
         <SegmentedControl
+          ariaLabel="Indexing speed"
           className="mt-0.5 shrink-0"
           value={value}
           onChange={(v) => onChange(v as "fast" | "gentle")}
