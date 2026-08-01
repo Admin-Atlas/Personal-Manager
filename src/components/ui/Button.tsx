@@ -11,8 +11,20 @@ import { cn } from "./cn";
 export type ButtonVariant = "primary" | "secondary" | "tertiary" | "danger";
 export type ButtonSize = "xs" | "sm" | "md" | "lg";
 
-// Hover/active are gated to :enabled so a disabled button never reacts to the pointer — combined
-// with the base disabled:opacity-40 it reads as unmistakably inert, not merely dimmed.
+// Hover/active are gated to :enabled so a disabled button never reacts to the pointer, which
+// together with `disabled:cursor-not-allowed` and the colour swap below reads as unmistakably
+// inert. The colour swap is the whole signal and it is a large one: primary/danger lose their
+// accent fill to `disabled:bg-surface` (the cue DESIGN_TOKENS.md §7 names), and every variant
+// drops its label to `faint` — a three-tier step down from ink2's 7.7-11.3:1.
+//
+// There used to be a `disabled:opacity-40` here as well. Two dimming mechanisms multiplied:
+// because `opacity` on the button creates a group, the label AND its fill composited toward the
+// background together, landing the label at 1.16-1.42:1 against its own fill in every theme.
+// DESIGN_TOKENS.md:222 specifies the disabled state as a colour change with no alpha; the alpha
+// was added in #181 to fix the opposite complaint (a disabled secondary looked enabled) and
+// over-corrected. designGuards.test.ts already recorded the consequence — "no token choice makes
+// the drawn colour compliant there anyway" — which is true only while the alpha is applied.
+// One mechanism, so the token decides the contrast and can be reasoned about.
 const VARIANT: Record<ButtonVariant, string> = {
   primary:
     "bg-accent text-accent-ink font-semibold enabled:hover:brightness-105 enabled:active:brightness-95 disabled:bg-surface disabled:text-faint",
@@ -69,7 +81,7 @@ export function Button({
   return (
     <button
       className={cn(
-        "inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center gap-1.5 rounded-[var(--radius-sm)] transition disabled:cursor-not-allowed disabled:opacity-40",
+        "inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center gap-1.5 rounded-[var(--radius-sm)] transition disabled:cursor-not-allowed",
         SIZE[size],
         terminal && "font-mono",
         VARIANT[variant],

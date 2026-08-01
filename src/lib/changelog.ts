@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.11-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Switches you can actually see when they're off. The little circle inside a switch was being painted in a colour only ever meant to sit on the accent fill — which is where it sits when the switch is ON. Turned off, it moved onto a different background where that colour means nothing, and on PM's default look it came out as exactly the page colour: an invisible circle in a nearly invisible pill. Every switch in Settings did this. Off now uses a colour with a guaranteed readability floor, so the off state reads clearly in every theme, mode and accent.",
+      "Switches now have an outline, so you can see the switch and not just the circle. The pill behind the circle was filled but never edged, and its fill sits only one step away from the panel it lies on — enough to read as a slightly raised patch, nowhere near enough to read as the edge of a control. The outline uses PM's strong edge colour, which means it goes darker on a light background and lighter on a dark one, and it firms up further when you turn Contrast to High — where before, switches were the one control High contrast did nothing at all for.",
+      "Buttons that are unavailable now dim once instead of twice. A disabled button was both recoloured and made see-through, and the two stacked — the label and the button faded into the background together, ending up practically invisible rather than merely inert. The colour change alone is a big step, and it's what PM's design rules specify.",
+    ],
+  },
+  {
     version: "3.114.10-alpha",
     date: "2026-08-01",
     highlights: [
