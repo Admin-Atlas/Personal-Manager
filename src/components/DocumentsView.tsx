@@ -17,6 +17,8 @@ import {
   promoteIndexOnly,
   onIngestProgress,
   rebuildIndex,
+  ackRebuildReport,
+  clearRebuildActivity,
   rebuildStatus,
   setDocumentMetadata,
   setDuplicateCheck,
@@ -27,8 +29,10 @@ import { landingSeq, landingsSince, mergeLandings, onDocumentsLanded } from "../
 import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import {
+  readActivityOpen,
   readCopyPhotosToVault,
   readDuplicateNudgeSeen,
+  writeActivityOpen,
   writeCopyPhotosToVault,
   writeDuplicateNudgeSeen,
 } from "../lib/documentPrefs";
@@ -36,7 +40,7 @@ import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
 import { useDepth, useTheme } from "../theme";
-import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
+import { Button, Card, Collapsible, ConfirmDialog, IconButton } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
 import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
@@ -119,6 +123,8 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
   const [items, setItems] = useState<ProgressItem[]>([]);
   // True when the restored Activity list is only the tail of a longer run.
   const [truncated, setTruncated] = useState(false);
+  // Persisted, because the tab router unmounts this view — see documentPrefs.
+  const [activityOpen, setActivityOpen] = useState(() => readActivityOpen() ?? true);
   // Determinate-bar inputs: `total` from the `counted` event, `processed` counted up as
   // each file lands. Null total (setup / model download) keeps the bar an indeterminate sweep.
   const [total, setTotal] = useState<number | null>(null);
@@ -311,7 +317,21 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
         if (!job.running) {
           // A rebuild that finished while we were away still has a result worth showing — the
           // `finished` event only ever reached a listener that was mounted at the time.
-          if (job.last_report) setSummary(job.last_report);
+          if (job.last_report) {
+            setSummary(job.last_report);
+            // Shown once, and then it stops following the user around. Nothing but the START of
+            // the next rebuild used to clear this, so the Done line survived every tab switch and
+            // only a relaunch got rid of it. MUST sit after the `cancelled` guard above, or
+            // StrictMode's double-invoked mount effect has pass one acknowledge the report before
+            // pass two reads it, and the line never appears in dev at all.
+            void ackRebuildReport().catch(() => {});
+          }
+          // The per-file rows outlive the run too. This branch used to return here having set only
+          // the summary, so "let me scroll back through everything this pass built" got zero rows
+          // the moment the rebuild finished. `ack_rebuild_report` deliberately leaves `recent`
+          // alone so there is something here to restore.
+          setItems(job.recent.map((r) => ({ ...r, detail: r.detail ?? undefined })));
+          setTruncated(job.recent_truncated);
           return;
         }
         setBusy(true);
@@ -508,6 +528,11 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
     if (busy || paths.length === 0) return;
     setBusy(true);
     setItems([]);
+    setTruncated(false);
+    // An import reports through its own Channel and never writes the backend's `recent` rows, so
+    // the snapshot still holds the LAST REBUILD's Activity. Left there, the next mount would
+    // restore those rows and present them as this import's. Drop the stale card at the source.
+    void clearRebuildActivity().catch(() => {});
     setTotal(null);
     setProcessed(0);
     setSummary(null);
@@ -567,6 +592,9 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
     if (busy) return;
     setBusy(true);
     setItems([]);
+    // Reset with the list it describes: `truncated` was never cleared, so once one long rebuild
+    // had set it the "this run was longer" notice outlived every later, shorter run.
+    setTruncated(false);
     setTotal(null);
     setProcessed(0);
     setSummary(null);
@@ -940,11 +968,24 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
               )}
               {prep && <p className="px-1 py-1 text-sm text-ink3">{prep}</p>}
               {items.length > 0 && (
-                <Collapsible title="Activity" meta={`${items.length}`}>
-                  <ul className="flex flex-col gap-1 pt-1">
+                <Collapsible
+                  title="Activity"
+                  meta={`${items.length}`}
+                  // Controlled + persisted: this view unmounts on every tab switch, so the
+                  // primitive's own `useState` reseeded the fold open each time it came back.
+                  open={activityOpen}
+                  onOpenChange={(o) => {
+                    setActivityOpen(o);
+                    writeActivityOpen(o);
+                  }}
+                >
+                  {/* The list had no scroller of its own, so a long rebuild rendered every row
+                      into the pane scroller and pushed the duplicates panel and the document
+                      table below the fold. ~26rem is about 15 rows at this row height. */}
+                  <ul className="flex max-h-[26rem] flex-col gap-1 overflow-y-auto pt-1">
                     {truncated && (
                       <li className="px-1 py-0.5 text-xs text-ink4">
-                        Showing the most recent files — earlier ones aren&rsquo;t kept.
+                        Showing the last {items.length} files — this run was longer.
                       </li>
                     )}
                     {items.map((item, i) => (
@@ -966,13 +1007,30 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                    exactly as it always has. It says "items", not "files": one folder that would not
                    open counts as one entry however much sits inside it, and the number underneath is
                    unknowable by definition. */
-                <p className="mt-2 border-t border-rule px-1 pt-2 text-xs text-ink3">
-                  Done — {summary.ingested} ingested, {summary.skipped} skipped, {summary.failed}{" "}
-                  failed
-                  {summary.unreadable > 0 &&
-                    `, ${summary.unreadable} item${summary.unreadable === 1 ? "" : "s"} could not be read`}
-                  .
-                </p>
+                <div className="mt-2 flex items-start justify-between gap-2 border-t border-rule px-1 pt-2">
+                  <p className="text-xs text-ink3">
+                    Done — {summary.ingested} ingested, {summary.skipped} skipped, {summary.failed}{" "}
+                    failed
+                    {summary.unreadable > 0 &&
+                      `, ${summary.unreadable} item${summary.unreadable === 1 ? "" : "s"} could not be read`}
+                    .
+                  </p>
+                  {/* Clears the rows with it — unlike the automatic acknowledge on mount, this is
+                      the user saying they are done with the whole card, not just the counts. */}
+                  <IconButton
+                    label="Dismiss"
+                    variant="subtle"
+                    className="shrink-0"
+                    onClick={() => {
+                      setSummary(null);
+                      setItems([]);
+                      setTruncated(false);
+                      void clearRebuildActivity().catch(() => {});
+                    }}
+                  >
+                    ×
+                  </IconButton>
+                </div>
               )}
             </Card>
           )}

@@ -911,6 +911,54 @@ pub fn rebuild_status(state: State<'_, AppState>) -> Result<crate::IngestJobStat
         .map_err(|_| Error::Other("rebuild state poisoned".into()))
 }
 
+/// Acknowledge the last finished rebuild's counts, so the "Done — N ingested" line stops coming
+/// back.
+///
+/// That line is a REPLAY: `rebuild_status` serves `last_report` on every mount, and the only thing
+/// that ever cleared it was the START of the next rebuild (:344-350). So it outlived every tab
+/// switch and only a relaunch — which builds a fresh `IngestJobState` — made it go. A user who had
+/// read the result was told it again every time they came back to Documents.
+///
+/// Deliberately leaves `recent` alone. Clearing the rows here too would be the tidier-looking
+/// "clear the finished card as a unit", and it would defeat the neighbouring fix: the common case
+/// is watching a rebuild end while the view is mounted, so the rows would be dropped the instant
+/// the run finished and "show me every file this pass built" would yield nothing. The banner is
+/// what was unwanted; the list is what was asked for. `clear_rebuild_activity` drops both, on an
+/// explicit act.
+///
+/// No-ops while a rebuild is running: `RebuildProgress` is a second live listener on the same
+/// snapshot, so a stray acknowledge must never touch an in-flight run.
+#[tauri::command]
+pub fn ack_rebuild_report(state: State<'_, AppState>) -> Result<()> {
+    if let Ok(mut snap) = state.ingest_job.lock() {
+        if !snap.running {
+            snap.last_report = None;
+        }
+    }
+    Ok(())
+}
+
+/// Drop the whole finished-rebuild card — the counts AND the per-file rows.
+///
+/// Two callers, both of which mean "the previous rebuild's Activity is no longer what this tab is
+/// about": the explicit dismiss on the Done line, and the start of an IMPORT. The import case
+/// matters more than it looks: drag-and-drop and Add files report through a per-call `Channel`, not
+/// through `ProgressSink`, so they never write `recent` at all. Without this the next mount would
+/// restore the last REBUILD's rows and present them as that import's Activity.
+///
+/// No-ops while a rebuild is running, for the same reason as `ack_rebuild_report`.
+#[tauri::command]
+pub fn clear_rebuild_activity(state: State<'_, AppState>) -> Result<()> {
+    if let Ok(mut snap) = state.ingest_job.lock() {
+        if !snap.running {
+            snap.last_report = None;
+            snap.recent.clear();
+            snap.recent_truncated = false;
+        }
+    }
+    Ok(())
+}
+
 /// Resume a rebuild a previous app session started but didn't finish (the app was closed/crashed
 /// mid-rebuild). Called once on launch. Returns whether a resume was kicked off.
 ///

@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.13-alpha",
+    date: "2026-08-01",
+    highlights: [
+      'The rebuild Activity list keeps every file in the pass, and scrolls. It used to hold only the last 50 — so a 161-file rebuild had thrown away two thirds of itself while you were still watching it, under a line saying "showing the most recent files". It now keeps the whole run for any normal library, in a box about fifteen rows tall that scrolls, instead of running down the page and pushing the document table out of sight.',
+      "The list also survives the rebuild finishing. Until now the moment a rebuild ended, coming back to the tab showed you nothing at all — the files it had just built were dropped. They stay, so you can scroll back through what was done.",
+      "Folding Activity away now sticks. Leaving the Documents tab unmounts it, so the fold sprang back open every time you returned; it remembers per machine now.",
+      "\"Done — 161 ingested\" stops following you around. That line was replayed from the last rebuild every time you opened the tab, and only starting another rebuild — or restarting PM — ever cleared it. It now bows out once you've seen it, and there's an × to clear the whole card, list and all.",
+      "Dropping files in no longer shows the previous rebuild's file list as if it belonged to the new import.",
+    ],
+  },
+  {
     version: "3.114.12-alpha",
     date: "2026-08-01",
     highlights: [

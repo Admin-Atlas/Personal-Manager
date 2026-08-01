@@ -1038,6 +1038,16 @@ export const stopDriveSync = () => invoke<void>("stop_drive_sync");
  *  whoever started it, so the per-call channel below only reaches a listener that stayed mounted. */
 export const rebuildStatus = () => invoke<IngestJobState>("rebuild_status");
 
+/** Acknowledge the last finished rebuild's counts so the "Done — N ingested" line stops replaying
+ *  on every mount. Leaves the per-file rows alone — the banner was the unwanted part, the list is
+ *  the part that was asked for. No-ops while a rebuild is running. */
+export const ackRebuildReport = () => invoke<void>("ack_rebuild_report");
+
+/** Drop the whole finished-rebuild card, counts and rows. For the explicit dismiss, and for the
+ *  start of an import — imports report through their own Channel and never write these rows, so a
+ *  stale rebuild's Activity would otherwise be restored as if it were the import's. */
+export const clearRebuildActivity = () => invoke<void>("clear_rebuild_activity");
+
 /** Chat-identity integrity: how many chats there are, how many are correctly typed, plus the last
  *  automatic repair pass and a fresh one taken now. The check IS the repair — it runs the same
  *  idempotent pass — so looking can never leave damage behind. */
