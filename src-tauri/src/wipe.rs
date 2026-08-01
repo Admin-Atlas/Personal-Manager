@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
-use crate::{google, paths, secrets, vault, AppState};
+use crate::{google, paths, secrets, vault, AppState, BusyGuard};
 
 /// The data-dir-relative folder every restore extracts into (`restored-vaults/restore-<ts>/`). Three
 /// concerns must agree on this name or a restored, decryptable vault copy leaks: the restore writers
@@ -852,9 +852,17 @@ fn is_pm_temp_staging(name: &str, app_name: &str) -> bool {
 
 /// Remove PM's abandoned staging files from the OS temp directory, returning how many went.
 ///
-/// Runs at boot (no sync, backup or restore can be in flight yet, so nothing live is at risk) and
-/// again during the wipe. Scoped to `std::env::temp_dir()` and to [`is_pm_temp_staging`]; anything
-/// that is not a positive prefix match is not touched.
+/// Runs at boot and again during the wipe. Scoped to `std::env::temp_dir()` and to
+/// [`is_pm_temp_staging`]; anything that is not a positive prefix match is not touched.
+///
+/// What is (and is not) quiesced when it runs, stated honestly rather than assumed: at boot nothing
+/// is in flight, so nothing live is at risk. During the wipe, [`wipe_pm_data`] holds the
+/// backup/restore single-flight, so no backup or restore can be staging into temp — but a connector
+/// sync CAN still be running, and `cloud_sync::stage_temp` deliberately disarms its own auto-delete
+/// so the converter can read the file. So this sweep may delete a staging file a live sync is
+/// mid-conversion on, and a sync that stages a file AFTER the sweep leaves a plaintext copy behind
+/// the erase. Closing that needs an RAII claim spanning the three connector slots, which does not
+/// exist yet (`AppState::sync_active` is check-then-act); it is tracked, not fixed here.
 pub fn sweep_temp_staging(app_name: &str) -> usize {
     let tmp = std::env::temp_dir();
     let Ok(rd) = std::fs::read_dir(&tmp) else {
@@ -879,6 +887,22 @@ pub fn sweep_temp_staging(app_name: &str) -> usize {
     removed
 }
 
+/// Why an erase is refused while a backup or restore is in flight. Deliberately a REFUSAL, never a
+/// cancel: stopping an upload part-way can leave a partial object on the remote that outlives the
+/// erase — the very leak this gate exists to close — and a cancelled restore can leave a decryptable
+/// vault copy in the staging tree. The sentence must keep naming what is running, where to stop it,
+/// and that nothing was removed; the copy is pinned by a test so it can't drift into a false claim.
+///
+/// "Nothing was deleted" is scoped to what the BACKEND owns. `RemovePmData.tsx` clears
+/// `localStorage` and destroys the briefing window before it invokes this command whenever the
+/// selection includes preferences, so the honest claim is about the vault, the store and the
+/// keychain — the same shape as the undeletable-DB-file refusal below.
+const BACKUP_IN_FLIGHT_REFUSAL: &str =
+    "A backup or restore is running. PM won't erase your data while one is in flight — a copy \
+     could finish uploading (or land in the restore staging folder) after the erase and outlive \
+     it. Wait for it to finish, or press Stop in Settings → Backup, then run Remove again. \
+     Nothing was deleted: your vault, database and keychain are untouched.";
+
 /// Execute the confirmed removal. The UI has already gated this behind the full confirmation ladder
 /// (explicit checkboxes → "are you sure" itemisation → optional Windows Hello → type-to-confirm), so
 /// this simply carries it out in a safe order and reports what happened.
@@ -888,6 +912,10 @@ pub fn sweep_temp_staging(app_name: &str) -> usize {
 /// interrupted (a force-quit during a slow revoke) or lost a race with an antivirus / Windows-Search
 /// lock — the next boot regenerates a fresh key, can't decrypt the old store, and dead-ends on the
 /// "could not open database" screen with no way back to setup. So:
+///   0. claim the backup/restore single-flight for the whole run, or refuse with
+///      [`BACKUP_IN_FLIGHT_REFUSAL`] — an upload finishing after the erase would strand a fully
+///      decryptable copy of the "removed" vault on a remote, and a restore finishing after it would
+///      strand one in `restored-vaults/`;
 ///   1. gather the keychain plan from the open store — but revoke/delete nothing yet;
 ///   2. close + delete the DB file **reliably**, and if it can't be removed, ABORT with the store
 ///      fully intact (its key still opens it) rather than pressing on to brick it;
@@ -901,6 +929,16 @@ pub async fn wipe_pm_data(
     state: State<'_, AppState>,
     selection: WipeSelection,
 ) -> Result<WipeReport> {
+    // --- 0. Claim the backup/restore single-flight FIRST — before the keychain plan, before the
+    //        first `take_conn`, and long before anything is deleted, so a refusal leaves the app
+    //        completely untouched. TAKING the guard rather than reading `backup_busy` is what makes
+    //        this airtight in both directions: a run already in flight loses the `compare_exchange`
+    //        and we refuse, and while we hold it every backup/restore door's own
+    //        `begin_backup_run` fails, so none can slip in between this check and the deletes.
+    //        A named binding, never `let _`, which would drop here and re-open the race. ---
+    let _backup_slot = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other(BACKUP_IN_FLIGHT_REFUSAL.into()))?;
+
     let mut report = WipeReport::default();
 
     // --- 1. Plan the keychain teardown from the open store (revoke + delete come later, in step 3). ---
@@ -1503,6 +1541,54 @@ mod tests {
             crate::db::WRONG_KEY_OR_CORRUPT_MSG,
         );
         assert_eq!(reset_refusal(&brick), None);
+    }
+
+    #[test]
+    fn the_in_flight_backup_refusal_names_the_run_and_promises_only_what_is_true() {
+        // The erase refuses rather than cancels, so this sentence is the entire user-facing
+        // outcome of that decision: it has to say what is running, how to stop it, and — the part
+        // that must never drift — what survived. A message that read "nothing changed" would be a
+        // FALSE claim: `RemovePmData.tsx` clears `localStorage` and destroys the briefing window
+        // before it ever invokes this command. So the promise is scoped to the three things the
+        // backend owns and did not touch.
+        let msg = BACKUP_IN_FLIGHT_REFUSAL;
+
+        // Names what is running — both kinds, because the guard covers both directions (an upload
+        // finishing after the erase, and a restore landing in the staging tree after it).
+        assert!(msg.contains("backup"), "must name the backup case");
+        assert!(msg.contains("restore"), "must name the restore case");
+
+        // Gives the way out, naming the control that actually exists. The button in
+        // `BackupSettings.tsx` is labelled "Stop", not "Cancel" — pinned here because a refusal
+        // that sends the user hunting for a button PM doesn't have is worse than no pointer.
+        assert!(
+            msg.contains("Settings → Backup"),
+            "must point at the panel holding the control"
+        );
+        assert!(
+            msg.contains("press Stop"),
+            "must name the button by its real label — BackupSettings.tsx renders \"Stop\""
+        );
+        assert!(
+            msg.contains("run Remove again"),
+            "must say the erase can simply be retried — this is a refusal, not a failure"
+        );
+
+        // The load-bearing promise, and its honest scope.
+        assert!(
+            msg.contains("Nothing was deleted"),
+            "must state plainly that the erase did not run"
+        );
+        for owned in ["vault", "database", "keychain"] {
+            assert!(
+                msg.contains(owned),
+                "the promise must name {owned} rather than claim a blanket no-op"
+            );
+        }
+        assert!(
+            !msg.contains("nothing changed") && !msg.contains("Nothing changed"),
+            "must NOT claim a blanket no-op — the frontend already cleared localStorage"
+        );
     }
 
     #[test]

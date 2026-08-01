@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.5-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Removing PM's data now refuses while a backup or restore is running, rather than going ahead. It could otherwise finish uploading a complete, readable copy of your vault to Proton or Drive after the erase said it was done — a copy that opens on any machine with the passphrase you still know. PM waits for the backup instead, and tells you so; nothing is deleted when it refuses.",
+      "The semantic map can no longer get stuck. If a layout pass failed in an unusual way it left a marker saying one was still running, so the map served its old positions with the spinner on forever, and installing or removing a component quietly stopped recomputing — until you restarted PM.",
+      "On macOS and Linux, PM now cleans up after a sidecar it had to restart. Each restart left a dead process entry behind; on a machine where the sandbox never works, that was two per attempt.",
+    ],
+  },
+  {
     version: "3.114.4-alpha",
     date: "2026-08-01",
     highlights: [

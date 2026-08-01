@@ -10051,6 +10051,10 @@ fn require_backup_passphrase(passphrase: String) -> Result<zeroize::Zeroizing<St
 /// happens at the end of the caller. Binding it to `_` would release `backup_busy` immediately and
 /// let two runs race into the same staging tree.
 ///
+/// The refusal names the erase as well as the two backup kinds, because `wipe::wipe_pm_data` holds
+/// this same guard for its whole run (so a copy can't finish uploading after "Remove PM data"
+/// reported success). Naming only "a backup or restore" would be a false claim in that case.
+///
 /// `phase` is a parameter because the opening phase is user-visible progress copy and the callers
 /// legitimately differ: a local restore opens on `Restore` (there is nothing to download), the two
 /// remote restores on `Download`, and the backup paths on `Snapshot`.
@@ -10060,7 +10064,7 @@ fn begin_backup_run<'a>(
     phase: BackupPhase,
 ) -> Result<BusyGuard<'a>> {
     let busy = BusyGuard::acquire(&state.backup_busy)
-        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+        .ok_or_else(|| Error::Other("a backup, restore or data erase is already running".into()))?;
     state.backup_cancel.store(false, Ordering::SeqCst);
     emit_backup_progress(
         app,

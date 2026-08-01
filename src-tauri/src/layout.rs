@@ -44,10 +44,13 @@ const MAP_PREF_KEY: &str = "map";
 
 // ---- shared state ---------------------------------------------------------
 
-/// A snapshot of the layout precompute job, so the Map can show progress and avoid stacking jobs.
+/// A snapshot of the layout precompute job: the reducer that last ran and the last error, so the Map
+/// can say what produced the cached coordinates and surface a failure.
+///
+/// Deliberately does NOT hold the single-flight flag. That lives on `AppState::layout_busy` and is
+/// claimed with [`crate::BusyGuard`] — see the claim in [`precompute_semantic_layout`].
 #[derive(Default, Clone, Serialize)]
 pub struct LayoutJobState {
-    pub running: bool,
     pub method: Option<String>,
     pub error: Option<String>,
 }
@@ -327,29 +330,31 @@ pub async fn precompute_semantic_layout(
     force_recompute: bool,
     ignore_sync: bool,
 ) -> Result<()> {
-    // Claim the single-flight slot.
-    {
-        let state = app.state::<AppState>();
-        let mut job = state
-            .layout_job
-            .lock()
-            .map_err(|_| Error::Other("layout job state poisoned".into()))?;
-        if job.running {
-            return Ok(());
-        }
-        job.running = true;
-        job.error = None;
-    }
+    // Claim the single-flight slot, or fold this request into the running pass. RAII, never a
+    // hand-cleared bool — F-43 is the repo's own rule about exactly this shape (docs/DECISIONS.md,
+    // "2026-07-05 — Audit-03 remediation, Wave 2 PR 2 (X-D1a): the sync single-flight becomes RAII"):
+    //
+    //   "hand-rolled single-flight with a `running` bool: set `true` at claim, back to `false` at the
+    //    tail of the rerun loop. A panic (or any early return) mid-pass skips that tail, so `running`
+    //    stays `true` for the rest of the session — after which every later sync sees 'already
+    //    running' and folds into a follow-up sweep that never comes."
+    //
+    // The layout's wedge is the same sentence with the Map in place of the connector: it would serve
+    // the stale cached coordinates forever, with the spinner stuck on, until an app restart.
+    // `BusyGuard` clears the flag on drop however the pass ends — an unwinding panic, or this future
+    // being dropped at the await below — and an `AtomicBool` cannot poison, so the poisoned-mutex `?`
+    // that used to turn one bad lock into a permanent `Err` for every later precompute is gone with
+    // it. `&AppState` (not the `State` temporary) so the guard's borrow lives across the await.
+    let state: &AppState = app.state::<AppState>().inner();
+    let Some(_busy) = crate::BusyGuard::acquire(&state.layout_busy) else {
+        return Ok(());
+    };
+    with_job(app, |job| job.error = None);
 
     let outcome = run_precompute(app, force_recompute, ignore_sync).await;
 
-    with_job(app, |job| {
-        job.running = false;
-        if let Err(e) = &outcome {
-            job.error = Some(e.to_string());
-        }
-    });
     if let Err(e) = &outcome {
+        with_job(app, |job| job.error = Some(e.to_string()));
         emit(
             app,
             LayoutProgressEvent::Error {
@@ -516,7 +521,7 @@ pub fn semantic_layout(state: State<'_, AppState>) -> Result<SemanticLayout> {
             })
         })?
         .collect::<rusqlite::Result<Vec<Coord>>>()?;
-    let computing = state.layout_job.lock().map(|j| j.running).unwrap_or(false);
+    let computing = state.layout_busy.load(std::sync::atomic::Ordering::SeqCst);
     Ok(SemanticLayout {
         method,
         coords,
@@ -622,8 +627,58 @@ pub async fn install_optional_tsne(app: AppHandle) -> Result<()> {
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// The F-43 property `precompute_semantic_layout` now leans on, pinned on the flag it claims.
+    ///
+    /// `precompute_semantic_layout` itself needs an `AppHandle`, so it cannot be called from a unit
+    /// test; what IS testable is the contract the claim depends on, in the shape the precompute uses
+    /// it — claim, bail out early through a `?`, and the slot must be open for the next pass. Before
+    /// this, the clear was a hand-written `job.running = false` after the awaited body, and anything
+    /// that skipped it (a panic, this future being dropped, a poisoned `layout_job`) left the Map
+    /// serving stale coordinates with the spinner on until an app restart.
+    #[test]
+    fn the_layout_slot_reopens_after_a_pass_that_returns_early() {
+        // Stands in for `precompute_semantic_layout`: claim, then leave by an error path that never
+        // reaches the tail of the function.
+        fn guarded_pass(flag: &AtomicBool, fail: bool) -> Result<&'static str> {
+            let Some(_busy) = crate::BusyGuard::acquire(flag) else {
+                return Ok("folded into the running pass");
+            };
+            if fail {
+                // Every `?` inside `run_precompute` (a locked store, a dead reducer, a failed
+                // transaction) lands here, as does the `Err` for a coord/id count mismatch.
+                return Err(Error::Other("the reducer failed".into()));
+            }
+            Ok("recomputed")
+        }
+
+        let layout_busy = AtomicBool::new(false);
+
+        assert!(guarded_pass(&layout_busy, true).is_err(), "the pass failed");
+        assert!(
+            !layout_busy.load(Ordering::SeqCst),
+            "an early return must still release the slot — a stuck flag wedges the Map for the session"
+        );
+        assert_eq!(
+            guarded_pass(&layout_busy, false).unwrap(),
+            "recomputed",
+            "and the NEXT open must recompute rather than serve the stale cache"
+        );
+        assert!(!layout_busy.load(Ordering::SeqCst), "released again");
+
+        // The other half of the contract: while a pass really is running, a second request folds
+        // into it instead of stacking a second reducer run.
+        let held = crate::BusyGuard::acquire(&layout_busy).expect("an idle slot admits the claim");
+        assert_eq!(
+            guarded_pass(&layout_busy, false).unwrap(),
+            "folded into the running pass"
+        );
+        drop(held);
+        assert!(!layout_busy.load(Ordering::SeqCst));
+    }
 
     /// Proves the whole vector-assembly path against a real sqlite-vec store: a document's leaf-chunk
     /// embeddings decode (whatever wire form the vector column returns), average per document, and
