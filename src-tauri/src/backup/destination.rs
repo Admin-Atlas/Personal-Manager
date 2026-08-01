@@ -19,7 +19,8 @@ use tauri::{AppHandle, Manager};
 
 use super::naming::BackupEntry;
 use super::RetentionOutcome;
-use crate::error::{Error, Result};
+use crate::blocking::spawn_blocking_result;
+use crate::error::Result;
 use crate::AppState;
 
 /// A single place PM pushes encrypted archives to.
@@ -58,7 +59,7 @@ impl BackupDestination {
         match self {
             Self::Proton { cli } => {
                 let (cli, local, app) = (cli.clone(), local.to_path_buf(), app.clone());
-                spawn_blocking_result(move || {
+                spawn_blocking_result("backup", move || {
                     let st = app.state::<AppState>();
                     super::proton::upload_archive(&cli, &local, Some(&st.backup_cancel))
                 })
@@ -76,7 +77,7 @@ impl BackupDestination {
         match self {
             Self::Proton { cli } => {
                 let cli = cli.clone();
-                spawn_blocking_result(move || super::proton::list_archives(&cli)).await
+                spawn_blocking_result("backup", move || super::proton::list_archives(&cli)).await
             }
             Self::GoogleDrive { token_key } => {
                 let folder = super::gdrive::ensure_backup_folder(token_key).await?;
@@ -92,8 +93,10 @@ impl BackupDestination {
         match self {
             Self::Proton { cli } => {
                 let (cli, prefix) = (cli.clone(), prefix.to_string());
-                spawn_blocking_result(move || super::proton::apply_retention(&cli, keep_n, &prefix))
-                    .await
+                spawn_blocking_result("backup", move || {
+                    super::proton::apply_retention(&cli, keep_n, &prefix)
+                })
+                .await
             }
             Self::GoogleDrive { token_key } => {
                 let folder = super::gdrive::ensure_backup_folder(token_key).await?;
@@ -122,7 +125,7 @@ impl BackupDestination {
                     dest_dir.to_path_buf(),
                     app.clone(),
                 );
-                spawn_blocking_result(move || {
+                spawn_blocking_result("backup", move || {
                     let st = app.state::<AppState>();
                     super::proton::download_archive(&cli, &name, &dest, Some(&st.backup_cancel))
                 })
@@ -133,18 +136,6 @@ impl BackupDestination {
             }
         }
     }
-}
-
-/// Run a blocking, fallible closure on the blocking pool and flatten the `JoinError`. Keeps the
-/// Proton arms above to one line each.
-async fn spawn_blocking_result<T, F>(f: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::Other(format!("backup task panicked: {e}")))?
 }
 
 #[cfg(test)]

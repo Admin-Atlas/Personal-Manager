@@ -6,6 +6,10 @@ mod backup;
 // "A model that fits your machine better is available" (#437): the pure, conservative decision about
 // whether any curated model is worth interrupting the user about, given what they already run.
 mod better_fit;
+// One home for "run this blocking, fallible closure off the async runtime", so ~40 call sites stop
+// hand-rolling the JoinError→Error conversion. It takes a label because the copies were the only
+// thing keeping their ~30 distinct panic messages distinct.
+mod blocking;
 mod briefing;
 mod calendar;
 mod chat;

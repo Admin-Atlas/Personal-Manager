@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.6-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Under-the-hood tidying, with nothing to see. PM's largest source file had grown to eleven thousand lines holding every one of its two hundred-odd internal operations, which made it hard to find anything and easy for the same mistake to be made twice in two corners of it. It is now seventeen files organised by what they do. Nothing moved but the code itself.",
+    ],
+  },
+  {
     version: "3.114.5-alpha",
     date: "2026-08-01",
     highlights: [

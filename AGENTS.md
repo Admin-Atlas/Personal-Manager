@@ -96,8 +96,9 @@ release remain the open post-v1 work.
   the living detail. Pure decision functions stay DB/network-free and unit-tested.
   - **Core** — `lib.rs` (Tauri builder, app state `Mutex<Connection>` + `SidecarManager` +
     single-flight `BusyGuard` flags, background schedulers, plugins, command registry),
-    `commands.rs` + `commands_dev.rs` (the `#[tauri::command]` surface), `error.rs`,
-    `paths.rs`, `clock.rs`.
+    `commands/` + `commands_dev.rs` (the `#[tauri::command]` surface; `commands/mod.rs` is
+    an index of sixteen per-surface submodules it glob re-exports, so every command is still
+    named `commands::<name>`), `error.rs`, `paths.rs`, `clock.rs`.
   - **Store** — `db/` (`open()` = SQLCipher key + sqlite-vec + FTS5 + migrations;
     `migrations.rs` additive + `user_version`-based, the version pinned to the migration
     count by a test in that file); `vault/` (the Markdown vault
