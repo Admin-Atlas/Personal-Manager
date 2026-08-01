@@ -218,12 +218,20 @@ export function CalendarEventPopover({
 
   const attendees = event.attendees ?? [];
 
+  // A `role="dialog"` with a blank accessible name is announced as an unnamed dialog, and the
+  // heading below would render empty beside it. Every producer of `summary` does already substitute
+  // something — Google's parse writes this exact string, the milestone overlay always appends
+  // " · <project>", and the pinboard overlay falls back to "deadline" — but that is three unconnected
+  // guarantees, one of them in Rust, with nothing pinning them. A fourth source (an ICS import, a new
+  // overlay) inherits the naming rule for free by landing here instead.
+  const title = event.summary.trim() || "(no title)";
+
   return (
     <div
       ref={panelRef}
       role="dialog"
       // No `aria-modal`: the calendar behind this stays live and Tab must be able to leave.
-      aria-label={event.summary}
+      aria-label={title}
       tabIndex={-1}
       className="fixed z-50 flex max-h-[75vh] w-[340px] flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl focus:outline-none"
       style={{
@@ -235,7 +243,7 @@ export function CalendarEventPopover({
       {/* Header */}
       <div className="flex items-start justify-between gap-2 border-b border-border px-3 py-2.5">
         <div className="min-w-0">
-          <h2 className="break-words font-head text-sm font-semibold text-ink">{event.summary}</h2>
+          <h2 className="break-words font-head text-sm font-semibold text-ink">{title}</h2>
           <div className="mt-0.5 flex items-center gap-1.5 text-xs text-ink4">
             <span
               className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"

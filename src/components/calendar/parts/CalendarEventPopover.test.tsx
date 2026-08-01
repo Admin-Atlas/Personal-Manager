@@ -241,4 +241,40 @@ describe("CalendarEventPopover", () => {
     fireEvent.mouseDown(elsewhere);
     expect(document.activeElement).toBe(elsewhere);
   });
+
+  it("still names itself when the event has no title", () => {
+    // Nothing pins the "summary is never blank" rule at the type — it is three separate producer-side
+    // guarantees (Google's parse, the milestone suffix, the pinboard fallback), one of them in Rust.
+    // A dialog announced with no name is a WCAG failure, so the naming lives at the consumer.
+    const { getByRole } = render(
+      <CalendarEventPopover
+        event={calendarEvent({ summary: "   " })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+
+    const panel = getByRole("dialog");
+    expect(panel.getAttribute("aria-label")).toBe("(no title)");
+    // The visible heading says the same thing, rather than rendering as an empty line.
+    expect(panel.querySelector("h2")?.textContent).toBe("(no title)");
+  });
+
+  it("names itself from the summary when there is one", () => {
+    const { getByRole } = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+
+    expect(getByRole("dialog").getAttribute("aria-label")).toBe("Design review");
+  });
 });
