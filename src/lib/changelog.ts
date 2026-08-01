@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.7-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "More under-the-hood tidying, again with nothing to see. The Backup settings screen was one very large piece of code holding every destination, the schedule, restoring and the passphrase all at once. It is now split by what each part does, which is what makes the next fix to any of them a small change rather than a careful one.",
+    ],
+  },
+  {
     version: "3.114.6-alpha",
     date: "2026-08-01",
     highlights: [
