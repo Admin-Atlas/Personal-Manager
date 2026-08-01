@@ -18,7 +18,10 @@ model weights itself — PM does not); and, only if you configure them, a read-o
 calendar fetch, a read-only sync of the cloud accounts you connect (Google Drive, Google
 Sheets, OneDrive), and encrypted backups to your own cloud. There is no telemetry, analytics,
 or crash reporting. At rest, the **SQLCipher store** (settings, search index) is encrypted with
-a key held in the OS keychain. **How PM's secrets (the database key, your API key, any OAuth
+a key held in the OS keychain. The webview's **`localStorage` holds interface state only** — theme
+and accent, panel sizes, view modes, which sections you have folded away — while anything that names
+your content (project names, calendar ids, the cloud accounts you back up to) lives in the encrypted
+store, not beside it. **How PM's secrets (the database key, your API key, any OAuth
 tokens) are stored differs by platform.** On **macOS** they share a *single keychain item*, so one
 "Always Allow" covers all of them instead of a separate prompt per secret — a deliberate
 convenience trade-off, and one worth stating plainly: that single grant is *coarser* than a
@@ -29,7 +32,10 @@ neither platform prompts per item, so nothing is lost by keeping them separate. 
 stored, the secrets themselves never leave the Rust backend. Your **documents live in a plaintext Markdown vault**,
 so their at-rest protection relies on your own OS full-disk encryption (BitLocker /
 FileVault) — a deliberate choice to keep your notes openable by any tool, not a gap
-to report. PM treats **all ingested content as untrusted data,
+to report. If you share a vault with another account on the same PC, **changing its passphrase never
+transfers ownership without an explicit confirmation** — a re-key carries the recorded owner
+forward, and a takeover is a separate, confirmed act that PM records in the vault's
+tamper-evident metadata. PM treats **all ingested content as untrusted data,
 never as instructions** — documents, calendar feeds, and model output can't make
 PM act on your behalf. The areas where a bug would matter most are: the
 **encrypted local store** (SQLCipher), **secret handling** (the OS keychain

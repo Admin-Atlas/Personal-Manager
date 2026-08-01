@@ -48,9 +48,19 @@ fn build_local_client(connect_timeout: std::time::Duration) -> reqwest::Client {
 }
 
 /// Pick the client (and thus the connect timeout) by whether the endpoint host is a loopback
-/// literal / `localhost`. A cheap SYNTACTIC check only — the security posture decision (resolving
-/// the address and refusing public cleartext) is a separate, stricter check the caller makes before
-/// any call is attempted.
+/// literal / `localhost`. A cheap SYNTACTIC check only, and **not** a security control: a name can
+/// resolve anywhere, so this decides a timeout and nothing else.
+///
+/// The security posture decision (resolve the address, refuse public cleartext) is a separate,
+/// stricter check made by the CALLER, not here — `local_ai::endpoint_refused_now`, applied by the
+/// `local_ai::configured_endpoint` prologue that every endpoint command shares and by the two
+/// `llm_gateway` local arms plus its window-probe task. It cannot live in this function: it is
+/// async, and a refusal here would have to become a `LocalFailKind`, which the circuit breaker
+/// would score as a strike — wrong, because a rebound host is not a dead host.
+///
+/// (This comment previously asserted a pre-call check that six of the seven paths through this
+/// module did not in fact perform. Keep it true: a false invariant comment is how that gap stayed
+/// invisible.)
 fn client_for(base_url: &str) -> &'static reqwest::Client {
     if host_is_loopback_literal(base_url) {
         &LOCAL_HTTP_LOOPBACK
@@ -159,6 +169,21 @@ pub fn classify_http(status: u16, body: &str) -> LocalFailKind {
 fn body_looks_like_loading(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
     b.contains("loading") || b.contains("is being loaded") || b.contains("warming up")
+}
+
+/// Render a transport error for `LocalFailure.detail` with any attached request URL redacted
+/// to scheme + host. This module is the one place in the backend that formats a `reqwest::Error`
+/// **outside** `?`, so it must redact the same way: `normalize_base_url` strips only a trailing
+/// `/v1`, so an endpoint pasted as `https://user:APIKEY@host` keeps its userinfo, and reqwest's
+/// Display appends the whole URL. Routed through the central `From<reqwest::Error>` so this
+/// bypass can never drift from it, then Displaying the inner error alone to keep the historical
+/// detail wording (no `network error:` prefix in a local-failure detail).
+fn redacted_transport_detail(e: reqwest::Error) -> String {
+    match crate::error::Error::from(e) {
+        crate::error::Error::Http(redacted) => redacted.to_string(),
+        // Unreachable — the conversion always yields `Http`. Defensive, not a fallback.
+        other => other.to_string(),
+    }
 }
 
 /// Map a reqwest send/stream error to a typed failure. Connect refusal → dead host; a timeout →
@@ -518,7 +543,7 @@ pub async fn probe(base_url: &str, token: Option<&str>) -> LocalResult<Vec<Strin
     let response = req
         .send()
         .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
+        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -577,7 +602,7 @@ where
     let response = req
         .send()
         .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
+        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -679,7 +704,7 @@ where
     let response = req
         .send()
         .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
+        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -817,7 +842,7 @@ pub async fn complete(
     let response = req
         .send()
         .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
+        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -1158,6 +1183,32 @@ mod tests {
             "a scheme is required"
         );
         assert!(normalize_base_url("ftp://x").is_err());
+    }
+
+    /// The one leak class the central `From<reqwest::Error>` does not cover on its own: these
+    /// entrypoints format the raw error into `LocalFailure.detail` instead of going through `?`.
+    /// `normalize_base_url` strips only a trailing `/v1`, so userinfo survives into the endpoint
+    /// string and would otherwise be Displayed straight into the UI. Loopback port 1 refuses
+    /// instantly, so this needs no DNS and no server.
+    #[test]
+    fn a_userinfo_base_url_never_reaches_a_local_failure_detail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(probe("https://user:APIKEY@127.0.0.1:1", None))
+            .expect_err("nothing listens on loopback port 1");
+        assert!(
+            !err.detail.contains("APIKEY"),
+            "userinfo leaked into the detail: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("127.0.0.1"),
+            "the host is the diagnosable part and should survive: {}",
+            err.detail
+        );
     }
 
     #[test]

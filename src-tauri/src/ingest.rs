@@ -42,7 +42,12 @@ const SUPPORTED: &[&str] = &[
 /// MarkItDown document path — they get OCR + EXIF, a `photos` row, and the synthetic photo body.
 /// Deliberately the spec's set; gif/bmp/tiff stay on the (no-op) document path. `heic` is here but
 /// NOT in `SUPPORTED`, so a HEIC only ingests via this branch.
-const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
+///
+/// `pub(crate)` so the READ side shares this one list: `commands::photo_original` bounds
+/// `read_document_image`'s original-file fallback to the same extensions that could have created
+/// the `photos` row in the first place. One list, not two — an extension added here must widen both
+/// sides together or the reader would refuse a type ingest happily accepts.
+pub(crate) const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
 
 /// Spreadsheet extensions routed to the dedicated spreadsheet processor ([`ingest_spreadsheet`])
 /// instead of MarkItDown — the sidecar parses them values-only into a metadata chunk + self-describing

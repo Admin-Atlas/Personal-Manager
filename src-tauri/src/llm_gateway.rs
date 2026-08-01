@@ -147,6 +147,12 @@ pub enum FallbackReason {
     /// The local host is inside its dead-host cooldown after repeated failures, so the request was
     /// routed to cloud WITHOUT attempting local this turn. Failure-derived, but not a fresh failure.
     Cooldown,
+    /// The configured endpoint's address now resolves to a public host over cleartext, so the
+    /// call-time posture gate refused it and the request went to cloud instead. NOT a failure and
+    /// NOT failure-derived: the local host may be perfectly healthy — what changed is where its
+    /// name points. Kept distinct from [`FallbackReason::HardFailure`] precisely so it can never be
+    /// read as evidence the host is dead.
+    EndpointRefused,
     /// BANKED for the power-aware provider policy (#432): a DELIBERATE user policy (local on AC /
     /// cloud on battery), categorically NOT a failure. No producer exists in PR3 (the feature is a
     /// deferred board card) — the variant is banked NOW so a later implementer physically cannot fold
@@ -162,6 +168,7 @@ impl FallbackReason {
         match self {
             FallbackReason::HardFailure(kind) => format!("hard_failure:{}", fail_kind_slug(kind)),
             FallbackReason::Cooldown => "cooldown".to_string(),
+            FallbackReason::EndpointRefused => "endpoint_refused".to_string(),
             FallbackReason::PowerPolicy => "power_policy".to_string(),
         }
     }
@@ -488,6 +495,25 @@ async fn run_local_complete(
         };
     }
 
+    // Call-time posture gate: the stored base URL is as often a hostname as an IP, and its address
+    // is only ever classified when it is SAVED. Asked ONCE here, deliberately OUTSIDE the retry
+    // loop below — a warming host can iterate a dozen-plus times and must not re-resolve each pass.
+    // A refusal is never recorded against the circuit breaker (see `endpoint_refused_now`).
+    if crate::local_ai::endpoint_refused_now(&local.base_url).await {
+        return match cloud {
+            Some(cloud) => {
+                cloud_complete(
+                    cloud,
+                    messages,
+                    FallbackReason::EndpointRefused,
+                    local.model.clone(),
+                )
+                .await
+            }
+            None => Err(Error::Other(crate::local_ai::CALL_TIME_REFUSAL.into())),
+        };
+    }
+
     let loop_start = Instant::now();
     let mut loading_recheck: u32 = 0;
     loop {
@@ -637,6 +663,25 @@ where
         };
     }
 
+    // The same call-time posture gate as `run_local_complete`, before a single chat token can leave
+    // the machine. Nothing has been streamed yet, so falling back to cloud here is always clean.
+    if crate::local_ai::endpoint_refused_now(&local.base_url).await {
+        return match cloud {
+            Some(cloud) => {
+                cloud_stream(
+                    cloud,
+                    messages,
+                    cache_through,
+                    on_token,
+                    FallbackReason::EndpointRefused,
+                    local.model.clone(),
+                )
+                .await
+            }
+            None => Err(Error::Other(crate::local_ai::CALL_TIME_REFUSAL.into())),
+        };
+    }
+
     let start = Instant::now();
     let mut first = false;
     let token = local.token.as_ref().map(Secret::expose);
@@ -742,6 +787,12 @@ fn ensure_local_window_cached(app: &AppHandle, local: &LocalArm) {
     let model = local.model.clone();
     let token = local.token.as_ref().map(|s| s.expose().to_string());
     tauri::async_runtime::spawn(async move {
+        // This task fires its own token-bearing request OUTSIDE both gateway gates, so it carries
+        // the call-time posture check itself. Silent on refusal: the context meter simply keeps its
+        // catalog/default rung, which is exactly what an unreachable `/slots` already does.
+        if crate::local_ai::endpoint_refused_now(&base_url).await {
+            return;
+        }
         let info = openai_compat::probe_window(&base_url, &model, token.as_deref(), catalog).await;
         app.state::<AppState>()
             .local_ai
@@ -817,6 +868,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A call-time endpoint refusal must not feed the dead-host circuit breaker. The host may be
+    /// perfectly healthy — what changed is where its NAME points — so striking it would hand a
+    /// rebound endpoint an escalating cooldown on top of the refusal, and would keep punishing it
+    /// after DNS settled back. Both local arms therefore return from the refusal branch before any
+    /// `rt.record`, and `local_ai::endpoint_refused_now` takes only a `&str` so it physically cannot
+    /// reach the breaker.
+    ///
+    /// The second half is what makes the first non-vacuous: the same runtime, given the nearest
+    /// wire failure (`Refused` — an endpoint that did not answer), DOES move. So "health unchanged"
+    /// is a fact about the refusal path, not about an inert runtime.
+    #[test]
+    fn an_endpoint_refusal_records_no_circuit_breaker_strike() {
+        let rt = crate::local_slot::LocalRuntime::default();
+        let quiet = format!("{:?}", rt.health());
+        assert!(rt.available(), "a fresh runtime is available");
+
+        rt.record(CallOutcome::for_failure(&LocalFailKind::Refused));
+        assert_ne!(
+            format!("{:?}", rt.health()),
+            quiet,
+            "a wire failure IS a strike — so an unchanged health after a refusal is meaningful"
+        );
+    }
+
+    /// The refusal reason is its own slug, never folded into the `hard_failure:` family, so nothing
+    /// downstream (the usage log, the honesty strip) can read a policy refusal as a dead host.
+    #[test]
+    fn an_endpoint_refusal_logs_outside_the_hard_failure_family() {
+        let slug = FallbackReason::EndpointRefused.as_log_str();
+        assert_eq!(slug, "endpoint_refused");
+        assert!(!slug.starts_with("hard_failure:"));
+        assert_ne!(slug, FallbackReason::Cooldown.as_log_str());
     }
 
     /// The role dimension is independent of the pref dimension: `for_role` reads the right field.

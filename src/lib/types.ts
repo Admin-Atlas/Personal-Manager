@@ -191,6 +191,16 @@ export interface DeletedVaultNotice {
   deleted_at: string | null;
 }
 
+/** A recorded, confirmed change of a shared vault's owner: who held it, who took it, and when.
+ *  Both SIDs can be null — no owner had been recorded, or the claimant's SID couldn't be read as
+ *  it was stamped. Windows-only, like vault ownership itself. */
+export interface OwnershipTransfer {
+  from_sid: string | null;
+  to_sid: string | null;
+  /** RFC3339; formatted DD-MM-YYYY for display. */
+  at: string;
+}
+
 /** The vault's current state for the UI: its key mode, whether it needs unlocking on
  *  this profile (a passphrase vault whose key isn't cached here yet), whether the
  *  Markdown is encrypted at rest, where it lives on disk, and its stable id. */
@@ -231,6 +241,10 @@ export interface VaultStatus {
    *  this account created. `joined`: a shared vault someone else created. `unknown`: no owner
    *  recorded, or an OS that can't tell us (every shared vault off Windows). */
   ownership: "device" | "owned" | "joined" | "unknown";
+  /** The last confirmed ownership takeover this vault records, or null if it has never had one.
+   *  Written under the vault metadata's MAC by a confirmed change-passphrase, so it is
+   *  tamper-evident; surfaced here so the Vault card can say it happened. */
+  ownership_transfer: OwnershipTransfer | null;
   /** "This vault's settings file was altered outside PM", when the last open said so — the same
    *  sentence `vault://meta-warning` carries. Repeated here because the boot open happens before
    *  the app subscribes to events, and because the condition now persists: a failed integrity

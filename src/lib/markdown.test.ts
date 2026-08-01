@@ -25,6 +25,27 @@ describe("safeUrl", () => {
     expect(safeUrl("../up")).toBe("../up");
   });
 
+  // The gap the "keeps relative and in-page targets" case above could not see: every one of its
+  // inputs uses ONE slash, and two slashes mean something entirely different. A protocol-relative
+  // target has no scheme, so the sanitizer's protocol allowlist passes it (it bails out "allowed"
+  // when there is no colon) and the `/`-prefix branch here used to hand it straight back — while the
+  // browser resolves it against the PAGE's protocol, i.e. `//evil.example/x` from
+  // `http://tauri.localhost` is `http://evil.example/x`. `safeUrl` is the LAST thing to touch a URL,
+  // so it is the only layer that can neutralise it.
+  it("treats a protocol-relative target as absolute, not relative", () => {
+    expect(safeUrl("//evil.example/x")).toBe("");
+    expect(safeUrl("//evil.example")).toBe("");
+    // Chromium's URL parser treats `/\` like `//`, so it is guarded too. NOT a case that can arrive
+    // from Markdown — remark percent-encodes destinations, so `/\evil` gets here as `/%5Cevil` and
+    // stays same-origin — it is cheap defence for a caller that isn't remark.
+    expect(safeUrl("/\\evil.example/x")).toBe("");
+    expect(safeUrl("\\\\evil.example/x")).toBe("");
+    // The counter-assertion: a genuine single-slash relative target must still survive, or the fix
+    // has over-corrected into breaking every in-app link.
+    expect(safeUrl("/path")).toBe("/path");
+    expect(safeUrl("/")).toBe("/");
+  });
+
   it("neutralises a hostile or non-allowlisted scheme to empty", () => {
     expect(safeUrl("javascript:alert(1)")).toBe("");
     expect(safeUrl("data:text/html,<script>alert(1)</script>")).toBe("");

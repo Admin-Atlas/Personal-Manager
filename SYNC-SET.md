@@ -44,7 +44,7 @@ Two rules that fall out of the classes:
 | `conversations` | truth | Chat titles and project scope. The turn text is authoritatively in the vault; this row is not recomputable from it alone. |
 | `messages` | truth | Bodies mirror the vault, but `citations`, `retrieved_chunk_ids` and `model` exist only here. |
 | `chat_sessions` | derived | Session↔document mapping, rolling summary, cursors, last prompt size. Re-derivable — but regenerating the summary is a **billable** model call. |
-| `settings` | mixed | Key-namespaced grab-bag. Truth: user preferences (retrieval k, reranking, backup frequency/retention). Device: local model scan dir, external CLI paths, sync cursors, last-run timestamps. Derived: the briefing cache, layout caches, the retrieval config stamp, the filing seed vocabulary (`filing_seed_vocabulary` — machine-guessed from the unreviewed backlog, regenerable, and travels verbatim in a `.pmbackup`). **There is no key-prefix convention today** — see Open decisions. |
+| `settings` | mixed | Key-namespaced grab-bag. Truth: user preferences (retrieval k, reranking, backup frequency/retention) **and the three webview blobs that hold user content** — `milestone_ui` (the per-project milestone sort, keyed by PROJECT NAME, plus the show-completed toggle), `calendar_ui` (the hidden-calendar set, whose ids are routinely the account's email address) and `backup_ui` (dismissed reconcile banners, keyed by destination + cloud account). Those three moved out of the webview's plaintext `localStorage` and are allowlisted to the webview in `settings.rs::WEBVIEW_PREFS`; they each get their own key because `project_ui` is rewritten whole on every divider drag. Device: local model scan dir, external CLI paths, sync cursors, last-run timestamps. Derived: the briefing cache, layout caches, the retrieval config stamp, the filing seed vocabulary (`filing_seed_vocabulary` — machine-guessed from the unreviewed backlog, regenerable, and travels verbatim in a `.pmbackup`). **There is no key-prefix convention today** — see Open decisions. |
 | `projects` | truth | Triage the user set: deadline, size, blocked-by, parent, importance, active date. |
 | `project_milestones` | truth | Multi-deadline project structure, incl. status and external-source anchoring. |
 | `project_activity` | truth | An emit-only historical record of what happened when. Nothing can recompute a past event. |
@@ -80,7 +80,7 @@ tables have not:
 | `entities.pmrules` (vault root, encrypted) | truth | The portable mirror for entities + aliases. Re-encrypted on rekey. |
 | `.pmindex` manifest (vault root, encrypted) | truth | The portable mirror for index-only pointers; `index_only::rebuild_from_manifest` restores the DB rows from it. Index-only sources are **already** portable — this corrects the older assumption that they had no export. |
 | OS keychain | device | API key, DB key, OAuth tokens, feed URLs. Never travels, by design. |
-| Frontend `localStorage` | device | Theme, mode, accent, depth, capability flags. Today device-local by default rather than by decision — see Open decisions. |
+| Frontend `localStorage` | device | **UI state only, and now by decision rather than by default.** What remains: view modes (calendar view/range/day-count/time-zones/open-on, Focus layout and upcoming mode, map grouping/cohesion/labels, briefing float mode); panel sizes (`pm.sidebar.frac`, both project fractions, the Focus split, the reader width, the briefing panel rect); the appearance axes (theme mode + accent + depth, the accessibility axes, the time zone the sunrise/sunset mode resolves against); capability flags (`pm:dev:mode`); fold state (chat sections, calendar roster, briefing sidebar); the panel/sort choices — both closed enumerations, panel ids and `{key,dir}`, never names; and the update/version markers. Plus `pm.calendar.cursor`, the day the user was last looking at, which **deliberately stayed** — it is view position, not content. The three keys that held user content (project names, calendar ids, cloud-account emails) moved to `settings` under `milestone_ui` / `calendar_ui` / `backup_ui`. |
 | Sidecar venv + downloaded models | device | Runtime artifacts, provisioned per machine. Never portable. |
 
 ## Checklist for a PR that adds a table
@@ -106,8 +106,15 @@ feature. None is implied by the classifications above.
    `.pmrules` shape fits it directly.
 3. **Billable re-derivation.** Chat summaries, review proposals and photo OCR are all derived but
    cost money to rebuild. Carry them, or accept the re-bill on a new device?
-4. **Frontend `localStorage`.** Theme, accent and depth are device-local because that is where
-   frontend state has always lived, not because anyone decided a user wants a different theme per
-   machine.
+4. **Frontend `localStorage`** — **RESOLVED (3.114.0-alpha).** The slice that was never a decision
+   is now one. Three keys held user content — a milestone sort map keyed by project name, a
+   hidden-calendar set of ids that are routinely email addresses, and one dynamically-named
+   dismissal key per cloud account — and they moved into the encrypted `settings` table
+   (`milestone_ui`, `calendar_ui`, `backup_ui`), so they are encrypted at rest, travel in a
+   `.pmbackup`, and go away with PM's data. Everything left is genuine chrome and stays device-local
+   **on purpose**: theme, accent and depth per machine is the right default for a display
+   preference, and so are panel sizes and view modes. The remaining question is narrower than the
+   original one — whether the appearance axes should *optionally* follow the user across machines —
+   and it is a product call, not a correctness gap.
 5. **`usage_log` aggregation.** Device-local is right for the rows; whether a combined spend total
    across devices is wanted is a separate question.

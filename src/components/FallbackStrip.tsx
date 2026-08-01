@@ -13,6 +13,10 @@ import { IconButton } from "./ui";
 export function fallbackCopy(reason: string): string {
   if (reason === "cooldown") return "your local model was resting after repeated errors";
   if (reason === "power_policy") return "PM switched to the cloud to save power";
+  // Not a failure: the endpoint's address now resolves to a public host over http, so PM refused to
+  // send the chat in the clear. Distinct copy so it doesn't read as "your server is broken".
+  if (reason === "endpoint_refused")
+    return "your local endpoint's address now points somewhere PM won't send chats in the clear";
   if (reason.startsWith("hard_failure:")) {
     switch (reason.slice("hard_failure:".length)) {
       case "timeout":

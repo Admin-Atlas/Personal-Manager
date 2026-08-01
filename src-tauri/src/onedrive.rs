@@ -598,6 +598,40 @@ pub async fn me_account(token: &microsoft::Token) -> Result<(String, String)> {
     microsoft::me(token).await
 }
 
+/// What to do after one delta page. Pure, so the off-host refusal below is testable without a
+/// server.
+#[derive(Debug)]
+enum DeltaStep {
+    /// Follow this `@odata.nextLink` to the next page.
+    Follow(String),
+    /// The walk is complete; persist this `@odata.deltaLink` as the cursor.
+    Done(String),
+}
+
+/// Decide the next step for a delta page, REFUSING a continuation link that is not a Graph URL.
+///
+/// A continuation link is provider DATA, not configuration: it arrives inside a response body, and
+/// PM otherwise both follows it and PERSISTS it into `connector_sources.cursor`, where it becomes
+/// the first request URL of every subsequent sync. `microsoft::authorized_send` already declines to
+/// attach the account bearer off-host, but only this refusal stops a value poisoned ONCE from
+/// persisting forever. Erroring leaves the cursor unadvanced and flags the account `error` via
+/// `finalize_or_flag` — the same end state the existing "no continuation token" arm already
+/// produces, so this introduces no new state.
+fn delta_step(next: Option<String>, delta: Option<String>) -> Result<DeltaStep> {
+    match (next, delta) {
+        (Some(link), _) | (None, Some(link)) if !microsoft::is_graph_url(&link) => Err(
+            Error::Other("OneDrive returned an off-host continuation link.".into()),
+        ),
+        (Some(n), _) => Ok(DeltaStep::Follow(n)),
+        (None, Some(link)) => Ok(DeltaStep::Done(link)),
+        // A page with neither a next nor a delta link is a malformed Graph response, not a
+        // truncation — surface it rather than silently baselining an incomplete pass.
+        (None, None) => Err(Error::Other(
+            "OneDrive delta returned no continuation token.".into(),
+        )),
+    }
+}
+
 /// Pull the whole-drive delta since `cursor` (a stored `@odata.deltaLink` URL) + the next delta link.
 /// `cursor = None` is the first sync / a re-baseline: the no-token `/root/delta` returns the full
 /// enumeration AND a fresh delta link in one walk. Follows `@odata.nextLink` across pages.
@@ -620,16 +654,9 @@ pub async fn list_delta(
         let v = microsoft::authorized_get(token_key, &url).await?;
         let (entries, next, delta) = parse_delta(&v);
         all.extend(entries);
-        match (next, delta) {
-            (Some(n), _) => url = n,
-            (None, Some(link)) => return Ok((all, link, false)),
-            // A page with neither a next nor a delta link is a malformed Graph response, not a
-            // truncation — surface it rather than silently baselining an incomplete pass.
-            (None, None) => {
-                return Err(Error::Other(
-                    "OneDrive delta returned no continuation token.".into(),
-                ))
-            }
+        match delta_step(next, delta)? {
+            DeltaStep::Follow(n) => url = n,
+            DeltaStep::Done(link) => return Ok((all, link, false)),
         }
     }
     // Page guard: `url` holds the next `@odata.nextLink` we'd have fetched — a resumable checkpoint.
@@ -1000,6 +1027,48 @@ mod tests {
         assert!(next.is_none());
         assert_eq!(delta.as_deref(), Some("https://graph/delta?token=TOK"));
         assert!(entries[0].removed);
+    }
+
+    /// The continuation guard, one layer below `list_delta`'s network loop: an off-host
+    /// `@odata.deltaLink` or `@odata.nextLink` errors instead of being followed or returned. The
+    /// error is what leaves `connector_sources.cursor` unadvanced — see
+    /// `finalize_or_flag_advances_on_a_clean_pass_and_holds_last_good_on_a_failed_one`, which pins
+    /// that a failed pass never writes the offered cursor.
+    #[test]
+    fn delta_step_refuses_an_off_host_continuation_link() {
+        let graph_next = "https://graph.microsoft.com/v1.0/me/drive/root/delta?$skiptoken=S";
+        let graph_delta = "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=TOK";
+
+        // The good shapes still flow exactly as before.
+        match delta_step(Some(graph_next.into()), None).unwrap() {
+            DeltaStep::Follow(u) => assert_eq!(u, graph_next),
+            DeltaStep::Done(_) => panic!("a nextLink must page, not finish"),
+        }
+        match delta_step(None, Some(graph_delta.into())).unwrap() {
+            DeltaStep::Done(u) => assert_eq!(u, graph_delta),
+            DeltaStep::Follow(_) => panic!("a deltaLink must finish, not page"),
+        }
+
+        // A poisoned deltaLink is the one that would persist and be replayed forever.
+        let err = delta_step(None, Some("https://evil.example/delta".into())).unwrap_err();
+        assert!(err.to_string().contains("off-host"), "got: {err}");
+        // A poisoned nextLink is refused too, so the page guard can never hand one back either.
+        let err = delta_step(Some("https://evil.example/next".into()), None).unwrap_err();
+        assert!(err.to_string().contains("off-host"), "got: {err}");
+        // A nextLink wins the match, so an off-host one must not be excused by a clean deltaLink.
+        let err = delta_step(
+            Some("https://evil.example/next".into()),
+            Some(graph_delta.into()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("off-host"), "got: {err}");
+
+        // Unchanged: neither link is still a malformed page, not a truncation.
+        let err = delta_step(None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("no continuation token"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -114,6 +114,12 @@ const ITEMS: Item[] = [
       "Revokes PM's Google access and forgets every key. Microsoft access is finished separately at account.live.com.",
     danger: true,
   },
+  // This detail is only true while the webview store holds UI STATE and nothing else. It was not:
+  // the per-project milestone sort map, the hidden-calendar set and the backup dismissals all held
+  // user content there, and they now live in the encrypted `settings` table (see lib/storedPrefs.ts)
+  // — which is covered by "Vault & database" above, and by a .pmbackup. Anything user-content-shaped
+  // that lands back in localStorage makes this sentence a lie, and makes it a lie in the one panel
+  // people read before deciding what to delete.
   {
     key: "localStorage",
     label: "App preferences",

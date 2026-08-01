@@ -15,11 +15,16 @@
 //      dropped rather than parsed (react-markdown's default).
 //   2. `rehype-sanitize` runs LAST with a GitHub-flavoured allowlist schema — it strips any unsafe
 //      element/attribute/URL protocol that slipped through, including `javascript:`/`data:` hrefs.
-//   3. `urlTransform` gates absolute link/image URLs to an http/https/mailto allowlist before hast.
+//   3. `urlTransform` (`safeUrl`) gates every link/image URL to an http/https/mailto allowlist as the
+//      hast tree is turned into React elements — i.e. AFTER layer 2, not before it.
 //
-// Rendered links carry `target="_blank"`, so the app-wide link interceptor in App.tsx routes their
-// clicks to the OS browser through the http(s)-guarded `open_url` — but that interceptor only guards a
-// real click, so the sanitizer's protocol allowlist above is what actually neutralises a hostile href.
+// Rendered links carry `target="_blank"`, and the shared `useExternalLinks` hook — mounted by BOTH
+// webview roots (App and PopoverRoot) — routes their clicks to the OS browser through the
+// http(s)-guarded `open_url`. That hook only guards a real click on a link that HAS a scheme, though.
+// `safeUrl` is what neutralises a hostile href: it runs LAST, after the sanitizer (react-markdown
+// applies `urlTransform` post-`processor.run`, not before it), so it — not the sanitizer's protocol
+// allowlist — is the final word on a URL, and it is the only layer that can see the SCHEMELESS case
+// (`//host`), which a protocol allowlist passes for want of a colon.
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -46,6 +51,15 @@ export const SCHEMA = {
 // (or any non-allowlisted) href to an empty string.
 const ABSOLUTE_ALLOWED = /^(https?:|mailto:)/i;
 export function safeUrl(url: string): string {
+  // A protocol-relative target carries no scheme, so neither the allowlist below nor the sanitizer's
+  // protocol check (which bails out "allowed" when there is no colon) ever sees one — yet the browser
+  // resolves it against the PAGE's protocol, i.e. straight off-origin: `//evil.example/x` from
+  // `http://tauri.localhost` is `http://evil.example/x`. This MUST precede the `/`-prefix allowance
+  // below, which would otherwise read it as same-origin-relative and hand it back verbatim.
+  // `\` rides along as cheap defence because Chromium's URL parser treats `/\` exactly like `//` for
+  // http(s) — it is NOT a case that can arrive from Markdown, since remark percent-encodes link
+  // destinations, so `/\evil.example` reaches here as `/%5Cevil.example` and stays same-origin.
+  if (/^[/\\][/\\]/.test(url)) return "";
   if (url.startsWith("#") || url.startsWith("/") || url.startsWith("./") || url.startsWith("../")) {
     return url;
   }

@@ -314,6 +314,127 @@ mod tests {
         );
     }
 
+    /// Every function in the crate that calls [`validate_passphrase_strength`], as
+    /// `(file, enclosing fn)`. Changing this list is a deliberate act, not a merge artefact.
+    const STRENGTH_CALL_SITES: &[(&str, &str)] = &[
+        ("commands.rs", "create_shareable_vault"),
+        ("commands.rs", "change_vault_passphrase"),
+        ("commands.rs", "create_local_backup"),
+        ("commands.rs", "set_backup_passphrase"),
+        ("commands.rs", "backup_to_proton"),
+        ("commands.rs", "backup_to_gdrive"),
+    ];
+
+    /// Functions the floor must NEVER be reachable from. Implied by the list above, but named so a
+    /// failure says which RULE was broken rather than just "the count changed".
+    const READ_PATHS: &[&str] = &[
+        "unlock_vault",
+        "adopt_shared_vault",
+        "adopt_restored_vault",
+        "restore_backup",
+        "verify_backup",
+        "open_with_passphrase",
+    ];
+
+    #[test]
+    fn the_strength_floor_still_has_exactly_its_six_create_change_call_sites() {
+        // Rule 3, enforced instead of merely documented. `the_padding_rule_can_never_reach_an_unlock`
+        // above proves the floor REFUSES what `derive_master` still accepts; that is only safe while
+        // no read path calls the floor. Nothing in the type system says so, and the tempting edit —
+        // "validate the passphrase on unlock too, for a nicer error" — is a one-way door: every
+        // pre-3.19.1 vault keyed to a padded string would become permanently unopenable, and nothing
+        // on disk records which form built the key. So the call sites are pinned here by source scan.
+        // A future edit that reaches for the floor on an unlock trips this suite rather than review.
+        //
+        // Scanning source at test time is unusual; it is the only way to state a whole-crate property
+        // about who calls a function. `CARGO_MANIFEST_DIR` is baked in at compile time (the same
+        // approach sidecar.rs's fixture tests use).
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        assert!(
+            files.len() > 10,
+            "the source walk found almost nothing ({}) — it has stopped matching the tree, and a \
+             pin that scans nothing passes forever",
+            files.len()
+        );
+
+        let mut found: Vec<(String, String)> = Vec::new();
+        for path in &files {
+            // The module that DEFINES the floor is exempt: its own signature and its own tests
+            // (including this one) name it many times over.
+            if path.ends_with("kdf.rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let text = std::fs::read_to_string(path).expect("read a source file");
+            let mut enclosing = String::from("<top level>");
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed
+                    .strip_prefix("pub async fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                    .or_else(|| trimmed.strip_prefix("async fn "))
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                {
+                    enclosing = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                // Comments and doc comments mention the floor freely; only code counts.
+                let code = line.split("//").next().unwrap_or_default();
+                if code.contains("validate_passphrase_strength(") {
+                    found.push((name.clone(), enclosing.clone()));
+                }
+            }
+        }
+
+        let mut found_sorted = found.clone();
+        found_sorted.sort();
+        let mut expected: Vec<(String, String)> = STRENGTH_CALL_SITES
+            .iter()
+            .map(|(f, fun)| ((*f).to_string(), (*fun).to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            found_sorted, expected,
+            "the passphrase strength floor is create/change-only (kdf.rs Rule 3). If you ADDED a \
+             create-or-change command, add it to STRENGTH_CALL_SITES. If this fired because the \
+             floor now runs on an unlock, verify, adopt or restore path: STOP — that is the \
+             one-way door this test exists to hold shut."
+        );
+
+        for forbidden in READ_PATHS {
+            assert!(
+                !found.iter().any(|(_, fun)| fun == forbidden),
+                "`{forbidden}` is a read path: an existing weak-or-padded passphrase must keep \
+                 opening its vault forever"
+            );
+        }
+    }
+
+    /// Every `.rs` file under `dir`, recursively. Plain recursion — no walkdir dependency (I-18).
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     #[test]
     fn absurd_cost_params_are_rejected_before_derivation() {
         // A hostile advertised folder could carry a meta with a multi-hundred-GiB memory cost to

@@ -32,6 +32,15 @@ describe("fallbackCopy", () => {
     expect(fallbackCopy("power_policy")).not.toContain("couldn't answer");
   });
 
+  // Same class of guard as the power-policy one above. A call-time posture refusal is a POLICY
+  // decision about the address the endpoint now resolves to, not evidence the server failed — the
+  // server is very likely running fine. Without this branch the slug falls through to "your local
+  // model couldn't answer", sending the user to debug a healthy server instead of their DNS.
+  it("never reports a call-time endpoint refusal as a model failure", () => {
+    expect(fallbackCopy("endpoint_refused")).toContain("in the clear");
+    expect(fallbackCopy("endpoint_refused")).not.toContain("couldn't answer");
+  });
+
   it("degrades an unknown slug to a generic reason (never leaks the raw token)", () => {
     const copy = fallbackCopy("some_future_reason");
     expect(copy).toContain("couldn't answer");
