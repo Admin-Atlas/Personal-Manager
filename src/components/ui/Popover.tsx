@@ -176,13 +176,26 @@ export function Popover({
       role="group"
       aria-label={ariaLabel}
       className={cn(
-        "z-30 min-w-[15rem] rounded-[var(--radius-sm)] border border-border2 bg-panel p-1 shadow-lg",
+        "min-w-[15rem] rounded-[var(--radius-sm)] border border-border2 bg-panel p-1 shadow-lg",
+        // The z-index is part of the same conditional as `fixed`/`absolute`, NOT a constant above
+        // it, and that is deliberate on two counts.
+        //
+        // Correctness: an escape-clipping panel leaves its parent's stacking context to sit in the
+        // viewport, so inside a Modal (`z-50`) a `z-30` panel painted BEHIND the dialog surface —
+        // the date picker in a pinboard folder set to "Overlay" opened invisibly, and the next
+        // click read as an outside-dismissal. Anchored panels must stay at `z-30`: they sit within
+        // their own parent and lifting them would let a popover in the page punch through overlays
+        // that are meant to cover it.
+        //
+        // Mechanics: `cn` is a plain joiner, not tailwind-merge. Appending `z-[60]` to a constant
+        // `z-30` would emit BOTH, and which one wins is decided by their order in the generated
+        // stylesheet rather than in this list. Exactly one z-utility must ever be produced.
         escapeClipping
           ? // Placed from measured coords, so no directional utilities — and invisible rather than
             // unmounted for the measuring frame, since an unmounted panel has nothing to measure.
-            "fixed"
+            "fixed z-[60]"
           : cn(
-              "absolute",
+              "absolute z-30",
               side === "top" ? "bottom-full mb-1" : "mt-1",
               align === "right" ? "right-0" : "left-0",
             ),

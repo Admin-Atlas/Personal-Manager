@@ -398,6 +398,33 @@ impl SecretCache {
         Ok(())
     }
 
+    /// Spend one more keychain read, but ONLY if the last one failed.
+    ///
+    /// `load` deliberately burns its single attempt before reading, so a dismissed macOS consent
+    /// dialog can't send all ~40 boot-time accessors back for a prompt each (#485/#536). The cost was
+    /// that the latch also outlived the thing it was protecting against: after a denied prompt the
+    /// process was stuck `Untrusted` forever, so the user could unlock their keychain, press the
+    /// Retry the error message itself points them at, and get the identical failure every time —
+    /// `load` returned `Ok` from the latch without ever touching the keychain again. Only quitting
+    /// PM cleared it.
+    ///
+    /// Re-arming is safe precisely because it is not automatic: this is reached from
+    /// `retry_open_vault` and nothing else — one deliberate user action, one fresh attempt. The
+    /// storm was driven by incidental accessors during boot, and none of them come through here.
+    ///
+    /// A `Trusted` cache is left alone: it was read cleanly, re-reading would prompt for nothing.
+    fn rearm_if_untrusted(&mut self) {
+        if self.bundle != BundleState::Untrusted {
+            return;
+        }
+        // `present` is already empty — the read that set `Untrusted` failed before populating it —
+        // so this drops no live secret. `absent` goes too: every entry in it was concluded from a
+        // bundle read that never happened.
+        self.absent.clear();
+        self.loaded = false;
+        self.bundle = BundleState::Unread;
+    }
+
     /// Drop every cached secret. Used by the wipe after the keychain items are deleted, so a later
     /// read can't serve a just-erased secret; next access reloads from the now-empty bundle.
     fn clear(&mut self) {
@@ -441,6 +468,15 @@ fn delete(name: &str) -> Result<()> {
 /// the invariant shouldn't depend on that timing).
 fn clear_cache() {
     cache().clear();
+}
+
+/// Allow one more keychain read after a failed one, for an EXPLICIT user-initiated retry.
+///
+/// Call this from a retry command and nowhere else — see [`SecretCache::rearm_if_untrusted`] for why
+/// the one-attempt-per-process latch exists and why re-arming it on a deliberate user action does not
+/// bring the macOS prompt storm back. A no-op unless the last read actually failed.
+pub fn rearm_for_retry() {
+    cache().rearm_if_untrusted();
 }
 
 /// Whether a `None` from [`get`] might mean "unreadable" rather than "not set", making any
@@ -1124,6 +1160,50 @@ mod tests {
             !absent_is_ambiguous_for(true, cache.bundle),
             "a wiped keychain must be mintable again"
         );
+    }
+
+    #[test]
+    fn an_explicit_retry_re_arms_a_failed_keychain_read() {
+        // The dead end: `load` burns its one attempt BEFORE reading, so a denied macOS prompt left
+        // the process Untrusted with `loaded` still true. Every later read — including the boot open
+        // behind the Retry button the error message points at — returned from the latch without
+        // touching the keychain, so Retry could never succeed however many times it was pressed.
+        let mut cache = SecretCache {
+            loaded: true,
+            bundle: BundleState::Untrusted,
+            ..Default::default()
+        };
+        cache.absent.insert("db_key".into());
+        cache.rearm_if_untrusted();
+        assert!(
+            !cache.loaded,
+            "the next read must actually reach the keychain"
+        );
+        assert_eq!(cache.bundle, BundleState::Unread);
+        assert!(
+            cache.absent.is_empty(),
+            "an absence concluded from a read that never happened must not survive the retry"
+        );
+    }
+
+    #[test]
+    fn re_arming_leaves_a_healthy_cache_untouched() {
+        // The other half of the guarantee: re-arming must not become a second way to re-prompt.
+        // A clean read is final — a Retry after a SUCCESSFUL load has nothing to re-read, and
+        // dropping `present` here would send the next accessor back to the keychain for a
+        // consent dialog the user already answered. That is the #485/#536 storm.
+        for state in [BundleState::Trusted, BundleState::Unread] {
+            let mut cache = SecretCache {
+                loaded: true,
+                bundle: state,
+                ..Default::default()
+            };
+            cache.present.insert("db_key".into(), Secret::from("v"));
+            cache.rearm_if_untrusted();
+            assert!(cache.loaded, "{state:?} must keep its one-attempt latch");
+            assert_eq!(cache.bundle, state);
+            assert_eq!(cache.present.len(), 1, "{state:?} must keep its secrets");
+        }
     }
 
     #[test]

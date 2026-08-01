@@ -209,6 +209,16 @@ export function RemovePmData({ biometricAvailable }: Props) {
   async function runWipe() {
     setStage("working");
     setError(null);
+    // Whether the irreversible frontend prologue below has run. Declared OUT here, not in the `try`,
+    // because the `catch` is the only place that reads it — a `try`-scoped `let` is not in scope
+    // there. `wipePmData` can still REFUSE after the prologue — a backup in flight, or a database
+    // file held open by antivirus — and both refusals say "Nothing was deleted", which is true of
+    // the BACKEND and false of this window: the preferences are already cleared, the theme provider
+    // is latched off and the briefing window is destroyed until restart. Dropping back to the
+    // type-to-confirm gate then invited a retry in an app that silently no longer works properly.
+    // The prologue's ordering is load-bearing (see below) and can't simply move after the call, so
+    // the honest fix is to stop describing the result as a clean no-op.
+    let prologueRan = false;
     try {
       // Clear the webview's own store FIRST, before the backend removes the OS-level store behind
       // it. The order matters on macOS: `~/Library/WebKit/<id>` is a live WKWebView store, and
@@ -224,6 +234,10 @@ export function RemovePmData({ biometricAvailable }: Props) {
       // content to write back over the deleted directory.
       const fullWipe = sel.regenerable && sel.vaultAndDb && sel.keychain;
       if (sel.localStorage || fullWipe) {
+        // Set BEFORE the first step, not after the last: destroying the briefing window is itself
+        // irreversible, and its failure is deliberately swallowed below, so a throw there must not
+        // leave this reading as though nothing had happened.
+        prologueRan = true;
         // Order matters, and all three steps are load-bearing.
         //
         // The briefing window goes FIRST. It is a second JS context on the same origin store, it
@@ -258,8 +272,18 @@ export function RemovePmData({ biometricAvailable }: Props) {
       setReport(rep);
       setStage("done");
     } catch (e) {
-      setError(String(e));
-      setStage("type"); // back to the last gate so they can retry or cancel
+      setError(
+        prologueRan
+          ? `${String(e)} Your data has not been removed — but this window's interface preferences ` +
+              `were already cleared before that failed, so please restart PM before trying again. ` +
+              `Until you do it won't remember your theme or layout, and the floating briefing window ` +
+              `stays closed.`
+          : String(e),
+      );
+      // Only offer a retry from a window that can still honour one. Once the prologue has run, this
+      // window is degraded whatever the backend says, so send them back to the start rather than
+      // leaving them on the final gate one click away from repeating it.
+      setStage(prologueRan ? "select" : "type");
     }
   }
 

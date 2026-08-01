@@ -156,6 +156,19 @@ class ModelNotCached(Exception):
     helper and retries the call. Never raised outside offline mode."""
 
 
+class Unconvertible(Exception):
+    """The engine ANSWERED and refused THIS FILE: a verdict about the input, not about the
+    engine. The main loop turns it into an `unconvertible` reply, which is the ONLY signal
+    `cloud_sync::is_permanently_unindexable` accepts as "skip this item and let the delta
+    cursor move past it".
+
+    Everything else — a failed import, a missing optional dependency, a broken venv, an OS
+    error — must NOT raise this. Those are the engine being broken, they resolve once it is
+    repaired, and they have to stay account-fatal so the cursor is held and the files are
+    re-offered. `str(exc)` carries no type information, so without this marker Rust cannot
+    tell the two apart and defaults, fail-closed, to "the engine is broken"."""
+
+
 def _load_model(build):
     """Construct a model, converting ANY failure in OFFLINE mode into ModelNotCached so Rust runs
     the network-allowed `--fetch` helper and retries. Treating every offline construction failure as
@@ -426,15 +439,41 @@ def _guard_file_size(path):
 def do_convert(params):
     """Convert one file to Markdown. Returns its text and a best-effort title."""
     path = params["path"]
-    _guard_file_size(path)
-    if str(path).lower().endswith(ZIP_CONTAINER_EXTS):
-        _guard_archive_inflation(path)
+    # PM's own caps are verdicts about THIS file, so they carry the `unconvertible` marker.
+    try:
+        _guard_file_size(path)
+        if str(path).lower().endswith(ZIP_CONTAINER_EXTS):
+            _guard_archive_inflation(path)
+    except ValueError as exc:
+        raise Unconvertible(str(exc)) from exc
+
+    # Deliberately OUTSIDE the try below: `get_markitdown()` imports markitdown lazily, so a
+    # broken or half-installed venv surfaces HERE as an ImportError/ModuleNotFoundError. That is
+    # the engine being broken, not a verdict on this file — it must stay account-fatal so the
+    # delta cursor is held and every affected file is re-offered once the engine is repaired.
+    engine = get_markitdown()
+    # Imported HERE, not at module scope: markitdown is a deliberately lazy import (see
+    # `get_markitdown`), and naming its exceptions at module level would load the whole package
+    # on every sidecar start — including for `embed`, `rerank` and `transcribe`, which never
+    # convert anything. Safe at this point: the engine has already imported successfully.
+    from markitdown import MarkItDownException, MissingDependencyException
+
     # `convert_local`, NOT `convert`: MarkItDown's `convert` dispatches on the STRING, and a path
     # beginning `http:` / `https:` / `file:` / `data:` is routed to `convert_uri` — a network fetch
     # from the one process that must never hold a socket. The names we pass are staged copies or
     # the user's own paths, so this is not reachable today; the local entry point makes it
     # unreachable by construction rather than by luck.
-    result = get_markitdown().convert_local(path)
+    try:
+        result = engine.convert_local(path)
+    except MissingDependencyException:
+        # A MarkItDownException, but NOT a verdict on the file: this format needs an optional
+        # package the venv is missing. Repairing the engine fixes it, so let it stay account-fatal
+        # rather than skipping every file of that type forever.
+        raise
+    except MarkItDownException as exc:
+        # UnsupportedFormatException / FileConversionException: the engine read this file and
+        # refused it. Retrying forever is what pins the account, so this one is a skip.
+        raise Unconvertible(str(exc)) from exc
     title = (getattr(result, "title", None) or "").strip()
     return {
         "markdown": clean_text(result.text_content or ""),
@@ -1376,6 +1415,17 @@ def main():
                 "ok": False,
                 "error": str(miss),
                 "error_kind": "model_not_cached",
+            }
+        except Unconvertible as verdict:
+            # The engine answered and refused THIS FILE. `error_kind` is the only thing that lets
+            # Rust skip the item and let the delta cursor past it — `str(exc)` carries no type, so
+            # without this marker a broken engine and a bad file are the same string. Must precede
+            # the broad `except` below, which would otherwise swallow it untagged.
+            response = {
+                "id": req_id,
+                "ok": False,
+                "error": str(verdict),
+                "error_kind": "unconvertible",
             }
         except Exception as exc:  # report, never crash the loop
             traceback.print_exc(file=sys.stderr)

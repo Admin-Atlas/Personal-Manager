@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.8-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "A problem with PM's document engine no longer makes cloud files disappear from your library without a word. If the engine broke — a half-finished install, a missing component — PM treated every file it couldn't read as a file it would never be able to read, marked it skipped, and moved its place-marker past it. Google Drive and OneDrive only ever report what has changed since that marker, so those files were never offered again: the sync said \"finished, 0 indexed, 3,000 skipped\", the account looked perfectly healthy, and the only way back was to disconnect the account and add it again. PM now tells the two cases apart — a file the engine has read and refused is skipped as before, but an engine that is simply broken holds the marker where it is, so everything is picked up again once it's repaired.",
+      "On Windows, removing only your app preferences no longer reports that nothing was removed. It said so every time — the preferences were genuinely gone, and the message arrived after they went — because the only part of that job Windows leaves to PM is done by the app itself, and PM was counting the other part. It now says what it did, and names the browser-side store it can't remove while running, which the uninstaller takes care of when you remove PM itself.",
+      "On a Mac, dismissing the keychain prompt at startup no longer leaves you stuck. PM asks the keychain once per launch, deliberately — asking again for every part of the app that needs a key is how you end up with a dozen prompts. But that limit also applied to the Retry button on the \"can't read your saved keys\" screen, so once you'd said no, Retry could never succeed no matter how many times you pressed it, and quitting PM was the only way out. Retry now genuinely asks again. Nothing else asks again, so the flood stays fixed.",
+      "Erasing a shared vault now says who else loses it. Deleting a vault you own also deletes it for every account you had linked to it — that is what it means and it hasn't changed, but the summary described it as your own data and named nobody, even though the list of linked accounts was sitting in the folder being deleted. It now names them.",
+      'If removing your data fails part-way, PM stops telling you nothing happened. Some refusals — a backup still uploading, a database file held open by antivirus — arrive after PM has already cleared this window\'s own preferences, so "nothing was deleted" was true of your files and untrue of the app you were looking at. It now says your data is untouched, tells you the preferences went anyway, and asks you to restart before trying again instead of leaving you one click from repeating it.',
+      "The date picker opens where you can see it inside a pinboard folder set to Overlay. It was being drawn behind the panel, so clicking a date field appeared to do nothing at all and the next click closed it again. Typing the date always worked; now the calendar does too.",
+    ],
+  },
+  {
     version: "3.114.7-alpha",
     date: "2026-08-01",
     highlights: [

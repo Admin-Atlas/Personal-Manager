@@ -227,6 +227,12 @@ pub(super) fn require_vault_owner(app: &AppHandle) -> Result<()> {
 /// re-arms the error and returns it, so the surface shows the fresh message.
 #[tauri::command]
 pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    // The user asked for this, so spend a fresh keychain read if the last one failed. Without it a
+    // denied macOS consent prompt latched the secret cache `Untrusted` for the life of the process:
+    // every Retry then failed identically — the boot open path never reached the keychain again —
+    // while the error message told the user to unlock their keychain and choose Retry. Scoped to
+    // this one command so the ~40 incidental boot accessors still get a single attempt between them.
+    secrets::rearm_for_retry();
     let resolved = vault::resolve(&app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
