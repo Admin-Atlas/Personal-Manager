@@ -188,13 +188,17 @@ pub async fn fetch_calendar_list_with_token(token: &google::Token) -> Result<Vec
 /// events expanded to single instances and ordered by start. `mirror_calendar_id` is the owning
 /// [`Calendar::id`] the events are stored under; `remote_id` is Google's own calendar id for the API
 /// path. Authorised with the account's `token_key`.
+///
+/// Returns `(events, complete)`. `complete` is `false` when the page-run hit the runaway guard, so
+/// [`replace_events`] can withhold its delete half rather than reap the tail we never reached — the
+/// same contract [`register_calendars`] already honours for the calendar LIST (I-09.3).
 pub async fn fetch_events(
     token_key: &str,
     mirror_calendar_id: &str,
     remote_id: &str,
     time_min: &str,
     time_max: &str,
-) -> Result<Vec<CalendarEvent>> {
+) -> Result<(Vec<CalendarEvent>, bool)> {
     let mut base = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
     base.path_segments_mut()
         .map_err(|_| Error::Other("invalid calendar API base".into()))?
@@ -224,15 +228,16 @@ pub async fn fetch_events(
         }
     })
     .await?;
-    // Runaway guard tripped (~25k events/calendar): the mirror is being truncated — log it rather
-    // than silently overwriting with a partial set (no realistic personal calendar hits this).
+    // Runaway guard tripped (~25k events/calendar): the set is partial. The breadcrumb stays (it is
+    // the only clue on a dev build), but the flag now travels with it — an eprintln is invisible on
+    // a GUI build, so it was never the thing keeping the mirror honest.
     if truncated {
         eprintln!(
             "calendar: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more \
              pages pending; its mirror may be truncated this sync"
         );
     }
-    Ok(out)
+    Ok((out, !truncated))
 }
 
 // --- calendar feeds (.ics — the no-OAuth path) ---
@@ -341,12 +346,16 @@ pub fn remove_feed(conn: &Connection, id: &str) -> Result<()> {
 /// [`time_window`]; network, no DB lock held — rule #4). `tz` is the user's zone, used to anchor
 /// floating/all-day ICS times (the feed itself carries no viewer zone), resolved by the caller
 /// before the await.
+///
+/// Returns `(events, complete)` — see [`ics::parse_feed_within_reporting`]. An over-size body is an
+/// error from `read_capped`, but a body cut mid-`VEVENT` or a feed past the parser's block/event
+/// caps comes back looking clean, so the parse's own verdict is what gates the mirror's delete.
 pub async fn sync_feed(
     feed: &IcsFeed,
     time_min: &str,
     time_max: &str,
     tz: chrono_tz::Tz,
-) -> Result<Vec<CalendarEvent>> {
+) -> Result<(Vec<CalendarEvent>, bool)> {
     // Re-validate at fetch time: a feed stored before this guard existed — or one
     // whose host now resolves to a private address — must not be fetched.
     validate_feed_url(&feed.url)?;
@@ -419,7 +428,7 @@ pub async fn sync_feed(
         break read_capped(resp, MAX_FEED_BYTES).await?;
     };
     let (win_start, win_end) = parse_window(time_min, time_max)?;
-    Ok(ics::parse_feed_within(
+    Ok(ics::parse_feed_within_reporting(
         &text, &feed.id, win_start, win_end, tz,
     ))
 }
@@ -1341,11 +1350,35 @@ fn events_hash(events: &[CalendarEvent]) -> String {
 /// Replace one calendar's mirrored events with a freshly fetched set. Skips the delete+reinsert entirely
 /// when the fetched set already matches what's mirrored (F-49): the provider is re-polled every ~15 min,
 /// and without this every poll rewrites every row — continuous WAL churn — even when nothing changed.
+///
+/// `complete` is the fetch's own verdict on whether it saw the WHOLE calendar (page guard, ICS caps, a
+/// body cut mid-block). On an INCOMPLETE fetch the delete half is withheld and the events that did
+/// arrive are upserted over the mirror: absence from a partial set is not evidence the user deleted
+/// anything (I-09.3). A genuinely-cancelled event in the unreached tail therefore lingers until the
+/// next complete fetch, which is the deliberate trade — reaping live rows is the worse failure.
 pub fn replace_events(
     conn: &Connection,
     calendar_id: &str,
     events: &[CalendarEvent],
+    complete: bool,
 ) -> Result<()> {
+    if !complete {
+        // Nothing observed proves nothing: an empty partial set is no evidence at all.
+        if events.is_empty() {
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        for e in events {
+            insert_event(&tx, e)?;
+        }
+        tx.commit()?;
+        // Never leave a hash describing a set the mirror does not hold. A merge that only refreshed
+        // existing rows leaves the row count unchanged, so a surviving hash could let F-49's
+        // unchanged-skip suppress the very rewrite that would repair the mirror — permanently.
+        crate::db::delete_setting(conn, &format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}"))?;
+        return Ok(());
+    }
+
     // F-49: skip when unchanged. The stored per-calendar hash tells us the set is identical; the row
     // count then confirms the rows are actually present, so a stale hash left by an external delete
     // (e.g. `prune_unselected`) can't wrongly suppress a re-insert — the skip is self-correcting.
@@ -1368,53 +1401,61 @@ pub fn replace_events(
         params![calendar_id],
     )?;
     for e in events {
-        let summary = clip(&e.summary, MAX_SUMMARY_CHARS);
-        let location = e.location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
-        let description = e
-            .description
-            .as_deref()
-            .map(|d| clip(d, MAX_DESCRIPTION_CHARS));
-        // Untrusted free-text from the provider — clip like description/location. Attendees are stored
-        // as a JSON array (NULL when none), parsed back on read.
-        let organizer = e.organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
-        let recurrence_summary = e
-            .recurrence_summary
-            .as_deref()
-            .map(|r| clip(r, MAX_LOCATION_CHARS));
-        let attendees = (!e.attendees.is_empty())
-            .then(|| serde_json::to_string(&e.attendees).unwrap_or_else(|_| "[]".to_string()));
-        tx.execute(
-            "INSERT OR REPLACE INTO calendar_events \
-             (id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
-              show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
-              visibility, created, updated) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-            params![
-                e.id,
-                e.calendar_id,
-                summary,
-                description,
-                location,
-                e.start,
-                e.end,
-                e.all_day as i64,
-                e.html_link,
-                e.uid,
-                e.show_as,
-                organizer,
-                attendees,
-                e.conference_url,
-                e.recurring as i64,
-                recurrence_summary,
-                e.status,
-                e.visibility,
-                e.created,
-                e.updated,
-            ],
-        )?;
+        insert_event(&tx, e)?;
     }
     tx.commit()?;
     crate::db::set_setting(conn, &key, &hash)?;
+    Ok(())
+}
+
+/// Write one fetched event into the mirror, clipping every untrusted text field on the way in.
+/// Written once so the complete (delete-then-insert) and incomplete (upsert-only) paths of
+/// [`replace_events`] can never drift in what they store.
+fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
+    let summary = clip(&e.summary, MAX_SUMMARY_CHARS);
+    let location = e.location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
+    let description = e
+        .description
+        .as_deref()
+        .map(|d| clip(d, MAX_DESCRIPTION_CHARS));
+    // Untrusted free-text from the provider — clip like description/location. Attendees are stored
+    // as a JSON array (NULL when none), parsed back on read.
+    let organizer = e.organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
+    let recurrence_summary = e
+        .recurrence_summary
+        .as_deref()
+        .map(|r| clip(r, MAX_LOCATION_CHARS));
+    let attendees = (!e.attendees.is_empty())
+        .then(|| serde_json::to_string(&e.attendees).unwrap_or_else(|_| "[]".to_string()));
+    tx.execute(
+        "INSERT OR REPLACE INTO calendar_events \
+         (id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
+          show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
+          visibility, created, updated) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        params![
+            e.id,
+            e.calendar_id,
+            summary,
+            description,
+            location,
+            e.start,
+            e.end,
+            e.all_day as i64,
+            e.html_link,
+            e.uid,
+            e.show_as,
+            organizer,
+            attendees,
+            e.conference_url,
+            e.recurring as i64,
+            recurrence_summary,
+            e.status,
+            e.visibility,
+            e.created,
+            e.updated,
+        ],
+    )?;
     Ok(())
 }
 
@@ -1438,7 +1479,7 @@ pub fn clear_all_events(conn: &Connection) -> Result<()> {
 }
 
 /// The shared forward-agenda read. Events starting within `days` and not yet past the day boundary,
-/// soonest first, deduped by iCal UID; unparseable dates are excluded.
+/// soonest first, deduped per occurrence (iCal UID + start); unparseable dates are excluded.
 ///
 /// The boundary is the *user's* civil day, not UTC's. `today` is their local date (`YYYY-MM-DD`, from
 /// [`crate::clock::today_sql_in`]) so an all-day event is kept for exactly the days it civilly spans —
@@ -1495,14 +1536,26 @@ fn agenda_query(
     let collected = rows
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Error::from)?;
-    // Dedup the same physical event mirrored on two overlapping calendars (same iCal UID),
-    // keeping the soonest copy — otherwise the focus agenda, chat preamble, and project name-match
-    // all see it twice. A null/empty UID can't be correlated, so those pass through untouched.
+    // Dedup the same physical event mirrored on two overlapping calendars, keeping the soonest
+    // copy — otherwise the focus agenda, chat preamble, and project name-match all see it twice.
+    //
+    // The key is the OCCURRENCE (uid + start), not the uid alone: every expanded occurrence of a
+    // recurring series carries the SERIES uid (`ics::make_event`, Graph `calendarView`), so a
+    // uid-only key kept the soonest one and silently dropped the rest — a weekly standup was a
+    // single agenda line for the whole horizon. The uid alone names the series; naming one
+    // occurrence needs the instant too (INVARIANTS I-04). A mirrored copy shares the start as well
+    // — every producer normalises it to `…Z` or `YYYY-MM-DD` — so the case this dedup was written
+    // for still collapses. A null/empty UID can't be correlated, so those pass through untouched.
+    //
+    // The uid-only collapses on the assistant paths are deliberate and must stay: `flags::detect`,
+    // the flag/briefing label joins and `milestones::calendar_dates_by_uid` each want ONE row per
+    // series ("a daily standup is one flag, not one per day"), which is a different question from
+    // "which occurrences are on the agenda".
     let mut seen = std::collections::HashSet::new();
     Ok(collected
         .into_iter()
         .filter(|a| match &a.event.uid {
-            Some(uid) if !uid.is_empty() => seen.insert(uid.clone()),
+            Some(uid) if !uid.is_empty() => seen.insert((uid.clone(), a.event.start.clone())),
             _ => true,
         })
         .collect())
@@ -1718,7 +1771,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
         let events = vec![ev("1", "Standup", "2026-07-06T09:00:00Z")];
-        replace_events(&conn, "cal-1", &events).unwrap();
+        replace_events(&conn, "cal-1", &events, true).unwrap();
 
         // Tamper with the mirrored row, then re-sync the SAME set. If it skips (F-49) the tamper
         // survives — proof the delete+reinsert never ran; a rewrite would erase the marker.
@@ -1727,7 +1780,7 @@ mod tests {
             [],
         )
         .unwrap();
-        replace_events(&conn, "cal-1", &events).unwrap();
+        replace_events(&conn, "cal-1", &events, true).unwrap();
         let summary: String = conn
             .query_row(
                 "SELECT summary FROM calendar_events WHERE id = '1'",
@@ -1742,7 +1795,7 @@ mod tests {
 
         // A stale hash (rows deleted out-of-band, e.g. prune_unselected) must NOT suppress the re-insert.
         conn.execute("DELETE FROM calendar_events", []).unwrap();
-        replace_events(&conn, "cal-1", &events).unwrap();
+        replace_events(&conn, "cal-1", &events, true).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM calendar_events WHERE calendar_id = 'cal-1'",
@@ -1753,6 +1806,97 @@ mod tests {
         assert_eq!(
             count, 1,
             "the count-guard re-inserts when the mirror was cleared"
+        );
+    }
+
+    /// The mirrored rows for `cal-1`, id-ordered, as `(id, summary)`.
+    fn mirrored(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT id, summary FROM calendar_events WHERE calendar_id = 'cal-1' ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn replace_events_never_deletes_on_an_incomplete_fetch() {
+        // I-09.3: a page-capped fetch (or an ICS body cut mid-block) hands back a PARTIAL set. The
+        // rows it didn't reach are not evidence of a deletion, so the delete half is withheld and
+        // what did arrive is merged over the mirror.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let full = vec![
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+            ev("2", "Review", "2026-07-06T14:00:00Z"),
+            ev("3", "Retro", "2026-07-06T16:00:00Z"),
+        ];
+        replace_events(&conn, "cal-1", &full, true).unwrap();
+
+        let partial = vec![ev("2", "Review (moved)", "2026-07-06T14:00:00Z")];
+        replace_events(&conn, "cal-1", &partial, false).unwrap();
+        assert_eq!(
+            mirrored(&conn),
+            vec![
+                ("1".to_string(), "Standup".to_string()),
+                ("2".to_string(), "Review (moved)".to_string()),
+                ("3".to_string(), "Retro".to_string()),
+            ],
+            "the unseen rows survive and the seen one is refreshed"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_fetch_clears_the_unchanged_skip_hash() {
+        // The subtle half: a partial merge can leave the row COUNT unchanged, so a surviving F-49
+        // hash + that count would let the unchanged-skip suppress the very rewrite that repairs the
+        // mirror — forever. The hash must be deleted, never merely left stale.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let full = vec![
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+            ev("2", "Review", "2026-07-06T14:00:00Z"),
+        ];
+        replace_events(&conn, "cal-1", &full, true).unwrap();
+        let key = format!("{CALENDAR_EVENTS_HASH_PREFIX}cal-1");
+        assert!(crate::db::get_setting(&conn, &key).unwrap().is_some());
+
+        // A partial fetch that happens to carry the same two rows: same hash, same count.
+        replace_events(&conn, "cal-1", &full, false).unwrap();
+        assert_eq!(
+            crate::db::get_setting(&conn, &key).unwrap(),
+            None,
+            "an incomplete write must not leave a hash describing the whole set"
+        );
+
+        // The next COMPLETE fetch — the true set is now one event — must therefore reap, not skip.
+        let truth = vec![ev("1", "Standup", "2026-07-06T09:00:00Z")];
+        replace_events(&conn, "cal-1", &truth, true).unwrap();
+        assert_eq!(
+            mirrored(&conn),
+            vec![("1".to_string(), "Standup".to_string())],
+            "a complete fetch repairs the mirror exactly"
+        );
+    }
+
+    #[test]
+    fn an_empty_incomplete_fetch_leaves_the_mirror_untouched() {
+        // Nothing observed proves nothing. An empty partial set is the shape that would wipe a whole
+        // calendar if the delete half ever ran on an unproven picture.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let full = vec![
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+            ev("2", "Review", "2026-07-06T14:00:00Z"),
+        ];
+        replace_events(&conn, "cal-1", &full, true).unwrap();
+        replace_events(&conn, "cal-1", &[], false).unwrap();
+        assert_eq!(
+            mirrored(&conn).len(),
+            2,
+            "an empty partial set reaps nothing"
         );
     }
 
@@ -2057,6 +2201,70 @@ mod tests {
         assert!(focus.iter().find(|a| a.event.id == "past").unwrap().ended);
         assert!(!focus.iter().find(|a| a.event.id == "future").unwrap().ended);
         assert!(!focus.iter().find(|a| a.event.id == "today").unwrap().ended);
+    }
+
+    #[test]
+    fn agenda_keeps_every_occurrence_but_still_dedups_a_mirror() {
+        // The agenda dedup exists for one physical event mirrored on two overlapping calendars. Keyed
+        // on the uid alone it also collapsed a recurring series — every occurrence shares the series
+        // uid — so a weekly standup was ONE agenda line for the whole horizon. Keyed on the
+        // occurrence (uid + start) the series survives and the mirrored copy still folds away.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute_batch(
+            "INSERT INTO calendar_events (id, calendar_id, summary, start, end, all_day, uid) VALUES \
+               ('w1', 'cal-1', 'Weekly', datetime('now','+1 day'),  datetime('now','+1 day','+30 minutes'),  0, 'weekly@x'), \
+               ('w2', 'cal-1', 'Weekly', datetime('now','+8 days'), datetime('now','+8 days','+30 minutes'), 0, 'weekly@x'), \
+               ('w3', 'cal-1', 'Weekly', datetime('now','+15 days'),datetime('now','+15 days','+30 minutes'),0, 'weekly@x');",
+        )
+        .unwrap();
+        // The cross-calendar mirror of the +8-day occurrence: same uid AND byte-identical start.
+        conn.execute(
+            "INSERT INTO calendar_events (id, calendar_id, summary, start, end, all_day, uid) \
+             SELECT 'm2', 'cal-2', summary, start, end, all_day, uid FROM calendar_events WHERE id = 'w2'",
+            [],
+        )
+        .unwrap();
+        let today: String = conn
+            .query_row("SELECT date('now')", [], |r| r.get(0))
+            .unwrap();
+
+        let rows = agenda_query(&conn, 21, 250, &today, "now").unwrap();
+        assert_eq!(rows.len(), 3, "every occurrence of the series survives");
+        let starts: std::collections::HashSet<&str> =
+            rows.iter().map(|a| a.event.start.as_str()).collect();
+        assert_eq!(starts.len(), 3, "the occurrences differ only by start");
+        // Which of the two identical-start rows wins is SQLite's tie order, so pin that exactly one
+        // of them does — that is the mirror collapsing.
+        let ids: std::collections::HashSet<&str> =
+            rows.iter().map(|a| a.event.id.as_str()).collect();
+        assert!(ids.contains("w1") && ids.contains("w3"));
+        assert_eq!(
+            ids.iter().filter(|id| matches!(**id, "w2" | "m2")).count(),
+            1,
+            "the cross-calendar mirror still collapses to one row"
+        );
+    }
+
+    #[test]
+    fn an_all_day_mirror_on_two_calendars_still_collapses() {
+        // The all-day half of the case the dedup was written for: a civil date is stored as a bare
+        // `YYYY-MM-DD` by every producer, so the mirrored copy shares the start exactly and the
+        // widened key folds it away just as the uid-only key did.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute_batch(
+            "INSERT INTO calendar_events (id, calendar_id, summary, start, all_day, uid) VALUES \
+               ('a1', 'cal-1', 'Offsite', date('now'), 1, 'offsite@x'), \
+               ('a2', 'cal-2', 'Offsite', date('now'), 1, 'offsite@x');",
+        )
+        .unwrap();
+        let today: String = conn
+            .query_row("SELECT date('now')", [], |r| r.get(0))
+            .unwrap();
+        let rows = agenda_query(&conn, 21, 250, &today, "now").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].event.id.as_str(), "a1" | "a2"));
     }
 
     // --- v45: work/personal typing --------------------------------------------------------------

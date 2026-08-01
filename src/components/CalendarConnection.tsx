@@ -417,6 +417,10 @@ function AccountBlock({
   onSetKind: (cal: Calendar, kind: EventKind | null) => void;
   onDisconnect: () => void;
 }) {
+  // 'error' means the sync RAN but couldn't see the whole calendar (a page-capped fetch, or an ICS
+  // body cut mid-event). Nothing was removed from the mirror and the account is perfectly reachable,
+  // so the shared "unreachable" wording would be an outright lie — mirrors CloudDriveConnection.
+  const partial = account.state === "error";
   const unreachable = account.state !== "ok";
   return (
     <div>
@@ -425,7 +429,7 @@ function AccountBlock({
           <span className="truncate text-sm text-ink">{account.email ?? account.label}</span>
           {unreachable ? (
             <span className="shrink-0 text-[0.625rem] uppercase tracking-wide text-st-due">
-              unreachable
+              {partial ? "sync didn’t finish" : "unreachable"}
             </span>
           ) : (
             <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--st-quick)]" />
@@ -440,6 +444,12 @@ function AccountBlock({
           Disconnect
         </Button>
       </div>
+      {partial && (
+        <p className="mt-0.5 text-xs text-ink4">
+          The last sync didn&rsquo;t reach the end of this calendar. The events already mirrored are
+          kept — nothing was removed — and the next sync picks up the rest.
+        </p>
+      )}
       {calendars.length > 0 ? (
         <>
           <ul className="mt-1.5 max-h-44 overflow-y-auto">

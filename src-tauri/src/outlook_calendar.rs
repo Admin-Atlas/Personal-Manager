@@ -82,13 +82,16 @@ pub async fn list_calendars(token_key: &str) -> Result<(Vec<RawCalendarInput>, b
 /// Fetch one calendar's events within `[time_min, time_max]` (RFC3339), recurrences pre-expanded via
 /// `calendarView`, ordered by start. `mirror_calendar_id` is the owning [`crate::calendar::Calendar::
 /// id`] the events are stored under; `remote_id` is Graph's own calendar id for the path.
+///
+/// Returns `(events, complete)`, matching the Google sibling: a page-run stopped by the runaway guard
+/// is a PARTIAL picture, and [`crate::calendar::replace_events`] must not reap off it.
 pub async fn fetch_events(
     token_key: &str,
     mirror_calendar_id: &str,
     remote_id: &str,
     time_min: &str,
     time_max: &str,
-) -> Result<Vec<CalendarEvent>> {
+) -> Result<(Vec<CalendarEvent>, bool)> {
     // Build the path via `path_segments_mut` (not string interpolation): a Graph calendar id is an
     // opaque, often base64url token that can contain `/`, which spliced into the path raw would
     // become extra segments and 404 the request — silently dropping a non-default calendar. Mirrors
@@ -105,10 +108,11 @@ pub async fn fetch_events(
         .append_pair("$orderby", "start/dateTime")
         .append_pair("$top", &PAGE_SIZE.to_string());
 
-    // `@odata.nextLink` is the cursor here too; the guard stays a silent backstop (flag discarded),
-    // matching the prior behaviour.
+    // `@odata.nextLink` is the cursor here too. The guard's flag travels back rather than being
+    // discarded — dropping it here was the quieter half of the same defect the Google path had, with
+    // not even an eprintln to show for it.
     let initial = url.to_string();
-    let (out, _truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
+    let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
         let initial = initial.as_str();
         async move {
             let u = cursor.unwrap_or_else(|| initial.to_string());
@@ -117,7 +121,13 @@ pub async fn fetch_events(
         }
     })
     .await?;
-    Ok(out)
+    if truncated {
+        eprintln!(
+            "outlook: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more pages \
+             pending; its mirror may be truncated this sync"
+        );
+    }
+    Ok((out, !truncated))
 }
 
 // --- pure parsing (unit-tested) ------------------------------------------------------------------

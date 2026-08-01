@@ -5812,13 +5812,19 @@ pub async fn add_ics_feed(
         let conn = state.conn()?;
         (resolve_zone(&conn), calendar::time_window(&conn)?)
     };
-    let events = calendar::sync_feed(&feed, &time_min, &time_max, tz).await?;
+    let (events, complete) = calendar::sync_feed(&feed, &time_min, &time_max, tz).await?;
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::save_new_feed(&feed)?;
     calendar::register_feed_source(&conn, &feed)?;
-    calendar::replace_events(&conn, &feed.id, &events)?;
-    calendar::set_last_sync(&conn)?;
+    calendar::replace_events(&conn, &feed.id, &events, complete)?;
+    // "Last synced" means "last COMPLETE sync": a feed that parsed only partly is still added (the
+    // events it gave are real), but stamping it clean would claim a picture we don't have.
+    if complete {
+        calendar::set_last_sync(&conn)?;
+    } else {
+        calendar::set_source_state(&conn, &feed.id, "error")?;
+    }
     Ok(())
 }
 
@@ -5876,7 +5882,9 @@ pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
 // --- shared sync over every provider ---
 
 /// Pull events from a single selected calendar (provider-dispatched) and write them to the mirror.
-/// Returns the event count. Never holds the DB lock across the fetch (rule #4).
+/// Returns `(event count, complete)` — `complete` is the fetch's own verdict on whether it saw the
+/// whole calendar, and gates the mirror's delete half plus the caller's state stamp. Never holds the
+/// DB lock across the fetch (rule #4).
 async fn sync_one_calendar(
     app: &AppHandle,
     cal: &calendar::Calendar,
@@ -5884,8 +5892,8 @@ async fn sync_one_calendar(
     time_min: &str,
     time_max: &str,
     tz: chrono_tz::Tz,
-) -> Result<usize> {
-    let events = match cal.provider.as_str() {
+) -> Result<(usize, bool)> {
+    let (events, complete) = match cal.provider.as_str() {
         "google" => {
             let email = calendar::account_email_of(&cal.source_id).ok_or_else(|| {
                 Error::Other(format!("bad calendar source id: {}", cal.source_id))
@@ -5928,8 +5936,8 @@ async fn sync_one_calendar(
     let n = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    calendar::replace_events(&conn, &cal.id, &events)?;
-    Ok(n)
+    calendar::replace_events(&conn, &cal.id, &events, complete)?;
+    Ok((n, complete))
 }
 
 /// Re-fetch each connected OAuth account's calendar LIST and reconcile the registry before events are
@@ -5987,6 +5995,9 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
 /// Returns the total events synced. Best-effort per source and never holds the DB lock across a fetch
 /// (rule #4); a source whose every calendar failed flips to `unreachable` while the rest keep their
 /// last-good events. Surfaces an error only if at least one source failed (the successes are committed).
+/// A source that fetched but couldn't see the whole calendar is stamped `error` ("the pass ran but
+/// didn't finish") rather than returned as an error — the write genuinely succeeded, so the honest
+/// signal is the state, not a toast.
 #[tauri::command]
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let _ = migrate_legacy_google_calendar(&app).await;
@@ -6022,6 +6033,11 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 
     let mut total = 0usize;
     let mut ok_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A source whose fetch SUCCEEDED but couldn't see the whole calendar. Its events were written
+    // (merged, never reaped — see `calendar::replace_events`), so it is neither a failure nor a
+    // clean sync; it gets its own bucket and the 'error' state, meaning "the pass ran but didn't
+    // finish", exactly as Drive and the local folder already use it.
+    let mut partial_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut failed_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_err: Option<Error> = None;
 
@@ -6048,9 +6064,13 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let mut results = futures_util::stream::iter(fetches).buffered(CALENDAR_FETCH_CONCURRENCY);
     while let Some((cal, result)) = results.next().await {
         match result {
-            Ok(n) => {
+            Ok((n, complete)) => {
                 total += n;
-                ok_sources.insert(cal.source_id.clone());
+                if complete {
+                    ok_sources.insert(cal.source_id.clone());
+                } else {
+                    partial_sources.insert(cal.source_id.clone());
+                }
             }
             Err(e) => {
                 failed_sources.insert(cal.source_id.clone());
@@ -6073,15 +6093,21 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         // A source with ANY failed calendar this round is 'unreachable' — check failures FIRST, so
         // a partially-failed account (some calendars ok, some not) isn't stamped a clean 'ok' and
         // hidden from the Connectors warning. A source that failed keeps its last-good events.
+        // Incompleteness is checked next, for the same reason one rung down: a source with one
+        // truncated calendar must not be stamped 'ok' just because its other calendars finished.
         for acc in calendar::list_sources(&conn, None)? {
             if failed_sources.contains(&acc.id) {
                 calendar::set_source_state(&conn, &acc.id, "unreachable")?;
+            } else if partial_sources.contains(&acc.id) {
+                calendar::set_source_state(&conn, &acc.id, "error")?;
             } else if ok_sources.contains(&acc.id) {
                 calendar::set_source_synced(&conn, &acc.id)?;
             }
         }
-        // Only stamp a clean global sync when every selected source refreshed.
-        if last_err.is_none() {
+        // Only stamp a clean global sync when every selected source refreshed IN FULL — "last
+        // synced" has to keep meaning "last complete sync", or a permanently-truncated calendar
+        // would show a fresh timestamp over a mirror that is quietly missing its tail.
+        if last_err.is_none() && partial_sources.is_empty() {
             calendar::set_last_sync(&conn)?;
         }
         // The mirror just moved, so what the briefing says about today may have moved with it (a

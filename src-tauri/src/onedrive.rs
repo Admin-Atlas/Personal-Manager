@@ -644,8 +644,9 @@ pub async fn list_delta(
 /// only the files beneath them. Any item id in `exclude` is never enqueued — pruning that folder and
 /// its whole subtree, both as a seed root and as a descended child. The folder-scoped counterpart to
 /// [`list_delta`].
-/// Returns the deduped files plus whether the walk was cut short by the folder-count guard (`true` ⇒
-/// INCOMPLETE — the caller must not treat an unseen file as deleted; see [`connector_sync::paginate`]).
+/// Returns the deduped files plus whether the walk was cut short — by the folder-count guard, or by one
+/// folder's page guard (`true` ⇒ INCOMPLETE — the caller must not treat an unseen file as deleted; see
+/// [`connector_sync::paginate`]).
 pub async fn enumerate_folders(
     token_key: &str,
     roots: &[String],
@@ -662,6 +663,7 @@ pub async fn enumerate_folders(
         .cloned()
         .collect();
     let mut nodes = 0usize;
+    let mut truncated = false;
     while let Some(folder) = queue.pop() {
         if !seen_folders.insert(folder.clone()) {
             continue; // a folder reachable two ways (nested selections) — walk it once.
@@ -671,26 +673,34 @@ pub async fn enumerate_folders(
             eprintln!("onedrive: folder walk hit the node guard at {MAX_PAGES} folders");
             return Ok((out, true));
         }
-        let mut url = item_children_url(&folder);
-        loop {
-            let v = microsoft::authorized_get(token_key, &url).await?;
-            let (children, next) = parse_children(&v);
-            for child in children {
-                if child.is_folder {
-                    if !excluded.contains(child.id.as_str()) {
-                        queue.push(child.id);
-                    }
-                } else if child.is_file && seen_files.insert(child.id.clone()) {
-                    out.push(child);
-                }
+        // One bounded pagination per folder — the same guard every other listing uses. A `nextLink`
+        // that never clears now flags the walk incomplete instead of spinning forever while re-pushing
+        // the same children into `queue` until the process runs out of memory.
+        let initial = item_children_url(&folder);
+        let (children, page_truncated) = connector_sync::paginate(MAX_PAGES, |cursor| {
+            let initial = initial.as_str();
+            async move {
+                let url = cursor.unwrap_or_else(|| initial.to_string());
+                let v = microsoft::authorized_get(token_key, &url).await?;
+                Ok(parse_children(&v))
             }
-            match next {
-                Some(n) => url = n,
-                None => break,
+        })
+        .await?;
+        if page_truncated {
+            eprintln!("onedrive: folder {folder} hit the page guard at {MAX_PAGES} pages");
+            truncated = true;
+        }
+        for child in children {
+            if child.is_folder {
+                if !excluded.contains(child.id.as_str()) {
+                    queue.push(child.id);
+                }
+            } else if child.is_file && seen_files.insert(child.id.clone()) {
+                out.push(child);
             }
         }
     }
-    Ok((out, false))
+    Ok((out, truncated))
 }
 
 /// The immediate subfolders of `parent_id` (or the drive root when `None`) — one lazy level of the
@@ -737,6 +747,30 @@ pub fn is_cursor_expired(err: &Error) -> bool {
 pub fn is_auth_failure(err: &Error) -> bool {
     let s = err.to_string();
     s.contains("(401") || s.contains("(403")
+}
+
+/// True if a Graph error on ONE item's body fetch is a per-item denial — forbidden (403), gone
+/// (404/410) or locked (423: malware-flagged, checked out, a locked Personal Vault) — rather than a
+/// throttle. The Graph sibling of [`crate::drive::is_item_forbidden_or_missing`], and used for the same
+/// reason: phase 2 skips that one file (recording an issue) instead of failing the account, whose delta
+/// cursor would otherwise be held at its last-good value forever, replaying the same poison item every
+/// pass with no lever for a whole-drive account to exclude it.
+///
+/// SharePoint/OneDrive also answers 403 for **throttling** (`activityLimitReached`,
+/// `quotaLimitReached`), which is retryable and must not match — the same exclusion
+/// [`crate::drive::is_rate_limited`] carves out of Drive's classifier. 401 is deliberately absent: a
+/// revoked token is account-wide, not per-item.
+///
+/// A mass denial (every item 403s ⇒ every item skipped ⇒ the cursor advances over a silent whole-drive
+/// gap) needs no counter here: `/root/delta` and `/items/{id}/content` share one token and one scope,
+/// so a lost grant fails phase 1 first and routes through [`is_auth_failure`] to the whole-account
+/// `SourceFailure` fan-out before any body is ever fetched.
+pub fn is_item_unfetchable(err: &Error) -> bool {
+    let s = err.to_string();
+    if s.contains("activityLimitReached") || s.contains("quotaLimitReached") {
+        return false;
+    }
+    s.contains("(403") || s.contains("(404") || s.contains("(410") || s.contains("(423")
 }
 
 /// Fetch a file's body as indexable text, or `None` if it has no useful text (skipped type, empty, or
@@ -1009,6 +1043,36 @@ mod tests {
             file: None,
         };
         assert_eq!(map_change(&folder, "a@b.com", false), None);
+    }
+
+    #[test]
+    fn is_item_unfetchable_matches_per_item_denials_but_never_a_throttle() {
+        // The classifier decides whether ONE bad item skips or holds the whole account's delta
+        // cursor. A per-item denial that held the cursor pinned the account forever; a throttle that
+        // skipped would step the cursor past a change PM never applied. Both directions are bugs, so
+        // both are pinned here — the two halves are otherwise indistinguishable stringly-typed 403s.
+        for denial in [
+            "Microsoft Graph request failed (404 Not Found): itemNotFound",
+            "Microsoft Graph request failed (403 Forbidden): accessDenied",
+            "Microsoft Graph request failed (423 Locked): malwareDetected",
+            "Microsoft Graph request failed (410 Gone): ",
+        ] {
+            assert!(
+                is_item_unfetchable(&Error::Other(denial.into())),
+                "{denial}"
+            );
+        }
+        for retryable in [
+            "Microsoft Graph request failed (429 Too Many Requests): ",
+            "Microsoft Graph request failed (503 Service Unavailable): ",
+            "Microsoft Graph request failed (403 Forbidden): activityLimitReached",
+            "Microsoft session expired — reconnect in Settings.",
+        ] {
+            assert!(
+                !is_item_unfetchable(&Error::Other(retryable.into())),
+                "{retryable}"
+            );
+        }
     }
 
     #[test]

@@ -52,6 +52,7 @@ import {
   isOverlayEvent,
   isPinboardEvent,
   MILESTONE_CALENDAR_ID,
+  occurrenceKey,
   PINBOARD_CALENDAR_ID,
   startOfDay,
 } from "../../lib/calendar-layout";
@@ -470,16 +471,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   );
 
   const visibleEvents = useMemo(() => {
-    // Filter to visible calendars, THEN dedup the same physical event mirrored on two of them (same
-    // iCal UID), keeping the first visible copy — otherwise it renders twice in the grid/agenda. Done
-    // after the hide filter so hiding one calendar still shows the copy on the calendar left visible.
+    // Filter to visible calendars, THEN dedup the same physical OCCURRENCE mirrored on two of them
+    // (same iCal UID *and* start), keeping the first visible copy — otherwise it renders twice in the
+    // grid/agenda. Done after the hide filter so hiding one calendar still shows the copy on the
+    // calendar left visible. Keyed on the UID alone this also collapsed every recurring series to one
+    // occurrence across the whole mirror — see `occurrenceKey`, which FocusUpcoming shares.
     const seen = new Set<string>();
     const out: CalendarEvent[] = [];
     for (const e of events) {
       if (hidden.has(e.calendar_id)) continue;
-      if (e.uid) {
-        if (seen.has(e.uid)) continue;
-        seen.add(e.uid);
+      const key = occurrenceKey(e);
+      if (key !== null) {
+        if (seen.has(key)) continue;
+        seen.add(key);
       }
       out.push(e);
     }

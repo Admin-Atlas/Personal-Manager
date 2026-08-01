@@ -402,16 +402,19 @@ pub struct AppState {
     /// Cooperative single-writer lock state for the engaged shared vault, if any.
     pub lock_session: Mutex<lock_session::LockSession>,
     /// Snapshot of the currently-running Drive sync (so the UI can resume showing progress after the
-    /// user navigates away and back). Empty/`running:false` when no sync is in flight.
+    /// user navigates away and back). Empty/`running:false` when no sync is in flight. Listed in
+    /// [`AppState::connector_slots`].
     pub drive_sync: Mutex<CloudSyncState>,
     /// Cooperative stop flag for the running Drive sync. `stop_drive_sync` sets it; the sync loop
     /// checks it between files and halts, keeping everything indexed so far. Reset at each sync start.
     pub drive_sync_cancel: AtomicBool,
-    /// Snapshot of the currently-running OneDrive sync (the Microsoft sibling of `drive_sync`).
+    /// Snapshot of the currently-running OneDrive sync (the Microsoft sibling of `drive_sync`). Listed
+    /// in [`AppState::connector_slots`].
     pub onedrive_sync: Mutex<CloudSyncState>,
     /// Cooperative stop flag for the running OneDrive sync (the sibling of `drive_sync_cancel`).
     pub onedrive_sync_cancel: AtomicBool,
     /// Snapshot of the currently-running local-folder sync (the filesystem sibling of `drive_sync`).
+    /// Listed in [`AppState::connector_slots`].
     pub local_sync: Mutex<LocalFolderSyncState>,
     /// Cooperative stop flag for the running local-folder sync (the sibling of `drive_sync_cancel`).
     pub local_sync_cancel: AtomicBool,
@@ -564,16 +567,21 @@ impl AppState {
         self.ingest_busy.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Whether a Drive or OneDrive sync is currently running — the idle indexer defers to either so they
-    /// don't contend for the engine (mirrors the layout precompute's idle-priority).
+    /// Every detached connector-sync slot, in one place. **A new connector MUST be added here.**
+    ///
+    /// This register is the stand-down gate seven background jobs share through
+    /// [`AppState::sync_active`]: the backup schedule, the chat index, the chat rolling summary, the
+    /// briefing, flag detection, the activity rollup, and the orphan sweep's delete refusal. Omitting a
+    /// slot fails silently — all seven simply read "nothing is syncing" — which is what shipped for the
+    /// local-folder slot (audit B1-7).
+    pub fn connector_slots(&self) -> [&dyn connector_sync::SlotStatus; 3] {
+        [&self.drive_sync, &self.onedrive_sync, &self.local_sync]
+    }
+
+    /// Whether ANY connector sync (Drive, OneDrive, local folder) is running right now — background
+    /// jobs defer to all of them so they neither contend for the engine nor act on a half-synced index.
     pub fn sync_active(&self) -> bool {
-        let drive = self.drive_sync.lock().map(|s| s.running).unwrap_or(false);
-        let onedrive = self
-            .onedrive_sync
-            .lock()
-            .map(|s| s.running)
-            .unwrap_or(false);
-        drive || onedrive
+        connector_sync::any_running(&self.connector_slots())
     }
 }
 

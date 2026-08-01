@@ -29,7 +29,7 @@ import { listAllCalendarEvents } from "../lib/ipc";
 import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../lib/calendarGeom";
 import { readHidden, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
-import { addDays, dayKey, startOfDay } from "../lib/calendar-layout";
+import { addDays, dayKey, occurrenceKey, startOfDay } from "../lib/calendar-layout";
 import { sourceColors, useTheme, useUserTime } from "../theme";
 import { formatEventWhen } from "../lib/format";
 import { Card, SegmentedControl } from "./ui";
@@ -152,8 +152,10 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
 
   const calendarIds = useMemo(() => calendars.map((c) => c.id), [calendars]);
 
-  // Filter, then dedup the same physical event mirrored on two calendars (same iCal UID), keeping the
-  // first — the grid buckets by day itself, so events outside the window simply aren't placed.
+  // Filter, then dedup the same physical OCCURRENCE mirrored on two calendars (same iCal UID *and*
+  // start), keeping the first — the grid buckets by day itself, so events outside the window simply
+  // aren't placed. Keyed on the UID alone this also collapsed every recurring series to a single
+  // occurrence across the whole mirror — see `occurrenceKey`, which CalendarView shares.
   //
   // The two exclusions matter because this grid reads the RAW mirror (listAllCalendarEvents), which is
   // deliberately unfiltered, whereas List mode is fed the backend agenda query, which filters quiet.
@@ -167,9 +169,10 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
     const out: CalendarEvent[] = [];
     for (const e of allEvents) {
       if (quiet.has(e.calendar_id) || hiddenIds.has(e.calendar_id)) continue;
-      if (e.uid) {
-        if (seen.has(e.uid)) continue;
-        seen.add(e.uid);
+      const key = occurrenceKey(e);
+      if (key !== null) {
+        if (seen.has(key)) continue;
+        seen.add(key);
       }
       out.push(e);
     }

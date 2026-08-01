@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.113.3-alpha",
+    date: "2026-07-31",
+    highlights: [
+      "Repeating calendar events now show every time they happen. PM was treating a whole repeating series as a single event, so a weekly meeting appeared exactly once in your agenda and once in the calendar — the other fifty-one were there in the mirror but never drawn. Your Month, Week and Year views and the Upcoming list on Focus will suddenly look a lot fuller, which is the honest picture.",
+      "Editing just one occurrence of a repeating event no longer makes it vanish. If you changed the title or the room for a single Tuesday and left the time alone, that Tuesday disappeared from PM entirely. It now shows, with your edit. All-day repeating events also now land on the dates the feed actually names, on every machine — before, they could sit a day out.",
+      "A calendar sync that doesn't finish no longer quietly shortens your calendar. If PM only got part of the way through fetching a calendar, it used to replace the whole mirror with whatever it had, so events silently went missing until the next full sync. Now it adds what it found, removes nothing, and the calendar's panel tells you the sync didn't finish.",
+      "Cloud connectors cope with the awkward cases instead of giving up on the whole account. One folder in your Drive you're not allowed to open no longer marks the entire account unreachable, and a single file OneDrive will never hand over no longer leaves the account stuck on an error forever, never syncing again. Reconnecting after a long gap now also notices the files you deleted while PM wasn't looking, instead of leaving them in your library.",
+      "Tracked folders on this device keep up with folder-level changes. Renaming or deleting a subfolder inside a folder you track is now picked up straight away, rather than leaving those files pointing at a path that no longer exists until the next scheduled scan. And if part of a tracked folder can't be read — a drive that unmounted, a permission you don't have — PM says so and removes nothing, instead of assuming everything under it was deleted.",
+      "Background work now waits its turn during a scan of a folder on this device, the way it already did for Drive and OneDrive. That includes the scheduled backup and the tidy-up that removes files, so neither runs against a half-scanned picture.",
+    ],
+  },
+  {
     version: "3.113.2-alpha",
     date: "2026-07-31",
     highlights: [
