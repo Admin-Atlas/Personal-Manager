@@ -64,3 +64,49 @@ describe("Field", () => {
     expect(document.getElementById(describedBy!)?.textContent).toBe("At least 12 characters.");
   });
 });
+
+// Eleven sites use the HOOK with a sibling `<label>` rather than the component, because `Field`
+// hard-codes `text-sm text-ink2` and a `gap-1` column while those sites carry their own type scale,
+// bespoke `mt-3`/`mt-4` spacing and trailing links. The cases above prove `Field`'s layout wires up;
+// this proves the shape those eleven actually emit does — a label and a control as plain siblings,
+// associated by nothing but the two spreads.
+describe("useFieldA11y spread over sibling elements", () => {
+  function SiblingPair({ error }: { error?: string }) {
+    const a11y = useFieldA11y({ error });
+    return (
+      <div>
+        <label {...a11y.labelProps} className="block text-sm font-medium text-ink2">
+          OpenRouter API key
+        </label>
+        <input {...a11y.controlProps} type="password" placeholder="sk-or-..." />
+        {error && <p {...a11y.errorProps}>{error}</p>}
+      </div>
+    );
+  }
+
+  it("names the control by the label rather than by the placeholder", () => {
+    const { getByLabelText, queryByLabelText } = render(<SiblingPair />);
+    expect(getByLabelText("OpenRouter API key")).toBeTruthy();
+    // The defect this closes: with no association the placeholder was the last-resort name, and it
+    // disappeared on the first keystroke.
+    expect(queryByLabelText("sk-or-...")).toBeNull();
+  });
+
+  it("announces a validation error and points the control at it", () => {
+    const { getByLabelText, getByRole } = render(<SiblingPair error="Couldn't read that" />);
+    const input = getByLabelText("OpenRouter API key");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(getByRole("alert").id).toBe(input.getAttribute("aria-describedby"));
+  });
+
+  it("mints distinct ids for two pairs on the same surface", () => {
+    const { getAllByLabelText } = render(
+      <>
+        <SiblingPair />
+        <SiblingPair />
+      </>,
+    );
+    const [first, second] = getAllByLabelText("OpenRouter API key");
+    expect(first.id).not.toBe(second.id);
+  });
+});

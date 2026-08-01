@@ -149,4 +149,31 @@ describe("SettingRow", () => {
     );
     expect(getByText("App lock").className).toBe("text-sm font-medium text-ink2");
   });
+
+  // Four rows shipped hand-written because the row's `mt-3` is a visible 12px on a section's FIRST
+  // child, and `cn()` could not cancel it: a caller's `mt-0` is emitted alongside `mt-3`, and
+  // Tailwind's ascending margin order hands the win to `mt-3`. Hence a variant, not a className —
+  // and the assertions are on the exact strings, because "contains mt-0" would pass on `mt-0 mt-3`,
+  // which is the bug.
+  it("spaces a row from the one above it by default", () => {
+    const { getByRole } = render(
+      <SettingRow label="Map tab">
+        {(a11y) => <Toggle {...a11y} checked onChange={() => {}} />}
+      </SettingRow>,
+    );
+    expect(getByRole("switch").parentElement?.className).toBe(
+      "mt-3 flex justify-between gap-3 items-center",
+    );
+  });
+
+  it("emits no top margin at all for the first row of a section", () => {
+    const { getByRole } = render(
+      <SettingRow label="Map tab" spacing="none">
+        {(a11y) => <Toggle {...a11y} checked onChange={() => {}} />}
+      </SettingRow>,
+    );
+    const className = getByRole("switch").parentElement?.className ?? "";
+    expect(className).toBe("flex justify-between gap-3 items-center");
+    expect(className).not.toMatch(/\bmt-/);
+  });
 });

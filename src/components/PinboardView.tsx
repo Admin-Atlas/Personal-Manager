@@ -203,7 +203,7 @@ function WidgetTile({
       {/* A note shows its size inline in its own footer (see NoteBody); timeline/folder keep the
           compact coords strip. */}
       {showPower && widget.kind !== "note" && (
-        <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[0.5625rem] text-faint">
+        <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[0.5625rem] text-ink4">
           {widget.rect.x},{widget.rect.y} · {widget.rect.w}×{widget.rect.h}
         </div>
       )}
@@ -509,7 +509,7 @@ export function PinboardView() {
         </div>
         <div className="flex items-center gap-2">
           {showPower && board.widgets.length > 0 && (
-            <span className="mr-1 font-mono text-[0.625rem] uppercase tracking-wide text-faint">
+            <span className="mr-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
               {board.widgets.length} item{board.widgets.length === 1 ? "" : "s"}
             </span>
           )}
@@ -1308,7 +1308,7 @@ const NoteBody = memo(function NoteBody({
               </div>
             )}
             {showPower && (
-              <span className="font-mono text-[0.5625rem] text-faint">
+              <span className="font-mono text-[0.5625rem] text-ink4">
                 {widget.rect.w}×{widget.rect.h}
               </span>
             )}

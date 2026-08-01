@@ -79,7 +79,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                         "flex h-5 w-5 items-center justify-center text-xs",
                         cell.isToday &&
                           "rounded-[var(--radius-sm)] bg-accent font-medium text-accent-ink",
-                        !cell.isToday && (cell.inMonth ? "text-ink2" : "text-faint"),
+                        !cell.isToday && (cell.inMonth ? "text-ink2" : "text-ink4"),
                       )}
                     >
                       {cell.date.getDate()}

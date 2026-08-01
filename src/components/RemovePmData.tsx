@@ -316,7 +316,7 @@ export function RemovePmData({ biometricAvailable }: Props) {
 
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-remove-data">
-      <label className="block text-sm font-medium text-st-due">Remove PM data</label>
+      <h2 className="block text-sm font-medium text-st-due">Remove PM data</h2>
       <p className="mt-1 text-xs text-ink4">
         Erase PM from this machine — choose exactly what to remove. Uninstalling PM the usual way
         already clears the big re-downloadable components; this is for clearing your actual data,

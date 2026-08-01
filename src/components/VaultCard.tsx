@@ -176,7 +176,7 @@ export function VaultCard() {
 
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-vault">
-      <label className="block text-sm font-medium text-ink2">Vault</label>
+      <h2 className="block text-sm font-medium text-ink2">Vault</h2>
 
       {status && (
         <p className="mt-1 text-xs text-ink4">
@@ -523,7 +523,7 @@ export function VaultCard() {
       </div>
 
       {error && <p className="mt-2 break-all text-xs text-st-due">{error}</p>}
-      {msg && <p className="mt-2 break-all text-xs text-faint">{msg}</p>}
+      {msg && <p className="mt-2 break-all text-xs text-ink4">{msg}</p>}
 
       <SectionInfo title="How the vault works">
         {shareable && (

@@ -28,13 +28,23 @@
 // The items-start/items-center split is driven by whether there IS a description, which is content,
 // not an axis: this component takes no Depth input and must never fork layout.
 //
-// `className` is for SPACING only (a row that needs `mt-2` rather than the usual `mt-3`). Do not
-// reach for it to restyle the label — `cn()` is a plain joiner, so a rival `text-xs` would not
-// replace `text-sm`, it would race it. Size and weight differences are the `emphasis` variant.
+// There is NO `className` prop, for the same reason `SectionLabel` has none. An earlier draft
+// documented one "for spacing only", and that escape could never have worked: `cn()` is a plain
+// joiner, so a caller's `mt-0` would be emitted ALONGSIDE this file's `mt-3`, and Tailwind emits
+// margin utilities in ascending order — `mt-3` wins and the caller's intent is silently dead. That
+// is not hypothetical; it is why four rows were left hand-written when the rest were converted.
+// Spacing is the `spacing` variant, size and weight are the `emphasis` variant, and anything else
+// is a new variant here rather than a class string racing this one at the call site.
 
 import type { ReactNode } from "react";
 import { cn } from "./cn";
 import { useFieldA11y, type FieldA11y } from "./Field";
+
+// SWAP, never layer — one complete margin string per value, and "none" contributes nothing at all.
+const SPACING = {
+  row: "mt-3",
+  none: "",
+} as const;
 
 export interface SettingRowProps {
   /** The visible label AND the control's accessible name. Written once, here. */
@@ -51,8 +61,10 @@ export interface SettingRowProps {
   /** "default" is the ordinary row label; "strong" is the heavier `font-medium` treatment worn by
    *  the rows whose section is a single control (App lock, Duplicate check, Help mode). */
   emphasis?: "default" | "strong";
-  /** Spacing only — see the header. */
-  className?: string;
+  /** Top margin. "row" (default) is the `mt-3` that separates a row from the row above it. "none"
+   *  is for a row that is the FIRST child of its own section, where the section's own `pt-4` (or a
+   *  card's padding) already supplies the space — adding `mt-3` there is a visible 12px. */
+  spacing?: keyof typeof SPACING;
   /** Renders the control, spreading the passed ARIA props onto it so it is named by `label`. */
   children: (controlProps: FieldA11y["controlProps"]) => ReactNode;
 }
@@ -63,7 +75,7 @@ export function SettingRow({
   aside,
   helpId,
   emphasis = "default",
-  className,
+  spacing = "row",
   children,
 }: SettingRowProps) {
   const a11y = useFieldA11y({ description });
@@ -83,9 +95,9 @@ export function SettingRow({
     <div
       data-help={helpId}
       className={cn(
-        "mt-3 flex justify-between gap-3",
+        SPACING[spacing],
+        "flex justify-between gap-3",
         description != null ? "items-start" : "items-center",
-        className,
       )}
     >
       {description != null ? (

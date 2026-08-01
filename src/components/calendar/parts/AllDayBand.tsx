@@ -101,7 +101,7 @@ export function AllDayBand({
         className="flex shrink-0 items-start justify-end pr-2 pt-1"
         style={{ width: `${gutterPx}px` }}
       >
-        {showLabel && <span className="font-mono text-[0.5625rem] text-faint">all-day</span>}
+        {showLabel && <span className="font-mono text-[0.5625rem] text-ink4">all-day</span>}
       </div>
       <div className="relative flex-1" style={{ height: `${laneCount * LANE_H}px` }}>
         {placed.map((b) => {

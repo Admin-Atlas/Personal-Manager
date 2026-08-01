@@ -61,7 +61,7 @@ export function PopoverRoot() {
             >
               <span
                 data-tauri-drag-region
-                className="font-mono text-[0.6875rem] uppercase tracking-wide text-faint"
+                className="font-mono text-[0.6875rem] uppercase tracking-wide text-ink4"
               >
                 Briefing — Today
               </span>

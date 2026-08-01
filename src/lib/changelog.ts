@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.3-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Status colours are noticeably deeper in light mode. Due soon, Blocked, Quick win, Take a look and Part of were all below the readability floor as text on a light background — Take a look as low as 3.1 against a required 4.5 — and turning on High contrast did not help, because that setting never touched these colours at all. Every one of them now clears the floor on every background, in all three looks and in the colour-blind-safe palette. Amber moves the furthest, so warning notices read considerably stronger. Dark mode is unchanged.",
+      "Text you are meant to read is no longer drawn in PM's faintest grey. That grey sits well below the readability floor, so around fifty places — empty states, file paths on the vault screens, counts, timestamps, the notes under settings — have moved up a step. The faint grey stays, but now only for genuine decoration: separators, placeholder dots, and disabled buttons.",
+      "The last settings fields that were labelled only visually are now properly attached to their controls, so a screen reader reads the right name for each. Getting a preference wrong in Teach also says so out loud now; it used to fail completely silently.",
+    ],
+  },
+  {
     version: "3.114.2-alpha",
     date: "2026-08-01",
     highlights: [

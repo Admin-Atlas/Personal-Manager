@@ -239,7 +239,7 @@ function Sources({
                 className="rounded-[var(--radius-sm)] px-1 transition-colors duration-500 motion-reduce:transition-none"
                 style={flash === i + 1 ? { background: "var(--accent-soft)" } : undefined}
               >
-                <span className="text-faint">[{i + 1}]</span>{" "}
+                <span className="text-ink4">[{i + 1}]</span>{" "}
                 {chatLink ? (
                   <button
                     type="button"
@@ -604,7 +604,7 @@ const MessageBlock = memo(function MessageBlock({
         <SaveAsNoteButton message={message} />
       )}
       {showProvenance && message.role === "assistant" && atLeast("standard") && message.model && (
-        <p className="px-1 text-[0.625rem] text-faint" data-help="chat-provenance">
+        <p className="px-1 text-[0.625rem] text-ink4" data-help="chat-provenance">
           via {shortModel(message.model)}
           {provider ? ` · ${provider}` : ""}
         </p>

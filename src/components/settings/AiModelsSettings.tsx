@@ -30,6 +30,7 @@ import {
   SectionLabel,
   Textarea,
   Toggle,
+  useFieldA11y,
   VisuallyHidden,
 } from "../ui";
 import { TabResetSection } from "./ResetControls";
@@ -96,6 +97,11 @@ export function AiModelsSettings({
   // gate (localStorage), shared with the Review tab's "Turn on AI" banner — off by default.
   const [reviewAi, setReviewAi] = useState(readReviewAiEnabled);
   const [error, setError] = useState<string | null>(null);
+  // The two key fields' label/control wiring. Both labels sat above their Input with no htmlFor, so
+  // the placeholder was the last-resort accessible name: the most consequential input in PM
+  // announced as "sk-or-... , password", and lost even that the moment typing started.
+  const keyField = useFieldA11y();
+  const bgKeyField = useFieldA11y();
 
   useEffect(() => {
     let cancelled = false;
@@ -261,14 +267,23 @@ export function AiModelsSettings({
     <>
       {error && <Callout className="mt-4">{error}</Callout>}
 
+      {/* This label doubles as the AI tab's scroll-spy anchor — `useScrollSpy` (SettingsView:151)
+          and `scrollToSection` both query `#sec-ai-keys`. So `labelProps` is NOT spread here: its
+          `id` would overwrite that anchor and silently break the sub-nav highlight. `htmlFor` does
+          the association, and `aria-labelledby` is re-pointed at the anchor id — leaving the hook's
+          own labelId in place would name the field after an element that is not in the DOM, which
+          resolves to an EMPTY name rather than falling back. */}
       <label
         id="sec-ai-keys"
         data-settings-section
+        htmlFor={keyField.labelProps.htmlFor}
         className="mt-5 block text-sm font-medium text-ink2"
       >
         OpenRouter API key
       </label>
       <Input
+        {...keyField.controlProps}
+        aria-labelledby="sec-ai-keys"
         type="password"
         autoComplete="off"
         data-help="settings-api-key"
@@ -291,8 +306,11 @@ export function AiModelsSettings({
         </a>
       )}
 
-      <label className="mt-4 block text-sm font-medium text-ink2">Background API key</label>
+      <label {...bgKeyField.labelProps} className="mt-4 block text-sm font-medium text-ink2">
+        Background API key
+      </label>
       <Input
+        {...bgKeyField.controlProps}
         type="password"
         autoComplete="off"
         data-help="settings-background-key"
@@ -515,7 +533,7 @@ export function AiModelsSettings({
           ) : (
             <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
           )}
-          <p className="mt-2 text-xs text-faint">
+          <p className="mt-2 text-xs text-ink4">
             Local models (Settings → Local AI) aren&apos;t counted here — this ledger tracks only
             your paid cloud calls.
           </p>

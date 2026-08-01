@@ -72,7 +72,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, State> {
           <Collapsible className="mt-3" title="Technical details" defaultOpen={false}>
             <p className="mt-2 font-mono text-xs break-words text-ink3">{message}</p>
             {stack !== null && (
-              <pre className="mt-2 max-h-48 overflow-auto font-mono text-xs whitespace-pre-wrap text-faint">
+              <pre className="mt-2 max-h-48 overflow-auto font-mono text-xs whitespace-pre-wrap text-ink4">
                 {stack}
               </pre>
             )}

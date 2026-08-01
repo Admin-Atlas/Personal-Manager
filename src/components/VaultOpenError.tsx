@@ -219,9 +219,7 @@ export function VaultOpenError({
         onConfirm={() => void detach()}
       />
 
-      {status.location && (
-        <p className="max-w-xs break-all text-xs text-faint">{status.location}</p>
-      )}
+      {status.location && <p className="max-w-xs break-all text-xs text-ink4">{status.location}</p>}
     </div>
   );
 }

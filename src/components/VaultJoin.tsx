@@ -161,7 +161,7 @@ export function VaultJoin({
         <p className="text-xs text-ink4">
           Anything already set up on this account is kept safely aside — nothing is deleted.
         </p>
-        <p className="text-xs text-faint">
+        <p className="text-xs text-ink4">
           If PM is open on the other account right now, you'll be asked to take over — only one
           account writes at a time.
         </p>
@@ -176,7 +176,7 @@ export function VaultJoin({
       </button>
 
       {vaults.length === 1 && vault && (
-        <p className="max-w-sm break-all text-xs text-faint">{vault.vault_root}</p>
+        <p className="max-w-sm break-all text-xs text-ink4">{vault.vault_root}</p>
       )}
     </div>
   );

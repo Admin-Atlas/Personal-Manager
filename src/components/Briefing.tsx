@@ -117,7 +117,7 @@ export function Briefing({
       data-help="focus-briefing"
     >
       <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
-        <h2 className="font-mono text-[0.6875rem] font-semibold uppercase tracking-wide text-faint">
+        <h2 className="font-mono text-[0.6875rem] font-semibold uppercase tracking-wide text-ink4">
           Today
         </h2>
         <RefreshButton busy={busy} onRefresh={onRefresh} />

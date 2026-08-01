@@ -777,7 +777,7 @@ export function GeneralSettings() {
           </SettingRow>
         )}
         {/* The zone in force is a readout — it stays visible; only what the zone *means* folds away. */}
-        <p className="mt-2 text-xs text-faint">
+        <p className="mt-2 text-xs text-ink4">
           {tzAuto ? `Following this device: ${deviceTimeZone()}` : `Selected: ${timeZone || "—"}`}
         </p>
         <SectionInfo title="What the time zone affects">
@@ -791,18 +791,14 @@ export function GeneralSettings() {
         className="mt-4 border-t border-border pt-4"
         data-help="settings-help-mode"
       >
-        <div className="flex items-start justify-between gap-3">
-          <label className="block text-sm font-medium text-ink2">Help mode</label>
-          <div className="flex items-center gap-2">
-            {!helpIsDefault && <ResetLink onReset={() => help.setEnabled(false)} />}
-            <Toggle
-              checked={help.enabled}
-              onChange={help.setEnabled}
-              ariaLabel="Help mode"
-              className="mt-0.5"
-            />
-          </div>
-        </div>
+        <SettingRow
+          label="Help mode"
+          emphasis="strong"
+          spacing="none"
+          aside={!helpIsDefault && <ResetLink onReset={() => help.setEnabled(false)} />}
+        >
+          {(a11y) => <Toggle {...a11y} checked={help.enabled} onChange={help.setEnabled} />}
+        </SettingRow>
         <SectionInfo title="What is help mode?">
           <p>
             When on, hovering any highlighted section shows a short explanation of what it does.

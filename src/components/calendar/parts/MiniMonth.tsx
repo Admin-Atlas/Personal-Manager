@@ -110,7 +110,7 @@ export function MiniMonth({
           {weekdayLabels.map((w, i) => (
             <div
               key={i}
-              className="text-center font-mono text-faint"
+              className="text-center font-mono text-ink4"
               style={{ fontSize: `${Math.max(9, Math.round(CELL * 0.35))}px` }}
             >
               {w}
@@ -148,7 +148,7 @@ export function MiniMonth({
                     round,
                     isToday && "bg-accent font-medium text-accent-ink",
                     isSelected && "border border-accent text-accent-text",
-                    !isToday && !isSelected && (inMonth ? "text-ink3" : "text-faint"),
+                    !isToday && !isSelected && (inMonth ? "text-ink3" : "text-ink4"),
                   )}
                   style={{
                     height: `${badgePx}px`,

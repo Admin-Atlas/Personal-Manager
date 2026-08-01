@@ -52,6 +52,7 @@ import {
   SectionInfo,
   SectionLabel,
   Select,
+  useFieldA11y,
 } from "../ui";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
@@ -76,6 +77,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const [tokenInput, setTokenInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [confirmForgetToken, setConfirmForgetToken] = useState(false);
+  // The endpoint form's two label/control pairs. Both labels sat above their Input naming nothing,
+  // so the fields announced as the placeholder ("http://localhost:11434", "bearer token").
+  const urlField = useFieldA11y();
+  const tokenField = useFieldA11y();
 
   // Model pull (Ollama only).
   const [pulling, setPulling] = useState<string | null>(null);
@@ -491,7 +496,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
             </>
           )}
         </ConfirmDialog>
-        <p className="mt-3 text-xs text-faint">
+        <p className="mt-3 text-xs text-ink4">
           Local models don't appear in Settings → AI &amp; Models → Usage &amp; cost — that ledger
           tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no
           per-use cost to count.
@@ -649,8 +654,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               </div>
             )}
             <div>
-              <label className="block text-sm font-medium text-ink2">Endpoint URL</label>
+              <label {...urlField.labelProps} className="block text-sm font-medium text-ink2">
+                Endpoint URL
+              </label>
               <Input
+                {...urlField.controlProps}
                 value={urlInput}
                 onChange={(e) => {
                   setUrlInput(e.target.value);
@@ -661,10 +669,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-ink2">
+              <label {...tokenField.labelProps} className="block text-sm font-medium text-ink2">
                 Token <span className="text-ink4">(optional — only for a remote endpoint)</span>
               </label>
               <Input
+                {...tokenField.controlProps}
                 type="password"
                 autoComplete="off"
                 value={tokenInput}
@@ -829,7 +838,7 @@ export function DownloadedModels({
             ))}
           </div>
           {found.length > 0 && (
-            <p className="mt-2 text-xs text-faint">Found via {listJoin(found)}.</p>
+            <p className="mt-2 text-xs text-ink4">Found via {listJoin(found)}.</p>
           )}
         </>
       )}
@@ -872,7 +881,7 @@ function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
       </p>
       <ConfigRow label="In system memory" fit={model.fit} />
       {model.fit.notes.map((n, i) => (
-        <p key={i} className="mt-1 text-xs text-faint">
+        <p key={i} className="mt-1 text-xs text-ink4">
           {n}
         </p>
       ))}
@@ -945,19 +954,19 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
         ))}
       </dl>
       {h.is_wsl && (
-        <p className="mt-1.5 text-xs text-faint">
+        <p className="mt-1.5 text-xs text-ink4">
           Running under WSL — GPU access depends on your WSL setup.
         </p>
       )}
-      {h.notes.length > 0 && <p className="mt-1.5 text-xs text-faint">{h.notes.join(" ")}</p>}
+      {h.notes.length > 0 && <p className="mt-1.5 text-xs text-ink4">{h.notes.join(" ")}</p>}
       {h.vram_gb != null && !h.unified_memory && (
-        <p className="mt-1.5 text-xs text-faint">
+        <p className="mt-1.5 text-xs text-ink4">
           Sized with ~{recs.reserve_gb.toFixed(0)} GB of RAM and ~{recs.gpu_reserve_gb.toFixed(0)}{" "}
           GB of GPU memory kept free.
         </p>
       )}
       {h.vram_gb != null && !h.unified_memory && h.gpu_bandwidth_gbps == null && (
-        <p className="mt-1.5 text-xs text-faint">
+        <p className="mt-1.5 text-xs text-ink4">
           Speed estimates use a default graphics-memory bandwidth — this card's exact model wasn't
           recognised.
         </p>
@@ -1009,7 +1018,7 @@ function NumbersGuide() {
           <dd className="inline text-ink4">{v}</dd>
         </div>
       ))}
-      <p className="pt-1 text-faint">
+      <p className="pt-1 text-ink4">
         Numbers are estimates. Memory assumes an f16 KV cache by default; where a card shows “q8_0
         KV”, PM sized it on a compressed (near-lossless) cache to keep a larger context or quant.
         Your real speed and memory depend on your runner and settings.
@@ -1044,7 +1053,7 @@ function ConfigRow({ label, fit }: { label: string; fit: LocalFitResult }) {
           <ConfigMetrics fit={fit} />
         </div>
       </div>
-      {caveat && <p className="mt-0.5 text-[0.625rem] text-faint">{caveat}</p>}
+      {caveat && <p className="mt-0.5 text-[0.625rem] text-ink4">{caveat}</p>}
     </div>
   );
 }
@@ -1114,7 +1123,7 @@ function RecommendationCard({
               <ConfigRow label="Highest quality" fit={f} />
               <ConfigRow label="Fastest on GPU" fit={rec.gpu.fit} />
               {canPull && (
-                <p className="text-[0.625rem] text-faint">
+                <p className="text-[0.625rem] text-ink4">
                   Download fetches the runner's default quant — set the quant &amp; context to
                   match.
                 </p>
@@ -1188,7 +1197,7 @@ function RecommendationCard({
         ? // Each Split row states its own caveat (and KV chip) via ConfigRow — nothing shared to add.
           null
         : f.notes.length > 0 && (
-            <p className="mt-1.5 text-[0.6875rem] text-faint">{f.notes.join(" ")}</p>
+            <p className="mt-1.5 text-[0.6875rem] text-ink4">{f.notes.join(" ")}</p>
           )}
     </div>
   );

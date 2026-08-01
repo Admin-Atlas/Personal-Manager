@@ -164,7 +164,9 @@ presets; shows/hides optional fields, **never** forks layout).
 (`src/theme/tokens.ts`, ported from `DESIGN_TOKENS.md`) computes CSS custom properties set on
 the document root; **components read only `var(--…)` (or the Tailwind utilities mapped to them),
 never a hex literal.** Role vocabulary: neutrals `--bg --panel --surface --border --border2
---rule --ink --ink2 --ink3 --ink4 --faint`; accent `--accent --accent-text --accent-ink
+--rule --ink --ink2 --ink3 --ink4` plus `--faint`, which is **decorative/disabled only** — no
+Contrast level lifts it, so the text ramp stops at `ink4` and a guard test enforces that; accent
+`--accent --accent-text --accent-ink
 --accent-soft`; status `--st-due --st-blocked --st-quick --st-look --st-part --st-track`; type
 `--head --ui --mono`; corners `--radius --radius-sm`. The only documented hex exceptions are the
 GraphView categorical node palette (`src/theme/graphPalette.ts`) and the fixed modal scrim tint.

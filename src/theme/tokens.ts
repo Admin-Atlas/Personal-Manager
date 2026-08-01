@@ -50,6 +50,11 @@ export interface A11yTheme {
 // the monochrome ramp, plus a small margin) that lifts a role to its WCAG target. Only the roles that
 // actually fall short are listed — so `aa` moves ONLY the lowest text tier (ink4), leaving PM's
 // look all but untouched, while `high` also firms up ink3 (→7:1 body), faint, and the border edges.
+//
+// `faint` being absent from `aa` is deliberate and is WHY it is decorative-only: lifting it to
+// 4.5:1 would land it on top of ink4 (4.73–4.98 after the aa boost) and collapse a tier of the
+// ramp. So it has no contrast floor at the default level, and no text a reader must read may wear
+// it — `designGuards.test.ts` holds the line with a named allow-list.
 const CONTRAST_SHIFT: Record<Contrast, Record<Mode, Partial<Record<Role, number>>>> = {
   aa: {
     dark: { ink4: 0.1 },

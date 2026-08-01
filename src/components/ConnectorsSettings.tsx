@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
-import { Button, Collapsible, SectionInfo, SectionLabel, SegmentedControl } from "./ui";
+import { Button, Collapsible, SectionInfo, SectionLabel, SegmentedControl, SettingRow } from "./ui";
 import { clearJustJoinedVault, justJoinedVault } from "../lib/joinedVault";
 import { CalendarConnection } from "./CalendarConnection";
 import { CloudDriveConnection } from "./CloudDriveConnection";
@@ -38,7 +38,7 @@ export function ConnectorsSettings({
 }) {
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-connectors">
-      <label className="block text-sm font-medium text-ink2">Connectors</label>
+      <h2 className="block text-sm font-medium text-ink2">Connectors</h2>
       <SectionInfo title="What are connectors?">
         <p>
           Connect external accounts so PM can find and use what’s in them, grouped by provider. Set
@@ -350,19 +350,20 @@ function IndexingSpeedControl({
       className="mt-4 rounded-[var(--radius)] border border-border p-3"
       data-help="settings-indexing-speed"
     >
-      <div className="flex items-start justify-between gap-3">
-        <label className="block text-sm font-medium text-ink2">Indexing speed</label>
-        <SegmentedControl
-          ariaLabel="Indexing speed"
-          className="mt-0.5 shrink-0"
-          value={value}
-          onChange={(v) => onChange(v as "fast" | "gentle")}
-          options={[
-            { value: "fast", label: "Fast" },
-            { value: "gentle", label: "Gentle" },
-          ]}
-        />
-      </div>
+      <SettingRow label="Indexing speed" emphasis="strong" spacing="none">
+        {(a11y) => (
+          <SegmentedControl
+            {...a11y}
+            className="shrink-0"
+            value={value}
+            onChange={(v) => onChange(v as "fast" | "gentle")}
+            options={[
+              { value: "fast", label: "Fast" },
+              { value: "gentle", label: "Gentle" },
+            ]}
+          />
+        )}
+      </SettingRow>
       <SectionInfo className="mt-2.5" title="What do Fast and Gentle do?">
         <p>
           How hard PM works your machine while it indexes <strong>Drive files and imports</strong>{" "}
@@ -387,7 +388,7 @@ function IndexingSpeedControl({
             </dd>
           </div>
         </dl>
-        <p className="text-faint">Changes apply right away — even partway through a sync.</p>
+        <p className="text-ink4">Changes apply right away — even partway through a sync.</p>
       </SectionInfo>
     </div>
   );

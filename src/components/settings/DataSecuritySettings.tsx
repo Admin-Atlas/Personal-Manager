@@ -16,7 +16,7 @@ import { IS_LINUX } from "../../lib/setupGuide";
 import type { AppLockStatus } from "../../lib/types";
 import { RemovePmData } from "../RemovePmData";
 import { VaultCard } from "../VaultCard";
-import { Button, Callout, SectionInfo, Toggle } from "../ui";
+import { Button, Callout, SectionInfo, SettingRow, Toggle } from "../ui";
 
 /** The Data & Security Settings tab. Self-contained: the app-lock toggle and the export/reveal
  *  actions each persist/run immediately through their own IPC calls, so there's nothing to batch —
@@ -104,41 +104,51 @@ export function DataSecuritySettings() {
         className="mt-4 border-t border-border pt-4"
         data-help="settings-app-lock"
       >
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <label className="block text-sm font-medium text-ink2">App lock</label>
-            {/* Only the *available* branch of this line was explanation. The other
-                two say why the toggle beside them is dead, so they stay inline — as
-                does the "can't verify here" notice, which is state, not commentary. */}
-            {!appLock?.available && (
-              <p className="mt-1 text-xs text-ink4">
-                {IS_LINUX
-                  ? "Not available on Linux yet. Your store is always encrypted at rest."
-                  : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
-              </p>
-            )}
-            {appLock?.enabled && !appLock.available && (
-              <p className="mt-1 text-xs text-ink4">
-                App lock is on, but this device can't verify — PM opens without it here. The setting
-                stays saved and re-arms on a device that can verify.
-              </p>
-            )}
-          </div>
-          <Toggle
-            checked={appLock?.enabled ?? false}
-            onChange={(v) => void toggleAppLock(v)}
-            ariaLabel="App lock"
-            disabled={!appLock?.available}
-            title={
-              appLock?.available
-                ? undefined
-                : IS_LINUX
-                  ? "Feature not available on Linux yet"
-                  : "Not available on this device"
-            }
-            className="mt-0.5"
-          />
-        </div>
+        {/* Only the *available* branch of this line was explanation. The other
+            two say why the toggle beside them is dead, so they stay inline — as
+            does the "can't verify here" notice, which is state, not commentary.
+            They are the row's `description`, so they now also name what the dead
+            switch is describing (aria-describedby). Both are <span>s inside the
+            row's one <p>: a nested <p> is invalid, and the second carries its own
+            `mt-1` because the first inherits the paragraph's. */}
+        <SettingRow
+          label="App lock"
+          emphasis="strong"
+          spacing="none"
+          description={
+            !appLock?.available ? (
+              <>
+                <span className="block">
+                  {IS_LINUX
+                    ? "Not available on Linux yet. Your store is always encrypted at rest."
+                    : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
+                </span>
+                {appLock?.enabled && (
+                  <span className="mt-1 block">
+                    App lock is on, but this device can&apos;t verify — PM opens without it here.
+                    The setting stays saved and re-arms on a device that can verify.
+                  </span>
+                )}
+              </>
+            ) : undefined
+          }
+        >
+          {(a11y) => (
+            <Toggle
+              {...a11y}
+              checked={appLock?.enabled ?? false}
+              onChange={(v) => void toggleAppLock(v)}
+              disabled={!appLock?.available}
+              title={
+                appLock?.available
+                  ? undefined
+                  : IS_LINUX
+                    ? "Feature not available on Linux yet"
+                    : "Not available on this device"
+              }
+            />
+          )}
+        </SettingRow>
         {appLock?.available && (
           <SectionInfo title="What does app lock do?">
             <p>
@@ -156,20 +166,20 @@ export function DataSecuritySettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-duplicates"
       >
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <label className="block text-sm font-medium text-ink2">Duplicate check</label>
-            <p className="mt-1 text-xs text-ink4">
-              Adds a &ldquo;Check for duplicates&rdquo; action to your Documents list.
-            </p>
-          </div>
-          <Toggle
-            checked={duplicateCheck}
-            onChange={(v) => void toggleDuplicateCheck(v)}
-            ariaLabel="Duplicate check"
-            className="mt-0.5"
-          />
-        </div>
+        <SettingRow
+          label="Duplicate check"
+          emphasis="strong"
+          spacing="none"
+          description="Adds a “Check for duplicates” action to your Documents list."
+        >
+          {(a11y) => (
+            <Toggle
+              {...a11y}
+              checked={duplicateCheck}
+              onChange={(v) => void toggleDuplicateCheck(v)}
+            />
+          )}
+        </SettingRow>
         <SectionInfo title="How PM looks for duplicates">
           <p>
             Two ways, and it runs only when you ask. It compares the opening of each document — with
@@ -191,7 +201,7 @@ export function DataSecuritySettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-data"
       >
-        <label className="block text-sm font-medium text-ink2">Data</label>
+        <h2 className="block text-sm font-medium text-ink2">Data</h2>
         <div className="mt-2 flex flex-wrap gap-2">
           <Button variant="tertiary" onClick={revealDataFolder}>
             Open data folder
@@ -200,7 +210,7 @@ export function DataSecuritySettings() {
             {exporting ? "Exporting…" : "Export all data…"}
           </Button>
         </div>
-        {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
+        {exportMsg && <p className="mt-2 break-all text-xs text-ink4">{exportMsg}</p>}
         <SectionInfo title="About your data & export">
           <p>
             Your documents and the encrypted store live in one folder (
