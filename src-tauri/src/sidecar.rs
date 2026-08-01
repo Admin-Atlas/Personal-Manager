@@ -1816,7 +1816,17 @@ impl SidecarManager {
                         continue;
                     }
                     let msg = value["error"].as_str().unwrap_or("unknown sidecar error");
-                    return Err(Error::Other(format!("sidecar {method} failed: {msg}")));
+                    // A reply that classified ITSELF keeps that classification in the message.
+                    // The Python side reports `str(exc)`, which carries no type information, so
+                    // this marker is the only thing that lets a caller tell "the engine refused
+                    // this file" from "the engine is broken" — a distinction
+                    // `cloud_sync::is_permanently_unindexable` has to get right, because one is a
+                    // skip and the other must hold the account's delta cursor. Untagged errors
+                    // keep their existing wording byte-for-byte.
+                    return Err(Error::Other(match value["error_kind"].as_str() {
+                        Some(kind) => format!("sidecar {method} failed [{kind}]: {msg}"),
+                        None => format!("sidecar {method} failed: {msg}"),
+                    }));
                 }
                 Err(e) => {
                     *guard = None; // force a respawn next time

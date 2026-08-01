@@ -577,7 +577,11 @@ class SpreadsheetTest(unittest.TestCase):
                 path = f"{d}/{name}"
                 with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
                     zf.writestr("word/document.xml", b"\0" * (4 * 1024 * 1024))
-                with self.assertRaises(ValueError, msg=name):
+                # `Unconvertible`, not the guard's raw ValueError: do_convert re-types PM's own
+                # caps into the verdict Rust classifies on, so the file is skipped and the delta
+                # cursor is allowed past it. The guard's own ValueError is asserted directly in
+                # `test_a_zip_bomb_is_refused_before_it_is_read` above.
+                with self.assertRaises(S.Unconvertible, msg=name):
                     S.do_convert({"path": path})
 
     def test_a_wide_sheet_is_column_capped_and_says_so(self):
@@ -757,6 +761,157 @@ class ProtocolTest(unittest.TestCase):
         replies = self._exchange(reqs)
         self.assertEqual([r["id"] for r in replies], [1, 2, 3])
         self.assertEqual([r["ok"] for r in replies], [True, False, True])
+
+
+def _fake_markitdown():
+    """A stand-in `markitdown` package carrying the real 0.1.6 exception hierarchy.
+
+    Injected rather than skipped-on-absent because the thing under test is a CLASSIFICATION, and
+    classification is exactly what breaks silently: the real package is not installed in CI, and a
+    test that skips there is a test that never guards the release it matters for.
+
+    ONE package instance per test, with what to raise held on the module (`pkg._raises`) rather
+    than captured per call. Building a fresh package for the exception and another for the engine
+    mints two unrelated class objects, so `except MarkItDownException` matches neither and every
+    assertion passes for the wrong reason.
+    """
+    import types
+
+    pkg = types.ModuleType("markitdown")
+    pkg._raises = None
+
+    class MarkItDownException(Exception):
+        pass
+
+    class UnsupportedFormatException(MarkItDownException):
+        pass
+
+    class FileConversionException(MarkItDownException):
+        pass
+
+    class MissingDependencyException(MarkItDownException):
+        pass
+
+    class _Result:
+        text_content = "hello"
+        title = "T"
+
+    class MarkItDown:
+        def convert_local(self, path):
+            if pkg._raises is not None:
+                raise pkg._raises
+            return _Result()
+
+    pkg.MarkItDownException = MarkItDownException
+    pkg.UnsupportedFormatException = UnsupportedFormatException
+    pkg.FileConversionException = FileConversionException
+    pkg.MissingDependencyException = MissingDependencyException
+    pkg.MarkItDown = MarkItDown
+    return pkg
+
+
+class ConvertVerdictTest(unittest.TestCase):
+    """A refusal of THIS FILE must be told apart from the ENGINE being broken.
+
+    `str(exc)` carries no type, so before this the Rust side matched the bare
+    `sidecar convert failed:` prefix — which every convert error wears. A half-installed venv
+    therefore answered "No module named 'markitdown'" for every file, each was classified
+    permanently-unindexable, and the delta cursor committed past changes PM had never indexed.
+    The changes feed never re-offers a committed change, so the files were gone until the user
+    disconnected and re-added the account. These pin which side of the line each cause falls on.
+    """
+
+    def setUp(self):
+        self.pkg = _fake_markitdown()
+
+    def _convert(self, path="/pm/test/doc.txt", raises=None):
+        self.pkg._raises = raises
+        with mock.patch.dict(sys.modules, {"markitdown": self.pkg}):
+            S._markitdown = None  # force get_markitdown() through the injected package
+            try:
+                return S.do_convert({"path": path})
+            finally:
+                S._markitdown = None
+
+    def test_engine_refusing_this_file_is_a_verdict(self):
+        # The engine read the file and said no. Retrying forever is what pins the account.
+        for exc_name in ("UnsupportedFormatException", "FileConversionException"):
+            exc_cls = getattr(self.pkg, exc_name)
+            with self.assertRaises(S.Unconvertible, msg=exc_name):
+                self._convert(raises=exc_cls("cannot handle .xyz"))
+
+    def test_broken_engine_is_not_a_verdict(self):
+        # Each of these resolves once the engine is repaired, so each must stay account-fatal —
+        # anything but Unconvertible, which is what holds the delta cursor.
+        for exc in (
+            ModuleNotFoundError("No module named 'markitdown'"),
+            ImportError("cannot import name 'MarkItDown'"),
+            OSError(28, "No space left on device"),
+            # A MarkItDownException, but about the ENVIRONMENT, not the file: this format needs
+            # an optional package the venv lacks. Skipping would lose every file of that type.
+            # Same package instance, so this really is caught by the `except MissingDependency`
+            # arm and re-raised — not merely unmatched.
+            self.pkg.MissingDependencyException("PdfConverter requires pdfminer.six"),
+        ):
+            with self.assertRaises(Exception) as caught:
+                self._convert(raises=exc)
+            self.assertNotIsInstance(caught.exception, S.Unconvertible, repr(exc))
+
+    def test_a_failed_lazy_import_is_not_a_verdict(self):
+        # The import lives in get_markitdown(), OUTSIDE do_convert's try — the case that actually
+        # shipped. With no `markitdown` in sys.modules at all, the ImportError must escape untagged.
+        S._markitdown = None
+        with mock.patch.dict(sys.modules, {"markitdown": None}):
+            with self.assertRaises(Exception) as caught:
+                S.do_convert({"path": "/pm/test/doc.txt"})
+        self.assertNotIsInstance(caught.exception, S.Unconvertible)
+
+    def test_pm_own_input_cap_is_a_verdict(self):
+        # PM's own caps are verdicts about the file. Runs the real guard against a real file.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.bin")
+            with open(p, "wb") as fh:
+                fh.write(b"x" * 4096)
+            with mock.patch.object(S, "MAX_INPUT_FILE_BYTES", 1024):
+                with self.assertRaises(S.Unconvertible) as caught:
+                    self._convert(path=p)
+        self.assertIn("too large to process", str(caught.exception))
+
+    def test_a_convertible_file_still_converts(self):
+        # The negative control: the wrapping must not turn a healthy conversion into an error.
+        self.assertEqual(self._convert()["markdown"], "hello")
+
+
+class ConvertVerdictWireTest(unittest.TestCase):
+    """The verdict has to survive the wire, or the classifier upstream never sees it.
+
+    Drives the real main loop, and deliberately uses PM's own size cap — which is enforced BEFORE
+    the lazy markitdown import — so this runs end to end in CI with the package absent.
+    """
+
+    def test_an_unconvertible_reply_is_tagged_on_the_wire(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.bin")
+            # `truncate`, not `write`: the cap is 128 MiB and the guard only calls getsize, so
+            # sizing the file costs nothing rather than committing 128 MB to disk on every run.
+            with open(p, "wb") as fh:
+                fh.truncate(S.MAX_INPUT_FILE_BYTES + 1)
+            req = json.dumps({"id": 1, "method": "convert", "params": {"path": p}})
+            proc = subprocess.run(
+                [sys.executable, os.path.join(os.path.dirname(__file__), "pm_sidecar.py")],
+                input=req + "\n",
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        reply = json.loads(proc.stdout.strip().splitlines()[0])
+        self.assertFalse(reply["ok"])
+        # The tag Rust renders as `sidecar convert failed [unconvertible]:` and classifies on.
+        self.assertEqual(reply.get("error_kind"), "unconvertible")
 
 
 if __name__ == "__main__":

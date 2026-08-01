@@ -558,12 +558,25 @@ fn is_file_lock_error(e: &Error) -> bool {
 ///
 /// Three causes, all terminal: PM's own download cap (`google.rs`/`microsoft.rs` `read_capped*`), the
 /// sidecar's input cap (`sidecar::check_input_size`), and the document engine ANSWERING and refusing
-/// this file. `sidecar convert failed:` is the engine's per-FILE verdict, minted in
-/// `SidecarManager::request` — reword that prefix and this classifier silently narrows back to the
-/// stuck behaviour, which is what the test below anchors. `sidecar convert IO error:` and "not
-/// installed" are the engine itself being broken and stay account-fatal, and a transient antivirus file
-/// lock has already been retried by [`convert_staged`]: it is checked FIRST because it arrives wearing
-/// the `sidecar convert failed:` prefix, and skipping it would drop a perfectly indexable file.
+/// this file.
+///
+/// **Fail-closed on the third.** This used to match the bare `sidecar convert failed:` prefix, which
+/// every convert error wears — including one raised by the engine being BROKEN. `do_convert` imports
+/// markitdown lazily, so a half-installed venv answers `sidecar convert failed: No module named
+/// 'markitdown'` for every file; that classified as permanently-unindexable, so each file was skipped,
+/// the account stayed `ok`, and the delta cursor committed past changes PM had never indexed. The
+/// changes feed never re-offers them, so the only recovery was disconnect-and-re-add. The prefix could
+/// not distinguish the two cases because Python reports `str(exc)`, which carries no type: measured,
+/// `str(UnsupportedFormatException("cannot handle .xyz"))` is exactly `cannot handle .xyz`.
+///
+/// So the verdict is now explicit: the sidecar raises `Unconvertible` for its own caps and for
+/// markitdown's `UnsupportedFormatException` / `FileConversionException` only, the main loop tags the
+/// reply `error_kind: "unconvertible"`, and `SidecarManager::request` renders that as
+/// `sidecar convert failed [unconvertible]:`. Anything untagged — an ImportError, a
+/// `MissingDependencyException` (the engine is incomplete; a repair fixes it), an OS error,
+/// `sidecar convert IO error:`, "not installed" — is the engine being broken and stays account-fatal,
+/// holding the cursor so the files are re-offered once it is repaired. A transient antivirus file lock
+/// is still checked FIRST: [`convert_staged`] has already retried it, and it arrives untagged anyway.
 fn is_permanently_unindexable(err: &Error) -> bool {
     if is_file_lock_error(err) {
         return false;
@@ -571,7 +584,7 @@ fn is_permanently_unindexable(err: &Error) -> bool {
     let s = err.to_string();
     s.contains("too large to index")
         || s.contains("too large to process")
-        || s.contains("sidecar convert failed:")
+        || s.contains("sidecar convert failed [unconvertible]:")
 }
 
 /// Drive both cloud sync engines: the detached, single-flight, crash-resumable lifecycle around one
@@ -2119,7 +2132,7 @@ mod tests {
         // either half is then a red test rather than a silently re-pinned account.
         for e in [
             Error::Other("Microsoft Graph request failed (404 Not Found): itemNotFound".into()),
-            Error::Other("sidecar convert failed: UnsupportedFormatException".into()),
+            Error::Other("sidecar convert failed [unconvertible]: cannot handle .xyz".into()),
         ] {
             let permanent =
                 <OneDriveDriver as CloudDriver>::is_item_gone(&e) || is_permanently_unindexable(&e);
@@ -2516,11 +2529,13 @@ mod tests {
     fn an_unconvertible_body_is_a_skip_but_a_broken_engine_is_a_failure() {
         // The provider-independent half (it fixes Drive as well as OneDrive): the engine ANSWERED and
         // refused this file, or the file is over a cap. Retrying either forever is what pins the
-        // account, so they are skips.
+        // account, so they are skips. The `[unconvertible]` tag is minted by `SidecarManager::request`
+        // from the sidecar's `error_kind`, which `do_convert` sets ONLY for markitdown's
+        // UnsupportedFormatException / FileConversionException and PM's own caps.
         for terminal in [
-            "sidecar convert failed: UnsupportedFormatException",
+            "sidecar convert failed [unconvertible]: cannot handle .xyz",
             "That OneDrive file is too large to index.",
-            "sidecar convert failed: file is too large to process (60 MiB; the limit is 40 MiB)",
+            "sidecar convert failed [unconvertible]: file is too large to process (60 MiB; the limit is 40 MiB)",
         ] {
             assert!(
                 is_permanently_unindexable(&Error::Other(terminal.into())),
@@ -2529,11 +2544,21 @@ mod tests {
         }
         // The negatives are the whole reason this is a predicate and not a `contains("sidecar")`. An
         // engine that is broken or absent will convert this file fine once fixed, and the antivirus
-        // lock arrives wearing the very prefix above — skipping either drops an indexable document.
+        // lock arrives wearing a convert-failure prefix — skipping either drops an indexable document.
+        //
+        // The UNTAGGED convert failures are the regression this test now pins. `str(exc)` on the
+        // Python side carries no type, so a broken venv answers with an ordinary message under the
+        // plain `sidecar convert failed:` prefix. Matching that prefix meant EVERY file was skipped
+        // while the delta cursor advanced past it — permanently, since the changes feed never
+        // re-offers a committed change. Untagged now means account-fatal, which holds the cursor.
         for retryable in [
             "sidecar convert IO error: broken pipe",
             "document engine is not installed yet — run setup first",
-            "sidecar convert failed: PermissionError: [Errno 13] Permission denied",
+            "sidecar convert failed [unconvertible]: PermissionError: [Errno 13] Permission denied",
+            "sidecar convert failed: No module named 'markitdown'",
+            "sidecar convert failed: cannot import name 'MarkItDown' from partially initialized module",
+            "sidecar convert failed: MissingDependencyException: PdfConverter requires pdfminer.six",
+            "sidecar convert failed: [Errno 28] No space left on device",
         ] {
             assert!(
                 !is_permanently_unindexable(&Error::Other(retryable.into())),

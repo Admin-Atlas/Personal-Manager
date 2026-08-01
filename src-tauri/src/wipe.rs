@@ -677,6 +677,23 @@ fn report_third_party_stores(app: &AppHandle, report: &mut WipeReport) {
     );
 }
 
+/// The summary label for the preferences class, given how many OS-written leftovers the backend
+/// itself removed.
+///
+/// Pure, and non-empty in BOTH arms, which is the whole point: `os_app_leftovers` is empty on Windows
+/// by design, so the count is always 0 there. Deriving the label from that count meant a Windows
+/// "App preferences"-only erase pushed nothing into `report.removed`, tripped the empty-report guard
+/// and returned "Nothing was selected to remove." — a false failure, raised after the frontend had
+/// already cleared the preferences. Testing it here pins the Windows case without needing to run an
+/// erase on a Windows box.
+fn preferences_label(os_leftovers_removed: usize) -> &'static str {
+    if os_leftovers_removed > 0 {
+        "App preferences & webview data"
+    } else {
+        "App preferences"
+    }
+}
+
 fn remove_os_leftovers(app: &AppHandle, report: &mut WipeReport) -> usize {
     let mut removed = 0usize;
     for path in paths::os_app_leftovers(app) {
@@ -1021,11 +1038,30 @@ pub async fn wipe_pm_data(
         // Now the pointed vault, if this profile has one and it is provably ours.
         match (&pointed_root, pointed_verdict) {
             (Some(root), Some((PointedVaultVerdict::Delete, meta))) => {
+                // Read the linked-accounts sidecar BEFORE the folder is erased — it lives inside it.
+                // A vault this profile OWNS may still be shared: `PointedVaultVerdict::Delete`
+                // covers both `Device` and `Owned`, and for `Owned` the erase destroys the vault for
+                // every account the owner linked. That is the owner's call to make (the deliberate
+                // `delete_shared_vault` does exactly the same thing), but the summary described this
+                // as "your Markdown vault and its encrypted store" and named nobody — while
+                // `vault-access.json`, listing precisely who loses access, sat in the folder being
+                // deleted. Best-effort by construction: an unreadable sidecar reads as "none".
+                let shared_with = meta
+                    .as_ref()
+                    .map(|m| vault::access::principals(root, &m.vault_id))
+                    .unwrap_or_default();
                 remove_pointed_vault(&app, &state, root, meta.as_ref(), &mut report);
                 report.removed.push(format!(
                     "Vault & encrypted database, including {}",
                     root.display()
                 ));
+                if !shared_with.is_empty() {
+                    report.removed.push(format!(
+                        "Shared access for {} other account(s), who can no longer open that vault: {}",
+                        shared_with.len(),
+                        shared_with.join(", ")
+                    ));
+                }
             }
             (Some(root), Some((PointedVaultVerdict::Leave(why), _))) => {
                 // Named, never guessed at. The user is about to lose the key that opens whatever is
@@ -1079,9 +1115,37 @@ pub async fn wipe_pm_data(
     //        is nothing left for WKWebView to flush back over the top of this. ---
     if selection.local_storage || full {
         report.os_leftovers_removed = remove_os_leftovers(&app, &mut report);
-        if report.os_leftovers_removed > 0 {
-            report.removed.push("App preferences & webview data".into());
-            report.quit_required = true;
+        // Report the preferences unconditionally. They are cleared by the FRONTEND — `localStorage`
+        // is wiped before it calls in (see the note above) — so by the time this arm runs the work is
+        // done whatever the backend itself found on disk.
+        //
+        // Gating the label on `os_leftovers_removed > 0` made an "App preferences"-only erase on
+        // Windows add nothing to `report.removed`, which then hit the empty-report check below and
+        // failed the whole call with "Nothing was selected to remove." — after the preferences were
+        // already gone, and with the window left degraded by the frontend's teardown. It is not an
+        // edge case on Windows, it is every time: `os_app_leftovers` is empty there BY DESIGN,
+        // because the webview folder is in use while PM runs and the NSIS uninstaller purges it from
+        // outside instead.
+        report
+            .removed
+            .push(preferences_label(report.os_leftovers_removed).into());
+        // The frontend has already torn down its own state, so the running window can't be trusted
+        // to keep working either way.
+        report.quit_required = true;
+
+        // On a PARTIAL wipe the uninstaller is never armed, so nothing purges the webview store —
+        // cookies and DOM cache stay on the machine. Say so rather than let the summary imply a
+        // clean sweep: the promise is not "PM deleted everything", it is "nothing of yours is left
+        // somewhere you don't know about".
+        if !full && report.os_leftovers_removed == 0 {
+            if let Ok(webview) = paths::webview_data_dir(&app) {
+                if webview.exists() {
+                    report.leave_behind(
+                        webview.display(),
+                        "in use while PM is running — removed by the uninstaller when you remove PM itself",
+                    );
+                }
+            }
         }
     }
 
@@ -1372,6 +1436,20 @@ mod tests {
             .iter()
             .all(|p| p.to_string_lossy().contains("com.example.other")));
         assert!(!got.iter().any(|p| p.to_string_lossy().contains("itsatlas")));
+    }
+
+    #[test]
+    fn erasing_preferences_always_reports_something_removed() {
+        // The regression: on Windows `os_app_leftovers` is empty BY DESIGN (the webview folder is
+        // in use; the NSIS uninstaller purges it), so this count is always 0 there. When the label
+        // was gated on the count, a preferences-only erase left `report.removed` empty, hit the
+        // "Nothing was selected to remove." guard and reported failure — after the frontend had
+        // already cleared localStorage and torn its own state down. Both arms must name something.
+        assert_eq!(preferences_label(0), "App preferences");
+        assert_eq!(preferences_label(3), "App preferences & webview data");
+        for n in [0usize, 1, 7] {
+            assert!(!preferences_label(n).is_empty(), "{n}");
+        }
     }
 
     #[test]
