@@ -121,12 +121,12 @@ fn probe_read(path: &Path, step: ProbeStep) -> std::result::Result<(), ProbeFail
 /// use the folder?" test that a stripped-inheritance DACL would fail.
 pub fn probe_vault_access(root: &Path) -> std::result::Result<(), ProbeFailure> {
     probe_one(root, ProbeStep::CreateInRoot)?;
-    let markdown = root.join("vault");
+    let markdown = root.join(super::MARKDOWN_DIRNAME);
     if markdown.is_dir() {
         probe_one(&markdown, ProbeStep::CreateInMarkdown)?;
     }
     probe_read(&root.join(super::META_FILENAME), ProbeStep::ReadMeta)?;
-    let db = root.join("pm.sqlite");
+    let db = root.join(super::DB_FILENAME);
     if db.exists() {
         std::fs::OpenOptions::new()
             .read(true)

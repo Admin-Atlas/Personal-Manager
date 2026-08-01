@@ -45,6 +45,21 @@ use verifier::Verifier;
 
 /// Filename of the per-vault, non-secret metadata, stored inside the vault folder.
 pub const META_FILENAME: &str = "vault-meta.json";
+/// Filename of the encrypted SQLCipher store inside the vault folder. [`resolve_layout`] is the
+/// layout rule; this const exists so the backup, export, wipe, preflight and migration paths that
+/// must name the file directly can agree with it instead of retyping the string.
+///
+/// It does NOT make a rename mechanical. The name also appears in user-facing copy
+/// ([`crate::commands::join_shared_vault`]'s "no vault here" message and `src/components/VaultJoin.tsx`,
+/// which cannot see this const at all), in `AGENTS.md` / `README.md` prose, and — via
+/// [`crate::backup::pack`] — inside every `.pmbackup` and export zip written so far. A rename is a
+/// checklist covering all of those plus a `manifest::SCHEMA` decision, not a one-line edit here.
+pub const DB_FILENAME: &str = "pm.sqlite";
+/// The Markdown subfolder inside the vault folder — the source of truth that sits beside
+/// [`DB_FILENAME`]. Named `*_DIRNAME` deliberately: [`crate::ingest`]'s `MARKDOWN_SUBDIRS` is a
+/// different concept (the allow-list of subdirectories *inside* this one), and the two have been
+/// confused before.
+pub const MARKDOWN_DIRNAME: &str = "vault";
 /// Reverse-DNS app id recorded in the meta (matches the keychain service + bundle id).
 pub const APP_ID: &str = "org.itsatlas.pm";
 /// Current `vault-meta.json` schema version.
@@ -680,8 +695,8 @@ pub fn resolve_layout(data_dir: &Path, pointer: Option<&VaultPointer>) -> Resolv
     let vault_root = pointer
         .map(|p| p.vault_root.clone())
         .unwrap_or_else(|| data_dir.to_path_buf());
-    let db_path = vault_root.join("pm.sqlite");
-    let markdown_dir = vault_root.join("vault");
+    let db_path = vault_root.join(DB_FILENAME);
+    let markdown_dir = vault_root.join(MARKDOWN_DIRNAME);
     ResolvedVault {
         vault_root,
         db_path,
@@ -1407,6 +1422,10 @@ mod tests {
         assert_eq!(boot_meta_decision(false, Err(denied.clone())), Err(denied));
     }
 
+    // The two layout pins below KEEP their `"pm.sqlite"` / `"vault"` literals on purpose: a test that
+    // asserts `resolve_layout` against the very constants `resolve_layout` is built from proves
+    // nothing. They are the only place the names are stated independently, so a sweep that "finishes
+    // the job" by substituting `DB_FILENAME` / `MARKDOWN_DIRNAME` here hollows out the contract.
     #[test]
     fn layout_defaults_to_the_data_dir_when_no_pointer() {
         let data = std::path::Path::new("/profile/data");

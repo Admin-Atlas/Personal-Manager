@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.4-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "A tag stops being offered the moment nothing carries it any more. Deleting the last document with a particular tag used to leave that tag sitting in the pickers — and, more annoyingly, in what PM tells the model about your library, so it would cheerfully suggest the tag again — until some unrelated filing elsewhere happened to tidy it away.",
+      "The count on the Review tab is no longer worked out by reading through your whole library. On a large library that was a visible pause every time the number refreshed.",
+      "Fixed a way a failed filing pass could leave your files changed while PM's own record of them was rolled back. If PM couldn't write its notes file at the end of a Review commit — a full disk, an antivirus lock — it undid the database half and not the files half, so the two disagreed and the next re-index adopted the version the database had rejected.",
+      "Filing a document is a little quicker, and noticeably so during a bulk re-tag, because PM no longer tidies its entire tag list once per document.",
+    ],
+  },
+  {
     version: "3.114.3-alpha",
     date: "2026-08-01",
     highlights: [

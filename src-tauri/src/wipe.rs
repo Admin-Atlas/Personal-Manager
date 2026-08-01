@@ -293,7 +293,13 @@ fn remove_empty_dir_retrying(path: &Path) {
 /// "wrong key or corrupt file" brick). The sidecars are harmless leftovers, so they're best-effort.
 fn remove_db_files_retrying(db_path: &Path) -> bool {
     for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(db_path.with_extension(format!("sqlite{suffix}")));
+        // SQLite names the sidecars by APPENDING to the whole DB filename, so derive them from that
+        // filename. The previous `with_extension(format!("sqlite{suffix}"))` produced the same two
+        // paths only because [`vault::DB_FILENAME`] happens to end in `.sqlite` — it re-encoded the
+        // extension a second time, in a module that has no business knowing it.
+        let mut sidecar = db_path.file_name().unwrap_or_default().to_os_string();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(db_path.with_file_name(sidecar));
     }
     for attempt in 0..3 {
         if std::fs::remove_file(db_path).is_ok() || !db_path.exists() {
@@ -744,8 +750,8 @@ fn remove_pointed_vault(
     meta: Option<&vault::VaultMeta>,
     report: &mut WipeReport,
 ) {
-    report.freed_bytes += dir_size(&root.join("vault"));
-    report.freed_bytes += std::fs::metadata(root.join("pm.sqlite"))
+    report.freed_bytes += dir_size(&root.join(vault::MARKDOWN_DIRNAME));
+    report.freed_bytes += std::fs::metadata(root.join(vault::DB_FILENAME))
         .map(|m| m.len())
         .unwrap_or(0);
 

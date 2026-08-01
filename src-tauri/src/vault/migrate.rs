@@ -19,20 +19,19 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+// The on-disk components of a vault within its root (the ones a move must carry): the encrypted DB
+// and the Markdown subfolder, plus the metadata file. All three names come from `vault/mod.rs`,
+// which owns the layout rule — this module used to declare its own private copies of the first two,
+// so a rename here and a rename in `resolve_layout` could silently disagree. Lock/journal files are
+// per-profile or ephemeral and are not moved.
 use super::{
     access, advert, load_meta, master_from_db_key_hex, meta_path, pointer, prepare_shareable,
     resolve, store_meta, KeyMode, MarkdownCipher, MarkdownEncryption, MarkdownPolicy, OwnerOnRekey,
-    VaultMeta,
+    VaultMeta, DB_FILENAME, MARKDOWN_DIRNAME,
 };
 use crate::error::{Error, Result};
 use crate::secret::Secret;
 use crate::{db, ingest, paths, secrets, AppState, VaultRuntime};
-
-/// The on-disk components of a vault within its root (mirrors `resolve_layout`): the
-/// encrypted DB and the Markdown subfolder. The metadata file ([`super::META_FILENAME`])
-/// is the third. Lock/journal files are per-profile or ephemeral and are not moved.
-const DB_FILENAME: &str = "pm.sqlite";
-const MARKDOWN_SUBDIR: &str = "vault";
 
 /// A requested vault transition. The four spec transitions are all expressed as plans:
 /// make shareable (Device to Passphrase, encrypt), make private (Passphrase to Device,
@@ -256,8 +255,8 @@ pub(crate) fn copy_vault_artifacts(from_root: &Path, to_root: &Path) -> Result<(
     std::fs::create_dir_all(to_root)?;
     copy_file_verified(&from_root.join(DB_FILENAME), &to_root.join(DB_FILENAME))?;
     copy_tree_verified(
-        &from_root.join(MARKDOWN_SUBDIR),
-        &to_root.join(MARKDOWN_SUBDIR),
+        &from_root.join(MARKDOWN_DIRNAME),
+        &to_root.join(MARKDOWN_DIRNAME),
     )?;
     for from in vault_sidecar_files(from_root) {
         if from.exists() {
@@ -285,7 +284,7 @@ pub(crate) fn delete_vault_artifacts(root: &Path) {
     let _ = std::fs::remove_file(root.join(DB_FILENAME));
     let _ = std::fs::remove_file(root.join(format!("{DB_FILENAME}-wal")));
     let _ = std::fs::remove_file(root.join(format!("{DB_FILENAME}-shm")));
-    let _ = std::fs::remove_dir_all(root.join(MARKDOWN_SUBDIR));
+    let _ = std::fs::remove_dir_all(root.join(MARKDOWN_DIRNAME));
     for file in vault_sidecar_files(root) {
         let _ = std::fs::remove_file(file);
     }
@@ -587,7 +586,7 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
             let conn = state.conn()?;
             vacuum_into(&conn, &backup.join(DB_FILENAME))?;
         }
-        copy_tree_verified(&resolved.markdown_dir, &backup.join(MARKDOWN_SUBDIR))?;
+        copy_tree_verified(&resolved.markdown_dir, &backup.join(MARKDOWN_DIRNAME))?;
         let meta_src = meta_path(&resolved.vault_root);
         if meta_src.exists() {
             copy_file_verified(&meta_src, &meta_path(&backup))?;
@@ -827,7 +826,7 @@ fn relocate(
             let to_resolved = super::ResolvedVault {
                 vault_root: to_root.to_path_buf(),
                 db_path: to_root.join(DB_FILENAME),
-                markdown_dir: to_root.join(MARKDOWN_SUBDIR),
+                markdown_dir: to_root.join(MARKDOWN_DIRNAME),
             };
             let new_master = master_from_db_key_hex(new_key.expose())?;
             state.open_session(
@@ -848,7 +847,7 @@ fn relocate(
                 let from_resolved = super::ResolvedVault {
                     vault_root: from_root.to_path_buf(),
                     db_path: from_root.join(DB_FILENAME),
-                    markdown_dir: from_root.join(MARKDOWN_SUBDIR),
+                    markdown_dir: from_root.join(MARKDOWN_DIRNAME),
                 };
                 let _ = state.open_session(
                     conn,
@@ -1351,7 +1350,7 @@ mod tests {
     /// Build a minimal, openable device vault at `root` keyed with `key_hex`, for the
     /// perform_relocation round-trip tests (a real SQLCipher DB + meta + Markdown dir).
     fn build_test_vault(root: &Path, key_hex: &str) -> VaultMeta {
-        std::fs::create_dir_all(root.join(MARKDOWN_SUBDIR)).unwrap();
+        std::fs::create_dir_all(root.join(MARKDOWN_DIRNAME)).unwrap();
         let conn = db::open(&root.join(DB_FILENAME), key_hex).unwrap();
         conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (7);")
             .unwrap();
@@ -1488,11 +1487,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("old");
         let to = root.path().join("new");
-        std::fs::create_dir_all(from.join(MARKDOWN_SUBDIR)).unwrap();
+        std::fs::create_dir_all(from.join(MARKDOWN_DIRNAME)).unwrap();
         std::fs::write(from.join(DB_FILENAME), b"db-bytes").unwrap();
         std::fs::write(meta_path(&from), b"{}").unwrap();
         std::fs::write(
-            from.join(MARKDOWN_SUBDIR).join("note.md.pmenc"),
+            from.join(MARKDOWN_DIRNAME).join("note.md.pmenc"),
             b"ciphertext",
         )
         .unwrap();
@@ -1504,7 +1503,7 @@ mod tests {
         // ...and every artifact landed at the destination.
         assert_eq!(std::fs::read(to.join(DB_FILENAME)).unwrap(), b"db-bytes");
         assert_eq!(
-            std::fs::read(to.join(MARKDOWN_SUBDIR).join("note.md.pmenc")).unwrap(),
+            std::fs::read(to.join(MARKDOWN_DIRNAME).join("note.md.pmenc")).unwrap(),
             b"ciphertext"
         );
         assert!(meta_path(&to).exists());
@@ -1513,7 +1512,7 @@ mod tests {
         std::fs::write(from.join("unrelated.txt"), b"keep").unwrap();
         delete_vault_artifacts(&from);
         assert!(!from.join(DB_FILENAME).exists());
-        assert!(!from.join(MARKDOWN_SUBDIR).exists());
+        assert!(!from.join(MARKDOWN_DIRNAME).exists());
         assert!(from.join("unrelated.txt").exists());
     }
 

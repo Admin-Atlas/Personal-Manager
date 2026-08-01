@@ -135,6 +135,11 @@ pub fn set_document_projects(
     home: &str,
     linked: &[String],
 ) -> Result<()> {
+    // Read BEFORE the DELETE, and read what the document HELD rather than what it is being given:
+    // afterwards this comes back empty and the prune below silently degrades to a no-op, which no
+    // end-state test would catch. See [`prune_orphan_tags_by_id`] for why this set is sufficient.
+    let prior = held_tag_ids(conn, doc_id, KIND_PROJECT)?;
+
     conn.execute(
         "DELETE FROM document_tags WHERE document_id = ?1 AND tag_id IN \
          (SELECT id FROM tags WHERE kind = 'project')",
@@ -142,6 +147,7 @@ pub fn set_document_projects(
     )?;
 
     let mut seen: Vec<String> = Vec::new();
+    let mut kept: Vec<i64> = Vec::new();
     for name in std::iter::once(home).chain(linked.iter().map(String::as_str)) {
         let norm = normalize(name);
         if norm.is_empty() || seen.contains(&norm) {
@@ -149,28 +155,108 @@ pub fn set_document_projects(
         }
         seen.push(norm);
         let tag_id = intern(conn, KIND_PROJECT, name)?;
+        kept.push(tag_id);
         conn.execute(
             "INSERT OR IGNORE INTO document_tags (document_id, tag_id) VALUES (?1, ?2)",
             params![doc_id, tag_id],
         )?;
     }
-    gc_orphan_project_tags(conn)
+    prune_orphan_tags_by_id(conn, &leaving(prior, &kept))?;
+    Ok(())
 }
 
-/// Drop project tags that nothing refers to any more.
-///
-/// Without this the registry only grows: unlinking the last document from a project would leave the
-/// name in every picker forever, and a typo made once would be offered as a real project for the
-/// life of the store. A row survives if it still has a membership OR the project has a triage row
-/// of its own — a project with a deadline and no documents yet is real and must stay offerable.
-fn gc_orphan_project_tags(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "DELETE FROM tags WHERE kind = 'project' \
-           AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id) \
-           AND NOT EXISTS (SELECT 1 FROM projects p WHERE lower(trim(p.name)) = tags.norm)",
-        [],
+/// The tags a write is taking away from a document: what it held, minus what it kept.
+fn leaving(prior: Vec<i64>, kept: &[i64]) -> Vec<i64> {
+    prior.into_iter().filter(|id| !kept.contains(id)).collect()
+}
+
+/// The `tags` ids `doc_id` currently holds of one kind — the only rows a write that replaces that
+/// kind's memberships can newly orphan.
+fn held_tag_ids(conn: &Connection, doc_id: i64, kind: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT dt.tag_id FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
+         WHERE dt.document_id = ?1 AND t.kind = ?2",
     )?;
-    Ok(())
+    let ids = stmt
+        .query_map(params![doc_id, kind], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Every `tags` id `doc_id` holds, of either kind — what [`crate::ingest::delete_document`] must
+/// snapshot before the row (and with it, by cascade, the join) goes.
+pub fn document_tag_ids(conn: &Connection, doc_id: i64) -> Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT tag_id FROM document_tags WHERE document_id = ?1")?;
+    let ids = stmt
+        .query_map(params![doc_id], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// What makes a PROJECT tag an orphan: nothing carries it and no triage row of its own keeps it
+/// real. Spelled once and shared by the whole-registry sweep and the per-write prune, so the two
+/// cannot come to disagree about what an orphan is.
+///
+/// The second clause is not optional. A project with a deadline and nothing filed into it yet is a
+/// legitimate and PERMANENT state — `project_names` and every picker depend on it surviving.
+const ORPHAN_PROJECT_TAG: &str = "kind = 'project' \
+       AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id) \
+       AND NOT EXISTS (SELECT 1 FROM projects p WHERE lower(trim(p.name)) = tags.norm)";
+
+/// What makes a LABEL an orphan. Unlike a project, a group tag has no triage row that could keep it
+/// alive, so "no memberships" is the whole test.
+const ORPHAN_GROUP_TAG: &str = "kind = 'group' \
+       AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id)";
+
+/// Drop whichever of `ids` this write has just left referring to nothing.
+///
+/// **Why an id restriction is sufficient.** A tag becomes orphaned only by losing a membership, and
+/// the only memberships a document write removes are that document's own — so the ids it held are a
+/// superset of everything it can orphan. Anything else a whole-registry sweep would delete is a
+/// PRE-EXISTING orphan, which is a different problem and belongs to the seam that created it (see
+/// [`prune_orphan_project_tags`]).
+///
+/// **Why it matters.** The whole-registry statements are `O(P + G)` index probes plus a full
+/// `projects` scan per surviving empty project — `lower(trim(p.name))` is an expression, so no index
+/// can serve it. Running that per document made a metadata-only pass (`delete_tag`, `rename_tag`,
+/// accepting a re-tag pass, a connector reconcile) scale with the size of the whole registry. This
+/// is `O(k)` in the document's own prior tag count, typically one to three, and runs not at all in
+/// the Rebuild steady state where the file says what the DB already said.
+///
+/// One kind-aware statement rather than two, because a given id is exactly one kind.
+pub fn prune_orphan_tags_by_id(conn: &Connection, ids: &[i64]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    /// Built once: this runs per document inside every bulk rewrite loop.
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "DELETE FROM tags WHERE id = ?1 \
+               AND (({ORPHAN_PROJECT_TAG}) OR ({ORPHAN_GROUP_TAG}))"
+        )
+    });
+    let mut stmt = conn.prepare_cached(&SQL)?;
+    let mut removed = 0;
+    for id in ids {
+        removed += stmt.execute(params![id])?;
+    }
+    Ok(removed)
+}
+
+/// Drop EVERY project tag that nothing refers to any more.
+///
+/// Without a prune somewhere the registry only grows: unlinking the last document from a project
+/// would leave the name in every picker forever, and a typo made once would be offered as a real
+/// project for the life of the store.
+///
+/// Filing prunes incrementally ([`prune_orphan_tags_by_id`]), so this whole-registry form is for the
+/// seams a per-document write cannot reach — the ones that remove memberships by CASCADE rather than
+/// by replacing them: [`crate::ingest::delete_document`]'s row delete (which snapshots the ids and
+/// takes the cheaper form) and Rebuild's wholesale wipe, where every tag is orphaned at once.
+pub fn prune_orphan_project_tags(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(&format!("DELETE FROM tags WHERE {ORPHAN_PROJECT_TAG}"), [])?;
+    Ok(n)
 }
 
 /// Replace a document's group-tag memberships.
@@ -178,12 +264,16 @@ fn gc_orphan_project_tags(conn: &Connection) -> Result<()> {
 /// The counterpart to [`set_document_projects`], called from the same seam and for the same reason:
 /// `documents.tags` stays the truth, and this keeps the queryable index over it from drifting.
 pub fn set_document_group_tags(conn: &Connection, doc_id: i64, tags: &[String]) -> Result<()> {
+    // Before the delete, for the reason spelled out in `set_document_projects`.
+    let prior = held_tag_ids(conn, doc_id, KIND_GROUP)?;
+
     conn.execute(
         "DELETE FROM document_tags WHERE document_id = ?1 AND tag_id IN \
          (SELECT id FROM tags WHERE kind = 'group')",
         params![doc_id],
     )?;
     let mut seen: Vec<String> = Vec::new();
+    let mut kept: Vec<i64> = Vec::new();
     for name in tags {
         let norm = normalize(name);
         if norm.is_empty() || seen.contains(&norm) {
@@ -191,18 +281,14 @@ pub fn set_document_group_tags(conn: &Connection, doc_id: i64, tags: &[String]) 
         }
         seen.push(norm);
         let tag_id = intern(conn, KIND_GROUP, name)?;
+        kept.push(tag_id);
         conn.execute(
             "INSERT OR IGNORE INTO document_tags (document_id, tag_id) VALUES (?1, ?2)",
             params![doc_id, tag_id],
         )?;
     }
-    // A label that just lost its last document should stop being offered. Unlike a project, a group
-    // tag has no triage row that could keep it alive, so "no memberships" is the whole test.
-    conn.execute(
-        "DELETE FROM tags WHERE kind = 'group' \
-           AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id)",
-        [],
-    )?;
+    // A label that just lost its last document should stop being offered.
+    prune_orphan_tags_by_id(conn, &leaving(prior, &kept))?;
     Ok(())
 }
 
@@ -222,13 +308,31 @@ pub struct TagSummary {
 /// Project rows count through [`MEMBERSHIPS_SQL`], so a project whose documents are all merely
 /// linked to it still counts honestly; group rows count through the join, which for them is the
 /// whole story.
+///
+/// `t.id` is a real third sort key, not decoration. A project and a label can legitimately share a
+/// norm (`Research` / `research` — that coexistence is what `idx_tags_kind_norm` is per-kind for),
+/// and at equal counts such a pair ties on BOTH of the other keys. Which one came first was an
+/// accident of the plan (`SCAN t`, so rowid order), and this list feeds the `@` autocomplete, so a
+/// plan change would silently reorder a user-visible menu. Naming `t.id` makes the shipped order the
+/// specified one, at no measured cost.
+///
+/// Deliberately NOT `CASE t.kind WHEN 'project' THEN 0 ELSE 1 END`, which would agree with
+/// [`resolve_mentions`]' collision rule and is arguably the better order — but changing which row a
+/// user sees first is a product decision, not a tidy-up.
+///
+/// **Do not "fix" the two scalar subqueries into pre-grouped LEFT JOINs.** It reads like the
+/// textbook improvement and the derived table looks like it is evaluated per row — it is not:
+/// `(MEMBERSHIPS_SQL)` is uncorrelated, so SQLite materialises it once under an `OP_Once` guard.
+/// Measured against the shipping SQLCipher build: a wash at 5k docs/250 project tags (30.9 vs
+/// 30.6 ms) and at 20k/550 (125.3 vs 126.7 ms), and 13% SLOWER at 2,050 project tags over 5k docs
+/// (40.7 vs 46.8 ms) — the many-tags shape the rewrite is supposed to help most.
 pub fn list_all(conn: &Connection) -> Result<Vec<TagSummary>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT t.name, t.kind, \
                 CASE WHEN t.kind = 'project' \
                      THEN (SELECT COUNT(*) FROM ({MEMBERSHIPS_SQL}) m WHERE m.norm = t.norm) \
                      ELSE (SELECT COUNT(*) FROM document_tags dt WHERE dt.tag_id = t.id) END \
-         FROM tags t ORDER BY 3 DESC, t.norm"
+         FROM tags t ORDER BY 3 DESC, t.norm, t.id"
     ))?;
     let rows = stmt
         .query_map([], |r| {
@@ -579,22 +683,18 @@ pub fn documents_with_group_tag(conn: &Connection, name: &str) -> Result<Vec<(i6
     Ok(rows)
 }
 
-/// Drop group-tag registry rows no document carries any more.
+/// Drop EVERY group-tag registry row no document carries any more — the label counterpart to
+/// [`prune_orphan_project_tags`].
 ///
-/// [`set_document_group_tags`] already runs exactly this after every write, so the normal paths need
-/// no help: rewriting a document's tags heals any label that just lost its last document, anywhere
-/// in the store. This exists for the one case that write cannot reach — deleting a tag that is
-/// ALREADY carried by nothing, where there is no document to rewrite and so no write to piggyback
-/// on. Idempotent, so calling it after a bulk rewrite that already pruned costs one no-op statement.
+/// [`set_document_group_tags`] prunes the labels a write itself orphans, so the normal paths need no
+/// help. This exists for the cases that write cannot reach: deleting a tag that is ALREADY carried
+/// by nothing (no document to rewrite, so no write to piggyback on), and Rebuild's wholesale wipe.
+/// Idempotent, so calling it after a bulk rewrite that already pruned costs one no-op statement.
 ///
 /// Group rows only. A project tag legitimately exists with no documents (it can be created as a
 /// triage row before anything is filed into it), and `project_names` depends on that.
 pub fn prune_orphan_group_tags(conn: &Connection) -> Result<usize> {
-    let n = conn.execute(
-        "DELETE FROM tags WHERE kind = 'group' \
-           AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id)",
-        [],
-    )?;
+    let n = conn.execute(&format!("DELETE FROM tags WHERE {ORPHAN_GROUP_TAG}"), [])?;
     Ok(n)
 }
 
@@ -1071,5 +1171,200 @@ mod tests {
             .query_row("SELECT count(*) FROM document_tags", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "the join cascades from documents");
+    }
+
+    /// Register a `projects` triage row — what makes an empty project "real" and keeps its tag
+    /// alive. Interning alone does not; production creates the row through Triage.
+    fn triage_row(conn: &Connection, name: &str) {
+        conn.execute("INSERT INTO projects(name) VALUES (?1)", params![name])
+            .unwrap();
+    }
+
+    /// The counts and the ORDER, by value — the three existing `list_all` tests assert name
+    /// membership only, so nothing pinned either. Covers each way a count can be reached: a project
+    /// counted purely through the join, a home visible only in `documents.project`, a home present
+    /// in BOTH under different casing (the `NOT EXISTS` dedup — one, not two), and both kinds of
+    /// empty row.
+    #[test]
+    fn list_all_counts_every_membership_route_once_and_orders_by_count_then_name() {
+        let (_dir, conn) = store();
+        // Doc 1 is homed in Hub and merely LINKED to Linked — Linked has no `documents.project`.
+        doc(&conn, 1, "Hub");
+        set_document_projects(&conn, 1, "Hub", &["Linked".into()]).unwrap();
+        // Doc 2's home reaches the join only through the column: never routed through a setter.
+        doc(&conn, 2, "Hub");
+        // Doc 3 holds its home in BOTH places, under different casing.
+        doc(&conn, 3, "hub");
+        set_document_projects(&conn, 3, "Hub", &[]).unwrap();
+        // An empty-but-real project, and a label nothing carries (interned straight, as `intern`
+        // itself is what production reaches through `set_document_group_tags`).
+        intern(&conn, KIND_PROJECT, "Empty Triage").unwrap();
+        triage_row(&conn, "Empty Triage");
+        intern(&conn, KIND_GROUP, "unused").unwrap();
+
+        let got: Vec<(String, String, i64)> = list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name, t.kind, t.documents))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                // Hub: docs 1 and 3 through the join, doc 2 through the column. Doc 3 counts ONCE
+                // although both routes name it.
+                ("Hub".into(), KIND_PROJECT.into(), 3),
+                ("Linked".into(), KIND_PROJECT.into(), 1),
+                // Zero-count rows survive on both arms, ordered by norm.
+                ("Empty Triage".into(), KIND_PROJECT.into(), 0),
+                ("unused".into(), KIND_GROUP.into(), 0),
+            ]
+        );
+    }
+
+    /// A project and a label may legitimately share a norm, and at equal counts such a pair ties on
+    /// both of the other sort keys. Which one comes first was an accident of the query plan (rowid
+    /// order) until `ORDER BY … , t.id` named it. This list is the `@` autocomplete, so the order is
+    /// user-visible; the net exists so a future rewrite of the counts cannot flip it unnoticed. It
+    /// catches exactly that: the pre-grouped-LEFT-JOIN form plans through `idx_tags_kind_norm` and
+    /// puts `group` first, and this test fails on it without the third key. Interning the project
+    /// FIRST is what makes the two orders differ — with the label first they agree and prove nothing.
+    #[test]
+    fn a_project_and_a_label_sharing_a_norm_keep_their_shipped_tie_order() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Research");
+        set_document_projects(&conn, 1, "Research", &[]).unwrap();
+        set_document_group_tags(&conn, 1, &["research".into()]).unwrap();
+
+        let got = list_all(&conn).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].kind.as_str(), got[0].documents), (KIND_PROJECT, 1));
+        assert_eq!((got[1].kind.as_str(), got[1].documents), (KIND_GROUP, 1));
+    }
+
+    /// One row per registry row, always — the guard against a future join that multiplies.
+    #[test]
+    fn list_all_returns_exactly_one_row_per_tag() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Hub");
+        doc(&conn, 2, "Hub");
+        set_document_projects(&conn, 1, "Hub", &["Side".into()]).unwrap();
+        set_document_projects(&conn, 2, "Hub", &["Side".into()]).unwrap();
+        set_document_group_tags(&conn, 1, &["tax".into(), "draft".into()]).unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(list_all(&conn).unwrap().len() as i64, rows);
+    }
+
+    /// I-tags-A, the project half of the prune invariant — untested until now (the existing net
+    /// covers only labels). A project with no triage row of its own must stop being offered the
+    /// moment its last document is filed elsewhere.
+    #[test]
+    fn a_project_with_no_triage_row_stops_being_offered_once_nothing_is_filed_there() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Old");
+        set_document_projects(&conn, 1, "Old", &[]).unwrap();
+        assert!(list_all(&conn).unwrap().iter().any(|t| t.name == "Old"));
+
+        rehome(&conn, 1, "New");
+        set_document_projects(&conn, 1, "New", &[]).unwrap();
+        assert!(
+            !list_all(&conn).unwrap().iter().any(|t| t.name == "Old"),
+            "an emptied project with no triage row must not linger in the pickers"
+        );
+    }
+
+    /// The second `NOT EXISTS` — the clause easiest to lose when the prune is restricted by id.
+    /// Here the empty project IS in the leaving set, so only the `projects`-row check can save it.
+    #[test]
+    fn an_empty_but_real_project_survives_the_write_that_empties_it() {
+        let (_dir, conn) = store();
+        triage_row(&conn, "Empty Project");
+        doc(&conn, 1, "Empty Project");
+        set_document_projects(&conn, 1, "Empty Project", &[]).unwrap();
+
+        rehome(&conn, 1, "Elsewhere");
+        set_document_projects(&conn, 1, "Elsewhere", &[]).unwrap();
+
+        let names: Vec<String> = list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            names.contains(&"Empty Project".to_string()),
+            "a project with a deadline and nothing filed yet is real — project_names depends on it"
+        );
+    }
+
+    /// The equivalence harness, and the strongest guard here: after an arbitrary sequence of writes
+    /// the per-write prune must have left the registry in exactly the state the whole-registry
+    /// sweeps would produce. If either sweep still has work to do, the id-restricted form missed an
+    /// orphan it was responsible for — the failure `leaving` read after the DELETE would cause, and
+    /// which no end-state test could otherwise see.
+    #[test]
+    fn the_per_write_prune_leaves_the_whole_registry_sweeps_nothing_to_do() {
+        let (_dir, conn) = store();
+        triage_row(&conn, "Kept Triage");
+        for id in 1..=3 {
+            doc(&conn, id, "Alpha");
+        }
+        set_document_projects(&conn, 1, "Alpha", &["Beta".into()]).unwrap();
+        set_document_projects(&conn, 2, "Alpha", &["Kept Triage".into()]).unwrap();
+        set_document_projects(&conn, 3, "Beta", &[]).unwrap();
+        set_document_group_tags(&conn, 1, &["tax".into(), "draft".into()]).unwrap();
+        set_document_group_tags(&conn, 2, &["draft".into()]).unwrap();
+        // Now take everything away again, one write at a time.
+        rehome(&conn, 1, "Alpha");
+        set_document_projects(&conn, 1, "Alpha", &[]).unwrap();
+        set_document_group_tags(&conn, 1, &[]).unwrap();
+        rehome(&conn, 2, "Alpha");
+        set_document_projects(&conn, 2, "Alpha", &[]).unwrap();
+        set_document_group_tags(&conn, 2, &[]).unwrap();
+        rehome(&conn, 3, "Alpha");
+        set_document_projects(&conn, 3, "Alpha", &[]).unwrap();
+
+        let surviving: Vec<String> = list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(surviving, vec!["Alpha".to_string(), "Kept Triage".into()]);
+        assert_eq!(
+            (
+                prune_orphan_project_tags(&conn).unwrap(),
+                prune_orphan_group_tags(&conn).unwrap()
+            ),
+            (0, 0),
+            "the per-write prune already removed everything the sweeps would"
+        );
+    }
+
+    /// Rebuild's wipe arm orphans every tag at once, by cascade — a state no per-document prune can
+    /// reach, since a tag whose documents are all gone is in no surviving document's leaving set.
+    /// This is the shape of the compensation `ingest::rebuild` runs immediately after the wipe.
+    #[test]
+    fn the_whole_registry_sweeps_clear_what_a_wholesale_document_delete_orphans() {
+        let (_dir, conn) = store();
+        triage_row(&conn, "Kept Triage");
+        doc(&conn, 1, "Alpha");
+        set_document_projects(&conn, 1, "Alpha", &["Kept Triage".into()]).unwrap();
+        set_document_group_tags(&conn, 1, &["tax".into()]).unwrap();
+
+        conn.execute("DELETE FROM documents", []).unwrap();
+        prune_orphan_project_tags(&conn).unwrap();
+        prune_orphan_group_tags(&conn).unwrap();
+
+        let names: Vec<String> = list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Kept Triage".to_string()],
+            "only the project with a triage row of its own outlives its documents"
+        );
     }
 }
