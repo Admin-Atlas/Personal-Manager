@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.116.3-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "One Google Drive file no longer turns into two documents. If someone shares a folder with you and one of the files inside it is a file you own, PM was indexing it twice — once as your own file, once as part of the shared folder — and then correctly reporting the pair in the duplicate check. The duplicate check was right; the source was wrong. Your own files are now left to the part of the sync that already handles them, and a file you don’t own inside a shared folder carries on being indexed exactly as before, which is the whole point of syncing shared folders.",
+      "The duplicate rows you already have are cleared up for you, not left behind. The next Drive sync merges each pair into a single document rather than deleting one and hoping. Nothing you set is lost: if you had confirmed the filing on one of the two, that one’s project and importance win; otherwise whatever is already filed stays put and any gap is filled from the other. Labels are combined, and a project that doesn’t end up as the document’s home is kept as a linked project — so the file is still findable everywhere you had put it.",
+    ],
+  },
+  {
     version: "3.116.2-alpha",
     date: "2026-08-02",
     highlights: [

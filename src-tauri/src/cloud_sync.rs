@@ -1310,17 +1310,38 @@ async fn gather_shared_with_me(
         if !owns {
             continue;
         }
-        let (files, root_truncated) = drive::enumerate_swm_root(token_key, root, cancel).await?;
+        let (listed, root_truncated) = drive::enumerate_swm_root(token_key, root, cancel).await?;
         truncated |= root_truncated;
+        // A file you OWN, found inside a folder someone shared with you, belongs to My Drive — which
+        // has been indexing it all along. Keeping it here is what produced two documents for one file
+        // (#700). Split it out BEFORE anything else touches the page: the adopt below would otherwise
+        // re-key the My-Drive row INTO this namespace, whereupon the baseline re-adds it.
+        let (files, owned) = drive::split_swm_descent(listed);
         // Adopt any legacy My-Drive-namespaced rows for these files, THEN read the root's known set —
         // so an adopted row is already in that set and reconciles as an Update/no-op, not a re-ingest.
-        let (known, adopted): (std::collections::HashSet<String>, Vec<(String, String)>) = {
+        // The owned files split off above are resolved in the same pass and under the same guard.
+        let (known, adopted, purged): (
+            std::collections::HashSet<String>,
+            Vec<(String, String)>,
+            Vec<String>,
+        ) = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
             let mut adopted = Vec::new();
+            let mut purged = Vec::new();
             for f in &files {
                 if let Some(pair) = drive::adopt_legacy_swm_row(&conn, email, &root.id, &f.id)? {
                     adopted.push(pair);
+                }
+            }
+            // Clear the duplicates users already have. The filter above only stops new ones; the pairs
+            // already indexed are the entire reported symptom, and they cannot be left for the user to
+            // sort out by hand.
+            for f in &owned {
+                match drive::resolve_owned_swm_duplicate(&conn, email, &root.id, &f.id)? {
+                    drive::SwmDuplicate::Absent => {}
+                    drive::SwmDuplicate::Rekeyed(old, new) => adopted.push((old, new)),
+                    drive::SwmDuplicate::Merged(removed) => purged.push(removed),
                 }
             }
             (
@@ -1328,6 +1349,7 @@ async fn gather_shared_with_me(
                     .into_iter()
                     .collect(),
                 adopted,
+                purged,
             )
         };
         // Carry each adoption into the encrypted manifest, off the DB guard. Without this the old
@@ -1344,6 +1366,21 @@ async fn gather_shared_with_me(
                     }
                 }
                 Err(e) => eprintln!("drive: shared-with-me manifest re-key skipped ({e})"),
+            }
+        }
+        // …and drop the purged ids from it, for exactly the same reason: a row deleted only in the DB
+        // is restored by the next Rebuild, which would put the duplicate straight back.
+        if !purged.is_empty() {
+            let state = app.state::<AppState>();
+            match state.manifest_io() {
+                Ok((vault_root, cipher)) => {
+                    for id in &purged {
+                        if let Err(e) = index_only::forget_source(&vault_root, &cipher, id) {
+                            eprintln!("drive: shared-with-me manifest purge skipped ({e})");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("drive: shared-with-me manifest purge skipped ({e})"),
             }
         }
         let root_id = root.id.clone();
