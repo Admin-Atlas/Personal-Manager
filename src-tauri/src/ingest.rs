@@ -125,6 +125,18 @@ pub struct Document {
     /// rest of the folder" action, which groups by (source_type, source_parent_folder_id).
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// What the SOURCE says about the document, as opposed to what PM measured at ingest (#701).
+    /// `None` everywhere means the provider did not say — rendered as "Unknown", never blank and
+    /// never attributed to the user. Only the two cloud connectors and the local folder can fill any
+    /// of these; a vault document, chat, photo or spreadsheet has no provider to ask.
+    pub source_author: Option<String>,
+    pub source_last_modified_by: Option<String>,
+    /// The source's own creation time (ISO-8601), distinct from `created_at`, which is PM's.
+    pub source_created_at: Option<String>,
+    /// The source file's size in bytes, distinct from `byte_size`, which measures the file PM
+    /// ingested — an index-only pointer has no such file. `None` for a Google-native Doc/Sheet/Slide,
+    /// which has no byte size at all.
+    pub source_size_bytes: Option<i64>,
 }
 
 /// The global event a rebuild's progress is broadcast on, alongside the caller's `Channel`.
@@ -2395,8 +2407,10 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
          tags = ?9, importance = ?10, reviewed = ?11, last_activity = ?12, entity_id = ?13, \
          source_type = ?14, source_state = ?15, source_id = ?16, external_ref = ?17, \
          source_modified_at = ?18, source_content_hash = ?19, stored_summary = ?20, \
-         source_parent_folder_id = ?21, source_parent_folder_name = ?22, source_account = ?23 \
-         WHERE id = ?24",
+         source_parent_folder_id = ?21, source_parent_folder_name = ?22, source_account = ?23, \
+         source_author = ?24, source_last_modified_by = ?25, source_created_at = ?26, \
+         source_size_bytes = ?27 \
+         WHERE id = ?28",
         params![
             meta.source_path,
             meta.title,
@@ -2421,6 +2435,10 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
             meta.source.source_parent_folder_id,
             meta.source.source_parent_folder_name,
             source_account,
+            meta.source.source_author,
+            meta.source.source_last_modified_by,
+            meta.source.source_created_at,
+            meta.source.source_size_bytes,
             doc_id,
         ],
     )?;
@@ -2459,9 +2477,10 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
           project, tags, importance, reviewed, last_activity, entity_id, \
           source_type, source_state, source_id, external_ref, source_modified_at, \
           source_content_hash, stored_summary, \
-          source_parent_folder_id, source_parent_folder_name, source_account) \
+          source_parent_folder_id, source_parent_folder_name, source_account, \
+          source_author, source_last_modified_by, source_created_at, source_size_bytes) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             meta.source_path,
             meta.vault_path,
@@ -2487,6 +2506,10 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
             meta.source.source_parent_folder_id,
             meta.source.source_parent_folder_name,
             source_account,
+            meta.source.source_author,
+            meta.source.source_last_modified_by,
+            meta.source.source_created_at,
+            meta.source.source_size_bytes,
         ],
     )?;
     let doc_id = tx.last_insert_rowid();
@@ -2752,7 +2775,7 @@ const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size
      (SELECT count(*) FROM chunks c WHERE c.document_id = d.id), \
      d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity, \
      d.source_type, d.source_state, d.external_ref, d.source_id, \
-     d.source_parent_folder_id, d.source_parent_folder_name";
+     d.source_parent_folder_id, d.source_parent_folder_name,      d.source_author, d.source_last_modified_by, d.source_created_at, d.source_size_bytes";
 
 /// Fill in each document's extra project memberships from the join, in ONE query for the whole
 /// list. A lookup per document would be an N+1 across the entire library — which is exactly the
@@ -2850,6 +2873,10 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         source_id: row.get(16)?,
         source_parent_folder_id: row.get(17)?,
         source_parent_folder_name: row.get(18)?,
+        source_author: row.get(19)?,
+        source_last_modified_by: row.get(20)?,
+        source_created_at: row.get(21)?,
+        source_size_bytes: row.get(22)?,
     })
 }
 
@@ -3769,6 +3796,18 @@ pub(crate) struct SourceMeta {
     /// chunked or embedded. `None` for vault imports and any source without a folder concept.
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// What the SOURCE says about the document, as opposed to what PM measured at ingest (#701).
+    /// `None` everywhere means the provider did not say — rendered as "Unknown", never blank and
+    /// never attributed to the user. Only the two cloud connectors and the local folder can fill any
+    /// of these; a vault document, chat, photo or spreadsheet has no provider to ask.
+    pub source_author: Option<String>,
+    pub source_last_modified_by: Option<String>,
+    /// The source's own creation time (ISO-8601), distinct from `created_at`, which is PM's.
+    pub source_created_at: Option<String>,
+    /// The source file's size in bytes, distinct from `byte_size`, which measures the file PM
+    /// ingested — an index-only pointer has no such file. `None` for a Google-native Doc/Sheet/Slide,
+    /// which has no byte size at all.
+    pub source_size_bytes: Option<i64>,
 }
 
 impl Default for SourceMeta {
@@ -3783,6 +3822,10 @@ impl Default for SourceMeta {
             stored_summary: None,
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            source_author: None,
+            source_last_modified_by: None,
+            source_created_at: None,
+            source_size_bytes: None,
         }
     }
 }

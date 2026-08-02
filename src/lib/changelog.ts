@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.117.0-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "PM now imports what the source knows about a document: who wrote it, who changed it last, when it was created there, and how big it is. Google Drive and OneDrive were never asked for any of it — the information was always there and PM simply wasn’t requesting it. Local folders contribute what a filesystem can (created and size); where a source has no answer, the field reads “Unknown” rather than going blank or quietly crediting you.",
+      "The duplicate check now shows all of it side by side. That is the screen that motivated this: two copies of one file with the same title and the same date give you nothing to choose between them, and now the author, the last editor, the creation date and the size sit on each card, lined up so you can read across.",
+      "You can choose which columns the Documents table shows. A “Columns” menu above the table turns each one on or off, including the four new ones. Your display depth still decides where it starts — so if you never open the menu, the table looks exactly as it did — and “Reset to depth” hands it back whenever you want.",
+      "Opening a document in the reader shows the same four facts under its title.",
+    ],
+  },
+  {
     version: "3.116.3-alpha",
     date: "2026-08-02",
     highlights: [

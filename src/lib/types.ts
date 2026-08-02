@@ -494,6 +494,16 @@ export interface Document {
    *  Review "apply this filing to the rest of the folder" action. */
   source_parent_folder_id: string | null;
   source_parent_folder_name: string | null;
+  /** What the SOURCE says about the document, as opposed to what PM measured at ingest (#701).
+   *  `null` means the provider did not say — rendered as "Unknown", never blank and never
+   *  attributed to you. Only the two cloud connectors and the local folder fill any of these. */
+  source_author: string | null;
+  source_last_modified_by: string | null;
+  /** The source's own creation time (ISO-8601), distinct from `created_at`, which is PM's. */
+  source_created_at: string | null;
+  /** The source file's size in bytes, distinct from `byte_size`, which measures what PM ingested.
+   *  Null for a Google-native Doc/Sheet/Slide, which has no byte size at all. */
+  source_size_bytes: number | null;
 }
 
 /**

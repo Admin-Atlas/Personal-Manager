@@ -41,7 +41,11 @@ const MAX_PAGES: usize = 1000;
 /// The field projection for a driveItem — kept tight (only what the connector needs). `file` and
 /// `folder` are facets we select whole (so `file.mimeType` / `file.hashes` come back); `deleted`
 /// marks a tombstone in the delta feed.
-const SELECT_ITEM: &str = "id,name,file,folder,deleted,webUrl,lastModifiedDateTime,size";
+/// `createdBy`, `lastModifiedBy` and `createdDateTime` joined for #701 — all documented `driveItem`
+/// properties. `createdBy`/`lastModifiedBy` are `identitySet` facets selected whole (like `file` and
+/// `folder` above), so `createdBy.user.displayName` comes back. Unlike Drive's, Graph's `$select` is
+/// not fail-closed on an unknown name, but the same discipline applies: it is a wire contract.
+const SELECT_ITEM: &str = "id,name,file,folder,deleted,webUrl,lastModifiedDateTime,size,createdBy,lastModifiedBy,createdDateTime";
 
 const PROVIDER: &str = "microsoft";
 const SERVICE: &str = "onedrive";
@@ -347,6 +351,14 @@ pub struct DriveItem {
     /// pointer as review context.
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
+    /// `createdBy.user.displayName` — the document's author (#701). Graph reports an `identitySet`
+    /// that can name an application rather than a person; only the `user` identity is read, so an
+    /// app-created file reads `None` ("Unknown") rather than naming the app that wrote it.
+    pub created_by: Option<String>,
+    /// `lastModifiedBy.user.displayName` — who last edited it, read the same way.
+    pub last_modified_by: Option<String>,
+    /// `createdDateTime` (ISO-8601) — the source's own creation time.
+    pub created_time: Option<String>,
 }
 
 /// Lets a folder-scoped enumeration reconcile through the shared [`index_only::reconcile_enumeration`]
@@ -391,6 +403,11 @@ impl DriveItem {
             // root (no parentReference name) simply stays untagged, exactly as before.
             source_parent_folder_id: self.parent_id.clone(),
             source_parent_folder_name: self.parent_name.clone(),
+            source_author: self.created_by.clone(),
+            source_last_modified_by: self.last_modified_by.clone(),
+            source_created_at: self.created_time.clone(),
+            // Already parsed and already in `$select` — it was simply never carried onto the pointer.
+            source_size_bytes: self.size,
         }
     }
 }
@@ -456,7 +473,28 @@ fn parse_item(v: &Value) -> Option<DriveItem> {
             .and_then(|p| p.get("name"))
             .and_then(Value::as_str)
             .map(String::from),
+        created_by: identity_name(v.get("createdBy")),
+        last_modified_by: identity_name(v.get("lastModifiedBy")),
+        created_time: v
+            .get("createdDateTime")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(String::from),
     })
+}
+
+/// The person named by a Graph `identitySet`, or `None`.
+///
+/// An `identitySet` can carry `user`, `application` and `device` identities; only `user` is read. A
+/// file written by a sync client or a bot then reads `None` and surfaces as "Unknown", which is
+/// truthful — naming the application would look like an author and mislead the person comparing two
+/// copies of a document, which is the whole reason these fields exist.
+fn identity_name(set: Option<&Value>) -> Option<String> {
+    set.and_then(|s| s.get("user"))
+        .and_then(|u| u.get("displayName"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 fn parse_delta_entry(v: &Value) -> Option<DriveDelta> {
@@ -869,6 +907,9 @@ mod tests {
             web_url: Some(format!("https://onedrive/{id}")),
             parent_id: None,
             parent_name: None,
+            created_by: None,
+            last_modified_by: None,
+            created_time: None,
         }
     }
 
