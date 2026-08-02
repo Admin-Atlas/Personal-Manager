@@ -23,6 +23,21 @@ export const WHEEL_STEP_PX = 55;
  *  pixels at once; without this the view would leap most of a month and lose the user's place. */
 const MAX_STEPS_PER_EVENT = 3;
 
+/**
+ * One event's sideways travel in PIXELS, whatever unit the platform chose to report.
+ *
+ * `deltaX` is only in pixels when `deltaMode` is 0. A device or engine that reports LINES (1) or
+ * PAGES (2) sends numbers one to two orders of magnitude smaller — a line-mode notch is `deltaX: 1`,
+ * which against a 55px threshold means 55 notches per day rather than one, and reads as the gesture
+ * simply not working. `scrollAxis.ts` has normalised this since it was written; this half was
+ * comparing raw units to a pixel constant. The 16px-per-line figure is the same one used there.
+ */
+export function horizontalPixels(e: { deltaX: number; deltaMode: number }): number {
+  if (e.deltaMode === 1) return e.deltaX * 16; // lines
+  if (e.deltaMode === 2) return e.deltaX * WHEEL_STEP_PX * 7; // pages ≈ a week's worth
+  return e.deltaX;
+}
+
 export interface ShiftResult {
   /** Whole day steps to apply now (negative = earlier). */
   steps: number;

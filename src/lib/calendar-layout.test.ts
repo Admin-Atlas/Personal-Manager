@@ -2,7 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { minutesFromLocalMidnight, occurrenceKey, timedEndMinutes } from "./calendar-layout";
+import {
+  dayDiff,
+  dayKey,
+  minutesFromLocalMidnight,
+  occurrenceKey,
+  startOfDay,
+  startOfWeek,
+  timedEndMinutes,
+} from "./calendar-layout";
 import type { CalendarEvent } from "./types";
 
 // Local Date constructors (new Date(y, m0, d, h, min)) read the local clock, so these are TZ-agnostic.
@@ -66,5 +74,27 @@ describe("minutesFromLocalMidnight", () => {
   it("is hours*60 + minutes of the local clock", () => {
     expect(minutesFromLocalMidnight(new Date(2024, 2, 5, 13, 45))).toBe(825);
     expect(minutesFromLocalMidnight(new Date(2024, 2, 5, 0, 0))).toBe(0);
+  });
+});
+
+describe("startOfWeek — the Monday of the week containing the day", () => {
+  it("walks back to the Monday from anywhere in the week", () => {
+    // 2026-07-27 is a Monday; 2026-08-02 is the Sunday that closes the same week.
+    expect(dayKey(startOfWeek(new Date(2026, 6, 27)))).toBe("2026-07-27"); // Monday → itself
+    expect(dayKey(startOfWeek(new Date(2026, 7, 1)))).toBe("2026-07-27"); // Saturday
+    expect(dayKey(startOfWeek(new Date(2026, 7, 2)))).toBe("2026-07-27"); // Sunday, NOT the 3rd
+  });
+
+  it("never returns a start in the future, and always one the day falls inside", () => {
+    // Sunday is the trap: a `getDay()`-indexed implementation makes it day 0 and returns the
+    // Monday AFTER, so the calendar opens on a week that has not happened and today is off screen.
+    for (let dayShift = 0; dayShift < 14; dayShift++) {
+      const d = new Date(2026, 7, 1 + dayShift);
+      const start = startOfWeek(d);
+      expect(start.getTime()).toBeLessThanOrEqual(startOfDay(d).getTime());
+      expect(dayDiff(start, d)).toBeGreaterThanOrEqual(0);
+      expect(dayDiff(start, d)).toBeLessThan(7);
+      expect(start.getDay()).toBe(1); // a Monday, every time
+    }
   });
 });
