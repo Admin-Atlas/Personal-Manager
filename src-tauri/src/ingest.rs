@@ -229,12 +229,17 @@ pub(crate) fn apply_event(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
 }
 
 /// Append a row, dropping the oldest once the cap is reached.
+///
+/// `pop_front` rather than `remove(0)`: with the cap at 2,000 an O(n) shift on every file after the
+/// buffer fills is real work on a large rebuild, and a deque makes eviction O(1). `VecDeque`
+/// serialises to a JSON array exactly as `Vec` does, so nothing on the wire or in the frontend
+/// changes.
 fn push_recent(snap: &mut crate::IngestJobState, item: crate::IngestItem) {
     if snap.recent.len() >= crate::RECENT_ITEMS_CAP {
-        snap.recent.remove(0);
+        snap.recent.pop_front();
         snap.recent_truncated = true;
     }
-    snap.recent.push(item);
+    snap.recent.push_back(item);
 }
 
 /// The Activity detail line for a file that landed: its chunk count, plus anything that went wrong

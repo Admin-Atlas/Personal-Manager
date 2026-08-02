@@ -270,14 +270,24 @@ pub struct IngestJobState {
     /// `started_at_ms`) kept counting, which is what made the gap look like a bug rather than a load.
     /// Capped-and-flagged like [`crate::cloud_sync::CloudSyncReport::issues`]; the tail is what a
     /// returning user is looking for, so the front is dropped first.
-    pub recent: Vec<IngestItem>,
+    ///
+    /// A `VecDeque` so that eviction at the cap is O(1) rather than an O(n) `remove(0)` per file —
+    /// it serialises to a JSON array identically, so the wire shape and the frontend are unchanged.
+    pub recent: std::collections::VecDeque<IngestItem>,
     /// True once `recent` has dropped older rows, so the UI can say the list is partial.
     pub recent_truncated: bool,
 }
 
-/// How many per-file rows the snapshot keeps. Enough to look continuous on return, small enough that
-/// a 10,000-file rebuild costs nothing to hold.
-pub const RECENT_ITEMS_CAP: usize = 50;
+/// How many per-file rows the snapshot keeps.
+///
+/// 50 was "enough to look continuous on return", which is the wrong goal: the Activity list is how
+/// a user watches a rebuild, and at 50 a 161-file pass had already discarded two thirds of itself
+/// before it finished — the list said "showing the most recent files" while the question being
+/// asked was "what has been built so far". The cap now fits a normal vault whole and exists only as
+/// a ceiling on the pathological case: 2,000 rows is ~200 KB in the snapshot and ~4,000 simple DOM
+/// nodes in a scroller that renders ~15 of them at a time, while a 10,000-file rebuild still cannot
+/// grow the snapshot without bound.
+pub const RECENT_ITEMS_CAP: usize = 2_000;
 
 /// One row of the rebuild's Activity list, mirrored into [`IngestJobState`].
 #[derive(Clone, serde::Serialize)]
@@ -1563,6 +1573,8 @@ pub fn run() {
             commands::stop_drive_sync,
             commands::resume_drive_sync,
             commands::rebuild_status,
+            commands::ack_rebuild_report,
+            commands::clear_rebuild_activity,
             commands::chat_identity_report,
             commands::resume_rebuild,
             commands::list_drive_shared_drives,

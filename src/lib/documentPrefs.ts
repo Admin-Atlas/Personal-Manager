@@ -56,3 +56,39 @@ export function writeDuplicateNudgeSeen(): void {
     /* best-effort — worst case the suggestion appears once more */
   }
 }
+
+// Whether the rebuild Activity fold is open.
+//
+// The Documents tab is a branch of App's view ternary inside an ErrorBoundary keyed on the view, so
+// LEAVING THE TAB UNMOUNTS IT. `Collapsible` keeps its own `useState(defaultOpen)` when it isn't
+// given `open`/`onOpenChange`, and that state dies with the mount — so a fold the user had closed
+// reseeded open on every return. Its own header comment already says the fix: state that must
+// outlive the mount is passed in, not left to the primitive.
+//
+// localStorage rather than a backend Setting, per the same rule as the two prefs above: a fold is a
+// statement about this person at this machine, not about the library.
+export const ACTIVITY_OPEN_KEY = "pm.documents.activityOpen";
+
+/** Whether the Activity fold is open — `null` when the user has never chosen, so the caller keeps
+ *  ownership of the default rather than having `false` mean both "closed" and "unset". */
+export function readActivityOpen(): boolean | null {
+  try {
+    const raw = localStorage.getItem(ACTIVITY_OPEN_KEY);
+    // Only the two values this ever writes count as a choice. Anything else — a hand-edited key, a
+    // half-written value — is "never chosen", not "closed": defaulting a junk read to closed would
+    // silently hide the Activity list, which is the one thing on this card the user came to see.
+    if (raw === "true") return true;
+    if (raw === "false") return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeActivityOpen(open: boolean): void {
+  try {
+    localStorage.setItem(ACTIVITY_OPEN_KEY, String(open));
+  } catch {
+    /* best-effort — a private-mode / quota failure just means the fold won't persist */
+  }
+}
