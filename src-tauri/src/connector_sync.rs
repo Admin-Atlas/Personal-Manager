@@ -360,9 +360,48 @@ where
     F: Fn(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<(Vec<T>, Option<String>)>>,
 {
+    paginate_until(max_pages, &never_cancelled, fetch).await
+}
+
+/// A cheap, side-effect-free "has the user asked this run to stop?" probe, threaded into the listing
+/// walk so a Stop lands mid-enumeration instead of at the next account boundary.
+///
+/// `Sync` because the probe is captured by the `Fn` closure each page's future is built from, and that
+/// future has to stay `Send` to cross the sync engine's `.await` points.
+pub type Cancel<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// The probe for a listing with no run behind it to cancel — the folder/account pickers, the calendar,
+/// and the backup destination walk. Named rather than an inline `&|| false` so the call sites read as a
+/// deliberate "nothing to stop here" instead of a forgotten argument.
+pub fn never_cancelled() -> bool {
+    false
+}
+
+/// [`paginate`] with a cancellation probe — the seam that makes "Stop indexing" bite during the listing
+/// walk rather than only between accounts.
+///
+/// The probe is read **before each page fetch**, so a Stop pressed mid-walk costs at most the request
+/// already in flight. A cancelled walk returns what it gathered so far with `truncated = true`, which is
+/// the same signal the page guard raises and therefore inherits its two guarantees for free: the
+/// reconcile plan is built with `complete = false` (so no absence is read as a deletion — see
+/// [`crate::index_only::reconcile_enumeration`]) and a baseline caller withholds its cursor. That is the
+/// whole reason cancellation reuses this flag instead of a separate one: a Stop that deleted documents
+/// would be far worse than a Stop that was slow.
+pub async fn paginate_until<T, F, Fut>(
+    max_pages: usize,
+    cancelled: Cancel<'_>,
+    fetch: F,
+) -> Result<(Vec<T>, bool)>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<T>, Option<String>)>>,
+{
     let mut out: Vec<T> = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..max_pages {
+        if cancelled() {
+            return Ok((out, true));
+        }
         let (mut items, next) = fetch(cursor).await?;
         out.append(&mut items);
         match next {
@@ -545,7 +584,7 @@ impl Drop for ManifestFlusher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// A `ManifestFlusher` whose write just bumps a shared counter, so the batching cadence is testable
@@ -924,6 +963,101 @@ mod tests {
             calls.load(Ordering::SeqCst),
             3,
             "and it stopped asking once the token cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_until_stops_mid_walk_and_keeps_what_it_gathered() {
+        // The Stop-indexing seam (#699). A cancel raised while page 3 is being asked for must end the
+        // walk THERE — keeping pages 1 and 2 — and flag the listing incomplete, because that flag is
+        // the only thing standing between a half-listed account and a reconcile that reads every
+        // unreached file as deleted.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let asked = calls.clone();
+        let probe = move || {
+            // Trip the flag once two pages are in, so the cancel lands mid-walk rather than before it.
+            if asked.load(Ordering::SeqCst) >= 2 {
+                flag.store(true, Ordering::SeqCst);
+            }
+            stop.load(Ordering::SeqCst)
+        };
+
+        let (out, truncated) = paginate_until(100, &probe, |_cursor| {
+            let seen = seen.clone();
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                // A token that never clears, so only the cancel can end this walk.
+                Ok::<_, Error>((vec![n], Some(format!("page-{}", n + 1))))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out,
+            vec![0, 1],
+            "the pages fetched before the Stop are kept"
+        );
+        assert!(
+            truncated,
+            "a cancelled walk is INCOMPLETE — no absence-inferred deletions, no cursor advance"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the probe is read BEFORE each fetch, so a Stop costs at most the request in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_until_that_is_never_cancelled_matches_paginate() {
+        // The probe must not change the shape of an ordinary walk — a complete listing has to keep
+        // reporting itself complete, or every uncancelled sync silently stops deleting.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (out, truncated) = paginate_until(10, &never_cancelled, |_cursor| {
+            let seen = seen.clone();
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>((vec![n], (n < 2).then(|| format!("page-{}", n + 1))))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!truncated, "nothing was cancelled and the token cleared");
+        assert_eq!(out, vec![0, 1, 2], "every page's items, in page order");
+    }
+
+    #[tokio::test]
+    async fn paginate_until_cancelled_before_the_first_page_fetches_nothing() {
+        // A Stop pressed during an earlier account's walk leaves the flag set for the rest of the run:
+        // every later listing must unwind immediately rather than fetching one more page each. Still
+        // `truncated` — an empty listing that claimed to be complete would delete the whole corpus.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (out, truncated) = paginate_until(10, &|| true, |_cursor| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>((vec![0usize], None))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(out.is_empty(), "nothing was listed");
+        assert!(
+            truncated,
+            "and an empty listing must never read as complete"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no request was made at all"
         );
     }
 

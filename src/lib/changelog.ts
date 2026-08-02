@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.116.2-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "“Stop indexing” now stops when you press it. PM asks a connected account for its file list before it indexes anything, and a Stop could only take effect between accounts — so pressing it while a big Drive was still being listed meant waiting for that whole account, every shared drive and every shared folder included, before anything happened. The button now takes effect inside the listing itself, so a Stop lands in seconds. Nothing about that is riskier than before: a run that was interrupted knows it only saw part of your account, so it never treats the files it hadn’t reached yet as deleted, and it never records that it got further than it did — the next sync simply picks the listing back up.",
+      "Leaving the Connectors tab mid-stop and coming back now shows what you left. The progress bar came back from where the sync really was, but the Stop button came back from nothing, so it read “Stop indexing” again next to a bar that had already been stopped — two parts of one screen disagreeing about the same run. Whether a stop has been asked for is now something the sync itself knows and the screen simply reflects, so the two can’t drift apart.",
+    ],
+  },
+  {
     version: "3.116.1-alpha",
     date: "2026-08-02",
     highlights: [

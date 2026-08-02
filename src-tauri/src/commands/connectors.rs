@@ -6,7 +6,7 @@
 
 use rusqlite::params;
 use serde::Serialize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager, State};
 
 use crate::blocking::spawn_blocking_result;
@@ -195,6 +195,14 @@ fn sync_snapshot<T: Clone>(state: &std::sync::Mutex<T>, what: &str) -> Result<T>
         .map_err(|_| Error::Other(format!("{what} sync state poisoned")))
 }
 
+/// Whether the snapshot should report "Stopping…" — a Stop is a request against the pass that is
+/// RUNNING, so an idle connector never reports one however the flag happens to be sitting (it is
+/// cleared at the next sync start, not on finish). Derived here rather than stored on the state, so
+/// the flag stays the single owner of the fact and the button can't disagree with it (#699).
+fn stop_requested(running: bool, cancel: &AtomicBool) -> bool {
+    running && cancel.load(Ordering::SeqCst)
+}
+
 /// Shared engine behind the three `resume_*_sync` commands: read the connector's pending-sync
 /// marker, bail when there's nothing to resume or a sync is already running this session (don't
 /// stack), then hand the marker's parsed target (account/folder; `None` = all) to `spawn`.
@@ -225,7 +233,9 @@ fn resume_pending_sync(
 /// can resume showing progress after the user leaves and returns.
 #[tauri::command]
 pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
-    sync_snapshot(&state.drive_sync, "drive")
+    let mut snap = sync_snapshot(&state.drive_sync, "drive")?;
+    snap.stopping = stop_requested(snap.running, &state.drive_sync_cancel);
+    Ok(snap)
 }
 
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
@@ -336,7 +346,9 @@ pub fn set_local_excludes(
 /// The currently-running local-folder sync snapshot, so the UI resumes progress after navigating away.
 #[tauri::command]
 pub fn local_folder_sync_status(state: State<'_, AppState>) -> Result<crate::LocalFolderSyncState> {
-    sync_snapshot(&state.local_sync, "local")
+    let mut snap = sync_snapshot(&state.local_sync, "local")?;
+    snap.stopping = stop_requested(snap.running, &state.local_sync_cancel);
+    Ok(snap)
 }
 
 /// Ask the running local-folder sync to stop after the current file (already-indexed files are kept).
@@ -810,7 +822,9 @@ pub fn set_onedrive_scope(
 /// The currently-running OneDrive sync snapshot, so the Settings UI can resume showing progress.
 #[tauri::command]
 pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
-    sync_snapshot(&state.onedrive_sync, "onedrive")
+    let mut snap = sync_snapshot(&state.onedrive_sync, "onedrive")?;
+    snap.stopping = stop_requested(snap.running, &state.onedrive_sync_cancel);
+    Ok(snap)
 }
 
 /// Sync one OneDrive account (or every account when `account` is `None`). The command the UI's

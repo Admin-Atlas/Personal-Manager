@@ -1513,10 +1513,14 @@ fn my_files_url(q: &str, page: Option<&str>) -> Result<String> {
 }
 
 /// Enumerate every non-trashed file in My Drive (paginated) — the first-sync baseline. Returns the
-/// files plus whether the page guard tripped (`true` ⇒ INCOMPLETE: the caller must not baseline a
-/// cursor past a partial listing — see [`connector_sync::paginate`]).
-pub async fn enumerate_drive(token_key: &str) -> Result<(Vec<DriveFile>, bool)> {
-    connector_sync::paginate(MAX_PAGES, |page| async move {
+/// files plus whether the listing was cut short (`true` ⇒ INCOMPLETE: the caller must not baseline a
+/// cursor past a partial listing — see [`connector_sync::paginate_until`]). Cut short by the page guard,
+/// or by the user pressing Stop (`cancel`).
+pub async fn enumerate_drive(
+    token_key: &str,
+    cancel: connector_sync::Cancel<'_>,
+) -> Result<(Vec<DriveFile>, bool)> {
+    connector_sync::paginate_until(MAX_PAGES, cancel, |page| async move {
         let v = google::authorized_get(token_key, &files_url(page.as_deref())?).await?;
         Ok(parse_files(&v))
     })
@@ -1626,10 +1630,11 @@ pub async fn enumerate_shared(
     drive_id: &str,
     folders: Option<&[String]>,
     exclude: &[String],
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveFile>, bool)> {
     match folders {
         None => {
-            connector_sync::paginate(MAX_PAGES, |page| async move {
+            connector_sync::paginate_until(MAX_PAGES, cancel, |page| async move {
                 let url = shared_files_url(
                     drive_id,
                     "trashed = false",
@@ -1643,7 +1648,7 @@ pub async fn enumerate_shared(
             .await
         }
         Some(roots) => {
-            walk_folders(token_key, roots, exclude, false, |q, page| {
+            walk_folders(token_key, roots, exclude, false, cancel, |q, page| {
                 shared_files_url(drive_id, q, FILE_FIELDS, "", page)
             })
             .await
@@ -1667,13 +1672,16 @@ pub async fn enumerate_shared(
 /// still propagates the 403. A transient rate-limit always propagates.
 ///
 /// Returns the deduped files plus whether the walk was cut short (`true` ⇒ INCOMPLETE — the caller must
-/// not treat an unseen file as deleted; see [`connector_sync::paginate`]). Three things set it: the
-/// folder-count guard, one folder's page guard, and a skipped forbidden-or-missing subtree.
+/// not treat an unseen file as deleted; see [`connector_sync::paginate_until`]). Four things set it: the
+/// folder-count guard, one folder's page guard, a skipped forbidden-or-missing subtree, and the user
+/// pressing Stop (`cancel`). This recursion is what dominates the wait on a big estate, so the probe is
+/// read both between folders and between a folder's pages.
 async fn walk_folders(
     token_key: &str,
     roots: &[String],
     exclude: &[String],
     tolerant: bool,
+    cancel: connector_sync::Cancel<'_>,
     url_for: impl Fn(&str, Option<&str>) -> Result<String> + Sync,
 ) -> Result<(Vec<DriveFile>, bool)> {
     use std::collections::HashSet;
@@ -1697,6 +1705,12 @@ async fn walk_folders(
         .collect();
     let mut nodes = 0usize;
     while let Some(folder) = queue.pop() {
+        // Stop pressed? End the walk here, flagged incomplete. Checked per FOLDER as well as per page
+        // (below) so a wide, shallow tree — thousands of folders of one page each — unwinds at once
+        // instead of paying a probe-then-return per remaining folder.
+        if cancel() {
+            return Ok((out, true));
+        }
         if !seen_folders.insert(folder.clone()) {
             continue; // a folder reachable two ways (nested selections) — walk it once.
         }
@@ -1709,7 +1723,7 @@ async fn walk_folders(
         // One bounded pagination per folder — the same guard every other listing uses. A page token
         // that never clears now flags the walk incomplete instead of spinning forever while re-pushing
         // the same children into `queue` until the process runs out of memory.
-        let listed = connector_sync::paginate(MAX_PAGES, |page| {
+        let listed = connector_sync::paginate_until(MAX_PAGES, cancel, |page| {
             // Sync prologue: build the URL here so the future captures only owned data and stays `Send`.
             let url = url_for(&q, page.as_deref());
             let listed_ok = &listed_ok;
@@ -1769,8 +1783,9 @@ pub async fn enumerate_my_folders(
     token_key: &str,
     folders: &[String],
     exclude: &[String],
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveFile>, bool)> {
-    walk_folders(token_key, folders, exclude, false, my_files_url).await
+    walk_folders(token_key, folders, exclude, false, cancel, my_files_url).await
 }
 
 /// Enumerate the files that live DIRECTLY in a drive's root (not inside any folder) — the loose files
@@ -1781,11 +1796,12 @@ pub async fn enumerate_my_folders(
 pub async fn enumerate_root_files(
     token_key: &str,
     drive_id: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveFile>, bool)> {
     let my_drive = drive_id == MY_DRIVE_ROOT;
     let parent = if my_drive { MY_DRIVE_ROOT } else { drive_id };
     let q = format!("'{parent}' in parents and trashed = false");
-    let (files, truncated) = connector_sync::paginate(MAX_PAGES, |page| {
+    let (files, truncated) = connector_sync::paginate_until(MAX_PAGES, cancel, |page| {
         let q = q.as_str();
         async move {
             let url = if my_drive {
@@ -1878,8 +1894,11 @@ fn root_is_folder(root: &DriveFile) -> bool {
 /// `sharedWithMe = true` returns only these roots, NEVER a shared folder's descendants (those are
 /// reached by walking `'<folderId>' in parents`, see [`enumerate_swm_root`]). Carries the truncated
 /// flag from the pagination guard.
-pub async fn list_swm_roots(token_key: &str) -> Result<(Vec<DriveFile>, bool)> {
-    connector_sync::paginate(MAX_PAGES, |page| async move {
+pub async fn list_swm_roots(
+    token_key: &str,
+    cancel: connector_sync::Cancel<'_>,
+) -> Result<(Vec<DriveFile>, bool)> {
+    connector_sync::paginate_until(MAX_PAGES, cancel, |page| async move {
         // The widened mask (see SWM_ROOT_EXTRA_FIELDS) — roots only, never the descendant walk.
         let url = swm_root_files_url("sharedWithMe = true and trashed = false", page.as_deref())?;
         let v = google::authorized_get(token_key, &url).await?;
@@ -1891,7 +1910,7 @@ pub async fn list_swm_roots(token_key: &str) -> Result<(Vec<DriveFile>, bool)> {
 /// The picker's view of the shared-with-me roots (id + name + folder-ness). A truncated listing just
 /// shows fewer rows (a picker has no deletion semantics), so the guard flag is discarded.
 pub async fn list_swm_root_choices(token_key: &str) -> Result<Vec<SwmRoot>> {
-    let (roots, _truncated) = list_swm_roots(token_key).await?;
+    let (roots, _truncated) = list_swm_roots(token_key, &connector_sync::never_cancelled).await?;
     Ok(roots
         .iter()
         .map(|r| SwmRoot {
@@ -1912,9 +1931,10 @@ pub async fn list_swm_root_choices(token_key: &str) -> Result<Vec<SwmRoot>> {
 pub async fn enumerate_swm_root(
     token_key: &str,
     root: &DriveFile,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveFile>, bool)> {
     if root.mime_type == SHORTCUT_MIME {
-        return enumerate_swm_shortcut(token_key, root).await;
+        return enumerate_swm_shortcut(token_key, root, cancel).await;
     }
     if root.mime_type == FOLDER_MIME {
         return walk_folders(
@@ -1922,6 +1942,7 @@ pub async fn enumerate_swm_root(
             std::slice::from_ref(&root.id),
             &[],
             true,
+            cancel,
             swm_files_url,
         )
         .await;
@@ -1937,6 +1958,7 @@ pub async fn enumerate_swm_root(
 async fn enumerate_swm_shortcut(
     token_key: &str,
     root: &DriveFile,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveFile>, bool)> {
     let (target_id, target_mime) = match (&root.shortcut_target_id, &root.shortcut_target_mime) {
         (Some(id), Some(mime)) => (id.as_str(), mime.as_str()),
@@ -1951,6 +1973,7 @@ async fn enumerate_swm_shortcut(
             &[target_id.to_string()],
             &[],
             true,
+            cancel,
             swm_files_url,
         )
         .await;
@@ -2017,10 +2040,17 @@ async fn list_changes_for(
     token_key: &str,
     drive_id: Option<&str>,
     cursor: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveChange>, String, bool)> {
     let mut all = Vec::new();
     let mut page = cursor.to_string();
     for _ in 0..MAX_PAGES {
+        // Stop pressed? Hand back the pages drained so far against the UNCONSUMED cursor, flagged
+        // truncated. Safe on a delta feed for the same reason the page guard is: the changes seen apply
+        // idempotently and `page` is still the token they came from, so the next sync replays them.
+        if cancel() {
+            return Ok((all, page, true));
+        }
         let v = google::authorized_get(token_key, &changes_url(&page, drive_id)?).await?;
         let (changes, next, new_start) = parse_changes(&v);
         all.extend(changes);
@@ -2040,8 +2070,9 @@ async fn list_changes_for(
 pub async fn list_changes(
     token_key: &str,
     cursor: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveChange>, String, bool)> {
-    list_changes_for(token_key, None, cursor).await
+    list_changes_for(token_key, None, cursor, cancel).await
 }
 
 /// Pull every change since `cursor` for one **shared drive's** own change feed + its next cursor.
@@ -2049,8 +2080,9 @@ pub async fn list_shared_changes(
     token_key: &str,
     drive_id: &str,
     cursor: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveChange>, String, bool)> {
-    list_changes_for(token_key, Some(drive_id), cursor).await
+    list_changes_for(token_key, Some(drive_id), cursor, cancel).await
 }
 
 /// Fetch one file's metadata (for body-on-demand, where we hold only the stored pointer).

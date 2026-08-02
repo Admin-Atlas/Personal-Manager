@@ -647,10 +647,16 @@ fn delta_step(next: Option<String>, delta: Option<String>) -> Result<DeltaStep> 
 pub async fn list_delta(
     token_key: &str,
     cursor: Option<&str>,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveDelta>, String, bool)> {
     let mut url = cursor.map(String::from).unwrap_or_else(root_delta_url);
     let mut all = Vec::new();
     for _ in 0..MAX_PAGES {
+        // Stop pressed? Hand back the pages drained so far against the `nextLink` we would have
+        // fetched — a resumable checkpoint, exactly as the page guard below returns.
+        if cancel() {
+            return Ok((all, url, true));
+        }
         let v = microsoft::authorized_get(token_key, &url).await?;
         let (entries, next, delta) = parse_delta(&v);
         all.extend(entries);
@@ -671,13 +677,14 @@ pub async fn list_delta(
 /// only the files beneath them. Any item id in `exclude` is never enqueued — pruning that folder and
 /// its whole subtree, both as a seed root and as a descended child. The folder-scoped counterpart to
 /// [`list_delta`].
-/// Returns the deduped files plus whether the walk was cut short — by the folder-count guard, or by one
-/// folder's page guard (`true` ⇒ INCOMPLETE — the caller must not treat an unseen file as deleted; see
-/// [`connector_sync::paginate`]).
+/// Returns the deduped files plus whether the walk was cut short — by the folder-count guard, by one
+/// folder's page guard, or by the user pressing Stop (`true` ⇒ INCOMPLETE — the caller must not treat an
+/// unseen file as deleted; see [`connector_sync::paginate_until`]).
 pub async fn enumerate_folders(
     token_key: &str,
     roots: &[String],
     exclude: &[String],
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, bool)> {
     use std::collections::HashSet;
     let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
@@ -692,6 +699,11 @@ pub async fn enumerate_folders(
     let mut nodes = 0usize;
     let mut truncated = false;
     while let Some(folder) = queue.pop() {
+        // Stop pressed? End the walk here, flagged incomplete — checked per FOLDER as well as per page
+        // (below), so a wide, shallow tree unwinds at once. See [`crate::drive::walk_folders`].
+        if cancel() {
+            return Ok((out, true));
+        }
         if !seen_folders.insert(folder.clone()) {
             continue; // a folder reachable two ways (nested selections) — walk it once.
         }
@@ -704,15 +716,16 @@ pub async fn enumerate_folders(
         // that never clears now flags the walk incomplete instead of spinning forever while re-pushing
         // the same children into `queue` until the process runs out of memory.
         let initial = item_children_url(&folder);
-        let (children, page_truncated) = connector_sync::paginate(MAX_PAGES, |cursor| {
-            let initial = initial.as_str();
-            async move {
-                let url = cursor.unwrap_or_else(|| initial.to_string());
-                let v = microsoft::authorized_get(token_key, &url).await?;
-                Ok(parse_children(&v))
-            }
-        })
-        .await?;
+        let (children, page_truncated) =
+            connector_sync::paginate_until(MAX_PAGES, cancel, |cursor| {
+                let initial = initial.as_str();
+                async move {
+                    let url = cursor.unwrap_or_else(|| initial.to_string());
+                    let v = microsoft::authorized_get(token_key, &url).await?;
+                    Ok(parse_children(&v))
+                }
+            })
+            .await?;
         if page_truncated {
             eprintln!("onedrive: folder {folder} hit the page guard at {MAX_PAGES} pages");
             truncated = true;

@@ -661,9 +661,10 @@ async fn run_cloud_pass<C: CloudDriver>(
     for email in emails {
         // Stop requested before this account's gather? Halt phase 1 — phase 2's first check reads the
         // same flag and reports the pass cancelled, and an ungathered account is simply left untouched
-        // (cursor unadvanced, no inferred deletions). This takes effect at an ACCOUNT boundary only:
-        // a walk already in flight still runs to completion, since interrupting one needs a cancel
-        // probe threaded through every enumerate/walk signature.
+        // (cursor unadvanced, no inferred deletions). A walk ALREADY in flight also stops now rather
+        // than running the account to completion: each driver hands the same flag down its listings as
+        // a [`connector_sync::Cancel`] probe (#699), where a trip returns what was gathered flagged
+        // truncated — which is what keeps a half-listed account from being read as a deletion.
         if sync_cancelled::<C>(app) {
             break;
         }
@@ -1048,6 +1049,7 @@ async fn gather_shared(
     token_key: &str,
     email: &str,
     sel: &drive::SharedSelection,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, Option<(String, String)>, bool)> {
     match sel.folders.as_deref() {
         Some(folders) => {
@@ -1058,11 +1060,12 @@ async fn gather_shared(
                 folders,
                 &sel.exclude,
                 sel.include_root_files,
+                cancel,
             )
             .await?;
             Ok((items, None, truncated))
         }
-        None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
+        None => gather_shared_whole(app, token_key, email, &sel.drive_id, cancel).await,
     }
 }
 
@@ -1078,14 +1081,15 @@ async fn gather_shared_folders(
     folders: &[String],
     exclude: &[String],
     include_root_files: bool,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, bool)> {
     let (mut files, mut truncated) =
-        drive::enumerate_shared(token_key, drive_id, Some(folders), exclude).await?;
+        drive::enumerate_shared(token_key, drive_id, Some(folders), exclude, cancel).await?;
     // Fix 4: also index files loose in the drive's root when opted in — a file has one parent, so a
     // root file never overlaps a folder-walked file (no dedup needed). Reconciled against the whole
     // drive's known set below, so toggling this off soft-removes the root files like unselecting a folder.
     if include_root_files {
-        let (root_files, rt) = drive::enumerate_root_files(token_key, drive_id).await?;
+        let (root_files, rt) = drive::enumerate_root_files(token_key, drive_id, cancel).await?;
         files.extend(root_files);
         truncated |= rt;
     }
@@ -1113,12 +1117,14 @@ async fn gather_my_drive_folders(
     folders: &[String],
     exclude: &[String],
     include_root_files: bool,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, bool)> {
     let (mut files, mut truncated) =
-        drive::enumerate_my_folders(token_key, folders, exclude).await?;
+        drive::enumerate_my_folders(token_key, folders, exclude, cancel).await?;
     // Fix 4: also index files loose in My Drive's root when opted in (see [`gather_shared_folders`]).
     if include_root_files {
-        let (root_files, rt) = drive::enumerate_root_files(token_key, drive::MY_DRIVE_ROOT).await?;
+        let (root_files, rt) =
+            drive::enumerate_root_files(token_key, drive::MY_DRIVE_ROOT, cancel).await?;
         files.extend(root_files);
         truncated |= rt;
     }
@@ -1160,8 +1166,9 @@ async fn baseline_my_drive(
     app: &AppHandle,
     token_key: &str,
     email: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, Option<String>, bool)> {
-    let (files, truncated) = drive::enumerate_drive(token_key).await?;
+    let (files, truncated) = drive::enumerate_drive(token_key, cancel).await?;
     let cursor = drive::start_page_token(token_key, None).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
@@ -1186,6 +1193,7 @@ async fn gather_shared_whole(
     token_key: &str,
     email: &str,
     drive_id: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, Option<(String, String)>, bool)> {
     let cursor = {
         let state = app.state::<AppState>();
@@ -1202,8 +1210,10 @@ async fn gather_shared_whole(
         app: &AppHandle,
         token_key: &str,
         drive_id: &str,
+        cancel: connector_sync::Cancel<'_>,
     ) -> Result<(Vec<DriveItem>, String, bool)> {
-        let (files, truncated) = drive::enumerate_shared(token_key, drive_id, None, &[]).await?;
+        let (files, truncated) =
+            drive::enumerate_shared(token_key, drive_id, None, &[], cancel).await?;
         let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
         let known: std::collections::HashSet<String> = {
             let state = app.state::<AppState>();
@@ -1226,17 +1236,17 @@ async fn gather_shared_whole(
 
     let cursor = match cursor {
         None => {
-            let (items, c, truncated) = baseline(app, token_key, drive_id).await?;
+            let (items, c, truncated) = baseline(app, token_key, drive_id, cancel).await?;
             return Ok((items, baseline_cursor(truncated, c), truncated));
         }
         Some(c) => c,
     };
 
     let (changes, new_cursor, truncated) =
-        match drive::list_shared_changes(token_key, drive_id, &cursor).await {
+        match drive::list_shared_changes(token_key, drive_id, &cursor, cancel).await {
             Ok(v) => v,
             Err(e) if drive::is_cursor_expired(&e) => {
-                let (items, c, truncated) = baseline(app, token_key, drive_id).await?;
+                let (items, c, truncated) = baseline(app, token_key, drive_id, cancel).await?;
                 return Ok((items, baseline_cursor(truncated, c), truncated));
             }
             Err(e) => return Err(e),
@@ -1276,8 +1286,9 @@ async fn gather_shared_with_me(
     token_key: &str,
     email: &str,
     picked: Option<&[String]>,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<DriveItem>, bool)> {
-    let (roots, mut truncated) = drive::list_swm_roots(token_key).await?;
+    let (roots, mut truncated) = drive::list_swm_roots(token_key, cancel).await?;
     let picked_set: Option<std::collections::HashSet<&str>> =
         picked.map(|ids| ids.iter().map(String::as_str).collect());
 
@@ -1299,7 +1310,7 @@ async fn gather_shared_with_me(
         if !owns {
             continue;
         }
-        let (files, root_truncated) = drive::enumerate_swm_root(token_key, root).await?;
+        let (files, root_truncated) = drive::enumerate_swm_root(token_key, root, cancel).await?;
         truncated |= root_truncated;
         // Adopt any legacy My-Drive-namespaced rows for these files, THEN read the root's known set —
         // so an adopted row is already in that set and reconciles as an Update/no-op, not a re-ingest.
@@ -1465,6 +1476,10 @@ impl CloudDriver for DriveDriver {
             let conn = state.conn()?;
             drive::get_scope(&conn, &email)?
         };
+        // The same flag phase 1 and phase 2 read between accounts, handed DOWN into every listing so a
+        // Stop lands inside the walk (#699). A trip returns what was gathered flagged truncated, which
+        // withholds this account's cursor and its reconcile deletions — see [`drive_baseline_items`].
+        let cancel = || sync_cancelled::<Self>(app);
 
         let mut items: Vec<DriveItem> = Vec::new();
         let mut new_cursor: Option<String> = None;
@@ -1485,6 +1500,7 @@ impl CloudDriver for DriveDriver {
                         folders,
                         &scope.my_drive_exclude,
                         scope.my_drive_include_root_files,
+                        &cancel,
                     )
                     .await
                     {
@@ -1512,24 +1528,28 @@ impl CloudDriver for DriveDriver {
                     // across passes instead of re-fetching the same head forever. A re-baseline
                     // ([`baseline_my_drive`]) withholds on truncation instead, and reconciles rather
                     // than re-adding — the only way a change made while the cursor was dead is seen.
-                    let outcome: Result<(Vec<DriveItem>, Option<String>, bool)> = if cursor
-                        .is_none()
-                    {
-                        baseline_my_drive(app, &token_key, &email).await
-                    } else {
-                        match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await
-                        {
-                            Ok((changes, c, truncated)) => Ok((
-                                changes.into_iter().map(DriveItem::Changed).collect(),
-                                Some(c),
-                                truncated,
-                            )),
-                            Err(e) if drive::is_cursor_expired(&e) => {
-                                baseline_my_drive(app, &token_key, &email).await
+                    let outcome: Result<(Vec<DriveItem>, Option<String>, bool)> =
+                        if cursor.is_none() {
+                            baseline_my_drive(app, &token_key, &email, &cancel).await
+                        } else {
+                            match drive::list_changes(
+                                &token_key,
+                                cursor.as_deref().unwrap_or(""),
+                                &cancel,
+                            )
+                            .await
+                            {
+                                Ok((changes, c, truncated)) => Ok((
+                                    changes.into_iter().map(DriveItem::Changed).collect(),
+                                    Some(c),
+                                    truncated,
+                                )),
+                                Err(e) if drive::is_cursor_expired(&e) => {
+                                    baseline_my_drive(app, &token_key, &email, &cancel).await
+                                }
+                                Err(e) => Err(e),
                             }
-                            Err(e) => Err(e),
-                        }
-                    };
+                        };
                     match outcome {
                         Ok((mut my_items, persist_cursor, truncated)) => {
                             items.append(&mut my_items);
@@ -1562,7 +1582,7 @@ impl CloudDriver for DriveDriver {
                 if !owns {
                     continue;
                 }
-                match gather_shared(app, &token_key, &email, sel).await {
+                match gather_shared(app, &token_key, &email, sel, &cancel).await {
                     Ok((mut recon, cursor, truncated)) => {
                         items.append(&mut recon);
                         coverage_incomplete |= truncated;
@@ -1595,6 +1615,7 @@ impl CloudDriver for DriveDriver {
                 &token_key,
                 &email,
                 scope.shared_with_me_roots.as_deref(),
+                &cancel,
             )
             .await
             {
@@ -1744,8 +1765,10 @@ async fn gather_onedrive_folders(
     email: &str,
     folders: &[String],
     exclude: &[String],
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<OneDriveItem>, bool)> {
-    let (items, truncated) = onedrive::enumerate_folders(token_key, folders, exclude).await?;
+    let (items, truncated) =
+        onedrive::enumerate_folders(token_key, folders, exclude, cancel).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -1774,8 +1797,9 @@ async fn baseline_onedrive(
     app: &AppHandle,
     token_key: &str,
     email: &str,
+    cancel: connector_sync::Cancel<'_>,
 ) -> Result<(Vec<OneDriveItem>, String, bool)> {
-    let (deltas, link, truncated) = onedrive::list_delta(token_key, None).await?;
+    let (deltas, link, truncated) = onedrive::list_delta(token_key, None, cancel).await?;
     // A no-token delta carries no tombstones, so the live-file payloads ARE the enumeration.
     let files: Vec<onedrive::DriveItem> = deltas.into_iter().filter_map(|d| d.file).collect();
     let known: std::collections::HashSet<String> = {
@@ -1861,6 +1885,10 @@ impl CloudDriver for OneDriveDriver {
             onedrive::get_scope(&conn, &email)?
         };
 
+        // See the Drive driver: the same cancel flag phase 1 reads between accounts, handed down into
+        // the listings so a Stop lands inside the walk (#699).
+        let cancel = || sync_cancelled::<Self>(app);
+
         let mut items: Vec<OneDriveItem> = Vec::new();
         let mut new_cursor: Option<String> = None;
         let mut auth_failed = false;
@@ -1870,8 +1898,15 @@ impl CloudDriver for OneDriveDriver {
         match scope.folders.as_deref() {
             // Folder-scoped: re-enumerate selected folders + reconcile (no cursor).
             Some(folders) => {
-                match gather_onedrive_folders(app, &token_key, &email, folders, &scope.exclude)
-                    .await
+                match gather_onedrive_folders(
+                    app,
+                    &token_key,
+                    &email,
+                    folders,
+                    &scope.exclude,
+                    &cancel,
+                )
+                .await
                 {
                     Ok((mut recon, truncated)) => {
                         items.append(&mut recon);
@@ -1895,15 +1930,16 @@ impl CloudDriver for OneDriveDriver {
                     onedrive::get_cursor(&conn, &email)?
                 };
                 let outcome: Result<(Vec<OneDriveItem>, String, bool)> = match &cursor {
-                    None => baseline_onedrive(app, &token_key, &email).await,
-                    Some(link) => match onedrive::list_delta(&token_key, Some(link)).await {
+                    None => baseline_onedrive(app, &token_key, &email, &cancel).await,
+                    Some(link) => match onedrive::list_delta(&token_key, Some(link), &cancel).await
+                    {
                         Ok((deltas, link, truncated)) => Ok((
                             deltas.into_iter().map(OneDriveItem::Delta).collect(),
                             link,
                             truncated,
                         )),
                         Err(e) if onedrive::is_cursor_expired(&e) => {
-                            baseline_onedrive(app, &token_key, &email).await
+                            baseline_onedrive(app, &token_key, &email, &cancel).await
                         }
                         Err(e) => Err(e),
                     },
@@ -2414,6 +2450,42 @@ mod tests {
             "a partial listing must never infer a deletion"
         );
         assert_eq!(items.len(), 1, "the file it did reach still gets an event");
+    }
+
+    #[tokio::test]
+    async fn a_gather_stopped_mid_walk_deletes_nothing_and_baselines_no_cursor() {
+        // The join the Stop fix rests on (#699), asserted end to end rather than in two halves: the
+        // flag a CANCELLED listing raises is the same `truncated` these guards already consume. Get
+        // that wrong and pressing Stop mid-walk becomes a mass deletion — every file the walk had not
+        // reached yet reads as absent from a listing that claims to be complete.
+        let known = std::collections::HashSet::from([
+            drive::source_id_for(EMAIL, "f1"),
+            drive::source_id_for(EMAIL, "f2"),
+        ]);
+
+        // One page listed, then Stop — standing in for the real enumeration's page loop.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (files, truncated) =
+            connector_sync::paginate_until(100, &|| stop.swap(true, Ordering::SeqCst), |_page| {
+                let f = drive_file("f1", "h1", "2026-07-01T00:00:00Z");
+                async move { Ok::<_, Error>((vec![f], Some("more".to_string()))) }
+            })
+            .await
+            .unwrap();
+
+        assert!(truncated, "a cancelled walk reports itself incomplete");
+        let items = drive_baseline_items(files, known, truncated, |id| {
+            drive::source_id_for(EMAIL, id)
+        });
+        assert!(
+            deleted_ids(&items).is_empty(),
+            "f2 was simply never reached — a Stop must not delete it"
+        );
+        assert_eq!(items.len(), 1, "the page it did list still reconciles");
+        // The cursor half of the same contract needs no assertion here: `baseline_my_drive` and
+        // `gather_shared_whole` both spell it `(!truncated).then_some(cursor)` at the call site, so the
+        // flag proved above is literally what withholds the advance. Phase 2 is belt to that brace —
+        // it breaks on the cancel flag before `finalize_or_flag` runs at all.
     }
 
     #[test]
