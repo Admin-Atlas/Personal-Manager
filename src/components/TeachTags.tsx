@@ -54,6 +54,10 @@ export function TeachTags() {
   // When the pass began, so a bar reopened mid-run counts from the true start rather than from
   // whenever this tab happened to mount.
   const [startedAt, setStartedAt] = useState<number | null>(null);
+  // What the last finished pass came to. Without it a pass that changed nothing is completely
+  // silent after the bar goes: the proposals list is simply empty, which looks identical to a pass
+  // that never ran. Restored on mount, so it also answers the user who was on another tab.
+  const [lastChanged, setLastChanged] = useState<number | null>(null);
 
   // Documents excluded from the accept. Everything staged is in by default: the pass was asked for
   // wholesale, so opting out is the exception.
@@ -85,6 +89,7 @@ export function TeachTags() {
     setLabelling(s.running && s.phase === "labelling");
     setStartedAt(s.started_at_ms);
     setProgress(s.total != null && s.running ? { done: s.processed, total: s.total } : null);
+    setLastChanged(s.last_changed);
     // The vocabulary is the billed output of phase one. Leaving the tab while that model call ran
     // used to throw it away entirely; it is restored here whether or not a pass is still running.
     if (s.vocabulary.length > 0) setVocabulary((v) => v ?? s.vocabulary);
@@ -109,11 +114,19 @@ export function TeachTags() {
       if (ev.type === "vocabulary") setVocabulary((v) => v ?? ev.tags);
       else if (ev.type === "progress") setProgress({ done: ev.done, total: ev.total });
       else if (ev.type === "finished") {
+        setLastChanged(ev.changed);
+        void load();
+      } else if (ev.type === "ended") {
         // The pass may have been started by a mount that is long gone, so this listener — not the
-        // starter's `finally` — is what releases the UI.
-        setLabelling(false);
+        // starter's `finally` — is what releases the UI. It has to be THIS event and not
+        // `finished`: the vocabulary phase never sends one, and neither does a pass that failed,
+        // which is how a tab that returned mid-phase used to end up shimmering forever with every
+        // control disabled.
+        if (ev.phase === "vocabulary") setProposing(false);
+        else setLabelling(false);
         setProgress(null);
         setStartedAt(null);
+        if (ev.error) setError(ev.error);
         void load();
       }
     }).then((fn) => {
@@ -330,6 +343,17 @@ export function TeachTags() {
               This keeps going if you leave the tab — come back any time to see where it has got to.
             </p>
           </div>
+        )}
+        {/* The outcome, once the bar has gone. A pass that proposes no changes is otherwise
+            completely silent — an empty proposals list looks exactly like a pass that never ran,
+            which is a poor answer after a billed run. Restored from the snapshot, so it reaches
+            the user who spent the pass on another tab. */}
+        {lastChanged != null && !proposing && !labelling && (
+          <p className="mt-3 text-sm text-ink3" role="status">
+            {lastChanged === 0
+              ? "Re-tag finished — every document already had the tags this pass would give it, so there is nothing to review."
+              : `Re-tag finished — ${lastChanged} document${lastChanged === 1 ? "" : "s"} to review below.`}
+          </p>
         )}
 
         {vocabulary && (

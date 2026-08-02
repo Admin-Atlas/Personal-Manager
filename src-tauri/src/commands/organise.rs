@@ -387,6 +387,21 @@ pub enum RetagEvent {
     Finished {
         changed: usize,
     },
+    /// A phase has stopped, however it stopped. Emitted by [`retag::RetagRunGuard`]'s `Drop`, so no
+    /// exit path can forget it — including the `?` sites, which is what the previous shape got
+    /// wrong. `Finished` says a pass SUCCEEDED and carries its result; `Ended` says nobody is
+    /// working any more, and is the only thing a re-entering view can rely on to release itself.
+    ///
+    /// Both phases emit it. The first phase used to emit nothing at all: it sent `Vocabulary` and
+    /// returned, the guard cleared `running` silently, and a Teach tab that mounted while the model
+    /// call was in flight adopted `running: true` and then never heard another word — shimmering
+    /// with every control disabled for the life of that mount.
+    Ended {
+        phase: crate::RetagPhase,
+        /// The failure, if it was one, so a view that was away while the pass died says why instead
+        /// of reverting silently to idle.
+        error: Option<String>,
+    },
 }
 
 /// How much a re-tag pass would cover, so the UI can state the cost BEFORE anything is billed.
@@ -475,6 +490,8 @@ fn retag_documents(app: &AppHandle) -> Result<Vec<RetagDoc>> {
 #[tauri::command]
 pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
     let state = app.state::<AppState>();
+    // Ahead of `begin` on purpose: a start that was refused never opened a phase, so it must not
+    // end one either — emitting `Ended` here would release a view watching the pass that IS running.
     let Some(_busy) = crate::BusyGuard::acquire(&state.retag_busy) else {
         return Err(Error::Other(
             "a re-tag pass is already running — it keeps going while you're on other tabs, and              Teach → Tags shows where it has got to."
@@ -483,14 +500,22 @@ pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
     };
     let sink = retag::RetagSink::new(app.clone());
     // One model call over sampled titles: there is nothing countable here, so the phase is
-    // honestly indeterminate rather than a bar sitting at zero. The guard clears `running` on
-    // every exit below — three early returns and two `?` sites — so a remounting Teach tab can
-    // never be left shimmering at a pass that ended.
-    let _run = sink.begin(crate::RetagPhase::Vocabulary, None);
-    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+    // honestly indeterminate rather than a bar sitting at zero.
+    //
+    // The body is split out so the guard can see how it ended. Every exit in it — six of them,
+    // four being `?` sites — now emits `Ended` on the way past, which is what a Teach tab that
+    // mounted mid-call has to hear before it can stop shimmering.
+    let mut run = sink.begin(crate::RetagPhase::Vocabulary, None);
+    let out = propose_vocabulary_inner(&app, &sink).await;
+    run.record(&out);
+    out
+}
+
+async fn propose_vocabulary_inner(app: &AppHandle, sink: &retag::RetagSink) -> Result<Vec<String>> {
+    let Some(plan) = llm_gateway::resolve(app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
-    let docs = retag_documents(&app)?;
+    let docs = retag_documents(app)?;
     if docs.is_empty() {
         return Ok(Vec::new());
     }
@@ -498,10 +523,10 @@ pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
     let max = retag::vocab_max(docs.len());
     let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
     // No cache_prefix: one call per pass, so there is no prefix to reuse.
-    let outcome = llm_gateway::complete(&app, &plan, &messages, false).await?;
+    let outcome = llm_gateway::complete(app, &plan, &messages, false).await?;
     let vocabulary = retag::parse_vocabulary(&outcome.completion.text, max);
     log_background_usage(
-        &app,
+        app,
         plan.models(),
         &[(
             outcome.completion.model.clone(),
@@ -538,6 +563,8 @@ pub async fn apply_retag_vocabulary(app: AppHandle, vocabulary: Vec<String>) -> 
     // Held across BOTH phases. `retag_assign` opens by clearing every staged proposal, so a second
     // pass started over a first — which a tab switch made possible, since it reset the component's
     // own `working` flag — would wipe the first's half-staged work.
+    //
+    // Ahead of `begin`, for the same reason as the vocabulary phase: a refused start ends nothing.
     let Some(_busy) = crate::BusyGuard::acquire(&state.retag_busy) else {
         return Err(Error::Other(
             "a re-tag pass is already running — it keeps going while you're on other tabs, and              Teach → Tags shows where it has got to."
@@ -545,8 +572,20 @@ pub async fn apply_retag_vocabulary(app: AppHandle, vocabulary: Vec<String>) -> 
         ));
     };
     let sink = retag::RetagSink::new(app.clone());
-    let _run = sink.begin(crate::RetagPhase::Labelling, None);
-    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+    let mut run = sink.begin(crate::RetagPhase::Labelling, None);
+    let out = apply_vocabulary_inner(&app, &sink, vocabulary).await;
+    run.record(&out);
+    out
+}
+
+/// The labelling pass proper. Nine exits, five of them `?` sites inside `retag_assign` — hence the
+/// split: the guard ends the phase on every one of them.
+async fn apply_vocabulary_inner(
+    app: &AppHandle,
+    sink: &retag::RetagSink,
+    vocabulary: Vec<String>,
+) -> Result<()> {
+    let Some(plan) = llm_gateway::resolve(app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
@@ -566,11 +605,19 @@ pub async fn apply_retag_vocabulary(app: AppHandle, vocabulary: Vec<String>) -> 
         ));
     }
 
-    let docs = retag_documents(&app)?;
+    let docs = retag_documents(app)?;
     if docs.is_empty() {
         sink.send(RetagEvent::Finished { changed: 0 });
         return Ok(());
     }
+    // The count is known here and not a moment earlier, but `begin` has to run before any of the
+    // exits above it. So the total is published as soon as it exists: without this the bar
+    // shimmers through the whole first model call — for the user who started it as much as for one
+    // returning to the tab — even though PM already knows it is about to label 165 documents.
+    sink.send(RetagEvent::Progress {
+        done: 0,
+        total: docs.len(),
+    });
     // The cap still applies to a hand-edited list: it bounds the cached prefix, and an unbounded
     // vocabulary is the failure this whole feature exists to undo.
     vocabulary.truncate(retag::vocab_max(docs.len()));
@@ -580,8 +627,8 @@ pub async fn apply_retag_vocabulary(app: AppHandle, vocabulary: Vec<String>) -> 
 
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
-    retag_assign(&app, &plan, &docs, &vocabulary, &sink, &mut usage_rows).await?;
-    log_background_usage(&app, plan.models(), &usage_rows);
+    retag_assign(app, &plan, &docs, &vocabulary, sink, &mut usage_rows).await?;
+    log_background_usage(app, plan.models(), &usage_rows);
     Ok(())
 }
 
@@ -608,7 +655,6 @@ async fn retag_assign(
 
     let total = docs.len();
     let mut done = 0usize;
-    let mut changed = 0usize;
     for chunk in docs.chunks(retag::ASSIGN_BATCH) {
         let inputs: Vec<retag::RetagInput<'_>> = chunk
             .iter()
@@ -640,7 +686,6 @@ async fn retag_assign(
             for (d, tags) in chunk.iter().zip(assignments) {
                 if let Some(tags) = tags {
                     retag::stage(&conn, d.id, &tags)?;
-                    changed += 1;
                 }
             }
         }
@@ -648,6 +693,16 @@ async fn retag_assign(
         sink.send(RetagEvent::Progress { done, total });
     }
 
+    // Count what the user will actually be shown, not what the model answered for. Staging a
+    // proposal identical to the tags a document already carries is the overwhelmingly common
+    // outcome on a well-tagged library, and counting those made the pass report "165 changed"
+    // above a list of three. `pending` applies the same order-insensitive comparison the proposals
+    // list does, so the number and the list can no longer disagree.
+    let changed = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        retag::pending(&conn)?.len()
+    };
     sink.send(RetagEvent::Finished { changed });
     Ok(())
 }
@@ -662,8 +717,12 @@ pub fn list_tag_proposals(state: State<'_, AppState>) -> Result<Vec<retag::TagPr
 /// Throw away a staged pass without applying any of it.
 #[tauri::command]
 pub fn discard_tag_proposals(state: State<'_, AppState>) -> Result<()> {
-    let conn = state.conn()?;
-    retag::clear(&conn, None)
+    {
+        let conn = state.conn()?;
+        retag::clear(&conn, None)?;
+    }
+    retag::clear_last_changed(&state);
+    Ok(())
 }
 
 /// Apply staged re-tags to the chosen documents — **tags and nothing else** (#580).
@@ -707,7 +766,14 @@ pub async fn commit_retag(app: AppHandle, document_ids: Vec<i64>) -> Result<usiz
             Ok(applied)
         })();
 
-        finish_vault_transaction(tx, written, None, result)
+        let out = finish_vault_transaction(tx, written, None, result);
+        // After the transaction, and with the DB guard released first. Only on success: a commit
+        // that rolled back leaves the proposals staged, so the count is still true of them.
+        drop(conn);
+        if out.is_ok() {
+            retag::clear_last_changed(&state);
+        }
+        out
     })
     .await
 }
