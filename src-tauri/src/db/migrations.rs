@@ -1504,6 +1504,68 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE documents ADD COLUMN pm_refreshed_at TEXT;
     "#,
+    // v54 — every PLACE a document's file lives, one row each (#710).
+    //
+    // Until now a document WAS its location: `documents.source_id` named exactly one place, so one
+    // file reachable through two Drive accounts, or as both a shared-drive item and a shared-with-me
+    // item, became two documents with two filings and two rows in every list. #703 fixed one such
+    // overlap by refusing to enumerate the file twice, which works only for overlaps PM can see from
+    // one account's listing — the general case (two accounts, one owner and one recipient) it cannot.
+    //
+    // The model Bobby chose over a primary-plus-record one, and his reasoning is the design: if a
+    // "primary" vanishes while another location is still live and still being edited, a primary-only
+    // model either goes stale or reaps a document the user still has. So: a document survives while
+    // ANY of its locations does, and each location is reconciled by its own connector on its own
+    // cursor, with its own change pointer.
+    //
+    // **`documents.source_id` stays, as a permanent identity ANCHOR that is never rewritten.** It has
+    // to stay — `vault_path` (`idx://<source_id>`) and `content_hash` are both NOT NULL UNIQUE and
+    // derived from it, and rule #3 forbids dropping a column. Making it immutable is what dissolves
+    // the promotion problem the card anticipated: nothing reads the anchor to decide whether a body
+    // is reachable any more (that is the rollup below), so a dead anchor costs nothing and no
+    // document ever has to be re-hashed, re-pathed or re-embedded to hand the crown to a sibling.
+    //
+    // The anchor's own row is a location like any other — it is in here too, not a special case
+    // outside it. `documents`' pointer columns (`source_state`, `external_ref`, `source_modified_at`,
+    // `source_content_hash`) are a MIRROR of that anchor location plus the reachability rollup, kept
+    // by one writer (`locations::sync_document`) so the two cannot drift; every existing reader of
+    // those columns keeps working untouched, which is what makes this landable in one piece.
+    //
+    // Rows exist only for `source_type = 'index_only'` — a location is a place a CONNECTOR found a
+    // file. A chat or a note carries a `source_id` too, but its "location" is a conversation or a
+    // widget, and folding those into this table would make its meaning (and its SYNC-SET class)
+    // mean two things at once. Promotion to a full local import deletes them, for the same reason.
+    //
+    // Identity claim (INVARIANTS I-07): "these are two locations of ONE file" is a FOURTH claim,
+    // beside `documents.content_hash` (derived Markdown), `photos.file_hash` (original bytes) and
+    // `source_content_hash` (whatever the provider reports). It is a claim about PROVENANCE — that
+    // two source ids name the same underlying object — and it is never inferred from a hash match
+    // alone. This migration makes no such claim: it gives every existing document exactly one
+    // location, so the shape lands with behaviour unchanged and the folding arrives separately.
+    r#"
+    CREATE TABLE document_locations (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id   INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        source_id     TEXT NOT NULL UNIQUE,
+        source_state  TEXT NOT NULL DEFAULT 'ok'
+                      CHECK (source_state IN ('ok','source_missing','unreachable')),
+        external_ref              TEXT,
+        source_modified_at        TEXT,
+        source_content_hash       TEXT,
+        source_parent_folder_id   TEXT,
+        source_parent_folder_name TEXT,
+        first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_document_locations_document ON document_locations(document_id);
+
+    INSERT INTO document_locations (
+        document_id, source_id, source_state, external_ref, source_modified_at,
+        source_content_hash, source_parent_folder_id, source_parent_folder_name, first_seen_at)
+    SELECT id, source_id, source_state, external_ref, source_modified_at,
+           source_content_hash, source_parent_folder_id, source_parent_folder_name, ingested_at
+    FROM documents
+    WHERE source_type = 'index_only' AND source_id IS NOT NULL;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1542,6 +1604,83 @@ pub fn run(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Every existing index-only document comes out of the v54 upgrade with EXACTLY ONE location —
+    /// and everything else comes out with none.
+    ///
+    /// This is the property the whole PR rests on. Every connector's known set now reads
+    /// `document_locations` and nothing else, so a document the backfill misses is invisible to its
+    /// connector: the next sync sees a file it has no record of, ingests it again, and the user's
+    /// library quietly doubles on upgrade. Replays the real ladder — drop back to v53, seed the
+    /// shapes an installed store actually holds, then run v54 for real.
+    #[test]
+    fn the_upgrade_gives_every_indexed_document_exactly_one_location() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute_batch(
+            "DROP TABLE document_locations; PRAGMA user_version = 53;
+             INSERT INTO documents(vault_path, title, content_hash, project, source_type,
+                 source_id, source_state, external_ref, source_content_hash)
+             VALUES ('idx://gdrive:a@x.com:f1','A','h1','Unsorted','index_only',
+                     'gdrive:a@x.com:f1','ok','/Reports/q3.docx','sh1'),
+                    ('idx://local:k1:f2','B','h2','Unsorted','index_only',
+                     'local:k1:f2','source_missing','/home/b.md','sh2'),
+                    -- a vault import, a chat, and a PROMOTED Drive file: none of these is a place a
+                    -- connector found a file, and a location row for any of them would put it back
+                    -- into a known set it has no business being in.
+                    ('c.md','C','h3','Unsorted','vault',NULL,'ok',NULL,NULL),
+                    ('d.md','D','h4','Unsorted','chat','chat:7','ok',NULL,NULL),
+                    ('e.md','E','h5','Unsorted','spreadsheet','gdrive:a@x.com:f9','ok',NULL,NULL);",
+        )
+        .unwrap();
+        super::run(&conn).unwrap();
+
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source_id, source_state, external_ref, source_content_hash \
+                     FROM document_locations ORDER BY source_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "gdrive:a@x.com:f1".to_string(),
+                    "ok".to_string(),
+                    Some("/Reports/q3.docx".to_string()),
+                    Some("sh1".to_string())
+                ),
+                (
+                    "local:k1:f2".to_string(),
+                    // The state travels too: a file already flagged gone must not come back as
+                    // healthy and be re-offered as a live pointer.
+                    "source_missing".to_string(),
+                    Some("/home/b.md".to_string()),
+                    Some("sh2".to_string())
+                ),
+            ],
+            "one location per index-only document, and none for anything else"
+        );
+
+        // Idempotent by construction — the ladder never re-runs a step, but a document that somehow
+        // gained two anchor rows would break the UNIQUE the reconcile keys on.
+        let dupes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM (SELECT source_id FROM document_locations \
+                 GROUP BY source_id HAVING count(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dupes, 0);
+    }
+
     /// A freshly-opened store reaches the latest `user_version` and carries the v14 connector
     /// registry with its documented defaults — the table 4A's Drive connector writes account state to.
     #[test]
@@ -1559,7 +1698,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 53,
+            version, 54,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1586,7 +1725,7 @@ mod tests {
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
-             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53)"
+             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

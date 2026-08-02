@@ -109,9 +109,9 @@ it is in the NULL-out list anyway, precisely so the first writer cannot cause th
 **Co-signers.** If a column is deliberately not re-resolved, the migration or the rebuild says so
 in a comment. Silence reads as an oversight.
 
-### I-07 · Three content-identity regimes, and a "duplicate" feature must name which — **Held**
+### I-07 · Four identity claims, and a "duplicate" feature must name which — **Held**
 
-PM hashes three different things and they are not interchangeable:
+PM makes four different identity claims and they are not interchangeable. Three are hashes:
 
 | Regime | What is hashed | Where |
 |---|---|---|
@@ -122,8 +122,17 @@ PM hashes three different things and they are not interchangeable:
 Two files with identical text but different bytes match on the first and differ on the second.
 A provider hash is comparable only with itself.
 
+The fourth is not a hash at all. **`document_locations` claims PROVENANCE** (#710): that two source
+ids name the same underlying object — one Drive file reached through two accounts, or as both a
+shared-drive item and a shared-with-me one. It is a claim about *where a file is*, not about what it
+contains, and it is the only one of the four that can be true of two files whose bytes differ (one
+copy edited since the other was last read) and false for two whose bytes are identical (two people
+who each wrote the same invoice template).
+
 **Co-signers.** Any feature that says "duplicate", "unchanged" or "already have this" names the
-regime it means, in the code and in the UI string. Never compare hashes across regimes.
+regime it means, in the code and in the UI string. Never compare hashes across regimes — and never
+infer provenance from a hash match alone: identical content is EVIDENCE for a fold, never a proof of
+one, and the fold is a claim PM should be able to point at a source id to justify.
 
 ### I-08 · Device identity has no single owner yet — **Forward**
 

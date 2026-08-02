@@ -86,9 +86,38 @@ pub struct ManifestItem {
     pub external_ref: Option<String>,
     pub source_modified_at: Option<String>,
     pub source_content_hash: Option<String>,
-    /// `'ok' | 'source_missing' | 'unreachable'` — the first-class reachability state.
+    /// `'ok' | 'source_missing' | 'unreachable'` — the first-class reachability state. Since #710
+    /// this is the ROLLUP across `locations`, not one place's answer, so an older build reading a
+    /// newer manifest still gets the honest "is this body reachable at all".
     pub source_state: String,
     pub stored_summary: Option<String>,
+    /// Every OTHER place this file lives (#710) — the anchor is `source_id` above, so this holds
+    /// only its siblings and is empty for all but a folded duplicate.
+    ///
+    /// `#[serde(default)]` because this file is the portable truth and every manifest written before
+    /// #710 lacks the key; without it a restore — the one moment this file has to work — would fail
+    /// to parse outright. The reverse direction is the honest cost of a portable format: an OLDER
+    /// build reading a newer manifest drops these on its next write, and the duplicate then
+    /// re-appears as two documents on that machine. It cannot corrupt anything, because a location
+    /// is a claim PM can re-derive, and the newer build folds it again.
+    #[serde(default)]
+    pub locations: Vec<ManifestLocation>,
+}
+
+/// One non-anchor place a file lives, as the portable manifest carries it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestLocation {
+    pub source_id: String,
+    /// THIS location's reachability — not the document's. The two differ exactly when one copy is
+    /// gone and another is fine, which is the case the whole model exists for.
+    pub source_state: String,
+    pub external_ref: Option<String>,
+    pub source_modified_at: Option<String>,
+    /// This location's own change pointer. Sharing one across locations would make each connector's
+    /// `Update` compare against the other's hash, and the two would re-embed each other forever.
+    pub source_content_hash: Option<String>,
+    pub source_parent_folder_id: Option<String>,
+    pub source_parent_folder_name: Option<String>,
 }
 
 // --- encryption (reuses the Markdown-at-rest primitive, like the #61 rules file) ---
@@ -226,6 +255,37 @@ fn mirror_items(conn: &Connection) -> Result<Vec<ManifestItem>> {
     // Memberships come from the join, in one pass rather than a query per item — an estate of
     // connected files is the case this path is built for, and per-item lookups would scale with it.
     let memberships = crate::tags::all_project_memberships(conn)?;
+    // Sibling locations in one pass, for the same reason memberships are: a folded estate is the
+    // case this path exists for, and a query per item would scale with it.
+    let mut siblings = std::collections::HashMap::<i64, Vec<ManifestLocation>>::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT l.document_id, l.source_id, l.source_state, l.external_ref, \
+                    l.source_modified_at, l.source_content_hash, l.source_parent_folder_id, \
+                    l.source_parent_folder_name \
+             FROM document_locations l JOIN documents d ON d.id = l.document_id \
+             WHERE d.source_type = ?1 AND l.source_id IS NOT d.source_id \
+             ORDER BY l.first_seen_at, l.id",
+        )?;
+        let rows = stmt.query_map(params![ingest::SOURCE_TYPE_INDEX_ONLY], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                ManifestLocation {
+                    source_id: r.get(1)?,
+                    source_state: r.get(2)?,
+                    external_ref: r.get(3)?,
+                    source_modified_at: r.get(4)?,
+                    source_content_hash: r.get(5)?,
+                    source_parent_folder_id: r.get(6)?,
+                    source_parent_folder_name: r.get(7)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (doc_id, loc) = row?;
+            siblings.entry(doc_id).or_default().push(loc);
+        }
+    }
     let mut stmt = conn.prepare(
         "SELECT source_id, title, project, tags, importance, reviewed, last_activity, \
                 external_ref, source_modified_at, source_content_hash, source_state, stored_summary, \
@@ -264,6 +324,7 @@ fn mirror_items(conn: &Connection) -> Result<Vec<ManifestItem>> {
                 source_content_hash: r.get(9)?,
                 source_state: r.get(10)?,
                 stored_summary: r.get(11)?,
+                locations: siblings.remove(&doc_id).unwrap_or_default(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -712,6 +773,26 @@ pub(crate) fn refresh_source_facts(
     if facts.is_empty() {
         return Ok(false);
     }
+    // The per-LOCATION half first (#710): where this copy sits and when it last changed THERE.
+    // `documents.source_modified_at` is a mirror of the anchor's, so advancing only the mirror would
+    // leave the location's own pointer stale — and the local-folder walk reads its mtime gate off the
+    // location, so it would re-hash every tracked file on every poll instead of no-opping.
+    conn.execute(
+        "UPDATE document_locations SET \
+             source_modified_at        = COALESCE(?2, source_modified_at), \
+             source_parent_folder_id   = COALESCE(?3, source_parent_folder_id), \
+             source_parent_folder_name = COALESCE(?4, source_parent_folder_name) \
+         WHERE source_id = ?1 AND ( \
+             (?2 IS NOT NULL AND source_modified_at        IS NOT ?2) OR \
+             (?3 IS NOT NULL AND source_parent_folder_id   IS NOT ?3) OR \
+             (?4 IS NOT NULL AND source_parent_folder_name IS NOT ?4))",
+        params![
+            source_id,
+            facts.modified_at,
+            facts.parent_folder_id,
+            facts.parent_folder_name,
+        ],
+    )?;
     let changed = conn.execute(
         "UPDATE documents SET \
              source_author            = COALESCE(?2, source_author), \
@@ -849,6 +930,9 @@ pub fn register_pointer(
         let conn = state.conn()?;
         ingest::iso_now(&conn)?
     };
+    // Held aside before `input` is consumed field-by-field below — the anchor location is recorded
+    // from it once the row exists.
+    let input_source_id = input.source_id.clone();
     let meta = DocMeta {
         source_path: None,
         // Synthetic NOT-NULL-UNIQUE sentinel: there is no real Markdown file, identity is keyed on
@@ -894,6 +978,27 @@ pub fn register_pointer(
         crate::entities::resolve_project(&conn, &meta.project, false)?.is_some()
     };
     let document = embed_and_index(state, gateway, body, &meta)?;
+    // The anchor location, recorded the moment the row lands (#710). Every index-only document has
+    // one from birth, so `document_locations` is never a partial view of the library — the
+    // connectors' known sets read it and nothing else, and a document missing from it would be
+    // re-ingested as a brand-new file on the very next pass.
+    {
+        let conn = state.conn()?;
+        crate::locations::record(
+            &conn,
+            document.id,
+            &crate::locations::Location {
+                source_id: input_source_id,
+                state: SourceState::Ok,
+                external_ref: meta.source.external_ref.clone(),
+                source_modified_at: meta.source.source_modified_at.clone(),
+                source_content_hash: meta.source.source_content_hash.clone(),
+                source_parent_folder_id: meta.source.source_parent_folder_id.clone(),
+                source_parent_folder_name: meta.source.source_parent_folder_name.clone(),
+                anchor: true,
+            },
+        )?;
+    }
     // The DB row is now committed; the portable manifest is NOT written here. The caller batches that
     // rewrite ([`apply_actions`] reports it dirtied the mirror, and the connector loop flushes every
     // `MANIFEST_FLUSH_EVERY` items via `ManifestFlusher`) — writing it per item made a bulk sync O(n²).
@@ -1105,7 +1210,37 @@ fn restore_item(
             source_size_bytes: None,
         },
     };
-    embed_and_index(state, gateway, &summary, &meta)?;
+    let document = embed_and_index(state, gateway, &summary, &meta)?;
+    // The anchor location, and every sibling the manifest carried (#710). Restoring the document
+    // without them would leave every folded copy unknown to its connector, and the next sync of that
+    // corpus would ingest the duplicate all over again — undoing the fold on the one path a user
+    // reaches for when something has already gone wrong.
+    {
+        let conn = state.conn()?;
+        let mut all = vec![crate::locations::Location {
+            source_id: item.source_id.clone(),
+            state: SourceState::from_db(&item.source_state),
+            external_ref: item.external_ref.clone(),
+            source_modified_at: item.source_modified_at.clone(),
+            source_content_hash: item.source_content_hash.clone(),
+            source_parent_folder_id: None,
+            source_parent_folder_name: None,
+            anchor: true,
+        }];
+        all.extend(item.locations.iter().map(|l| crate::locations::Location {
+            source_id: l.source_id.clone(),
+            state: SourceState::from_db(&l.source_state),
+            external_ref: l.external_ref.clone(),
+            source_modified_at: l.source_modified_at.clone(),
+            source_content_hash: l.source_content_hash.clone(),
+            source_parent_folder_id: l.source_parent_folder_id.clone(),
+            source_parent_folder_name: l.source_parent_folder_name.clone(),
+            anchor: false,
+        }));
+        for loc in &all {
+            crate::locations::record(&conn, document.id, loc)?;
+        }
+    }
     Ok(true)
 }
 
@@ -1217,32 +1352,60 @@ pub(crate) fn read_raw_item_state(
     source_id: &str,
     include_promoted: bool,
 ) -> Result<Option<RawItemState>> {
-    let sql = if include_promoted {
+    // The pointer columns come from the LOCATION, not the document (#710): each place a file lives
+    // is reconciled by its own connector against its own change pointer, and sharing one would make
+    // location B's `Update` compare against location A's hash — the two corpora would then re-embed
+    // each other in a loop, forever, on every pass.
+    //
+    // `summary_indexed_flag` is computed from the document's ANCHOR id (`d.source_id`), never the
+    // queried one: the stored `content_hash` is derived from the anchor, so asking the question with
+    // a sibling's id would compare two unrelated digests and always answer false.
+    let by_location = conn
+        .query_row(
+            "SELECT l.external_ref, l.source_modified_at, l.source_content_hash, l.source_state, \
+                    d.content_hash, d.stored_summary, d.source_id \
+             FROM document_locations l JOIN documents d ON d.id = l.document_id \
+             WHERE l.source_id = ?1 AND d.source_type = 'index_only'",
+            params![source_id],
+            raw_item_state_row,
+        )
+        .optional()?;
+    if by_location.is_some() || !include_promoted {
+        return Ok(by_location);
+    }
+    // Drive only. A document PROMOTED to a full local import keeps its `gdrive:` id as a claim
+    // marker but is no longer index-only, so it has no locations — this table describes places a
+    // CONNECTOR found a file, and a promoted one is a stored file now. Matching it here is what
+    // makes the sync see it as present-and-reachable (an `Add` re-fires as a `Noop`) rather than
+    // ingesting a second, index-only copy beside it.
+    conn.query_row(
         "SELECT external_ref, source_modified_at, source_content_hash, source_state, \
-                content_hash, stored_summary \
-         FROM documents WHERE source_id = ?1"
-    } else {
-        "SELECT external_ref, source_modified_at, source_content_hash, source_state, \
-                content_hash, stored_summary \
-         FROM documents WHERE source_id = ?1 AND source_type = 'index_only'"
-    };
-    conn.query_row(sql, params![source_id], |r| {
-        let content_hash: String = r.get(4)?;
-        let stored_summary: Option<String> = r.get(5)?;
-        Ok(RawItemState {
-            external_ref: r.get(0)?,
-            source_modified_at: r.get(1)?,
-            source_content_hash: r.get(2)?,
-            source_state: r.get(3)?,
-            summary_indexed: summary_indexed_flag(
-                source_id,
-                &content_hash,
-                stored_summary.as_deref(),
-            ),
-        })
-    })
+                content_hash, stored_summary, source_id \
+         FROM documents WHERE source_id = ?1",
+        params![source_id],
+        raw_item_state_row,
+    )
     .optional()
     .map_err(Error::from)
+}
+
+/// The shared row-mapper behind both arms of [`read_raw_item_state`]. Column 6 is the ANCHOR source
+/// id, which is what the stored `content_hash` was derived from.
+fn raw_item_state_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItemState> {
+    let content_hash: String = r.get(4)?;
+    let stored_summary: Option<String> = r.get(5)?;
+    let anchor_id: Option<String> = r.get(6)?;
+    Ok(RawItemState {
+        external_ref: r.get(0)?,
+        source_modified_at: r.get(1)?,
+        source_content_hash: r.get(2)?,
+        source_state: r.get(3)?,
+        summary_indexed: summary_indexed_flag(
+            anchor_id.as_deref().unwrap_or_default(),
+            &content_hash,
+            stored_summary.as_deref(),
+        ),
+    })
 }
 
 /// [`read_raw_item_state`] mapped into the reducer's [`ItemState`] — the shape the cloud
@@ -1545,30 +1708,39 @@ fn reembed_item(
     if body.is_empty() {
         return Err(Error::Other("re-embed received an empty body".into()));
     }
-    // If this source was promoted to a full local import, it is no longer index-only. Do NOT re-embed
-    // (that would clobber the imported content with an index-only summary). Just advance its tracked
-    // pointer so the next sync sees no change — the local copy is the user's snapshot; they re-import
-    // to pull a fresh version. Checked before the (expensive) split/embed below.
-    {
+    // Which document this location belongs to, and its ANCHOR id. Both matter: the anchor is what
+    // `documents.content_hash` was derived from, so re-deriving it from the queried id would give a
+    // sibling location its own identity and break the UNIQUE it shares with the anchor (#710).
+    //
+    // If this source was promoted to a full local import, it is no longer index-only and has no
+    // locations. Do NOT re-embed (that would clobber the imported content with an index-only
+    // summary). Just advance its tracked pointer so the next sync sees no change — the local copy is
+    // the user's snapshot; they re-import to pull a fresh version. Checked before the (expensive)
+    // split/embed below.
+    let (doc_id, anchor_id) = {
         let conn = state.conn()?;
-        let is_index_only = conn
+        let found: Option<(i64, Option<String>)> = conn
             .query_row(
-                "SELECT 1 FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+                "SELECT d.id, d.source_id FROM document_locations l \
+                 JOIN documents d ON d.id = l.document_id \
+                 WHERE l.source_id = ?1 AND d.source_type = 'index_only'",
                 params![source_id],
-                |_| Ok(()),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .is_some();
-        if !is_index_only {
-            conn.execute(
-                "UPDATE documents SET source_content_hash = ?2, source_modified_at = ?3 \
-                 WHERE source_id = ?1",
-                params![source_id, new_content_hash, input.source_modified_at],
-            )?;
-            return Ok(());
+            .optional()?;
+        match found {
+            Some((id, anchor)) => (id, anchor.unwrap_or_else(|| source_id.to_string())),
+            None => {
+                conn.execute(
+                    "UPDATE documents SET source_content_hash = ?2, source_modified_at = ?3 \
+                     WHERE source_id = ?1",
+                    params![source_id, new_content_hash, input.source_modified_at],
+                )?;
+                return Ok(());
+            }
         }
-    }
-    let content_hash = pointer_content_hash(source_id, body);
+    };
+    let content_hash = pointer_content_hash(&anchor_id, body);
     let chunks = ingest::split_document(gateway, body, &input.title, &content_hash)?;
     let texts = ingest::leaf_embed_texts(&chunks);
     let embeddings = gateway.embed_documents(&texts)?;
@@ -1577,11 +1749,6 @@ fn reembed_item(
 
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
-    let doc_id: i64 = tx.query_row(
-        "SELECT id FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
-        params![source_id],
-        |r| r.get(0),
-    )?;
     ingest::replace_chunks(&tx, doc_id, &chunks, &embeddings, true, Some(&summary))?;
     let now = ingest::iso_now(&tx)?;
     // The source facts ride along. This statement used to update the hash, summary and title and
@@ -1589,22 +1756,24 @@ fn reembed_item(
     // handed in `input` — so the columns #704 added were correct at first sight and then frozen
     // through every subsequent edit of the file. COALESCE for the same reason as
     // `refresh_source_facts`: a provider that has stopped reporting a fact must not erase it.
+    //
+    // The POINTER columns are deliberately absent here (#710): `source_state`,
+    // `source_content_hash` and `source_modified_at` describe one LOCATION, and
+    // `locations::record` below owns them along with the reachability rollup. One writer for the
+    // mirror is the only thing keeping the two from drifting.
     tx.execute(
-        "UPDATE documents SET content_hash = ?2, source_content_hash = ?3, source_modified_at = ?4, \
-                stored_summary = ?5, title = ?6, source_state = 'ok', \
-                source_author             = COALESCE(?7, source_author), \
-                source_last_modified_by   = COALESCE(?8, source_last_modified_by), \
-                source_created_at         = COALESCE(?9, source_created_at), \
-                source_size_bytes         = COALESCE(?10, source_size_bytes), \
-                source_parent_folder_id   = COALESCE(?11, source_parent_folder_id), \
-                source_parent_folder_name = COALESCE(?12, source_parent_folder_name), \
-                pm_refreshed_at           = ?13 \
+        "UPDATE documents SET content_hash = ?2, stored_summary = ?3, title = ?4, \
+                source_author             = COALESCE(?5, source_author), \
+                source_last_modified_by   = COALESCE(?6, source_last_modified_by), \
+                source_created_at         = COALESCE(?7, source_created_at), \
+                source_size_bytes         = COALESCE(?8, source_size_bytes), \
+                source_parent_folder_id   = COALESCE(?9, source_parent_folder_id), \
+                source_parent_folder_name = COALESCE(?10, source_parent_folder_name), \
+                pm_refreshed_at           = ?11 \
          WHERE id = ?1",
         params![
             doc_id,
             content_hash,
-            new_content_hash,
-            input.source_modified_at,
             summary,
             input.title,
             input.source_author,
@@ -1615,6 +1784,23 @@ fn reembed_item(
             input.source_parent_folder_name,
             now,
         ],
+    )?;
+    // A location PM has just re-read is a location PM can reach, so this is also what clears a
+    // stale `source_missing` — the same thing the old `source_state = 'ok'` in the statement above
+    // did, now said about the place rather than the document.
+    crate::locations::record(
+        &tx,
+        doc_id,
+        &crate::locations::Location {
+            source_id: source_id.to_string(),
+            state: SourceState::Ok,
+            external_ref: input.external_ref.clone(),
+            source_modified_at: input.source_modified_at.clone(),
+            source_content_hash: Some(new_content_hash.to_string()),
+            source_parent_folder_id: input.source_parent_folder_id.clone(),
+            source_parent_folder_name: input.source_parent_folder_name.clone(),
+            anchor: anchor_id == source_id,
+        },
     )?;
     tx.commit()?;
     Ok(())
@@ -1637,35 +1823,31 @@ pub fn reindex_pointer(
     reembed_item(state, gateway, &input.source_id, &source_hash, input)
 }
 
-/// Set one index-only item's reachability state (`documents.source_state`).
+/// Set ONE LOCATION's reachability, and re-derive its document's (#710).
+///
+/// The change since v54 is what happens to a document with more than one location: this moves the
+/// place the connector is talking about, and `documents.source_state` becomes the rollup across all
+/// of them — so a file deleted from one Drive account but still sitting in a tracked folder stays
+/// readable, from the copy that is still there.
 fn set_item_state(conn: &Connection, source_id: &str, state: SourceState) -> Result<()> {
-    conn.execute(
-        "UPDATE documents SET source_state = ?2 WHERE source_id = ?1 AND source_type = 'index_only'",
-        params![source_id, state.as_str()],
-    )?;
+    crate::locations::set_state(conn, source_id, state)?;
     Ok(())
 }
 
-/// Set the reachability state of EVERY item of a source — the source-failure fan-out. Matches an
-/// exact `source_id`, or any id namespaced as `<source>:<localid>` (the convention a connector
-/// follows so an account's items move together). Never deletes: a failed source must not read as a
-/// deletion.
+/// Set the reachability of every LOCATION of a source — the source-failure fan-out. Matches an exact
+/// `source_id`, or any id namespaced as `<source>:<localid>` (the convention a connector follows so
+/// an account's items move together). Never deletes: a failed source must not read as a deletion —
+/// and since v54 it no longer reads as one at the *document* either, when another copy is fine.
 fn set_source_state(conn: &Connection, source: &str, state: SourceState) -> Result<()> {
-    conn.execute(
-        "UPDATE documents SET source_state = ?2 \
-         WHERE source_type = 'index_only' AND (source_id = ?1 OR source_id LIKE ?1 || ':%')",
-        params![source, state.as_str()],
-    )?;
+    crate::locations::set_source_state(conn, source, state)?;
     Ok(())
 }
 
-/// Update one index-only item's external ref (a rename/move kept the stable id, so its
-/// classification + chunks are untouched).
+/// Update one LOCATION's external ref (a rename/move kept the stable id, so its classification +
+/// chunks are untouched). The document's own `external_ref` follows only when the moved location is
+/// the anchor — a sibling moving must not send the reader somewhere the document isn't.
 fn set_external_ref(conn: &Connection, source_id: &str, external_ref: Option<&str>) -> Result<()> {
-    conn.execute(
-        "UPDATE documents SET external_ref = ?2 WHERE source_id = ?1 AND source_type = 'index_only'",
-        params![source_id, external_ref],
-    )?;
+    crate::locations::set_external_ref(conn, source_id, external_ref)?;
     Ok(())
 }
 
@@ -1996,6 +2178,7 @@ mod tests {
                 source_content_hash: Some("deadbeef".into()),
                 source_state: "ok".into(),
                 stored_summary: Some("A short readable summary.".into()),
+                locations: Vec::new(),
             }],
         }
     }
@@ -2070,6 +2253,7 @@ mod tests {
             source_content_hash: None,
             source_state: "ok".into(),
             stored_summary: Some("s".into()),
+            locations: Vec::new(),
         }
     }
 
@@ -2084,6 +2268,15 @@ mod tests {
                 source_id,
                 project
             ],
+        )
+        .unwrap();
+        // ...and its anchor location, which is what v54's backfill gave every existing row and what
+        // `register_pointer` records for every new one. Every per-item read and every state write
+        // goes through the location now, so a document without one is invisible to its connector.
+        conn.execute(
+            "INSERT INTO document_locations(document_id, source_id, source_state) \
+             VALUES (?1, ?2, 'ok')",
+            params![conn.last_insert_rowid(), source_id],
         )
         .unwrap();
     }
@@ -2842,6 +3035,7 @@ mod tests {
             source_content_hash: None,
             source_state: "ok".into(),
             stored_summary: Some("s".into()),
+            locations: Vec::new(),
         }
     }
 
@@ -2930,11 +3124,20 @@ mod tests {
                  source_parent_folder_id TEXT, source_parent_folder_name TEXT,
                  pm_refreshed_at TEXT
              );
+             CREATE TABLE document_locations (
+                 id INTEGER PRIMARY KEY, document_id INTEGER, source_id TEXT UNIQUE,
+                 source_state TEXT, external_ref TEXT, source_modified_at TEXT,
+                 source_content_hash TEXT, source_parent_folder_id TEXT,
+                 source_parent_folder_name TEXT, first_seen_at TEXT
+             );
              INSERT INTO documents(source_type, source_id, source_author, source_last_modified_by,
                  source_created_at, source_size_bytes, source_modified_at,
                  source_parent_folder_id, source_parent_folder_name, pm_refreshed_at)
              VALUES ('index_only','s1','Ada Lovelace','Grace Hopper','2026-01-01T00:00:00Z',
-                     1024,'2026-05-01T00:00:00Z','fid-1','Invoices', NULL);",
+                     1024,'2026-05-01T00:00:00Z','fid-1','Invoices', NULL);
+             INSERT INTO document_locations(document_id, source_id, source_state,
+                 source_modified_at, source_parent_folder_id, source_parent_folder_name)
+             VALUES (1,'s1','ok','2026-05-01T00:00:00Z','fid-1','Invoices');",
         )
         .unwrap();
         conn

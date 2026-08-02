@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.120.0-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "Groundwork for the duplicate work: a document can now know about every place its file lives, rather than being one place. Nothing looks different yet — every document has exactly one location today, and the change that starts joining them up is next — but the rule underneath is worth knowing: a document stays readable as long as any one of its copies is still there. Lose the Drive copy of a file you also keep in a tracked folder and PM opens the folder copy instead of telling you the file is gone.",
+      "A knock-on you may notice sooner: an expired Google or Microsoft sign-in used to grey out every file from that account, including ones PM could still reach perfectly well from somewhere else. It now only greys out the copies it genuinely can't reach.",
+      "Nothing is deleted to resolve a duplicate, ever — that was the decision behind the design, and this is the shape that makes it possible. Two copies means one document with two records of where it is, and both keep being checked.",
+    ],
+  },
+  {
     version: "3.119.0-alpha",
     date: "2026-08-02",
     highlights: [
