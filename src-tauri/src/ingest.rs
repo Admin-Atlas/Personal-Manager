@@ -512,6 +512,9 @@ fn ingest_one(
 
     // Convert to Markdown (sidecar; no DB lock held).
     let (markdown, title) = state.sidecar.convert(path)?;
+    // What the DOCUMENT states about itself — after the conversion, so a file that won't convert
+    // never pays for it, and skipped entirely for the formats that state nothing (#709).
+    let props = state.sidecar.file_properties(path);
     let markdown = markdown.trim().to_string();
     // A file that renders to no text (an image with no OCR, a blank document) has
     // nothing to index — and would otherwise hash to sha256("") and collide with
@@ -574,6 +577,7 @@ fn ingest_one(
     let vault_file = vault.join(&vault_name);
     cipher.write_to(&vault_file, &render_markdown(&front, &markdown))?;
 
+    let source = imported_file_source(SourceMeta::default(), props, path, &created_at, byte_size);
     let meta = DocMeta {
         source_path: Some(path.to_string_lossy().into()),
         vault_path: vault_name,
@@ -589,7 +593,7 @@ fn ingest_one(
         tags: Vec::new(),
         importance: None,
         reviewed: false,
-        source: SourceMeta::default(),
+        source,
     };
     let document =
         index_fresh_document(state, &vault_file, &meta, &chunks, &embeddings, None, None)?;
@@ -597,6 +601,48 @@ fn ingest_one(
         document,
         warning: None,
     })
+}
+
+/// The source facts of a file the user handed PM directly — a drag-and-drop or folder import (#709).
+///
+/// The document IS the source here, so "what the source says" is what the FILE says, and a vault
+/// import stops being the one path where every fact reads "Unknown" about a file PM has in its hands.
+/// The document's own creation date wins over the filesystem's when it states one, for the reason it
+/// wins everywhere: it describes the document rather than when this copy reached this disk. Where it
+/// states nothing the filesystem's birth time stands, so a dropped .txt still answers "Created".
+///
+/// `mtime` doubles as `source_modified_at` — the same value PM already stores as its own `created_at`
+/// for an import. Not a second opinion, just the one PM has, under the heading it belongs to.
+/// `base` carries the discriminator — a plain import is a vault document, a workbook is a
+/// `'spreadsheet'` — so this adds facts without ever changing what kind of thing the row is.
+fn imported_file_source(
+    base: SourceMeta,
+    props: crate::sidecar::FileProperties,
+    path: &Path,
+    mtime: &str,
+    byte_size: Option<i64>,
+) -> SourceMeta {
+    SourceMeta {
+        source_author: props.author,
+        source_last_modified_by: props.last_modified_by,
+        // `or_else`, so a document that stated its own creation date costs no stat at all.
+        source_created_at: props.created_at.or_else(|| file_birth_time(path)),
+        source_modified_at: Some(mtime.to_string()),
+        source_size_bytes: byte_size,
+        ..base
+    }
+}
+
+/// When the filesystem says this file came into being (ISO-8601), if it will say.
+///
+/// Genuinely unavailable on some platform/filesystem pairs — `Unsupported` on Linux kernels or
+/// filesystems without `statx` birth-time support — so `None` is the ordinary case rather than a
+/// failure, and reads as "Unknown" like any other source that will not say.
+fn file_birth_time(path: &Path) -> Option<String> {
+    std::fs::metadata(path)
+        .and_then(|m| m.created())
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
 }
 
 /// Ingest one image: OCR + EXIF via the sidecar, then the SAME chunk/embed/index pipeline as a
@@ -835,6 +881,9 @@ fn ingest_spreadsheet(
 ) -> Result<Outcome> {
     // Parse values-only in the sidecar (no DB lock held), then shape to Markdown Rust-side.
     let sheets = state.sidecar.analyze_spreadsheet(path, ext.unwrap_or(""))?;
+    // A workbook is an OOXML container like any other, so it states an author too (#709). A .csv
+    // states nothing and is never asked.
+    let props = state.sidecar.file_properties(path);
     let Some((body, record)) = spreadsheets::to_markdown(&sheets) else {
         return Ok(Outcome::Skipped("no extractable rows".into()));
     };
@@ -891,6 +940,13 @@ fn ingest_spreadsheet(
     let vault_file = vault.join(&vault_name);
     cipher.write_to(&vault_file, &render_markdown(&front, &body))?;
 
+    let source = imported_file_source(
+        SourceMeta::spreadsheet(),
+        props,
+        path,
+        &created_at,
+        byte_size,
+    );
     let meta = DocMeta {
         source_path: Some(path.to_string_lossy().into()),
         vault_path: vault_name,
@@ -906,7 +962,7 @@ fn ingest_spreadsheet(
         tags: Vec::new(),
         importance: None,
         reviewed: false,
-        source: SourceMeta::spreadsheet(),
+        source,
     };
     let document = index_fresh_document(
         state,
@@ -4658,6 +4714,66 @@ impl OptionalExists for std::result::Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_imported_file_is_its_own_source() {
+        // A drag-and-drop was the one path where every source fact read "Unknown" about a file PM
+        // had in its hands — the document IS the source here, so what it states is what the source
+        // says (#709). The discriminator comes from `base` and is never overwritten by the facts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.docx");
+        std::fs::write(&path, b"x").unwrap();
+        let stated = crate::sidecar::FileProperties {
+            author: Some("Jane Okafor".into()),
+            last_modified_by: Some("Sam Reyes".into()),
+            created_at: Some("2023-04-11T09:12:00Z".into()),
+        };
+        let meta = imported_file_source(
+            SourceMeta::spreadsheet(),
+            stated,
+            &path,
+            "2026-08-02T10:00:00Z",
+            Some(4096),
+        );
+        assert_eq!(meta.source_type, SOURCE_TYPE_SPREADSHEET);
+        assert_eq!(meta.source_author.as_deref(), Some("Jane Okafor"));
+        assert_eq!(meta.source_last_modified_by.as_deref(), Some("Sam Reyes"));
+        assert_eq!(
+            meta.source_created_at.as_deref(),
+            Some("2023-04-11T09:12:00Z")
+        );
+        assert_eq!(
+            meta.source_modified_at.as_deref(),
+            Some("2026-08-02T10:00:00Z")
+        );
+        assert_eq!(meta.source_size_bytes, Some(4096));
+    }
+
+    #[test]
+    fn a_file_that_states_nothing_still_answers_created_from_the_disk() {
+        // A dropped .txt has no property block to read, but PM is holding the file — reporting
+        // "Unknown" for a date the filesystem will state outright is a miss, not honesty.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"x").unwrap();
+        // Only where the platform has a birth time to give; `None` there is the ordinary case on a
+        // Linux filesystem without statx support, not a failure.
+        if file_birth_time(&path).is_some() {
+            let meta = imported_file_source(
+                SourceMeta::default(),
+                crate::sidecar::FileProperties::default(),
+                &path,
+                "2026-08-02T10:00:00Z",
+                Some(1),
+            );
+            assert!(meta.source_created_at.is_some());
+            assert!(
+                meta.source_author.is_none(),
+                "no author is still no author — never the OS account"
+            );
+        }
+        assert!(file_birth_time(Path::new("/pm/test/gone.txt")).is_none());
+    }
 
     fn doc_event(path: &str) -> IngestEvent {
         IngestEvent::Failed {

@@ -1584,7 +1584,7 @@ async fn reconcile_present_file(
     // would never move again. Writes nothing when nothing differs (see `refresh_source_facts`), so a
     // fifteen-minute poll over a settled folder still touches no pages.
     if known.is_some() {
-        let facts = local_source_facts(file, current_iso.clone());
+        let facts = local_facts_for_refresh(file, current_iso.clone());
         let app2 = app.clone();
         let source_id = file.source_id.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1691,13 +1691,21 @@ async fn build_local_pointer(
 ) -> Result<Option<index_only::PointerInput>> {
     let path = file.abs_path.clone();
     let app2 = app.clone();
+    // One blocking hop for both. The properties read is a zip-directory or PDF-trailer lookup that
+    // costs nothing beside the conversion, and it is skipped outright for the formats that state
+    // nothing (see `carries_document_properties`) — so a folder of text notes pays not one call.
+    // Only once the conversion has succeeded: a file that will not convert has no document for
+    // these to describe.
     let converted = tokio::task::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        state.sidecar.convert(&path)
+        state
+            .sidecar
+            .convert(&path)
+            .map(|out| (out, state.sidecar.file_properties(&path)))
     })
     .await
     .map_err(|e| Error::Other(format!("local convert task panicked: {e}")))?;
-    let (markdown, title) = converted?;
+    let ((markdown, title), props) = converted?;
     let markdown = markdown.trim().to_string();
     if markdown.is_empty() {
         return Ok(None);
@@ -1711,11 +1719,10 @@ async fn build_local_pointer(
         title
     };
     // One definition of what a local file's facts ARE, shared with the refresh path so first sight
-    // and every later sighting cannot disagree. A filesystem knows no author (#701) — there is no
-    // per-file ownership PM could read that would mean what "author" means on Drive or OneDrive, and
-    // the machine's own user account is not the answer — so both name fields stay `None`, which the
-    // UI renders as "Unknown" rather than guessing that it was you.
-    let facts = local_source_facts(file, modified_at);
+    // and every later sighting cannot disagree — then whatever the DOCUMENT itself stated folded on
+    // top (#709). The filesystem still knows no author, and PM still never names the machine's own
+    // user account; what changed is that a .docx or .pdf that plainly states one is now read.
+    let facts = with_document_properties(local_source_facts(file, modified_at), props);
     Ok(Some(index_only::PointerInput {
         source_id: file.source_id.clone(),
         title,
@@ -1739,8 +1746,8 @@ async fn build_local_pointer(
 /// of its content, so the reconcile takes its unchanged-mtime early return and the stored folder
 /// columns would otherwise never move again.
 ///
-/// Author and last-editor stay `None` here on purpose — a filesystem knows neither, and reading what
-/// the FILE itself says is a separate step with its own cost (#709).
+/// Author and last-editor stay `None` here on purpose — a filesystem knows neither. What the FILE
+/// itself states is folded on top by [`with_document_properties`], on the path that reads it (#709).
 fn local_source_facts(file: &LocalFile, modified_at: Option<String>) -> index_only::SourceFacts {
     let parent = file.abs_path.parent();
     let (created_at, _) = file_times_and_size(&file.abs_path);
@@ -1756,6 +1763,46 @@ fn local_source_facts(file: &LocalFile, modified_at: Option<String>) -> index_on
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string()),
     }
+}
+
+/// A local file's filesystem facts with whatever the DOCUMENT stated about itself folded on top.
+///
+/// Precedence is the whole point. Where both have an answer the document's wins: a .docx states when
+/// the DOCUMENT was created, while the filesystem states when THIS COPY landed on THIS disk — and for
+/// anything that was ever emailed, downloaded, or restored from a backup those are far apart, with
+/// only one of them being what a reader means by "Created". Where the document says nothing (a PDF
+/// has no notion of a last editor; a writer may omit the block entirely) the filesystem's answer
+/// stands, and where neither says anything the column reads "Unknown", as before.
+fn with_document_properties(
+    mut facts: index_only::SourceFacts,
+    props: crate::sidecar::FileProperties,
+) -> index_only::SourceFacts {
+    facts.author = props.author.or(facts.author);
+    facts.last_modified_by = props.last_modified_by.or(facts.last_modified_by);
+    facts.created_at = props.created_at.or(facts.created_at);
+    facts
+}
+
+/// [`local_source_facts`] for the no-work path, minus anything the document may have stated better.
+///
+/// The refresh COALESCEs, so a `None` can never unlearn a stored fact — but a `Some` overwrites, and
+/// the filesystem's birth time is a `Some` that would quietly replace the creation date a .docx
+/// stated about ITSELF with the moment this copy landed on this disk, on the very next poll. So the
+/// formats that can state their own creation date don't have it re-asserted here.
+///
+/// Properties are read once, at ingest, and not re-read on this path on purpose: it runs for every
+/// tracked file on every fifteen-minute poll, and opening every archive in the tree to re-learn a
+/// fact that cannot change without the mtime changing too — which is the path that *does* re-read
+/// them — is a cost with no answer to show for it.
+fn local_facts_for_refresh(
+    file: &LocalFile,
+    modified_at: Option<String>,
+) -> index_only::SourceFacts {
+    let mut facts = local_source_facts(file, modified_at);
+    if crate::sidecar::carries_document_properties(&file.abs_path) {
+        facts.created_at = None;
+    }
+    facts
 }
 
 /// A local file's creation time (ISO-8601 UTC) and size in bytes, best-effort.
@@ -2308,6 +2355,107 @@ mod tests {
         // The item id is namespaced under its folder's source id, so a SourceFailure fan-out
         // (`source_id LIKE 'local:abc123:%'`) catches it.
         assert!(sid.starts_with(&format!("{}:", folder_source_id("abc123"))));
+    }
+
+    /// A `LocalFile` for a file that REALLY EXISTS, so the filesystem has a birth time to give and
+    /// a test about discarding one is testing something.
+    fn local_file(dir: &Path, name: &str) -> LocalFile {
+        let abs_path = dir.join(name);
+        std::fs::write(&abs_path, b"x").unwrap();
+        LocalFile {
+            source_id: format!("local:abc123:{name}"),
+            abs_path,
+            rel_path: format!("reports/{name}"),
+            size: 1,
+        }
+    }
+
+    fn stated(
+        author: Option<&str>,
+        editor: Option<&str>,
+        created: Option<&str>,
+    ) -> crate::sidecar::FileProperties {
+        crate::sidecar::FileProperties {
+            author: author.map(str::to_string),
+            last_modified_by: editor.map(str::to_string),
+            created_at: created.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn what_the_document_states_outranks_what_the_disk_says() {
+        // The filesystem knows this copy landed today; the .docx knows it was written in 2023. Only
+        // one of those is what a reader means by "Created", and it is not the one the disk holds —
+        // for anything ever emailed, downloaded or restored from a backup they are years apart.
+        let disk = index_only::SourceFacts {
+            created_at: Some("2026-08-02T10:00:00+00:00".into()),
+            size_bytes: Some(4096),
+            ..Default::default()
+        };
+        let facts = with_document_properties(
+            disk,
+            stated(
+                Some("Jane Okafor"),
+                Some("Sam Reyes"),
+                Some("2023-04-11T09:12:00Z"),
+            ),
+        );
+        assert_eq!(facts.author.as_deref(), Some("Jane Okafor"));
+        assert_eq!(facts.last_modified_by.as_deref(), Some("Sam Reyes"));
+        assert_eq!(facts.created_at.as_deref(), Some("2023-04-11T09:12:00Z"));
+        assert_eq!(facts.size_bytes, Some(4096), "disk facts are not discarded");
+    }
+
+    #[test]
+    fn a_document_that_states_nothing_leaves_the_disks_answer_standing() {
+        // A .txt, or a writer that omitted the property block. Silence must not overwrite what PM
+        // already had — the same rule the refresh COALESCE enforces one layer down.
+        let disk = index_only::SourceFacts {
+            created_at: Some("2026-08-02T10:00:00+00:00".into()),
+            ..Default::default()
+        };
+        let facts = with_document_properties(disk, crate::sidecar::FileProperties::default());
+        assert_eq!(
+            facts.created_at.as_deref(),
+            Some("2026-08-02T10:00:00+00:00")
+        );
+        assert!(
+            facts.author.is_none(),
+            "still Unknown, never the OS account"
+        );
+    }
+
+    #[test]
+    fn the_poll_never_overwrites_a_creation_date_the_document_stated() {
+        // The trap this exists for: `refresh_source_facts` COALESCEs, so a None can't unlearn — but
+        // the filesystem's birth time is a Some, and left in place it would replace the .docx's own
+        // creation date with "when this copy landed here" on the very next fifteen-minute poll.
+        // Properties are read at ingest, on the path a content change already takes.
+        let dir = tempfile::tempdir().unwrap();
+        let docx = local_file(dir.path(), "plan.docx");
+        let notes = local_file(dir.path(), "notes.md");
+
+        // The premise, asserted rather than assumed: this platform DOES hand back a birth time, so
+        // dropping it below is a decision instead of an accident of the fixture. Where it doesn't
+        // (a Linux filesystem without statx birth-time support) there is nothing to clobber, and
+        // the rest of the test has no subject.
+        if local_source_facts(&notes, None).created_at.is_none() {
+            return;
+        }
+
+        let refreshed = local_facts_for_refresh(&docx, Some("2026-08-02".into()));
+        assert!(
+            refreshed.created_at.is_none(),
+            "a format that states its own creation date keeps it"
+        );
+        assert_eq!(refreshed.modified_at.as_deref(), Some("2026-08-02"));
+        assert_eq!(refreshed.size_bytes, Some(1), "the rest still refreshes");
+
+        // A .md states nothing, so there is nothing to clobber and the disk's answer still lands —
+        // which is what keeps a file moved between tracked folders from going stale (#708).
+        let refreshed = local_facts_for_refresh(&notes, Some("2026-08-02".into()));
+        assert!(refreshed.created_at.is_some());
+        assert!(refreshed.parent_folder_name.is_some());
     }
 
     #[test]

@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.119.0-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "Your own documents now say who wrote them. A Word file, a PowerPoint, a spreadsheet or a PDF carries its author, its last editor and the date it was created inside the file itself — PM reads that now, so files from a folder on your computer fill in the same columns as files from Google Drive instead of a row of “Unknown”. Files you drag in are covered too. It applies as each file is indexed, so existing files fill in the next time they change; anything you add from now on arrives complete.",
+      "Created now means when the document was created, not when the copy on your disk was made. For anything you were emailed, downloaded, or restored from a backup those are wildly different dates, and only one of them is the one you meant. Where a file says nothing about itself, the date on disk still stands.",
+      "Plain text, Markdown and web pages are unaffected — there is nowhere in those formats for an author to be written down, so PM doesn’t go looking, and they stay as quick to index as they were.",
+    ],
+  },
+  {
     version: "3.118.0-alpha",
     date: "2026-08-02",
     highlights: [

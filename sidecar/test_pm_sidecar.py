@@ -19,12 +19,16 @@ skipped when fastembed is unavailable (it never downloads).
 Run: `python sidecar/test_pm_sidecar.py` (or `just sidecar-test`).
 """
 
+import contextlib
 import importlib.util
 import json
 import os
 import subprocess
 import sys
+import tempfile
+import types
 import unittest
+import zipfile
 from unittest import mock
 
 import pm_sidecar as S
@@ -912,6 +916,190 @@ class ConvertVerdictWireTest(unittest.TestCase):
         self.assertFalse(reply["ok"])
         # The tag Rust renders as `sidecar convert failed [unconvertible]:` and classifies on.
         self.assertEqual(reply.get("error_kind"), "unconvertible")
+
+
+CORE_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties
+    xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:dcterms="http://purl.org/dc/terms/">
+  <dc:title>Q3 plan</dc:title>
+  <dc:creator>{creator}</dc:creator>
+  <cp:lastModifiedBy>{editor}</cp:lastModifiedBy>
+  <dcterms:created>2025-11-04T09:12:00Z</dcterms:created>
+  <dcterms:modified>2026-01-20T08:00:00Z</dcterms:modified>
+</cp:coreProperties>
+"""
+
+
+@contextlib.contextmanager
+def _xml_parser():
+    """Run the OOXML reader with a parser available.
+
+    `just sidecar-test` is stdlib-only by design, so where the pinned defusedxml isn't installed we
+    stand in the stdlib parser that it patches. What these tests are about — the zip handling and
+    the namespaced lookups — is identical either way, and the fail-closed path when NEITHER is
+    importable gets its own test below.
+    """
+    try:
+        import defusedxml.ElementTree  # noqa: F401
+
+        yield
+        return
+    except Exception:
+        pass
+    import xml.etree.ElementTree as ET
+
+    stub = types.ModuleType("defusedxml.ElementTree")
+    stub.fromstring = ET.fromstring
+    pkg = types.ModuleType("defusedxml")
+    pkg.ElementTree = stub
+    with mock.patch.dict(sys.modules, {"defusedxml": pkg, "defusedxml.ElementTree": stub}):
+        yield
+
+
+def _write_ooxml(path, core_xml=None):
+    """A minimal OOXML container. `_ooxml_properties` opens exactly one member, so a two-entry zip
+    is a faithful stand-in for a real .docx — and one this test builds with no dependency at all."""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        if core_xml is not None:
+            zf.writestr(S.CORE_PROPS_PATH, core_xml)
+
+
+class DocumentPropertiesTest(unittest.TestCase):
+    """What the FILE says about itself (#709).
+
+    The position this refines: a filesystem has no author PM could honestly report (#701), so local
+    documents showed "Unknown" everywhere while the document itself plainly named one. Reading the
+    document's own property block closes that without PM ever naming the OS account.
+    """
+
+    def _docx(self, d, core_xml=CORE_XML.format(creator="Jane Okafor", editor="Sam Reyes")):
+        path = os.path.join(d, "plan.docx")
+        _write_ooxml(path, core_xml)
+        return path
+
+    def test_an_ooxml_document_states_its_author_editor_and_creation(self):
+        with tempfile.TemporaryDirectory() as d, _xml_parser():
+            props = S.read_document_properties(self._docx(d))
+        self.assertEqual(props["author"], "Jane Okafor")
+        self.assertEqual(props["last_modified_by"], "Sam Reyes")
+        self.assertEqual(props["created"], "2025-11-04T09:12:00Z")
+
+    def test_the_documents_own_modified_date_is_deliberately_not_reported(self):
+        # The fixture HAS a dcterms:modified and it must not reach the reply. PM's
+        # `source_modified_at` for a local file is the filesystem mtime, which is what the connector
+        # diffs to notice a change; a second, differently-sourced "modified" invites that
+        # substitution, and a docProps date predating the copy on disk would look permanently stale.
+        with tempfile.TemporaryDirectory() as d, _xml_parser():
+            props = S.read_document_properties(self._docx(d))
+        self.assertEqual(sorted(props), ["author", "created", "last_modified_by"])
+
+    def test_an_unstated_author_reads_as_not_stated_rather_than_blank(self):
+        # Word writes `<dc:creator/>` for an unset author. An empty string rendered under "Author"
+        # is worse than "Unknown" — it looks like PM lost the value rather than never had it.
+        for creator in ("", "   ", "\n\t"):
+            with tempfile.TemporaryDirectory() as d, _xml_parser():
+                path = self._docx(d, CORE_XML.format(creator=creator, editor="Sam Reyes"))
+                props = S.read_document_properties(path)
+            self.assertIsNone(props["author"], repr(creator))
+            self.assertEqual(props["last_modified_by"], "Sam Reyes")  # the others still land
+
+    def test_a_container_with_no_property_block_is_not_a_failure(self):
+        # Legal, and some writers do it. Every reader here answers "the document didn't say".
+        with tempfile.TemporaryDirectory() as d, _xml_parser():
+            path = os.path.join(d, "bare.docx")
+            _write_ooxml(path)
+            self.assertEqual(S.read_document_properties(path), S.no_properties())
+
+    def test_an_oversized_property_member_is_refused_before_it_inflates(self):
+        # The whole-archive guard's 1 GiB ceiling is far too coarse to catch a bomb aimed at the one
+        # member this reader opens, so the member carries its own cap.
+        with tempfile.TemporaryDirectory() as d, _xml_parser():
+            path = self._docx(d)
+            with mock.patch.object(S, "MAX_DOC_PROPS_BYTES", 8):
+                props = S.read_document_properties(path)
+        self.assertEqual(props, S.no_properties())
+
+    def test_a_missing_hardened_parser_fails_closed(self):
+        # Unlike `defuse_stdlib()` at import, which is best-effort because ingest depends on it.
+        # This parse is optional, so a venv without defusedxml simply gets no properties.
+        with tempfile.TemporaryDirectory() as d:
+            path = self._docx(d)
+            with mock.patch.dict(sys.modules, {"defusedxml": None, "defusedxml.ElementTree": None}):
+                self.assertEqual(S.read_document_properties(path), S.no_properties())
+
+    def test_a_format_with_no_property_block_asks_nothing(self):
+        # .txt/.md/.html carry no properties at all, and a path that doesn't exist must still answer
+        # rather than raise — a property is never the reason a file fails to land.
+        self.assertEqual(S.read_document_properties("/pm/test/notes.md"), S.no_properties())
+        self.assertEqual(S.read_document_properties("/pm/test/gone.docx"), S.no_properties())
+
+    def test_a_long_value_is_capped(self):
+        self.assertEqual(len(S.clean_property("x" * 5000)), S.MAX_PROPERTY_CHARS)
+
+
+class PdfDateTest(unittest.TestCase):
+    """The PDF Info dictionary's own encodings, as pure functions — so they are covered in CI with
+    no PDF library installed."""
+
+    def test_a_full_pdf_date_carries_its_offset(self):
+        self.assertEqual(S.pdf_date_to_iso("D:20260104120000+01'00'"), "2026-01-04T12:00:00+01:00")
+        self.assertEqual(S.pdf_date_to_iso("D:20260104120000Z"), "2026-01-04T12:00:00Z")
+
+    def test_every_field_after_the_year_is_optional(self):
+        # The spec's truncation points, which real writers do use.
+        self.assertEqual(S.pdf_date_to_iso("D:2026"), "2026-01-01T00:00:00Z")
+        self.assertEqual(S.pdf_date_to_iso("D:202601"), "2026-01-01T00:00:00Z")
+        self.assertEqual(S.pdf_date_to_iso("D:20260104"), "2026-01-04T00:00:00Z")
+        self.assertEqual(
+            S.pdf_date_to_iso("20260104"), "2026-01-04T00:00:00Z"
+        )  # D: is optional too
+
+    def test_a_date_that_is_not_a_pdf_date_is_refused_rather_than_salvaged(self):
+        # An ISO date wrongly stored in the Info dictionary would otherwise truncate to its year and
+        # be reported with false precision — a wrong answer, which is worse than a missing one.
+        for bad in ("D:2026-01-04", "2026-01-04T09:00:00Z", "D:20261345", "", None, "not a date"):
+            self.assertIsNone(S.pdf_date_to_iso(bad), repr(bad))
+
+    def test_a_pdf_string_decodes_from_either_encoding(self):
+        self.assertEqual(S.pdf_string(b"Jane Okafor"), "Jane Okafor")
+        # UTF-16 with a BOM, which is how any non-ASCII name is written. The codec eats the BOM.
+        self.assertEqual(S.pdf_string("René Fauré".encode("utf-16")), "René Fauré")
+        # PDFDocEncoding otherwise, which agrees with latin-1 over everything a name contains.
+        self.assertEqual(S.pdf_string(b"Ren\xe9"), "René")
+        self.assertIsNone(S.pdf_string(None))
+
+    def test_a_malformed_w3cdtf_timestamp_is_refused(self):
+        self.assertEqual(S.iso_or_none("2025-11-04T09:12:00Z"), "2025-11-04T09:12:00Z")
+        self.assertEqual(S.iso_or_none("2025-11-04"), "2025-11-04")
+        self.assertIsNone(S.iso_or_none("last Tuesday"))
+        self.assertIsNone(S.iso_or_none(None))
+
+
+class FilePropertiesWireTest(unittest.TestCase):
+    """The method is reachable over the wire and always answers in one shape. Uses a .md path, which
+    carries no property block, so this runs end to end in CI with nothing installed."""
+
+    def test_the_reply_shape_is_fixed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "notes.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("# hello\n")
+            req = json.dumps({"id": 7, "method": "file_properties", "params": {"path": path}})
+            proc = subprocess.run(
+                [sys.executable, os.path.join(os.path.dirname(__file__), "pm_sidecar.py")],
+                input=req + "\n",
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        reply = json.loads(proc.stdout.strip().splitlines()[0])
+        self.assertTrue(reply["ok"], proc.stdout)
+        self.assertEqual(
+            reply["result"], {"author": None, "last_modified_by": None, "created": None}
+        )
 
 
 if __name__ == "__main__":
