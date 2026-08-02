@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.118.0-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "The Columns menu closes when you click away from it. It was the last panel in PM that didn't, so picking your columns and then clicking anywhere else left it sitting open over the table. It now closes on a click outside, on Escape, and hands focus back to the button you opened it with.",
+      "Every column sorts, including the four that describe the source. Author, Modified by, Created, Updated and Size were deliberately left unsortable, on the reasoning that ordering by a column reading “Unknown” for most rows would just pile the Unknowns at one end. That was a fair worry and it is answered directly instead: rows with no answer always sort to the bottom, whichever way the arrow points, so sorting by author never buries the files that have one.",
+      "Two more things a document can tell you: Updated — when the file itself last changed at Google Drive, OneDrive or on disk — and Last synced, when PM last had something new to write down about it. Between them they separate “nobody has edited this since March” from “this connector stopped working in March”, which until now looked identical from the outside. Ingested now shows the time as well as the date.",
+      "What each Depth starts with has been rethought. Minimal shows the project; Standard adds importance, author and size; Power adds the chunk count. Everything else waits until you turn it on. If you have ever opened the Columns menu and ticked anything, your table is untouched — your choice is yours until you press “Reset to depth”. If you never have, the table follows the new starting set: at Power that means Ingested steps back and Author and Size step in.",
+      "Table headings are no longer shouted in capitals.",
+    ],
+  },
+  {
     version: "3.117.2-alpha",
     date: "2026-08-02",
     highlights: [

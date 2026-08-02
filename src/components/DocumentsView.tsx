@@ -27,7 +27,7 @@ import {
 } from "../lib/ipc";
 import { landingSeq, landingsSince, mergeLandings, onDocumentsLanded } from "../lib/documentFeed";
 import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
-import { formatDate } from "../lib/format";
+import { formatDateTime } from "../lib/format";
 import {
   readActivityOpen,
   readCopyPhotosToVault,
@@ -52,7 +52,7 @@ import {
   type DocColumnKey,
 } from "../lib/documentColumns";
 import { sourceFactKnown, sourceFactValue } from "../lib/sourceFacts";
-import { Button, Card, Collapsible, ConfirmDialog, IconButton } from "./ui";
+import { Button, Card, Collapsible, ConfirmDialog, IconButton, Popover } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
 import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
@@ -83,19 +83,42 @@ interface Summary {
   unreadable: number;
 }
 
-// Sorting for the document table. The available columns depend on the Depth preset (Ingested only
-// shows on Power), so a header only sorts when it's rendered. `null` = the backend's default order
-// (newest first). Importance is ranked high > medium > low > none > archive rather than alphabetically.
-type SortKey = "title" | "project" | "importance" | "chunks" | "ingested";
-// The source-fact columns are display-only: they are shown to tell two copies of a file apart, not
-// to order the library by, and sorting on a column whose value is "Unknown" for most rows would put
-// a wall of Unknowns at one end of the table. Their headers render as plain labels, not buttons.
+// Sorting for the document table: EVERY column sorts, plus the always-present title. A header only
+// sorts when it is rendered, so which keys are reachable follows the column picker. `null` = the
+// backend's default order (newest first). Importance is ranked high > medium > low > none > archive
+// rather than alphabetically.
+//
+// The source facts were originally display-only, on the reasoning that ordering by a column reading
+// "Unknown" for most rows just banks the Unknowns at one end. That is a real objection and it is
+// answered directly below rather than by refusing to sort: unknowns go LAST in both directions, so
+// clicking a header never buries the rows that have an answer.
+type SortKey = "title" | DocColumnKey;
 interface DocSort {
   key: SortKey;
   dir: "asc" | "desc";
 }
-// Columns where "biggest first" is the more useful default on first click.
-const SORT_DESC_FIRST = new Set<SortKey>(["importance", "chunks", "ingested"]);
+// Columns where "biggest / most recent first" is the more useful default on first click.
+const SORT_DESC_FIRST = new Set<SortKey>([
+  "importance",
+  "chunks",
+  "created",
+  "updated",
+  "size",
+  "ingested",
+  "synced",
+]);
+
+/** Compare two possibly-absent values, keeping absent ones at the END whichever way the column is
+ *  sorted. Returns `null` when both are present, so the caller compares them normally.
+ *
+ *  The direction factor is applied by the caller AFTER this, which is why the unknown cases return a
+ *  value already multiplied back out — an unknown must not flip to the top when the arrow flips. */
+function unknownsLast<T>(a: T | null, b: T | null, factor: number): number | null {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1 * factor;
+  if (b == null) return -1 * factor;
+  return null;
+}
 
 // Image extensions that go through the photo pipeline (mirrors `PHOTO_EXTS` in the Rust ingest). Used
 // only to decide whether to offer the one-time OCR install before a drop — the backend re-checks.
@@ -162,13 +185,12 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
   // Dev-only (debug builds): drive the index-only substrate without a real connector.
   const [devTitle, setDevTitle] = useState("");
   const [devBody, setDevBody] = useState("");
-  const { showPower } = useDepth();
+  const { depth } = useDepth();
   // Which columns the table shows (#701). `null` = the user has never chosen, so the table follows
   // Depth — which is what keeps switching Depth working for anyone who never opens the picker, and
   // what Reset restores by clearing the stored value rather than writing today's Depth set out.
   const [columnChoice, setColumnChoice] = useState<DocColumnKey[] | null>(readColumns);
-  const [columnsOpen, setColumnsOpen] = useState(false);
-  const columns = columnChoice ?? defaultColumns(showPower);
+  const columns = columnChoice ?? defaultColumns(depth);
   const shows = (key: DocColumnKey) => columns.includes(key);
   const setColumns = (next: DocColumnKey[] | null) => {
     setColumnChoice(next);
@@ -741,6 +763,52 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
         case "ingested":
           c = a.ingested_at.localeCompare(b.ingested_at);
           break;
+        case "synced":
+          // Never null in practice — the projection falls back to the ingest time — but typed as
+          // nullable, so it goes through the same guard as the rest rather than being special-cased.
+          {
+            const u = unknownsLast(a.pm_refreshed_at, b.pm_refreshed_at, factor);
+            if (u !== null) return u;
+            c = a.pm_refreshed_at!.localeCompare(b.pm_refreshed_at!);
+          }
+          break;
+        case "author":
+          {
+            const u = unknownsLast(a.source_author, b.source_author, factor);
+            if (u !== null) return u;
+            c = a.source_author!.localeCompare(b.source_author!);
+          }
+          break;
+        case "modifiedBy":
+          {
+            const u = unknownsLast(a.source_last_modified_by, b.source_last_modified_by, factor);
+            if (u !== null) return u;
+            c = a.source_last_modified_by!.localeCompare(b.source_last_modified_by!);
+          }
+          break;
+        case "created":
+          // ISO-8601 sorts lexicographically, which is why these compare as strings rather than
+          // being parsed into Dates for every comparison of every pair.
+          {
+            const u = unknownsLast(a.source_created_at, b.source_created_at, factor);
+            if (u !== null) return u;
+            c = a.source_created_at!.localeCompare(b.source_created_at!);
+          }
+          break;
+        case "updated":
+          {
+            const u = unknownsLast(a.source_modified_at, b.source_modified_at, factor);
+            if (u !== null) return u;
+            c = a.source_modified_at!.localeCompare(b.source_modified_at!);
+          }
+          break;
+        case "size":
+          {
+            const u = unknownsLast(a.source_size_bytes, b.source_size_bytes, factor);
+            if (u !== null) return u;
+            c = a.source_size_bytes! - b.source_size_bytes!;
+          }
+          break;
       }
       if (c === 0) c = a.title.localeCompare(b.title); // stable tiebreak
       return c * factor;
@@ -1078,46 +1146,56 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                 "one control, one home". Depth still seeds the set; this takes over from there, and
                 Reset hands it back rather than freezing today's Depth into an explicit choice. */}
             {documents.length > 0 && (
-              <div className="relative mb-2 flex justify-end">
-                <Button
-                  variant="tertiary"
-                  size="sm"
-                  onClick={() => setColumnsOpen((v) => !v)}
-                  aria-expanded={columnsOpen}
-                  title="Choose which columns this table shows"
-                >
-                  Columns
-                </Button>
-                {columnsOpen && (
-                  <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-[var(--radius-sm)] border border-border bg-panel p-2 shadow-lg">
-                    <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
-                    {DOC_COLUMN_KEYS.map((key) => (
-                      <label
-                        key={key}
-                        className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={shows(key)}
-                          onChange={() => setColumns(toggleColumn(columns, key))}
-                        />
-                        {DOC_COLUMN_LABELS[key]}
-                      </label>
-                    ))}
-                    <div className="mt-1 border-t border-rule pt-1">
-                      <Button
-                        variant="tertiary"
-                        size="sm"
-                        onClick={() => setColumns(null)}
-                        disabled={columnChoice == null}
-                        title="Go back to following your display depth"
-                      >
-                        Reset to depth
-                      </Button>
-                    </div>
-                  </div>
+              // The shared Popover primitive rather than a hand-rolled panel: this was the only
+              // dismissless one left in the tree, so clicking anywhere else on the page left it
+              // hanging open. It brings click-outside, Escape and focus-restore with it. Passed as a
+              // plain node, NOT the function form — the function form hands you `close`, which is
+              // right for a menu of actions and wrong for a list of checkboxes you tick several of.
+              <Popover
+                align="right"
+                ariaLabel="Columns"
+                rootClassName="mb-2 flex justify-end"
+                panelClassName="w-56 p-2"
+                trigger={({ open, toggle }) => (
+                  <Button
+                    variant="tertiary"
+                    size="sm"
+                    onClick={toggle}
+                    aria-expanded={open}
+                    title="Choose which columns this table shows"
+                  >
+                    Columns
+                  </Button>
                 )}
-              </div>
+              >
+                <>
+                  <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
+                  {DOC_COLUMN_KEYS.map((key) => (
+                    <label
+                      key={key}
+                      className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={shows(key)}
+                        onChange={() => setColumns(toggleColumn(columns, key))}
+                      />
+                      {DOC_COLUMN_LABELS[key]}
+                    </label>
+                  ))}
+                  <div className="mt-1 border-t border-rule pt-1">
+                    <Button
+                      variant="tertiary"
+                      size="sm"
+                      onClick={() => setColumns(null)}
+                      disabled={columnChoice == null}
+                      title="Go back to following your display depth"
+                    >
+                      Reset to depth
+                    </Button>
+                  </div>
+                </>
+              </Popover>
             )}
             {documents.length === 0 ? (
               <p className="text-sm text-ink4">No documents yet.</p>
@@ -1126,7 +1204,7 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
               // truncates long titles/source paths instead of forcing the whole table (and page) to
               // scroll sideways. The metadata columns are sized to their content.
               <table className="w-full table-fixed text-left text-sm">
-                <thead className="font-mono text-xs uppercase tracking-wide text-ink3">
+                <thead className="text-xs font-medium tracking-wide text-ink3">
                   <tr className="border-b border-border">
                     <SortHeader label="Title" sortKey="title" sort={sort} onSort={toggleSort} />
                     {shows("project") && (
@@ -1157,18 +1235,18 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                         widthClass={DOC_COLUMN_WIDTHS.chunks}
                       />
                     )}
-                    {/* Plain headers, not sort buttons — see the SortKey note above. */}
                     {DOC_COLUMN_KEYS.filter(isSourceFactColumn)
                       .filter(shows)
                       .map((key) => (
-                        <th
+                        <SortHeader
                           key={key}
-                          className={`py-2 font-medium ${DOC_COLUMN_WIDTHS[key]} ${
-                            key === "size" ? "text-right" : ""
-                          }`}
-                        >
-                          {DOC_COLUMN_LABELS[key]}
-                        </th>
+                          label={DOC_COLUMN_LABELS[key]}
+                          sortKey={key}
+                          sort={sort}
+                          onSort={toggleSort}
+                          align={key === "size" ? "right" : undefined}
+                          widthClass={DOC_COLUMN_WIDTHS[key]}
+                        />
                       ))}
                     {shows("ingested") && (
                       <SortHeader
@@ -1178,6 +1256,16 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                         onSort={toggleSort}
                         align="right"
                         widthClass={DOC_COLUMN_WIDTHS.ingested}
+                      />
+                    )}
+                    {shows("synced") && (
+                      <SortHeader
+                        label="Last synced"
+                        sortKey="synced"
+                        sort={sort}
+                        onSort={toggleSort}
+                        align="right"
+                        widthClass={DOC_COLUMN_WIDTHS.synced}
                       />
                     )}
                   </tr>
@@ -1321,9 +1409,16 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                               {sourceFactValue(doc, key)}
                             </td>
                           ))}
+                        {/* Date AND time, in one cell rather than two columns: a separate time
+                            column would sort independently of its own date, which is a footgun. */}
                         {shows("ingested") && (
                           <td className="py-2 text-right text-ink4">
-                            {formatDate(doc.ingested_at)}
+                            {formatDateTime(doc.ingested_at)}
+                          </td>
+                        )}
+                        {shows("synced") && (
+                          <td className="py-2 text-right text-ink4">
+                            {doc.pm_refreshed_at ? formatDateTime(doc.pm_refreshed_at) : "—"}
                           </td>
                         )}
                       </tr>

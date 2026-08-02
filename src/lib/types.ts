@@ -504,6 +504,13 @@ export interface Document {
   /** The source file's size in bytes, distinct from `byte_size`, which measures what PM ingested.
    *  Null for a Google-native Doc/Sheet/Slide, which has no byte size at all. */
   source_size_bytes: number | null;
+  /** When the SOURCE last changed — Drive/OneDrive's own modified time, or a local file's mtime.
+   *  Stored since v11 and refreshed on every sync; it had no way of reaching a screen until #707. */
+  source_modified_at: string | null;
+  /** When PM last had something new to write down about this document — not when it last looked, so
+   *  a file nobody has touched keeps an old stamp. Falls back to the ingest time, since first sight
+   *  is a refresh too, and is therefore never null in practice. */
+  pm_refreshed_at: string | null;
 }
 
 /**

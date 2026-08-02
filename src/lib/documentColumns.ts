@@ -17,6 +17,7 @@
 // localStorage rather than a backend Setting, by the same rule as the rest of `documentPrefs`: which
 // columns are on is a statement about this person at this machine, not about the library.
 
+import type { Depth } from "../theme";
 import { SOURCE_FACT_KEYS, SOURCE_FACT_LABELS, type SourceFactKey } from "./sourceFacts";
 
 /** Every column the table can render, in display order. `title` is not here: it is always shown and
@@ -27,6 +28,7 @@ export const DOC_COLUMN_KEYS = [
   "chunks",
   ...SOURCE_FACT_KEYS,
   "ingested",
+  "synced",
 ] as const;
 export type DocColumnKey = (typeof DOC_COLUMN_KEYS)[number];
 
@@ -38,6 +40,7 @@ export const DOC_COLUMN_LABELS: Record<DocColumnKey, string> = {
   chunks: "Chunks",
   ...SOURCE_FACT_LABELS,
   ingested: "Ingested",
+  synced: "Last synced",
 };
 
 /** Fixed widths for the `table-fixed` layout. Title takes the leftover space, so every other column
@@ -49,8 +52,11 @@ export const DOC_COLUMN_WIDTHS: Record<DocColumnKey, string> = {
   author: "w-36",
   modifiedBy: "w-36",
   created: "w-28",
+  updated: "w-28",
   size: "w-24",
-  ingested: "w-32",
+  // Both carry a time as well as a date, so they need more room than the date-only columns above.
+  ingested: "w-40",
+  synced: "w-40",
 };
 
 /** Whether a column is a source fact (rendered from `sourceFacts`) rather than a PM-side field. */
@@ -58,12 +64,33 @@ export function isSourceFactColumn(key: DocColumnKey): key is SourceFactKey {
   return (SOURCE_FACT_KEYS as readonly string[]).includes(key);
 }
 
-/** The set a given Depth starts from — deliberately EXACTLY what the table showed before the picker
- *  existed, so nobody's table changes shape until they ask it to. The four source facts are off by
- *  default at every Depth: they are the reason the picker exists, not a new baseline. */
-export function defaultColumns(showPower: boolean): DocColumnKey[] {
-  const base: DocColumnKey[] = ["project", "importance", "chunks"];
-  return showPower ? [...base, "ingested"] : base;
+/** The set a given Depth starts from.
+ *
+ *  Chosen by hand rather than derived: `min` earns its name by showing the one thing that answers
+ *  "where does this live", `standard` adds the two facts people actually scan a library by (who
+ *  wrote it, how big it is) plus how much it matters, and `power` adds the chunk count, which is a
+ *  statement about the index rather than about the document.
+ *
+ *  Everything else — who last changed it, when it was created, when it was updated, when PM ingested
+ *  or last synced it — is off until asked for. They are real questions, but they are questions about
+ *  ONE document, and a column answers them for a thousand at the cost of the width the title needs.
+ *
+ *  This replaces the original seeding, which was "exactly what the table showed before the picker
+ *  existed". That was the right call while the picker was new and nobody had opinions about it yet;
+ *  it is not a permanent claim. Note who moves: a user who has never opened the picker follows this
+ *  and will see their table change shape once (at Power, `Ingested` goes and `Author`/`Size` arrive);
+ *  a user who has ever toggled a column has a stored explicit set and is untouched until they press
+ *  Reset. */
+export function defaultColumns(depth: Depth): DocColumnKey[] {
+  const wanted: DocColumnKey[] =
+    depth === "min"
+      ? ["project"]
+      : depth === "standard"
+        ? ["project", "importance", "author", "size"]
+        : ["project", "importance", "chunks", "author", "size"];
+  // Filtered through the canonical order rather than trusted as written, so the lists above can be
+  // read as sets and a reordering here can never desync from the header order.
+  return DOC_COLUMN_KEYS.filter((k) => wanted.includes(k));
 }
 
 export const DOC_COLUMNS_KEY = "pm.documents.columns";
