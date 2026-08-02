@@ -18,11 +18,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const scanDuplicates = vi.fn();
 const deleteDocument = vi.fn();
+const dismissDuplicatePair = vi.fn();
+const restoreDuplicateDismissals = vi.fn();
 const openReader = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
   scanDuplicates: () => scanDuplicates(),
   deleteDocument: (id: number) => deleteDocument(id),
+  // Explicit factory: a name missing here resolves to `undefined` and the click that calls it
+  // throws, so a new ipc import has to be added in the same change that uses it.
+  dismissDuplicatePair: (a: number, b: number) => dismissDuplicatePair(a, b),
+  restoreDuplicateDismissals: () => restoreDuplicateDismissals(),
 }));
 
 vi.mock("../lib/reader", () => ({
@@ -95,8 +101,11 @@ beforeEach(() => {
     pairs: [BOTH_SIGNALS],
     similarity_skipped: false,
     similarity_limit: 5000,
+    dismissed: 0,
   });
   deleteDocument.mockResolvedValue(undefined);
+  dismissDuplicatePair.mockResolvedValue(undefined);
+  restoreDuplicateDismissals.mockResolvedValue(undefined);
 });
 
 async function scanned() {
@@ -113,7 +122,14 @@ describe("the scan", () => {
 
   it("says why a pair was flagged, in words that carry the confidence", async () => {
     await scanned();
-    expect(screen.getByText(/start identically and read the same/)).toBeTruthy();
+    expect(screen.getByText(/start identically/)).toBeTruthy();
+  });
+
+  it("explains how matching works once, in the panel, not once per pair", async () => {
+    await scanned();
+    // It describes the CHECK, so it is identical on every row; repeated per card it read as a note
+    // about that pair and pushed the two documents down every card.
+    expect(screen.getAllByText(/compares what is inside a document/)).toHaveLength(1);
   });
 
   it("distinguishes a similarity-only pair from an identical opening", async () => {
@@ -189,5 +205,37 @@ describe("removing one side", () => {
     await waitFor(() => expect(screen.queryByText("Contract Acme (copy)")).toBeNull());
     expect(screen.getByText(/Nothing looks duplicated/)).toBeTruthy();
     expect(scanDuplicates).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("keeping both", () => {
+  it("records the decision so the pair stops being re-offered", async () => {
+    // The third answer. Before this the only choices were "delete one" or "leave it and be asked
+    // again on every scan forever" — the report is recomputed from scratch each time and wrote
+    // nothing back, which is why a rebuild appeared to bring the same duplicates back.
+    await scanned();
+    fireEvent.click(screen.getByRole("button", { name: "Keep both" }));
+    await waitFor(() => expect(dismissDuplicatePair).toHaveBeenCalledWith(1, 2));
+    // …and it leaves the list, without a re-scan.
+    await waitFor(() => expect(screen.queryByText("Contract Acme")).toBeNull());
+    expect(scanDuplicates).toHaveBeenCalledTimes(1);
+  });
+
+  it("says how many are hidden and offers them back", async () => {
+    // Never a silent narrowing: a result the user cannot see the shape of is the same defect as a
+    // scan that skipped half its method and reported a clean sweep.
+    scanDuplicates.mockResolvedValue({
+      scanned: 120,
+      pairs: [],
+      similarity_skipped: false,
+      similarity_limit: 5000,
+      dismissed: 3,
+    });
+    render(<DuplicatesPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "Check for duplicates" }));
+    await waitFor(() => expect(screen.getByText(/3 pairs you chose to keep/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Show them again" }));
+    await waitFor(() => expect(restoreDuplicateDismissals).toHaveBeenCalled());
   });
 });

@@ -1478,6 +1478,8 @@ pub fn run() {
             settings::set_reranking,
             settings::set_duplicate_check,
             duplicates::scan_duplicates,
+            duplicates::dismiss_duplicate_pair,
+            duplicates::restore_duplicate_dismissals,
             // ONE-TIME cleanup — delete these three with the `sweep` module in the release after
             // this one (card #651's follow-up).
             sweep::scan_orphan_files,

@@ -1442,6 +1442,28 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX IF NOT EXISTS idx_documents_reviewed ON documents(reviewed);
     "#,
+    // v51: remember which duplicate pairs the user has decided to keep.
+    //
+    // The duplicate report was stateless by construction: `scan_duplicates` recomputes everything
+    // from `documents`/`chunks`/`chunk_vec` on every invocation and writes nothing back. The only
+    // "resolved" state was a component-local Set, cleared at the top of every scan. So a pair the
+    // user had looked at and deliberately kept came back on the next scan, and on the one after
+    // that — which is exactly the "I think the same duplicate files were flagged again" report,
+    // and it had nothing to do with the rebuild that happened in between.
+    //
+    // Ids are stored lower-first to match `duplicates::ordered`, so a pair is one row whichever way
+    // round it is discovered. `documents.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so a rowid is
+    // never reused and a stale dismissal cannot silently re-attach to a different document; the
+    // cascades then clear a dismissal when either side is deleted (foreign keys are ON for every
+    // connection). `IF NOT EXISTS` for the same db-ladder teardown reason as v48/v50.
+    r#"
+    CREATE TABLE IF NOT EXISTS duplicate_dismissals (
+      a_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      b_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      dismissed_at  TEXT NOT NULL,
+      PRIMARY KEY (a_document_id, b_document_id)
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1497,7 +1519,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 50,
+            version, 51,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1524,7 +1546,7 @@ mod tests {
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
-             documents.reviewed index for the review queue is v50)"
+             documents.reviewed index for the review queue is v50;              duplicate-pair dismissals is v51)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

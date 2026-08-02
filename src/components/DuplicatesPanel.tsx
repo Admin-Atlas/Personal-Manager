@@ -18,24 +18,45 @@
 
 import { useCallback, useState } from "react";
 
-import { deleteDocument, scanDuplicates } from "../lib/ipc";
-import { formatDate } from "../lib/format";
+import {
+  deleteDocument,
+  dismissDuplicatePair,
+  restoreDuplicateDismissals,
+  scanDuplicates,
+} from "../lib/ipc";
+import { formatDateTime } from "../lib/format";
+import { provenanceParts } from "../lib/sourceLabel";
 import { useReader } from "../lib/reader";
 import type { DuplicatePair, DuplicateReport, Document } from "../lib/types";
 import { Button, ConfirmDialog } from "./ui";
 
 /** How a pair was found, as a sentence rather than a score. The wording carries the confidence: an
- *  identical opening is a fact about the text, similarity is a judgement with a threshold behind it,
- *  and the two together are the only case worth calling near-certain. */
+ *  identical opening is a fact about the text, similarity is a judgement with a threshold behind it.
+ *
+ *  The two signals TOGETHER used to get a third sentence of their own ("…and read the same
+ *  throughout"). It said nothing the first sentence didn't: an identical opening is already the
+ *  strongest thing on offer, and adding a second clause per card cost a line on every row to
+ *  restate confidence the reader had no way to act on differently. */
 function whyFlagged(pair: DuplicatePair): string {
-  if (pair.same_opening && pair.similarity !== null) {
-    return "These start identically and read the same throughout.";
-  }
   if (pair.same_opening) {
     return "These start identically — the same opening, ignoring formatting.";
   }
   return "These read very alike, though they don't start the same way.";
 }
+
+/** Why a renamed copy still matches, said once rather than left to be inferred.
+ *
+ *  Both signals read the BODY — the opening key folds body text, and the similarity signal compares
+ *  first-leaf vectors. Neither ever looks at the title. So two documents with the same contents and
+ *  different names are duplicates by design and PM is right to flag them; what was missing is that
+ *  nothing said so, which makes a correct flag read as a false positive.
+ *
+ *  It belongs beside "looks for documents you have twice", NOT on each card: it describes how the
+ *  check works, which is true of the whole panel and identical on every row. Repeated per pair it
+ *  read as a note about THAT pair, and pushed the two documents — the only per-row content that
+ *  differs — further down every card. */
+const NAMES_ARE_NOT_COMPARED =
+  "PM compares what is inside a document, not what it is called — so a renamed copy still matches, and two files with the same name but different contents do not.";
 
 /** A document's origin in the words the rest of the app uses. */
 function originOf(doc: Document): string {
@@ -64,6 +85,7 @@ function SideCard({
   onRemove: () => void;
   busy: boolean;
 }) {
+  const provenance = provenanceParts(doc);
   return (
     <div className="flex-1 rounded-md border border-border p-3">
       <button
@@ -74,8 +96,17 @@ function SideCard({
         {doc.title}
       </button>
       <p className="mt-1 text-xs text-ink4">{originOf(doc)}</p>
+      {/* Where it actually came from. `originOf` reads from `source_type` alone, so every connector
+          collapses to one sentence and two copies of a file — one per connected account, say —
+          rendered byte-identically on the one screen that asks you to delete one of them. All of
+          this was already on the row and simply not read. */}
+      {provenance.length > 0 && (
+        <p className="mt-0.5 break-words text-xs text-ink3">{provenance.join(" · ")}</p>
+      )}
       <p className="mt-0.5 text-xs text-ink4">
-        {doc.project} · added {formatDate(doc.ingested_at)}
+        {/* The full timestamp, not the date: two rows created milliseconds apart in one sync pass
+            — exactly what a cross-account duplicate is — render identically under a date. */}
+        {doc.project} · added {formatDateTime(doc.ingested_at)}
       </p>
       <div className="mt-2 flex gap-2">
         <Button variant="tertiary" onClick={onOpen}>
@@ -102,11 +133,38 @@ export function DuplicatesPanel() {
   // would make clearing three duplicates take three full sweeps — so pairs are hidden locally and the
   // count stays honest by counting what is still on screen.
   const [removed, setRemoved] = useState<Set<number>>(new Set());
+  // Pairs dismissed since this scan, hidden locally for the same reason `removed` is: re-scanning
+  // after each decision would make clearing three pairs take three full sweeps.
+  const [keptPairs, setKeptPairs] = useState<Set<string>>(new Set());
+
+  const pairKey = (p: DuplicatePair) => `${p.a.id}-${p.b.id}`;
+
+  async function keepBoth(pair: DuplicatePair) {
+    setError(null);
+    try {
+      await dismissDuplicatePair(pair.a.id, pair.b.id);
+      setKeptPairs((prev) => new Set(prev).add(pairKey(pair)));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function unhideAll() {
+    setError(null);
+    try {
+      await restoreDuplicateDismissals();
+      setKeptPairs(new Set());
+      await scan();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
 
   const scan = useCallback(async () => {
     setScanning(true);
     setError(null);
     setRemoved(new Set());
+    setKeptPairs(new Set());
     try {
       setReport(await scanDuplicates());
     } catch (e) {
@@ -131,7 +189,11 @@ export function DuplicatesPanel() {
     }
   }
 
-  const visible = (report?.pairs ?? []).filter((p) => !removed.has(p.a.id) && !removed.has(p.b.id));
+  const visible = (report?.pairs ?? []).filter(
+    (p) => !removed.has(p.a.id) && !removed.has(p.b.id) && !keptPairs.has(pairKey(p)),
+  );
+  // Everything the report is not showing, so a narrowed result is never presented as a whole one.
+  const hiddenCount = (report?.dismissed ?? 0) + keptPairs.size;
 
   return (
     <div className="mt-4 rounded-lg border border-border p-4" data-help="documents-duplicates">
@@ -140,7 +202,7 @@ export function DuplicatesPanel() {
           <h3 className="text-sm font-medium text-ink2">Duplicate check</h3>
           <p className="mt-1 text-xs text-ink4">
             Looks for documents you have twice. It shows you both and never removes anything on its
-            own.
+            own. {NAMES_ARE_NOT_COMPARED}
           </p>
         </div>
         <Button variant="secondary" onClick={() => void scan()} disabled={scanning}>
@@ -171,11 +233,37 @@ export function DuplicatesPanel() {
         </div>
       )}
 
+      {report !== null && hiddenCount > 0 && (
+        <p className="mt-2 text-xs text-ink4">
+          {hiddenCount} pair{hiddenCount === 1 ? "" : "s"} you chose to keep{" "}
+          {hiddenCount === 1 ? "is" : "are"} hidden.{" "}
+          <button
+            className="underline underline-offset-2 hover:text-ink3"
+            onClick={() => void unhideAll()}
+          >
+            Show them again
+          </button>
+        </p>
+      )}
+
       {visible.length > 0 && (
         <ul className="mt-3 space-y-3">
           {visible.map((pair) => (
             <li key={`${pair.a.id}-${pair.b.id}`} className="rounded-lg border border-border p-3">
-              <p className="text-xs text-ink3">{whyFlagged(pair)}</p>
+              <div className="flex items-start justify-between gap-2">
+                <p className="text-xs text-ink3">{whyFlagged(pair)}</p>
+                {/* The third answer. Until now the only choices were "delete one" or "leave it and
+                    be asked again forever" — the report recomputes from scratch every scan and
+                    wrote nothing back, so a decision already made was re-offered indefinitely. */}
+                <Button
+                  variant="tertiary"
+                  className="shrink-0"
+                  disabled={removing}
+                  onClick={() => void keepBoth(pair)}
+                >
+                  Keep both
+                </Button>
+              </div>
               <div className="mt-2 flex flex-col gap-2 sm:flex-row">
                 <SideCard
                   doc={pair.a}
