@@ -1433,6 +1433,11 @@ export const switchToVault = (folder: string, makePrivate: boolean) =>
 /** The current backup/restore snapshot — restores the progress UI on return + shows the last result. */
 export const backupStatus = () => invoke<BackupState>("backup_status");
 
+/** Acknowledge the last run's outcome so its banner stops replaying. The banner is served from the
+ *  backend snapshot on every mount, so a frontend-only dismiss comes straight back on the next tab
+ *  switch — this is the only thing that actually clears it. */
+export const clearBackupReport = () => invoke<void>("clear_backup_report");
+
 /** Ask the running backup/restore to stop. A backup's partial output is discarded; a restore leaves the
  *  live vault untouched. */
 export const stopBackup = () => invoke<void>("stop_backup");

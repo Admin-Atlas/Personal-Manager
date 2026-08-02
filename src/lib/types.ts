@@ -985,8 +985,28 @@ export interface BackupReport {
   created_at: string | null;
   /** Destinations that failed this run while at least one other succeeded (F-22), as
    *  `"<label>: <error>"` strings — for a non-blocking "backed up, but X failed" banner. Empty on a
-   *  clean run and always empty for a restore. */
+   *  clean run and always empty for a restore.
+   *
+   *  Genuine UPLOAD failures only. A keep-last-N prune that could not trim used to land here too,
+   *  which reported a destination whose archive uploaded perfectly as having failed. */
   failed_destinations: string[];
+  /** Retention trouble on a destination whose upload SUCCEEDED — its own sentence, never under the
+   *  "destination failed" headline. */
+  retention_notes: RetentionNote[];
+}
+
+/** One destination's keep-last-N trouble (mirrors the Rust `RetentionNote`). */
+export interface RetentionNote {
+  /** `BackupDestination::kind()` — the stable machine key ("proton" | "gdrive"), never the label,
+   *  so the UI can match a note to that destination's live listing without string-matching a name
+   *  that is allowed to be reworded. */
+  kind: string;
+  /** Ready-to-show sentence, already naming the destination. */
+  message: string;
+  /** True when this is a count fact (archives over the limit could not be trimmed) rather than a
+   *  transport failure. ONLY a count fact may be auto-suppressed by a fresh listing showing the
+   *  destination back under its limit — a trim that errored is not healed by the count. */
+  over_limit: boolean;
 }
 
 /** What a keep-last-N trim actually managed to do at a destination.

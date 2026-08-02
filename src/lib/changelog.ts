@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.114.12-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Backing up now shows its progress where you pressed the button. The progress bar existed and worked — it just rendered near the top of the tab, about five sections above the \"Back up now\" you'd actually clicked, so on any normal window the feedback was off-screen and the backup looked like it had done nothing. There's now a bar under the button too, and it only appears for the destination you started.",
+      "The first stage of a backup no longer looks stuck. Preparing the snapshot is a single database operation that can't report a percentage, so the bar sat frozen at 0% for what is often the longest part of a backup. It shimmers instead, like every other step PM can't measure. Verifying a restore did the same thing and is fixed with it.",
+      "Your backups say when they were taken. The list showed the raw file name, which is 68 characters with the date on the END — so the part that got cut off was exactly the date you were looking for. Each row now leads with the date and time, with the size and full file name underneath. Saving a backup to this computer suggests a dated file name too, instead of offering to overwrite the last one.",
+      '"Backed up, but 1 destination failed" stops haunting you. That message was replayed from the last run every time you opened the tab, and only another backup could ever replace it — so if you fixed the problem yourself, PM kept telling you about it forever. It now has a Dismiss button that actually sticks.',
+      "…and most of the time it was never a failure at all. If PM couldn't tidy up your older backups to respect \"keep the last N\", that was being reported as the destination failing, even though your backup had uploaded perfectly. Those are now separate sentences, and the tidying one clears itself: delete the extra backups in Drive and the message is gone next time you look. If PM can't see the destination to check, it keeps the message rather than guessing.",
+      "Opening the Backup tab during a backup no longer shows the previous run's failures underneath the live progress bar.",
+    ],
+  },
+  {
     version: "3.114.11-alpha",
     date: "2026-08-01",
     highlights: [

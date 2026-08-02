@@ -1643,6 +1643,7 @@ pub fn run() {
             commands::restore_local_backup,
             commands::switch_to_vault,
             commands::backup_status,
+            commands::clear_backup_report,
             commands::stop_backup,
             commands::proton_cli_status,
             commands::set_proton_cli_path,
