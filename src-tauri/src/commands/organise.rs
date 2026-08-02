@@ -397,6 +397,25 @@ pub struct RetagScope {
     pub calls: i64,
 }
 
+/// The re-tag pass's live snapshot (empty / `running:false` when idle), so Teach → Tags can resume
+/// showing progress after the user leaves and returns — the retag sibling of [`rebuild_status`].
+///
+/// This is the piece that was missing. Both phases already emitted everything needed, but over a
+/// per-call `Channel` that only the invoking component could hear; a tab switch dropped that
+/// subscription and there was no way to rejoin a pass that was still running. It also carries the
+/// finished vocabulary and the last pass's change count, so returning after either phase completed
+/// still shows the result.
+///
+/// [`rebuild_status`]: super::rebuild_status
+#[tauri::command]
+pub fn retag_status(state: State<'_, AppState>) -> Result<crate::RetagJobState> {
+    state
+        .retag_job
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("re-tag state poisoned".into()))
+}
+
 #[tauri::command]
 pub fn retag_scope(state: State<'_, AppState>) -> Result<RetagScope> {
     let conn = state.conn()?;
@@ -455,6 +474,19 @@ fn retag_documents(app: &AppHandle) -> Result<Vec<RetagDoc>> {
 /// Nothing is written and nothing is staged. Runs on the background key.
 #[tauri::command]
 pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
+    let state = app.state::<AppState>();
+    let Some(_busy) = crate::BusyGuard::acquire(&state.retag_busy) else {
+        return Err(Error::Other(
+            "a re-tag pass is already running — it keeps going while you're on other tabs, and              Teach → Tags shows where it has got to."
+                .into(),
+        ));
+    };
+    let sink = retag::RetagSink::new(app.clone());
+    // One model call over sampled titles: there is nothing countable here, so the phase is
+    // honestly indeterminate rather than a bar sitting at zero. The guard clears `running` on
+    // every exit below — three early returns and two `?` sites — so a remounting Teach tab can
+    // never be left shimmering at a pass that ended.
+    let _run = sink.begin(crate::RetagPhase::Vocabulary, None);
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
@@ -482,6 +514,11 @@ pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
             "the model did not return a usable tag vocabulary — nothing has been changed".into(),
         ));
     }
+    // Into the snapshot as well as the return value: this call is BILLED, and leaving the tab
+    // while it ran used to throw the result away.
+    sink.send(RetagEvent::Vocabulary {
+        tags: vocabulary.clone(),
+    });
     Ok(vocabulary)
 }
 
@@ -496,11 +533,19 @@ pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
 /// Proposals are STAGED, never applied — `commit_retag` is the only thing that writes.
 /// Runs on the background key and never holds the DB lock across a model call (rule #4).
 #[tauri::command]
-pub async fn apply_retag_vocabulary(
-    app: AppHandle,
-    vocabulary: Vec<String>,
-    on_event: Channel<RetagEvent>,
-) -> Result<()> {
+pub async fn apply_retag_vocabulary(app: AppHandle, vocabulary: Vec<String>) -> Result<()> {
+    let state = app.state::<AppState>();
+    // Held across BOTH phases. `retag_assign` opens by clearing every staged proposal, so a second
+    // pass started over a first — which a tab switch made possible, since it reset the component's
+    // own `working` flag — would wipe the first's half-staged work.
+    let Some(_busy) = crate::BusyGuard::acquire(&state.retag_busy) else {
+        return Err(Error::Other(
+            "a re-tag pass is already running — it keeps going while you're on other tabs, and              Teach → Tags shows where it has got to."
+                .into(),
+        ));
+    };
+    let sink = retag::RetagSink::new(app.clone());
+    let _run = sink.begin(crate::RetagPhase::Labelling, None);
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
@@ -523,19 +568,19 @@ pub async fn apply_retag_vocabulary(
 
     let docs = retag_documents(&app)?;
     if docs.is_empty() {
-        let _ = on_event.send(RetagEvent::Finished { changed: 0 });
+        sink.send(RetagEvent::Finished { changed: 0 });
         return Ok(());
     }
     // The cap still applies to a hand-edited list: it bounds the cached prefix, and an unbounded
     // vocabulary is the failure this whole feature exists to undo.
     vocabulary.truncate(retag::vocab_max(docs.len()));
-    let _ = on_event.send(RetagEvent::Vocabulary {
+    sink.send(RetagEvent::Vocabulary {
         tags: vocabulary.clone(),
     });
 
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
-    retag_assign(&app, &plan, &docs, &vocabulary, &on_event, &mut usage_rows).await?;
+    retag_assign(&app, &plan, &docs, &vocabulary, &sink, &mut usage_rows).await?;
     log_background_usage(&app, plan.models(), &usage_rows);
     Ok(())
 }
@@ -552,7 +597,7 @@ async fn retag_assign(
     plan: &llm_gateway::RoutePlan,
     docs: &[RetagDoc],
     vocabulary: &[String],
-    on_event: &Channel<RetagEvent>,
+    sink: &retag::RetagSink,
     usage_rows: &mut Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)>,
 ) -> Result<()> {
     {
@@ -600,10 +645,10 @@ async fn retag_assign(
             }
         }
         done += chunk.len();
-        let _ = on_event.send(RetagEvent::Progress { done, total });
+        sink.send(RetagEvent::Progress { done, total });
     }
 
-    let _ = on_event.send(RetagEvent::Finished { changed });
+    sink.send(RetagEvent::Finished { changed });
     Ok(())
 }
 

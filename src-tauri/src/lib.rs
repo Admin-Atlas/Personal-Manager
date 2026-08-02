@@ -278,6 +278,37 @@ pub struct IngestJobState {
     pub recent_truncated: bool,
 }
 
+/// The re-tag pass's live snapshot, read on mount and followed live on `retag://progress`.
+///
+/// A re-tag runs entirely in the backend on an owned `AppHandle`: nothing ties it to the React
+/// tree, so it keeps going when the Teach tab unmounts. What it USED to lose was the audience —
+/// progress went out over a per-call `Channel` minted by the component, so leaving the tab dropped
+/// the only subscription and there was no way to rejoin. The counts were never the problem; both
+/// numbers were already being emitted.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct RetagJobState {
+    pub running: bool,
+    /// Which half is in flight. `vocabulary` is one model call over sampled titles and has nothing
+    /// countable to report — it is honestly indeterminate, not a bar stuck at zero.
+    pub phase: Option<RetagPhase>,
+    pub processed: usize,
+    pub total: Option<usize>,
+    pub started_at_ms: Option<i64>,
+    /// The vocabulary the first phase settled on. Held here so a user who leaves during the (billed)
+    /// model call still gets the result on return — it used to be destroyed by the unmount.
+    pub vocabulary: Vec<String>,
+    /// How many documents the finished pass changed, so a returning user sees the outcome.
+    pub last_changed: Option<usize>,
+}
+
+/// Which half of a re-tag pass is running.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetagPhase {
+    Vocabulary,
+    Labelling,
+}
+
 /// How many per-file rows the snapshot keeps.
 ///
 /// 50 was "enough to look continuous on return", which is the wrong goal: the Activity list is how
@@ -440,6 +471,14 @@ pub struct AppState {
     /// rebuild modal) can resume showing progress after the user navigates away and back — the
     /// ingest sibling of `drive_sync`.
     pub ingest_job: Mutex<IngestJobState>,
+    /// The re-tag pass's live snapshot — the ingest sibling, for the same reason. Both phases of a
+    /// re-tag outlive the Teach tab that started them, and the tab router unmounts that tab.
+    pub retag_job: Mutex<RetagJobState>,
+    /// Single-flight for the whole re-tag pass, held across BOTH phases. Without it, switching tabs
+    /// resets the component-local `working` flag and a second pass can be started over a first —
+    /// and `retag_assign` OPENS by clearing every staged proposal, so the second pass would wipe
+    /// the first's half-staged work.
+    pub retag_busy: AtomicBool,
     /// Single-flight guard for the rebuild, and the flag every other indexing writer defers to while one
     /// runs (see [`AppState::rebuild_running`]). Two overlapping rebuilds are not merely wasteful — they
     /// fight over the same rows, and on the vector-width arm (which still clears the store) the second's
@@ -1282,6 +1321,8 @@ pub fn run() {
                 local_sync: Mutex::new(LocalFolderSyncState::default()),
                 local_sync_cancel: AtomicBool::new(false),
                 ingest_job: Mutex::new(IngestJobState::default()),
+                retag_job: Mutex::new(RetagJobState::default()),
+                retag_busy: AtomicBool::new(false),
                 ingest_busy: AtomicBool::new(false),
                 layout_job: Mutex::new(layout::LayoutJobState::default()),
                 last_user_activity: Mutex::new(Instant::now()),
@@ -1509,6 +1550,7 @@ pub fn run() {
             commands::transcribe_audio,
             commands::list_projects,
             commands::retag_scope,
+            commands::retag_status,
             commands::propose_retag_vocabulary,
             commands::apply_retag_vocabulary,
             commands::delete_tag,

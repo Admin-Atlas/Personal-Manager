@@ -565,6 +565,25 @@ export interface RetagScope {
   calls: number;
 }
 
+/** The re-tag pass's live snapshot (mirrors the Rust `RetagJobState`).
+ *
+ *  Read on mount so a Teach tab that was unmounted mid-pass can rejoin one still running — and can
+ *  collect the (billed) vocabulary of a first phase that finished while it was away, which used to
+ *  be destroyed outright. */
+export interface RetagJobState {
+  running: boolean;
+  /** Which half is in flight. `vocabulary` is one model call and has nothing countable to report,
+   *  so it renders as an indeterminate shimmer rather than a bar stuck at zero. */
+  phase: "vocabulary" | "labelling" | null;
+  processed: number;
+  total: number | null;
+  started_at_ms: number | null;
+  /** The vocabulary the first phase settled on — empty until it has. */
+  vocabulary: string[];
+  /** How many documents the last finished pass changed. */
+  last_changed: number | null;
+}
+
 export type RetagEvent =
   /** The vocabulary the first call settled on — shown while the rest of the pass runs, so a bad
    *  vocabulary can be seen (and the pass abandoned) without waiting for every document. */

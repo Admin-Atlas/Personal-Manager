@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.115.0-alpha",
+    date: "2026-08-01",
+    highlights: [
+      "Re-tagging your library now has a proper progress bar, and you can walk away from it. Both halves of a re-tag — choosing the vocabulary and labelling every document — show the same progress bar the rest of PM uses, with the count and, if your display depth is set high enough, a percentage and elapsed time. Leaving the Teach tab and coming back now rejoins the pass exactly where it is, instead of showing you nothing and leaving you unsure whether it was still going. It always was still going; PM had simply stopped listening to it.",
+      "Choosing a vocabulary no longer throws away what you paid for. That step is a model call, and leaving the tab while it ran discarded the result — so you'd come back to nothing and have to run it again. It's kept now, and waiting for you.",
+      'The "Reading your library" message is no longer written on a greyed-out button. Using a disabled button as the status readout put the only word about what PM was doing at about a seventh of the contrast it needed, out of reach of the keyboard, and invisible to a screen reader.',
+      "PM refuses to start a second re-tag over a first. Starting a pass wipes any proposals already staged, and switching tabs used to reset the safeguard that prevented it — so a second pass could quietly destroy the half-reviewed results of the first. The proposals list also stays out of the way while a pass is running, rather than offering to apply a set that is still changing underneath you.",
+    ],
+  },
+  {
     version: "3.114.14-alpha",
     date: "2026-08-01",
     highlights: [

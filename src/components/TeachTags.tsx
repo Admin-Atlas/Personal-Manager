@@ -26,13 +26,16 @@ import {
   discardTagProposals,
   listTagProposals,
   listTags,
+  onRetagProgress,
   proposeRetagVocabulary,
   renameTag,
   retagScope,
+  retagStatus,
 } from "../lib/ipc";
 import { findSimilarTags } from "../lib/tagSimilarity";
-import type { RetagScope, TagProposalRow, TagSummary } from "../lib/types";
+import type { RetagJobState, RetagScope, TagProposalRow, TagSummary } from "../lib/types";
 import { Button, Card, Dialog, Input } from "./ui";
+import { IngestProgress } from "./IngestProgress";
 
 export function TeachTags() {
   const [tags, setTags] = useState<TagSummary[]>([]);
@@ -48,6 +51,9 @@ export function TeachTags() {
   const [proposing, setProposing] = useState(false);
   const [labelling, setLabelling] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  // When the pass began, so a bar reopened mid-run counts from the true start rather than from
+  // whenever this tab happened to mount.
+  const [startedAt, setStartedAt] = useState<number | null>(null);
 
   // Documents excluded from the accept. Everything staged is in by default: the pass was asked for
   // wholesale, so opting out is the exception.
@@ -70,6 +76,56 @@ export function TeachTags() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Adopt whatever the backend says is happening. Shared by the mount restore and by `finished`,
+  // so a pass that ends while this tab is away lands in exactly the same state as one watched
+  // throughout.
+  const adopt = useCallback((s: RetagJobState) => {
+    setProposing(s.running && s.phase === "vocabulary");
+    setLabelling(s.running && s.phase === "labelling");
+    setStartedAt(s.started_at_ms);
+    setProgress(s.total != null && s.running ? { done: s.processed, total: s.total } : null);
+    // The vocabulary is the billed output of phase one. Leaving the tab while that model call ran
+    // used to throw it away entirely; it is restored here whether or not a pass is still running.
+    if (s.vocabulary.length > 0) setVocabulary((v) => v ?? s.vocabulary);
+  }, []);
+
+  // A re-tag pass runs detached from this view, so switching tabs unmounts us while the work — and
+  // the billing — carries on. Restore whatever is in flight from the backend snapshot, then follow
+  // the global event for the rest. This is DocumentsView's rebuild restore, transcribed: the
+  // pattern is the one the ingest side already proves.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    retagStatus()
+      .then((s) => {
+        if (cancelled) return;
+        adopt(s);
+      })
+      .catch(() => {});
+
+    void onRetagProgress((ev) => {
+      if (ev.type === "vocabulary") setVocabulary((v) => v ?? ev.tags);
+      else if (ev.type === "progress") setProgress({ done: ev.done, total: ev.total });
+      else if (ev.type === "finished") {
+        // The pass may have been started by a mount that is long gone, so this listener — not the
+        // starter's `finally` — is what releases the UI.
+        setLabelling(false);
+        setProgress(null);
+        setStartedAt(null);
+        void load();
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [adopt, load]);
 
   async function run(fn: () => Promise<unknown>) {
     setBusy(true);
@@ -103,13 +159,14 @@ export function TeachTags() {
     setLabelling(true);
     setProgress(null);
     try {
-      await applyRetagVocabulary(vocabulary, (ev) => {
-        if (ev.type === "progress") setProgress({ done: ev.done, total: ev.total });
-      });
+      // No callback: progress arrives on the global `retag://progress` subscription below, which
+      // survives this component unmounting. The starter deliberately does NOT also clear progress
+      // in a `finally` — this promise resolves when the command returns, and the listener is the
+      // thing that knows when the PASS is done.
+      await applyRetagVocabulary(vocabulary);
       await load();
     } catch (e) {
       setError(String(e));
-    } finally {
       setLabelling(false);
       setProgress(null);
     }
@@ -233,14 +290,47 @@ export function TeachTags() {
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Button variant="secondary" onClick={() => void propose()} disabled={working}>
-            {proposing ? "Reading your library…" : vocabulary ? "Suggest again" : "Suggest tags"}
+            {vocabulary ? "Suggest again" : "Suggest tags"}
           </Button>
-          {progress && (
-            <span className="font-mono text-xs text-ink4">
-              {progress.done} / {progress.total}
-            </span>
-          )}
         </div>
+
+        {/* Both phases report through the same component the rest of PM uses, so they tier by
+            Depth for free: shimmer at minimal, bar + "36 of 165" at standard, + a percentage and
+            an elapsed timer at power. It also carries role="progressbar" and an accessible name.
+
+            This replaces two non-surfaces. Choosing a vocabulary swapped the BUTTON's own label to
+            "Reading your library…" while disabling it — so the operation's only status lived on a
+            disabled control: unreachable by keyboard, unannounced by a screen reader, and drawn at
+            roughly 1.4:1. Labelling had a bare "36 / 165" span and no bar at all. */}
+        {proposing && (
+          <div className="mt-3">
+            {/* One model call over sampled titles — nothing countable, so `total={null}` shimmers
+                rather than pinning a bar at zero. */}
+            <IngestProgress
+              processed={0}
+              total={null}
+              startedAt={startedAt ?? undefined}
+              label="Reading your library"
+            />
+            <p className="mt-1 text-xs text-ink4">
+              Choosing one vocabulary with your whole library in view — usually a few seconds. This
+              keeps going if you leave the tab.
+            </p>
+          </div>
+        )}
+        {labelling && (
+          <div className="mt-3">
+            <IngestProgress
+              processed={progress?.done ?? 0}
+              total={progress?.total ?? null}
+              startedAt={startedAt ?? undefined}
+              label="Labelling your library"
+            />
+            <p className="mt-1 text-xs text-ink4">
+              This keeps going if you leave the tab — come back any time to see where it has got to.
+            </p>
+          </div>
+        )}
 
         {vocabulary && (
           <div className="mt-4">
@@ -292,7 +382,12 @@ export function TeachTags() {
       </Card>
 
       {/* ---------------------------------------------------------------- the proposals */}
-      {rows.length > 0 && (
+      {/* Hidden while a pass runs, and that is a data guard rather than tidiness: `retag_assign`
+          OPENS by clearing every staged proposal, so this block would be offering irreversible bulk
+          vault writes over a set that is half-replaced and still moving. Before the pass survived a
+          tab switch this was hard to reach; now that it does, it is one tab switch away. The
+          backend's `retag_busy` single-flight is the other half of the same guard. */}
+      {rows.length > 0 && !proposing && !labelling && (
         <div className="mt-4">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-2">
             <p className="font-mono text-xs uppercase tracking-wide text-ink4">

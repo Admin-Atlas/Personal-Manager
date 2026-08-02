@@ -25,6 +25,12 @@ const proposeRetagVocabulary = vi.fn();
 const applyRetagVocabulary = vi.fn();
 const deleteTag = vi.fn();
 const renameTag = vi.fn();
+// The re-tag pass now reports on the global `retag://progress` event and keeps its state in a
+// backend snapshot, so the component reads both on mount. An ipc name missing from the factory
+// below resolves to `undefined` and the mount effect throws, taking every test in this file with
+// it — so these two are not optional extras.
+const retagStatus = vi.fn();
+const onRetagProgress = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
   listTags: () => listTags(),
@@ -33,7 +39,11 @@ vi.mock("../lib/ipc", () => ({
   commitRetag: (ids: number[]) => commitRetag(ids),
   discardTagProposals: () => discardTagProposals(),
   proposeRetagVocabulary: () => proposeRetagVocabulary(),
-  applyRetagVocabulary: (v: string[], cb: (e: unknown) => void) => applyRetagVocabulary(v, cb),
+  // No callback parameter any more: a per-call Channel is only heard by the component that made
+  // it, and this one unmounts on a tab switch.
+  applyRetagVocabulary: (v: string[]) => applyRetagVocabulary(v),
+  retagStatus: () => retagStatus(),
+  onRetagProgress: (h: (e: unknown) => void) => onRetagProgress(h),
   deleteTag: (name: string) => deleteTag(name),
   renameTag: (a: string, b: string) => renameTag(a, b),
 }));
@@ -93,6 +103,16 @@ beforeEach(() => {
   discardTagProposals.mockResolvedValue(undefined);
   proposeRetagVocabulary.mockResolvedValue(["invoice", "application"]);
   applyRetagVocabulary.mockResolvedValue(undefined);
+  retagStatus.mockResolvedValue({
+    running: false,
+    phase: null,
+    processed: 0,
+    total: null,
+    started_at_ms: null,
+    vocabulary: [],
+    last_changed: null,
+  });
+  onRetagProgress.mockResolvedValue(() => {});
   deleteTag.mockResolvedValue(1);
   renameTag.mockResolvedValue(1);
 });
@@ -165,7 +185,7 @@ describe("the re-tag pass", () => {
     fireEvent.click(screen.getByRole("button", { name: /Label my library/ }));
     await waitFor(() =>
       // Lowercased on the way in, matching how tags are stored everywhere else.
-      expect(applyRetagVocabulary).toHaveBeenCalledWith(["invoice", "receipts"], expect.anything()),
+      expect(applyRetagVocabulary).toHaveBeenCalledWith(["invoice", "receipts"]),
     );
   });
 });

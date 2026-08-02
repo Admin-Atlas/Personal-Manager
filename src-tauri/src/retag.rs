@@ -704,3 +704,153 @@ mod tests {
         assert_eq!(m[1].content.matches('x').count(), ASSIGN_EXCERPT);
     }
 }
+
+/// The `retag://progress` event name — the global channel both re-tag phases report on.
+///
+/// Deliberately a global emit rather than the per-call `tauri::ipc::Channel` this replaced. A
+/// channel is minted by whoever invokes the command, so only that caller hears it — and that caller
+/// is a component the tab router unmounts. The work carried on regardless (a Tauri async command
+/// holds an owned `AppHandle`; nothing ties its future to the React tree), so the pass ran to
+/// completion, kept staging proposals, and nobody was listening. Same reasoning, and the same
+/// wording, as `ingest::REBUILD_EVENT`.
+///
+/// The starting view must therefore NOT keep a channel as well, or every batch is counted twice.
+pub const RETAG_EVENT: &str = "retag://progress";
+
+/// Mirrors a re-tag event into [`crate::RetagJobState`] and emits it globally — `ingest::ProgressSink`
+/// with `retag://progress` substituted.
+#[derive(Clone)]
+pub struct RetagSink {
+    app: tauri::AppHandle,
+}
+
+impl RetagSink {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+
+    /// Send one event. Best-effort by design: a failed emit must never abort the pass — the whole
+    /// point is that the work outlives its audience.
+    pub fn send(&self, ev: crate::commands::RetagEvent) {
+        self.mirror(&ev);
+        let _ = tauri::Emitter::emit(&self.app, RETAG_EVENT, ev);
+    }
+
+    /// Fold an event into the shared snapshot. The guard is bound to a named local and dropped at
+    /// the end of this function — it must never be held across an `.await`, or the enclosing async
+    /// command's future stops being `Send` and will not compile.
+    fn mirror(&self, ev: &crate::commands::RetagEvent) {
+        use tauri::Manager;
+        let state = self.app.state::<crate::AppState>();
+        let guard = state.retag_job.lock();
+        let Ok(mut snap) = guard else { return };
+        apply_event(&mut snap, ev);
+    }
+
+    /// Open a phase: stamp `running`, the phase, and the start time. Returns a guard that clears
+    /// `running` on drop.
+    ///
+    /// The guard is the point. `propose_retag_vocabulary` has three early returns plus two `?`
+    /// propagation sites, and `apply_retag_vocabulary` has three more — a set-on-entry /
+    /// clear-on-exit pair would leave `running: true` behind any of them, and a remounting Teach
+    /// tab would then shimmer forever with no way to clear it. This is `BusyGuard`'s RAII shape
+    /// applied to the snapshot, and like `BusyGuard` it also survives an unwinding panic.
+    pub fn begin(&self, phase: crate::RetagPhase, total: Option<usize>) -> RetagRunGuard {
+        use tauri::Manager;
+        if let Ok(mut snap) = self.app.state::<crate::AppState>().retag_job.lock() {
+            snap.running = true;
+            snap.phase = Some(phase);
+            snap.processed = 0;
+            snap.total = total;
+            snap.started_at_ms = Some(crate::epoch_ms());
+            snap.last_changed = None;
+        }
+        RetagRunGuard {
+            app: self.app.clone(),
+        }
+    }
+}
+
+/// Clears `running` however the phase ends — return, `?`, or panic. See [`RetagSink::begin`].
+pub struct RetagRunGuard {
+    app: tauri::AppHandle,
+}
+
+impl Drop for RetagRunGuard {
+    fn drop(&mut self) {
+        use tauri::Manager;
+        if let Ok(mut snap) = self.app.state::<crate::AppState>().retag_job.lock() {
+            snap.running = false;
+            snap.phase = None;
+            snap.started_at_ms = None;
+        }
+    }
+}
+
+/// Fold one re-tag event into the snapshot. Pure, so the counting rules a returning tab depends on
+/// are unit-testable without an app handle.
+pub fn apply_event(snap: &mut crate::RetagJobState, ev: &crate::commands::RetagEvent) {
+    use crate::commands::RetagEvent as E;
+    match ev {
+        // Carried in the snapshot as well as emitted: the vocabulary is the billed result of the
+        // first phase, and leaving the tab used to destroy it outright.
+        E::Vocabulary { tags } => snap.vocabulary = tags.clone(),
+        E::Progress { done, total } => {
+            snap.processed = *done;
+            snap.total = Some(*total);
+        }
+        E::Finished { changed } => {
+            snap.last_changed = Some(*changed);
+            snap.processed = snap.total.unwrap_or(snap.processed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use crate::commands::RetagEvent as E;
+    use crate::RetagJobState;
+
+    #[test]
+    fn a_returning_tab_sees_the_counts_it_missed() {
+        let mut snap = RetagJobState::default();
+        super::apply_event(
+            &mut snap,
+            &E::Progress {
+                done: 36,
+                total: 165,
+            },
+        );
+        assert_eq!(snap.processed, 36);
+        assert_eq!(snap.total, Some(165));
+    }
+
+    #[test]
+    fn the_billed_vocabulary_survives_the_unmount_that_used_to_destroy_it() {
+        let mut snap = RetagJobState::default();
+        super::apply_event(
+            &mut snap,
+            &E::Vocabulary {
+                tags: vec!["tax".into(), "receipts".into()],
+            },
+        );
+        assert_eq!(snap.vocabulary, vec!["tax".to_string(), "receipts".into()]);
+    }
+
+    #[test]
+    fn finishing_fills_the_bar_rather_than_leaving_it_short() {
+        // The last batch can be partial, so the final Progress need not equal the total. A bar left
+        // at 160/165 next to "Done" reads as a pass that stopped early.
+        let mut snap = RetagJobState::default();
+        super::apply_event(
+            &mut snap,
+            &E::Progress {
+                done: 160,
+                total: 165,
+            },
+        );
+        super::apply_event(&mut snap, &E::Finished { changed: 12 });
+        assert_eq!(snap.processed, 165);
+        assert_eq!(snap.last_changed, Some(12));
+    }
+}
