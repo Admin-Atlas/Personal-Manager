@@ -64,6 +64,33 @@ describe("contrast axis — WCAG targets across every system × mode", () => {
         }
       });
 
+      // 1.4.11 again, for the one control with no text of its own to fall back on: a switch.
+      // Toggle.tsx outlines its track in `--ink4`, and this is the measurement behind that choice.
+      //
+      // Both obvious picks fail. `--border2` is the ramp's "strong edge" and lands at 1.42–1.84:1
+      // against `--panel` at the default Contrast — even `high` only reaches 2.82–4.29:1, so a
+      // switch outlined in it is invisible at every level the app offers, which is exactly what
+      // shipping it proved. `--accent` fails from the other side: on a light theme with a pale
+      // accent the ON fill drops to 1.36:1 against the row behind it, so an accent-coloured outline
+      // is a line drawn in the colour it sits on. The fill alone is never a boundary either
+      // (`--surface` on `--panel` is 1.03–1.16:1).
+      //
+      // Asserted at BOTH levels, not just `high`: an outline that only appears at High contrast is
+      // an outline the default install does not have. And across every accent, because the accent
+      // hue tints the very backgrounds the outline is measured against.
+      it(`${system}/${mode}: the switch outline clears 3:1 on both its fills, at every level`, () => {
+        for (const contrast of ["aa", "high"] as const) {
+          for (const anyAccent of ACCENTS[system]) {
+            const v = themeVars(system, mode, anyAccent, false, contrast);
+            // The outline is painted over the track's own edge, so it is read against the fill it
+            // rims (`--surface` when OFF) and against the row the switch sits on (`--panel`).
+            for (const against of ["surface", "panel"] as const) {
+              expect(ratioOf(v, "ink4", against)).toBeGreaterThanOrEqual(3);
+            }
+          }
+        }
+      });
+
       // The semantic status colours are TEXT: the error banner's message, Field's role="alert", the
       // "Due soon" chip, every connector failure string. They render at text-xs, so the 3:1
       // large-text exemption never applies. They also sit OUTSIDE the contrast axis — boost() only

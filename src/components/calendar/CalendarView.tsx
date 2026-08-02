@@ -778,8 +778,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         // The swipe target. `ref={gridRef}` was missing entirely until now, so the Calendar tab's
         // horizontal swipe had never once fired despite the v3.88.0 notes advertising it here
         // alongside Focus's. Note WHERE this branch sits: it renders only once `overview` has
-        // resolved, which is why `useHorizontalWheelShift` hands back a CALLBACK ref — an effect
-        // would have run at mount, found nothing, and never looked again (see its header).
+        // resolved, and the day columns inside it are keyed by date, so they are all replaced on
+        // every step. `useHorizontalWheelShift` owns neither problem from here — it listens on the
+        // window and hit-tests this element's box, so it needs only to be told which box (its
+        // header has the two failure modes that shape came from).
         <div ref={gridRef} className="flex min-h-0 flex-1 flex-col">
           {/* key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the
               keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not

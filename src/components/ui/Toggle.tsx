@@ -68,14 +68,24 @@ export function Toggle({
         className,
       )}
     >
-      {/* The track carries an OUTLINE, not just a fill. `--surface` sits one step off `--panel` by
-          design — that separation is enough to read as a raised area behind text, and nowhere near
-          enough to read as the EDGE of a control on its own, so an OFF switch was a knob floating
-          on what looked like empty page. `--border2` is the ramp's strong edge and it is
-          mode-relative in exactly the way this needs: `boost()` pushes it toward the contrast
-          extreme, so it darkens against a light page and lightens against a dark one, and `high`
-          firms it further (+0.18 L light / +0.20 L dark) rather than leaving the switch alone the
-          way an un-outlined track did at every level.
+      {/* The track carries an OUTLINE, not just a fill, and the outline is `--ink4` in BOTH states.
+          That token choice is measured, not aesthetic — contrast.test.ts now pins it.
+
+          A switch is a user-interface component, so its visual boundary owes 3:1 against the
+          adjacent colour (WCAG 1.4.11). Nothing here used to clear that. The OFF fill is `--surface`
+          on a `--panel` row: 1.03–1.16:1 across every System × Mode × Accent, i.e. no boundary at
+          all. `--border2` — the ramp's "strong edge", and the obvious first pick — measures
+          1.42–1.84:1 at the default Contrast and only 2.82–4.29:1 at `high`, so a switch outlined in
+          it stayed invisible at every level the app offers. That is not a subtle miss to tune; a
+          1.8:1 hairline is not a line anyone can see, which is why outlining the track in it read as
+          no change at all. The ON state is no better off: `--accent` on `--panel` falls to 1.36:1
+          under a light theme with a pale accent, so the filled pill has no edge either, and giving
+          it an `--accent` outline (as a first pass did) drew a line in the colour it sat on.
+          `--ink4` is the lowest neutral `boost()` floors at 4.5:1 at EVERY Contrast level, and it
+          measures 4.77–6.76:1 against both `--surface` and `--panel` everywhere — the only ramp
+          token that clears the requirement without a per-theme exception. Being neutral it is also
+          mode-relative for free (dark line on a light page, light line on a dark one) and never
+          depends on the accent, which is why one class serves both states.
 
           AN INSET SHADOW, NOT A BORDER, and that is not a stylistic choice. A border is part of the
           box, so with `border-box` it eats a pixel off the padding box — which is what `absolute`
@@ -87,10 +97,8 @@ export function Toggle({
           exactly what it was before the outline existed and is identical in both states. */}
       <span
         className={cn(
-          "relative inline-block h-[var(--tg-track-h,24px)] w-[var(--tg-track-w,44px)] rounded-full transition-colors",
-          checked
-            ? "bg-accent shadow-[inset_0_0_0_1px_var(--accent)]"
-            : "bg-surface shadow-[inset_0_0_0_1px_var(--border2)]",
+          "relative inline-block h-[var(--tg-track-h,24px)] w-[var(--tg-track-w,44px)] rounded-full shadow-[inset_0_0_0_1px_var(--ink4)] transition-colors",
+          checked ? "bg-accent" : "bg-surface",
         )}
       >
         {/* The knob colour follows `checked`, exactly as the track above does. It used to be
