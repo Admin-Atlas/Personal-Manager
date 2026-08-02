@@ -1067,6 +1067,211 @@ pub fn adopt_legacy_swm_row(
     Ok((updated > 0).then_some((old, new)))
 }
 
+/// Split a shared-with-me **descent** into the files this corpus owns and the files it must not claim.
+///
+/// The two Drive corpora are meant to be disjoint, and the rule is already written down at
+/// [`map_change`]: My Drive owns a file you own, shared-with-me owns a file you don't. The My-Drive
+/// baseline enforces it (`q` carries `sharedWithMe = false`); the shared-with-me DESCENT never did.
+/// `swm_root_files_url` scopes the ROOTS with `sharedWithMe = true`, but the walk beneath them is only
+/// `'{folder}' in parents and trashed = false` — so **a file you own, sitting inside a folder someone
+/// shared with you**, was picked up by both passes and landed as two documents: `gdrive:<email>:<id>`
+/// and `gdrive:swm:<rootId>:<id>`. Two rows, two chunk sets, both correct by their own rules, and
+/// indistinguishable to the user (#700).
+///
+/// Filtering the parsed page rather than adding an `ownedByMe` term to `q`: `ownedByMe` is already in
+/// [`FILE_FIELDS`] and already parsed, so this costs nothing and risks nothing — where a new `q` term
+/// would have to be proved against a live v3 call first, the mask being fail-closed (#481 → #538).
+///
+/// **Deliberately not wider than `ownedByMe`.** A file you do NOT own inside a shared folder is the
+/// whole point of this corpus and keeps indexing. Drive omits `ownedByMe` for an item living in someone
+/// else's *shared drive* — which parses `false` here, so such a file stays in the shared-with-me corpus.
+/// That is the right way for this to fail: a shared-drive item is not in your My-Drive baseline either,
+/// so keeping it loses nothing, where dropping it would silently stop indexing it.
+pub fn split_swm_descent(files: Vec<DriveFile>) -> (Vec<DriveFile>, Vec<DriveFile>) {
+    files.into_iter().partition(|f| !f.owned_by_me)
+}
+
+/// What [`resolve_owned_swm_duplicate`] did about one file that both corpora had claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwmDuplicate {
+    /// Nothing was indexed under the shared-with-me id — the steady state once a sync has run.
+    Absent,
+    /// Only the shared-with-me row existed, so it was re-keyed onto the My-Drive id **in place**.
+    /// Chunks, embeddings and the whole classification ride the document ROW id, so nothing is lost
+    /// and nothing is re-embedded. Carries `(old, new)` for the manifest re-key.
+    Rekeyed(String, String),
+    /// Both rows existed — the ordinary case, since the My-Drive baseline had been indexing the file
+    /// all along. The My-Drive row survives (carrying anything the doomed row had that it lacked) and
+    /// the shared-with-me row is purged. Carries the removed source id, for the manifest.
+    Merged(String),
+}
+
+/// The user-owned half of a document row — what a reconcile must never destroy (AGENTS.md rule 3).
+/// Read from both duplicate rows so the survivor can absorb the other before it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classification {
+    /// The home project. `Unsorted` is the schema default and reads as "nobody has filed this".
+    pub project: String,
+    /// The legacy JSON label array on the row itself (`document_tags` is the live join; this is kept
+    /// in step by `write_document_truth`, so a merge has to carry both).
+    pub tags: String,
+    pub importance: Option<String>,
+    /// Whether a human confirmed the filing. Not a value but a decision, which is what lets it break
+    /// the tie below instead of being gap-filled like the rest.
+    pub reviewed: bool,
+    pub entity_id: Option<i64>,
+}
+
+/// The home-project value the schema defaults to; anything else means someone (or the filer) chose it.
+const UNSORTED: &str = "Unsorted";
+
+/// Union two JSON label arrays, survivor's order first. Anything unparseable is treated as no labels
+/// rather than failing the merge — losing a malformed array is not worth failing a sync over, and the
+/// live `document_tags` join carries the same labels.
+fn union_tag_json(survivor: &str, doomed: &str) -> String {
+    let parse = |s: &str| {
+        serde_json::from_str::<Vec<String>>(s)
+            .ok()
+            .unwrap_or_default()
+    };
+    let mut out = parse(survivor);
+    for t in parse(doomed) {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Fold a doomed duplicate's classification into the survivor's, losing nothing.
+///
+/// Pure, so the rule is testable without a database. Three rules, in order:
+///
+/// 1. **A confirmed filing beats an unconfirmed one.** If the doomed row was `reviewed` and the
+///    survivor was not, the doomed row's home project and importance win — `reviewed` is the only
+///    field that records a human actually deciding, so it is the only honest tie-break.
+/// 2. **Otherwise fill gaps, never overwrite.** Which row the user edited is unknowable when neither
+///    (or both) was reviewed — both were auto-filed at ingest — so nothing already set on the survivor
+///    is disturbed and nothing set only on the doomed row is dropped.
+/// 3. **Labels union; `reviewed` ORs.**
+///
+/// [`resolve_shared_drive_twins`] deliberately refuses to resolve a divergent pair at all, and this is
+/// not an inconsistency with it: that sweep predates M:N project membership (#577), so demoting a home
+/// project there really would have discarded it. Here the caller unions `document_tags` as well, so a
+/// project that loses the home slot survives as a LINKED project — the document stays findable under
+/// both, and no case actually loses one.
+pub fn merge_classification(survivor: Classification, doomed: &Classification) -> Classification {
+    let doomed_decided = doomed.reviewed && !survivor.reviewed;
+    let unfiled = survivor.project.trim().is_empty() || survivor.project == UNSORTED;
+    Classification {
+        project: if doomed_decided || unfiled {
+            doomed.project.clone()
+        } else {
+            survivor.project
+        },
+        tags: union_tag_json(&survivor.tags, &doomed.tags),
+        importance: if doomed_decided && doomed.importance.is_some() {
+            doomed.importance.clone()
+        } else {
+            survivor.importance.or_else(|| doomed.importance.clone())
+        },
+        reviewed: survivor.reviewed || doomed.reviewed,
+        entity_id: survivor.entity_id.or(doomed.entity_id),
+    }
+}
+
+/// Read one index-only row's id + classification, or `None` when there is no such row.
+fn classified_row(conn: &Connection, source_id: &str) -> Result<Option<(i64, Classification)>> {
+    conn.query_row(
+        "SELECT id, project, tags, importance, reviewed, entity_id FROM documents \
+         WHERE source_type = 'index_only' AND source_id = ?1",
+        params![source_id],
+        |r| {
+            Ok((
+                r.get(0)?,
+                Classification {
+                    project: r.get(1)?,
+                    tags: r.get(2)?,
+                    importance: r.get(3)?,
+                    reviewed: r.get::<_, i64>(4)? != 0,
+                    entity_id: r.get(5)?,
+                },
+            ))
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Resolve a file that BOTH corpora indexed: a file you own, found during a shared-with-me descent.
+///
+/// [`split_swm_descent`] stops new ones being created; this clears the ones users already have, which
+/// is the whole symptom — the duplicate check keeps reporting them, and it is right to. Runtime
+/// reconcile rather than a migration (rule #3), mirroring [`adopt_legacy_swm_row`] — which re-keys in
+/// the opposite direction, and which for one of these files was actively making things worse: it moved
+/// the My-Drive row into the shared-with-me namespace, whereupon the My-Drive baseline re-added it.
+///
+/// **The My-Drive row wins.** It is the canonical namespace for a file you own, it is reached by the
+/// cheap delta cursor rather than a full re-walk, and it survives the shared folder being un-shared —
+/// where `gdrive:swm:<rootId>:` is keyed on a root that can vanish. The doomed row's classification is
+/// folded into it first ([`merge_classification`]), and its project/label memberships are UNIONed in,
+/// so nothing a user set is lost either way round.
+///
+/// Returns what happened, so the caller can carry the same change into the encrypted manifest — a DB
+/// change alone leaves the old id in the portable truth, where the mirror-∪-file union keeps it and the
+/// next Rebuild restores the duplicate.
+pub fn resolve_owned_swm_duplicate(
+    conn: &Connection,
+    email: &str,
+    root_id: &str,
+    file_id: &str,
+) -> Result<SwmDuplicate> {
+    let swm_id = swm_source_id(root_id, file_id);
+    let my_id = source_id_for(email, file_id);
+    let Some((swm_row, swm_class)) = classified_row(conn, &swm_id)? else {
+        return Ok(SwmDuplicate::Absent);
+    };
+    let Some((my_row, my_class)) = classified_row(conn, &my_id)? else {
+        // Nothing to merge with: the row simply moves namespace, keeping its id and everything hanging
+        // off it. `OR IGNORE` for symmetry with `adopt_legacy_swm_row`; the `None` above already
+        // established there is no collision.
+        conn.execute(
+            "UPDATE OR IGNORE documents SET source_id = ?2 \
+             WHERE source_type = 'index_only' AND source_id = ?1",
+            params![swm_id, my_id],
+        )?;
+        return Ok(SwmDuplicate::Rekeyed(swm_id, my_id));
+    };
+
+    let merged = merge_classification(my_class, &swm_class);
+    // One transaction: the absorb and the purge commit together, so a failure between them can never
+    // leave the duplicate deleted with its filing not yet carried across.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE documents SET project = ?2, tags = ?3, importance = ?4, reviewed = ?5, \
+             entity_id = ?6 WHERE id = ?1",
+        params![
+            my_row,
+            merged.project,
+            merged.tags,
+            merged.importance,
+            merged.reviewed as i64,
+            merged.entity_id
+        ],
+    )?;
+    // Union the join rows (projects AND labels) before the doomed row cascades them away. Additive by
+    // construction: a link the survivor already had is untouched, one only the duplicate had is kept,
+    // and a home project that lost the tie above lands here as a linked project rather than vanishing.
+    tx.execute(
+        "INSERT OR IGNORE INTO document_tags (document_id, tag_id) \
+         SELECT ?1, tag_id FROM document_tags WHERE document_id = ?2",
+        params![my_row, swm_row],
+    )?;
+    crate::ingest::delete_document(&tx, swm_row)?;
+    tx.commit()?;
+    Ok(SwmDuplicate::Merged(swm_id))
+}
+
 // --- Drive file model + pure parsing/mapping (the unit-tested core) ------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2498,6 +2703,7 @@ mod tests {
     use crate::index_only::SourceState;
 
     const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const EMAIL: &str = "a@b.com";
 
     fn file(id: &str, mime: &str, md5: Option<&str>, modified: &str) -> DriveFile {
         DriveFile {
@@ -2744,6 +2950,187 @@ mod tests {
         let again = resolve_shared_drive_twins(&conn).unwrap();
         assert_eq!(again.retired, 0);
         assert_eq!(again.divergent, 1);
+    }
+
+    #[test]
+    fn the_swm_descent_drops_files_you_own_and_keeps_the_rest() {
+        // #700, the walk's filter — the roots were never the bug. `swm_root_files_url` scopes the ROOTS
+        // with `sharedWithMe = true`, but the descent beneath them is only `'{folder}' in parents`, so a
+        // file you OWN inside a folder someone shared with you was claimed by both corpora.
+        let mut mine = file("F1", "text/plain", Some("h1"), "2026-07-01T00:00:00Z");
+        mine.owned_by_me = true;
+        let mut theirs = file("F2", "text/plain", Some("h2"), "2026-07-01T00:00:00Z");
+        theirs.owned_by_me = false;
+        // Drive omits `ownedByMe` for an item in someone else's shared drive, which parses false.
+        let mut in_their_shared_drive =
+            file("F3", "text/plain", Some("h3"), "2026-07-01T00:00:00Z");
+        in_their_shared_drive.owned_by_me = false;
+
+        let (shared, owned) = split_swm_descent(vec![mine, theirs, in_their_shared_drive]);
+        assert_eq!(
+            owned.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["F1"],
+            "a file you own belongs to the My-Drive corpus, which already had it"
+        );
+        assert_eq!(
+            shared.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["F2", "F3"],
+            "a file you do NOT own is the whole point of this corpus and must keep indexing — \
+             including one whose ownedByMe Drive never reported"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_filing_beats_an_unconfirmed_one_and_nothing_else_is_overwritten() {
+        let class = |project: &str, tags: &str, imp: Option<&str>, reviewed: bool| Classification {
+            project: project.into(),
+            tags: tags.into(),
+            importance: imp.map(String::from),
+            reviewed,
+            entity_id: None,
+        };
+
+        // Rule 1: the row a human confirmed wins the home project and importance.
+        let merged = merge_classification(
+            class("Work", "[]", Some("low"), false),
+            &class("Personal", "[]", Some("high"), true),
+        );
+        assert_eq!(merged.project, "Personal");
+        assert_eq!(merged.importance.as_deref(), Some("high"));
+        assert!(merged.reviewed, "the decision carries across");
+
+        // Rule 2: with no decision either way, the survivor is never overwritten…
+        let kept = merge_classification(
+            class("Work", "[]", Some("low"), false),
+            &class("Personal", "[]", Some("high"), false),
+        );
+        assert_eq!(kept.project, "Work");
+        assert_eq!(kept.importance.as_deref(), Some("low"));
+
+        // …but a gap on the survivor IS filled, which is the case that would otherwise lose filing.
+        let filled = merge_classification(
+            class(UNSORTED, "[]", None, false),
+            &class("Personal", "[]", Some("high"), false),
+        );
+        assert_eq!(filled.project, "Personal");
+        assert_eq!(filled.importance.as_deref(), Some("high"));
+
+        // A survivor's own confirmation is never overridden by an unconfirmed duplicate.
+        let confirmed = merge_classification(
+            class("Work", "[]", Some("low"), true),
+            &class("Personal", "[]", Some("high"), false),
+        );
+        assert_eq!(confirmed.project, "Work");
+
+        // Rule 3: labels union, survivor first, no duplicates — and unparseable JSON is not fatal.
+        let tags = merge_classification(
+            class("Work", r#"["a","b"]"#, None, false),
+            &class("Work", r#"["b","c"]"#, None, false),
+        );
+        assert_eq!(tags.tags, r#"["a","b","c"]"#);
+        let broken = merge_classification(
+            class("Work", "not json", None, false),
+            &class("Work", r#"["c"]"#, None, false),
+        );
+        assert_eq!(broken.tags, r#"["c"]"#);
+    }
+
+    #[test]
+    fn an_already_indexed_swm_duplicate_is_absorbed_into_the_my_drive_row() {
+        // The half the filter cannot fix: users already have both rows, and the duplicate check keeps
+        // reporting them — correctly. The My-Drive row wins (canonical namespace for a file you own,
+        // reached by the delta cursor, survives the folder being un-shared) and absorbs the other.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let insert = |sid: &str, project: &str, reviewed: i64| -> i64 {
+            conn.execute(
+                "INSERT INTO documents(source_type, source_id, title, project, tags, reviewed, \
+                     vault_path, content_hash) \
+                 VALUES ('index_only', ?1, ?2, ?3, '[]', ?4, ?5, ?6)",
+                params![
+                    sid,
+                    format!("t-{sid}"),
+                    project,
+                    reviewed,
+                    format!("v/{sid}"),
+                    format!("h-{sid}")
+                ],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let count = |sid: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM documents WHERE source_id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // The reported shape: one Drive file, two rows.
+        let my_row = insert(&source_id_for(EMAIL, "F1"), UNSORTED, 0);
+        insert(&swm_source_id("ROOT", "F1"), "Taxes", 1);
+
+        let outcome = resolve_owned_swm_duplicate(&conn, EMAIL, "ROOT", "F1").unwrap();
+        assert_eq!(
+            outcome,
+            SwmDuplicate::Merged(swm_source_id("ROOT", "F1")),
+            "both rows existed, so the shared-with-me one is absorbed and purged"
+        );
+        assert_eq!(
+            count(&swm_source_id("ROOT", "F1")),
+            0,
+            "the duplicate is gone"
+        );
+        assert_eq!(count(&source_id_for(EMAIL, "F1")), 1, "one row remains");
+        let (project, reviewed): (String, i64) = conn
+            .query_row(
+                "SELECT project, reviewed FROM documents WHERE id = ?1",
+                params![my_row],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(project, "Taxes", "the confirmed filing survived the purge");
+        assert_eq!(reviewed, 1);
+
+        // Idempotent: the steady state after one sync is that there is nothing left to resolve.
+        assert_eq!(
+            resolve_owned_swm_duplicate(&conn, EMAIL, "ROOT", "F1").unwrap(),
+            SwmDuplicate::Absent
+        );
+    }
+
+    #[test]
+    fn a_lone_swm_row_is_re_keyed_rather_than_deleted() {
+        // No My-Drive row to merge into — the file simply moves namespace, keeping its document id and
+        // therefore its chunks, embeddings and classification (rule #3: a re-key, never a drop).
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(source_type, source_id, title, project, tags, reviewed, \
+                 vault_path, content_hash) \
+             VALUES ('index_only', ?1, 'T', 'Taxes', '[]', 1, 'v/1', 'h1')",
+            params![swm_source_id("ROOT", "F1")],
+        )
+        .unwrap();
+        let before: i64 = conn
+            .query_row("SELECT id FROM documents", [], |r| r.get(0))
+            .unwrap();
+
+        let outcome = resolve_owned_swm_duplicate(&conn, EMAIL, "ROOT", "F1").unwrap();
+        assert_eq!(
+            outcome,
+            SwmDuplicate::Rekeyed(swm_source_id("ROOT", "F1"), source_id_for(EMAIL, "F1"))
+        );
+        let (id, sid, project): (i64, String, String) = conn
+            .query_row("SELECT id, source_id, project FROM documents", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(id, before, "the row id is what chunks and vectors hang off");
+        assert_eq!(sid, source_id_for(EMAIL, "F1"));
+        assert_eq!(project, "Taxes", "its filing rode along untouched");
     }
 
     #[test]
