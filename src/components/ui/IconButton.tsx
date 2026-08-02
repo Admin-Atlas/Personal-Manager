@@ -57,7 +57,14 @@ export function IconButton({
       aria-label={label}
       title={title ?? label}
       className={cn(
-        "inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] transition disabled:cursor-not-allowed disabled:opacity-40",
+        // The disabled state recolours to the `faint` role rather than applying the old
+        // `disabled:opacity-40`: one dimming mechanism, not a group alpha multiplied over a
+        // resting `text-ink4` (see Button for the measurements). The disabled: variant beats
+        // each VARIANT's own `text-ink4` on specificity — (0,2,0) against (0,1,0) — so it
+        // belongs here once rather than repeated per variant.
+        // NB: spell the class only in the class list. `designGuards.test.ts` counts the
+        // literal across the whole file, so quoting it in prose inflates this file's entry.
+        "inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] transition disabled:cursor-not-allowed disabled:text-faint",
         VARIANT[variant],
         className,
       )}

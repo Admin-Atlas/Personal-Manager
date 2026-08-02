@@ -139,9 +139,14 @@ describe("every dialog has an accessible name", () => {
 // `ink`→`ink4`, and `faint` now means what its name says.
 //
 // What legitimately remains is separators, a placeholder glyph, and disabled controls. WCAG 1.4.3
-// exempts text that is part of an INACTIVE user-interface component, which is what all four
-// `Button` entries are — and `Button`'s base already applies `disabled:opacity-40`, so no token
-// choice makes the drawn colour compliant there anyway.
+// exempts text that is part of an INACTIVE user-interface component, which is what the `Button`
+// and `IconButton` entries are.
+//
+// This note used to end "and `Button`'s base already applies `disabled:opacity-40`, so no token
+// choice makes the drawn colour compliant there anyway". That alpha is gone: it multiplied with
+// `faint` and drove the drawn label to 1.16–1.42:1, which is not a contrast exemption, it is
+// invisible. With one mechanism instead of two the token now DOES decide the drawn colour, so the
+// `faint` floor at `aa` is a live question rather than a moot one — see DESIGN_TOKENS.md.
 //
 // The count is part of the key. A FIFTH `disabled:text-faint` inside Button.tsx is exactly the
 // regression this rule is for, and a file-level allow-list would wave it through. Tests are
@@ -155,6 +160,9 @@ const DECORATIVE_FAINT: ReadonlySet<string> = new Set([
   "src/components/dev/DevRaw.tsx ×1",
   // `disabled:text-faint` on primary / secondary / tertiary / danger.
   "src/components/ui/Button.tsx ×4",
+  // The single `disabled:text-faint` in IconButton's base — one entry, not one per variant,
+  // because it wins over each VARIANT's `text-ink4` on specificity.
+  "src/components/ui/IconButton.tsx ×1",
 ]);
 
 describe("`text-faint` is decorative, never informational text", () => {

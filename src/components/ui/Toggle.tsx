@@ -68,16 +68,47 @@ export function Toggle({
         className,
       )}
     >
+      {/* The track carries an OUTLINE, not just a fill. `--surface` sits one step off `--panel` by
+          design — that separation is enough to read as a raised area behind text, and nowhere near
+          enough to read as the EDGE of a control on its own, so an OFF switch was a knob floating
+          on what looked like empty page. `--border2` is the ramp's strong edge and it is
+          mode-relative in exactly the way this needs: `boost()` pushes it toward the contrast
+          extreme, so it darkens against a light page and lightens against a dark one, and `high`
+          firms it further (+0.18 L light / +0.20 L dark) rather than leaving the switch alone the
+          way an un-outlined track did at every level.
+
+          AN INSET SHADOW, NOT A BORDER, and that is not a stylistic choice. A border is part of the
+          box, so with `border-box` it eats a pixel off the padding box — which is what `absolute`
+          offsets and percentage `top` resolve against. Adding one shrank the knob's inset from 2px
+          to 1px on all four sides, making the dot look larger and its surround thinner, and left
+          the two states' edges landing on different device-pixel boundaries at a fractional DPR
+          (Windows at 150%), so the gap looked wider on one side than the other. A shadow paints
+          over the track's own edge and takes part in no layout at all, so the knob geometry is
+          exactly what it was before the outline existed and is identical in both states. */}
       <span
         className={cn(
           "relative inline-block h-[var(--tg-track-h,24px)] w-[var(--tg-track-w,44px)] rounded-full transition-colors",
-          checked ? "bg-accent" : "bg-surface",
+          checked
+            ? "bg-accent shadow-[inset_0_0_0_1px_var(--accent)]"
+            : "bg-surface shadow-[inset_0_0_0_1px_var(--border2)]",
         )}
       >
+        {/* The knob colour follows `checked`, exactly as the track above does. It used to be
+            an unconditional `bg-accent-ink` — a token calibrated ONLY against the accent fill
+            it sits on when the switch is ON. Off the accent it has no contract at all, and
+            under the mono accent `--accent-ink` and `--bg` are the same literal, so an OFF
+            knob was drawn in the page background: 1.00:1 against the page, 1.04:1 against its
+            own track. Every default install (slate + dark + mono) saw it. `ink4` is the
+            lowest neutral role `boost()` floors at 4.5:1 at every Contrast level, which
+            contrast.test.ts already pins, so the OFF knob inherits a real floor instead of
+            depending on the accent. */}
         <span
           className={cn(
-            "absolute left-[2px] top-1/2 h-[var(--tg-knob,20px)] w-[var(--tg-knob,20px)] -translate-y-1/2 rounded-full bg-accent-ink transition-transform",
-            checked ? "translate-x-[var(--tg-on,20px)]" : "translate-x-0",
+            // 2px, the original inset: the track's outline is a shadow and so consumes none of the
+            // padding box these offsets resolve against. At both densities (44/24/20/20 and
+            // 52/28/24/24) that is 2px of track on every side, ON and OFF alike.
+            "absolute left-[2px] top-1/2 h-[var(--tg-knob,20px)] w-[var(--tg-knob,20px)] -translate-y-1/2 rounded-full transition-transform",
+            checked ? "bg-accent-ink translate-x-[var(--tg-on,20px)]" : "bg-ink4 translate-x-0",
           )}
         />
       </span>
