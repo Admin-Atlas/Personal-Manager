@@ -45,7 +45,13 @@ const MAX_PAGES: usize = 1000;
 /// properties. `createdBy`/`lastModifiedBy` are `identitySet` facets selected whole (like `file` and
 /// `folder` above), so `createdBy.user.displayName` comes back. Unlike Drive's, Graph's `$select` is
 /// not fail-closed on an unknown name, but the same discipline applies: it is a wire contract.
-const SELECT_ITEM: &str = "id,name,file,folder,deleted,webUrl,lastModifiedDateTime,size,createdBy,lastModifiedBy,createdDateTime";
+///
+/// `parentReference` was the omission that mattered (#708): [`parse_item`] has always read it for the
+/// containing-folder id and name, but this projection never asked for it. The whole-drive `/root/delta`
+/// path carries no `$select` at all and so got it free from Graph's default projection — while every
+/// FOLDER-SCOPED account, which reaches items through `children` listings, recorded no parent folder
+/// whatever. Those rows fill in on their next pass now.
+const SELECT_ITEM: &str = "id,name,file,folder,deleted,webUrl,lastModifiedDateTime,size,createdBy,lastModifiedBy,createdDateTime,parentReference";
 
 const PROVIDER: &str = "microsoft";
 const SERVICE: &str = "onedrive";
@@ -390,24 +396,38 @@ impl DriveItem {
 
     /// A `PointerInput` for the foundation, given the freshly-fetched body.
     pub fn pointer(&self, source_id: String, body: String) -> index_only::PointerInput {
+        let facts = self.source_facts();
         index_only::PointerInput {
             source_id,
             title: self.name.clone(),
             external_ref: self.web_url.clone(),
-            source_modified_at: self.modified_time.clone(),
+            source_modified_at: facts.modified_at,
             source_content_hash: self.content_hash(),
             body,
-            // Parent-folder parity with Drive: Graph's `parentReference` carries the folder id AND its
-            // name inline (Drive resolves the name in a separate fetch), so both ride straight onto the
-            // pointer as review context — they never touch the chunker/embedder. A file at the drive
-            // root (no parentReference name) simply stays untagged, exactly as before.
-            source_parent_folder_id: self.parent_id.clone(),
-            source_parent_folder_name: self.parent_name.clone(),
-            source_author: self.created_by.clone(),
-            source_last_modified_by: self.last_modified_by.clone(),
-            source_created_at: self.created_time.clone(),
-            // Already parsed and already in `$select` — it was simply never carried onto the pointer.
-            source_size_bytes: self.size,
+            source_parent_folder_id: facts.parent_folder_id,
+            source_parent_folder_name: facts.parent_folder_name,
+            source_author: facts.author,
+            source_last_modified_by: facts.last_modified_by,
+            source_created_at: facts.created_at,
+            source_size_bytes: facts.size_bytes,
+        }
+    }
+
+    /// What Graph currently says about this item, without a body — the refresh path's source (#708).
+    ///
+    /// Parent-folder parity with Drive: Graph's `parentReference` carries the folder id AND its name
+    /// inline (Drive resolves the name in a separate fetch), so both ride along free and a refresh
+    /// never needs a network call. A file at the drive root simply stays untagged, exactly as before.
+    pub fn source_facts(&self) -> index_only::SourceFacts {
+        index_only::SourceFacts {
+            author: self.created_by.clone(),
+            last_modified_by: self.last_modified_by.clone(),
+            created_at: self.created_time.clone(),
+            // Already parsed and already in `$select` — it was simply never carried anywhere.
+            size_bytes: self.size,
+            modified_at: self.modified_time.clone(),
+            parent_folder_id: self.parent_id.clone(),
+            parent_folder_name: self.parent_name.clone(),
         }
     }
 }
@@ -1209,5 +1229,40 @@ mod tests {
             FetchPlan::DownloadBinary
         );
         assert_eq!(fetch_plan(""), FetchPlan::Skip);
+    }
+
+    #[test]
+    fn the_item_projection_asks_for_the_parent_folder_it_parses() {
+        // `parse_item` has always read `parentReference` for the containing folder's id and name,
+        // but this projection never asked for it. The whole-drive delta path got it anyway (it sends
+        // no `$select` at all, so Graph returns its default projection), which is exactly why the
+        // gap stayed invisible: only FOLDER-SCOPED accounts, which reach items through `children`
+        // listings, recorded no folder at all.
+        for field in [
+            "parentReference",
+            "createdBy",
+            "lastModifiedBy",
+            "createdDateTime",
+            "lastModifiedDateTime",
+            "size",
+        ] {
+            assert!(
+                super::SELECT_ITEM.split(',').any(|f| f == field),
+                "$select must name {field}"
+            );
+        }
+        assert!(super::root_children_url().contains("$select="));
+        assert!(super::item_children_url("abc").contains("$select="));
+    }
+
+    #[test]
+    fn the_whole_drive_delta_deliberately_sends_no_select() {
+        // Graph's DEFAULT projection is what supplies the metadata on this path. Adding a `$select`
+        // here without every name above would silently blank the source facts on the busiest
+        // OneDrive route, so the absence is pinned rather than left to be "tidied up" later.
+        assert!(
+            !super::root_delta_url().contains("$select"),
+            "the delta URL relies on Graph's default projection"
+        );
     }
 }

@@ -1370,19 +1370,38 @@ impl DriveFile {
         body: String,
         folder_name: Option<String>,
     ) -> index_only::PointerInput {
+        let facts = self.source_facts(folder_name);
         index_only::PointerInput {
             source_id,
             title: self.name.clone(),
             external_ref: self.web_view_link.clone(),
-            source_modified_at: self.modified_time.clone(),
+            source_modified_at: facts.modified_at,
             source_content_hash: self.content_hash(),
             body,
-            source_parent_folder_id: self.parent_id.clone(),
-            source_parent_folder_name: folder_name,
-            source_author: self.owner_name.clone(),
-            source_last_modified_by: self.last_modified_by.clone(),
-            source_created_at: self.created_time.clone(),
-            source_size_bytes: self.size_bytes,
+            source_parent_folder_id: facts.parent_folder_id,
+            source_parent_folder_name: facts.parent_folder_name,
+            source_author: facts.author,
+            source_last_modified_by: facts.last_modified_by,
+            source_created_at: facts.created_at,
+            source_size_bytes: facts.size_bytes,
+        }
+    }
+
+    /// What Drive currently says about this file, without a body.
+    ///
+    /// The same values `pointer` carries, reachable on the path where nothing needs re-embedding —
+    /// which is the overwhelmingly common case on a settled library, and the one where these facts
+    /// used to go stale forever. `folder_name` is passed in because resolving it costs an API call
+    /// (Drive gives ids, not names) and the caller only pays for it when the file has actually moved.
+    pub fn source_facts(&self, folder_name: Option<String>) -> index_only::SourceFacts {
+        index_only::SourceFacts {
+            author: self.owner_name.clone(),
+            last_modified_by: self.last_modified_by.clone(),
+            created_at: self.created_time.clone(),
+            size_bytes: self.size_bytes,
+            modified_at: self.modified_time.clone(),
+            parent_folder_id: self.parent_id.clone(),
+            parent_folder_name: folder_name,
         }
     }
 }

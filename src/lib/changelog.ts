@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.117.2-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "What a document’s source says about it now stays true. PM asked Google Drive and OneDrive for the author, the last editor, the creation date and the size the first time it ever saw a file — and then never asked again. Rename the file, resize it, move it to another folder, hand it to a colleague to edit, and PM went on reporting whatever it had been told months earlier. Every sync now brings all of that up to date, including the folder a file has been moved into. It costs nothing when nothing has changed: a file that nobody has touched is recognised as unchanged and left alone, so the fifteen-minute check is no busier than it was.",
+      "Something PM has been told is never forgotten just because the source goes quiet. Drive genuinely stops reporting an owner once a file moves into a shared drive, and Google’s own documents have no file size at all — so PM keeps the last thing it was actually told rather than blanking the field. “Unknown” means nobody ever said, not that PM lost it.",
+      "OneDrive accounts set to sync particular folders now record which folder each file is in. PM has always read that from Microsoft’s reply, but for folder-scoped accounts it never asked for it — so those files showed no folder anywhere in PM, while accounts syncing the whole drive were fine. They fill in on the next sync.",
+      "Rebuilding no longer wipes those four facts off your cloud files. Rebuild works from your vault, and your vault has never carried them, so it was writing “nothing” over them on every pass — the same bug the file-size field had already been fixed for, which the newer fields hadn’t inherited.",
+      "PM also now records when it last had something new to write down about each document, which is the difference between “nobody has edited this since March” and “this connector stopped working in March”. It appears in the Documents table in the next update.",
+    ],
+  },
+  {
     version: "3.117.1-alpha",
     date: "2026-08-02",
     highlights: [

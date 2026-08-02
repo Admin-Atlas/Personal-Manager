@@ -1577,6 +1577,27 @@ async fn reconcile_present_file(
     // rebuild-from-manifest restore) must still be upgraded to the full body — so fall through to
     // hash + re-embed even on a stable mtime; the reducer turns the unchanged-hash Update into a
     // ReEmbed, and once it is full-body indexed the flag self-clears so later walks no-op again.
+    // Before the early return below, and for the same reason the cloud engines refresh before their
+    // `needs_body` gate: the item that needs no work is exactly the one whose recorded facts drift.
+    // A file moved between tracked folders, or renamed in place, changes not one byte of content —
+    // so the walk takes the unchanged-mtime path and the stored folder, size and created columns
+    // would never move again. Writes nothing when nothing differs (see `refresh_source_facts`), so a
+    // fifteen-minute poll over a settled folder still touches no pages.
+    if known.is_some() {
+        let facts = local_source_facts(file, current_iso.clone());
+        let app2 = app.clone();
+        let source_id = file.source_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let state = app2.state::<AppState>();
+            let conn = state.conn()?;
+            let now = ingest::iso_now(&conn)?;
+            index_only::refresh_source_facts(&conn, &source_id, &facts, &now)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("local facts refresh task panicked: {e}")))??;
+    }
+
     let summary_only = known.is_some_and(|k| k.summary_indexed);
     if !plan.content_maybe_changed && !summary_only {
         return Ok(PresentOutcome::NoChange);
@@ -1689,28 +1710,52 @@ async fn build_local_pointer(
     } else {
         title
     };
-    let parent = file.abs_path.parent();
-    let (created_at, size_bytes) = file_times_and_size(&file.abs_path);
+    // One definition of what a local file's facts ARE, shared with the refresh path so first sight
+    // and every later sighting cannot disagree. A filesystem knows no author (#701) — there is no
+    // per-file ownership PM could read that would mean what "author" means on Drive or OneDrive, and
+    // the machine's own user account is not the answer — so both name fields stay `None`, which the
+    // UI renders as "Unknown" rather than guessing that it was you.
+    let facts = local_source_facts(file, modified_at);
     Ok(Some(index_only::PointerInput {
         source_id: file.source_id.clone(),
         title,
         external_ref: Some(file.abs_path.to_string_lossy().to_string()),
-        source_modified_at: modified_at,
+        source_modified_at: facts.modified_at,
         source_content_hash: Some(hash.to_string()),
         body: markdown,
-        source_parent_folder_id: parent.map(|p| p.to_string_lossy().to_string()),
-        source_parent_folder_name: parent
+        source_parent_folder_id: facts.parent_folder_id,
+        source_parent_folder_name: facts.parent_folder_name,
+        source_author: facts.author,
+        source_last_modified_by: facts.last_modified_by,
+        source_created_at: facts.created_at,
+        source_size_bytes: facts.size_bytes,
+    }))
+}
+
+/// What the filesystem says about a local file right now, for the freshness refresh (#708).
+///
+/// The local counterpart of the cloud drivers' `refresh_facts`, and reachable on the path where
+/// nothing needs re-reading: a file that is moved between tracked folders, or renamed, changes none
+/// of its content, so the reconcile takes its unchanged-mtime early return and the stored folder
+/// columns would otherwise never move again.
+///
+/// Author and last-editor stay `None` here on purpose — a filesystem knows neither, and reading what
+/// the FILE itself says is a separate step with its own cost (#709).
+fn local_source_facts(file: &LocalFile, modified_at: Option<String>) -> index_only::SourceFacts {
+    let parent = file.abs_path.parent();
+    let (created_at, _) = file_times_and_size(&file.abs_path);
+    index_only::SourceFacts {
+        author: None,
+        last_modified_by: None,
+        created_at,
+        // Already stat'ed by the walk, so this costs nothing beyond the conversion.
+        size_bytes: i64::try_from(file.size).ok(),
+        modified_at,
+        parent_folder_id: parent.map(|p| p.to_string_lossy().to_string()),
+        parent_folder_name: parent
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string()),
-        // A filesystem knows no author (#701) — there is no per-file ownership PM could read that
-        // would mean what "author" means on Drive or OneDrive, and the machine's own user account is
-        // not the answer. Both name fields stay `None`, which the UI renders as "Unknown" rather than
-        // guessing that it was you.
-        source_author: None,
-        source_last_modified_by: None,
-        source_created_at: created_at,
-        source_size_bytes: size_bytes,
-    }))
+    }
 }
 
 /// A local file's creation time (ISO-8601 UTC) and size in bytes, best-effort.
