@@ -1464,6 +1464,31 @@ const MIGRATIONS: &[&str] = &[
       PRIMARY KEY (a_document_id, b_document_id)
     );
     "#,
+    // v52: what the SOURCE knows about a document — author, last editor, creation time, size (#701).
+    //
+    // Four columns rather than reusing the two that look close enough. `created_at` is PM's own
+    // ingest-side field (index-only registration sets it to `source_modified_at`, so it is not a
+    // creation time at all), and `byte_size` is measured from the file PM ingested — for an
+    // index-only pointer there is no such file. Overloading either would make the existing readers
+    // mean two things depending on `source_type`, which is exactly the sort of ambiguity the
+    // duplicate panel was asked to resolve, not add to.
+    //
+    // All four are NULLABLE with no default, and NULL is meaningful: **the provider did not say**.
+    // The UI renders that as "Unknown" rather than blank or "you" — a decision made up front,
+    // because a document's author reading as the person looking at it is worse than no answer. Only
+    // Drive, OneDrive and the local folder can populate any of them; vault documents, chats, photos
+    // and spreadsheets have no provider to ask, and stay NULL by design.
+    //
+    // `source_size_bytes` is INTEGER: Drive returns `size` as a decimal STRING (it can exceed 2^53,
+    // so the API never sends it as a JSON number) and Graph as a number; both are parsed into i64 at
+    // the connector, so the column has one type. A Google-native file (Doc/Sheet/Slide) has no
+    // `size` at all — those stay NULL, which is honest: they occupy no Drive quota bytes.
+    r#"
+    ALTER TABLE documents ADD COLUMN source_author           TEXT;
+    ALTER TABLE documents ADD COLUMN source_last_modified_by TEXT;
+    ALTER TABLE documents ADD COLUMN source_created_at       TEXT;
+    ALTER TABLE documents ADD COLUMN source_size_bytes       INTEGER;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1519,7 +1544,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 51,
+            version, 52,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1546,7 +1571,7 @@ mod tests {
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
-             documents.reviewed index for the review queue is v50;              duplicate-pair dismissals is v51)"
+             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -2328,6 +2353,51 @@ mod tests {
 
     /// v25 adds the rolling-summary store: `chat_sessions.summary` lands nullable (a session born before
     /// card C has no summary, and assembles the same as before) and round-trips text once card C writes one.
+    #[test]
+    fn source_metadata_columns_land_nullable_and_hold_a_big_size() {
+        // v52 (#701). NULL is the meaningful default — "the provider did not say", which the UI
+        // renders as "Unknown" — so a row inserted without them must come back NULL rather than
+        // taking some empty-string default that would render as a blank cell.
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('v/a.md','A','h1')",
+            [],
+        )
+        .unwrap();
+        let row: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT source_author, source_last_modified_by, source_created_at, \
+                 source_size_bytes FROM documents WHERE content_hash = 'h1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, None, None), "all four default NULL");
+
+        // INTEGER, not TEXT: Drive sends `size` as a decimal string precisely because a file can
+        // exceed 2^53 bytes, and the connector parses it to i64 so the column has one type. A value
+        // past that boundary has to survive the round trip intact.
+        let big: i64 = 9_007_199_254_740_995; // 2^53 + 3
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_author, \
+                 source_size_bytes) VALUES ('v/b.md','B','h2','Jane Okafor',?1)",
+            rusqlite::params![big],
+        )
+        .unwrap();
+        let (author, size): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT source_author, source_size_bytes FROM documents WHERE content_hash = 'h2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(author.as_deref(), Some("Jane Okafor"));
+        assert_eq!(size, Some(big), "a size past 2^53 round-trips exactly");
+    }
+
     #[test]
     fn chat_summary_column_lands_nullable() {
         const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";

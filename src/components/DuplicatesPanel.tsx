@@ -16,7 +16,7 @@
 //   * a scan that could not run its full method says so, rather than reporting a clean result it
 //     did not earn.
 
-import { useCallback, useState } from "react";
+import { Fragment, useCallback, useState } from "react";
 
 import {
   deleteDocument,
@@ -26,6 +26,7 @@ import {
 } from "../lib/ipc";
 import { formatDateTime } from "../lib/format";
 import { provenanceParts } from "../lib/sourceLabel";
+import { sourceFacts } from "../lib/sourceFacts";
 import { useReader } from "../lib/reader";
 import type { DuplicatePair, DuplicateReport, Document } from "../lib/types";
 import { Button, ConfirmDialog } from "./ui";
@@ -108,6 +109,20 @@ function SideCard({
             — exactly what a cross-account duplicate is — render identically under a date. */}
         {doc.project} · added {formatDateTime(doc.ingested_at)}
       </p>
+      {/* What the SOURCE knows (#701) — the thing that actually tells two copies apart when
+          everything PM measured about them is identical. A definition list rather than a run-on
+          sentence, because the two cards sit side by side and the labels have to line up; all four
+          rows always render, so an unknown on one side never shifts the other out of step. */}
+      <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs">
+        {sourceFacts(doc).map((fact) => (
+          <Fragment key={fact.key}>
+            <dt className="text-ink4">{fact.label}</dt>
+            <dd className={`break-words ${fact.known ? "text-ink2" : "text-ink4"}`}>
+              {fact.value}
+            </dd>
+          </Fragment>
+        ))}
+      </dl>
       <div className="mt-2 flex gap-2">
         <Button variant="tertiary" onClick={onOpen}>
           Open

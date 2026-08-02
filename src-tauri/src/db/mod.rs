@@ -1031,6 +1031,10 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_parent_folder_id; \
              ALTER TABLE documents DROP COLUMN source_parent_folder_name; \
              ALTER TABLE documents DROP COLUMN source_account; \
+             ALTER TABLE documents DROP COLUMN source_author; \
+             ALTER TABLE documents DROP COLUMN source_last_modified_by; \
+             ALTER TABLE documents DROP COLUMN source_created_at; \
+             ALTER TABLE documents DROP COLUMN source_size_bytes; \
              DROP INDEX IF EXISTS idx_documents_entity; \
              DROP TABLE entity_aliases; \
              DROP TABLE entities; \
@@ -1211,6 +1215,10 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_parent_folder_id; \
              ALTER TABLE documents DROP COLUMN source_parent_folder_name; \
              ALTER TABLE documents DROP COLUMN source_account; \
+             ALTER TABLE documents DROP COLUMN source_author; \
+             ALTER TABLE documents DROP COLUMN source_last_modified_by; \
+             ALTER TABLE documents DROP COLUMN source_created_at; \
+             ALTER TABLE documents DROP COLUMN source_size_bytes; \
              ALTER TABLE entities DROP COLUMN confidence; \
              ALTER TABLE entities DROP COLUMN user_confirmed; \
              ALTER TABLE usage_log DROP COLUMN cost_usd; \

@@ -1690,6 +1690,7 @@ async fn build_local_pointer(
         title
     };
     let parent = file.abs_path.parent();
+    let (created_at, size_bytes) = file_times_and_size(&file.abs_path);
     Ok(Some(index_only::PointerInput {
         source_id: file.source_id.clone(),
         title,
@@ -1701,7 +1702,32 @@ async fn build_local_pointer(
         source_parent_folder_name: parent
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string()),
+        // A filesystem knows no author (#701) — there is no per-file ownership PM could read that
+        // would mean what "author" means on Drive or OneDrive, and the machine's own user account is
+        // not the answer. Both name fields stay `None`, which the UI renders as "Unknown" rather than
+        // guessing that it was you.
+        source_author: None,
+        source_last_modified_by: None,
+        source_created_at: created_at,
+        source_size_bytes: size_bytes,
     }))
+}
+
+/// A local file's creation time (ISO-8601 UTC) and size in bytes, best-effort.
+///
+/// `created()` is genuinely unavailable on some platform/filesystem pairs — it is `Unsupported` on
+/// Linux kernels or filesystems without `statx` birth-time support — so a `None` here is the ordinary
+/// case, not a failure, and reads as "Unknown" like any other source that will not say. Size is
+/// always available once the file has been read.
+fn file_times_and_size(path: &Path) -> (Option<String>, Option<i64>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (None, None);
+    };
+    let created = meta
+        .created()
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+    (created, i64::try_from(meta.len()).ok())
 }
 
 /// [`connector_sync::apply_connector_actions`] on a blocking thread, awaited — so the async driver

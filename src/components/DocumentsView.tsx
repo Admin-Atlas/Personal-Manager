@@ -40,6 +40,18 @@ import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
 import { useDepth, useTheme } from "../theme";
+import {
+  DOC_COLUMN_KEYS,
+  DOC_COLUMN_LABELS,
+  DOC_COLUMN_WIDTHS,
+  defaultColumns,
+  isSourceFactColumn,
+  readColumns,
+  toggleColumn,
+  writeColumns,
+  type DocColumnKey,
+} from "../lib/documentColumns";
+import { sourceFactKnown, sourceFactValue } from "../lib/sourceFacts";
 import { Button, Card, Collapsible, ConfirmDialog, IconButton } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
@@ -75,6 +87,9 @@ interface Summary {
 // shows on Power), so a header only sorts when it's rendered. `null` = the backend's default order
 // (newest first). Importance is ranked high > medium > low > none > archive rather than alphabetically.
 type SortKey = "title" | "project" | "importance" | "chunks" | "ingested";
+// The source-fact columns are display-only: they are shown to tell two copies of a file apart, not
+// to order the library by, and sorting on a column whose value is "Unknown" for most rows would put
+// a wall of Unknowns at one end of the table. Their headers render as plain labels, not buttons.
 interface DocSort {
   key: SortKey;
   dir: "asc" | "desc";
@@ -148,6 +163,17 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
   const [devTitle, setDevTitle] = useState("");
   const [devBody, setDevBody] = useState("");
   const { showPower } = useDepth();
+  // Which columns the table shows (#701). `null` = the user has never chosen, so the table follows
+  // Depth — which is what keeps switching Depth working for anyone who never opens the picker, and
+  // what Reset restores by clearing the stored value rather than writing today's Depth set out.
+  const [columnChoice, setColumnChoice] = useState<DocColumnKey[] | null>(readColumns);
+  const [columnsOpen, setColumnsOpen] = useState(false);
+  const columns = columnChoice ?? defaultColumns(showPower);
+  const shows = (key: DocColumnKey) => columns.includes(key);
+  const setColumns = (next: DocColumnKey[] | null) => {
+    setColumnChoice(next);
+    writeColumns(next);
+  };
   // Inline reclassify (issue #333) rides the same "show manual triage" switch as the Review/Teach
   // tabs: when the user trusts the AI's filing and hides those, the per-row Edit affordance hides
   // too (the table stays read-only).
@@ -1048,6 +1074,51 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
           )}
 
           <div className="mt-6">
+            {/* The column picker (#701). It sits beside the table it changes, not in Settings —
+                "one control, one home". Depth still seeds the set; this takes over from there, and
+                Reset hands it back rather than freezing today's Depth into an explicit choice. */}
+            {documents.length > 0 && (
+              <div className="relative mb-2 flex justify-end">
+                <Button
+                  variant="tertiary"
+                  size="sm"
+                  onClick={() => setColumnsOpen((v) => !v)}
+                  aria-expanded={columnsOpen}
+                  title="Choose which columns this table shows"
+                >
+                  Columns
+                </Button>
+                {columnsOpen && (
+                  <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-[var(--radius-sm)] border border-border bg-panel p-2 shadow-lg">
+                    <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
+                    {DOC_COLUMN_KEYS.map((key) => (
+                      <label
+                        key={key}
+                        className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={shows(key)}
+                          onChange={() => setColumns(toggleColumn(columns, key))}
+                        />
+                        {DOC_COLUMN_LABELS[key]}
+                      </label>
+                    ))}
+                    <div className="mt-1 border-t border-rule pt-1">
+                      <Button
+                        variant="tertiary"
+                        size="sm"
+                        onClick={() => setColumns(null)}
+                        disabled={columnChoice == null}
+                        title="Go back to following your display depth"
+                      >
+                        Reset to depth
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             {documents.length === 0 ? (
               <p className="text-sm text-ink4">No documents yet.</p>
             ) : (
@@ -1058,36 +1129,55 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                 <thead className="font-mono text-xs uppercase tracking-wide text-ink3">
                   <tr className="border-b border-border">
                     <SortHeader label="Title" sortKey="title" sort={sort} onSort={toggleSort} />
-                    <SortHeader
-                      label="Project"
-                      sortKey="project"
-                      sort={sort}
-                      onSort={toggleSort}
-                      widthClass="w-40"
-                    />
-                    <SortHeader
-                      label="Importance"
-                      sortKey="importance"
-                      sort={sort}
-                      onSort={toggleSort}
-                      widthClass="w-28"
-                    />
-                    <SortHeader
-                      label="Chunks"
-                      sortKey="chunks"
-                      sort={sort}
-                      onSort={toggleSort}
-                      align="right"
-                      widthClass="w-20"
-                    />
-                    {showPower && (
+                    {shows("project") && (
+                      <SortHeader
+                        label="Project"
+                        sortKey="project"
+                        sort={sort}
+                        onSort={toggleSort}
+                        widthClass={DOC_COLUMN_WIDTHS.project}
+                      />
+                    )}
+                    {shows("importance") && (
+                      <SortHeader
+                        label="Importance"
+                        sortKey="importance"
+                        sort={sort}
+                        onSort={toggleSort}
+                        widthClass={DOC_COLUMN_WIDTHS.importance}
+                      />
+                    )}
+                    {shows("chunks") && (
+                      <SortHeader
+                        label="Chunks"
+                        sortKey="chunks"
+                        sort={sort}
+                        onSort={toggleSort}
+                        align="right"
+                        widthClass={DOC_COLUMN_WIDTHS.chunks}
+                      />
+                    )}
+                    {/* Plain headers, not sort buttons — see the SortKey note above. */}
+                    {DOC_COLUMN_KEYS.filter(isSourceFactColumn)
+                      .filter(shows)
+                      .map((key) => (
+                        <th
+                          key={key}
+                          className={`py-2 font-medium ${DOC_COLUMN_WIDTHS[key]} ${
+                            key === "size" ? "text-right" : ""
+                          }`}
+                        >
+                          {DOC_COLUMN_LABELS[key]}
+                        </th>
+                      ))}
+                    {shows("ingested") && (
                       <SortHeader
                         label="Ingested"
                         sortKey="ingested"
                         sort={sort}
                         onSort={toggleSort}
                         align="right"
-                        widthClass="w-32"
+                        widthClass={DOC_COLUMN_WIDTHS.ingested}
                       />
                     )}
                   </tr>
@@ -1180,37 +1270,58 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                             )
                           )}
                         </td>
-                        <td className="py-2 pr-3 text-ink3">
-                          <span className="inline-flex items-center gap-1.5">
-                            {!doc.reviewed && (
-                              <span
-                                className="inline-block h-1.5 w-1.5 rounded-full"
-                                style={{ background: "var(--st-due)" }}
-                                title="Awaiting review"
-                              />
+                        {shows("project") && (
+                          <td className="py-2 pr-3 text-ink3">
+                            <span className="inline-flex items-center gap-1.5">
+                              {!doc.reviewed && (
+                                <span
+                                  className="inline-block h-1.5 w-1.5 rounded-full"
+                                  style={{ background: "var(--st-due)" }}
+                                  title="Awaiting review"
+                                />
+                              )}
+                              <ProjectSummary doc={doc} />
+                            </span>
+                          </td>
+                        )}
+                        {shows("importance") && (
+                          <td className="py-2 pr-3 capitalize text-ink3">
+                            {doc.importance ?? "—"}
+                          </td>
+                        )}
+                        {shows("chunks") && (
+                          <td className="py-2 pr-3 text-right text-ink3">
+                            {devMode ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void toggleChunks(doc.id);
+                                }}
+                                className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
+                                title="Inspect this document's chunk breakdown"
+                              >
+                                {doc.chunk_count}
+                              </button>
+                            ) : (
+                              doc.chunk_count
                             )}
-                            <ProjectSummary doc={doc} />
-                          </span>
-                        </td>
-                        <td className="py-2 pr-3 capitalize text-ink3">{doc.importance ?? "—"}</td>
-                        <td className="py-2 pr-3 text-right text-ink3">
-                          {devMode ? (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void toggleChunks(doc.id);
-                              }}
-                              className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
-                              title="Inspect this document's chunk breakdown"
+                          </td>
+                        )}
+                        {DOC_COLUMN_KEYS.filter(isSourceFactColumn)
+                          .filter(shows)
+                          .map((key) => (
+                            <td
+                              key={key}
+                              className={`truncate py-2 pr-3 ${
+                                key === "size" ? "text-right" : ""
+                              } ${sourceFactKnown(doc, key) ? "text-ink3" : "text-ink4"}`}
+                              title={sourceFactValue(doc, key)}
                             >
-                              {doc.chunk_count}
-                            </button>
-                          ) : (
-                            doc.chunk_count
-                          )}
-                        </td>
-                        {showPower && (
+                              {sourceFactValue(doc, key)}
+                            </td>
+                          ))}
+                        {shows("ingested") && (
                           <td className="py-2 text-right text-ink4">
                             {formatDate(doc.ingested_at)}
                           </td>
@@ -1219,7 +1330,7 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                       {/* Dev-mode chunk breakdown, expanded directly under its document (read-only). */}
                       {devMode && chunksFor === doc.id && (
                         <tr>
-                          <td colSpan={showPower ? 5 : 4} className="pb-3">
+                          <td colSpan={columns.length + 1} className="pb-3">
                             <div className="rounded-[var(--radius-sm)] border border-border bg-surface p-3">
                               <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
                                 chunks · doc_id {doc.id}
@@ -1239,7 +1350,7 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
                           per-field optimistic saves). Tags stay out of this surface. */}
                       {teachVisible && editingId === doc.id && (
                         <tr>
-                          <td colSpan={showPower ? 5 : 4} className="pb-3">
+                          <td colSpan={columns.length + 1} className="pb-3">
                             <div className="flex flex-col gap-2 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
                               <div
                                 className="flex items-start gap-2 text-xs text-ink3"

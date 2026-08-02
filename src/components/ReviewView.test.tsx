@@ -89,6 +89,10 @@ function doc(id: number, over: Partial<Document> = {}): Document {
     source_id: null,
     source_parent_folder_id: null,
     source_parent_folder_name: null,
+    source_author: null,
+    source_last_modified_by: null,
+    source_created_at: null,
+    source_size_bytes: null,
     ...over,
   };
 }

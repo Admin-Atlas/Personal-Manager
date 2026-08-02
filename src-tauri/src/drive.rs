@@ -70,9 +70,17 @@ const MAX_PAGES: usize = 1000;
 /// between #481 and this fix: `sharedWithMe` (v3 exposes the timestamp `sharedWithMeTime` instead —
 /// the bare boolean survives only as a `q` search term, which is why `files_url`'s query still uses
 /// it) and `capabilities.canExport` (not a v3 capability at all; `canDownload` is).
+///
+/// The last four (`owners`, `lastModifyingUser`, `createdTime`, `size`) were added for #701 and are
+/// all documented v3 `File` fields: `owners` and `lastModifyingUser` are `User` resources sub-selected
+/// in the same style as `capabilities(...)` above — and in the same style `SWM_ROOT_EXTRA_FIELDS`
+/// already used for `owners`, which is where that spelling is proven against live traffic;
+/// `createdTime` and `size` are top-level scalars. **`size` arrives as a decimal STRING**, not a
+/// number, because a file can exceed 2^53 bytes.
 const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink,parents,\
 sharedWithMeTime,ownedByMe,shortcutDetails(targetId,targetMimeType,targetResourceKey),\
-capabilities(canDownload),resourceKey";
+capabilities(canDownload),resourceKey,owners(displayName,emailAddress),\
+lastModifyingUser(displayName,emailAddress),createdTime,size";
 /// Drive's folder MIME type (folders are containers we walk, never files we index).
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Drive's shortcut MIME type. Shared items often arrive as shortcuts; a shared-with-me shortcut is
@@ -1313,6 +1321,19 @@ pub struct DriveFile {
     /// The `resourceKey` some link-shared items need in the `X-Goog-Drive-Resource-Keys` header to be
     /// read; persisted with the pointer so an on-demand body fetch can replay it. `None` otherwise.
     pub resource_key: Option<String>,
+    /// The first owner's display name (`owners[0].displayName`) — the document's author (#701). Drive
+    /// omits `owners` entirely for an item living in a shared drive, where the drive owns the file
+    /// rather than a person; that reads `None` and surfaces as "Unknown", which is the honest answer.
+    pub owner_name: Option<String>,
+    /// `lastModifyingUser.displayName` — who last edited it. `None` when Drive does not say (an item
+    /// never edited since creation, or one whose editor is not visible to this account).
+    pub last_modified_by: Option<String>,
+    /// v3 `createdTime` (RFC-3339) — the source's own creation time, distinct from PM's ingest time.
+    pub created_time: Option<String>,
+    /// v3 `size` in bytes. Drive sends it as a decimal STRING (a file can exceed 2^53 bytes), parsed
+    /// to `i64` here so the column has one type. `None` for a folder and for a Google-native
+    /// Doc/Sheet/Slide, neither of which has a byte size at all.
+    pub size_bytes: Option<i64>,
 }
 
 /// Lets a folder-scoped enumeration reconcile through the shared [`index_only::reconcile_enumeration`]
@@ -1358,6 +1379,10 @@ impl DriveFile {
             body,
             source_parent_folder_id: self.parent_id.clone(),
             source_parent_folder_name: folder_name,
+            source_author: self.owner_name.clone(),
+            source_last_modified_by: self.last_modified_by.clone(),
+            source_created_at: self.created_time.clone(),
+            source_size_bytes: self.size_bytes,
         }
     }
 }
@@ -1516,6 +1541,33 @@ fn parse_file(v: &Value) -> Option<DriveFile> {
             .get("capabilities")
             .and_then(|c| c.get("canDownload"))
             .and_then(Value::as_bool),
+        owner_name: v
+            .get("owners")
+            .and_then(Value::as_array)
+            .and_then(|o| o.first())
+            .and_then(|u| u.get("displayName"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        last_modified_by: v
+            .get("lastModifyingUser")
+            .and_then(|u| u.get("displayName"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        created_time: v
+            .get("createdTime")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(String::from),
+        // A STRING in the v3 wire format, so `as_str().parse()` — `as_i64()` returns None here and
+        // would have silently reported every file as sizeless. `as_i64()` is kept as a fallback in
+        // case a future response sends a number.
+        size_bytes: v.get("size").and_then(|s| {
+            s.as_str()
+                .and_then(|t| t.parse::<i64>().ok())
+                .or_else(|| s.as_i64())
+        }),
         resource_key: v
             .get("resourceKey")
             .and_then(Value::as_str)
@@ -2046,8 +2098,11 @@ fn swm_files_url(q: &str, page: Option<&str>) -> Result<String> {
 /// `sharingUser` is the account that shared the item with you; `owners` is the fallback, since Drive
 /// documents `sharingUser` as present only "if applicable" and omits `owners` for items living in a
 /// shared drive. Both are real v3 `File` fields, sub-selected in the same style as the baseline.
-const SWM_ROOT_EXTRA_FIELDS: &str =
-    "sharingUser(displayName,emailAddress),owners(displayName,emailAddress)";
+/// `owners` used to be named here too; it moved into [`FILE_FIELDS`] with #701 (the author column
+/// needs it everywhere, not only on the picker), so this constant is down to the one field that is
+/// genuinely root-only. Repeating a name in both halves of the mask would be a duplicate field in the
+/// projection — harmless, but the mask is the last place to leave something ambiguous.
+const SWM_ROOT_EXTRA_FIELDS: &str = "sharingUser(displayName,emailAddress)";
 
 fn swm_root_files_url(q: &str, page: Option<&str>) -> Result<String> {
     swm_url_with_fields(q, page, &format!("{FILE_FIELDS},{SWM_ROOT_EXTRA_FIELDS}"))
@@ -2724,6 +2779,10 @@ mod tests {
             shortcut_target_resource_key: None,
             can_download: None,
             resource_key: None,
+            owner_name: None,
+            last_modified_by: None,
+            created_time: None,
+            size_bytes: None,
         }
     }
 
@@ -2744,27 +2803,103 @@ mod tests {
         );
 
         // Sub-selected, never bare: `sharingUser` alone is valid but returns the whole User object,
-        // and the neighbouring names must not be misspelled singulars.
+        // and the name must not be a misspelled plural.
         assert!(SWM_ROOT_EXTRA_FIELDS.contains("sharingUser(displayName,emailAddress)"));
-        assert!(SWM_ROOT_EXTRA_FIELDS.contains("owners(displayName,emailAddress)"));
-        assert!(
-            !SWM_ROOT_EXTRA_FIELDS.contains("owner("),
-            "v3 has `owners`, not `owner`"
-        );
         assert!(
             !SWM_ROOT_EXTRA_FIELDS.contains("sharingUsers"),
             "v3 has `sharingUser`, singular"
         );
 
+        // `owners` moved INTO the baseline with #701 — the author column needs it on every path, not
+        // just the picker — so the root mask must no longer repeat it.
         assert!(
-            !FILE_FIELDS.contains("sharingUser") && !FILE_FIELDS.contains("owners"),
-            "the baseline mask is shared by every other Drive path — it must not be widened"
+            !SWM_ROOT_EXTRA_FIELDS.contains("owners"),
+            "owners lives in FILE_FIELDS now; repeating it duplicates the field in the projection"
+        );
+        assert!(
+            !FILE_FIELDS.contains("sharingUser"),
+            "sharingUser stays root-only — Drive reports it on the directly-shared root alone"
         );
         let descendants = swm_files_url("'x' in parents", None).unwrap();
         assert!(
             !descendants.contains("sharingUser"),
             "the descendant walk keeps the baseline mask; Drive reports no sharingUser there anyway"
         );
+    }
+
+    #[test]
+    fn the_baseline_mask_asks_for_what_the_source_knows_in_real_v3_spellings() {
+        // #701. The mask is FAIL-CLOSED — one unknown name 400s the WHOLE listing, not just that
+        // field, which is how #481 killed every Drive path until #538. This constant is shared by the
+        // My-Drive baseline, the changes feed, the folder picker, the shared-drive listing and the
+        // shared-with-me walk, so a mistake here breaks all of them at once. Pin each added name's
+        // exact v3 spelling, and pin the singular/plural traps that are the actual failure mode.
+        assert!(FILE_FIELDS.contains("owners(displayName,emailAddress)"));
+        assert!(FILE_FIELDS.contains("lastModifyingUser(displayName,emailAddress)"));
+        assert!(FILE_FIELDS.contains("createdTime"));
+        assert!(FILE_FIELDS.contains("size"));
+
+        assert!(
+            !FILE_FIELDS.contains("owner("),
+            "v3 has `owners`, plural — `owner` is not a field"
+        );
+        assert!(
+            !FILE_FIELDS.contains("lastModifyingUsers"),
+            "v3 has `lastModifyingUser`, singular"
+        );
+        assert!(
+            !FILE_FIELDS.contains("createdDate"),
+            "`createdDate` is the v2 spelling; v3 is `createdTime`"
+        );
+        assert!(
+            !FILE_FIELDS.contains("fileSize"),
+            "`fileSize` is the v2 spelling; v3 is `size`"
+        );
+        // And it really reaches every path that shares the constant, not just the one it was added for.
+        for url in [
+            files_url(None).unwrap(),
+            my_files_url("'x' in parents", None).unwrap(),
+            swm_files_url("'x' in parents", None).unwrap(),
+            shared_files_url("D1", "trashed = false", FILE_FIELDS, "", None).unwrap(),
+        ] {
+            assert!(url.contains("lastModifyingUser"), "missing from {url}");
+            assert!(url.contains("createdTime"), "missing from {url}");
+        }
+    }
+
+    #[test]
+    fn drive_metadata_parses_the_v3_shapes_and_says_nothing_when_drive_says_nothing() {
+        // `size` is the one that would fail silently: v3 sends it as a decimal STRING (a file can
+        // exceed 2^53 bytes), so `as_i64()` returns None and EVERY file would have reported as
+        // sizeless while looking perfectly healthy.
+        let full = serde_json::json!({
+            "id": "F1", "name": "A.pdf", "mimeType": "application/pdf",
+            "owners": [{"displayName": "Jane Okafor", "emailAddress": "jane@x.com"}],
+            "lastModifyingUser": {"displayName": "Sam Reyes"},
+            "createdTime": "2025-11-04T09:00:00.000Z",
+            "size": "2411724"
+        });
+        let f = parse_file(&full).unwrap();
+        assert_eq!(f.owner_name.as_deref(), Some("Jane Okafor"));
+        assert_eq!(f.last_modified_by.as_deref(), Some("Sam Reyes"));
+        assert_eq!(f.created_time.as_deref(), Some("2025-11-04T09:00:00.000Z"));
+        assert_eq!(f.size_bytes, Some(2_411_724));
+
+        // A number is accepted too, so a future response shape can't regress this to None.
+        let numeric = serde_json::json!({"id": "F2", "name": "B", "size": 42});
+        assert_eq!(parse_file(&numeric).unwrap().size_bytes, Some(42));
+
+        // A Google-native Doc has no `size` and a shared-drive item has no `owners`. Both must read
+        // None — "Unknown" — rather than an empty string, which would render as a blank cell.
+        let native = serde_json::json!({
+            "id": "F3", "name": "Notes", "mimeType": "application/vnd.google-apps.document",
+            "owners": [], "lastModifyingUser": {"displayName": ""}
+        });
+        let n = parse_file(&native).unwrap();
+        assert_eq!(n.size_bytes, None);
+        assert_eq!(n.owner_name, None);
+        assert_eq!(n.last_modified_by, None, "an empty name is not a name");
+        assert_eq!(n.created_time, None);
     }
 
     #[test]
@@ -3553,6 +3688,10 @@ mod tests {
             shortcut_target_resource_key: None,
             can_download: None,
             resource_key: None,
+            owner_name: None,
+            last_modified_by: None,
+            created_time: None,
+            size_bytes: None,
         }
     }
 

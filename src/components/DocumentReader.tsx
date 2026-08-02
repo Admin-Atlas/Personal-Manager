@@ -23,6 +23,7 @@ import {
 import { Markdown } from "../lib/markdown";
 import { parentGroupStarts, segmentByLeaves, shadeLeaves } from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
+import { sourceFacts } from "../lib/sourceFacts";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 
@@ -312,6 +313,19 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
               ))}
             <span>· {formatDate(doc.ingested_at)}</span>
           </div>
+          {/* What the SOURCE knows (#701), on the surface where there is room to read it properly.
+              A wrapping row of label/value pairs rather than a table: the header is already narrow
+              and resizable, and this must not push the document itself down the panel. All four
+              always render — an "Unknown" is information, and a field that vanished when empty
+              would make the reader look like it renders different things for different files. */}
+          <dl className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-xs">
+            {sourceFacts(doc).map((fact) => (
+              <div key={fact.key} className="flex items-baseline gap-1">
+                <dt className="text-ink4">{fact.label}</dt>
+                <dd className={fact.known ? "text-ink3" : "text-ink4"}>{fact.value}</dd>
+              </div>
+            ))}
+          </dl>
         </div>
         {canOverlay && (
           <button

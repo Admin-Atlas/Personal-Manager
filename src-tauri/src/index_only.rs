@@ -625,6 +625,14 @@ pub struct PointerInput {
     /// alongside the body but is never chunked or embedded. `None` for sources with no folder concept.
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// What the SOURCE says about the item (#701) — its author, who last edited it, when it was
+    /// created there, and how big it is. `None` means the provider did not say, which the UI renders
+    /// as "Unknown". Rides alongside the body exactly like the parent folder above: never chunked,
+    /// never embedded.
+    pub source_author: Option<String>,
+    pub source_last_modified_by: Option<String>,
+    pub source_created_at: Option<String>,
+    pub source_size_bytes: Option<i64>,
 }
 
 /// Length (chars) of the offline summary kept for an index-only item — short enough to stay a
@@ -760,6 +768,10 @@ pub fn register_pointer(
             stored_summary: Some(summarize(body)),
             source_parent_folder_id: input.source_parent_folder_id,
             source_parent_folder_name: input.source_parent_folder_name,
+            source_author: input.source_author,
+            source_last_modified_by: input.source_last_modified_by,
+            source_created_at: input.source_created_at,
+            source_size_bytes: input.source_size_bytes,
         },
     };
     // F-04: landing this item resolves its project with `create_if_new`, which MINTS a mirror entity
@@ -973,6 +985,14 @@ fn restore_item(
             // restore it — the folder tag re-populates on the next Drive refresh (no backfill here).
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            // Same for what the source knows (#701), and deliberately the same answer: the manifest
+            // is a PORTABLE format, so widening it is a compatibility surface of its own, and these
+            // four are refetched on the very next sync anyway. A restored row shows "Unknown" until
+            // then, which is honest — PM genuinely does not know yet.
+            source_author: None,
+            source_last_modified_by: None,
+            source_created_at: None,
+            source_size_bytes: None,
         },
     };
     embed_and_index(state, gateway, &summary, &meta)?;

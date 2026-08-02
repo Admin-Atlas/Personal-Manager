@@ -2413,6 +2413,10 @@ mod tests {
             shortcut_target_resource_key: None,
             can_download: None,
             resource_key: None,
+            owner_name: None,
+            last_modified_by: None,
+            created_time: None,
+            size_bytes: None,
         }
     }
 
@@ -2431,6 +2435,9 @@ mod tests {
             web_url: None,
             parent_id: None,
             parent_name: None,
+            created_by: None,
+            last_modified_by: None,
+            created_time: None,
         }
     }
 

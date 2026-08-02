@@ -617,9 +617,14 @@ pub async fn dev_apply_change_event(
                         source_modified_at: Some(now.clone()),
                         source_content_hash: Some(new_hash),
                         body,
-                        // Dev affordance (pasted body) — no source folder to tag with.
+                        // Dev affordance (pasted body) — no source folder to tag with, and no
+                        // provider to ask about author/created/size either.
                         source_parent_folder_id: None,
                         source_parent_folder_name: None,
+                        source_author: None,
+                        source_last_modified_by: None,
+                        source_created_at: None,
+                        source_size_bytes: None,
                     }),
                 )
             }
@@ -641,9 +646,14 @@ pub async fn dev_apply_change_event(
                         source_modified_at: Some(now.clone()),
                         source_content_hash: Some(new_hash),
                         body,
-                        // Dev affordance (pasted body) — no source folder to tag with.
+                        // Dev affordance (pasted body) — no source folder to tag with, and no
+                        // provider to ask about author/created/size either.
                         source_parent_folder_id: None,
                         source_parent_folder_name: None,
+                        source_author: None,
+                        source_last_modified_by: None,
+                        source_created_at: None,
+                        source_size_bytes: None,
                     }),
                 )
             }

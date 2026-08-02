@@ -560,9 +560,13 @@ pub(super) async fn reindex_index_only_core(app: &AppHandle, doc_id: i64) -> Res
             source_content_hash,
             body: embedded,
             // Not used by the re-embed (it rewrites only the chunk map + summary + title); the DB's
-            // existing folder columns are left untouched.
+            // existing folder and source-metadata columns are left untouched.
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            source_author: None,
+            source_last_modified_by: None,
+            source_created_at: None,
+            source_size_bytes: None,
         };
         let gateway = {
             let conn = state.conn()?;
