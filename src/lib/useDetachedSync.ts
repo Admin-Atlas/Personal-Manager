@@ -23,6 +23,9 @@ export interface DetachedSyncSnapshot {
   /** Epoch ms the running pass began, for an elapsed timer that survives this view unmounting. */
   started_at_ms: number | null;
   last_report: SyncReport | null;
+  /** Whether a Stop has already been requested for the running pass. The backend derives it from the
+   *  cancel flag, so it is the one owner of that fact — this view only reflects it. */
+  stopping: boolean;
 }
 
 export interface DetachedSyncOptions<S extends DetachedSyncSnapshot> {
@@ -157,6 +160,11 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
           // leaving Settings mid-sync and coming back no longer restarts the timer at 0:00.
           setStartedAt(s.started_at_ms);
           setTarget(optsRef.current.targetOf(s));
+          // …and the same for the Stop already pressed (#699). This was the one piece of the run's
+          // state the remount did NOT restore, so a tab switch mid-stop brought back a frozen bar
+          // beside a button that read "Stop indexing" again — the bar restored from the backend, the
+          // button from local state that had just been thrown away.
+          setStopping(s.stopping);
         } else if (s.last_report) {
           setReport(s.last_report);
         }

@@ -30,6 +30,7 @@ const idle = (over: Partial<DriveSyncState> = {}): DriveSyncState => ({
   started_at_ms: null,
   account: null,
   last_report: null,
+  stopping: false,
   ...over,
 });
 
@@ -237,6 +238,32 @@ describe("useDetachedSync", () => {
     await act(() => result.current.requestStop());
     expect(result.current.stopping).toBe(true);
     expect(opts.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores a Stop already pressed when the view remounts mid-stop", async () => {
+    // #699: `stopping` was the one piece of the run's state the remount did NOT restore. Leaving the
+    // Connectors tab after pressing Stop and coming back showed a frozen bar next to a button that
+    // read "Stop indexing" again — the bar restored from the backend, the button from local state
+    // that had just been unmounted. The backend derives this from the cancel flag, so it is the owner.
+    const { opts } = makeOpts({
+      fetchStatus: vi.fn(async () =>
+        idle({ running: true, processed: 5, total: 10, stopping: true }),
+      ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.syncing).toBe(true));
+    expect(result.current.stopping).toBe(true);
+  });
+
+  it("does not claim a run is stopping when the backend says it is not", async () => {
+    // The false-positive side: a bar restored mid-run must not show "Stopping…" for a Stop nobody
+    // pressed, which would disable the only control that can end the run.
+    const { opts } = makeOpts({
+      fetchStatus: vi.fn(async () => idle({ running: true, processed: 5, total: 10 })),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.syncing).toBe(true));
+    expect(result.current.stopping).toBe(false);
   });
 
   it("unsubscribes on unmount", async () => {

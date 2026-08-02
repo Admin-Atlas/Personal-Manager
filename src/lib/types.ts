@@ -969,6 +969,10 @@ export interface DriveSyncState {
   /** The account (email) being synced, or null for an all-accounts pass. */
   account: string | null;
   last_report: SyncReport | null;
+  /** True when a Stop has already been requested for the running pass. Derived by the backend from
+   *  the connector's cancel flag, so the run's stop state has exactly ONE owner and a view mounting
+   *  mid-stop reflects it rather than starting again from "not stopping" (#699). */
+  stopping: boolean;
 }
 
 // --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
@@ -1186,6 +1190,10 @@ export interface OneDriveSyncState {
   started_at_ms: number | null;
   account: string | null;
   last_report: SyncReport | null;
+  /** True when a Stop has already been requested for the running pass. Derived by the backend from
+   *  the connector's cancel flag, so the run's stop state has exactly ONE owner and a view mounting
+   *  mid-stop reflects it rather than starting again from "not stopping" (#699). */
+  stopping: boolean;
 }
 
 // --- Local folders (index-only connector, board card 6) ---
@@ -1230,6 +1238,10 @@ export interface LocalFolderSyncState {
   /** The folder key being synced, or null for an all-folders pass. */
   folder: string | null;
   last_report: SyncReport | null;
+  /** True when a Stop has already been requested for the running pass. Derived by the backend from
+   *  the connector's cancel flag, so the run's stop state has exactly ONE owner and a view mounting
+   *  mid-stop reflects it rather than starting again from "not stopping" (#699). */
+  stopping: boolean;
 }
 
 /** One document's 2-D position on the semantic memory map (coords are in [0,1]²). */

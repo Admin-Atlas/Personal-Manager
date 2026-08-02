@@ -221,6 +221,16 @@ pub struct CloudSyncState {
     /// The most recent finished sync's report (counts + the not-indexed list), so a user returning to
     /// Settings after a sync has completed still sees the result. Cleared when a new sync starts.
     pub last_report: Option<cloud_sync::CloudSyncReport>,
+    /// Whether a Stop has been requested for the pass that is running. **Derived at snapshot time from
+    /// the connector's cancel flag, never stored here** — the flag is the one owner of that fact, so the
+    /// two cannot drift.
+    ///
+    /// It has to reach the UI because "Stopping…" used to be local React state: the Connectors tab
+    /// unmounts on a tab switch, so pressing Stop and stepping away came back to a frozen bar beside a
+    /// button that once again read "Stop indexing", with the two surfaces disagreeing about one run
+    /// (#699). Same rule as the Documents "Done — N ingested" line (#693): the run's state has exactly
+    /// one owner and the view re-reads it on mount.
+    pub stopping: bool,
 }
 
 /// A snapshot of the local-folder sync that's currently running (if any) — the filesystem sibling of
@@ -240,6 +250,9 @@ pub struct LocalFolderSyncState {
     pub queue: connector_sync::SyncQueue,
     /// The most recent finished sync's report, so a user returning after a sync still sees the result.
     pub last_report: Option<localfolder::LocalSyncReport>,
+    /// Whether a Stop has been requested for the running pass — derived at snapshot time from
+    /// `local_sync_cancel`, never stored. See [`CloudSyncState::stopping`].
+    pub stopping: bool,
 }
 
 /// A snapshot of the index rebuild that's currently running (if any) — the ingest sibling of
