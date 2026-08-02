@@ -52,24 +52,29 @@ describe("Toggle", () => {
     expect(track().className).toContain("bg-accent");
   });
 
-  it("outlines the track in both states, so the control has an edge and not just a fill", () => {
-    // The fill alone was not enough: `--surface` is one step off `--panel`, which reads as a raised
-    // area behind text and not as the edge of a control, so an OFF switch looked like a lone knob on
-    // empty page. `--border2` is the ramp's strong edge and the only neutral `boost()` firms at
-    // `high` (+0.18 L light / +0.20 L dark) — an un-bordered track was identical at every Contrast
-    // level, which is why turning High contrast on did nothing for switches.
+  it("outlines the track in `--ink4` in BOTH states, the only token that clears 3:1 everywhere", () => {
+    // A switch is a UI component, so its boundary owes 3:1 (WCAG 1.4.11). The fill never gave one —
+    // `--surface` on `--panel` measures 1.03–1.16:1 — and neither did the two obvious outlines:
+    // `--border2` is 1.42–1.84:1 at the default Contrast (2.82–4.29:1 even at `high`), and an ON
+    // track outlined in `--accent` draws a line in the colour underneath it. Both shipped and both
+    // read as no outline at all. `--ink4` measures 4.77–6.76:1 against surface AND panel at every
+    // level; contrast.test.ts sweeps that across every System × Mode × Accent so this class cannot
+    // drift back onto a token that only looks like an edge.
+    //
+    // ONE class, outside the checked branch, is the point: the outline must not depend on the
+    // accent, because the accent is exactly what fails in light mode (down to 1.36:1).
     const trackOf = (el: HTMLElement) => el.querySelector("span") as HTMLElement;
     const off = render(<Toggle checked={false} onChange={() => {}} ariaLabel="Sync" />);
     const offTrack = trackOf(off.getByRole("switch", { name: "Sync" }));
-    expect(offTrack.className).toContain("shadow-[inset_0_0_0_1px_var(--border2)]");
+    expect(offTrack.className).toContain("shadow-[inset_0_0_0_1px_var(--ink4)]");
     cleanup();
     const on = render(<Toggle checked onChange={() => {}} ariaLabel="Sync" />);
     const onTrack = trackOf(on.getByRole("switch", { name: "Sync" }));
     // An inset SHADOW, not a border: a border would eat a pixel off the padding box that the
     // knob's `left`/`top` resolve against, shrinking its inset from 2px to 1px and landing the two
-    // states on different device-pixel boundaries at a fractional DPR. ON wears its own fill colour
-    // because its silhouette is already the fill.
-    expect(onTrack.className).toContain("shadow-[inset_0_0_0_1px_var(--accent)]");
+    // states on different device-pixel boundaries at a fractional DPR.
+    expect(onTrack.className).toContain("shadow-[inset_0_0_0_1px_var(--ink4)]");
+    expect(onTrack.className).not.toContain("var(--accent)]");
   });
 
   it("keeps its own disabled alpha — it is the switch's only inert cue", () => {

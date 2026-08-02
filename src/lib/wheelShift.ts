@@ -38,6 +38,28 @@ export function horizontalPixels(e: { deltaX: number; deltaMode: number }): numb
   return e.deltaX;
 }
 
+/**
+ * Whether a wheel event's pointer falls inside a day-stepping region's box.
+ *
+ * GEOMETRY, not DOM ancestry, and that distinction is the whole reason this exists. Deciding
+ * ownership with `el.contains(e.target)` needs the event to still be dispatched through a node that
+ * is inside `el` — and the calendar's day columns are keyed by date, so EVERY one of them is
+ * replaced the instant a step lands. A gesture that began over a column and continues after the
+ * step has its subsequent events targeted at a node that is no longer in the tree, and the swipe
+ * dies after exactly one day. A rectangle cannot be replaced out from under a gesture.
+ *
+ * A zero-extent box is never owned: an unmounted or display:none region reports 0×0 at 0,0, which
+ * would otherwise claim every wheel event in the top-left corner of the window.
+ */
+export function withinRect(
+  rect: { left: number; right: number; top: number; bottom: number },
+  x: number,
+  y: number,
+): boolean {
+  if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
+  return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+}
+
 export interface ShiftResult {
   /** Whole day steps to apply now (negative = earlier). */
   steps: number;

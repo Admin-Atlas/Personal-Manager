@@ -7,6 +7,7 @@ import {
   horizontalPixels,
   isHorizontalGesture,
   WHEEL_STEP_PX,
+  withinRect,
 } from "./wheelShift";
 
 const S = WHEEL_STEP_PX;
@@ -76,6 +77,33 @@ describe("horizontalPixels — the threshold is in pixels, so the delta must be 
     // Capped downstream at MAX_STEPS_PER_EVENT regardless; this just keeps the sign and magnitude
     // meaningful instead of treating "one page" as one pixel.
     expect(accumulateShift(0, horizontalPixels({ deltaX: -1, deltaMode: 2 })).steps).toBe(-3);
+  });
+});
+
+describe("withinRect — ownership survives the re-render the step itself causes", () => {
+  const grid = { left: 100, right: 500, top: 60, bottom: 400 };
+
+  it("owns a pointer inside the region", () => {
+    expect(withinRect(grid, 300, 200)).toBe(true);
+    expect(withinRect(grid, 100, 60)).toBe(true); // top-left corner is inside
+  });
+
+  it("disowns a pointer outside it, on either axis", () => {
+    expect(withinRect(grid, 99, 200)).toBe(false);
+    expect(withinRect(grid, 300, 401)).toBe(false);
+  });
+
+  it("treats the far edges as outside, so two side-by-side regions never both claim a pixel", () => {
+    expect(withinRect(grid, 500, 200)).toBe(false);
+    expect(withinRect(grid, 300, 400)).toBe(false);
+  });
+
+  it("never owns a zero-extent box — an unmounted region reports 0×0 at the origin", () => {
+    // Without this, a hidden or not-yet-laid-out grid would claim every wheel event in the
+    // top-left corner of the window.
+    const collapsed = { left: 0, right: 0, top: 0, bottom: 0 };
+    expect(withinRect(collapsed, 0, 0)).toBe(false);
+    expect(withinRect({ left: 10, right: 10, top: 0, bottom: 50 }, 10, 25)).toBe(false);
   });
 });
 

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.116.1-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "Switches now have a visible edge, at every theme and contrast setting. An off switch used to be a dot floating on what looked like empty page, and the outline added to fix that was drawn in a grey only 1.4–1.8 times lighter than the page behind it — measurably too faint to see, which is why it looked like nothing had changed. The outline is now drawn in a tone that is guaranteed to stand out against both the switch and the page in every system, mode, accent and contrast level PM offers, and the app's own contrast audit now checks it, so it can't quietly fade again.",
+      "Swiping sideways across the calendar keeps working past the first day. The gesture stepped the calendar once and then went dead: the day columns are rebuilt every time the view moves, and the swipe was listening on the very columns it had just replaced. It now follows your pointer rather than the columns, so a long swipe keeps moving — and it works the same from a trackpad, a tilt wheel or a side wheel.",
+    ],
+  },
+  {
     version: "3.116.0-alpha",
     date: "2026-08-01",
     highlights: [
