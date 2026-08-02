@@ -527,6 +527,96 @@ pub fn boot_meta_decision(
     }
 }
 
+/// Whether boot may open the store at the resolved location, decided by [`store_presence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorePresence {
+    /// `pm.sqlite` is on disk — open it exactly as before.
+    Present,
+    /// No store, and nothing on disk suggests this vault was ever used: a genuinely
+    /// fresh profile. `db::open` creates the file, as it always has.
+    FreshProfile,
+    /// No store, but this vault's settings and/or its Markdown are still here. Something
+    /// outside PM removed `pm.sqlite`. Boot must REPORT this and open nothing.
+    Missing,
+}
+
+/// Decide whether an absent `pm.sqlite` is a fresh profile or an erased library. Pure, so
+/// the safety rule is unit-tested without a live store (same shape as
+/// [`boot_meta_decision`]).
+///
+/// This exists because `rusqlite::Connection::open` **creates** a missing file and
+/// `migrations::run` then stamps the current schema onto it. Boot therefore had no way to
+/// tell "no store yet" from "store gone": an erased `pm.sqlite` came back as a fresh,
+/// fully-migrated, empty database and was presented as a healthy library, with no error
+/// anywhere. Everything living outside the store — themes in the webview's `localStorage`,
+/// keys in the OS keychain — survived, so the app even looked configured. It is the same
+/// invariant `secrets.rs` already enforces for the secret store (`BundleState::Untrusted`
+/// — an unreadable store must never equal an empty one), applied to the database itself.
+///
+/// The rule is deliberately asymmetric. Any surviving evidence of use — the metadata file,
+/// a populated Markdown tree, or a retired pointer — makes a missing store [`Missing`],
+/// even though a first boot interrupted between `ensure_device_meta` and `db::open` would
+/// also land there. That false positive costs one click on a recovery screen that creates
+/// the store on request; the false negative it replaces cost a user their whole library
+/// with no warning at all.
+///
+/// [`Missing`]: StorePresence::Missing
+pub fn store_presence(
+    db_present: bool,
+    meta_present: bool,
+    markdown_populated: bool,
+    retired_pointer_present: bool,
+) -> StorePresence {
+    if db_present {
+        return StorePresence::Present;
+    }
+    if meta_present || markdown_populated || retired_pointer_present {
+        return StorePresence::Missing;
+    }
+    StorePresence::FreshProfile
+}
+
+/// Whether the Markdown tree holds at least one entry. A missing or unreadable directory
+/// reads as empty: this only ever *adds* evidence that a vault was used, so failing to
+/// read it can never manufacture a [`StorePresence::Missing`] out of a fresh profile.
+fn markdown_populated(markdown_dir: &Path) -> bool {
+    std::fs::read_dir(markdown_dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Gather the on-disk facts and apply [`store_presence`]. `data_dir` is the profile
+/// directory (where the retired pointer lives), which for a pointed vault is NOT
+/// `resolved.vault_root`.
+pub fn inspect_store_presence(resolved: &ResolvedVault, data_dir: &Path) -> StorePresence {
+    store_presence(
+        resolved.db_path.exists(),
+        meta_path(&resolved.vault_root).exists(),
+        markdown_populated(&resolved.markdown_dir),
+        data_dir.join(pointer::RETIRED_POINTER_FILENAME).exists(),
+    )
+}
+
+/// The fault raised when [`inspect_store_presence`] reports [`StorePresence::Missing`].
+/// Carries the store's path so the recovery screen can name it, and
+/// [`VaultFaultCode::StoreMissing`] so that screen offers "create a new empty store"
+/// rather than the gone-folder story — and so `wipe::reset_refusal` keeps the
+/// destructive "Start fresh" closed for it.
+pub fn store_missing_fault(db_path: &Path) -> VaultFault {
+    VaultFault {
+        code: VaultFaultCode::StoreMissing,
+        op: "open the vault".into(),
+        path: Some(db_path.display().to_string()),
+        message: format!(
+            "PM's encrypted store is missing from {} — but this vault's settings are still \
+             there, so it was removed from outside PM rather than by anything PM did. \
+             Nothing has been deleted or re-created. If you have a backup, or the file \
+             turns up, restore it before creating a new one",
+            db_path.display()
+        ),
+    }
+}
+
 /// What [`authenticate_meta`] did on open — surfaced so a caller can show a non-blocking warning (M-3).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MetaAuthReport {
@@ -1420,6 +1510,43 @@ mod tests {
         );
         // At the default location a meta-load failure stays fatal, as before.
         assert_eq!(boot_meta_decision(false, Err(denied.clone())), Err(denied));
+    }
+
+    #[test]
+    fn store_presence_never_calls_an_erased_library_a_fresh_profile() {
+        use StorePresence::*;
+        // A store on disk is opened, whatever else is or isn't there.
+        for meta in [true, false] {
+            for md in [true, false] {
+                for retired in [true, false] {
+                    assert_eq!(store_presence(true, meta, md, retired), Present);
+                }
+            }
+        }
+        // Nothing at all: a genuinely fresh profile still creates its vault, as it always has.
+        assert_eq!(store_presence(false, false, false, false), FreshProfile);
+        // ANY surviving evidence that this vault was used turns a missing store into a
+        // reportable fault instead of a silent, empty, freshly-migrated library. Each
+        // signal stands on its own — the metadata file, a populated Markdown tree (the
+        // documents themselves), or a retired pointer from a previous detach.
+        assert_eq!(store_presence(false, true, false, false), Missing);
+        assert_eq!(store_presence(false, false, true, false), Missing);
+        assert_eq!(store_presence(false, false, false, true), Missing);
+        assert_eq!(store_presence(false, true, true, true), Missing);
+    }
+
+    #[test]
+    fn store_missing_fault_is_its_own_code_and_names_the_file() {
+        // The code is what keeps the destructive doors shut: `wipe::reset_refusal` refuses
+        // `StoreMissing` outright, and the recovery screen offers "start a new empty store"
+        // rather than the gone-folder story. It must never be folded into NoVault.
+        let fault = store_missing_fault(Path::new("/tmp/pm/pm.sqlite"));
+        assert_eq!(fault.code, VaultFaultCode::StoreMissing);
+        assert_ne!(fault.code, VaultFaultCode::NoVault);
+        assert!(fault.path.as_deref().unwrap().contains("pm.sqlite"));
+        // The message must not claim PM did this — it didn't, and the user's next move
+        // (look for a backup, look for the file) depends on knowing that.
+        assert!(fault.message.contains("outside PM"));
     }
 
     // The two layout pins below KEEP their `"pm.sqlite"` / `"vault"` literals on purpose: a test that

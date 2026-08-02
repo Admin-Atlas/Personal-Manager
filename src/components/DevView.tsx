@@ -175,12 +175,15 @@ export function DevView() {
       .then(setSidecar)
       .catch(() => {});
     readSandbox();
+    // Surface these, like their siblings above and below. Swallowing them made a store that
+    // WOULDN'T OPEN render identically to one whose tables are genuinely empty — on the one
+    // screen built for telling those apart, and during the one incident where it mattered.
     devTableCounts()
       .then(setCounts)
-      .catch(() => {});
+      .catch((e) => setError(String(e)));
     devTableRows("corrections", PAGE, 0)
       .then(setCorrections)
-      .catch(() => {});
+      .catch((e) => setError(String(e)));
   }, [readSandbox]);
 
   useEffect(() => {

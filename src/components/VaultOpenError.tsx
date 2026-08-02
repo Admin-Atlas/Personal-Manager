@@ -8,6 +8,12 @@
 //                 The data is intact; Repair access is the primary action, never deletion.
 //  - "no-vault"/"not-found" — the pointed folder no longer holds a vault (moved, deleted,
 //                 or an unplugged drive). Try again / step back to a vault on this account.
+//  - "store-missing" — the vault is here but pm.sqlite is gone. The ONLY branch whose exit
+//                 creates instead of deleting: "Start a new empty store" leaves the Markdown,
+//                 the metadata and the keys in place, so a recovered store still opens and a
+//                 Rebuild can restore the library from the notes. "Start fresh" is hidden and
+//                 backend-refused here — there is no unreadable file to delete, and it would
+//                 take the notes with it.
 //  - anything else — the transient story as before (antivirus or Windows Search holding
 //                 the file, disk I/O): Retry, with db::open's friendly message.
 //
@@ -19,7 +25,12 @@
 
 import { useState } from "react";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { detachFromSharedVault, resetAfterOpenError, retryOpenVault } from "../lib/ipc";
+import {
+  createReplacementStore,
+  detachFromSharedVault,
+  resetAfterOpenError,
+  retryOpenVault,
+} from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
 import { Button, Callout, Input } from "./ui";
 import { DetachConfirm, RepairAccessButton } from "./VaultRecovery";
@@ -37,6 +48,10 @@ export function VaultOpenError({
   const fault = status.fault;
   const denied = fault?.code === "denied";
   const gone = fault?.code === "no-vault" || fault?.code === "not-found";
+  // The store file itself is gone while the vault around it survives. Its recovery is the
+  // opposite of every other fault here: nothing may be deleted, and the way forward creates
+  // rather than removes — so it gets its own copy and its own action.
+  const storeMissing = fault?.code === "store-missing";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(fault?.message ?? null);
   // The destructive escape hatch, revealed only if the user asks for it.
@@ -69,6 +84,22 @@ export function VaultOpenError({
     try {
       await detachFromSharedVault();
       window.location.reload();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  }
+
+  // Accept a missing store and carry on with an empty one. Deletes nothing: the Markdown
+  // vault, the metadata and the saved keys stay put, so a recovered pm.sqlite can still be
+  // restored over the top and a Rebuild can reconstruct the index from the Markdown.
+  async function createStore() {
+    if (busy || resetting) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await createReplacementStore();
+      onResolved();
     } catch (e) {
       setError(String(e));
       setBusy(false);
@@ -108,17 +139,25 @@ export function VaultOpenError({
 
       <div>
         <h1 className="font-ui text-lg font-semibold text-ink">
-          {denied ? "PM can't reach your vault right now" : "Couldn't open your vault"}
+          {denied
+            ? "PM can't reach your vault right now"
+            : storeMissing
+              ? "PM's store is missing"
+              : "Couldn't open your vault"}
         </h1>
         <p className="mt-1 max-w-xs text-sm text-ink4">
           {denied
             ? "Windows is refusing this account access to the vault folder. Your documents " +
               "are still there and still encrypted — nothing has been deleted."
-            : gone
-              ? "The folder PM points at doesn't hold a vault any more — it may have been " +
-                "moved or deleted, or be on a drive that isn't connected."
-              : "Your documents are safe — the vault file was momentarily unavailable, often " +
-                "because antivirus or Windows Search was scanning it. Try again in a moment."}
+            : storeMissing
+              ? "The file PM keeps your library in has gone from the vault folder, but the " +
+                "vault itself is still here. PM hasn't deleted or re-created anything — it " +
+                "stopped so you can put the file back first, if you can."
+              : gone
+                ? "The folder PM points at doesn't hold a vault any more — it may have been " +
+                  "moved or deleted, or be on a drive that isn't connected."
+                : "Your documents are safe — the vault file was momentarily unavailable, often " +
+                  "because antivirus or Windows Search was scanning it. Try again in a moment."}
         </p>
       </div>
 
@@ -136,8 +175,29 @@ export function VaultOpenError({
         disabled={busy || resetting}
         onClick={() => void retry()}
       >
-        {busy ? "Trying again…" : "Try again"}
+        {busy ? "Trying again…" : storeMissing ? "Check again" : "Try again"}
       </Button>
+
+      {/* The one way past a missing store, and deliberately not the primary action: putting
+          the file back beats starting empty, so "Check again" leads. This creates and never
+          deletes — the Markdown vault is left intact precisely so Rebuild can use it. */}
+      {storeMissing && (
+        <div className="max-w-xs">
+          <Button
+            variant="secondary"
+            disabled={busy || resetting}
+            onClick={() => void createStore()}
+          >
+            Start a new empty store
+          </Button>
+          <p className="mt-1 text-xs text-ink4">
+            Nothing is deleted. Your notes, your vault settings and your saved keys stay exactly
+            where they are — so if the missing file turns up, or you restore a backup, it still
+            opens. If your notes are still in the vault folder, Rebuild in Settings puts your
+            library back from them.
+          </p>
+        </div>
+      )}
 
       {status.pointed_root && (
         <div className="max-w-xs">
@@ -158,8 +218,10 @@ export function VaultOpenError({
       {/* The destructive "Start fresh" recovery is only for THIS profile's own vault. A pointed
           (shared/joined) vault belongs to a folder we don't own, and a DENIED vault is intact
           data behind a permissions problem — the backend refuses both; the UI doesn't offer
-          them in the first place. */}
-      {status.pointed_root || denied ? null : !showReset ? (
+          them in the first place. A MISSING store is the third: there is no unreadable file to
+          delete, and this path would take the Markdown vault — the one copy of the notes that
+          could still rebuild the library — with it. "Start a new empty store" is its exit. */}
+      {status.pointed_root || denied || storeMissing ? null : !showReset ? (
         <button
           className="text-xs text-ink4 underline underline-offset-2 hover:text-ink3"
           disabled={busy || resetting}
@@ -176,8 +238,11 @@ export function VaultOpenError({
             Try “Try again” a few times first — a vault that&apos;s only momentarily locked (often
             by antivirus or Windows Search) opens once the file is free. If it truly never opens,
             the vault is damaged and can&apos;t be recovered on this device. You can start fresh —
-            this <span className="font-medium text-st-due">permanently deletes the vault</span> and
-            sets PM up again from scratch. Your saved keys and sign-ins are kept.
+            this{" "}
+            <span className="font-medium text-st-due">
+              permanently deletes the vault, including every note in it
+            </span>
+            , and sets PM up again from scratch. Your saved keys and sign-ins are kept.
           </p>
           <p className="mt-2 text-xs text-ink4">
             Type <span className="font-mono font-medium text-ink2">{RESET_PHRASE}</span> to confirm.
