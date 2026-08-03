@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.117.1-alpha",
+    date: "2026-08-02",
+    highlights: [
+      "Leaving the Teach tab while PM is choosing your tag vocabulary no longer leaves it stuck. Coming back part-way through showed a bar that never moved and every button greyed out, for as long as you stayed on the tab. The pass itself was fine — usually it had already finished — but the first half of a re-tag ended without ever saying so, and the screen was waiting to be told. Both halves now announce that they have stopped, whatever stopped them, so the tab can no longer be left waiting on a pass that is over.",
+      "A re-tag that fails while you are on another tab now says what went wrong. It used to go quiet and look exactly like one that had never been started.",
+      "Labelling shows its count from the first moment instead of after the first batch comes back. PM already knew it was about to label 165 documents; the bar simply wasn't being told until the first answers arrived, so the longest single wait in the pass was the one part with nothing to watch.",
+      'The finished line counts what you will actually be asked to review. It counted every document the model answered for, so a well-tagged library was told "165 documents changed" above a list of three. It now also says so when a pass changed nothing at all, rather than leaving an empty list to speak for itself.',
+    ],
+  },
+  {
     version: "3.117.0-alpha",
     date: "2026-08-02",
     highlights: [

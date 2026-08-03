@@ -941,11 +941,19 @@ pub fn rebuild_status(state: State<'_, AppState>) -> Result<crate::IngestJobStat
 #[tauri::command]
 pub fn ack_rebuild_report(state: State<'_, AppState>) -> Result<()> {
     if let Ok(mut snap) = state.ingest_job.lock() {
-        if !snap.running {
-            snap.last_report = None;
-        }
+        ack_report(&mut snap);
     }
     Ok(())
+}
+
+/// The acknowledge rule itself, lifted out of the lock so it can be tested without an app handle.
+///
+/// It is one line and it carries two promises a user will notice: the Done line is shown exactly
+/// once and never again, and acknowledging it does not take the per-file rows with it.
+pub(crate) fn ack_report(snap: &mut crate::IngestJobState) {
+    if !snap.running {
+        snap.last_report = None;
+    }
 }
 
 /// Drop the whole finished-rebuild card — the counts AND the per-file rows.
@@ -1069,6 +1077,59 @@ mod rebuild_marker_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finished_snapshot() -> crate::IngestJobState {
+        let mut snap = crate::IngestJobState {
+            last_report: Some(crate::IngestReport {
+                ingested: 161,
+                skipped: 0,
+                failed: 0,
+                unreadable: 0,
+            }),
+            ..Default::default()
+        };
+        snap.recent.push_back(crate::IngestItem {
+            name: "Contract.pdf".into(),
+            status: "done".into(),
+            detail: None,
+        });
+        snap
+    }
+
+    #[test]
+    fn the_done_line_is_shown_once_and_is_gone_on_every_return_after() {
+        // "Done — 161 ingested" used to be replayed from the snapshot on every mount, so only
+        // starting another rebuild or restarting PM ever cleared it. Acknowledging it on the
+        // restore path is what makes the SECOND return quiet — the promise being pinned here.
+        let mut snap = finished_snapshot();
+        assert!(snap.last_report.is_some(), "first return still shows it");
+
+        super::ack_report(&mut snap);
+        assert!(snap.last_report.is_none(), "second return must be quiet");
+
+        // And it stays gone: nothing short of a new run writes `last_report` again.
+        super::ack_report(&mut snap);
+        assert!(snap.last_report.is_none());
+    }
+
+    #[test]
+    fn acknowledging_the_done_line_keeps_the_files_it_listed() {
+        // The deliberate half of the trade-off: the banner was unwanted, the per-file rows were
+        // the thing asked for. Clearing both here would empty the Activity list the instant a
+        // rebuild ended for anyone watching it happen.
+        let mut snap = finished_snapshot();
+        super::ack_report(&mut snap);
+        assert_eq!(snap.recent.len(), 1);
+    }
+
+    #[test]
+    fn a_running_rebuild_is_never_acknowledged_out_from_under_itself() {
+        // `RebuildProgress` is a second live listener on the same snapshot.
+        let mut snap = finished_snapshot();
+        snap.running = true;
+        super::ack_report(&mut snap);
+        assert!(snap.last_report.is_some());
+    }
 
     #[test]
     fn derive_title_takes_first_non_blank_line_capped() {

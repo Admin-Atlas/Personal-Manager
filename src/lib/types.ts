@@ -599,7 +599,16 @@ export type RetagEvent =
    *  vocabulary can be seen (and the pass abandoned) without waiting for every document. */
   | { type: "vocabulary"; tags: string[] }
   | { type: "progress"; done: number; total: number }
-  | { type: "finished"; changed: number };
+  | { type: "finished"; changed: number }
+  /** A phase stopped, however it stopped — the only thing a re-entering view can rely on to
+   *  release itself. `finished` says a pass SUCCEEDED and carries its result; a pass that failed,
+   *  or one whose first phase simply ended, sends only this. Emitted from the backend guard's
+   *  drop, so no exit path can omit it. */
+  | {
+      type: "ended";
+      phase: "vocabulary" | "labelling";
+      error: string | null;
+    };
 
 /** One document's staged re-tag: what it carries now, and what the pass proposes instead.
  *  Only documents whose tags would actually change are returned. */

@@ -13,7 +13,7 @@
 // Each is invisible in the markup and expensive to get wrong: these paths rewrite tags across a
 // whole library, through the vault, with no undo.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const listTags = vi.fn();
@@ -187,6 +187,104 @@ describe("the re-tag pass", () => {
       // Lowercased on the way in, matching how tags are stored everywhere else.
       expect(applyRetagVocabulary).toHaveBeenCalledWith(["invoice", "receipts"]),
     );
+  });
+});
+
+// Leaving the tab unmounts this view while the pass carries on, so returning re-reads the backend
+// snapshot and adopts whatever is in flight. Adopting `running` DISABLES every control — which
+// makes a terminal event the only thing that can ever release them again. The vocabulary phase used
+// to send none at all: it emitted its result, the run guard cleared `running` in silence, and a tab
+// that returned mid-call shimmered with everything greyed out for the life of that mount (#706).
+//
+// Nothing else in this file exercises a running pass, so these are the only tests that would catch
+// it coming back.
+describe("a pass you left and came back to", () => {
+  function emit(ev: unknown) {
+    const handler = onRetagProgress.mock.calls[0]?.[0] as (e: unknown) => void;
+    expect(handler).toBeTypeOf("function");
+    act(() => handler(ev));
+  }
+
+  function inFlight(phase: "vocabulary" | "labelling", over: Record<string, unknown> = {}) {
+    retagStatus.mockResolvedValue({
+      running: true,
+      phase,
+      processed: 0,
+      total: null,
+      started_at_ms: 1_000,
+      vocabulary: [],
+      last_changed: null,
+      ...over,
+    });
+  }
+
+  it("rejoins a vocabulary phase, and is released only when the phase ENDS", async () => {
+    inFlight("vocabulary");
+    await ready();
+
+    await waitFor(() =>
+      expect(screen.getByRole("progressbar", { name: "Reading your library" })).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: /Suggest/ })).toHaveProperty("disabled", true);
+
+    // The billed result arriving is NOT the phase ending — this is the distinction the old code
+    // collapsed, and collapsing it is what left the tab wedged.
+    emit({ type: "vocabulary", tags: ["invoice"] });
+    expect(screen.getByRole("progressbar", { name: "Reading your library" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Suggest/ })).toHaveProperty("disabled", true);
+
+    emit({ type: "ended", phase: "vocabulary", error: null });
+    await waitFor(() =>
+      expect(screen.queryByRole("progressbar", { name: "Reading your library" })).toBeNull(),
+    );
+    expect(screen.getByRole("button", { name: /Suggest/ })).toHaveProperty("disabled", false);
+  });
+
+  it("rejoins a labelling pass at the count it has really reached", async () => {
+    // The 36-of-165 report: the count used to be pushed down a per-call Channel that died with the
+    // component, so a returning tab restarted from nothing.
+    inFlight("labelling", { processed: 36, total: 165 });
+    await ready();
+
+    await waitFor(() =>
+      expect(screen.getByRole("progressbar", { name: "Labelling your library" })).toBeTruthy(),
+    );
+    expect(screen.getByText("36 of 165")).toBeTruthy();
+
+    emit({ type: "progress", done: 48, total: 165 });
+    await waitFor(() => expect(screen.getByText("48 of 165")).toBeTruthy());
+
+    emit({ type: "finished", changed: 3 });
+    emit({ type: "ended", phase: "labelling", error: null });
+    await waitFor(() =>
+      expect(screen.queryByRole("progressbar", { name: "Labelling your library" })).toBeNull(),
+    );
+    expect(screen.getByText(/3 documents to review below/)).toBeTruthy();
+  });
+
+  it("says a pass that changed nothing changed nothing", async () => {
+    // Otherwise a billed pass over a well-tagged library is completely silent: an empty proposals
+    // list looks exactly like a pass that never ran.
+    inFlight("labelling", { processed: 165, total: 165 });
+    await ready();
+    emit({ type: "finished", changed: 0 });
+    emit({ type: "ended", phase: "labelling", error: null });
+    await waitFor(() => expect(screen.getByText(/nothing to review/)).toBeTruthy());
+  });
+
+  it("explains a pass that died while the tab was away, instead of reverting to idle", async () => {
+    inFlight("labelling", { processed: 12, total: 165 });
+    await ready();
+    await waitFor(() =>
+      expect(screen.getByRole("progressbar", { name: "Labelling your library" })).toBeTruthy(),
+    );
+
+    emit({ type: "ended", phase: "labelling", error: "the model did not respond" });
+    await waitFor(() => expect(screen.getByText("the model did not respond")).toBeTruthy());
+    expect(screen.queryByRole("progressbar", { name: "Labelling your library" })).toBeNull();
+    // A failed pass reports no count: `finished` never fired, so there is nothing to claim.
+    expect(screen.queryByText(/to review below/)).toBeNull();
+    expect(screen.getByRole("button", { name: /Suggest/ })).toHaveProperty("disabled", false);
   });
 });
 

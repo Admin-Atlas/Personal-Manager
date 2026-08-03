@@ -747,14 +747,14 @@ impl RetagSink {
         apply_event(&mut snap, ev);
     }
 
-    /// Open a phase: stamp `running`, the phase, and the start time. Returns a guard that clears
-    /// `running` on drop.
+    /// Open a phase: stamp `running`, the phase, and the start time. Returns a guard that ENDS the
+    /// phase on drop.
     ///
-    /// The guard is the point. `propose_retag_vocabulary` has three early returns plus two `?`
-    /// propagation sites, and `apply_retag_vocabulary` has three more — a set-on-entry /
-    /// clear-on-exit pair would leave `running: true` behind any of them, and a remounting Teach
-    /// tab would then shimmer forever with no way to clear it. This is `BusyGuard`'s RAII shape
-    /// applied to the snapshot, and like `BusyGuard` it also survives an unwinding panic.
+    /// The guard is the point. Between them the two commands have fifteen exits that leave this
+    /// scope — six in the vocabulary phase, nine in the labelling one, most of them `?`
+    /// propagation sites inside `retag_assign`. A set-on-entry / clear-on-exit pair would leave
+    /// `running: true` behind any of them. This is `BusyGuard`'s RAII shape applied to the
+    /// snapshot, and like `BusyGuard` it also survives an unwinding panic.
     pub fn begin(&self, phase: crate::RetagPhase, total: Option<usize>) -> RetagRunGuard {
         use tauri::Manager;
         if let Ok(mut snap) = self.app.state::<crate::AppState>().retag_job.lock() {
@@ -767,23 +767,62 @@ impl RetagSink {
         }
         RetagRunGuard {
             app: self.app.clone(),
+            phase,
+            error: None,
         }
     }
 }
 
-/// Clears `running` however the phase ends — return, `?`, or panic. See [`RetagSink::begin`].
+/// Ends a phase however it ends — return, `?`, or panic. See [`RetagSink::begin`].
+///
+/// Clearing `running` is not enough on its own, and that was the bug: a view that adopted
+/// `running: true` on mount disabled its controls and had nothing left to listen for, because the
+/// snapshot going quiet is not an event. The guard therefore SENDS [`RetagEvent::Ended`] rather
+/// than mutating the snapshot directly — one path, so a listening view and the snapshot can never
+/// disagree about whether the pass is over.
+///
+/// [`RetagEvent::Ended`]: crate::commands::RetagEvent::Ended
 pub struct RetagRunGuard {
     app: tauri::AppHandle,
+    phase: crate::RetagPhase,
+    error: Option<String>,
+}
+
+impl RetagRunGuard {
+    /// Record how the phase turned out, so the terminal event can carry the failure.
+    ///
+    /// Called with the inner function's result immediately before this guard drops. A pass that
+    /// died on a model timeout or a missing provider otherwise reverts a re-entering tab to idle
+    /// with no explanation at all.
+    pub fn record<T>(&mut self, outcome: &Result<T>) {
+        if let Err(e) = outcome {
+            self.error = Some(e.to_string());
+        }
+    }
 }
 
 impl Drop for RetagRunGuard {
     fn drop(&mut self) {
-        use tauri::Manager;
-        if let Ok(mut snap) = self.app.state::<crate::AppState>().retag_job.lock() {
-            snap.running = false;
-            snap.phase = None;
-            snap.started_at_ms = None;
-        }
+        // Deliberately NOT wrapped in a `retag_job` lock scope: `send` takes that lock itself via
+        // `mirror`, and the mutex is a non-reentrant `std::sync::Mutex`, so holding it here would
+        // self-deadlock the moment the phase ended. The `Ended` arm of `apply_event` does the
+        // clearing this used to do inline.
+        RetagSink::new(self.app.clone()).send(crate::commands::RetagEvent::Ended {
+            phase: self.phase,
+            error: self.error.take(),
+        });
+    }
+}
+
+/// Forget the outcome line of the last finished pass.
+///
+/// `last_changed` reports on STAGED proposals, so it stops being true the moment they are applied
+/// or thrown away — otherwise "12 documents changed" sits above an empty list until the next pass
+/// starts. Call it after the DB work and outside any open `conn` scope: taking `retag_job` while
+/// the DB guard is held would establish a second lock order for no reason.
+pub fn clear_last_changed(state: &crate::AppState) {
+    if let Ok(mut snap) = state.retag_job.lock() {
+        snap.last_changed = None;
     }
 }
 
@@ -802,6 +841,13 @@ pub fn apply_event(snap: &mut crate::RetagJobState, ev: &crate::commands::RetagE
         E::Finished { changed } => {
             snap.last_changed = Some(*changed);
             snap.processed = snap.total.unwrap_or(snap.processed);
+        }
+        // The phase is over. `Finished` does not do this: a pass can end without succeeding, and
+        // every one of those paths reaches here instead.
+        E::Ended { .. } => {
+            snap.running = false;
+            snap.phase = None;
+            snap.started_at_ms = None;
         }
     }
 }
@@ -852,5 +898,71 @@ mod progress_tests {
         super::apply_event(&mut snap, &E::Finished { changed: 12 });
         assert_eq!(snap.processed, 165);
         assert_eq!(snap.last_changed, Some(12));
+    }
+
+    #[test]
+    fn a_vocabulary_phase_that_ends_releases_the_tab_watching_it() {
+        // The regression this whole change exists for. The first phase emitted `Vocabulary` and
+        // returned; the guard cleared `running` in silence. A Teach tab that mounted while the
+        // model call was in flight had adopted `running: true`, and a snapshot going quiet is not
+        // an event — so it shimmered with every control disabled for the life of that mount.
+        let mut snap = RetagJobState {
+            running: true,
+            phase: Some(crate::RetagPhase::Vocabulary),
+            started_at_ms: Some(1_000),
+            ..Default::default()
+        };
+
+        super::apply_event(
+            &mut snap,
+            &E::Vocabulary {
+                tags: vec!["tax".into()],
+            },
+        );
+        // Still running after the result arrives — the phase has produced its output, not ended.
+        assert!(snap.running, "the vocabulary event must not end the phase");
+
+        super::apply_event(
+            &mut snap,
+            &E::Ended {
+                phase: crate::RetagPhase::Vocabulary,
+                error: None,
+            },
+        );
+        assert!(!snap.running);
+        assert!(snap.phase.is_none());
+        assert!(snap.started_at_ms.is_none());
+        // The billed vocabulary outlives the phase that produced it.
+        assert_eq!(snap.vocabulary, vec!["tax".to_string()]);
+    }
+
+    #[test]
+    fn a_pass_that_fails_ends_without_claiming_it_finished() {
+        // `Ended` carries the failure; `Finished` is never sent. A view that was away must not be
+        // told a number of documents changed when none did.
+        let mut snap = RetagJobState {
+            running: true,
+            phase: Some(crate::RetagPhase::Labelling),
+            total: Some(165),
+            ..Default::default()
+        };
+        super::apply_event(
+            &mut snap,
+            &E::Progress {
+                done: 36,
+                total: 165,
+            },
+        );
+        super::apply_event(
+            &mut snap,
+            &E::Ended {
+                phase: crate::RetagPhase::Labelling,
+                error: Some("the model did not respond".into()),
+            },
+        );
+        assert!(!snap.running);
+        assert_eq!(snap.last_changed, None, "a failed pass changed nothing");
+        // The count it got to is left alone: it is true, and it is what the pass actually did.
+        assert_eq!(snap.processed, 36);
     }
 }
