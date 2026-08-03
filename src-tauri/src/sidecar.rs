@@ -151,6 +151,61 @@ fn check_input_size(size: u64, cap: u64) -> Result<()> {
     Ok(())
 }
 
+/// What a DOCUMENT states about itself, as opposed to what its container on disk says (#709).
+///
+/// The refinement of #701's "a filesystem has no author": that is still true of the filesystem, and
+/// PM still never names the OS account — but an OOXML container carries `docProps/core.xml` and a
+/// PDF carries an Info dictionary, and a document that plainly names its author should not read
+/// "Unknown" just because it arrived from a folder rather than from Drive.
+///
+/// `None` throughout means the document did not say, which is exactly what an absent provider fact
+/// means, so these flow into the same columns and render the same way.
+///
+/// No `modified_at`, deliberately. For a local file `source_modified_at` is the filesystem mtime,
+/// which is what the connector diffs to notice a change; a second, differently-sourced "modified"
+/// would sooner or later be substituted for it, and a document whose docProps date predates the copy
+/// on disk would then look permanently stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileProperties {
+    pub author: Option<String>,
+    pub last_modified_by: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// The extensions whose format defines a document-properties block. Everything else — .md, .txt,
+/// .html, .csv — genuinely has nowhere to state an author, so asking costs a round trip to be told
+/// nothing. .epub is a zip too, but indirects its metadata through META-INF/container.xml, which is
+/// a different reader than the one the sidecar has.
+const DOCUMENT_PROPERTY_EXTS: &[&str] = &["docx", "pptx", "xlsx", "xlsm", "pdf"];
+
+/// Whether this file's format can state an author at all. Pure; the gate that keeps a folder of
+/// plain-text notes from paying for a sidecar call per file.
+pub fn carries_document_properties(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| DOCUMENT_PROPERTY_EXTS.contains(&e.as_str()))
+}
+
+/// The sidecar's `file_properties` reply as [`FileProperties`]. Split out and pure so the wire
+/// contract with `pm_sidecar.py` — including its "" and null cases — is unit-tested without a child
+/// process. A blank string reads as unstated: an empty author rendered under "Author" looks like PM
+/// lost the value rather than never having had it.
+fn file_properties_from_reply(reply: &Value) -> FileProperties {
+    let field = |key: &str| {
+        reply[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    FileProperties {
+        author: field("author"),
+        last_modified_by: field("last_modified_by"),
+        created_at: field("created"),
+    }
+}
+
 /// How many non-matching stdout lines we'll skip while waiting for our reply before
 /// giving up and respawning. With the monotonic request id a stale/old line can
 /// never match, so anything skipped is noise; this bounds a chatty or wedged child
@@ -1259,6 +1314,31 @@ impl SidecarManager {
         let markdown = result["markdown"].as_str().unwrap_or_default().to_string();
         let title = result["title"].as_str().unwrap_or_default().to_string();
         Ok((markdown, title))
+    }
+
+    /// What a document says about ITSELF — never what the filesystem or the OS account says (#709).
+    ///
+    /// Returns a value rather than a `Result` on purpose: a property is a nicety, and the type is
+    /// how "this can never be the reason a file fails to land" is enforced rather than remembered.
+    /// A file the sidecar can't read, an engine that isn't there, a format with no property block —
+    /// all of them are the same answer here, and all of them render "Unknown".
+    ///
+    /// Skips the round trip entirely for the formats that state nothing, so the common case (a
+    /// dropped .md, a folder of text notes) costs nothing at all.
+    pub fn file_properties(&self, path: &Path) -> FileProperties {
+        if !carries_document_properties(path) {
+            return FileProperties::default();
+        }
+        match self.request("file_properties", json!({ "path": path.to_string_lossy() })) {
+            Ok(reply) => file_properties_from_reply(&reply),
+            Err(e) => {
+                eprintln!(
+                    "sidecar: reading {}'s properties failed ({e})",
+                    path.display()
+                );
+                FileProperties::default()
+            }
+        }
     }
 
     /// The on-device model-cache dir for the Whisper weights (a sibling of the venv under
@@ -2543,6 +2623,11 @@ fn request_timeout(method: &str) -> std::time::Duration {
         "convert" | "analyze_spreadsheet" | "reduce" => Duration::from_secs(10 * 60),
         // Pure tokeniser pass — fast once the tokeniser is loaded.
         "count_tokens" => Duration::from_secs(5 * 60),
+        // A zip directory entry or a PDF trailer: milliseconds on any real file, and generous even
+        // for a damaged PDF whose cross-reference table has to be reconstructed by scanning. Kept
+        // well under the default so a stall on one file's properties can't hold a sync for ten
+        // minutes over a fact the document was free not to state in the first place.
+        "file_properties" => Duration::from_secs(2 * 60),
         // Any other (or future) method: a safe, generous default.
         _ => Duration::from_secs(10 * 60),
     }
@@ -3585,6 +3670,71 @@ mod tests {
             secs("something_new") > 0,
             "unknown methods get a safe default"
         );
+    }
+
+    #[test]
+    fn only_the_formats_that_state_an_author_are_asked() {
+        // The gate that keeps a folder of plain-text notes from paying a sidecar round trip per
+        // file to be told nothing. Extension match is case-insensitive: Windows hands back
+        // whatever case the file was created with.
+        for name in [
+            "plan.docx",
+            "deck.PPTX",
+            "budget.xlsx",
+            "macro.xlsm",
+            "scan.pdf",
+        ] {
+            assert!(carries_document_properties(Path::new(name)), "{name}");
+        }
+        for name in [
+            "notes.md",
+            "log.txt",
+            "page.html",
+            "rows.csv",
+            "README",
+            "photo.jpg",
+        ] {
+            assert!(!carries_document_properties(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_document_that_did_not_say_is_told_apart_from_one_that_said_nothing() {
+        // Both halves of the wire contract with `pm_sidecar.py`. A null is the document declining to
+        // state a fact; an empty string is Word's `<dc:creator/>`, which means the same thing — and
+        // an empty author rendered under "Author" reads as PM having lost the value.
+        assert_eq!(
+            file_properties_from_reply(&json!({
+                "author": "Jane Okafor",
+                "last_modified_by": "  Sam Reyes  ",
+                "created": "2025-11-04T09:12:00Z",
+            })),
+            FileProperties {
+                author: Some("Jane Okafor".into()),
+                last_modified_by: Some("Sam Reyes".into()),
+                created_at: Some("2025-11-04T09:12:00Z".into()),
+            }
+        );
+        for blank in [json!(null), json!(""), json!("   ")] {
+            let props = file_properties_from_reply(
+                &json!({ "author": blank, "last_modified_by": blank, "created": blank }),
+            );
+            assert_eq!(props, FileProperties::default(), "{blank}");
+        }
+        // A reply missing the keys altogether — an older worker, or one that gave up — is the same
+        // answer, not a panic.
+        assert_eq!(
+            file_properties_from_reply(&json!({})),
+            FileProperties::default()
+        );
+    }
+
+    #[test]
+    fn a_property_read_is_never_the_reason_a_file_fails_to_land() {
+        // `file_properties` returns a value, not a Result, so no call site can make it fatal by
+        // accident — a document's author is never worth failing an ingest over. Coercing it to this
+        // exact fn pointer IS the assertion: give it a fallible return and this stops compiling.
+        let _: fn(&SidecarManager, &Path) -> FileProperties = SidecarManager::file_properties;
     }
 
     #[test]

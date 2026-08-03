@@ -436,6 +436,237 @@ def _guard_file_size(path):
         )
 
 
+# --- What a document says about ITSELF ---------------------------------------------------------
+#
+# A filesystem knows no author (#701) — but the FILE very often does. An OOXML container carries
+# `docProps/core.xml` (`dc:creator`, `cp:lastModifiedBy`, `dcterms:created`) and a PDF carries an
+# Info dictionary (`/Author`, `/CreationDate`). Reading those is what lets a local document show the
+# same facts as a Drive one, without PM ever naming the OS account looking at the screen (#709).
+#
+# Deliberately NOT read: the document's own MODIFIED date. PM's `source_modified_at` for a local
+# file is the filesystem mtime, which is exactly what the connector diffs to notice a change;
+# handing back a second, differently-sourced "modified" invites precisely that substitution, and a
+# document whose docProps date predates the copy on disk would then look permanently stale.
+#
+# Every reader below returns nulls instead of raising. A property is a nicety — it must never be the
+# reason a file fails to land — so the shape is fixed and the failure is silent by construction.
+
+# The largest `docProps/core.xml` this reader will inflate. A real one is a couple of KiB; anything
+# past this is a bomb aimed at the single member we open, which `_guard_archive_inflation`'s
+# whole-archive 1 GiB ceiling is far too coarse to catch.
+MAX_DOC_PROPS_BYTES = 1024 * 1024
+
+# One property value's cap. An author is a name; a hostile file could put the whole member in there,
+# and a table cell holding 200 KiB of text helps nobody.
+MAX_PROPERTY_CHARS = 256
+
+# The zip containers with a `docProps/core.xml`. .epub is a zip too but stores its metadata in an
+# OPF whose path is itself indirected through META-INF/container.xml — a different reader, not
+# worth one here until an .epub actually needs it.
+OOXML_PROPERTY_EXTS = (".docx", ".pptx", ".xlsx", ".xlsm")
+
+CORE_PROPS_PATH = "docProps/core.xml"
+_DC_NS = "{http://purl.org/dc/elements/1.1/}"
+_CP_NS = "{http://schemas.openxmlformats.org/package/2006/metadata/core-properties}"
+_DCTERMS_NS = "{http://purl.org/dc/terms/}"
+
+
+def no_properties():
+    """The reply when nothing could be read: every key present, every value null. Fixed-shape on
+    purpose — the Rust side never has to tell "the reader gave up" from "the document didn't say",
+    because for its purposes those are the same answer, and both render "Unknown"."""
+    return {"author": None, "last_modified_by": None, "created": None}
+
+
+def clean_property(value):
+    """One property value, or None. Blank and whitespace-only read as "not stated": Word writes
+    `<dc:creator/>` for an unset author, and an empty string rendered as an author would be worse
+    than "Unknown"."""
+    if not isinstance(value, str):
+        return None
+    text = clean_text(value).strip()
+    return text[:MAX_PROPERTY_CHARS] if text else None
+
+
+def iso_or_none(text):
+    """A W3CDTF timestamp as OOXML writes it (`2026-01-04T12:00:00Z`), or None.
+
+    Validated rather than trusted: this string lands in a database column that three date surfaces
+    parse, and a malformed one renders as "Invalid Date" on all of them."""
+    if not text:
+        return None
+    import datetime
+
+    try:
+        datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return text
+
+
+def pdf_string(value):
+    """A PDF string object as text, or None.
+
+    Values arrive as bytes in either UTF-16 (BOM-prefixed, which is how any non-ASCII name is
+    written) or PDFDocEncoding, which agrees with latin-1 across everything a name realistically
+    contains. Pure, so it is tested without a PDF library present."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, bytes):
+        return None
+    if value[:2] in (b"\xfe\xff", b"\xff\xfe"):
+        return value.decode("utf-16", "replace")
+    return value.decode("latin-1", "replace")
+
+
+def pdf_offset(tz):
+    """The UTC offset of a PDF date (`+01'00'`, `Z`, or absent) as an ISO suffix, or None when it is
+    not one at all.
+
+    Absent means the spec's "local time, locale unknown". Stored as `Z` so PM keeps ONE timestamp
+    format everywhere; the worst case is a displayed DATE shifting by a few hours at a boundary,
+    against a stored naive time that no reader could place either."""
+    if tz in ("", "Z", "z"):
+        return "Z"
+    if tz[0] not in "+-":
+        return None
+    rest = tz[1:].replace("'", "")
+    if len(rest) == 2 and rest.isdigit():
+        return f"{tz[0]}{rest}:00"
+    if len(rest) == 4 and rest.isdigit():
+        return f"{tz[0]}{rest[:2]}:{rest[2:]}"
+    return None
+
+
+def pdf_date_to_iso(text):
+    """A PDF date string (`D:20260104120000+01'00'`) as ISO-8601, or None.
+
+    Every field after the year is optional in the spec and real writers omit them, so a bare
+    `D:2026` is legal and means the first instant of that year. Anything that is not that shape is
+    refused outright rather than salvaged — an ISO date wrongly stored in the Info dictionary would
+    otherwise be truncated to its year and reported with false precision. Pure."""
+    if not text:
+        return None
+    import datetime
+
+    s = text.strip()
+    if s.startswith("D:"):
+        s = s[2:]
+    lead = 0
+    while lead < len(s) and s[lead].isdigit():
+        lead += 1
+    # 4/6/8/10/12/14 = the spec's truncation points (year … second). Any other run is not a date.
+    if lead not in (4, 6, 8, 10, 12, 14):
+        return None
+    digits, offset = s[:lead], pdf_offset(s[lead:])
+    if offset is None:
+        return None
+
+    def part(start, end, default):
+        piece = digits[start:end]
+        return int(piece) if len(piece) == end - start else default
+
+    try:
+        stamp = datetime.datetime(
+            int(digits[:4]),
+            part(4, 6, 1),
+            part(6, 8, 1),
+            part(8, 10, 0),
+            part(10, 12, 0),
+            part(12, 14, 0),
+        )
+    except ValueError:
+        return None
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S") + offset
+
+
+def _ooxml_properties(path):
+    """`docProps/core.xml` out of an OOXML container, without inflating anything else."""
+    try:
+        from defusedxml.ElementTree import fromstring
+    except Exception:
+        # Fail CLOSED, unlike the best-effort `defuse_stdlib()` at the top of this file: that one
+        # hardens a parse that ingest depends on, so proceeding beats breaking. This parse is
+        # optional, so a venv missing defusedxml simply doesn't get properties.
+        return no_properties()
+    import zipfile
+
+    try:
+        _guard_archive_inflation(path)
+        with zipfile.ZipFile(path) as zf:
+            info = zf.getinfo(CORE_PROPS_PATH)
+            if info.file_size > MAX_DOC_PROPS_BYTES:
+                return no_properties()
+            raw = zf.read(CORE_PROPS_PATH)
+        root = fromstring(raw)
+    except Exception:
+        # KeyError (a writer that emitted no core.xml — legal), BadZipFile, the inflation guard's
+        # ValueError, a parse error, an unreadable file. All the same answer here.
+        return no_properties()
+
+    def text(tag):
+        el = root.find(tag)
+        return clean_property(el.text if el is not None else None)
+
+    return {
+        "author": text(f"{_DC_NS}creator"),
+        "last_modified_by": text(f"{_CP_NS}lastModifiedBy"),
+        "created": iso_or_none(text(f"{_DCTERMS_NS}created")),
+    }
+
+
+def _pdf_properties(path):
+    """The Info dictionary of a PDF. Parses the trailer and one object — not the page content — so
+    this stays cheap next to the conversion that follows."""
+    try:
+        from pdfminer.pdfdocument import PDFDocument
+        from pdfminer.pdfparser import PDFParser
+    except Exception:
+        return no_properties()
+    try:
+        with open(path, "rb") as fh:
+            doc = PDFDocument(PDFParser(fh))
+            info = doc.info[0] if doc.info else {}
+    except Exception:
+        # Encrypted, truncated, or not a PDF at all. The conversion that follows delivers the real
+        # verdict on the file; this reader has no opinion to add.
+        return no_properties()
+    return {
+        "author": clean_property(pdf_string(info.get("Author"))),
+        # A PDF names a Producer and a Creator, both of which are APPLICATIONS rather than people.
+        # Rendering "Microsoft Word" under "Modified by" would be a wrong answer, which is strictly
+        # worse than the missing one.
+        "last_modified_by": None,
+        "created": pdf_date_to_iso(pdf_string(info.get("CreationDate"))),
+    }
+
+
+def read_document_properties(path):
+    """Author, last editor and creation date as the DOCUMENT states them, for the formats that
+    state them. Always `{author, last_modified_by, created}`; each value null when unstated."""
+    lower = str(path).lower()
+    if lower.endswith(OOXML_PROPERTY_EXTS):
+        return _ooxml_properties(path)
+    if lower.endswith(".pdf"):
+        return _pdf_properties(path)
+    # .txt/.md/.html/.csv and the rest carry no property block at all. Not a failure: most files
+    # genuinely have no author to state, which is the case "Unknown" exists for.
+    return no_properties()
+
+
+def do_file_properties(params):
+    """What one file says about itself. Rust asks only for the extensions that can answer, so an
+    all-null reply here means the document really didn't say."""
+    path = params["path"]
+    try:
+        _guard_file_size(path)
+    except ValueError:
+        # Over the input cap: `convert` refuses this file anyway, so there is no document for these
+        # properties to belong to.
+        return no_properties()
+    return read_document_properties(path)
+
+
 def do_convert(params):
     """Convert one file to Markdown. Returns its text and a best-effort title."""
     path = params["path"]
@@ -1338,6 +1569,7 @@ HANDLERS = {
     "ping": lambda params: {"ok": True},
     "worker_selftest": do_worker_selftest,
     "convert": do_convert,
+    "file_properties": do_file_properties,
     "embed": do_embed,
     "count_tokens": do_count_tokens,
     "rerank": do_rerank,
