@@ -4,14 +4,7 @@
 import { useEffect, useState } from "react";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 
-import {
-  appLockStatus,
-  exportAllData,
-  getSettings,
-  openDataFolder,
-  setAppLock,
-  setDuplicateCheck,
-} from "../../lib/ipc";
+import { appLockStatus, exportAllData, openDataFolder, setAppLock } from "../../lib/ipc";
 import { IS_LINUX } from "../../lib/setupGuide";
 import type { AppLockStatus } from "../../lib/types";
 import { RemovePmData } from "../RemovePmData";
@@ -26,29 +19,12 @@ export function DataSecuritySettings() {
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [duplicateCheck, setDuplicateCheckState] = useState(false);
 
   useEffect(() => {
     appLockStatus()
       .then(setAppLockState)
       .catch(() => {});
-    getSettings()
-      .then((s) => setDuplicateCheckState(s.duplicate_check))
-      .catch(() => {});
   }, []);
-
-  async function toggleDuplicateCheck(next: boolean) {
-    setError(null);
-    // Optimistic, then reverted on failure: the toggle only decides whether an action is OFFERED, so
-    // a flicker costs nothing and a toggle that ignores your click reads as broken.
-    setDuplicateCheckState(next);
-    try {
-      await setDuplicateCheck(next);
-    } catch (e) {
-      setDuplicateCheckState(!next);
-      setError(String(e));
-    }
-  }
 
   async function toggleAppLock(next: boolean) {
     setError(null);
@@ -158,41 +134,6 @@ export function DataSecuritySettings() {
             </p>
           </SectionInfo>
         )}
-      </div>
-
-      <div
-        id="sec-data-duplicates"
-        data-settings-section
-        className="mt-5 border-t border-border pt-4"
-        data-help="settings-duplicates"
-      >
-        <SettingRow
-          label="Duplicate check"
-          emphasis="strong"
-          spacing="none"
-          description="Adds a “Check for duplicates” action to your Documents list."
-        >
-          {(a11y) => (
-            <Toggle
-              {...a11y}
-              checked={duplicateCheck}
-              onChange={(v) => void toggleDuplicateCheck(v)}
-            />
-          )}
-        </SettingRow>
-        <SectionInfo title="How PM looks for duplicates">
-          <p>
-            Two ways, and it runs only when you ask. It compares the opening of each document — with
-            capitals, punctuation and spacing ignored, so the same file converted two different ways
-            still matches — and it compares what each document is <em>about</em>, which catches the
-            same report saved as both a Word file and a PDF.
-          </p>
-          <p>
-            It always shows you both documents and never removes anything. Documents built from the
-            same template share an opening, and a run of invoices reads very alike, so some pairs
-            will not be duplicates at all — that judgement stays yours.
-          </p>
-        </SectionInfo>
       </div>
 
       <div

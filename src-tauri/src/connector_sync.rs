@@ -488,6 +488,10 @@ pub fn apply_connector_actions(
     // synchronously must not find the mutex still held (it is not reentrant).
     drop(gateway);
     for document in &applied.landed {
+        // Noted for the background duplicate check whether or not it is announced (#711): an
+        // already-reviewed row is not news for the Review queue, but it is every bit as capable of
+        // being the second copy of something.
+        crate::duplicates::note_arrival(state.inner(), document.id);
         // An already-reviewed row is not an arrival for the Review queue's purposes. Cheap to check
         // here, and it keeps a promoted-then-resynced file from reappearing as new.
         if !document.reviewed {

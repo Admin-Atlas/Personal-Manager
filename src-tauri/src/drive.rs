@@ -199,6 +199,17 @@ pub struct TwinSweep {
     pub divergent: usize,
     /// Twins with no survivor (unexpected post-v19) — re-keyed into the new namespace (adopted).
     pub adopted: usize,
+    /// The retired twins' source ids, for the caller to strip from the portable manifest (#711).
+    ///
+    /// Both this and [`Self::rekeyed`] were missing, and the omission made the whole sweep a ghost:
+    /// it changed the DB and left the manifest saying what it always had, so
+    /// [`crate::index_only::reconcile_on_open`]'s mirror-∪-file union kept the old entry and the next
+    /// Rebuild restored the twin it had just retired. The sweep is idempotent, so this went unnoticed
+    /// — it simply did the same work again, forever.
+    pub retired_ids: Vec<String>,
+    /// Adopted twins as `(old_id, new_id)`, for the caller to RENAME in the manifest rather than
+    /// strip: the row moved namespace and kept its filing, so `forget_source` would throw that away.
+    pub rekeyed: Vec<(String, String)>,
 }
 
 /// Resolve the v19 shared-drive "twins" left stranded when two connected accounts had indexed the same
@@ -267,6 +278,7 @@ pub fn resolve_shared_drive_twins(conn: &Connection) -> Result<TwinSweep> {
                     "UPDATE OR IGNORE documents SET source_id = ?1 WHERE id = ?2",
                     params![survivor_id, id],
                 )?;
+                sweep.rekeyed.push((source_id.clone(), survivor_id));
                 sweep.adopted += 1;
             }
             Some((s_project, s_tags, s_importance, s_reviewed, s_entity)) => {
@@ -279,6 +291,7 @@ pub fn resolve_shared_drive_twins(conn: &Connection) -> Result<TwinSweep> {
                     let tx = conn.unchecked_transaction()?;
                     crate::ingest::delete_document(&tx, id)?;
                     tx.commit()?;
+                    sweep.retired_ids.push(source_id.clone());
                     sweep.retired += 1;
                 } else {
                     // Divergent filing: a user-facing merge decision — left untouched, deferred.
@@ -1163,6 +1176,27 @@ pub fn merge_classification(survivor: Classification, doomed: &Classification) -
         reviewed: survivor.reviewed || doomed.reviewed,
         entity_id: survivor.entity_id.or(doomed.entity_id),
     }
+}
+
+/// Read one document's classification by id, or `None` when there is no such row. The by-document-id
+/// twin of [`classified_row`], for callers that already resolved which rows they are merging —
+/// [`crate::duplicates::fold_by_identity`] groups by provider file id, not by source id.
+pub fn classification_of(conn: &Connection, document_id: i64) -> Result<Option<Classification>> {
+    conn.query_row(
+        "SELECT project, tags, importance, reviewed, entity_id FROM documents WHERE id = ?1",
+        params![document_id],
+        |r| {
+            Ok(Classification {
+                project: r.get(0)?,
+                tags: r.get(1)?,
+                importance: r.get(2)?,
+                reviewed: r.get::<_, i64>(3)? != 0,
+                entity_id: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Read one index-only row's id + classification, or `None` when there is no such row.
@@ -3056,6 +3090,14 @@ mod tests {
         assert_eq!(sweep.retired, 1, "the identical duplicate is merged away");
         assert_eq!(sweep.divergent, 1, "the divergent one is never guessed");
         assert_eq!(sweep.adopted, 0);
+        // #711: the sweep has to SAY which ids it retired, or the caller cannot carry the change into
+        // the portable manifest — and `reconcile_on_open`'s mirror-∪-file union then restores the twin
+        // this pass just deleted, on every open, forever.
+        assert_eq!(
+            sweep.retired_ids,
+            vec!["gdrive:a@b.com:sd:D1:F1".to_string()]
+        );
+        assert!(sweep.rekeyed.is_empty(), "nothing moved namespace here");
 
         let count = |sid: &str| -> i64 {
             conn.query_row(

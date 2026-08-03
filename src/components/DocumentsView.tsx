@@ -21,20 +21,26 @@ import {
   clearRebuildActivity,
   rebuildStatus,
   setDocumentMetadata,
-  setDuplicateCheck,
+  duplicateSnapshot,
+  onDuplicatesUpdated,
   sidecarStatus,
   vaultStatus,
 } from "../lib/ipc";
 import { landingSeq, landingsSince, mergeLandings, onDocumentsLanded } from "../lib/documentFeed";
-import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
+import { subscribeUntilCleanup } from "../lib/subscribe";
+import type {
+  Document,
+  DevTablePage,
+  DuplicateReport,
+  IngestEvent,
+  SidecarStatus,
+} from "../lib/types";
 import { formatDateTime } from "../lib/format";
 import {
   readActivityOpen,
   readCopyPhotosToVault,
-  readDuplicateNudgeSeen,
   writeActivityOpen,
   writeCopyPhotosToVault,
-  writeDuplicateNudgeSeen,
 } from "../lib/documentPrefs";
 import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
@@ -61,7 +67,7 @@ import { IngestProgress } from "./IngestProgress";
 // ONE-TIME cleanup — remove with the component in the release after this one (card #651 follow-up).
 import { OrphanSweepBanner } from "./OrphanSweepBanner";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
-import { DuplicateNudge, DuplicatesPanel } from "./DuplicatesPanel";
+import { DuplicatesPanel } from "./DuplicatesPanel";
 import { useReader } from "../lib/reader";
 
 // Datalist backing the inline-reclassify project field (existing project names for autocomplete).
@@ -133,22 +139,9 @@ function hasPhotos(paths: string[]): boolean {
 interface Props {
   /** Jump to the Review view (the sorting-review queue). */
   onReviewClick?: () => void;
-  /**
-   * Whether the duplicate check is switched on (#282), or `null` while settings are still loading.
-   *
-   * Passed in rather than read here, and that is the whole point: Settings is an overlay rendered
-   * as a SIBLING of this view, so this component stays mounted underneath it and a mount-time read
-   * never sees the toggle being flipped. Turning the check on and closing Settings left the user
-   * looking at a Documents tab with no "Check for duplicates" anywhere — exactly where the Settings
-   * copy had just told them to look. App re-reads settings when the overlay closes, so taking it
-   * from there fixes both directions at once.
-   */
-  duplicateCheck: boolean | null;
-  /** Re-read settings after this view turns the check on itself (from the nudge). */
-  onDuplicateCheckChange: () => void;
 }
 
-export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckChange }: Props) {
+export function DocumentsView({ onReviewClick }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [status, setStatus] = useState<SidecarStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -236,31 +229,39 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
   // "show full text" here anymore.
   const { openReader, current: readerDoc } = useReader();
 
-  // #282. `duplicateCheck` is `null` until settings have loaded, so neither the panel nor the nudge
-  // flashes on before PM knows which one belongs here. The nudge's dismissal is per-machine UI
-  // state, not a preference about this library, so it lives in localStorage rather than the vault's
-  // settings.
-  const [duplicateNudgeDismissed, setDuplicateNudgeDismissed] = useState(readDuplicateNudgeSeen);
+  // The duplicate check (#282, moved here by #711). It used to be gated by a Settings toggle, with a
+  // dismissible nudge in this view so an off-by-default tool buried in a Settings tab was findable
+  // at all. Both are gone: the check is one faint button beside the list it acts on, which is where
+  // "one control, one home" said it belonged, and the nudge existed only to work around it not
+  // being there.
+  //
+  // The report is held HERE rather than in the panel because the button needs it too — a background
+  // check that found something has to be able to say so without the panel being open, which is the
+  // entire point of it running in the background.
+  const [duplicates, setDuplicates] = useState<DuplicateReport | null>(null);
+  const [showDuplicates, setShowDuplicates] = useState(false);
+  const duplicatePairs = duplicates?.pairs.length ?? 0;
 
-  async function enableDuplicateCheck() {
-    setError(null);
-    try {
-      await setDuplicateCheck(true);
-      // Turning it on IS the nudge having done its job, so it is spent either way. Without this it
-      // would come back the next time the check was switched off in Settings — and a suggestion
-      // that returns after you have both seen it and acted on it is no longer a suggestion.
-      writeDuplicateNudgeSeen();
-      setDuplicateNudgeDismissed(true);
-      onDuplicateCheckChange();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  function dismissDuplicateNudge() {
-    writeDuplicateNudgeSeen();
-    setDuplicateNudgeDismissed(true);
-  }
+  // Read on mount and again whenever a background check finishes. Read on MOUNT specifically
+  // because the tab router unmounts this view: a result held only here would be discarded the
+  // moment the user looked at something else, which is exactly the failure the long-running-jobs
+  // rule exists to prevent. The backend owns the snapshot; this is the re-read.
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      duplicateSnapshot()
+        .then((r) => {
+          if (alive) setDuplicates(r);
+        })
+        .catch(() => {});
+    };
+    load();
+    const stop = subscribeUntilCleanup(() => onDuplicatesUpdated(load));
+    return () => {
+      alive = false;
+      stop();
+    };
+  }, []);
 
   // Promote a Drive Sheet (index-only) to a full local spreadsheet import. Fetches the whole grid,
   // indexes it locally, and reloads so the row reflects its new source type.
@@ -844,6 +845,18 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
           <Button onClick={pickFolder} disabled={busy || installingOcr}>
             Add folder
           </Button>
+          {/* Faint, like Rebuild beside it: a rarely-used tool that acts on this list, not a
+              primary action. The count is the whole return on checking in the background — without
+              it the button would look identical whether PM had found three duplicates or none, and
+              nobody would press it. */}
+          <Button
+            variant="tertiary"
+            onClick={() => setShowDuplicates((v) => !v)}
+            data-help="documents-duplicates"
+            title="Look for documents you have twice"
+          >
+            {duplicatePairs > 0 ? `Duplicates (${duplicatePairs})` : "Duplicates"}
+          </Button>
           <Button
             variant="tertiary"
             onClick={() => setConfirmRebuild(true)}
@@ -1129,15 +1142,15 @@ export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckC
             </Card>
           )}
 
-          {/* #282. When the check is on, its panel sits above the list it acts on — the one control,
-              one home rule: Settings owns whether it is offered, this view owns using it. When it is
-              off, a single dismissible nudge exists so the feature is discoverable at all; without
-              it, an off-by-default tool buried in a Settings tab is one nobody finds. */}
-          {duplicateCheck === true && <DuplicatesPanel />}
-          {duplicateCheck === false && !duplicateNudgeDismissed && documents.length > 0 && (
-            <DuplicateNudge
-              onEnable={() => void enableDuplicateCheck()}
-              onDismiss={dismissDuplicateNudge}
+          {/* The duplicate panel sits above the list it acts on, and only when asked for — one
+              control, one home. What has changed since #282 is that its answer can already be
+              waiting: the background check runs after any sync or import that actually landed
+              something, so opening this is often reading a result rather than starting a wait. */}
+          {showDuplicates && (
+            <DuplicatesPanel
+              report={duplicates}
+              onReport={setDuplicates}
+              onClose={() => setShowDuplicates(false)}
             />
           )}
 

@@ -426,6 +426,10 @@ pub fn run(
                 if !document.reviewed {
                     let _ = app.emit(DOCUMENT_LANDED, &document);
                 }
+                // The other door a new document comes through (#711). A file dragged in is exactly
+                // as likely to be a second copy of something as one a connector found — more so,
+                // since the user is often importing what they already have in a cloud account.
+                crate::duplicates::note_arrival(&state, document.id);
                 let _ = on_event.send(IngestEvent::Done { document, warning });
                 // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously.
                 // Re-read each file (cheap) so flipping Fast/Gentle mid-import takes effect at once.
@@ -468,6 +472,9 @@ pub fn run(
         failed,
         unreadable,
     });
+    // The import is over — check what it landed, in the background and only if it landed anything
+    // (#711). Same rule as the connectors': once per run, never once per file.
+    crate::duplicates::sweep_arrivals(app);
     Ok(())
 }
 

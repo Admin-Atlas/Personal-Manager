@@ -20,6 +20,7 @@ const scanDuplicates = vi.fn();
 const deleteDocument = vi.fn();
 const dismissDuplicatePair = vi.fn();
 const restoreDuplicateDismissals = vi.fn();
+const documentLocations = vi.fn();
 const openReader = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
@@ -29,6 +30,7 @@ vi.mock("../lib/ipc", () => ({
   // throws, so a new ipc import has to be added in the same change that uses it.
   dismissDuplicatePair: (a: number, b: number) => dismissDuplicatePair(a, b),
   restoreDuplicateDismissals: () => restoreDuplicateDismissals(),
+  documentLocations: (id: number) => documentLocations(id),
 }));
 
 vi.mock("../lib/reader", () => ({
@@ -55,11 +57,22 @@ vi.mock("../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
+import { useState } from "react";
+
 import { DuplicatesPanel } from "./DuplicatesPanel";
+import type { Document, DuplicateReport } from "../lib/types";
 
 afterEach(cleanup);
 
-function doc(id: number, title: string, source_type = "vault") {
+/** The panel as the Documents view mounts it: the report lives OUTSIDE, because the toolbar button
+ *  shows its count whether or not the panel is open. `seed` stands in for a background check that
+ *  already ran. */
+function Panel({ seed = null }: { seed?: DuplicateReport | null }) {
+  const [report, setReport] = useState<DuplicateReport | null>(seed);
+  return <DuplicatesPanel report={report} onReport={setReport} onClose={() => {}} />;
+}
+
+function doc(id: number, title: string, source_type: Document["source_type"] = "vault"): Document {
   return {
     id,
     title,
@@ -79,11 +92,14 @@ function doc(id: number, title: string, source_type = "vault") {
     source_state: "ok",
     source_id: null,
     external_ref: null,
-    stored_summary: null,
     source_modified_at: null,
-    source_account: null,
     source_parent_folder_id: null,
     source_parent_folder_name: null,
+    source_author: null,
+    source_last_modified_by: null,
+    source_created_at: null,
+    source_size_bytes: null,
+    pm_refreshed_at: null,
   };
 }
 
@@ -102,22 +118,49 @@ beforeEach(() => {
     similarity_skipped: false,
     similarity_limit: 5000,
     dismissed: 0,
+    checked_at: "2026-08-03T09:00:00Z",
+    incremental: false,
   });
   deleteDocument.mockResolvedValue(undefined);
+  documentLocations.mockResolvedValue([]);
   dismissDuplicatePair.mockResolvedValue(undefined);
   restoreDuplicateDismissals.mockResolvedValue(undefined);
 });
 
+const CHECK = "Check the whole library";
+
 async function scanned() {
-  render(<DuplicatesPanel />);
-  fireEvent.click(screen.getByRole("button", { name: "Check for duplicates" }));
+  render(<Panel />);
+  fireEvent.click(screen.getByRole("button", { name: CHECK }));
   await waitFor(() => expect(screen.getByText("Contract Acme")).toBeTruthy());
 }
 
 describe("the scan", () => {
   it("runs only when asked", () => {
-    render(<DuplicatesPanel />);
+    render(<Panel />);
     expect(scanDuplicates).not.toHaveBeenCalled();
+  });
+
+  it("shows what the background check already found, without asking again", async () => {
+    // The whole return on checking after a sync (#711): opening the panel reads a result rather
+    // than starting a 13-second wait. A panel that re-scanned on mount would throw that away.
+    render(
+      <Panel
+        seed={{
+          scanned: 120,
+          pairs: [BOTH_SIGNALS],
+          similarity_skipped: false,
+          similarity_limit: 5000,
+          dismissed: 0,
+          checked_at: "2026-08-03T09:00:00Z",
+          incremental: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("Contract Acme")).toBeTruthy();
+    expect(scanDuplicates).not.toHaveBeenCalled();
+    // …and it says what it did NOT look at, for the same reason a half-run scan does.
+    expect(screen.getByText(/covers what has arrived since PM last looked/)).toBeTruthy();
   });
 
   it("says why a pair was flagged, in words that carry the confidence", async () => {
@@ -152,16 +195,18 @@ describe("the scan", () => {
       pairs: [],
       similarity_skipped: true,
       similarity_limit: 5000,
+      checked_at: "2026-08-03T09:00:00Z",
+      incremental: false,
     });
-    render(<DuplicatesPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Check for duplicates" }));
+    render(<Panel />);
+    fireEvent.click(screen.getByRole("button", { name: CHECK }));
     await waitFor(() => expect(screen.getByText(/compared openings only/)).toBeTruthy());
   });
 
   it("surfaces a failure instead of looking like an empty library", async () => {
     scanDuplicates.mockRejectedValue("the index is being rebuilt");
-    render(<DuplicatesPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Check for duplicates" }));
+    render(<Panel />);
+    fireEvent.click(screen.getByRole("button", { name: CHECK }));
     await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/rebuilt/));
     expect(screen.queryByText(/Nothing looks duplicated/)).toBeNull();
   });
@@ -230,9 +275,11 @@ describe("keeping both", () => {
       similarity_skipped: false,
       similarity_limit: 5000,
       dismissed: 3,
+      checked_at: "2026-08-03T09:00:00Z",
+      incremental: false,
     });
-    render(<DuplicatesPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Check for duplicates" }));
+    render(<Panel />);
+    fireEvent.click(screen.getByRole("button", { name: CHECK }));
     await waitFor(() => expect(screen.getByText(/3 pairs you chose to keep/)).toBeTruthy());
 
     fireEvent.click(screen.getByRole("button", { name: "Show them again" }));

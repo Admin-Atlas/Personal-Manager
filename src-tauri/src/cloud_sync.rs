@@ -347,6 +347,10 @@ fn emit_run_finished<C: CloudDriver>(app: &AppHandle) {
             report: report.unwrap_or_default(),
         },
     );
+    // The run is over — check whatever it landed for duplicates, in the background and only if it
+    // landed anything (#711). Deliberately here rather than per item: a pass that indexes four
+    // hundred files should compare them once, together, not four hundred times.
+    crate::duplicates::sweep_arrivals(app);
 }
 
 /// True if the running sync has been asked to stop.

@@ -484,6 +484,11 @@ pub struct AppState {
     pub local_sync: Mutex<LocalFolderSyncState>,
     /// Cooperative stop flag for the running local-folder sync (the sibling of `drive_sync_cancel`).
     pub local_sync_cancel: AtomicBool,
+    /// The background duplicate check's state (#711): what has landed since the last sweep, whether
+    /// one is running, and what it found. In memory for the session — every pair is recomputable
+    /// from the store, so persisting it would be a second copy of a derived thing to keep in step
+    /// with deletions, re-embeds and dismissals.
+    pub duplicate_watch: Mutex<duplicates::DuplicateWatch>,
     /// Snapshot of the currently-running index rebuild, so the Documents tab (and the Settings
     /// rebuild modal) can resume showing progress after the user navigates away and back — the
     /// ingest sibling of `drive_sync`.
@@ -971,6 +976,33 @@ impl AppState {
         }
     }
 
+    /// Carry a set of source-id changes made in the DB into the portable manifest, so they survive a
+    /// Rebuild (#711).
+    ///
+    /// The two halves are not interchangeable. A **retired** id is a document that no longer exists,
+    /// so it is stripped ([`index_only::forget_source`]); a **re-keyed** one is the same document
+    /// under a new id, so it is renamed in place ([`index_only::rekey_sources`]) — stripping it would
+    /// throw away the user's filing.
+    ///
+    /// Best-effort and logged, like every other step of the open: a manifest write that fails must
+    /// not block the vault opening, and the DB is the live truth either way. What it costs is that
+    /// the sweep runs again next open, which is exactly what it did before this existed.
+    fn carry_to_manifest(
+        vault_root: &std::path::Path,
+        cipher: &index_only::ManifestCipher,
+        retired: &[String],
+        rekeyed: &[(String, String)],
+    ) {
+        for source_id in retired {
+            if let Err(e) = index_only::forget_source(vault_root, cipher, source_id) {
+                eprintln!("index_only: could not strip {source_id} from the manifest ({e})");
+            }
+        }
+        if let Err(e) = index_only::rekey_sources(vault_root, cipher, rekeyed) {
+            eprintln!("index_only: could not re-key the manifest ({e})");
+        }
+    }
+
     /// Reconcile the encrypted index-only manifest with the DB mirror for the active session. Runs
     /// AFTER [`AppState::reconcile_entity_rules`] (it resolves each item's project through the
     /// rebuilt aliases). A no-op when the vault is locked; best-effort, like the rules reconcile —
@@ -987,12 +1019,42 @@ impl AppState {
         // v19 follow-up: retire identical shared-drive twins (harmless duplicates); a divergent twin is
         // left in place for a user-facing merge (deferred). Best-effort, cheap after the first pass.
         match crate::drive::resolve_shared_drive_twins(&conn) {
-            Ok(s) if s.retired + s.divergent + s.adopted > 0 => eprintln!(
-                "drive: shared-drive twins — retired {}, {} divergent left for review, adopted {}",
-                s.retired, s.divergent, s.adopted
-            ),
-            Ok(_) => {}
+            Ok(s) => {
+                if s.retired + s.divergent + s.adopted > 0 {
+                    eprintln!(
+                        "drive: shared-drive twins — retired {}, {} divergent left for review, adopted {}",
+                        s.retired, s.divergent, s.adopted
+                    );
+                }
+                // #711: carry the sweep into the portable manifest. Without this the whole sweep was
+                // a ghost — the DB changed, the file did not, and `reconcile_on_open`'s mirror-∪-file
+                // union below restored what had just been retired. It went unnoticed because the
+                // sweep is idempotent: it simply did the same work again on every open, forever.
+                Self::carry_to_manifest(&vault_root, &cipher, &s.retired_ids, &s.rekeyed);
+            }
             Err(e) => eprintln!("drive: shared-drive twin sweep skipped ({e})"),
+        }
+        // #711: fill `provenance_key` on locations written before v55, then fold every set of rows
+        // that are provably the same file into one document with many locations. Ordered — the fold
+        // reads the key the backfill writes. Cheap once settled: the backfill converges to reading
+        // no rows, and the fold is one grouped scan of `document_locations`.
+        match crate::locations::backfill_keys(&conn) {
+            Ok(n) if n > 0 => {
+                eprintln!("locations: keyed {n} existing locations by provider file id")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("locations: provenance backfill skipped ({e})"),
+        }
+        match crate::duplicates::fold_by_identity(&conn) {
+            Ok(f) if f.folded > 0 => {
+                eprintln!(
+                    "duplicates: folded {} rows into files PM already had",
+                    f.folded
+                );
+                Self::carry_to_manifest(&vault_root, &cipher, &f.retired, &[]);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("duplicates: identity fold skipped ({e})"),
         }
         match index_only::reconcile_on_open(&conn, &vault_root, &cipher) {
             // F-04: the reconcile resolves each item's project with `create_if_new`, so a manifest
@@ -1337,6 +1399,7 @@ pub fn run() {
                 onedrive_sync_cancel: AtomicBool::new(false),
                 local_sync: Mutex::new(LocalFolderSyncState::default()),
                 local_sync_cancel: AtomicBool::new(false),
+                duplicate_watch: Mutex::new(duplicates::DuplicateWatch::default()),
                 ingest_job: Mutex::new(IngestJobState::default()),
                 retag_job: Mutex::new(RetagJobState::default()),
                 retag_busy: AtomicBool::new(false),
@@ -1493,8 +1556,8 @@ pub fn run() {
             settings::set_background_auto_switch,
             settings::set_help_mode,
             settings::set_reranking,
-            settings::set_duplicate_check,
             duplicates::scan_duplicates,
+            duplicates::duplicate_snapshot,
             duplicates::dismiss_duplicate_pair,
             duplicates::restore_duplicate_dismissals,
             // ONE-TIME cleanup — delete these three with the `sweep` module in the release after
@@ -1683,6 +1746,7 @@ pub fn run() {
             commands::open_source,
             commands::read_document_body,
             commands::document_chunk_spans,
+            commands::document_locations,
             commands::read_document_image,
             commands::open_url,
             commands::get_tray_enabled,

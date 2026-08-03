@@ -48,6 +48,40 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::Result;
 use crate::index_only::SourceState;
 
+/// A provider-global key for the FILE a source id points at — the primitive #711 needed and PM had
+/// nowhere. `None` when the provider offers no such key, which is not a failure but an answer.
+///
+/// A source id says **where**, and it says it differently for every route the same Drive file
+/// arrives by: `gdrive:<email>:<fileId>` to its owner, `gdrive:swm:<rootId>:<fileId>` to whoever it
+/// was shared with, `gdrive:sd:<driveId>:<fileId>` inside a shared drive — plus the legacy
+/// `gdrive:<email>:sd:<driveId>:<fileId>` twin shape v19 re-keyed away from. All four end in the
+/// same Drive fileId, which is global: Drive hands one id per file across My Drive, shared drives
+/// and every share of it. So the key is the last `:`-separated segment, and taking it from the END
+/// is what makes one rule cover all four shapes instead of four parsers that can disagree.
+///
+/// **The trap this is written to avoid.** Drive fileIds are `[A-Za-z0-9_-]`, so they legitimately
+/// contain `_` — which is a single-character wildcard in SQL `LIKE`. A `LIKE 'gdrive:%:' || fileId`
+/// lookup would therefore match a DIFFERENT file whose id differs only in that position, and merge
+/// two documents that were never the same thing. Nothing here builds a pattern: the key is derived
+/// in Rust, stored in a column, and compared with `=`.
+///
+/// **OneDrive returns `None`, on purpose.** Graph item ids are unique per *drive*, not per tenant,
+/// so a bare itemId key could collide across two accounts and merge two genuinely different files.
+/// An unsound key is worse than no key — a missed duplicate is a row the user scrolls past, a false
+/// one silently destroys a document. Local folders are `None` for the same reason (an OS file id is
+/// per-volume) and chats and photos because they are not files a connector found.
+pub fn provenance_key(source_id: &str) -> Option<String> {
+    // Drive is the only provider with a global file id today. Anything else answers "no key", and
+    // adding one is a per-provider proof about its id space, never a default.
+    let rest = source_id.strip_prefix("gdrive:")?;
+    let file_id = rest.rsplit(':').next()?;
+    // A prefix with nothing after it (`gdrive:`, `gdrive:a@b.com:`) names no file.
+    if file_id.is_empty() || !rest.contains(':') {
+        return None;
+    }
+    Some(format!("gdrive-file:{file_id}"))
+}
+
 /// One place a document's file lives, as stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
@@ -151,11 +185,12 @@ pub fn record(conn: &Connection, document_id: i64, loc: &Location) -> Result<()>
     conn.execute(
         "INSERT INTO document_locations (document_id, source_id, source_state, external_ref, \
              source_modified_at, source_content_hash, source_parent_folder_id, \
-             source_parent_folder_name) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             source_parent_folder_name, provenance_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
          ON CONFLICT(source_id) DO UPDATE SET \
              document_id = excluded.document_id, \
              source_state = excluded.source_state, \
+             provenance_key = excluded.provenance_key, \
              external_ref = COALESCE(excluded.external_ref, external_ref), \
              source_modified_at = COALESCE(excluded.source_modified_at, source_modified_at), \
              source_content_hash = COALESCE(excluded.source_content_hash, source_content_hash), \
@@ -170,9 +205,75 @@ pub fn record(conn: &Connection, document_id: i64, loc: &Location) -> Result<()>
             loc.source_content_hash,
             loc.source_parent_folder_id,
             loc.source_parent_folder_name,
+            provenance_key(&loc.source_id),
         ],
     )?;
     sync_document(conn, document_id)
+}
+
+/// Fill [`provenance_key`] on locations that predate the column (v55) — every row written before
+/// #711 shipped, since the migration deliberately left the derivation to this one function rather
+/// than reimplementing it as SQL string surgery.
+///
+/// Narrowed to `gdrive:` ids because that is the only prefix [`provenance_key`] answers for, and a
+/// prefix `LIKE` is safe (no user data in the pattern). Everything else keeps a NULL key, which is
+/// its correct final value — so this converges to reading zero rows rather than re-visiting every
+/// OneDrive and local location at each open. Returns how many rows it filled.
+pub fn backfill_keys(conn: &Connection) -> Result<usize> {
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id FROM document_locations \
+             WHERE provenance_key IS NULL AND source_id LIKE 'gdrive:%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut filled = 0usize;
+    for (id, source_id) in pending {
+        let Some(key) = provenance_key(&source_id) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE document_locations SET provenance_key = ?2 WHERE id = ?1",
+            params![id, key],
+        )?;
+        filled += 1;
+    }
+    Ok(filled)
+}
+
+/// The index-only document already holding a location of this same file, if PM knows one — the
+/// lookup that stops a second document being minted for a file arriving by a second route.
+///
+/// Exact equality on the derived key, never a `LIKE` (see [`provenance_key`] for why that
+/// distinction is load-bearing). Ordered by document id so two callers racing the same file settle
+/// on the same survivor rather than each adopting the other.
+pub fn document_for_key(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT l.document_id FROM document_locations l \
+         JOIN documents d ON d.id = l.document_id \
+         WHERE l.provenance_key = ?1 AND d.source_type = 'index_only' \
+         ORDER BY l.document_id LIMIT 1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Move every location of `from` onto `to` — the fold, and the reason a duplicate can be resolved
+/// without losing a place the file lives.
+///
+/// **Order matters at the call site.** `document_locations.document_id` cascades on delete, so this
+/// has to run BEFORE the doomed document row goes; run after, and the locations it was meant to
+/// rescue are already gone. Callers do both inside one transaction.
+pub fn move_all(conn: &Connection, from: i64, to: i64) -> Result<usize> {
+    let moved = conn.execute(
+        "UPDATE document_locations SET document_id = ?2 WHERE document_id = ?1",
+        params![from, to],
+    )?;
+    sync_document(conn, to)?;
+    Ok(moved)
 }
 
 /// Forget every location of a document — used when it stops being an index-only pointer at all
@@ -355,9 +456,15 @@ mod tests {
         .unwrap();
         let id = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO document_locations (document_id, source_id, source_state, external_ref) \
-             VALUES (?1, ?2, 'ok', ?3)",
-            params![id, source_id, format!("/at/{source_id}")],
+            "INSERT INTO document_locations (document_id, source_id, source_state, external_ref, \
+                 provenance_key) \
+             VALUES (?1, ?2, 'ok', ?3, ?4)",
+            params![
+                id,
+                source_id,
+                format!("/at/{source_id}"),
+                provenance_key(source_id)
+            ],
         )
         .unwrap();
         id
@@ -653,6 +760,107 @@ mod tests {
         let best = fetchable(&conn, id).unwrap().unwrap();
         assert_eq!(best.state, SourceState::Unreachable);
         assert_eq!(best.source_id, "gdrive:a@x.com:f1");
+    }
+
+    #[test]
+    fn every_route_to_one_drive_file_derives_the_same_key() {
+        // The three live shapes plus the legacy twin one. This single equality is all three of
+        // #711's open cases at once: owner vs recipient, two differently-owned shared roots, and a
+        // shared-drive file also shared directly.
+        let key = Some("gdrive-file:1AbC".to_string());
+        assert_eq!(provenance_key("gdrive:a@x.com:1AbC"), key, "the owner");
+        assert_eq!(
+            provenance_key("gdrive:swm:rootA:1AbC"),
+            key,
+            "shared with me"
+        );
+        assert_eq!(provenance_key("gdrive:swm:rootB:1AbC"), key, "another root");
+        assert_eq!(provenance_key("gdrive:sd:drive9:1AbC"), key, "shared drive");
+        assert_eq!(
+            provenance_key("gdrive:a@x.com:sd:drive9:1AbC"),
+            key,
+            "the legacy per-account shared-drive twin v19 re-keyed away from"
+        );
+    }
+
+    #[test]
+    fn an_underscore_in_a_file_id_cannot_widen_the_match() {
+        // Drive fileIds are [A-Za-z0-9_-], and `_` is a single-character wildcard in SQL LIKE. A
+        // `LIKE 'gdrive:%:' || fileId` lookup would match a DIFFERENT file differing only there and
+        // merge two documents that were never the same thing. The key is derived and compared with
+        // `=`, so these two stay apart — a missed duplicate is a row you scroll past, a false one
+        // destroys a document.
+        let underscore = provenance_key("gdrive:a@x.com:1A_C4").unwrap();
+        let literal = provenance_key("gdrive:a@x.com:1AbC4").unwrap();
+        assert_ne!(underscore, literal);
+        assert_eq!(underscore, "gdrive-file:1A_C4");
+    }
+
+    #[test]
+    fn a_provider_with_no_global_file_id_gets_no_key() {
+        // OneDrive Graph item ids are unique per DRIVE, not per tenant, so a bare-itemId key could
+        // collide across two accounts and merge two genuinely different files. An unsound key is
+        // worse than none. Local ids are per-volume; chats and photos are not connector files.
+        assert_eq!(provenance_key("onedrive:a@x.com:01ITEM"), None);
+        assert_eq!(provenance_key("local:folder1:8892"), None);
+        assert_eq!(provenance_key("chat:conv7"), None);
+        // Malformed Drive ids name no file, and must not all collapse onto one shared key.
+        assert_eq!(provenance_key("gdrive:"), None);
+        assert_eq!(provenance_key("gdrive:a@x.com"), None);
+        assert_eq!(provenance_key("gdrive:a@x.com:"), None);
+    }
+
+    #[test]
+    fn a_second_route_to_a_file_finds_the_document_that_already_has_it() {
+        // The lookup that stops a second document being minted. The owner indexed the file; the
+        // recipient's shared-with-me walk reaches the same fileId under a root id the owner never
+        // sees, and lands on the document that already exists.
+        let conn = open();
+        let id = doc(&conn, "gdrive:a@x.com:1AbC");
+        let key = provenance_key("gdrive:swm:rootB:1AbC").unwrap();
+        assert_eq!(document_for_key(&conn, &key).unwrap(), Some(id));
+        // A different file is a different key, however alike the ids look.
+        let other = provenance_key("gdrive:swm:rootB:1AbD").unwrap();
+        assert_eq!(document_for_key(&conn, &other).unwrap(), None);
+    }
+
+    #[test]
+    fn locations_written_before_v55_are_keyed_at_the_next_open() {
+        // The migration deliberately left the derivation to `provenance_key` rather than writing a
+        // second, divergent copy of the rule as SQL. So every pre-#711 row arrives NULL and this is
+        // what makes it findable — including the legacy twin shape, which is exactly the case the
+        // SQL version would have got wrong.
+        let conn = open();
+        let id = doc(&conn, "gdrive:a@x.com:sd:drive9:1AbC");
+        conn.execute("UPDATE document_locations SET provenance_key = NULL", [])
+            .unwrap();
+        assert_eq!(backfill_keys(&conn).unwrap(), 1);
+        let key = provenance_key("gdrive:sd:drive9:1AbC").unwrap();
+        assert_eq!(document_for_key(&conn, &key).unwrap(), Some(id));
+        // Converges: a second open reads no rows, rather than re-visiting every location forever.
+        assert_eq!(backfill_keys(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn folding_moves_the_places_before_the_row_that_owned_them_goes() {
+        // `document_locations.document_id` cascades on delete, so a fold that deleted first would
+        // destroy the very locations it meant to rescue — and the folded id would come back as a
+        // brand-new file on the next pass, rebuilding the duplicate forever.
+        let conn = open();
+        let survivor = doc(&conn, "gdrive:a@x.com:1AbC");
+        let doomed = doc(&conn, "gdrive:swm:rootB:1AbC");
+        assert_eq!(move_all(&conn, doomed, survivor).unwrap(), 1);
+        conn.execute("DELETE FROM documents WHERE id = ?1", params![doomed])
+            .unwrap();
+        let places: Vec<String> = list(&conn, survivor)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.source_id)
+            .collect();
+        assert_eq!(places, vec!["gdrive:a@x.com:1AbC", "gdrive:swm:rootB:1AbC"]);
+        assert!(!known_ids(&conn, "gdrive:swm:rootB:", None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

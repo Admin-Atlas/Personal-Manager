@@ -1166,6 +1166,7 @@ fn emit_local_run_finished(app: &AppHandle) {
             report: report.unwrap_or_default(),
         },
     );
+    crate::duplicates::sweep_arrivals(app);
 }
 
 /// True if the running local-folder sync has been asked to stop.

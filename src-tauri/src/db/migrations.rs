@@ -1566,6 +1566,30 @@ const MIGRATIONS: &[&str] = &[
     FROM documents
     WHERE source_type = 'index_only' AND source_id IS NOT NULL;
     "#,
+    // v55 — which FILE a location points at, as opposed to where it is (#711).
+    //
+    // v54 gave a document many locations but nothing that could recognise two of them as the same
+    // file. A source id answers "where", and it answers it differently for every route the same
+    // Drive file arrives by: `gdrive:<email>:<fileId>` to its owner, `gdrive:swm:<rootId>:<fileId>`
+    // to whoever it was shared with, `gdrive:sd:<driveId>:<fileId>` inside a shared drive. Nothing
+    // in PM extracted the fileId those three have in common, so three ids meant three documents.
+    //
+    // This column holds that common part, derived (`locations::provenance_key`) rather than
+    // supplied: NULL wherever the provider offers no such key, which is every non-Drive id today.
+    // OneDrive is NULL on purpose and not for want of effort — Graph item ids are unique per DRIVE,
+    // not per tenant, so keying on a bare itemId would be unsound in the direction that matters: it
+    // could merge two genuinely different files.
+    //
+    // Deliberately NOT unique, and deliberately not backfilled here. Not unique because two rows
+    // sharing a key is the whole point — that IS a file in two places. Not backfilled because the
+    // derivation has to cope with the legacy `gdrive:<email>:sd:<driveId>:<fileId>` twin shape as
+    // well as the three live ones, and writing that as SQL string surgery would be a second,
+    // divergent copy of a rule with one correct home. `locations::backfill_keys` fills existing
+    // rows at the next vault open, from the same function every new row goes through.
+    r#"
+    ALTER TABLE document_locations ADD COLUMN provenance_key TEXT;
+    CREATE INDEX idx_document_locations_provenance ON document_locations(provenance_key);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1698,7 +1722,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 54,
+            version, 55,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1725,7 +1749,7 @@ mod tests {
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
-             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54)"
+             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54; \n             which file a location points at is v55)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
