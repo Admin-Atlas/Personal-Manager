@@ -1489,6 +1489,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE documents ADD COLUMN source_created_at       TEXT;
     ALTER TABLE documents ADD COLUMN source_size_bytes       INTEGER;
     "#,
+    // v53 — when PM last rewrote this row from its source (#708).
+    //
+    // `ingested_at` is first-sight only and nothing has ever bumped it; `last_activity` is seeded
+    // from ingest and then only moved by chats; `connector_sources.last_synced_at` is per ACCOUNT,
+    // so it says a Drive was checked, never that this document was. That left no way at all to
+    // tell "nobody has edited this file since March" apart from "this connector stopped working in
+    // March" — the two look identical in every surface PM has.
+    //
+    // Written only when a write actually happens: the refresh guard makes an unchanged item update
+    // zero rows, so an idle fifteen-minute poll does not touch the page cache. That is deliberate,
+    // and it is what the column means — "when PM last had something new to write down", not "when
+    // PM last looked". A stable file therefore keeps an old stamp, honestly.
+    r#"
+    ALTER TABLE documents ADD COLUMN pm_refreshed_at TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1544,7 +1559,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 52,
+            version, 53,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1571,7 +1586,7 @@ mod tests {
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
-             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52)"
+             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

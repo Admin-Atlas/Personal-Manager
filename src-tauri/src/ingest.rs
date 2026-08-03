@@ -2388,9 +2388,12 @@ pub(crate) fn stamp_rebuild_pass(tx: &Connection, doc_id: i64, pass: &str) -> Re
 /// the vault already holds. Kept beside the INSERT so the two can't drift. `vault_path` is the key this
 /// matched on, so it is never rewritten.
 ///
-/// `byte_size` is the one column deliberately COALESCEd rather than assigned: it is measured at ingest
-/// from the ORIGINAL file, and the vault front-matter never carries it — so `rebuild_one` always passes
-/// `None` and a plain assignment would null it on every pass (it did, on every rebuild, until this).
+/// `byte_size` and the four source facts are deliberately COALESCEd rather than assigned. They are
+/// learned from something the vault front-matter does not carry — `byte_size` is measured at ingest
+/// from the ORIGINAL file, and the source facts are what the provider said about it — so
+/// `rebuild_one` always passes `None` for them and a plain assignment nulls them on every pass. It
+/// did exactly that to `byte_size` on every rebuild until this, and the #701 columns shipped with
+/// the same bug because they did not inherit the fix (#708).
 fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<()> {
     let tags_json =
         serde_json::to_string(&meta.tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
@@ -2408,8 +2411,10 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
          source_type = ?14, source_state = ?15, source_id = ?16, external_ref = ?17, \
          source_modified_at = ?18, source_content_hash = ?19, stored_summary = ?20, \
          source_parent_folder_id = ?21, source_parent_folder_name = ?22, source_account = ?23, \
-         source_author = ?24, source_last_modified_by = ?25, source_created_at = ?26, \
-         source_size_bytes = ?27 \
+         source_author = COALESCE(?24, source_author), \
+         source_last_modified_by = COALESCE(?25, source_last_modified_by), \
+         source_created_at = COALESCE(?26, source_created_at), \
+         source_size_bytes = COALESCE(?27, source_size_bytes) \
          WHERE id = ?28",
         params![
             meta.source_path,
@@ -5280,6 +5285,64 @@ mod tests {
             size,
             Some(4096),
             "a rebuild must not forget the file's size"
+        );
+    }
+
+    #[test]
+    fn upsert_preserves_the_source_facts_the_vault_cannot_restore() {
+        // Exactly the `byte_size` story, for the four columns #701 added: the author, last editor,
+        // created date and size come from the PROVIDER, the vault front-matter carries none of them,
+        // and `rebuild_one` therefore supplies None for all four. They shipped without the COALESCE
+        // that had already been added next door, so a Rebuild wiped them off every promoted row.
+        let (_d, conn, vault_id, _idx) = store_with_one_of_each();
+        conn.execute(
+            "UPDATE documents SET source_author = 'Ada Lovelace', \
+                 source_last_modified_by = 'Grace Hopper', \
+                 source_created_at = '2026-01-01T00:00:00Z', source_size_bytes = 4096 \
+             WHERE id = ?1",
+            params![vault_id],
+        )
+        .unwrap();
+
+        let meta = DocMeta {
+            source_path: None,
+            vault_path: "v.md".into(),
+            title: "V".into(),
+            content_hash: "hv".into(),
+            ext: None,
+            byte_size: None,
+            created_at: None,
+            ingested_at: "2026-07-16T00:00:00Z".into(),
+            project: "Unsorted".into(),
+            linked_projects: Vec::new(),
+            tags: vec![],
+            importance: None,
+            reviewed: false,
+            last_activity: None,
+            source: SourceMeta::default(), // exactly what `rebuild_one` supplies
+        };
+        update_document_row(&conn, vault_id, &meta).unwrap();
+
+        let (author, editor, created, size): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT source_author, source_last_modified_by, source_created_at, \
+                        source_size_bytes FROM documents WHERE id = ?1",
+                params![vault_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(author.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(editor.as_deref(), Some("Grace Hopper"));
+        assert_eq!(created.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            size,
+            Some(4096),
+            "a rebuild must not forget what the source said"
         );
     }
 

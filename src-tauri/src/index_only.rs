@@ -635,6 +635,116 @@ pub struct PointerInput {
     pub source_size_bytes: Option<i64>,
 }
 
+/// What the SOURCE says about an item, as of the last time PM looked (#701 wrote them, #708 keeps
+/// them true).
+///
+/// The flow is one-directional on purpose: each connector builds its `SourceFacts` from the payload
+/// in hand, and a [`PointerInput`] is then assembled FROM those facts. So first sight and every
+/// later sighting read one definition of what a file's facts are, and the two cannot drift.
+///
+/// Held separately from [`PointerInput`] because the two paths that write these columns have very
+/// different costs: first-sight ingest has the body in hand and is about to embed it, while a
+/// refresh runs against an item whose content has not changed at all and must therefore be free
+/// when there is nothing to say.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct SourceFacts {
+    pub author: Option<String>,
+    pub last_modified_by: Option<String>,
+    pub created_at: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub modified_at: Option<String>,
+    pub parent_folder_id: Option<String>,
+    /// Resolving a Drive folder's NAME costs an API call, so it is filled in only when the id has
+    /// actually moved. `None` here means "don't touch the stored name", not "the folder is unnamed"
+    /// — which is why [`refresh_source_facts`] treats it separately from the rest.
+    pub parent_folder_name: Option<String>,
+}
+
+impl SourceFacts {
+    /// True when the provider told us nothing at all, so there is no point taking the DB lock.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The parent folder id currently stored for an item, so a caller can tell whether it has moved.
+///
+/// Exists to keep the folder-NAME lookup rare: on Drive a name costs an API call, and resolving one
+/// per distinct folder on every fifteen-minute poll would turn a settled library into a steady
+/// stream of requests. The id itself rides on the listing for free, so comparing ids is what decides
+/// whether the name is worth fetching. `Ok(None)` covers both "no such row" and "no folder".
+pub(crate) fn stored_parent_folder_id(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT source_parent_folder_id FROM documents \
+             WHERE source_id = ?1 AND source_type = 'index_only'",
+            params![source_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Bring one index-only row's source facts up to date, and stamp when that happened.
+///
+/// Returns whether anything was actually written. Two rules, both load-bearing:
+///
+/// **A fact PM knows is never unlearned by silence.** Every column is `COALESCE`d, so a `None`
+/// leaves the stored value alone. Drive genuinely stops reporting `owners` once a file moves into a
+/// shared drive, and Google-native documents have no `size` — under a wholesale assignment those
+/// files would silently lose an author and a size PM had already been told, which is the
+/// lifting-a-constraint-drops-the-default shape that has bitten this codebase before. "Unknown"
+/// should mean PM was never told, not that PM forgot.
+///
+/// **An unchanged item writes nothing.** The `WHERE` clause compares every incoming fact against
+/// what is stored (`IS NOT`, so NULLs compare safely) and matches no rows unless something differs.
+/// This runs for every item on every pass of every account — a fifteen-minute poll over a settled
+/// library must not dirty a single page.
+pub(crate) fn refresh_source_facts(
+    conn: &Connection,
+    source_id: &str,
+    facts: &SourceFacts,
+    now: &str,
+) -> Result<bool> {
+    if facts.is_empty() {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "UPDATE documents SET \
+             source_author            = COALESCE(?2, source_author), \
+             source_last_modified_by  = COALESCE(?3, source_last_modified_by), \
+             source_created_at        = COALESCE(?4, source_created_at), \
+             source_size_bytes        = COALESCE(?5, source_size_bytes), \
+             source_modified_at       = COALESCE(?6, source_modified_at), \
+             source_parent_folder_id  = COALESCE(?7, source_parent_folder_id), \
+             source_parent_folder_name = COALESCE(?8, source_parent_folder_name), \
+             pm_refreshed_at          = ?9 \
+         WHERE source_id = ?1 AND source_type = 'index_only' AND ( \
+             (?2 IS NOT NULL AND source_author            IS NOT ?2) OR \
+             (?3 IS NOT NULL AND source_last_modified_by  IS NOT ?3) OR \
+             (?4 IS NOT NULL AND source_created_at        IS NOT ?4) OR \
+             (?5 IS NOT NULL AND source_size_bytes        IS NOT ?5) OR \
+             (?6 IS NOT NULL AND source_modified_at       IS NOT ?6) OR \
+             (?7 IS NOT NULL AND source_parent_folder_id  IS NOT ?7) OR \
+             (?8 IS NOT NULL AND source_parent_folder_name IS NOT ?8))",
+        params![
+            source_id,
+            facts.author,
+            facts.last_modified_by,
+            facts.created_at,
+            facts.size_bytes,
+            facts.modified_at,
+            facts.parent_folder_id,
+            facts.parent_folder_name,
+            now,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Length (chars) of the offline summary kept for an index-only item — short enough to stay a
 /// pointer, long enough to recognise + keyword-find the item. The full body is a live fetch.
 const SUMMARY_CHARS: usize = 500;
@@ -1473,9 +1583,22 @@ fn reembed_item(
         |r| r.get(0),
     )?;
     ingest::replace_chunks(&tx, doc_id, &chunks, &embeddings, true, Some(&summary))?;
+    let now = ingest::iso_now(&tx)?;
+    // The source facts ride along. This statement used to update the hash, summary and title and
+    // silently drop the author, last editor, created date, size and parent folder it had just been
+    // handed in `input` — so the columns #704 added were correct at first sight and then frozen
+    // through every subsequent edit of the file. COALESCE for the same reason as
+    // `refresh_source_facts`: a provider that has stopped reporting a fact must not erase it.
     tx.execute(
         "UPDATE documents SET content_hash = ?2, source_content_hash = ?3, source_modified_at = ?4, \
-                stored_summary = ?5, title = ?6, source_state = 'ok' \
+                stored_summary = ?5, title = ?6, source_state = 'ok', \
+                source_author             = COALESCE(?7, source_author), \
+                source_last_modified_by   = COALESCE(?8, source_last_modified_by), \
+                source_created_at         = COALESCE(?9, source_created_at), \
+                source_size_bytes         = COALESCE(?10, source_size_bytes), \
+                source_parent_folder_id   = COALESCE(?11, source_parent_folder_id), \
+                source_parent_folder_name = COALESCE(?12, source_parent_folder_name), \
+                pm_refreshed_at           = ?13 \
          WHERE id = ?1",
         params![
             doc_id,
@@ -1484,6 +1607,13 @@ fn reembed_item(
             input.source_modified_at,
             summary,
             input.title,
+            input.source_author,
+            input.source_last_modified_by,
+            input.source_created_at,
+            input.source_size_bytes,
+            input.source_parent_folder_id,
+            input.source_parent_folder_name,
+            now,
         ],
     )?;
     tx.commit()?;
@@ -2785,5 +2915,136 @@ mod tests {
         assert_eq!(ext.as_deref(), Some("drive://moved"));
         assert_eq!(proj, "Taxes", "a rename leaves classification untouched");
         assert_eq!(ent, Some(entity), "the entity link survives a rename");
+    }
+
+    // --- source-fact freshness (#708) ---
+
+    /// The columns `refresh_source_facts` touches, and nothing else.
+    fn facts_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                 id INTEGER PRIMARY KEY, source_type TEXT, source_id TEXT,
+                 source_author TEXT, source_last_modified_by TEXT, source_created_at TEXT,
+                 source_size_bytes INTEGER, source_modified_at TEXT,
+                 source_parent_folder_id TEXT, source_parent_folder_name TEXT,
+                 pm_refreshed_at TEXT
+             );
+             INSERT INTO documents(source_type, source_id, source_author, source_last_modified_by,
+                 source_created_at, source_size_bytes, source_modified_at,
+                 source_parent_folder_id, source_parent_folder_name, pm_refreshed_at)
+             VALUES ('index_only','s1','Ada Lovelace','Grace Hopper','2026-01-01T00:00:00Z',
+                     1024,'2026-05-01T00:00:00Z','fid-1','Invoices', NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn stored(conn: &Connection) -> (Option<String>, Option<i64>, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT source_author, source_size_bytes, source_parent_folder_name, pm_refreshed_at              FROM documents WHERE source_id = 's1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn as_stored() -> SourceFacts {
+        SourceFacts {
+            author: Some("Ada Lovelace".into()),
+            last_modified_by: Some("Grace Hopper".into()),
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            size_bytes: Some(1024),
+            modified_at: Some("2026-05-01T00:00:00Z".into()),
+            parent_folder_id: Some("fid-1".into()),
+            parent_folder_name: Some("Invoices".into()),
+        }
+    }
+
+    #[test]
+    fn an_item_that_has_not_changed_writes_nothing_at_all() {
+        // This runs for every item of every account on every pass, including the fifteen-minute
+        // poll. On a settled library it must not dirty a single page — so "nothing to say" has to
+        // mean zero rows matched, not an UPDATE that happens to assign the same values back.
+        let conn = facts_db();
+        assert!(!refresh_source_facts(&conn, "s1", &as_stored(), "2026-08-02T10:00:00Z").unwrap());
+        let (_, _, _, refreshed) = stored(&conn);
+        assert_eq!(refreshed, None, "an idle pass leaves no stamp");
+    }
+
+    #[test]
+    fn a_file_that_was_resized_is_updated_and_stamped() {
+        let conn = facts_db();
+        let facts = SourceFacts {
+            size_bytes: Some(2048),
+            ..as_stored()
+        };
+        assert!(refresh_source_facts(&conn, "s1", &facts, "2026-08-02T10:00:00Z").unwrap());
+        let (_, size, _, refreshed) = stored(&conn);
+        assert_eq!(size, Some(2048));
+        assert_eq!(refreshed.as_deref(), Some("2026-08-02T10:00:00Z"));
+    }
+
+    #[test]
+    fn a_fact_the_provider_stops_reporting_is_kept_not_erased() {
+        // Drive genuinely stops sending `owners` once a file moves into a shared drive, and a
+        // Google-native document has no `size` at all. A wholesale assignment would quietly erase an
+        // author PM had already been told — "Unknown" must mean never told, not forgotten.
+        let conn = facts_db();
+        let facts = SourceFacts {
+            author: None,
+            size_bytes: Some(4096),
+            ..as_stored()
+        };
+        assert!(refresh_source_facts(&conn, "s1", &facts, "2026-08-02T10:00:00Z").unwrap());
+        let (author, size, _, _) = stored(&conn);
+        assert_eq!(
+            author.as_deref(),
+            Some("Ada Lovelace"),
+            "silence erases nothing"
+        );
+        assert_eq!(size, Some(4096), "while what it DID say still lands");
+    }
+
+    #[test]
+    fn an_all_empty_refresh_never_reaches_the_database() {
+        let conn = facts_db();
+        assert!(!refresh_source_facts(&conn, "s1", &SourceFacts::default(), "t").unwrap());
+        let (author, size, _, refreshed) = stored(&conn);
+        assert_eq!(author.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(size, Some(1024));
+        assert_eq!(refreshed, None);
+    }
+
+    #[test]
+    fn a_moved_file_updates_the_folder_it_now_sits_in() {
+        let conn = facts_db();
+        let facts = SourceFacts {
+            parent_folder_id: Some("fid-2".into()),
+            parent_folder_name: Some("Archive 2026".into()),
+            ..as_stored()
+        };
+        assert!(refresh_source_facts(&conn, "s1", &facts, "2026-08-02T10:00:00Z").unwrap());
+        let (_, _, folder, _) = stored(&conn);
+        assert_eq!(folder.as_deref(), Some("Archive 2026"));
+        assert_eq!(
+            stored_parent_folder_id(&conn, "s1").unwrap().as_deref(),
+            Some("fid-2"),
+            "and the id the next pass compares against moves with it"
+        );
+    }
+
+    #[test]
+    fn a_size_beyond_the_float_range_round_trips() {
+        // Drive sends `size` as a decimal STRING precisely because it can exceed 2^53; the column is
+        // INTEGER and the parse is i64, so nothing in the path may narrow it.
+        let conn = facts_db();
+        let huge = 9_007_199_254_740_993i64; // 2^53 + 1
+        let facts = SourceFacts {
+            size_bytes: Some(huge),
+            ..as_stored()
+        };
+        assert!(refresh_source_facts(&conn, "s1", &facts, "t").unwrap());
+        assert_eq!(stored(&conn).1, Some(huge));
     }
 }

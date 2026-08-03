@@ -243,6 +243,24 @@ trait CloudDriver: Send + Sync + Clone {
         body: String,
         cache: &mut Self::FolderCache,
     ) -> impl std::future::Future<Output = index_only::PointerInput> + Send;
+
+    /// What the source says about `file` right now, for an item whose CONTENT has not changed (#708).
+    ///
+    /// `make_pointer`'s sibling for the path where no body is fetched — which is nearly every item on
+    /// nearly every pass of a settled library, and precisely where these facts used to freeze. A file
+    /// can be renamed, resized, moved, or handed to a new editor without a byte of its content
+    /// changing, and #704 wrote these columns only on first sight.
+    ///
+    /// `stored_parent_id` is what PM currently has, so a provider that must PAY for a folder name can
+    /// skip the lookup unless the file has actually moved. `cache` is the same per-pass memo
+    /// `make_pointer` uses, so the two share every resolution.
+    fn refresh_facts(
+        &self,
+        token_key: &str,
+        file: &Self::File,
+        stored_parent_id: Option<&str>,
+        cache: &mut Self::FolderCache,
+    ) -> impl std::future::Future<Output = index_only::SourceFacts> + Send;
 }
 
 // --- generic engine ------------------------------------------------------------------------------
@@ -779,13 +797,41 @@ async fn run_cloud_pass<C: CloudDriver>(
             // rows out from under each other (`drive::adopt_legacy_swm_row`), so a plan built by an
             // earlier gather is only judged against the store as it stands now — see
             // [`baseline_my_drive`]'s note on legacy shared-with-me rows.
-            let current = {
+            let (current, stored_parent) = {
                 let state = app.state::<AppState>();
                 let conn = state.conn()?;
-                C::read_item_state(&conn, &source_id)?
+                (
+                    C::read_item_state(&conn, &source_id)?,
+                    index_only::stored_parent_folder_id(&conn, &source_id)?,
+                )
             };
             let actions = index_only::react(event, current.as_ref());
             let category = connector_sync::action_category(&actions);
+
+            // Keep what the SOURCE says about this item true, whatever the reducer decided to do
+            // about its CONTENT — and deliberately BEFORE the `needs_body` gate below, because the
+            // whole point is the item that needs no body. #704 wrote the author, last editor,
+            // created date and size once, at first sight, and nothing ever wrote them again: a file
+            // renamed, resized, moved or handed to someone else reported whatever Drive had said the
+            // first time PM saw it, for as long as the file existed.
+            //
+            // Free when there is nothing to say. `refresh_source_facts` matches no rows unless a
+            // value actually differs, so a settled library's fifteen-minute poll writes nothing at
+            // all; the folder-name lookup — the only part that costs a request — is gated on the
+            // parent id having moved. Deliberately NOT reported to `manifest_flush`: the portable
+            // manifest carries no source facts, so dirtying it here would rewrite and re-encrypt the
+            // whole mirror every idle pass for a change it does not even hold.
+            if let Some(f) = file {
+                let facts = driver
+                    .refresh_facts(&w.token_key, f, stored_parent.as_deref(), &mut folder_cache)
+                    .await;
+                if !facts.is_empty() {
+                    let state = app.state::<AppState>();
+                    let conn = state.conn()?;
+                    let now = crate::ingest::iso_now(&conn)?;
+                    index_only::refresh_source_facts(&conn, &source_id, &facts, &now)?;
+                }
+            }
 
             let needs_body = actions.iter().any(|a| {
                 matches!(
@@ -1747,6 +1793,25 @@ impl CloudDriver for DriveDriver {
         };
         file.pointer(source_id, body, folder_name)
     }
+
+    async fn refresh_facts(
+        &self,
+        token_key: &str,
+        file: &drive::DriveFile,
+        stored_parent_id: Option<&str>,
+        cache: &mut std::collections::HashMap<String, Option<String>>,
+    ) -> index_only::SourceFacts {
+        // The name is the only thing here that costs a request, so it is fetched only when the file
+        // has genuinely changed folder. Everything else — owner, last editor, created, size, modified
+        // — is already on the listing payload PM has in hand.
+        let folder_name = match file.parent_id.as_deref() {
+            Some(pid) if stored_parent_id != Some(pid) => {
+                resolve_folder_name(token_key, pid, cache).await
+            }
+            _ => None,
+        };
+        file.source_facts(folder_name)
+    }
 }
 
 // --- OneDrive driver -----------------------------------------------------------------------------
@@ -2072,6 +2137,18 @@ impl CloudDriver for OneDriveDriver {
         _cache: &mut (),
     ) -> index_only::PointerInput {
         file.pointer(source_id, body)
+    }
+
+    async fn refresh_facts(
+        &self,
+        _token_key: &str,
+        file: &onedrive::DriveItem,
+        _stored_parent_id: Option<&str>,
+        _cache: &mut (),
+    ) -> index_only::SourceFacts {
+        // Graph carries the parent folder's name inline, so unlike Drive there is nothing to resolve
+        // and no reason to care whether the item moved — the answer is already in hand.
+        file.source_facts()
     }
 }
 

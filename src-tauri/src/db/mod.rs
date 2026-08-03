@@ -1035,6 +1035,7 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_last_modified_by; \
              ALTER TABLE documents DROP COLUMN source_created_at; \
              ALTER TABLE documents DROP COLUMN source_size_bytes; \
+             ALTER TABLE documents DROP COLUMN pm_refreshed_at; \
              DROP INDEX IF EXISTS idx_documents_entity; \
              DROP TABLE entity_aliases; \
              DROP TABLE entities; \
@@ -1219,6 +1220,7 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_last_modified_by; \
              ALTER TABLE documents DROP COLUMN source_created_at; \
              ALTER TABLE documents DROP COLUMN source_size_bytes; \
+             ALTER TABLE documents DROP COLUMN pm_refreshed_at; \
              ALTER TABLE entities DROP COLUMN confidence; \
              ALTER TABLE entities DROP COLUMN user_confirmed; \
              ALTER TABLE usage_log DROP COLUMN cost_usd; \
