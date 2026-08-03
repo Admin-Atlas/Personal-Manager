@@ -387,32 +387,36 @@ pub fn resume_local_folder_sync(app: AppHandle) -> Result<bool> {
 /// its bytes match the string the stored chunk offsets were computed against. Shared by the reader
 /// (`fetch_index_only_body`) and the on-demand re-index (`reindex_index_only`). Never persists the body.
 async fn fetch_index_only_text(app: &AppHandle, doc_id: i64) -> Result<String> {
-    let (source_type, source_id, source_state, external_ref): (
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-    ) = {
+    // The LIVE location, not the identity anchor (#710). A document reachable at two places opens
+    // from whichever one is still there — which is the point of the model: the anchor is an identity,
+    // and a file deleted from the account that happened to index it first must not take the copy in
+    // a tracked folder down with it. `fetchable` prefers the anchor and falls through.
+    let (source_type, location) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        conn.query_row(
-            "SELECT source_type, source_id, source_state, external_ref FROM documents WHERE id = ?1",
+        let source_type: String = conn.query_row(
+            "SELECT source_type FROM documents WHERE id = ?1",
             params![doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?
+            |r| r.get(0),
+        )?;
+        (source_type, crate::locations::fetchable(&conn, doc_id)?)
     };
     if source_type != ingest::SOURCE_TYPE_INDEX_ONLY {
         return Err(Error::Other(
             "This document is stored locally — open it directly.".into(),
         ));
     }
-    let source_id =
-        source_id.ok_or_else(|| Error::Other("This indexed item has no source pointer.".into()))?;
-    if source_state == "source_missing" {
-        return Err(Error::Other(
+    let missing = || {
+        Error::Other(
             "This file was removed at the source; only its saved summary is available.".into(),
-        ));
+        )
+    };
+    let location = location.ok_or_else(missing)?;
+    if location.state == index_only::SourceState::SourceMissing {
+        return Err(missing());
     }
+    let source_id = location.source_id;
+    let external_ref = location.external_ref;
     let state = app.state::<AppState>();
     // `ensure_installed` is blocking (first run installs the venv + deps) — run it on the blocking
     // pool so it never pins a tokio worker (F-41). The cloned handle reaches AppState in the closure.

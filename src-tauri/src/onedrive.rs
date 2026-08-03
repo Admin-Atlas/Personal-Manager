@@ -323,16 +323,7 @@ pub fn set_scope(conn: &Connection, email: &str, scope: &OneDriveScope) -> Resul
 /// flagged missing/unreachable — e.g. a folder removed and re-added); an id in this set that is no
 /// longer present is a deletion. There is one drive per account, so this is simply every account item.
 pub fn known_source_ids(conn: &Connection, email: &str) -> Result<Vec<String>> {
-    let prefix = format!("{}:", account_id(email));
-    let mut stmt = conn.prepare(
-        "SELECT source_id FROM documents \
-         WHERE source_type = 'index_only' AND source_state = 'ok' \
-           AND source_id LIKE ?1 || '%'",
-    )?;
-    let rows: Vec<String> = stmt
-        .query_map(params![prefix], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(rows)
+    crate::locations::known_ids(conn, &format!("{}:", account_id(email)), None)
 }
 
 // --- driveItem model + pure parsing/mapping (the unit-tested core) -------------------------------

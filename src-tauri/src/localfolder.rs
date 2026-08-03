@@ -796,31 +796,46 @@ pub fn remove_folder(conn: &Connection, key: &str) -> Result<()> {
 /// so the reconcile can diff the walk against it (present-but-known, and known-but-absent = deleted).
 pub fn known_items(conn: &Connection, key: &str) -> Result<HashMap<String, KnownItem>> {
     let id = folder_source_id(key);
-    let mut stmt = conn.prepare(
-        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state, \
-                content_hash, stored_summary \
-         FROM documents WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{KNOWN_ITEM_COLUMNS} AND l.source_id LIKE ?1 || ':%'"
+    ))?;
     let rows = stmt
-        .query_map(params![id], |r| {
-            let sid: String = r.get(0)?;
-            let content_hash: String = r.get(5)?;
-            let stored_summary: Option<String> = r.get(6)?;
-            let summary_indexed =
-                index_only::summary_indexed_flag(&sid, &content_hash, stored_summary.as_deref());
-            Ok((
-                sid,
-                KnownItem {
-                    external_ref: r.get::<_, Option<String>>(1)?,
-                    modified_at: r.get::<_, Option<String>>(2)?,
-                    content_hash: r.get::<_, Option<String>>(3)?,
-                    source_state: r.get::<_, String>(4)?,
-                    summary_indexed,
-                },
-            ))
-        })?
+        .query_map(params![id], known_item_row)?
         .collect::<std::result::Result<HashMap<_, _>, _>>()?;
     Ok(rows)
+}
+
+/// The three walk-side lookups below all read one item's persisted state, and all three read it from
+/// its LOCATION rather than its document (#710): the pointer columns describe one place a file
+/// lives, and a document may have several. The trailing `d.source_id` is the ANCHOR id — what the
+/// stored `content_hash` was derived from, and therefore the only id `summary_indexed_flag` can
+/// honestly ask its question with.
+const KNOWN_ITEM_COLUMNS: &str =
+    "SELECT l.source_id, l.external_ref, l.source_modified_at, l.source_content_hash, \
+            l.source_state, d.content_hash, d.stored_summary, d.source_id \
+     FROM document_locations l JOIN documents d ON d.id = l.document_id \
+     WHERE d.source_type = 'index_only'";
+
+fn known_item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, KnownItem)> {
+    let sid: String = r.get(0)?;
+    let content_hash: String = r.get(5)?;
+    let stored_summary: Option<String> = r.get(6)?;
+    let anchor_id: Option<String> = r.get(7)?;
+    let summary_indexed = index_only::summary_indexed_flag(
+        anchor_id.as_deref().unwrap_or_default(),
+        &content_hash,
+        stored_summary.as_deref(),
+    );
+    Ok((
+        sid,
+        KnownItem {
+            external_ref: r.get::<_, Option<String>>(1)?,
+            modified_at: r.get::<_, Option<String>>(2)?,
+            content_hash: r.get::<_, Option<String>>(3)?,
+            source_state: r.get::<_, String>(4)?,
+            summary_indexed,
+        },
+    ))
 }
 
 /// The persisted state of a single already-indexed item, keyed by its source id — the watcher's
@@ -852,28 +867,9 @@ pub fn source_id_for_ref(
 ) -> Result<Option<(String, KnownItem)>> {
     let id = folder_source_id(key);
     conn.query_row(
-        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state, \
-                content_hash, stored_summary \
-         FROM documents \
-         WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%' AND external_ref = ?2",
+        &format!("{KNOWN_ITEM_COLUMNS} AND l.source_id LIKE ?1 || ':%' AND l.external_ref = ?2"),
         params![id, abs_path],
-        |r| {
-            let sid: String = r.get(0)?;
-            let content_hash: String = r.get(5)?;
-            let stored_summary: Option<String> = r.get(6)?;
-            let summary_indexed =
-                index_only::summary_indexed_flag(&sid, &content_hash, stored_summary.as_deref());
-            Ok((
-                sid,
-                KnownItem {
-                    external_ref: r.get(1)?,
-                    modified_at: r.get(2)?,
-                    content_hash: r.get(3)?,
-                    source_state: r.get(4)?,
-                    summary_indexed,
-                },
-            ))
-        },
+        known_item_row,
     )
     .optional()
     .map_err(Into::into)
@@ -897,32 +893,15 @@ pub fn items_under_dir(
     let prefix = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
     // SQLite's `substr` counts CHARACTERS on a TEXT value, so the bound length must too.
     let prefix_len = prefix.chars().count() as i64;
-    let mut stmt = conn.prepare(
-        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state, \
-                content_hash, stored_summary \
-         FROM documents \
-         WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%' \
-           AND substr(external_ref, 1, ?3) = ?2",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{KNOWN_ITEM_COLUMNS} AND l.source_id LIKE ?1 || ':%' \
+           AND substr(l.external_ref, 1, ?3) = ?2"
+    ))?;
     let rows = stmt
         .query_map(params![id, prefix, prefix_len], |r| {
-            let sid: String = r.get(0)?;
+            let (sid, item) = known_item_row(r)?;
             let external_ref: String = r.get(1)?;
-            let content_hash: String = r.get(5)?;
-            let stored_summary: Option<String> = r.get(6)?;
-            let summary_indexed =
-                index_only::summary_indexed_flag(&sid, &content_hash, stored_summary.as_deref());
-            Ok((
-                sid,
-                external_ref.clone(),
-                KnownItem {
-                    external_ref: Some(external_ref),
-                    modified_at: r.get::<_, Option<String>>(2)?,
-                    content_hash: r.get::<_, Option<String>>(3)?,
-                    source_state: r.get::<_, String>(4)?,
-                    summary_indexed,
-                },
-            ))
+            Ok((sid, external_ref, item))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows
@@ -2772,17 +2751,31 @@ mod tests {
                  id INTEGER PRIMARY KEY, source_type TEXT, source_id TEXT, external_ref TEXT,
                  source_modified_at TEXT, source_content_hash TEXT, source_state TEXT,
                  content_hash TEXT, stored_summary TEXT
+             );
+             CREATE TABLE document_locations (
+                 id INTEGER PRIMARY KEY, document_id INTEGER, source_id TEXT UNIQUE,
+                 source_state TEXT, external_ref TEXT, source_modified_at TEXT,
+                 source_content_hash TEXT, source_parent_folder_id TEXT,
+                 source_parent_folder_name TEXT, first_seen_at TEXT
              );",
         )
         .unwrap();
         let root = PathBuf::from("/vault/docs");
         let notes = root.join("notes");
+        // A document plus its anchor location, the shape v54's backfill leaves every existing row in.
         let add = |sid: &str, path: &Path| {
             conn.execute(
                 "INSERT INTO documents(source_type,source_id,external_ref,source_modified_at,\
                      source_content_hash,source_state,content_hash,stored_summary) \
                  VALUES ('index_only',?1,?2,'t0','h0','ok','h0',NULL)",
                 params![sid, path.to_string_lossy()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO document_locations(document_id,source_id,source_state,external_ref,\
+                     source_modified_at,source_content_hash,first_seen_at) \
+                 VALUES (?1,?2,'ok',?3,'t0','h0','t0')",
+                params![conn.last_insert_rowid(), sid, path.to_string_lossy()],
             )
             .unwrap();
         };

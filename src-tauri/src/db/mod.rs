@@ -1013,6 +1013,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN visibility; \
              ALTER TABLE calendar_events DROP COLUMN created; \
              ALTER TABLE calendar_events DROP COLUMN updated; \
+             DROP TABLE document_locations; \
              DROP TABLE doc_layout; \
              DROP TABLE document_proposals; \
              DROP TABLE shared_drive_access; \
@@ -1198,6 +1199,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN visibility; \
              ALTER TABLE calendar_events DROP COLUMN created; \
              ALTER TABLE calendar_events DROP COLUMN updated; \
+             DROP TABLE document_locations; \
              DROP TABLE doc_layout; \
              DROP TABLE document_proposals; \
              DROP TABLE shared_drive_access; \

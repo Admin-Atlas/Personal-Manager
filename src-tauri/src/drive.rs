@@ -997,15 +997,7 @@ pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<(
 /// file, or reactivates one that was previously flagged missing/unreachable — e.g. a folder the user
 /// removed and re-added); an id in this set that is no longer present is a deletion.
 pub fn known_shared_source_ids(conn: &Connection, drive_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT source_id FROM documents \
-         WHERE source_type = 'index_only' AND source_state = 'ok' \
-           AND source_id LIKE ?1 || '%'",
-    )?;
-    let rows: Vec<String> = stmt
-        .query_map(params![shared_prefix(drive_id)], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(rows)
+    crate::locations::known_ids(conn, &shared_prefix(drive_id), None)
 }
 
 /// Every currently-healthy indexed **My Drive** item id for one account — the set the folder-scoped
@@ -1014,15 +1006,8 @@ pub fn known_shared_source_ids(conn: &Connection, drive_id: &str) -> Result<Vec<
 /// account prefix but are reconciled per shared drive on their own.
 pub fn known_my_drive_source_ids(conn: &Connection, email: &str) -> Result<Vec<String>> {
     let prefix = format!("{}:", account_id(email));
-    let mut stmt = conn.prepare(
-        "SELECT source_id FROM documents \
-         WHERE source_type = 'index_only' AND source_state = 'ok' \
-           AND source_id LIKE ?1 || '%' AND source_id NOT LIKE ?1 || 'sd:%'",
-    )?;
-    let rows: Vec<String> = stmt
-        .query_map(params![prefix], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(rows)
+    let shared = format!("{prefix}sd:");
+    crate::locations::known_ids(conn, &prefix, Some(&shared))
 }
 
 /// Every currently-healthy indexed item id under one **shared-with-me root** — the set its reconcile
@@ -1030,15 +1015,7 @@ pub fn known_my_drive_source_ids(conn: &Connection, email: &str) -> Result<Vec<S
 /// rather than a drive). An account-independent `gdrive:swm:<rootId>:` prefix never collides with the
 /// My-Drive `gdrive:<email>:` prefix (an email is never literally "swm"), so the corpora stay disjoint.
 pub fn known_swm_source_ids(conn: &Connection, root_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT source_id FROM documents \
-         WHERE source_type = 'index_only' AND source_state = 'ok' \
-           AND source_id LIKE ?1 || '%'",
-    )?;
-    let rows: Vec<String> = stmt
-        .query_map(params![swm_prefix(root_id)], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(rows)
+    crate::locations::known_ids(conn, &swm_prefix(root_id), None)
 }
 
 /// Adopt a legacy **leaked** row: a top-level shared file previously indexed under `email`'s My-Drive

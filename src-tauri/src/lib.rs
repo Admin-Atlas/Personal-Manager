@@ -62,6 +62,10 @@ mod local_slot;
 // from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
 // mtime→hash diff); the live `notify` watcher is the next card.
 mod localfolder;
+// Every PLACE a document's file lives (#710): one file reachable through two accounts is one
+// document with two locations, each reconciled by its own connector, and the document survives
+// while any of them does.
+mod locations;
 mod lock_session;
 mod microsoft;
 mod milestones;

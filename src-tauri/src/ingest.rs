@@ -1195,6 +1195,10 @@ pub fn promote_spreadsheet(
                 now,
             ],
         )?;
+        // This row is no longer an index-only pointer, so it has no CONNECTOR locations (#710) —
+        // its body is a file PM stores now. Leaving them behind would keep the promoted file in
+        // its connector's known set and make the reconcile treat it as a live pointer.
+        crate::locations::forget_all(&tx, doc_id)?;
         tx.commit()?;
         Ok(())
     })();
@@ -1470,6 +1474,10 @@ pub fn ingest_note_document(
                         now,
                     ],
                 )?;
+                // This row is no longer an index-only pointer, so it has no CONNECTOR locations (#710) —
+                // its body is a file PM stores now. Leaving them behind would keep the promoted file in
+                // its connector's known set and make the reconcile treat it as a live pointer.
+                crate::locations::forget_all(&tx, doc_id)?;
                 tx.commit()?;
                 load_document(&conn, doc_id)
             }
