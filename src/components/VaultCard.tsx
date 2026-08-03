@@ -18,13 +18,13 @@ import {
   changeVaultPassphrase,
   deleteSharedVault,
   detachFromSharedVault,
-  exportPlaintextMarkdown,
   forgetVaultPassphrase,
   makeVaultPrivate,
   vaultStatus,
 } from "../lib/ipc";
 import type { PassphraseScore, VaultStatus } from "../lib/types";
-import { Button, Callout, Input, SectionInfo } from "./ui";
+import { Button, Callout, Collapsible, Input, SectionInfo } from "./ui";
+import { PLATFORM } from "../lib/setupGuide";
 import { formatDate } from "../lib/format";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { ShareVaultWizard } from "./ShareVaultWizard";
@@ -103,22 +103,6 @@ export function VaultCard() {
     if (dir) setAdoptFolder(dir);
   }
 
-  async function exportPlaintext() {
-    // The backend opens the folder picker itself (L-5), so we don't pass a path.
-    setBusy(true);
-    setError(null);
-    setMsg(null);
-    try {
-      const res = await exportPlaintextMarkdown();
-      if (!res) return; // cancelled
-      setMsg(`Exported ${res.count} Markdown file${res.count === 1 ? "" : "s"} to ${res.dest}`);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   /** Join an existing shared vault from this account: unlock + point this profile at
    *  it, then reload the whole webview so every view reboots on the new store (the same
    *  pattern as the backup-restore switch). The previous vault stays on disk, set aside. */
@@ -175,17 +159,19 @@ export function VaultCard() {
   const joined = status?.ownership === "joined";
 
   return (
-    <div className="mt-5 border-t border-border pt-4" data-help="settings-vault">
-      <h2 className="block text-sm font-medium text-ink2">Vault</h2>
-
+    <div className="mt-4" data-help="settings-vault">
+      {/* No heading and no rule of its own since #712: this card now sits INSIDE the one "Your
+          data" section, whose heading already names the folder these controls act on, and a second
+          heading here is what made one subject read as two. The status line stays — it is a state
+          readout, not commentary, and never folds. The path is deliberately gone: the section above
+          shows it once, on the button that opens it, which was the whole point of merging them. */}
       {status && (
-        <p className="mt-1 text-xs text-ink4">
+        <p className="text-xs text-ink4">
           This vault is{" "}
           <span className="font-medium text-ink3">
             {shareable ? "shareable (passphrase-protected)" : "private to this device"}
           </span>
-          {shareable && status.markdown_encrypted ? ", with Markdown encrypted at rest" : ""}.{" "}
-          <span className="break-all">{status.location}</span>
+          {shareable && status.markdown_encrypted ? ", with Markdown encrypted at rest" : ""}.
         </p>
       )}
 
@@ -239,304 +225,343 @@ export function VaultCard() {
         </div>
       )}
 
-      {/* Device-only → the guided share flow (passphrase → shared folder → accounts). */}
-      {status && !shareable && (
-        <div className="mt-3">
-          <Button
-            variant="secondary"
-            onClick={() => setWizardOpen(true)}
-            disabled={busy}
-            data-help="settings-vault-share"
-          >
-            Share with other accounts…
-          </Button>
-        </div>
-      )}
+      {/* Sharing one vault between several Windows accounts on one PC, folded away closed (#712).
+          It is a genuinely niche feature and it had been sitting at the same level as "where is my
+          data", which is a question everybody has.
 
-      {/* Shareable → manage actions (why encryption is forced folds into the card's info block). */}
-      {shareable && (
-        <>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => setWizardOpen(true)}
-              disabled={busy}
-              data-help="settings-vault-share"
-            >
-              Manage sharing…
-            </Button>
-            <Button variant="secondary" onClick={() => setPending("change")} disabled={busy}>
-              Change passphrase…
-            </Button>
-            <Button variant="secondary" onClick={() => setPending("private")} disabled={busy}>
-              Make private…
-            </Button>
-            <Button
-              variant="tertiary"
-              disabled={busy}
-              onClick={() =>
-                run(
-                  () => forgetVaultPassphrase(),
-                  "Passphrase forgotten on this device — you'll be asked for it next launch.",
-                )
-              }
-            >
-              Forget passphrase here
-            </Button>
-            {/* Deleting a shared vault only makes sense once it's actually in a shared
+          The copy is honest about what is missing off Windows rather than implying parity. The ACL
+          enforcement really does exist on macOS and Linux; what is Windows-only is everything that
+          makes sharing SET-UP-able — discovering the other accounts, the picker, the suggested
+          location, and the ownership gate. So the wizard is offered on Windows only, while the
+          manual join path stays reachable everywhere: for an existing Mac or Linux user it is the
+          only join path there has ever been, and hiding it would strand them. */}
+      <Collapsible
+        className="mt-3"
+        defaultOpen={false}
+        title={<span className="text-xs text-ink3">Share this vault with other accounts</span>}
+      >
+        <div className="pt-1">
+          {PLATFORM !== "windows" && (
+            <p className="text-xs text-ink4">
+              On {PLATFORM === "mac" ? "macOS" : "Linux"} PM can open a shared vault that already
+              exists, but it can&rsquo;t set one up for you: finding the other accounts on this
+              machine, choosing a folder they can all reach, and checking who owns the vault are
+              Windows-only today. The permissions themselves work here — it is the setting-up that
+              doesn&rsquo;t.
+            </p>
+          )}
+          {/* Device-only → the guided share flow (passphrase → shared folder → accounts). */}
+          {status && !shareable && PLATFORM === "windows" && (
+            <div className="mt-3">
+              <Button
+                variant="secondary"
+                onClick={() => setWizardOpen(true)}
+                disabled={busy}
+                data-help="settings-vault-share"
+              >
+                Share with other accounts…
+              </Button>
+            </div>
+          )}
+
+          {/* Shareable → manage actions (why encryption is forced folds into the card's info block). */}
+          {shareable && (
+            <>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {PLATFORM === "windows" && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => setWizardOpen(true)}
+                    disabled={busy}
+                    data-help="settings-vault-share"
+                  >
+                    Manage sharing…
+                  </Button>
+                )}
+                <Button variant="secondary" onClick={() => setPending("change")} disabled={busy}>
+                  Change passphrase…
+                </Button>
+                <Button variant="secondary" onClick={() => setPending("private")} disabled={busy}>
+                  Make private…
+                </Button>
+                <Button
+                  variant="tertiary"
+                  disabled={busy}
+                  onClick={() =>
+                    run(
+                      () => forgetVaultPassphrase(),
+                      "Passphrase forgotten on this device — you'll be asked for it next launch.",
+                    )
+                  }
+                >
+                  Forget passphrase here
+                </Button>
+                {/* Deleting a shared vault only makes sense once it's actually in a shared
                 folder (pointed) — it removes the vault for every account that uses it. */}
-            {/* Hidden outright for a vault another account created: it is theirs to delete, and
+                {/* Hidden outright for a vault another account created: it is theirs to delete, and
                 PM should not hand a joiner the button. Still offered when ownership is UNKNOWN (a
                 vault from before ownership was recorded, or an account whose SID changed), because
                 hiding it there would lock a genuine owner out of their own vault — the confirmation
                 warns instead. Not a security boundary: anyone with write access to the folder can
                 delete the files themselves. The backend refuses the joined case too. */}
-            {status?.pointed_root && status.ownership !== "joined" && (
-              <Button variant="tertiary" onClick={() => setPending("delete")} disabled={busy}>
-                Delete shared vault…
-              </Button>
-            )}
-          </div>
+                {status?.pointed_root && status.ownership !== "joined" && (
+                  <Button variant="tertiary" onClick={() => setPending("delete")} disabled={busy}>
+                    Delete shared vault…
+                  </Button>
+                )}
+              </div>
 
-          {pending === "change" && (
-            <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
-              <p className="text-xs text-ink4">
-                Set a new passphrase. The vault is re-keyed and its Markdown re-encrypted.
-                {status?.pointed_root
-                  ? " Every other account using this shared vault is locked out until you give them the new passphrase."
-                  : ""}
-              </p>
-              {/* A joiner re-keying a vault someone else created also becomes its recorded owner —
+              {pending === "change" && (
+                <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
+                  <p className="text-xs text-ink4">
+                    Set a new passphrase. The vault is re-keyed and its Markdown re-encrypted.
+                    {status?.pointed_root
+                      ? " Every other account using this shared vault is locked out until you give them the new passphrase."
+                      : ""}
+                  </p>
+                  {/* A joiner re-keying a vault someone else created also becomes its recorded owner —
                   the backend refuses without this box, which is a speed bump against doing it by
                   accident, not an authorization control. `live={false}` on the frame because the
                   inner <p> is already the alert: two nested live regions say it twice. */}
-              {joined && (
-                <Callout body="ink" live={false} className="space-y-2">
-                  <p className="text-xs text-st-due" role="alert">
-                    This shared vault was created by another account on this PC. Changing its
-                    passphrase locks everyone else out until you tell them the new one, and makes
-                    this account the vault&rsquo;s owner. Ask its owner to change it instead if you
-                    can.
-                  </p>
-                  <label className="flex items-start gap-2 text-xs text-ink3">
-                    <input
-                      type="checkbox"
-                      className="mt-0.5"
-                      checked={takeover}
-                      onChange={(e) => setTakeover(e.currentTarget.checked)}
-                      disabled={busy}
-                    />
-                    <span>
-                      I&rsquo;m taking over ownership of this vault — everyone else needs the new
-                      passphrase from me.
-                    </span>
-                  </label>
-                </Callout>
+                  {joined && (
+                    <Callout body="ink" live={false} className="space-y-2">
+                      <p className="text-xs text-st-due" role="alert">
+                        This shared vault was created by another account on this PC. Changing its
+                        passphrase locks everyone else out until you tell them the new one, and
+                        makes this account the vault&rsquo;s owner. Ask its owner to change it
+                        instead if you can.
+                      </p>
+                      <label className="flex items-start gap-2 text-xs text-ink3">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={takeover}
+                          onChange={(e) => setTakeover(e.currentTarget.checked)}
+                          disabled={busy}
+                        />
+                        <span>
+                          I&rsquo;m taking over ownership of this vault — everyone else needs the
+                          new passphrase from me.
+                        </span>
+                      </label>
+                    </Callout>
+                  )}
+                  <Input
+                    type="password"
+                    placeholder="New passphrase"
+                    value={pass}
+                    onChange={(e) => setPass(e.target.value)}
+                    autoFocus
+                  />
+                  <Input
+                    type="password"
+                    placeholder="Confirm new passphrase"
+                    value={confirm}
+                    onChange={(e) => setConfirm(e.target.value)}
+                  />
+                  <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
+                  <div className="flex gap-2">
+                    <Button
+                      variant="primary"
+                      disabled={busy || !passphrasesMatch || !strongEnough || (joined && !takeover)}
+                      onClick={() =>
+                        run(
+                          () => changeVaultPassphrase(pass, joined && takeover),
+                          "Passphrase changed.",
+                        )
+                      }
+                    >
+                      {busy ? "Working…" : "Change passphrase"}
+                    </Button>
+                    <Button variant="tertiary" onClick={reset} disabled={busy}>
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
               )}
-              <Input
-                type="password"
-                placeholder="New passphrase"
-                value={pass}
-                onChange={(e) => setPass(e.target.value)}
-                autoFocus
-              />
-              <Input
-                type="password"
-                placeholder="Confirm new passphrase"
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-              />
-              <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
-              <div className="flex gap-2">
-                <Button
-                  variant="primary"
-                  disabled={busy || !passphrasesMatch || !strongEnough || (joined && !takeover)}
-                  onClick={() =>
-                    run(
-                      () => changeVaultPassphrase(pass, joined && takeover),
-                      "Passphrase changed.",
-                    )
-                  }
-                >
-                  {busy ? "Working…" : "Change passphrase"}
-                </Button>
-                <Button variant="tertiary" onClick={reset} disabled={busy}>
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          )}
 
-          {pending === "private" && (
-            <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
-              {/* For a vault another account created there is no confirmation on offer, because
+              {pending === "private" && (
+                <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
+                  {/* For a vault another account created there is no confirmation on offer, because
                   there is no way back: making it private re-keys it to THIS account's device key
                   (held in this keychain alone), decrypts the notes, and moves the shared folder
                   into this profile. Unlike a re-key, no passphrase gets the owner back in. So the
                   button is replaced by the non-destructive exit, which the backend's refusal names
                   too — the two must not disagree about what a joiner is offered. */}
-              {joined ? (
-                <>
-                  <p className="text-xs text-st-due" role="alert">
-                    This shared vault was created by another account on this PC, so it isn&rsquo;t
-                    yours to make private &mdash; that would re-key it to this account alone and
-                    move it out of the shared folder, with no way back in for anyone else.
-                  </p>
-                  {/* Leaving is what `detachFromSharedVault` does, and it retires this profile's
+                  {joined ? (
+                    <>
+                      <p className="text-xs text-st-due" role="alert">
+                        This shared vault was created by another account on this PC, so it
+                        isn&rsquo;t yours to make private &mdash; that would re-key it to this
+                        account alone and move it out of the shared folder, with no way back in for
+                        anyone else.
+                      </p>
+                      {/* Leaving is what `detachFromSharedVault` does, and it retires this profile's
                       POINTER — so it is only on offer when there is a pointer to retire. Without
                       one it is a silent no-op, and a button that does nothing is worse than no
                       button: the honest answer here is that PM has nothing to offer. (Reachable
                       when a shareable vault sits in this profile's own folder and the account's SID
                       has since changed, which reads as `joined` on the user's own vault.) */}
-                  {status?.pointed_root && (
-                    <p className="text-xs text-ink4">
-                      You can leave it instead. The shared vault stays exactly where it is for
-                      everyone still using it, and you can rejoin any time with the passphrase.
+                      {status?.pointed_root && (
+                        <p className="text-xs text-ink4">
+                          You can leave it instead. The shared vault stays exactly where it is for
+                          everyone still using it, and you can rejoin any time with the passphrase.
+                        </p>
+                      )}
+                      <div className="flex gap-2">
+                        {status?.pointed_root && (
+                          <Button
+                            variant="secondary"
+                            disabled={busy}
+                            onClick={() => setConfirmDetach(true)}
+                          >
+                            Use a vault on this account instead
+                          </Button>
+                        )}
+                        <Button variant="tertiary" onClick={reset} disabled={busy}>
+                          Cancel
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-xs text-ink4">
+                        Make this vault private to this device again? It's re-keyed to a device-only
+                        key and its Markdown is decrypted back to plaintext. Other profiles will no
+                        longer be able to open it.
+                      </p>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="primary"
+                          disabled={busy}
+                          onClick={() =>
+                            run(
+                              () => makeVaultPrivate(),
+                              "This vault is private to this device again.",
+                            )
+                          }
+                        >
+                          {busy ? "Working…" : "Make private"}
+                        </Button>
+                        <Button variant="tertiary" onClick={reset} disabled={busy}>
+                          Cancel
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {pending === "delete" && (
+                <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-st-due p-3">
+                  <p className="text-xs text-ink3">
+                    Delete this shared vault for{" "}
+                    <span className="font-medium text-st-due">every</span> account that uses it? Its
+                    documents, chats, and projects are{" "}
+                    <span className="font-medium text-st-due">permanently removed</span> from the
+                    shared folder. Connected accounts lose access at their next launch and are moved
+                    back to a vault of their own.
+                  </p>
+                  <p className="text-xs text-ink4">
+                    {status?.has_set_aside_vault
+                      ? "This account switches back to the vault that was set aside when you joined."
+                      : "This account switches to a new, empty vault (your data was moved into the shared copy when you shared it)."}
+                  </p>
+                  {status?.ownership === "unknown" && (
+                    <p className="text-xs text-st-due" role="alert">
+                      PM can&rsquo;t confirm this account created this vault &mdash; it was made
+                      before PM recorded that, or this account has changed since. If someone else
+                      set it up, ask them to delete it from their own PM instead.
                     </p>
                   )}
-                  <div className="flex gap-2">
-                    {status?.pointed_root && (
-                      <Button
-                        variant="secondary"
-                        disabled={busy}
-                        onClick={() => setConfirmDetach(true)}
-                      >
-                        Use a vault on this account instead
-                      </Button>
-                    )}
-                    <Button variant="tertiary" onClick={reset} disabled={busy}>
-                      Cancel
-                    </Button>
-                  </div>
-                </>
-              ) : (
-                <>
                   <p className="text-xs text-ink4">
-                    Make this vault private to this device again? It's re-keyed to a device-only key
-                    and its Markdown is decrypted back to plaintext. Other profiles will no longer
-                    be able to open it.
+                    Back up anything you still want first. This cannot be undone, and PM keeps no
+                    copy.
                   </p>
                   <div className="flex gap-2">
-                    <Button
-                      variant="primary"
-                      disabled={busy}
-                      onClick={() =>
-                        run(() => makeVaultPrivate(), "This vault is private to this device again.")
-                      }
-                    >
-                      {busy ? "Working…" : "Make private"}
+                    <Button variant="danger" disabled={busy} onClick={() => void deleteShared()}>
+                      {busy ? "Deleting…" : "Delete for everyone"}
                     </Button>
                     <Button variant="tertiary" onClick={reset} disabled={busy}>
                       Cancel
                     </Button>
                   </div>
-                </>
+                </div>
               )}
-            </div>
+            </>
           )}
 
-          {pending === "delete" && (
-            <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-st-due p-3">
-              <p className="text-xs text-ink3">
-                Delete this shared vault for <span className="font-medium text-st-due">every</span>{" "}
-                account that uses it? Its documents, chats, and projects are{" "}
-                <span className="font-medium text-st-due">permanently removed</span> from the shared
-                folder. Connected accounts lose access at their next launch and are moved back to a
-                vault of their own.
-              </p>
-              <p className="text-xs text-ink4">
-                {status?.has_set_aside_vault
-                  ? "This account switches back to the vault that was set aside when you joined."
-                  : "This account switches to a new, empty vault (your data was moved into the shared copy when you shared it)."}
-              </p>
-              {status?.ownership === "unknown" && (
-                <p className="text-xs text-st-due" role="alert">
-                  PM can&rsquo;t confirm this account created this vault &mdash; it was made before
-                  PM recorded that, or this account has changed since. If someone else set it up,
-                  ask them to delete it from their own PM instead.
+          {/* Always available: join a shared vault someone else set up on this PC. */}
+          <div className="mt-3" data-help="settings-vault-join">
+            {pending !== "adopt" ? (
+              <Button variant="tertiary" onClick={() => setPending("adopt")} disabled={busy}>
+                Open an existing shared vault…
+              </Button>
+            ) : (
+              <div className="space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
+                <p className="text-xs text-ink4">
+                  Point PM at a shared vault folder someone set up on this PC (or a copied vault)
+                  and open it with its passphrase. PM switches to that vault; the one you're using
+                  now is kept on disk, set aside — nothing is deleted.
                 </p>
-              )}
-              <p className="text-xs text-ink4">
-                Back up anything you still want first. This cannot be undone, and PM keeps no copy.
-              </p>
-              <div className="flex gap-2">
-                <Button variant="danger" disabled={busy} onClick={() => void deleteShared()}>
-                  {busy ? "Deleting…" : "Delete for everyone"}
-                </Button>
-                <Button variant="tertiary" onClick={reset} disabled={busy}>
-                  Cancel
-                </Button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="secondary"
+                    onClick={() => void pickAdoptFolder()}
+                    disabled={busy}
+                  >
+                    Choose the vault folder…
+                  </Button>
+                  {adoptFolder && (
+                    <span className="break-all font-mono text-xs text-ink3">{adoptFolder}</span>
+                  )}
+                </div>
+                <Input
+                  type="password"
+                  placeholder="Vault passphrase"
+                  value={pass}
+                  onChange={(e) => setPass(e.target.value)}
+                />
+                <div className="flex gap-2">
+                  <Button
+                    variant="primary"
+                    disabled={busy || !adoptFolder || pass.length === 0}
+                    onClick={() => void adopt()}
+                  >
+                    {busy ? "Joining…" : "Open shared vault"}
+                  </Button>
+                  <Button variant="tertiary" onClick={reset} disabled={busy}>
+                    Cancel
+                  </Button>
+                </div>
               </div>
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Always available: join a shared vault someone else set up on this PC. */}
-      <div className="mt-3" data-help="settings-vault-join">
-        {pending !== "adopt" ? (
-          <Button variant="tertiary" onClick={() => setPending("adopt")} disabled={busy}>
-            Open an existing shared vault…
-          </Button>
-        ) : (
-          <div className="space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
-            <p className="text-xs text-ink4">
-              Point PM at a shared vault folder someone set up on this PC (or a copied vault) and
-              open it with its passphrase. PM switches to that vault; the one you're using now is
-              kept on disk, set aside — nothing is deleted.
-            </p>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button variant="secondary" onClick={() => void pickAdoptFolder()} disabled={busy}>
-                Choose the vault folder…
-              </Button>
-              {adoptFolder && (
-                <span className="break-all font-mono text-xs text-ink3">{adoptFolder}</span>
-              )}
-            </div>
-            <Input
-              type="password"
-              placeholder="Vault passphrase"
-              value={pass}
-              onChange={(e) => setPass(e.target.value)}
-            />
-            <div className="flex gap-2">
-              <Button
-                variant="primary"
-                disabled={busy || !adoptFolder || pass.length === 0}
-                onClick={() => void adopt()}
-              >
-                {busy ? "Joining…" : "Open shared vault"}
-              </Button>
-              <Button variant="tertiary" onClick={reset} disabled={busy}>
-                Cancel
-              </Button>
-            </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Always available: the portability escape hatch. */}
-      <div className="mt-3">
-        <Button variant="tertiary" onClick={exportPlaintext} disabled={busy}>
-          Export to plaintext Markdown…
-        </Button>
-      </div>
+          <SectionInfo title="How a shared vault works">
+            {shareable && (
+              <p>
+                Markdown encryption is on because this vault is shared. Without it, other accounts
+                on this device could read your notes directly.
+              </p>
+            )}
+            <p>
+              A shared vault lives in a folder every participating account can reach, and opens with
+              a passphrase rather than a key held by one account&rsquo;s keychain. Everyone sees the
+              same documents, projects and chats; sign-ins and API keys stay personal to each
+              account.
+            </p>
+            <p>
+              Your files stay yours either way. Export to plaintext Markdown any time from{" "}
+              <span className="font-medium">Export</span> above — encryption protects them at rest,
+              it doesn&rsquo;t lock you in.
+            </p>
+          </SectionInfo>
+        </div>
+      </Collapsible>
 
       {error && <p className="mt-2 break-all text-xs text-st-due">{error}</p>}
       {msg && <p className="mt-2 break-all text-xs text-ink4">{msg}</p>}
-
-      <SectionInfo title="How the vault works">
-        {shareable && (
-          <p>
-            Markdown encryption is on because this vault is shared. Without it, other accounts on
-            this device could read your notes directly.
-          </p>
-        )}
-        <p>
-          Your files stay yours. Export to plaintext Markdown anytime with your passphrase —
-          encryption protects them at rest, it doesn't lock you in.
-        </p>
-      </SectionInfo>
 
       <ShareVaultWizard
         open={wizardOpen}

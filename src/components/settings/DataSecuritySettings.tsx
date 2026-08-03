@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useState } from "react";
-import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 
-import { appLockStatus, exportAllData, openDataFolder, setAppLock } from "../../lib/ipc";
+import { appLockStatus, dataLocations, openDataFolder, setAppLock } from "../../lib/ipc";
 import { IS_LINUX } from "../../lib/setupGuide";
-import type { AppLockStatus } from "../../lib/types";
+import type { AppLockStatus, DataLocations } from "../../lib/types";
+import { ExportDataDialog } from "../ExportDataDialog";
 import { RemovePmData } from "../RemovePmData";
 import { VaultCard } from "../VaultCard";
 import { Button, Callout, SectionInfo, SettingRow, Toggle } from "../ui";
@@ -16,13 +16,16 @@ import { Button, Callout, SectionInfo, SettingRow, Toggle } from "../ui";
  *  errors surface inline here (the StorageSettings pattern), not in a shared footer. */
 export function DataSecuritySettings() {
   const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportMsg, setExportMsg] = useState<string | null>(null);
+  const [where, setWhere] = useState<DataLocations | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     appLockStatus()
       .then(setAppLockState)
+      .catch(() => {});
+    dataLocations()
+      .then(setWhere)
       .catch(() => {});
   }, []);
 
@@ -42,31 +45,6 @@ export function DataSecuritySettings() {
       await openDataFolder();
     } catch (e) {
       setError(String(e));
-    }
-  }
-
-  async function exportData() {
-    setError(null);
-    setExportMsg(null);
-    let dest: string | null;
-    try {
-      dest = await saveFileDialog({
-        defaultPath: "personal-manager-export.zip",
-        filters: [{ name: "Zip archive", extensions: ["zip"] }],
-      });
-    } catch (e) {
-      setError(String(e));
-      return;
-    }
-    if (!dest) return; // the user cancelled the dialog
-    setExporting(true);
-    try {
-      await exportAllData(dest);
-      setExportMsg(`Exported to ${dest}`);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setExporting(false);
     }
   }
 
@@ -136,41 +114,62 @@ export function DataSecuritySettings() {
         )}
       </div>
 
+      {/* Data and Vault were two sections about one folder, and the separation WAS the incident
+          (#712): on a Mac the vault path sat as text in one of them while "Open data folder"
+          waited about forty lines away in the other — and the two could point at different places,
+          because the button opened the profile default while the card showed the resolved root.
+          One section now, with the path on the button that opens it. The registry id is the
+          existing `sec-data-data`; minting a new one silently breaks the in-rail sub-nav. */}
       <div
         id="sec-data-data"
         data-settings-section
         className="mt-5 border-t border-border pt-4"
         data-help="settings-data"
       >
-        <h2 className="block text-sm font-medium text-ink2">Data</h2>
+        <h2 className="block text-sm font-medium text-ink2">Your data</h2>
+        {where && (
+          <p className="mt-1 break-all text-xs text-ink4">
+            Everything PM keeps for you lives in{" "}
+            <span className="font-medium text-ink3">{where.vault_root}</span>
+          </p>
+        )}
+        {/* Named only when it differs. A moved or shared vault genuinely has two folders — the
+            vault itself, and this profile's own folder holding the pointer to it plus the
+            regenerable runtime — and staying silent about the second is how someone ends up backing
+            up the wrong one. On an ordinary install there is one place, and it reads as one. */}
+        {where?.pointed && (
+          <p className="mt-1 break-all text-xs text-ink4">
+            PM&rsquo;s own settings folder on this account is separate:{" "}
+            <span className="text-ink3">{where.app_data_dir}</span>
+          </p>
+        )}
         <div className="mt-2 flex flex-wrap gap-2">
           <Button variant="tertiary" onClick={revealDataFolder}>
             Open data folder
           </Button>
-          <Button variant="tertiary" onClick={exportData} disabled={exporting}>
-            {exporting ? "Exporting…" : "Export all data…"}
+          <Button variant="tertiary" onClick={() => setExportOpen(true)}>
+            Export&hellip;
           </Button>
         </div>
-        {exportMsg && <p className="mt-2 break-all text-xs text-ink4">{exportMsg}</p>}
         <SectionInfo title="About your data & export">
           <p>
-            Your documents and the encrypted store live in one folder (
-            <span className="font-medium">Personal Manager</span>). Open it to back it up by hand,
-            or export everything to a single <span className="font-medium">.zip</span> — the
-            Markdown vault plus the encrypted store (the regenerable runtime is left out). The store
-            stays encrypted in the archive.
+            Your documents are Markdown files in that folder, stored unencrypted so any tool can
+            read them; PM&rsquo;s own store (projects, chats, the search index) sits beside them and
+            is always encrypted. To protect the Markdown when your machine is off or logged out,
+            turn on full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on Linux).
           </p>
           <p>
-            Your documents in the Markdown vault are stored unencrypted so any tool can read them.
-            To protect them when your machine is off or logged out, turn on full-disk encryption
-            (BitLocker on Windows, FileVault on macOS, LUKS on Linux).
+            <span className="font-medium">Export</span> offers everything or just your documents,
+            plain or encrypted. Plain means readable Markdown — PM&rsquo;s store stays encrypted
+            inside the archive either way. Encrypted is the same file a backup writes, and needs a
+            passphrase to open.
           </p>
         </SectionInfo>
-      </div>
 
-      <div id="sec-data-vault" data-settings-section>
         <VaultCard />
       </div>
+
+      <ExportDataDialog open={exportOpen} onClose={() => setExportOpen(false)} />
 
       <div id="sec-data-remove" data-settings-section>
         <RemovePmData biometricAvailable={appLock?.available ?? false} />

@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.122.0-alpha",
+    date: "2026-08-03",
+    highlights: [
+      "Everything about where your data lives is now in one place, with the folder written above the button that opens it. The path used to sit as text in one section while “Open data folder” waited about forty lines away in another — and on a vault you had moved or joined, the two could point at different folders, so the button opened somewhere your documents were not. One section, one path, and the button goes where the text says.",
+      "If your vault has been moved or shared, PM now also names its own settings folder on this account separately. They really are two places, and backing up the wrong one is the mistake worth avoiding.",
+      "Export now asks what you actually want: everything or just your documents, plain or encrypted, with a sentence saying exactly what each combination produces. Plain means readable Markdown — PM’s own store stays encrypted inside the archive either way, which the old button never said. Encrypted writes the same .pmbackup file a backup does and needs a passphrase to open. An encrypted copy of the documents alone is the one thing PM won’t do, and it says so rather than quietly giving you something else: restoring one needs PM’s store and the vault’s key file, so an archive without them could never be restored.",
+      "The export zip now carries what a backup carries. It had been leaving out the vault’s own key file, your entity rules and every cloud pointer — so unzipping it on another machine gave you a vault PM couldn’t open, and if it did open, one that had quietly lost things. On a moved or shared vault it was worse: the right database paired with a stale set of documents from the old folder.",
+      "Sharing one vault between several accounts on the same PC is now folded away at the bottom, where a rarely-used feature belongs. On macOS and Linux it also says plainly what is missing: PM can open a shared vault that already exists there, but it can’t set one up, because finding the other accounts and granting them access is Windows-only. Opening an existing one stays where it was — for a Mac or Linux user it is the only way in there has ever been.",
+    ],
+  },
+  {
     version: "3.121.0-alpha",
     date: "2026-08-03",
     highlights: [

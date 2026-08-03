@@ -1763,6 +1763,7 @@ pub fn run() {
             commands::cost_summary,
             commands::refresh_pricing,
             commands::open_data_folder,
+            commands::data_locations,
             commands::export_all_data,
             commands::export_plaintext_markdown,
             // "Remove PM data" teardown (Settings → Data & Security) — the à-la-carte counterpart to

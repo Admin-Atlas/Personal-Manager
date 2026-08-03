@@ -131,8 +131,10 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
         Icon: DataIcon,
         sections: [
           { id: "sec-data-applock", label: "App lock" },
-          { id: "sec-data-data", label: "Data" },
-          { id: "sec-data-vault", label: "Vault" },
+          // Data and Vault merged into one section (#712) — the split was the incident. The id
+          // is the surviving one of the two, deliberately: changing it breaks the in-rail
+          // sub-nav and `scrollToSection` then silently no-ops.
+          { id: "sec-data-data", label: "Your data" },
           { id: "sec-data-remove", label: "Remove data" },
           { id: "sec-data-license", label: "License" },
         ],
