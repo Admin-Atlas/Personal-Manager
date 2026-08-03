@@ -1150,11 +1150,6 @@ export default function App() {
                     {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
                     <DocumentsView
                       onReviewClick={teachVisible ? () => setView("review") : undefined}
-                      // From App's settings, which are re-read when the Settings overlay closes — this
-                      // view stays mounted underneath it, so its own mount-time read never saw the
-                      // toggle change (#282).
-                      duplicateCheck={settings ? settings.duplicate_check : null}
-                      onDuplicateCheckChange={refreshSettings}
                     />
                   </main>
                 ) : view === "review" ? (

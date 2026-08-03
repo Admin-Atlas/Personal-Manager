@@ -926,6 +926,41 @@ pub fn register_pointer(
             });
         }
     }
+    // The same FILE reached by a second route (#711). One Drive file has one file id however it is
+    // found — owned in My Drive, inside a shared drive, or shared with a second connected account —
+    // so if PM already holds a location with this file's key, this is not a new document. It is a
+    // new PLACE for one PM has, and recording it here is what stops the second row existing at all
+    // rather than being cleaned up afterwards.
+    //
+    // `None` from `provenance_key` is the common answer (every non-Drive id today) and simply means
+    // no such claim can be made — never that the file is new.
+    if let Some(key) = crate::locations::provenance_key(&input.source_id) {
+        let conn = state.conn()?;
+        if let Some(existing) = crate::locations::document_for_key(&conn, &key)? {
+            crate::locations::record(
+                &conn,
+                existing,
+                &crate::locations::Location {
+                    source_id: input.source_id.clone(),
+                    state: SourceState::Ok,
+                    external_ref: input.external_ref.clone(),
+                    source_modified_at: input.source_modified_at.clone(),
+                    source_content_hash: input.source_content_hash.clone(),
+                    source_parent_folder_id: input.source_parent_folder_id.clone(),
+                    source_parent_folder_name: input.source_parent_folder_name.clone(),
+                    // Never the anchor: that id is assigned once, at birth, and this document was
+                    // born somewhere else.
+                    anchor: false,
+                },
+            )?;
+            // Not an arrival. The user has seen this document; it has simply turned out to live in
+            // one more place, which is not news the Review queue should re-open.
+            return Ok(Registered {
+                document: ingest::load_document(&conn, existing)?,
+                created: false,
+            });
+        }
+    }
     let now = {
         let conn = state.conn()?;
         ingest::iso_now(&conn)?

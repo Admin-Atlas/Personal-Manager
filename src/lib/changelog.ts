@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.121.0-alpha",
+    date: "2026-08-03",
+    highlights: [
+      "One file in a connected account is now one document, however many ways you can reach it. If you own a file and a colleague has also shared it with you, or it sits in a shared drive that someone shared with you directly, PM used to hold it twice — two rows, two filings, two of everything, and no way to tell them apart on screen. It now recognises them as the same file and keeps one document that lives in two places. Nothing is deleted to do it: both places go on being checked, so the document stays readable as long as either one is still there.",
+      "Copies you already have are joined up the next time PM opens, and whichever of the two you had filed is the filing that survives — projects, labels and importance are merged rather than picked between. Where a file lives now shows under it, in the reader and in the duplicate check, so “two places” is something you can look at rather than take on trust.",
+      "This does not guess. PM joins two records only when the provider’s own id says they are the same file; two documents that merely look alike are still shown to you to decide on, exactly as before. Files in two different services stay separate — there is no shared id to go on, and inventing one would eventually merge two documents that were never the same.",
+      "The duplicate check has moved out of Settings and onto the Documents tab, beside Rebuild. There is no longer anything to switch on: it checks in the background after any sync or import that actually brought something new in, and the button tells you what it found. Checking the whole library is still one click away for when you want everything compared against everything.",
+    ],
+  },
+  {
     version: "3.120.0-alpha",
     date: "2026-08-02",
     highlights: [

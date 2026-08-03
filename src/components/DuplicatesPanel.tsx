@@ -29,6 +29,7 @@ import { provenanceParts } from "../lib/sourceLabel";
 import { sourceFacts } from "../lib/sourceFacts";
 import { useReader } from "../lib/reader";
 import type { DuplicatePair, DuplicateReport, Document } from "../lib/types";
+import { DocumentPlaces } from "./DocumentPlaces";
 import { Button, ConfirmDialog } from "./ui";
 
 /** How a pair was found, as a sentence rather than a score. The wording carries the confidence: an
@@ -123,6 +124,10 @@ function SideCard({
           </Fragment>
         ))}
       </dl>
+      {/* Where this document's file actually lives — plural since #711, and the reason a pair can
+          now look like one document rather than two. Folded away: on the surface that asks you to
+          delete something, the detail has to be reachable without being in the way. */}
+      <DocumentPlaces docId={doc.id} />
       <div className="mt-2 flex gap-2">
         <Button variant="tertiary" onClick={onOpen}>
           Open
@@ -137,9 +142,19 @@ function SideCard({
   );
 }
 
-export function DuplicatesPanel() {
+export function DuplicatesPanel({
+  report,
+  onReport,
+  onClose,
+}: {
+  /** The last check's findings, background or on demand. Owned by the Documents view because its
+   *  toolbar button shows the count — a background result nobody can see is not a result. */
+  report: DuplicateReport | null;
+  onReport: (r: DuplicateReport | null) => void;
+  onClose: () => void;
+}) {
   const { openReader } = useReader();
-  const [report, setReport] = useState<DuplicateReport | null>(null);
+  const setReport = onReport;
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingRemove, setPendingRemove] = useState<Document | null>(null);
@@ -188,7 +203,7 @@ export function DuplicatesPanel() {
     } finally {
       setScanning(false);
     }
-  }, []);
+  }, [setReport]);
 
   async function confirmRemove() {
     if (!pendingRemove) return;
@@ -220,9 +235,14 @@ export function DuplicatesPanel() {
             own. {NAMES_ARE_NOT_COMPARED}
           </p>
         </div>
-        <Button variant="secondary" onClick={() => void scan()} disabled={scanning}>
-          {scanning ? "Checking…" : report ? "Check again" : "Check for duplicates"}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="secondary" onClick={() => void scan()} disabled={scanning}>
+            {scanning ? "Checking…" : "Check the whole library"}
+          </Button>
+          <Button variant="tertiary" onClick={onClose}>
+            Close
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -236,8 +256,19 @@ export function DuplicatesPanel() {
           <p className="text-xs text-ink4">
             {visible.length === 0
               ? `Nothing looks duplicated across your ${report.scanned} documents.`
-              : `${visible.length} possible ${visible.length === 1 ? "pair" : "pairs"} across your ${report.scanned} documents.`}
+              : `${visible.length} possible ${visible.length === 1 ? "pair" : "pairs"} across your ${report.scanned} documents.`}{" "}
+            Checked {formatDateTime(report.checked_at)}.
           </p>
+          {/* A narrower scan reported as a whole one is a clean bill of health PM has not earned —
+              the same rule as the skipped-similarity line below. A background check compares what
+              arrived against the library, so anything already there and already duplicated when it
+              ran was never asked about. */}
+          {report.incremental && (
+            <p className="mt-1 text-xs text-ink4">
+              This covers what has arrived since PM last looked. Check the whole library to compare
+              everything against everything.
+            </p>
+          )}
           {/* A partial method must never be reported as a clean result. */}
           {report.similarity_skipped && (
             <p className="mt-1 text-xs text-[var(--st-due)]">
@@ -321,39 +352,6 @@ export function DuplicatesPanel() {
         )}
         <p>The other document in the pair is left alone.</p>
       </ConfirmDialog>
-    </div>
-  );
-}
-
-/** The one-time suggestion that the duplicate check exists (#282).
- *
- *  An off-by-default tool inside a Settings tab is a tool nobody finds, and this one is off by
- *  default for a good reason (its signals produce false pairs, so PM should not volunteer them). One
- *  dismissible card in the view it would act on is the smallest thing that resolves that tension:
- *  it names what the feature does, it is refusable, and refusing it is remembered. */
-export function DuplicateNudge({
-  onEnable,
-  onDismiss,
-}: {
-  onEnable: () => void;
-  onDismiss: () => void;
-}) {
-  return (
-    <div className="mt-4 rounded-lg border border-border p-4">
-      <p className="text-sm text-ink2">Have you got the same document twice?</p>
-      <p className="mt-1 text-xs text-ink4">
-        PM can look through your library for documents that appear to be duplicates — the same file
-        imported twice, or one that also lives in a connected account. It shows you both and never
-        removes anything by itself.
-      </p>
-      <div className="mt-3 flex gap-2">
-        <Button variant="secondary" onClick={onEnable}>
-          Turn it on
-        </Button>
-        <Button variant="tertiary" onClick={onDismiss}>
-          No thanks
-        </Button>
-      </div>
     </div>
   );
 }

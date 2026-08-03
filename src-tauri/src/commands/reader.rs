@@ -110,6 +110,48 @@ pub fn document_chunk_spans(state: State<'_, AppState>, doc_id: i64) -> Result<V
     Ok(rows)
 }
 
+/// One place a document's file lives, in the shape the UI renders (#710/#711).
+///
+/// A flattened `locations::Location` rather than the struct itself: the frontend's own
+/// `sourceLabel.ts` already decodes a `source_id` into the words a person would use, and returning
+/// the raw id lets one labeller serve documents and locations alike instead of a second copy of the
+/// namespace rules living in Rust and drifting from it.
+#[derive(Serialize)]
+pub struct DocumentPlace {
+    pub source_id: String,
+    /// `'ok' | 'unreachable' | 'source_missing'` — for THIS place, not the document. A document with
+    /// two places is routinely reachable at one and not the other, which is the whole point of
+    /// showing them separately.
+    pub state: String,
+    pub external_ref: Option<String>,
+    pub source_modified_at: Option<String>,
+    pub source_parent_folder_name: Option<String>,
+    /// True for the place whose id is the document's permanent identity anchor. Shown as "the
+    /// original" ordering only — never as "the good copy", because it isn't one.
+    pub anchor: bool,
+}
+
+/// Every place one document's file lives, anchor first then oldest-first.
+///
+/// Empty for a vault document, a chat or a photo — none of which a connector found — and the UI
+/// renders nothing rather than an empty list, because "this has no locations" is a statement about
+/// PM's plumbing that means nothing to the person reading it.
+#[tauri::command]
+pub fn document_locations(state: State<'_, AppState>, doc_id: i64) -> Result<Vec<DocumentPlace>> {
+    let conn = state.conn()?;
+    Ok(crate::locations::list(&conn, doc_id)?
+        .into_iter()
+        .map(|l| DocumentPlace {
+            source_id: l.source_id,
+            state: l.state.as_str().to_string(),
+            external_ref: l.external_ref,
+            source_modified_at: l.source_modified_at,
+            source_parent_folder_name: l.source_parent_folder_name,
+            anchor: l.anchor,
+        })
+        .collect())
+}
+
 /// The original image for a `photo` document, as base64 + mime, for the reader to display. Prefers the
 /// encrypted copy in the vault when the user opted to save one; otherwise falls back to the original
 /// file where PM referenced it on disk (photos are referenced-in-place by default — no vault copy). Only

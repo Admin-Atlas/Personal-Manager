@@ -31,6 +31,7 @@ import type {
   DevTableCount,
   DevTablePage,
   Document,
+  DocumentLocation,
   DraftPreference,
   DriveAccount,
   DriveFolder,
@@ -205,14 +206,20 @@ export const packageManagedLinux = () => invoke<boolean>("package_managed_linux"
  *  triggers a Rebuild; the effect lands on the next query. */
 export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });
 
-/** Offer the duplicate check in the Documents view, or stop offering it (#282). Gates the offer
- *  only — scanning is always something the user asks for, so turning this on starts nothing. */
-export const setDuplicateCheck = (enabled: boolean) =>
-  invoke<void>("set_duplicate_check", { enabled });
-
-/** Scan the whole library for documents held twice (#282), by identical opening text and by
- *  near-identical embeddings. On demand only, and it reports — nothing is deleted or merged. */
+/** Scan the WHOLE library for documents held twice (#282), by identical opening text and by
+ *  near-identical embeddings. It reports — nothing is deleted or merged. Replaces whatever the
+ *  background check last found, since a full sweep answers every question those only sampled. */
 export const scanDuplicates = () => invoke<DuplicateReport>("scan_duplicates");
+
+/** What the last check found, or `null` if none has run this session (#711). Read on mount: the tab
+ *  router unmounts the Documents view, so a background result held only in component state would be
+ *  thrown away the moment the user looked at something else. */
+export const duplicateSnapshot = () => invoke<DuplicateReport | null>("duplicate_snapshot");
+
+/** Fire when a background duplicate check has updated that snapshot — after a sync or import run
+ *  that actually landed something (#711). Never on a poll that found nothing. */
+export const onDuplicatesUpdated = (handler: () => void): Promise<UnlistenFn> =>
+  listen("duplicates://updated", () => handler());
 
 /** Record that the user looked at a pair and is keeping both, so it stops being re-offered. The
  *  report is recomputed from scratch on every scan and writes nothing back, so without this a
@@ -1322,6 +1329,11 @@ export const readDocumentBody = (docId: number) => invoke<string>("read_document
 /** The document's chunk spans (leaves + parents, ordered) — the chunk-boundary overlay's data. */
 export const documentChunkSpans = (docId: number) =>
   invoke<ChunkSpan[]>("document_chunk_spans", { docId });
+
+/** Every place this document's file lives, anchor first then oldest-first (#710/#711). Empty for a
+ *  vault document, a chat or a photo — none of which a connector found. */
+export const documentLocations = (docId: number) =>
+  invoke<DocumentLocation[]>("document_locations", { docId });
 
 /** The decrypted original image for a photo saved into the vault, as base64 + mime; `null` when none was
  *  saved (the reader then falls back to the OCR body). */

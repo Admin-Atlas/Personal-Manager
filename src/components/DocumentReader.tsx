@@ -24,6 +24,7 @@ import { Markdown } from "../lib/markdown";
 import { parentGroupStarts, segmentByLeaves, shadeLeaves } from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
 import { sourceFacts } from "../lib/sourceFacts";
+import { DocumentPlaces } from "./DocumentPlaces";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 
@@ -326,6 +327,10 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
               </div>
             ))}
           </dl>
+          {/* Every place this file lives (#710/#711). Renders nothing at all for a document with
+              one place, which is nearly all of them — the source line above already said where it
+              is, and "In 1 place" beneath it would be chrome restating the header. */}
+          <DocumentPlaces docId={doc.id} />
         </div>
         {canOverlay && (
           <button

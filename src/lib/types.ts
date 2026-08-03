@@ -46,9 +46,6 @@ export interface Settings {
   /** The effective confidence-gate threshold — the minimum top rerank score for PM to trust its
    *  grounding — or null when a dev has disabled the gate. On by default; tuned in Developer mode (#402). */
   retrieval_confidence_threshold: number | null;
-  /** Whether the Documents view offers the duplicate check (#282). Default off; scanning is always
-   *  on demand, so this gates the offer, never a background pass. */
-  duplicate_check: boolean;
 }
 
 /** One search-language / embedder choice offered at vault creation. */
@@ -1926,6 +1923,30 @@ export interface DuplicateReport {
   /** Pairs hidden because the user already chose to keep both — reported, never silently
    *  subtracted. */
   dismissed: number;
+  /** When this report was produced. Shown because a result that arrived on its own, with no button
+   *  pressed, is otherwise indistinguishable from one that is hours stale. */
+  checked_at: string;
+  /** True when this covers only what arrived since the last check, not the whole library (#711).
+   *  Surfaced for the same reason `similarity_skipped` is. */
+  incremental: boolean;
+}
+
+/** One place a document's file lives; mirrors `commands::reader::DocumentPlace` (#710/#711).
+ *
+ *  The raw `source_id` travels rather than a pre-rendered label, so `sourceLabel.ts` — which already
+ *  decodes the connectors' namespaces for documents — serves locations too, instead of a second copy
+ *  of those rules living in Rust and drifting from it. */
+export interface DocumentLocation {
+  source_id: string;
+  /** For THIS place, not the document: a file with two places is routinely reachable at one and not
+   *  the other, which is the whole reason they are shown apart. */
+  state: "ok" | "unreachable" | "source_missing";
+  external_ref: string | null;
+  source_modified_at: string | null;
+  source_parent_folder_name: string | null;
+  /** The place whose id is the document's permanent identity anchor — an ordering, never a claim
+   *  that this copy is the good one. */
+  anchor: boolean;
 }
 
 /** ONE-TIME cleanup (card #651) — delete this block with the sweep in the next release.

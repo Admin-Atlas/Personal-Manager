@@ -134,6 +134,22 @@ regime it means, in the code and in the UI string. Never compare hashes across r
 infer provenance from a hash match alone: identical content is EVIDENCE for a fold, never a proof of
 one, and the fold is a claim PM should be able to point at a source id to justify.
 
+**What that proof looks like (#711).** `locations::provenance_key` is the only thing in PM allowed
+to assert the fourth claim, and it does so by deriving the PROVIDER's own global file id from a
+source id — the one datum that is the same for every route to a file. Two consequences follow, and
+both are load-bearing:
+
+* A provider whose ids are not global answers `None`, and that is an answer, not a gap. OneDrive
+  item ids are unique per drive; a bare-itemId key could collide across two accounts and merge two
+  genuinely different files. **An unsound key is worse than no key** — a missed duplicate is a row
+  the user scrolls past, a false one silently destroys a document.
+* The key is compared with `=` against a stored column, never built into a `LIKE` pattern. Drive
+  file ids legitimately contain `_`, which is a single-character wildcard, so `LIKE '…' || fileId`
+  matches files that differ exactly where the underscore sits.
+
+Anything proven this way is folded without asking (one document, many locations). Anything short of
+proof stays in `duplicates.rs`, which only ever reports.
+
 ### I-08 · Device identity has no single owner yet — **Forward**
 
 PM currently holds two unrelated device notions: the OS device id baked into a local-folder file
