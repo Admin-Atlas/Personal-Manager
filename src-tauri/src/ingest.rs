@@ -137,6 +137,16 @@ pub struct Document {
     /// ingested — an index-only pointer has no such file. `None` for a Google-native Doc/Sheet/Slide,
     /// which has no byte size at all.
     pub source_size_bytes: Option<i64>,
+    /// When the SOURCE last changed — Drive/OneDrive's own modified time, or the file's mtime for a
+    /// local folder. Distinct from every other timestamp here: `created_at` and `ingested_at` are
+    /// PM's, and `source_created_at` is when the thing was made. Stored since v11 and written on
+    /// every re-sync; it simply had no way of reaching the UI until #707.
+    pub source_modified_at: Option<String>,
+    /// When PM last had something new to write down about this document (v53) — NOT when PM last
+    /// looked. A file nobody has touched keeps an old stamp, which is the honest answer and is what
+    /// tells "unedited since March" apart from "this connector stopped working in March". The
+    /// projection falls back to `ingested_at`, since first sight is a refresh too.
+    pub pm_refreshed_at: Option<String>,
 }
 
 /// The global event a rebuild's progress is broadcast on, alongside the caller's `Channel`.
@@ -2780,7 +2790,8 @@ const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size
      (SELECT count(*) FROM chunks c WHERE c.document_id = d.id), \
      d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity, \
      d.source_type, d.source_state, d.external_ref, d.source_id, \
-     d.source_parent_folder_id, d.source_parent_folder_name,      d.source_author, d.source_last_modified_by, d.source_created_at, d.source_size_bytes";
+     d.source_parent_folder_id, d.source_parent_folder_name,      d.source_author, d.source_last_modified_by, d.source_created_at, d.source_size_bytes, \
+     d.source_modified_at, COALESCE(d.pm_refreshed_at, d.ingested_at)";
 
 /// Fill in each document's extra project memberships from the join, in ONE query for the whole
 /// list. A lookup per document would be an N+1 across the entire library — which is exactly the
@@ -2882,6 +2893,8 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         source_last_modified_by: row.get(20)?,
         source_created_at: row.get(21)?,
         source_size_bytes: row.get(22)?,
+        source_modified_at: row.get(23)?,
+        pm_refreshed_at: row.get(24)?,
     })
 }
 

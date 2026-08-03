@@ -19,11 +19,43 @@ import {
 beforeEach(() => localStorage.clear());
 
 describe("defaultColumns", () => {
-  it("is exactly what the table showed before the picker existed", () => {
-    // The whole point of seeding from Depth rather than inventing a new default: nobody's table
-    // changes shape until they ask it to. The four source facts are OFF at every Depth.
-    expect(defaultColumns(false)).toEqual(["project", "importance", "chunks"]);
-    expect(defaultColumns(true)).toEqual(["project", "importance", "chunks", "ingested"]);
+  it("shows more of the document as Depth rises, and never more than that", () => {
+    // Deliberately hand-chosen rather than "whatever the table happened to show before the picker
+    // existed", which is what these numbers used to pin. `min` answers where a document lives;
+    // `standard` adds the two facts people actually scan a library by plus how much it matters;
+    // `power` adds the chunk count, which is a statement about the index rather than the document.
+    expect(defaultColumns("min")).toEqual(["project"]);
+    expect(defaultColumns("standard")).toEqual(["project", "importance", "author", "size"]);
+    expect(defaultColumns("power")).toEqual(["project", "importance", "chunks", "author", "size"]);
+  });
+
+  it("leaves the per-document questions off until they are asked for", () => {
+    // Who last changed it, when it was created, when it was updated, when PM ingested or last
+    // synced it: real questions, but questions about ONE document, and a column answers them for a
+    // thousand at the cost of the width the title needs.
+    for (const depth of ["min", "standard", "power"] as const) {
+      for (const key of ["modifiedBy", "created", "updated", "ingested", "synced"] as const) {
+        expect(defaultColumns(depth)).not.toContain(key);
+      }
+    }
+  });
+
+  it("returns columns in canonical display order whatever order they are listed in", () => {
+    for (const depth of ["min", "standard", "power"] as const) {
+      const cols = defaultColumns(depth);
+      const canonical = DOC_COLUMN_KEYS.filter((k) => cols.includes(k));
+      expect(cols).toEqual([...canonical]);
+    }
+  });
+
+  it("only moves a user who has never opened the picker", () => {
+    // The migration property, and the thing to say in What's New: a stored choice is a full explicit
+    // set, never a diff from the Depth default, so changing these defaults cannot reshape the table
+    // of anyone who has ever ticked a box — until they press Reset.
+    writeColumns(["chunks", "ingested"]);
+    expect(readColumns()).toEqual(["chunks", "ingested"]);
+    writeColumns(null);
+    expect(readColumns()).toBeNull();
   });
 });
 

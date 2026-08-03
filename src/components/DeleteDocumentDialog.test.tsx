@@ -62,6 +62,8 @@ function doc(over: Partial<Document> = {}): Document {
     source_last_modified_by: null,
     source_created_at: null,
     source_size_bytes: null,
+    source_modified_at: null,
+    pm_refreshed_at: null,
     ...over,
   } as Document;
 }

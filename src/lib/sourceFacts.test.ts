@@ -5,7 +5,7 @@
 // when the source knows nothing (#701).
 
 import { describe, expect, it } from "vitest";
-import { sourceFactValue, sourceFacts, UNKNOWN } from "./sourceFacts";
+import { SOURCE_FACT_KEYS, sourceFactValue, sourceFacts, UNKNOWN } from "./sourceFacts";
 import type { Document } from "./types";
 
 function doc(over: Partial<Document> = {}): Document {
@@ -34,6 +34,8 @@ function doc(over: Partial<Document> = {}): Document {
     source_last_modified_by: null,
     source_created_at: null,
     source_size_bytes: null,
+    source_modified_at: null,
+    pm_refreshed_at: null,
     ...over,
   };
 }
@@ -45,6 +47,7 @@ describe("sourceFacts", () => {
         source_author: "Jane Okafor",
         source_last_modified_by: "Sam Reyes",
         source_created_at: "2025-11-04T09:00:00Z",
+        source_modified_at: "2025-12-20T09:00:00Z",
         source_size_bytes: 2_411_724,
       }),
     );
@@ -53,6 +56,9 @@ describe("sourceFacts", () => {
       ["Modified by", "Sam Reyes"],
       // DD-MM-YYYY, like every other date in the app.
       ["Created", "04-11-2025"],
+      // "Updated", not "Modified": it sits next to "Modified by", and two headings a word apart
+      // that mean different things is a pair the reader has to stop and disambiguate.
+      ["Updated", "20-12-2025"],
       ["Size", "2 MB"],
     ]);
     expect(facts.every((f) => f.known)).toBe(true);
@@ -62,18 +68,18 @@ describe("sourceFacts", () => {
     // The decision this module exists to hold. A local file has no author PM could honestly report,
     // and naming the person looking at the screen would be worse than no answer.
     const facts = sourceFacts(doc());
-    expect(facts.map((f) => f.value)).toEqual([UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN]);
+    expect(facts.map((f) => f.value)).toEqual([UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN]);
     expect(facts.every((f) => !f.known)).toBe(true);
   });
 
-  it("always returns all four, so two compare cards stay level", () => {
+  it("always returns every fact, so two compare cards stay level", () => {
     // The duplicates surface renders these side by side. A card that dropped its unknown rows would
     // put "Created" on one side level with "Size" on the other — which is exactly the confusion the
     // panel was asked to remove.
     const known = sourceFacts(doc({ source_author: "Jane Okafor" }));
     const unknown = sourceFacts(doc());
-    expect(known).toHaveLength(4);
-    expect(unknown).toHaveLength(4);
+    expect(known).toHaveLength(SOURCE_FACT_KEYS.length);
+    expect(unknown).toHaveLength(SOURCE_FACT_KEYS.length);
     expect(known.map((f) => f.key)).toEqual(unknown.map((f) => f.key));
   });
 

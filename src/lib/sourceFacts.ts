@@ -21,14 +21,19 @@ export const UNKNOWN = "Unknown";
 
 /** Which source facts exist, in the order they read. Doubles as the column key in the Documents
  *  table, so a stored column choice and a rendered row can't drift apart. */
-export const SOURCE_FACT_KEYS = ["author", "modifiedBy", "created", "size"] as const;
+export const SOURCE_FACT_KEYS = ["author", "modifiedBy", "created", "updated", "size"] as const;
 export type SourceFactKey = (typeof SOURCE_FACT_KEYS)[number];
 
-/** The heading each fact is shown under — one wording for all three surfaces. */
+/** The heading each fact is shown under — one wording for all three surfaces.
+ *
+ *  "Updated" rather than "Modified", deliberately: it sits next to "Modified by", and two headings
+ *  a word apart that mean different things (WHEN the source last changed vs WHO last changed it)
+ *  is exactly the kind of pair a reader has to stop and disambiguate. */
 export const SOURCE_FACT_LABELS: Record<SourceFactKey, string> = {
   author: "Author",
   modifiedBy: "Modified by",
   created: "Created",
+  updated: "Updated",
   size: "Size",
 };
 
@@ -51,6 +56,11 @@ export function sourceFactValue(doc: Document, key: SourceFactKey): string {
       return doc.source_last_modified_by ?? UNKNOWN;
     case "created":
       return doc.source_created_at ? formatDateOnly(doc.source_created_at) : UNKNOWN;
+    case "updated":
+      // When the SOURCE last changed, which PM has stored since v11 and refreshes on every sync —
+      // it simply had no way of reaching a screen until #707. Distinct from "Last synced", which is
+      // about PM rather than the file.
+      return doc.source_modified_at ? formatDateOnly(doc.source_modified_at) : UNKNOWN;
     case "size":
       // `formatBytes` renders null as "—"; this surface says Unknown instead, because a missing size
       // means the same thing here as a missing author — the source didn't say. A Google-native Doc
@@ -68,12 +78,14 @@ export function sourceFactKnown(doc: Document, key: SourceFactKey): boolean {
       return doc.source_last_modified_by != null;
     case "created":
       return doc.source_created_at != null;
+    case "updated":
+      return doc.source_modified_at != null;
     case "size":
       return doc.source_size_bytes != null;
   }
 }
 
-/** All four facts, always — an absent one reads "Unknown" rather than vanishing.
+/** Every fact, always — an absent one reads "Unknown" rather than vanishing.
  *
  *  Fixed-length on purpose: on the compare cards the two sides sit next to each other, and a card
  *  that dropped its unknown rows would put "Created" on one side level with "Size" on the other. */
