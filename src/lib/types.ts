@@ -1931,6 +1931,21 @@ export interface DuplicateReport {
   incremental: boolean;
 }
 
+/** Where PM's data is on disk; mirrors `commands::export::DataLocations` (#712).
+ *
+ *  Two paths because there genuinely are two once a vault has been moved or joined: the vault folder
+ *  holds the store and the Markdown, while this profile's own folder keeps the pointer to it plus the
+ *  regenerable runtime. Before #712 no command exposed either, which is how the Settings card came to
+ *  show one path beside a button that opened a different one. */
+export interface DataLocations {
+  /** The folder holding pm.sqlite, vault-meta.json and the Markdown — what "Open data folder" opens. */
+  vault_root: string;
+  /** This profile's own folder. Equal to `vault_root` for a vault that has never been moved. */
+  app_data_dir: string;
+  /** True when the two differ. The card names the second folder only then. */
+  pointed: boolean;
+}
+
 /** One place a document's file lives; mirrors `commands::reader::DocumentPlace` (#710/#711).
  *
  *  The raw `source_id` travels rather than a pre-rendered label, so `sourceLabel.ts` — which already

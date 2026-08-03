@@ -26,6 +26,7 @@ import type {
   PassphraseScore,
   CostSummary,
   DailyBriefing,
+  DataLocations,
   DevRetrievalExplain,
   DevSystemInfo,
   DevTableCount,
@@ -1415,7 +1416,11 @@ export const routeFocusInput = (text: string) => invoke<FocusRoute>("route_focus
 
 // --- Data folder: reveal + export ---
 
-/** Reveal the data folder (encrypted store + Markdown vault) in the OS file manager. */
+/** Where PM's data actually is (#712) — the vault folder the button below opens, plus this
+ *  profile's own folder when a moved or joined vault has made them two different places. */
+export const dataLocations = () => invoke<DataLocations>("data_locations");
+
+/** Reveal the RESOLVED vault folder (encrypted store + Markdown vault) in the OS file manager. */
 export const openDataFolder = () => invoke<void>("open_data_folder");
 
 /** Bundle the data folder into a single .zip at `destPath` (store snapshot + vault;

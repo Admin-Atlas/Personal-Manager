@@ -93,9 +93,21 @@ function status(over: Partial<VaultStatus> = {}): VaultStatus {
   };
 }
 
+/** Render the card and expand the sharing disclosure the controls now live behind (#712).
+ *
+ *  Not optional politeness: `Collapsible` keeps its body MOUNTED and marks it `inert`, and jsdom
+ *  implements neither `inert` nor the CSS that hides it — so every query below would keep passing
+ *  against controls a real user cannot reach until they expand this. */
+async function openSharing() {
+  render(<VaultCard />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: /share this vault with other accounts/i }),
+  );
+}
+
 /** Render the card and open its "Change passphrase…" panel with a matching, strong passphrase. */
 async function openChangePanel() {
-  render(<VaultCard />);
+  await openSharing();
   fireEvent.click(await screen.findByRole("button", { name: /change passphrase…/i }));
   fireEvent.change(screen.getByPlaceholderText("New passphrase"), { target: { value: PASS } });
   fireEvent.change(screen.getByPlaceholderText("Confirm new passphrase"), {
@@ -111,6 +123,22 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("VaultCard — the vault owner gate", () => {
+  it("starts with sharing folded away", async () => {
+    // #712 demoted it deliberately: sharing one vault between accounts on one PC is niche, and it
+    // had been sitting at the same level as "where is my data", which is a question everybody has.
+    // The disclosure closed is the demotion — an open one would be the same prominence with extra
+    // chrome.
+    vaultStatus.mockResolvedValue(status());
+    render(<VaultCard />);
+    const toggle = await screen.findByRole("button", {
+      name: /share this vault with other accounts/i,
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // What must NOT fold: the state readout. It says what this vault currently is, and a status
+    // hidden behind a click is a status nobody reads.
+    expect(screen.getByText(/shareable \(passphrase-protected\)/i)).toBeTruthy();
+  });
+
   it("keeps a joiner's Change disabled until the takeover box is ticked, then sends true", async () => {
     vaultStatus.mockResolvedValue(status({ ownership: "joined" }));
     const change = await openChangePanel();
@@ -147,7 +175,7 @@ describe("VaultCard — the vault owner gate", () => {
 
   it("offers a joiner the leave affordance instead of Make private, and never calls it", async () => {
     vaultStatus.mockResolvedValue(status({ ownership: "joined" }));
-    render(<VaultCard />);
+    await openSharing();
     fireEvent.click(await screen.findByRole("button", { name: /make private…/i }));
 
     expect(screen.queryByRole("button", { name: /^make private$/i })).toBeNull();
@@ -163,7 +191,7 @@ describe("VaultCard — the vault owner gate", () => {
     // user's OWN vault. `detachFromSharedVault` retires a POINTER, so with none it silently does
     // nothing — PM must not offer it. The way forward is the re-key hatch, not this panel.
     vaultStatus.mockResolvedValue(status({ ownership: "joined", pointed_root: null }));
-    render(<VaultCard />);
+    await openSharing();
     fireEvent.click(await screen.findByRole("button", { name: /make private…/i }));
 
     expect(screen.queryByRole("button", { name: /^make private$/i })).toBeNull();
@@ -175,7 +203,7 @@ describe("VaultCard — the vault owner gate", () => {
 
   it("still offers Make private on a vault this account owns", async () => {
     vaultStatus.mockResolvedValue(status({ ownership: "owned", is_owner: true }));
-    render(<VaultCard />);
+    await openSharing();
     fireEvent.click(await screen.findByRole("button", { name: /make private…/i }));
 
     expect(disabled(screen.getByRole("button", { name: /^make private$/i }))).toBe(false);
