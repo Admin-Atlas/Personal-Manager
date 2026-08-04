@@ -81,8 +81,12 @@ export interface DetachedSync {
   stopping: boolean;
   confirmStop: boolean;
   setConfirmStop: (v: boolean) => void;
-  /** Start (or queue) a sync for one target (or all when null). */
-  sync: (target: string | null) => void;
+  /** Start (or queue) a sync for one target (or all when null).
+   *
+   *  `starter` overrides the backend call that begins the pass, so a door other than "Sync now" —
+   *  today only "Re-index everything", which forgets the delta cursor first — still gets the
+   *  optimistic paint and the status reconcile rather than a silent screen until `counted`. */
+  sync: (target: string | null, starter?: (target: string | null) => Promise<unknown>) => void;
   /** Ask the running sync to stop. */
   requestStop: () => void;
 }
@@ -222,59 +226,67 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
   // listener above, and the sync survives navigating away. The backend single-flights, so a request
   // made while one is already running is folded into a follow-up pass — only the call that *starts* a
   // sync drives the optimistic progress + error rollback, so it never hijacks a running bar.
-  const sync = useCallback((tgt: string | null) => {
-    setError(null);
-    const startsIt = !syncingRef.current;
-    if (startsIt) {
-      setReport(null);
-      setTarget(tgt);
-      setQueued(new Set());
-      setProgress({ processed: 0, total: null });
-      // Optimistic — the backend stamps its own on `begin_pass`, and the next remount reads that.
-      setStartedAt(Date.now());
-    } else if (tgt != null) {
-      setQueued((q) => new Set(q).add(tgt));
-    }
-    void optsRef.current
-      .start(tgt)
-      .then(() => {
-        // Re-read what the run actually owes now the request has been recorded. The optimistic add
-        // above is a guess about a fact the BACKEND owns, and it can be wrong in both directions: an
-        // all-targets request (the 15-minute poller, or a connect) subsumes the specific ones and
-        // clears them, and this view has no way to know that happened. Reconciling here is also what
-        // covers the no-unmount case — a run started elsewhere emits `counted` only after its whole
-        // gather, so until then `syncing` is false and a click takes the `startsIt` branch above and
-        // paints a row "Syncing…" that the backend has merely queued.
-        void optsRef.current
-          .fetchStatus()
-          .then((s) => {
-            if (!s.running) return;
-            setTarget(optsRef.current.targetOf(s));
-            setProgress((p) => p ?? { processed: s.processed, total: s.total });
-            setStartedAt((a) => a ?? s.started_at_ms);
-            setQueued(new Set(s.queued));
-            setQueuedAll(s.queued_all);
-          })
-          .catch(() => {});
-      })
-      .catch((e) => {
-        setError(String(e));
-        if (startsIt) {
-          setProgress(null);
-          setStartedAt(null);
-          setTarget(null);
-        } else if (tgt != null) {
-          // A refused request (a Rebuild is running, say) never reached the queue, so the optimistic
-          // badge would otherwise sit there for the rest of the run claiming a sweep nobody owes.
-          setQueued((q) => {
-            if (!q.has(tgt)) return q;
-            const next = new Set(q);
-            next.delete(tgt);
-            return next;
-          });
-        }
-      });
-  }, []);
+  // `starter` overrides which backend call begins the pass, for the one caller that starts a sync by
+  // a different door: "Re-index everything" forgets the delta cursor first and then runs an ordinary
+  // pass. It went straight to its own command, which meant it skipped every line below — so nothing
+  // painted until the backend's `counted` event, and that only fires once phase 1 has listed the
+  // whole account. On a large Drive that is minutes of a screen showing no bar, no "Syncing…" and
+  // two still-enabled buttons over a run that had already started.
+  const sync = useCallback(
+    (tgt: string | null, starter?: (t: string | null) => Promise<unknown>) => {
+      setError(null);
+      const startsIt = !syncingRef.current;
+      if (startsIt) {
+        setReport(null);
+        setTarget(tgt);
+        setQueued(new Set());
+        setProgress({ processed: 0, total: null });
+        // Optimistic — the backend stamps its own on `begin_pass`, and the next remount reads that.
+        setStartedAt(Date.now());
+      } else if (tgt != null) {
+        setQueued((q) => new Set(q).add(tgt));
+      }
+      void (starter ? starter(tgt) : optsRef.current.start(tgt))
+        .then(() => {
+          // Re-read what the run actually owes now the request has been recorded. The optimistic add
+          // above is a guess about a fact the BACKEND owns, and it can be wrong in both directions: an
+          // all-targets request (the 15-minute poller, or a connect) subsumes the specific ones and
+          // clears them, and this view has no way to know that happened. Reconciling here is also what
+          // covers the no-unmount case — a run started elsewhere emits `counted` only after its whole
+          // gather, so until then `syncing` is false and a click takes the `startsIt` branch above and
+          // paints a row "Syncing…" that the backend has merely queued.
+          void optsRef.current
+            .fetchStatus()
+            .then((s) => {
+              if (!s.running) return;
+              setTarget(optsRef.current.targetOf(s));
+              setProgress((p) => p ?? { processed: s.processed, total: s.total });
+              setStartedAt((a) => a ?? s.started_at_ms);
+              setQueued(new Set(s.queued));
+              setQueuedAll(s.queued_all);
+            })
+            .catch(() => {});
+        })
+        .catch((e) => {
+          setError(String(e));
+          if (startsIt) {
+            setProgress(null);
+            setStartedAt(null);
+            setTarget(null);
+          } else if (tgt != null) {
+            // A refused request (a Rebuild is running, say) never reached the queue, so the optimistic
+            // badge would otherwise sit there for the rest of the run claiming a sweep nobody owes.
+            setQueued((q) => {
+              if (!q.has(tgt)) return q;
+              const next = new Set(q);
+              next.delete(tgt);
+              return next;
+            });
+          }
+        });
+    },
+    [],
+  );
 
   // Stop the running sync (the caller gates this behind a confirm). The backend halts after the current
   // file and keeps everything indexed so far; the "finished" event (a `cancelled` report) clears the bar.

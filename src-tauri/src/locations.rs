@@ -276,6 +276,56 @@ pub fn move_all(conn: &Connection, from: i64, to: i64) -> Result<usize> {
     Ok(moved)
 }
 
+/// Carry an identity re-key of `documents.source_id` onto the location that holds the old id.
+///
+/// The anchor is described above as "assigned once, never rewritten", and for a document's whole
+/// life that is true. Three Drive reconciles are the exception, and they predate this table: a row
+/// indexed under the wrong namespace is moved into the right one in place, precisely so the user's
+/// filing and its vectors survive ([`crate::drive::adopt_legacy_swm_row`],
+/// [`crate::drive::resolve_owned_swm_duplicate`], [`crate::drive::resolve_shared_drive_twins`]).
+///
+/// **Why they now need this.** Before v54 those re-keys moved the whole reconcile key with them,
+/// because the key WAS `documents.source_id`. Since #710/#717/#718 every connector's known set
+/// ([`known_ids`]) and every per-item state read resolve through `document_locations` instead — so a
+/// re-key that stops at `documents` strands the location on an id no corpus enumerates. The next
+/// complete pass sees it as known-but-absent, plans a `Delete`, and flags a perfectly live file
+/// `source_missing`. Worse, it is unrecoverable: the corpus that CAN see the file emits the new id,
+/// and [`set_state`] resolves that through [`document_of`], which finds no location and writes
+/// nothing — so every later pass repeats the same no-op, and the row never recovers.
+///
+/// Callers run this in the same transaction as the `documents` update, and only when that update
+/// actually happened (all three use `UPDATE OR IGNORE`, which no-ops on a collision).
+///
+/// Returns whether a location was found for `old`.
+pub fn rekey(conn: &Connection, old: &str, new: &str) -> Result<bool> {
+    if old == new {
+        return Ok(false);
+    }
+    let Some(document_id) = document_of(conn, old)? else {
+        return Ok(false);
+    };
+    // `source_id` is UNIQUE, so this can collide with a location that already records the file under
+    // the new id — `OR IGNORE` keeps that from failing the caller's transaction.
+    let moved = conn.execute(
+        "UPDATE OR IGNORE document_locations SET source_id = ?2, provenance_key = ?3 \
+         WHERE source_id = ?1",
+        params![old, new, provenance_key(new)],
+    )?;
+    if moved == 0 {
+        // The place is already recorded under `new`; what is left at `old` is a second record of the
+        // same place, under an id that no longer names anything. Drop it rather than leave it to be
+        // reaped as missing. This cannot flip a survivor's state: [`sync_document`] returns early for
+        // a document left with no locations, and where the two records belong to different documents
+        // they share a `provenance_key`, so the identity fold merges them on the next open.
+        conn.execute(
+            "DELETE FROM document_locations WHERE source_id = ?1",
+            params![old],
+        )?;
+    }
+    sync_document(conn, document_id)?;
+    Ok(true)
+}
+
 /// Forget every location of a document — used when it stops being an index-only pointer at all
 /// (promotion to a full local import). Not a deletion of the document.
 pub fn forget_all(conn: &Connection, document_id: i64) -> Result<()> {
@@ -477,6 +527,85 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_rekey_moves_the_location_so_the_new_id_is_the_one_that_resolves() {
+        // The blocker this closes. Three Drive reconciles re-key `documents.source_id` in place, and
+        // since every known set and every per-item state read moved onto this table, a re-key that
+        // stopped at `documents` left the location holding an id no corpus enumerates: the next
+        // complete pass planned a Delete and flagged a live file `source_missing`, unrecoverably —
+        // `set_state` for the NEW id resolved through `document_of`, found nothing, and wrote
+        // nothing, on that pass and every one after it.
+        let conn = open();
+        let id = doc(&conn, "gdrive:a@x.com:F1");
+        conn.execute(
+            "UPDATE documents SET source_id = 'gdrive:swm:R9:F1' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(rekey(&conn, "gdrive:a@x.com:F1", "gdrive:swm:R9:F1").unwrap());
+
+        assert_eq!(
+            document_of(&conn, "gdrive:swm:R9:F1").unwrap(),
+            Some(id),
+            "the new id resolves, so a later SetState can reach the row"
+        );
+        assert_eq!(
+            document_of(&conn, "gdrive:a@x.com:F1").unwrap(),
+            None,
+            "the old id names nothing — otherwise its corpus reaps it as missing"
+        );
+        // The known set is what the reconcile diffs against, and it reads this table.
+        assert_eq!(
+            known_ids(&conn, "gdrive:swm:R9:", None).unwrap(),
+            vec!["gdrive:swm:R9:F1".to_string()],
+            "the file is known under the namespace that can actually enumerate it"
+        );
+        assert!(
+            known_ids(&conn, "gdrive:a@x.com:", None)
+                .unwrap()
+                .is_empty(),
+            "and is gone from the one that cannot"
+        );
+        // The derived key follows the rename: it is what the identity fold groups on, and a stale
+        // one would stop two records of the same file ever being recognised as such.
+        let key: Option<String> = conn
+            .query_row(
+                "SELECT provenance_key FROM document_locations WHERE source_id = ?1",
+                params!["gdrive:swm:R9:F1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key.as_deref(), Some("gdrive-file:F1"));
+        // And the round trip works: the corpus that CAN see the file now heals it.
+        assert!(set_state(&conn, "gdrive:swm:R9:F1", SourceState::SourceMissing).unwrap());
+        assert_eq!(state_of(&conn, id), "source_missing");
+        assert!(set_state(&conn, "gdrive:swm:R9:F1", SourceState::Ok).unwrap());
+        assert_eq!(state_of(&conn, id), "ok", "recovery is possible again");
+    }
+
+    #[test]
+    fn a_rekey_onto_an_id_already_recorded_drops_the_stale_row_rather_than_stranding_it() {
+        // `source_id` is UNIQUE, so a re-key can collide with a location that already records the
+        // same place. The place is not lost — it is recorded under the new id — so what is left at
+        // the old id is a second record of it, naming something that no longer exists. Left behind
+        // it would be reaped as missing; it goes instead.
+        let conn = open();
+        let keeper = doc(&conn, "gdrive:swm:R9:F1");
+        let other = doc(&conn, "gdrive:a@x.com:F1");
+        assert!(rekey(&conn, "gdrive:a@x.com:F1", "gdrive:swm:R9:F1").unwrap());
+
+        assert_eq!(
+            document_of(&conn, "gdrive:swm:R9:F1").unwrap(),
+            Some(keeper),
+            "the existing record of the place is the one that stands"
+        );
+        assert_eq!(document_of(&conn, "gdrive:a@x.com:F1").unwrap(), None);
+        // The now-locationless row is left ALONE rather than flipped to missing: `sync_document`
+        // returns early for a document with no locations, and the identity fold merges the two on
+        // the next open (they share a provenance key).
+        assert_eq!(state_of(&conn, other), "ok");
     }
 
     #[test]

@@ -1024,6 +1024,14 @@ pub fn touch_modified_at(
     source_id: &str,
     modified_at: Option<&str>,
 ) -> Result<()> {
+    // The LOCATION's pointer first: since #710 that is the column `plan_file` reads its change gate
+    // back from, and `documents.source_modified_at` is only its mirror. Advancing the mirror alone
+    // leaves a touched-but-unedited file (a backup tool, a metadata write) re-hashing on every
+    // fifteen-minute poll for the rest of its life.
+    conn.execute(
+        "UPDATE document_locations SET source_modified_at = ?2 WHERE source_id = ?1",
+        params![source_id, modified_at],
+    )?;
     conn.execute(
         "UPDATE documents SET source_modified_at = ?2 WHERE source_id = ?1 AND source_type = 'index_only'",
         params![source_id, modified_at],
@@ -1564,7 +1572,16 @@ async fn reconcile_present_file(
     // would never move again. Writes nothing when nothing differs (see `refresh_source_facts`), so a
     // fifteen-minute poll over a settled folder still touches no pages.
     if known.is_some() {
-        let facts = local_facts_for_refresh(file, current_iso.clone());
+        // Everything EXCEPT the mtime. That column is this walk's change GATE — `plan_file` reads it
+        // straight back off the location as `KnownItem.modified_at` — so advancing it here would
+        // record the edit as seen before a single byte of the new content has been read. Every
+        // failure path below (`Failed` on an unreadable file, `NoText`) then returns without writing
+        // the body, and the next walk compares the NEW mtime against itself, concludes nothing
+        // changed, and never offers the file again: PM serves the pre-edit body forever. A file held
+        // open by the application that just saved it is the ordinary way to hit that. The gate is
+        // advanced only where the outcome is final — `register_pointer`/`reembed_item` on a real
+        // ingest, `touch_modified_at` on a same-hash touch.
+        let facts = local_facts_for_refresh(file, None);
         let app2 = app.clone();
         let source_id = file.source_id.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -2335,6 +2352,78 @@ mod tests {
         // The item id is namespaced under its folder's source id, so a SourceFailure fan-out
         // (`source_id LIKE 'local:abc123:%'`) catches it.
         assert!(sid.starts_with(&format!("{}:", folder_source_id("abc123"))));
+    }
+
+    #[test]
+    fn a_touch_advances_the_gate_the_walk_actually_reads() {
+        // `plan_file`'s `content_maybe_changed` compares against `KnownItem.modified_at`, which since
+        // #710 is read from `document_locations.source_modified_at` — the `documents` column is only
+        // its mirror. `touch_modified_at` wrote the mirror alone, so a file that had been touched
+        // without being edited (a backup tool, a metadata write) was re-hashed on every
+        // fifteen-minute poll for the rest of its life: the gate it was checked against never moved.
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let sid = "local:abc123:report.docx";
+        conn.execute(
+            "INSERT INTO documents(source_type, source_id, title, project, tags, reviewed, \
+                 vault_path, content_hash, source_modified_at) \
+             VALUES ('index_only', ?1, 'T', 'Unsorted', '[]', 0, 'v/1', 'h1', '2026-01-01T00:00:00Z')",
+            params![sid],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO document_locations(document_id, source_id, source_state, \
+                 source_modified_at) \
+             VALUES (?1, ?2, 'ok', '2026-01-01T00:00:00Z')",
+            params![id, sid],
+        )
+        .unwrap();
+
+        touch_modified_at(&conn, sid, Some("2026-08-04T09:00:00Z")).unwrap();
+
+        let at_location: Option<String> = conn
+            .query_row(
+                "SELECT source_modified_at FROM document_locations WHERE source_id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            at_location.as_deref(),
+            Some("2026-08-04T09:00:00Z"),
+            "the gate moved, so the next walk no-ops instead of re-hashing"
+        );
+        let mirrored: Option<String> = conn
+            .query_row(
+                "SELECT source_modified_at FROM documents WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mirrored.as_deref(), Some("2026-08-04T09:00:00Z"));
+    }
+
+    #[test]
+    fn the_pre_body_facts_refresh_never_carries_the_mtime() {
+        // The other half of the same defect, from the other direction. `reconcile_present_file`
+        // refreshes the source facts BEFORE it reads the body — deliberately, because a file that
+        // needs no work is exactly the one whose folder and size drift. Carrying the mtime through
+        // that call marked the edit as seen before a byte had been read, so a failed read (a file
+        // still held open by the app that saved it) left the gate at the NEW mtime and the walk
+        // never offered the file again: PM served the pre-edit body forever.
+        let dir = tempfile::tempdir().unwrap();
+        let file = local_file(dir.path(), "report.md");
+        let facts = local_facts_for_refresh(&file, None);
+        assert!(
+            facts.modified_at.is_none(),
+            "the change gate is not the facts refresh's to move"
+        );
+        assert!(
+            !facts.is_empty(),
+            "and the refresh still has real work to do — size and created still travel"
+        );
     }
 
     /// A `LocalFile` for a file that REALLY EXISTS, so the filesystem has a birth time to give and

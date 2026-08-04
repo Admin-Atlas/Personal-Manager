@@ -273,11 +273,18 @@ pub fn resolve_shared_drive_twins(conn: &Connection) -> Result<TwinSweep> {
             None => {
                 // No survivor: the twin is the only copy — adopt it into the new namespace (its filing
                 // rides along). OR IGNORE guards a late collision; if it collides it is a genuine
-                // duplicate the identical/divergent logic settles on the next pass.
-                conn.execute(
+                // duplicate the identical/divergent logic settles on the next pass. The location that
+                // holds the old id moves with the anchor, in one transaction, or the shared-drive
+                // corpus reaps a live file it can no longer match — see [`crate::locations::rekey`].
+                let tx = conn.unchecked_transaction()?;
+                let updated = tx.execute(
                     "UPDATE OR IGNORE documents SET source_id = ?1 WHERE id = ?2",
                     params![survivor_id, id],
                 )?;
+                if updated > 0 {
+                    crate::locations::rekey(&tx, &source_id, &survivor_id)?;
+                }
+                tx.commit()?;
                 sweep.rekeyed.push((source_id.clone(), survivor_id));
                 sweep.adopted += 1;
             }
@@ -1054,6 +1061,30 @@ pub fn known_swm_source_ids(conn: &Connection, root_id: &str) -> Result<Vec<Stri
     crate::locations::known_ids(conn, &swm_prefix(root_id), None)
 }
 
+/// Narrow a shared-with-me known set to the ids this enumeration is actually authoritative for.
+/// **PURE.**
+///
+/// [`split_swm_descent`] removes the files you OWN from the listing, so the walk that follows cannot
+/// contain them — and a known id absent from a complete enumeration is precisely what
+/// `reconcile_enumeration` plans a `Delete` for. [`resolve_owned_swm_duplicate`] retires only the
+/// ones still holding an ANCHOR; since #711 a folded id lives on as a plain LOCATION, which
+/// [`known_swm_source_ids`] still returns (it reads `document_locations` now, not
+/// `documents.source_id`), and the `Absent` outcome leaves it exactly where it was. Left in the set
+/// it flags a live share `source_missing` on the next complete pass.
+///
+/// Their reachability is My Drive's to report, on its own cursor — which is the whole reason they
+/// were split out.
+pub fn narrow_swm_known(
+    mut known: std::collections::HashSet<String>,
+    root_id: &str,
+    owned_file_ids: impl IntoIterator<Item = String>,
+) -> std::collections::HashSet<String> {
+    for file_id in owned_file_ids {
+        known.remove(&swm_source_id(root_id, &file_id));
+    }
+    known
+}
+
 /// Adopt a legacy **leaked** row: a top-level shared file previously indexed under `email`'s My-Drive
 /// namespace (`gdrive:<email>:<fileId>`, back when the whole-drive baseline still returned
 /// shared-with-me items) is re-keyed IN PLACE to its shared-with-me id `gdrive:swm:<rootId>:<fileId>`.
@@ -1080,11 +1111,19 @@ pub fn adopt_legacy_swm_row(
     if old == new {
         return Ok(None);
     }
-    let updated = conn.execute(
+    // One transaction: the anchor and the location that holds it move together, or neither does.
+    // A re-key that reaches `documents` alone strands the location on an id no corpus enumerates,
+    // and the next complete pass reaps a live file — see [`crate::locations::rekey`].
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
         "UPDATE OR IGNORE documents SET source_id = ?2 \
          WHERE source_type = 'index_only' AND source_id = ?1",
         params![old, new],
     )?;
+    if updated > 0 {
+        crate::locations::rekey(&tx, &old, &new)?;
+    }
+    tx.commit()?;
     Ok((updated > 0).then_some((old, new)))
 }
 
@@ -1276,12 +1315,19 @@ pub fn resolve_owned_swm_duplicate(
     let Some((my_row, my_class)) = classified_row(conn, &my_id)? else {
         // Nothing to merge with: the row simply moves namespace, keeping its id and everything hanging
         // off it. `OR IGNORE` for symmetry with `adopt_legacy_swm_row`; the `None` above already
-        // established there is no collision.
-        conn.execute(
+        // established there is no collision. The location moves in the same transaction — the swm
+        // id is about to leave this corpus's enumeration for good ([`split_swm_descent`]), so a
+        // location left behind on it is reaped as missing on the very next pass.
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
             "UPDATE OR IGNORE documents SET source_id = ?2 \
              WHERE source_type = 'index_only' AND source_id = ?1",
             params![swm_id, my_id],
         )?;
+        if updated > 0 {
+            crate::locations::rekey(&tx, &swm_id, &my_id)?;
+        }
+        tx.commit()?;
         return Ok(SwmDuplicate::Rekeyed(swm_id, my_id));
     };
 
@@ -1311,6 +1357,11 @@ pub fn resolve_owned_swm_duplicate(
     )?;
     crate::ingest::delete_document(&tx, swm_row)?;
     tx.commit()?;
+    // Same reasoning as the boot fold ([`crate::duplicates::fold_by_identity`]): the survivor's
+    // merged filing is now only in the DB, while the manifest still describes its pre-merge state.
+    // The caller strips the DOOMED id from the file, never the survivor's item, so without this the
+    // next `reconcile_on_open` could apply the stale filing back over the merge.
+    crate::index_only::mark_manifest_stale(conn);
     Ok(SwmDuplicate::Merged(swm_id))
 }
 
@@ -3327,6 +3378,143 @@ mod tests {
         assert_eq!(id, before, "the row id is what chunks and vectors hang off");
         assert_eq!(sid, source_id_for(EMAIL, "F1"));
         assert_eq!(project, "Taxes", "its filing rode along untouched");
+    }
+
+    /// An index-only row plus the anchor location the v54 backfill gives it — the shape every real
+    /// store is in, and the one the re-key tests above were silently missing.
+    fn row_with_location(conn: &Connection, source_id: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO documents(source_type, source_id, title, project, tags, reviewed, \
+                 vault_path, content_hash) \
+             VALUES ('index_only', ?1, 'T', 'Taxes', '[]', 1, ?2, ?3)",
+            params![
+                source_id,
+                format!("v/{source_id}"),
+                format!("h-{source_id}")
+            ],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO document_locations(document_id, source_id, source_state, provenance_key) \
+             VALUES (?1, ?2, 'ok', ?3)",
+            params![id, source_id, crate::locations::provenance_key(source_id)],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn re_keying_a_lone_swm_row_carries_its_location_out_of_the_swm_known_set() {
+        // The blocker. `split_swm_descent` removes a file you own from the shared-with-me listing, so
+        // this corpus stops enumerating it — while `known_swm_source_ids` reads `document_locations`
+        // and went on returning it. Known but absent reconciles as a Delete, and a perfectly live
+        // share was flagged `source_missing` on the very next pass, with no way back.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let swm = swm_source_id("ROOT", "F1");
+        let id = row_with_location(&conn, &swm);
+
+        assert_eq!(
+            resolve_owned_swm_duplicate(&conn, EMAIL, "ROOT", "F1").unwrap(),
+            SwmDuplicate::Rekeyed(swm.clone(), source_id_for(EMAIL, "F1"))
+        );
+
+        assert_eq!(
+            crate::locations::document_of(&conn, &source_id_for(EMAIL, "F1")).unwrap(),
+            Some(id),
+            "the location moved with the anchor, so My Drive can now reconcile it"
+        );
+        assert!(
+            known_swm_source_ids(&conn, "ROOT").unwrap().is_empty(),
+            "and it has left the known set of the corpus that can no longer see it"
+        );
+    }
+
+    #[test]
+    fn adopting_a_legacy_swm_row_carries_its_location_too() {
+        // The mirror image, and the one #728's "Re-index everything" makes reachable on demand: a
+        // cleared cursor forces the full My-Drive baseline, which cannot contain a shared-with-me
+        // file — so a location left in the My-Drive known set is planned as a Delete.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let legacy = source_id_for(EMAIL, "F1");
+        let id = row_with_location(&conn, &legacy);
+
+        let pair = adopt_legacy_swm_row(&conn, EMAIL, "ROOT", "F1")
+            .unwrap()
+            .expect("a legacy row was there to adopt");
+        assert_eq!(pair, (legacy.clone(), swm_source_id("ROOT", "F1")));
+
+        assert_eq!(
+            crate::locations::document_of(&conn, &swm_source_id("ROOT", "F1")).unwrap(),
+            Some(id)
+        );
+        assert!(
+            crate::locations::known_ids(&conn, &format!("gdrive:{EMAIL}:"), None)
+                .unwrap()
+                .is_empty(),
+            "the My-Drive baseline no longer knows an id it can never enumerate"
+        );
+    }
+
+    #[test]
+    fn adopting_a_shared_drive_twin_carries_its_location_too() {
+        // The third re-key site, same failure: the twin's location kept the per-account id while the
+        // anchor moved to the account-independent one.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let twin = format!("gdrive:{EMAIL}:sd:D1:F1");
+        let id = row_with_location(&conn, &twin);
+
+        let sweep = resolve_shared_drive_twins(&conn).unwrap();
+        assert_eq!(sweep.adopted, 1, "no survivor, so the twin is adopted");
+        assert_eq!(
+            crate::locations::document_of(&conn, "gdrive:sd:D1:F1").unwrap(),
+            Some(id),
+            "the location follows the anchor into the shared-drive namespace"
+        );
+        assert_eq!(
+            crate::locations::document_of(&conn, &twin).unwrap(),
+            None,
+            "and nothing is left at the id its corpus stopped enumerating at v19"
+        );
+    }
+
+    #[test]
+    fn the_swm_known_set_drops_the_files_the_descent_split_out() {
+        // The blocker, as a property. A file you own inside a folder shared with you is removed from
+        // the shared-with-me listing — so if its `gdrive:swm:` id stays in the known set, a COMPLETE
+        // walk sees known-but-absent and reconciles it as a deletion, flagging a live share missing.
+        // Its reachability belongs to My Drive, which reaches it on its own cursor.
+        let known: std::collections::HashSet<String> = [
+            swm_source_id("ROOT", "OWNED"),
+            swm_source_id("ROOT", "SHARED"),
+        ]
+        .into_iter()
+        .collect();
+
+        let narrowed = narrow_swm_known(known, "ROOT", ["OWNED".to_string()]);
+
+        assert!(
+            !narrowed.contains(&swm_source_id("ROOT", "OWNED")),
+            "the split-out file is not this enumeration's to delete"
+        );
+        assert!(
+            narrowed.contains(&swm_source_id("ROOT", "SHARED")),
+            "a file you genuinely don't own is still reconciled here — that is the whole corpus"
+        );
+    }
+
+    #[test]
+    fn narrowing_the_swm_known_set_is_scoped_to_its_own_root() {
+        // The same file id under a DIFFERENT shared root is a different place, reconciled by that
+        // root's own pass. Narrowing keyed on the file id alone would silently stop deletions being
+        // noticed there.
+        let known: std::collections::HashSet<String> =
+            [swm_source_id("OTHER", "F1")].into_iter().collect();
+        let narrowed = narrow_swm_known(known, "ROOT", ["F1".to_string()]);
+        assert!(narrowed.contains(&swm_source_id("OTHER", "F1")));
     }
 
     #[test]

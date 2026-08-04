@@ -21,6 +21,7 @@ import { Fragment, useCallback, useState } from "react";
 import {
   deleteDocument,
   dismissDuplicatePair,
+  duplicateSnapshot,
   restoreDuplicateDismissals,
   scanDuplicates,
 } from "../lib/ipc";
@@ -159,21 +160,18 @@ export function DuplicatesPanel({
   const [error, setError] = useState<string | null>(null);
   const [pendingRemove, setPendingRemove] = useState<Document | null>(null);
   const [removing, setRemoving] = useState(false);
-  // Documents removed since the scan. The report is a snapshot, and re-scanning after every removal
-  // would make clearing three duplicates take three full sweeps — so pairs are hidden locally and the
-  // count stays honest by counting what is still on screen.
-  const [removed, setRemoved] = useState<Set<number>>(new Set());
-  // Pairs dismissed since this scan, hidden locally for the same reason `removed` is: re-scanning
-  // after each decision would make clearing three pairs take three full sweeps.
-  const [keptPairs, setKeptPairs] = useState<Set<string>>(new Set());
 
-  const pairKey = (p: DuplicatePair) => `${p.a.id}-${p.b.id}`;
-
+  // Both actions below re-read the backend snapshot rather than hiding the pair in component state.
+  // Local sets gave the same instant feedback, but they lived and died with this component — and
+  // since the report became a backend-owned snapshot the panel re-reads on mount, leaving the two
+  // out of step meant a tab switch resurrected every decision the user had just made. The backend
+  // now prunes the pair as part of the action, so one read is the whole update, and `dismissed`
+  // comes back already counting what it hid.
   async function keepBoth(pair: DuplicatePair) {
     setError(null);
     try {
       await dismissDuplicatePair(pair.a.id, pair.b.id);
-      setKeptPairs((prev) => new Set(prev).add(pairKey(pair)));
+      setReport(await duplicateSnapshot());
     } catch (e) {
       setError(String(e));
     }
@@ -183,7 +181,6 @@ export function DuplicatesPanel({
     setError(null);
     try {
       await restoreDuplicateDismissals();
-      setKeptPairs(new Set());
       await scan();
     } catch (e) {
       setError(String(e));
@@ -193,8 +190,6 @@ export function DuplicatesPanel({
   const scan = useCallback(async () => {
     setScanning(true);
     setError(null);
-    setRemoved(new Set());
-    setKeptPairs(new Set());
     try {
       setReport(await scanDuplicates());
     } catch (e) {
@@ -210,8 +205,8 @@ export function DuplicatesPanel({
     setRemoving(true);
     try {
       await deleteDocument(pendingRemove.id);
-      setRemoved((prev) => new Set(prev).add(pendingRemove.id));
       setPendingRemove(null);
+      setReport(await duplicateSnapshot());
     } catch (e) {
       setError(String(e));
     } finally {
@@ -219,11 +214,9 @@ export function DuplicatesPanel({
     }
   }
 
-  const visible = (report?.pairs ?? []).filter(
-    (p) => !removed.has(p.a.id) && !removed.has(p.b.id) && !keptPairs.has(pairKey(p)),
-  );
+  const visible = report?.pairs ?? [];
   // Everything the report is not showing, so a narrowed result is never presented as a whole one.
-  const hiddenCount = (report?.dismissed ?? 0) + keptPairs.size;
+  const hiddenCount = report?.dismissed ?? 0;
 
   return (
     <div className="mt-4 rounded-lg border border-border p-4" data-help="documents-duplicates">

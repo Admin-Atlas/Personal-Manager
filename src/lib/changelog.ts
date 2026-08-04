@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.123.1-alpha",
+    date: "2026-08-04",
+    highlights: [
+      "Files in a connected account are no longer reported as missing when they are perfectly fine. PM sometimes moves a file's record from one part of an account to another — a file you own that turned up inside a folder shared with you, or one indexed years ago under an older naming scheme. It was moving the record but not the note of where the file actually lives, so the part of PM that checks that account looked for something that was no longer there and concluded the file had been deleted. The file then showed as gone, refused to open, and nothing could bring it back: every later check repeated the same mistake. This was reachable straight from the new Re-index everything button, which is exactly the case a full re-read of an account was meant to help with.",
+      "Your filing survives PM tidying up duplicates on its own. When PM joins two records of one file together, the project, labels and importance from both are merged onto the one that remains. That merge was being written to PM's own store but not to the portable copy in your vault — and moments later, on the same launch, PM reads that copy back as the truth. It was quietly undoing the merge, and because the other record had already gone there was nothing left to recover it from. A document you had filed and approved could reappear in Review, back in Unsorted.",
+      "Keep both, and removing one side of a pair, now stick when you leave the tab. Your decision was being remembered only by the screen you were looking at, so the Documents tab came back offering the same pair again, with no sign you had already settled it. A removed document could even come back as a card with working buttons, for a document that no longer existed.",
+      "An edit to a file in a tracked folder is never skipped because PM could not read it the first time. If a file was still open in the app that had just saved it, PM noted the file as seen before it had actually read the new contents — so it never looked again, and went on serving the old version in search and in answers until you happened to edit the file a second time.",
+      "Re-index everything shows its progress the moment you press it, rather than after the listing finishes — which on a large account was minutes of a screen that looked like nothing had happened. It is also refused cleanly while a Rebuild is running: it used to discard the account's place-marker first and fail afterwards, which quietly turned the next ordinary background check into a full re-read of the whole account that nobody had asked for.",
+      "The export screen now describes the file it actually writes. A plain export was said to open only on this machine — true when it held your documents and PM's store, but it now also carries the settings file a restore needs, so on a vault you protect with a passphrase it opens anywhere that passphrase does. It says that plainly, because it is the sentence you read while deciding where to put the file.",
+    ],
+  },
+  {
     version: "3.123.0-alpha",
     date: "2026-08-04",
     highlights: [

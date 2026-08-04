@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const scanDuplicates = vi.fn();
 const deleteDocument = vi.fn();
 const dismissDuplicatePair = vi.fn();
+const duplicateSnapshot = vi.fn();
 const restoreDuplicateDismissals = vi.fn();
 const documentLocations = vi.fn();
 const openReader = vi.fn();
@@ -29,6 +30,7 @@ vi.mock("../lib/ipc", () => ({
   // Explicit factory: a name missing here resolves to `undefined` and the click that calls it
   // throws, so a new ipc import has to be added in the same change that uses it.
   dismissDuplicatePair: (a: number, b: number) => dismissDuplicatePair(a, b),
+  duplicateSnapshot: () => duplicateSnapshot(),
   restoreDuplicateDismissals: () => restoreDuplicateDismissals(),
   documentLocations: (id: number) => documentLocations(id),
 }));
@@ -110,17 +112,30 @@ const BOTH_SIGNALS = {
   similarity: 0.99,
 };
 
-beforeEach(() => {
-  vi.clearAllMocks();
-  scanDuplicates.mockResolvedValue({
+/** A report in the shape the backend returns, so a test states only what it is about. */
+function report(
+  pairs: (typeof BOTH_SIGNALS)[],
+  extra: Partial<DuplicateReport> = {},
+): DuplicateReport {
+  return {
     scanned: 120,
-    pairs: [BOTH_SIGNALS],
+    pairs,
     similarity_skipped: false,
     similarity_limit: 5000,
     dismissed: 0,
     checked_at: "2026-08-03T09:00:00Z",
     incremental: false,
-  });
+    ...extra,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  scanDuplicates.mockResolvedValue(report([BOTH_SIGNALS]));
+  // Both resolving actions prune the pair in the backend and the panel re-reads, so the default
+  // snapshot is the report AFTER the only pair has gone. Component state no longer hides anything:
+  // that was the defect — it died with the component, and the tab router unmounts this view.
+  duplicateSnapshot.mockResolvedValue(report([]));
   deleteDocument.mockResolvedValue(undefined);
   documentLocations.mockResolvedValue([]);
   dismissDuplicatePair.mockResolvedValue(undefined);
@@ -243,13 +258,25 @@ describe("removing one side", () => {
   });
 
   it("drops the pair from the list once one side is gone", async () => {
-    // Re-scanning after every removal would make clearing three duplicates take three full sweeps.
+    // Re-scanning after every removal would make clearing three duplicates take three full sweeps —
+    // so the backend prunes the pair and this re-reads the snapshot, which is one cheap read.
     await scanned();
     fireEvent.click(screen.getAllByRole("button", { name: "Remove this one" })[0]);
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(screen.queryByText("Contract Acme (copy)")).toBeNull());
     expect(screen.getByText(/Nothing looks duplicated/)).toBeTruthy();
     expect(scanDuplicates).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes the removal from the backend snapshot, not from component state", async () => {
+    // The regression: a deleted document was hidden in a local `removed` set that died with the
+    // component. The tab router unmounts this view, so coming back re-rendered a card — with live
+    // Open and "Remove this one" buttons — for a row that no longer existed.
+    await scanned();
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove this one" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(deleteDocument).toHaveBeenCalledWith(1));
+    await waitFor(() => expect(duplicateSnapshot).toHaveBeenCalledTimes(1));
   });
 });
 
@@ -263,6 +290,20 @@ describe("keeping both", () => {
     await waitFor(() => expect(dismissDuplicatePair).toHaveBeenCalledWith(1, 2));
     // …and it leaves the list, without a re-scan.
     await waitFor(() => expect(screen.queryByText("Contract Acme")).toBeNull());
+    expect(scanDuplicates).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes the decision from the backend snapshot, and the hidden count with it", async () => {
+    // The regression this closes: `dismiss_duplicate_pair` persisted the decision, but nothing ever
+    // reached the cached report the Documents view re-reads on mount. `absorb` only appends, so the
+    // pair survived every later sweep — a tab switch re-offered a decision the user had already
+    // made, and with `dismissed` still 0 there was not even a "you chose to keep this" line to
+    // explain it. Both now come back from the backend, which is what makes them survive a remount.
+    duplicateSnapshot.mockResolvedValue(report([], { dismissed: 1 }));
+    await scanned();
+    fireEvent.click(screen.getByRole("button", { name: "Keep both" }));
+    await waitFor(() => expect(duplicateSnapshot).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/1 pair you chose to keep/)).toBeTruthy());
     expect(scanDuplicates).toHaveBeenCalledTimes(1);
   });
 

@@ -258,14 +258,16 @@ export function CloudDriveConnection({
       await refresh();
     });
 
-  // Re-index one account from scratch. Fire-and-forget like `ds.sync`: the backend forgets the
-  // account's delta cursor and then runs an ordinary pass, so progress arrives on the same global
-  // event stream and the bar behaves exactly as it does for Sync now. Not routed through `ds.run` —
-  // that sets `busy`, which disables the whole connector, and this starts a detached sync rather
-  // than a short blocking action.
+  // Re-index one account from scratch. Routed through `ds.sync` with its own starter so it takes the
+  // same optimistic paint as "Sync now" — the bar, the row's "Syncing…" and the disabled controls
+  // appear on the click, not minutes later when the backend finishes listing the account and emits
+  // `counted`. That gap was the whole defect: the confirm dialog warns the walk takes a while, then
+  // the screen showed nothing had happened, so the obvious move was to press it again — which the
+  // backend refuses with "A sync is already running", under a connector that still looked idle.
+  // Still not `ds.run`: that sets `busy` and disables the whole connector for what is a detached
+  // sync, not a short blocking action.
   const reindex = (email: string) => {
-    setError(null);
-    void meta.reindex(email).catch((e) => setError(String(e)));
+    ds.sync(email, () => meta.reindex(email));
   };
 
   const configured = status?.oauth_client_configured ?? false;
