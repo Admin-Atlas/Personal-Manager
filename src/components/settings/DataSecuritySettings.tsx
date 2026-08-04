@@ -154,15 +154,19 @@ export function DataSecuritySettings() {
         <SectionInfo title="About your data & export">
           <p>
             Your documents are Markdown files in that folder, stored unencrypted so any tool can
-            read them; PM&rsquo;s own store (projects, chats, the search index) sits beside them and
-            is always encrypted. To protect the Markdown when your machine is off or logged out,
-            turn on full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on Linux).
+            read them — unless your vault keeps them encrypted at rest, which the vault card below
+            says either way; PM&rsquo;s own store (projects, chats, the search index) sits beside
+            them and is always encrypted. To protect the Markdown when your machine is off or logged
+            out, turn on full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on
+            Linux).
           </p>
           <p>
             <span className="font-medium">Export</span> offers everything or just your documents,
-            plain or encrypted. Plain means readable Markdown — PM&rsquo;s store stays encrypted
-            inside the archive either way. Encrypted is the same file a backup writes, and needs a
-            passphrase to open.
+            plain or encrypted. Plain writes a .zip of the whole vault — PM&rsquo;s store stays
+            encrypted inside it, but the archive also carries the settings file a restore needs, so
+            the copy is exactly as private as the vault it came from: on a passphrase vault it opens
+            on any machine that passphrase reaches. Encrypted is the same file a backup writes,
+            locked with a passphrase you choose.
           </p>
         </SectionInfo>
 

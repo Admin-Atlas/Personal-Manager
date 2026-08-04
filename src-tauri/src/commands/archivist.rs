@@ -53,7 +53,7 @@ const REBUILD_PENDING_KEY: &str = "rebuild_pending";
 /// deletion: a file or manifest entry that outlives its row is harmless and self-healing, whereas
 /// removing either before a failed commit strands the database pointing at truth that is gone.
 #[tauri::command]
-pub fn delete_document(state: State<'_, AppState>, document_id: i64) -> Result<()> {
+pub fn delete_document(app: AppHandle, state: State<'_, AppState>, document_id: i64) -> Result<()> {
     let (vault_dir, _cipher) = state.markdown_io()?;
     let (vault_root, _rules_cipher) = state.rules_io()?;
     let (_, manifest_cipher) = state.manifest_io()?;
@@ -87,6 +87,14 @@ pub fn delete_document(state: State<'_, AppState>, document_id: i64) -> Result<(
     let tx = conn.unchecked_transaction()?;
     ingest::delete_document(&tx, document_id)?;
     tx.commit()?;
+    // Release the connection BEFORE the duplicate watch is touched below: `sweep_arrivals` takes the
+    // watch and then a connection, so taking them the other way round here is how the two would
+    // deadlock. Nothing after this point needs the DB.
+    drop(conn);
+    // The cached duplicate report is a derived snapshot the panel re-reads on mount, and a pair
+    // naming a row that no longer exists is not a question — left in place it rendered a card, with
+    // live Open and Remove buttons, for a deleted document.
+    crate::duplicates::forget_document(&app, document_id);
 
     if owns_file {
         for rel in [vault_path, photo_original].into_iter().flatten() {

@@ -1394,13 +1394,18 @@ async fn gather_shared_with_me(
                     drive::SwmDuplicate::Merged(removed) => purged.push(removed),
                 }
             }
-            (
+            // Narrowed to what this enumeration can actually speak for: the owned files were split
+            // OUT of `files` above, so leaving their ids in the known set makes the reconcile read
+            // them as deleted. See `drive::narrow_swm_known` for why `resolve_owned_swm_duplicate`
+            // does not already cover it.
+            let known = drive::narrow_swm_known(
                 drive::known_swm_source_ids(&conn, &root.id)?
                     .into_iter()
                     .collect(),
-                adopted,
-                purged,
-            )
+                &root.id,
+                owned.iter().map(|f| f.id.clone()),
+            );
+            (known, adopted, purged)
         };
         // Carry each adoption into the encrypted manifest, off the DB guard. Without this the old
         // My-Drive-namespaced id survives in the portable truth (the mirror-∪-file union never drops

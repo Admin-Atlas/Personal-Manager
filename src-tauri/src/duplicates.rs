@@ -485,6 +485,16 @@ pub fn fold_by_identity(conn: &Connection) -> Result<IdentityFold> {
             fold.retired.push(doomed.anchor.clone());
         }
     }
+    // A fold moves the DB mirror AHEAD of the encrypted manifest, which is precisely what the stale
+    // flag means. The caller strips the doomed anchors from the file, but the SURVIVOR's item still
+    // carries its pre-fold project/tags/importance/reviewed — and `reconcile_on_open` runs moments
+    // later in the same call, treats that file as truth, and writes the stale values back over the
+    // merged filing. The row that held the correct filing has already been deleted by then, so there
+    // is nothing left to recover it from. Marking stale makes the reconcile repair the file from the
+    // mirror BEFORE it applies it, which is the case that machinery exists for.
+    if fold.folded > 0 {
+        crate::index_only::mark_manifest_stale(conn);
+    }
     Ok(fold)
 }
 
@@ -634,19 +644,26 @@ fn load_dismissals(conn: &Connection) -> Result<std::collections::HashSet<(i64, 
 /// top of every scan. So a decision the user had already made was re-offered on every scan forever.
 #[tauri::command]
 pub fn dismiss_duplicate_pair(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     a: i64,
     b: i64,
 ) -> Result<()> {
-    let conn = state.conn()?;
-    let (lo, hi) = ordered(a, b);
-    conn.execute(
-        "INSERT OR IGNORE INTO duplicate_dismissals (a_document_id, b_document_id, dismissed_at)
-         VALUES (?1, ?2, ?3)",
-        // chrono directly, NOT a helper that takes `&AppState`: the connection guard is already
-        // held here, and re-entering `state.conn()` on a non-reentrant mutex self-deadlocks.
-        rusqlite::params![lo, hi, chrono::Utc::now().to_rfc3339()],
-    )?;
+    {
+        let conn = state.conn()?;
+        let (lo, hi) = ordered(a, b);
+        conn.execute(
+            "INSERT OR IGNORE INTO duplicate_dismissals (a_document_id, b_document_id, dismissed_at)
+             VALUES (?1, ?2, ?3)",
+            // chrono directly, NOT a helper that takes `&AppState`: the connection guard is already
+            // held here, and re-entering `state.conn()` on a non-reentrant mutex self-deadlocks.
+            rusqlite::params![lo, hi, chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
+    // Outside the block above, so the connection guard is released before the watch mutex is taken:
+    // `sweep_arrivals` locks the watch and then takes a connection, and acquiring the two in the
+    // opposite order here is how a deadlock between them would be built.
+    forget_pair(&app, a, b);
     Ok(())
 }
 
@@ -705,6 +722,62 @@ pub fn duplicate_snapshot(
 /// The event the background sweep emits when the snapshot changes, so an open Documents tab updates
 /// without polling.
 pub const DUPLICATES_UPDATED: &str = "duplicates://updated";
+
+/// Drop every cached pair that names `document_id`, because the row is gone.
+///
+/// [`DuplicateWatch`]'s own doc names the hazard this closes: an in-memory report IS "a second copy
+/// of a derived thing to keep in step with deletions", and nothing kept it in step. [`absorb`] only
+/// ever APPENDS, so a pair whose document had been deleted survived every later sweep — and the
+/// panel went on rendering a card for it, with live Open and Remove buttons, until the user ran a
+/// full check.
+///
+/// [`absorb`]: DuplicateReport::absorb
+pub fn forget_document(app: &tauri::AppHandle, document_id: i64) {
+    let changed = {
+        let state = tauri::Manager::state::<crate::AppState>(app);
+        let Ok(mut watch) = state.duplicate_watch.lock() else {
+            return;
+        };
+        let Some(report) = watch.report.as_mut() else {
+            return;
+        };
+        let before = report.pairs.len();
+        report
+            .pairs
+            .retain(|p| p.a.id != document_id && p.b.id != document_id);
+        before != report.pairs.len()
+    };
+    if changed {
+        let _ = tauri::Emitter::emit(app, DUPLICATES_UPDATED, ());
+    }
+}
+
+/// Drop one cached pair the user has decided to keep, counting it among the hidden ones.
+///
+/// The dismissal is persisted by [`dismiss_duplicate_pair`], but persistence alone never reached the
+/// snapshot the panel re-reads on mount — so switching tabs and coming back re-offered a decision
+/// the user had already made, with no "you chose to keep this" line to explain it, because
+/// `dismissed` had not moved either. Bumping it here is what keeps that line honest.
+pub fn forget_pair(app: &tauri::AppHandle, a: i64, b: i64) {
+    let pair = ordered(a, b);
+    let changed = {
+        let state = tauri::Manager::state::<crate::AppState>(app);
+        let Ok(mut watch) = state.duplicate_watch.lock() else {
+            return;
+        };
+        let Some(report) = watch.report.as_mut() else {
+            return;
+        };
+        let before = report.pairs.len();
+        report.pairs.retain(|p| ordered(p.a.id, p.b.id) != pair);
+        let gone = before - report.pairs.len();
+        report.dismissed += gone;
+        gone > 0
+    };
+    if changed {
+        let _ = tauri::Emitter::emit(app, DUPLICATES_UPDATED, ());
+    }
+}
 
 /// One scan. `focus` of `None` is the whole library; `Some(ids)` compares only those documents
 /// against it. Shared by the on-demand command and the background sweep so there is one definition
@@ -1074,6 +1147,60 @@ mod tests {
         assert_eq!(gone, 0);
         // Idempotent: a second sweep of a settled store folds nothing.
         assert_eq!(fold_by_identity(&conn).unwrap().folded, 0);
+    }
+
+    #[test]
+    fn a_fold_marks_the_manifest_stale_so_the_merged_filing_is_not_reverted() {
+        // The blocker. `reconcile_index_only` runs this fold and then `index_only::reconcile_on_open`
+        // against the same connection. The fold writes the merged filing to the DB and deletes the
+        // doomed row; its caller strips only that doomed anchor from the manifest, so the SURVIVOR's
+        // item there still carries its pre-fold project/tags/reviewed. The reconcile then reads that
+        // file as truth and writes the stale values straight back over the merge — silently, and
+        // with the row that held the correct filing already gone, so nothing could recover it.
+        //
+        // The stale flag is exactly the "mirror is ahead of the file" signal, and it makes the
+        // reconcile repair the file from the mirror BEFORE applying it.
+        let (_dir, conn) = open_store();
+        let survivor = indexed(&conn, "gdrive:a@x.com:1AbC", "Unsorted", false);
+        indexed(&conn, "gdrive:swm:rootB:1AbC", "Taxes", true);
+
+        assert_eq!(
+            crate::db::get_setting(&conn, "index_only_manifest_stale").unwrap(),
+            None,
+            "nothing has moved the mirror ahead of the file yet"
+        );
+        assert_eq!(fold_by_identity(&conn).unwrap().folded, 1);
+
+        // The merge happened…
+        let project: String = conn
+            .query_row(
+                "SELECT project FROM documents WHERE id = ?1",
+                params![survivor],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "Taxes", "the confirmed filing won the merge");
+        // …and the manifest is now known to be behind it.
+        assert_eq!(
+            crate::db::get_setting(&conn, "index_only_manifest_stale").unwrap(),
+            Some("1".into()),
+            "so the next reconcile rewrites the file rather than applying a stale one"
+        );
+    }
+
+    #[test]
+    fn a_fold_that_changes_nothing_leaves_the_manifest_alone() {
+        // The flag forces a full manifest rewrite at the next open, so an idempotent sweep over a
+        // settled store must not set it — otherwise every launch pays for a write nothing needed.
+        let (_dir, conn) = open_store();
+        indexed(&conn, "gdrive:a@x.com:1AbC", "Work", false);
+        indexed(&conn, "gdrive:b@x.com:9ZzZ", "Work", false);
+
+        assert_eq!(fold_by_identity(&conn).unwrap().folded, 0);
+        assert_eq!(
+            crate::db::get_setting(&conn, "index_only_manifest_stale").unwrap(),
+            None
+        );
     }
 
     #[test]

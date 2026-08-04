@@ -54,7 +54,14 @@ function describe(scope: Scope, format: Format): string {
     return "A single .pmbackup file, locked with a passphrase you choose. This is exactly what PM's backup writes — you can restore it on any machine, and PM cannot open it without that passphrase.";
   }
   if (scope === "everything") {
-    return "A single .zip: your documents as readable Markdown, plus PM's store. The store stays encrypted inside the archive, so it only opens on a machine whose keychain holds this app's key — the Markdown is what you can read anywhere.";
+    // Kept true for BOTH vault modes, and rewritten when the archive stopped being store + Markdown:
+    // it now also carries the vault's own settings file, without which a restore is impossible. On a
+    // passphrase vault that file holds the salt and verifier the passphrase derives against, which
+    // makes the .zip a complete, portable copy of the library rather than one pinned to this
+    // machine's keychain — and on such a vault the Markdown inside is encrypted too, so the old
+    // promise of "readable anywhere" was wrong in the same breath. This is the sentence a user reads
+    // while deciding where to put the file, so it says what the file actually is.
+    return "A single .zip holding everything a restore needs: PM's store, your documents, and the vault's own settings file. The store stays encrypted inside the archive — on a device vault that means it opens only on this machine, whose keychain holds the key; on a vault you protect with a passphrase it opens anywhere that passphrase does, so keep the file as closely as you keep the passphrase. Your documents travel as readable Markdown, unless your vault keeps them encrypted at rest — then they stay encrypted here too.";
   }
   return "A folder of plain .md files, decrypted. Nothing else — no projects, no chats, no search index. This is the escape hatch: your writing, readable by anything, with no PM required.";
 }

@@ -271,6 +271,13 @@ const REINDEX_BUSY: &str =
 /// by default.
 #[tauri::command]
 pub async fn reindex_drive(app: AppHandle, account: String) -> Result<usize> {
+    // BEFORE the cursor is touched. `sync_drive` performs this same check, but it did so only after
+    // the clear below had already committed — so a re-index started during a Rebuild returned an
+    // error the UI showed as "nothing happened", having permanently discarded the cursor. The next
+    // background poll then found none and re-enumerated the entire estate: a full walk nobody asked
+    // for, announced nowhere, against the "manual only, no background full walk" constraint this
+    // feature was designed around. A refusal must leave the account exactly as it found it.
+    refuse_if_rebuilding(&app, "a re-index would be indexing into a moving target")?;
     {
         let state = app.state::<AppState>();
         if sync_snapshot(&state.drive_sync, "drive")?.running {
@@ -286,6 +293,8 @@ pub async fn reindex_drive(app: AppHandle, account: String) -> Result<usize> {
 /// reason.
 #[tauri::command]
 pub async fn reindex_onedrive(app: AppHandle, account: String) -> Result<usize> {
+    // Before the clear, for the reason spelled out in [`reindex_drive`].
+    refuse_if_rebuilding(&app, "a re-index would be indexing into a moving target")?;
     {
         let state = app.state::<AppState>();
         if sync_snapshot(&state.onedrive_sync, "onedrive")?.running {
