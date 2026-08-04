@@ -1,4 +1,4 @@
-PM desktop release — **v3.114.9-alpha**.
+PM desktop release — **v3.123.2-alpha**.
 
 ## Install
 
@@ -45,83 +45,79 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.114.9-alpha
+## What's new in 3.123.2-alpha
 
-This release rolls up everything since v3.85.2 — here's the tour at a glance:
+This release rolls up everything since v3.114.9 — here's the tour at a glance:
 
-- **A short wait the first time you open this one.** Unlike the last few releases, this one does a
-  little work on arrival. PM spends about a minute reinstalling its document engine so every
-  component in it is checked against a known fingerprint before it runs, and your conversations move
-  into their own **chats** folder inside the vault — a plain rename, nothing re-encrypted, nothing
-  re-indexed. If older versions left deleted photos or spreadsheets behind, PM offers **once** to
-  clear them out, shows you exactly what it found, and deletes nothing until you say so. Your files,
-  vault and settings are untouched by all of it. If you use photo text recognition or the memory
-  map's detailed layout, one may show as not installed afterwards — re-adding it from **Settings →
-  Storage** is quick.
-- **A document can belong to more than one project.** The Project field is a list you build like the
-  To: line of an email. The first is the **primary** project — the one that owns the document,
-  counts it as activity and places it on the Map — and the rest are links. You can see which is
-  which wherever a document appears, and change it on the spot. A project's chat can now answer from
-  documents linked into it, not just the ones filed there. Existing vaults carry over untouched.
-- **Your tags are yours to edit — and PM stops inventing them.** **Teach → Tags** lists every label
-  with how many documents carry it: rename one everywhere, fold near-duplicates together
-  (tax/taxes, chair/chairs), or take one off every document. You can also re-tag your **whole
-  library** from a single vocabulary chosen with everything in view. That last part fixes something
-  quietly broken: tags proposed a few documents at a time produced labels like "ammun" and
-  "placement" — fair descriptions of one file, and useless as tags, because a tag that lands on one
-  document groups nothing. Nothing is written until you approve both the vocabulary and the
-  per-document before-and-after. You can also point a chat at a tag: type **@** in the message box,
-  pick one, and that single message searches it.
-- **Projects you can merge, delete, and re-file into.** Merge one project into another and
-  everything moves across before the old one is deleted. Delete a project and choose separately what
-  becomes of its files, its chats and its name. Delete a single document from wherever you found it.
-  Each asks you to type the name first and counts up exactly what it holds, because none of it can
-  be undone from inside PM. **"Part of" has been removed** — it hid a project's own status behind a
-  parent's name, and merging does honestly what it was being used for.
-- **Sorting a new import happens as the files land.** Each file appears in Documents and in Review
-  the moment it's stored, already carrying a proposed project, importance and tags — so you can
-  approve the first handful while the rest are still arriving. Every file gets a suggestion however
-  it reached PM, and PM never asks twice about one it has already suggested for. PM can also look
-  through your library for **documents you have twice**, comparing both the opening text and what
-  each document is about, so the same report saved as a Word file and a PDF still matches.
-- **Every repeating calendar event now shows every time it happens.** PM was treating a whole
-  repeating series as a single event, so a weekly meeting appeared exactly once. Your Month, Week
-  and Year views and Upcoming on Focus will suddenly look a lot fuller — that's the honest picture.
-  Editing a single occurrence no longer makes it vanish, and a sync that doesn't finish now adds
-  what it found and removes nothing.
-- **Your connected accounts keep themselves up to date — and a half-finished sync stops costing you
-  files.** Google Drive, OneDrive and local folders are now checked when you open PM and every 15
-  minutes after, the way your calendar already was ("Shared with me" gets its own hourly rhythm). A
-  sync that only partly succeeded no longer removes anything: one unreadable folder, one file
-  OneDrive won't hand over, or a drive that went away no longer takes the whole account down or
-  quietly shortens your library. And a problem with the document engine no longer makes files
-  disappear without a word — PM used to treat everything it couldn't read as unreadable forever and
-  move its place-marker past it, so those files were never offered again.
-- **"Remove PM data" now really removes everything — and says what it couldn't.** It reaches the
-  caches, old installers and sandbox profiles PM had been leaving in folders you'd never think to
-  look in, the Mac and Linux leftovers it never touched, and a vault you had moved elsewhere. It
-  refuses while a backup is uploading, won't touch a vault another account owns, tells you when
-  erasing a shared vault takes it away from other accounts too, and **lists what it left behind with
-  the exact path** instead of claiming everything is gone.
-- **Your vault is harder to tamper with and safer to interrupt.** Notes, chat transcripts and saved
-  photos are now written and swapped into place in one step, so a crash mid-save leaves you the old
-  version rather than half a file. A settings file edited to claim your notes aren't encrypted is
-  refused rather than re-signed. Changing the passphrase on a vault shared between two accounts asks
-  you to confirm you're taking it over. And an operation that can't read part of your vault — a
-  passphrase change, an export, a backup — now stops and says so instead of finishing and reporting
-  success. You can also **keep typing while PM is still answering**: press Enter and your message
-  waits its turn, up to three at a time.
-- **Reading PM is easier, and it speaks properly now.** Every status colour clears the readability
-  floor in light mode (Take a look was as low as 3.1 against a required 4.5), text you're meant to
-  read is out of PM's faintest grey, every dialog has a name a screen reader can announce, and
-  errors and warnings are announced rather than failing in silence. Reduced motion is honoured
-  everywhere, including PM's own setting.
-- **Licences, properly — and a smaller install.** PM's own licence now installs alongside the app;
-  the credits file covers the interface's open-source work and its typefaces too; and every local
-  model PM suggests says what its weights are licensed under, with the seven under publisher terms
-  showing you those terms before the download rather than after. PM also got smaller: it had been
-  installing 82 MB of debugging files it never needed, so the bundled Python drops from 150 MB to
-  69 MB.
+- **A little tidying when you first open this one.** PM joins up files it can *prove* it was holding
+  twice — the same Google Drive file reached two ways — into one document that knows both places it
+  lives. Your filing is merged rather than chosen between, and nothing is deleted to do it. It happens
+  on the first launch and on the next Drive sync, and needs nothing from you. If you have never opened
+  the Documents table's **Columns** menu, that table also starts from a slightly different set of
+  columns than before; if you have ever ticked anything, your choice is untouched.
+- **One file is one document, however many places it lives.** If you own a file and a colleague has
+  also shared it with you, PM used to hold it twice — two rows, two filings, and no way to tell them
+  apart on screen. It now recognises them as the same file and keeps one document living in two
+  places, both still checked, so the document stays readable as long as either one is there. It only
+  ever joins two records when the provider's own id says they are the same file; two documents that
+  merely look alike are still shown to you to decide on. The duplicate check has moved out of Settings
+  onto the **Documents** tab, runs quietly after any sync that brought something new in, and now shows
+  where each copy came from — which account, which shared drive, which folder — so you can tell the two
+  sides apart. You can also say **keep both**, and PM remembers.
+- **Your documents say who wrote them — and keep saying it truthfully.** Author, last editor, creation
+  date and size now come through from Google Drive, OneDrive and your own machine. Word, PowerPoint,
+  Excel and PDF files carry that information inside the file itself, so a document from a folder on
+  your computer fills in the same columns as one from Drive. **Created** now means when the document
+  was created, not when the copy on your disk was made — for anything emailed, downloaded or restored
+  from a backup those are wildly different dates. And every sync brings it all up to date, including
+  the folder a file has been moved into; PM used to ask once, when it first saw the file, and never
+  again. Where a source says nothing, the field reads "Unknown" — and something PM was once told is
+  never blanked just because the source has gone quiet.
+- **A Documents table you can shape.** A **Columns** menu turns each column on or off; every column
+  sorts, with the rows that have no answer always settling at the bottom so sorting by author never
+  buries the files that have one. Two new facts join them: **Updated**, when the file itself last
+  changed at its source, and **Last synced**, when PM last had something new to write down about it.
+  Between them they separate "nobody has edited this since March" from "this connector stopped working
+  in March", which until now looked identical from outside.
+- **Sync you can stop, leave, and ask again from scratch.** **Stop indexing** now takes effect inside
+  the file listing, so it lands in seconds rather than after a whole account. Press **Sync now** on a
+  second account while the first is indexing and the "Queued" label stays put when you switch tabs. And
+  a new **Re-index everything**, behind the small arrow next to Sync now, reads every file in an account
+  again — for when PM and the account look like they have drifted apart. It asks first, because it takes
+  a while; nothing is deleted, and files PM already has are recognised and left alone.
+- **Re-tagging your library is something you can walk away from.** Both halves — choosing the vocabulary
+  and labelling every document — show a real progress bar, and leaving the Teach tab and coming back
+  rejoins the pass where it is instead of showing you nothing. The vocabulary step is a model call, and
+  its result is now kept rather than thrown away when you look at something else. A pass that ends says
+  so, however it ended, and PM refuses to start a second re-tag over a first.
+- **Everything about where your data lives, in one place — and an export that says what it is.** The
+  folder is written above the button that opens it, and on a vault you have moved or shared, PM names
+  its own settings folder separately. Export asks what you actually want — everything or just your
+  documents, plain or encrypted — with a sentence for each combination saying exactly what it produces
+  and how private the result is. The export archive now also carries the vault's key file, your entity
+  rules and every cloud pointer, which it had been leaving out: unzipped on another machine, the old one
+  gave you a vault PM could not open.
+- **Backups that show their work.** The progress bar now appears under the button you pressed rather
+  than five sections up the page, and the first stage shimmers instead of sitting frozen at 0%. Your
+  backups are listed by date and time rather than a 68-character filename with the date on the end. The
+  "a destination failed" banner can be dismissed and stays dismissed — and most of the time it was never
+  a failure at all: PM was reporting a tidy-up of older backups as the backup itself failing.
+- **A missing library is reported, never quietly re-created.** If PM's store has been deleted or moved
+  from outside PM, it now stops, names the file, and tells you it has deleted and re-created nothing, so
+  you can put it back or restore a backup first. It used to start over silently, opening looking perfectly
+  normal with nothing in it. "Start fresh" now also says that it deletes your notes, which it always did.
+- **Things you can see.** Switches have a visible edge and a visible off state at every theme, mode,
+  accent and contrast level — and PM's own contrast audit checks them now, so they cannot quietly fade
+  again. Disabled buttons dim once instead of twice. The calendar opens on an ordinary Monday-to-Sunday
+  week, and swiping sideways across it keeps working past the first day. The rebuild activity list keeps
+  every file in the pass, scrolls, and survives the rebuild finishing.
+- **And under the hood.** Approving a large pile of documents no longer locks up the app — PM was
+  rewriting and re-encrypting its whole index file once per document, so two hundred approvals meant two
+  hundred full rewrites. Security updates landed for three of the libraries PM builds on. A pre-release
+  review also closed several faults in the work above, before any of it reached you: files in a connected
+  account being reported as missing when they were fine, a duplicate merge quietly undoing your filing on
+  the next launch, and an edit to a tracked file being skipped for good if PM could not read it the first
+  time.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
