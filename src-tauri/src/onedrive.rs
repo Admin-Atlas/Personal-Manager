@@ -218,6 +218,20 @@ pub fn get_cursor(conn: &Connection, email: &str) -> Result<Option<String>> {
     Ok(raw.filter(|s| !s.trim().is_empty()))
 }
 
+/// Forget the delta link for an account, so the next pass re-enumerates the whole drive instead of
+/// asking Graph what changed — the OneDrive half of "Re-index everything" (#727). See
+/// [`crate::drive::clear_cursors`] for why this reaches no new code path and costs no re-ingest.
+///
+/// A folder-scoped account keeps no cursor to begin with (it re-enumerates every pass already), so
+/// this is a harmless no-op there rather than a case to special-case at the caller.
+pub fn clear_cursor(conn: &Connection, email: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE connector_sources SET cursor = NULL WHERE id = ?1",
+        params![account_id(email)],
+    )?;
+    Ok(())
+}
+
 /// Record a clean sync: advance the whole-drive delta link (when whole-drive synced this pass), stamp
 /// the time, and clear any failure state. A folder-scoped pass passes `None` (it keeps no cursor) but
 /// still stamps the time + clears failure.

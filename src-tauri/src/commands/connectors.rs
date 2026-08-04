@@ -251,6 +251,52 @@ pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncS
     Ok(snap)
 }
 
+/// The message a full re-index is refused with while a sync is in flight. Named once because both
+/// providers raise it and the UI's disabled state must agree with it word for word.
+const REINDEX_BUSY: &str =
+    "A sync is already running. Wait for it to finish, then re-index — starting one now would \
+     re-establish the cursor this is meant to discard.";
+
+/// Re-index one Drive account from scratch: forget its delta cursors, then run an ordinary sync,
+/// which now has no cursor to ride and so re-enumerates everything in scope (#727).
+///
+/// **Refused while a sync is running, and that guard is load-bearing rather than defensive.** The
+/// running pass ends in `finalize_sync`, which writes a FRESH cursor. Clearing the map underneath it
+/// would therefore be undone moments later by a pass that never re-enumerated — leaving the user with
+/// a full walk they asked for, waited through, and did not get. The UI also disables the control, but
+/// a frontend boolean is not a store guarantee (the webview is untrusted), so the refusal lives here.
+///
+/// Deliberately per-ACCOUNT and never "all". A full walk is the most expensive thing this connector
+/// does, and the point of the split control is to make the expensive path chosen rather than reached
+/// by default.
+#[tauri::command]
+pub async fn reindex_drive(app: AppHandle, account: String) -> Result<usize> {
+    {
+        let state = app.state::<AppState>();
+        if sync_snapshot(&state.drive_sync, "drive")?.running {
+            return Err(Error::Other(REINDEX_BUSY.into()));
+        }
+        let conn = state.conn()?;
+        drive::clear_cursors(&conn, &account)?;
+    }
+    sync_drive(app, Some(account), Some(true)).await
+}
+
+/// Re-index one OneDrive account from scratch — the sibling of [`reindex_drive`]; same guard, same
+/// reason.
+#[tauri::command]
+pub async fn reindex_onedrive(app: AppHandle, account: String) -> Result<usize> {
+    {
+        let state = app.state::<AppState>();
+        if sync_snapshot(&state.onedrive_sync, "onedrive")?.running {
+            return Err(Error::Other(REINDEX_BUSY.into()));
+        }
+        let conn = state.conn()?;
+        onedrive::clear_cursor(&conn, &account)?;
+    }
+    sync_onedrive(app, Some(account)).await
+}
+
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
 /// [`cloud_sync::drive_sync_core`] for the behaviour; this is the command the UI's "Sync now" calls.
 ///

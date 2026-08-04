@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.123.0-alpha",
+    date: "2026-08-04",
+    highlights: [
+      "Sync now on a Drive or OneDrive account has grown a second option: Re-index everything. The everyday button asks the provider what has changed since last time, which is one quick request and almost always the right answer. The new one reads every file in the account again — for when something looks out of date, or you suspect PM and the account have drifted apart. A change feed only ever reports what it noticed at the time, and there was previously no way to ask for a fresh look without disconnecting the account and starting over.",
+      "It sits behind the small arrow next to Sync now, and asks before it starts, because on a large account it takes a while and uses bandwidth. Nothing is deleted and nothing you have filed is lost — files PM already has are recognised and left alone, so it is mostly listing requests rather than downloading your documents again. It also refreshes what the provider says about each file it sees: author, when it was created, how big it is, and which folder it lives in.",
+    ],
+  },
+  {
     version: "3.122.3-alpha",
     date: "2026-08-04",
     highlights: [
