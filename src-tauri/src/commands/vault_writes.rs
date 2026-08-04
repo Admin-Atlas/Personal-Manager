@@ -239,6 +239,10 @@ pub(super) fn rewrite_documents(
         }
     }
 
+    // Renaming or merging an entity rewrites every document linked to it, so this is a bulk loop and
+    // gets the same treatment as `commit_review`: the manifest is regenerated whole from the mirror,
+    // making a per-document push quadratic in library size. Flushed once after the loop (#722).
+    let mut deferred_manifest = false;
     for (doc_id, project, tags_json, importance, reviewed, last_activity) in rows {
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
         // `None` = leave this document where it is. That is the case for a document merely LINKED
@@ -252,7 +256,7 @@ pub(super) fn rewrite_documents(
         // excluding the row's current home as well as the incoming one. Without that, a rename
         // emitted the OLD name here and wrote it straight back into every renamed document.
         let linked = crate::tags::linked_projects(tx, doc_id, home)?;
-        out.push(ingest::write_document_truth(
+        let w = ingest::write_document_truth(
             tx,
             vault,
             cipher,
@@ -268,6 +272,19 @@ pub(super) fn rewrite_documents(
             // Identity maintenance, not engagement: renaming/merging an entity rewrites every linked
             // doc, and logging one "filed" observation per doc would read as a burst of activity (B6-6).
             ingest::FilingActivity::Suppress,
+            ingest::ManifestWrite::Batched,
+        )?;
+        deferred_manifest |= w.is_none();
+        out.extend(w);
+    }
+    // Called more than once in a transaction by a caller that rewrites several id sets, which is
+    // still correct — one push per call instead of one per document, and the last write subsumes the
+    // rest because the manifest is regenerated whole.
+    if deferred_manifest {
+        out.push(ingest::flush_manifest_batch(
+            tx,
+            vault_root,
+            manifest_cipher,
         )?);
     }
     Ok(())

@@ -802,6 +802,10 @@ fn rewrite_document_tags(
     written: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
 ) -> Result<usize> {
     let mut applied = 0usize;
+    // See `commit_review`: the manifest is regenerated whole, so pushing it per document makes a bulk
+    // sweep quadratic in library size. Deleting a label across a large index-only corpus is exactly
+    // that shape, so this seam batches too and flushes once below (#722).
+    let mut deferred_manifest = false;
     for (doc_id, tags) in updates {
         let row: Option<(String, Option<String>, i64, String)> = tx
             .query_row(
@@ -817,7 +821,7 @@ fn rewrite_document_tags(
             continue;
         };
         let linked = crate::tags::linked_projects(tx, *doc_id, &project)?;
-        written.push(ingest::write_document_truth(
+        let w = ingest::write_document_truth(
             tx,
             vault,
             cipher,
@@ -831,8 +835,20 @@ fn rewrite_document_tags(
             vault_root,
             manifest_cipher,
             ingest::FilingActivity::Suppress,
-        )?);
+            ingest::ManifestWrite::Batched,
+        )?;
+        deferred_manifest |= w.is_none();
+        written.extend(w);
         applied += 1;
+    }
+    // One push for the whole sweep, after every document's memberships have landed in the join the
+    // manifest is regenerated from.
+    if deferred_manifest {
+        written.push(ingest::flush_manifest_batch(
+            tx,
+            vault_root,
+            manifest_cipher,
+        )?);
     }
     Ok(applied)
 }
@@ -1017,6 +1033,10 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
+        // Set when any decision took the index-only arm, which under `Batched` wrote its row and left
+        // the shared manifest to us. False for an all-vault batch, where there is no manifest to push.
+        let mut deferred_manifest = false;
+
         let result: Result<usize> = (|| {
             let mut logged = 0usize;
             for d in &decisions {
@@ -1054,8 +1074,15 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                     &vault_root,
                     &manifest_cipher,
                     ingest::FilingActivity::Record,
+                    // The manifest is regenerated whole from the mirror, so pushing it per document
+                    // meant N whole-corpus scans and N whole-file encrypt+fsync cycles inside the
+                    // held DB guard — quadratic in library size, and what made a 200-document
+                    // Approve-all freeze the window (#722). The row still lands here; the file is
+                    // flushed once below.
+                    ingest::ManifestWrite::Batched,
                 )?;
-                written.push(w);
+                deferred_manifest |= w.is_none();
+                written.extend(w);
                 entities::reassign_document(&tx, d.document_id, entity_id)?;
                 // This document is leaving the review queue — drop its cached proposal (belt-and-braces
                 // alongside the ON DELETE CASCADE that covers an actual deletion). Inside the tx, so it
@@ -1069,6 +1096,21 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                     capture_alias(&tx, entity_id, &d.proposed_project)?;
                     entities::set_confirmed(&tx, entity_id)?;
                 }
+            }
+            // The batch's one manifest push. AFTER the loop, so every document's memberships are in
+            // the join `mirror_items` reads — flushing earlier would write a manifest missing them,
+            // and `reconcile_on_open` believes the FILE at the next launch, so that is data loss
+            // rather than a stale readout. Before the tail, so its snapshot joins the rollback set.
+            //
+            // `ingest::flush_manifest_batch`, never `connector_sync::flush_manifest` — that one takes
+            // `state.conn()` itself and this closure is already holding it. The DB mutex is not
+            // reentrant, so the wrong call here is a permanent freeze, not a slow path.
+            if deferred_manifest {
+                written.push(ingest::flush_manifest_batch(
+                    &tx,
+                    &vault_root,
+                    &manifest_cipher,
+                )?);
             }
             Ok(logged)
         })();
@@ -1160,7 +1202,7 @@ pub async fn set_document_metadata(
                     linked.push(other);
                 }
             }
-            written.push(ingest::write_document_truth(
+            written.extend(ingest::write_document_truth(
                 &tx,
                 &vault,
                 &cipher,
@@ -1174,6 +1216,8 @@ pub async fn set_document_metadata(
                 &vault_root,
                 &manifest_cipher,
                 ingest::FilingActivity::Record,
+                // One document, one call — there is no later flush to defer to.
+                ingest::ManifestWrite::PerDocument,
             )?);
             entities::reassign_document(&tx, document_id, entity_id)?;
             // A deliberate after-the-fact metadata edit vouches for the chosen entity — confirm it.

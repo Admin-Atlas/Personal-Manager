@@ -3005,6 +3005,55 @@ pub enum FilingActivity {
     Suppress,
 }
 
+/// When a batch of index-only documents pushes its regenerated manifest to disk.
+///
+/// The manifest is not per-document state: [`crate::index_only::write_synced`] regenerates the WHOLE
+/// file from the DB mirror, so writing it once after N documents is byte-identical to writing it
+/// after each — the last write of a batch already subsumes every earlier one. What differs is the
+/// cost. Each write re-scans every index-only row (`mirror_items`, plus a membership join and a
+/// locations join), then decrypts, re-encrypts and fsyncs the whole file. Per document, that makes a
+/// bulk pass quadratic in LIBRARY size rather than linear in batch size: approving 200 documents over
+/// a cloud estate cost 200 whole-corpus scans and 200 whole-manifest encrypt+fsync cycles, all inside
+/// the app-wide DB guard, which is what froze the window (#722).
+///
+/// The sync path already solved this with [`crate::connector_sync::ManifestFlusher`]; the truth-writer
+/// never adopted it. This is that cure for the writer's own bulk callers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ManifestWrite {
+    /// Push the manifest as part of this document's write — the single-document surfaces, where one
+    /// call is the whole pass and there is no later flush to rely on.
+    PerDocument,
+    /// Skip the push and return `None` from the index-only arm, meaning: *this document's truth is
+    /// the shared manifest, and you owe it one [`flush_manifest_batch`] before your transaction
+    /// commits*. For bulk callers only.
+    Batched,
+}
+
+/// Push the manifest once for a [`ManifestWrite::Batched`] pass, returning its snapshot for rollback.
+///
+/// Call this after the LAST document of the batch and before the transaction's tail. Ordering is
+/// load-bearing in both directions: [`write_document_truth`] writes the membership join that
+/// `mirror_items` reads, so flushing before the batch's final `set_document_projects` would write a
+/// manifest missing those memberships — and `reconcile_on_open` treats the manifest file as truth at
+/// the next launch, so that is silent data loss, not a stale readout.
+///
+/// **Never reach for [`crate::connector_sync::flush_manifest`] or `ManifestFlusher` here.** Both take
+/// `state.conn()` themselves, and every caller of this function is already holding that guard. The DB
+/// mutex is not reentrant, so that is a permanent self-deadlock rather than a slow path — which is
+/// why this takes the caller's own `&Connection` (a `Transaction` derefs to one) and nothing else.
+///
+/// The returned prior bytes are the TRUE pre-batch manifest, because this is the batch's only write.
+/// The per-document mode never had that property: it snapshotted N times and only the first held the
+/// pre-batch state, correct solely by virtue of [`restore_vault_files`] unwinding newest-first.
+pub fn flush_manifest_batch(
+    tx: &Connection,
+    vault_root: &Path,
+    manifest_cipher: &crate::index_only::ManifestCipher,
+) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    let prior = crate::index_only::write_synced(tx, vault_root, manifest_cipher)?;
+    Ok((crate::index_only::manifest_path(vault_root), prior))
+}
+
 /// Persist a document's organisational truth (canonical project + tags/importance/reviewed/
 /// last_activity) to wherever its source keeps it, returning the file snapshot for rollback. The
 /// single indirection point every metadata write goes through — so hard-coding front-matter can't
@@ -3015,6 +3064,11 @@ pub enum FilingActivity {
 /// Pass a `rusqlite::Transaction` (it derefs to `&Connection`); commit it only once the whole batch
 /// is written. The returned `(path, prior_bytes)` rolls back via [`restore_vault_files`] for either
 /// arm (an empty prior means the file was freshly created — it gets removed, not zeroed).
+///
+/// `manifest` decides when the index-only arm pushes the shared manifest ([`ManifestWrite`]). Under
+/// [`ManifestWrite::Batched`] that arm returns `None` — the document's row is written but the file is
+/// not, and the caller owes it one [`flush_manifest_batch`] before its transaction commits. The vault
+/// arm always returns `Some`: a Markdown file IS per-document truth and has nothing to batch.
 #[allow(clippy::too_many_arguments)]
 pub fn write_document_truth(
     tx: &Connection,
@@ -3030,7 +3084,8 @@ pub fn write_document_truth(
     vault_root: &Path,
     manifest_cipher: &crate::index_only::ManifestCipher,
     activity: FilingActivity,
-) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    manifest: ManifestWrite,
+) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
     // The membership join is a queryable index over what the truth file is about to say, so it is
     // written here — inside the caller's transaction — and nowhere else. This is what INVARIANTS
     // I-02 ("one writer owns a document's filing") buys: a new filing surface gets correct
@@ -3046,7 +3101,7 @@ pub fn write_document_truth(
     crate::tags::set_document_group_tags(tx, doc_id, tags)?;
 
     let written = match truth_source(tx, doc_id)? {
-        TruthSource::VaultFrontmatter => rewrite_vault_metadata(
+        TruthSource::VaultFrontmatter => Some(rewrite_vault_metadata(
             tx,
             vault,
             cipher,
@@ -3057,7 +3112,7 @@ pub fn write_document_truth(
             importance,
             reviewed,
             last_activity,
-        )?,
+        )?),
         TruthSource::IndexManifest => rewrite_manifest_metadata(
             tx,
             vault_root,
@@ -3068,6 +3123,7 @@ pub fn write_document_truth(
             importance,
             reviewed,
             last_activity,
+            manifest,
         )?,
     };
 
@@ -3468,6 +3524,11 @@ fn rewrite_vault_metadata(
 /// removing the file. The per-write snapshot stack unwinds a mixed batch — several vault files plus
 /// the single manifest — correctly newest-first, because each manifest write reads-current then
 /// writes-new.
+///
+/// Under [`ManifestWrite::Batched`] the row is still written but the file is not, and this returns
+/// `None` — the caller flushes once via [`flush_manifest_batch`]. That is where the cost goes: the
+/// mirror update below is a single-row `UPDATE`, while the push it skips is a whole-corpus scan plus a
+/// whole-file encrypt and fsync (see [`ManifestWrite`]).
 #[allow(clippy::too_many_arguments)]
 fn rewrite_manifest_metadata(
     tx: &Connection,
@@ -3479,7 +3540,8 @@ fn rewrite_manifest_metadata(
     importance: Option<&str>,
     reviewed: bool,
     last_activity: &str,
-) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    manifest: ManifestWrite,
+) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
     // No `linked_projects` argument, unlike the vault arm: this document has no front-matter to
     // write it into. Its portable truth is the manifest, which `write_synced` regenerates from the
     // membership join that `write_document_truth` has already updated before dispatching here.
@@ -3497,8 +3559,10 @@ fn rewrite_manifest_metadata(
             doc_id
         ],
     )?;
-    let prior = crate::index_only::write_synced(tx, vault_root, manifest_cipher)?;
-    Ok((crate::index_only::manifest_path(vault_root), prior))
+    if manifest == ManifestWrite::Batched {
+        return Ok(None);
+    }
+    Ok(Some(flush_manifest_batch(tx, vault_root, manifest_cipher)?))
 }
 
 /// Restore truth files overwritten during an abandoned metadata batch to their prior raw bytes — the
@@ -5951,8 +6015,10 @@ mod tests {
             dir.path(),
             &cipher,
             FilingActivity::Record,
+            ManifestWrite::PerDocument,
         )
-        .unwrap();
+        .unwrap()
+        .expect("PerDocument pushes the manifest and returns its snapshot");
         tx.commit().unwrap();
 
         // It wrote the manifest (first write → empty prior), not a vault file.
@@ -5985,6 +6051,223 @@ mod tests {
         assert_eq!(row_project, "Project X");
     }
 
+    // --- batched manifest writes (#722) -------------------------------------------------------
+    //
+    // The manifest is regenerated WHOLE from the DB mirror, so writing it once after N documents has
+    // to be byte-for-byte what writing it after each one produced. That identity is the entire licence
+    // for `ManifestWrite::Batched`, so it is asserted here rather than argued in a comment.
+
+    /// Add a second index-only document, so a batch has more than one manifest item to fold.
+    fn add_index_only(conn: &Connection, source_id: &str, title: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id, \
+                    project, stored_summary) \
+             VALUES (?1, ?2, ?3, 'index_only', ?4, 'Unsorted', 'another short summary')",
+            params![
+                format!("idx://{source_id}"),
+                title,
+                format!("h-{source_id}"),
+                source_id
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// File one index-only document, returning whatever the truth-writer handed back for rollback.
+    #[allow(clippy::too_many_arguments)]
+    fn file_index_only(
+        tx: &Connection,
+        vault_dir: &Path,
+        root: &Path,
+        cipher: &crate::index_only::ManifestCipher,
+        doc_id: i64,
+        project: &str,
+        manifest: ManifestWrite,
+    ) -> Option<(std::path::PathBuf, Vec<u8>)> {
+        write_document_truth(
+            tx,
+            vault_dir,
+            &crate::vault::MarkdownCipher::plaintext("vault-test"),
+            doc_id,
+            project,
+            &[],
+            &["urgent".to_string()],
+            Some("high"),
+            true,
+            "2026-06-26T00:00:00Z",
+            root,
+            cipher,
+            FilingActivity::Record,
+            manifest,
+        )
+        .unwrap()
+    }
+
+    /// `Batched` writes the document's ROW but not the manifest FILE, and says so by returning `None`.
+    /// This is what makes the flush the caller's debt: skipping the push without the `None` would lose
+    /// the manifest silently.
+    #[test]
+    fn a_batched_write_moves_the_row_and_leaves_the_manifest_file_alone() {
+        use crate::index_only::{manifest_path, ManifestCipher};
+        let (dir, mut conn, _vault_id, index_id) = store_with_one_of_each();
+        let cipher = ManifestCipher::from_master("vault-test", &[9u8; 32]);
+        let vault_dir = dir.path().join("vault");
+
+        let tx = conn.transaction().unwrap();
+        let written = file_index_only(
+            &tx,
+            &vault_dir,
+            dir.path(),
+            &cipher,
+            index_id,
+            "Project X",
+            ManifestWrite::Batched,
+        );
+        tx.commit().unwrap();
+
+        assert!(
+            written.is_none(),
+            "a batched write owes the caller a flush and must say so"
+        );
+        assert!(
+            !manifest_path(dir.path()).exists(),
+            "the manifest file was not touched"
+        );
+        let row_project: String = conn
+            .query_row(
+                "SELECT project FROM documents WHERE id = ?1",
+                params![index_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_project, "Project X", "the mirror still moved");
+    }
+
+    /// THE identity claim. Two documents filed per-document and two filed batched-then-flushed must
+    /// leave the same manifest — otherwise batching is a behaviour change wearing a performance
+    /// change's clothes.
+    #[test]
+    fn a_batched_flush_matches_writing_the_manifest_per_document() {
+        use crate::index_only::{read_manifest, ManifestCipher};
+
+        let file_both = |manifest: ManifestWrite| {
+            let (dir, mut conn, _vault_id, first) = store_with_one_of_each();
+            let second = add_index_only(&conn, "s2", "Second pointer");
+            let cipher = ManifestCipher::from_master("vault-test", &[9u8; 32]);
+            let vault_dir = dir.path().join("vault");
+
+            let tx = conn.transaction().unwrap();
+            for (id, project) in [(first, "Project X"), (second, "Project Y")] {
+                file_index_only(&tx, &vault_dir, dir.path(), &cipher, id, project, manifest);
+            }
+            if manifest == ManifestWrite::Batched {
+                flush_manifest_batch(&tx, dir.path(), &cipher).unwrap();
+            }
+            tx.commit().unwrap();
+            read_manifest(dir.path(), &cipher).unwrap().unwrap()
+        };
+
+        let per_document = file_both(ManifestWrite::PerDocument);
+        let batched = file_both(ManifestWrite::Batched);
+        assert_eq!(
+            per_document, batched,
+            "one flush after the batch must equal a push per document"
+        );
+        // Not vacuously equal: both really carry the two filings.
+        assert_eq!(batched.items.len(), 2);
+        assert!(batched.items.iter().any(|i| i.project == "Project X"));
+        assert!(batched.items.iter().any(|i| i.project == "Project Y"));
+    }
+
+    /// The rollback snapshot. Batching writes the manifest ONCE, so the prior bytes it returns are the
+    /// true pre-batch file — a property the per-document mode never had (it snapshotted N times and
+    /// only the first held the pre-batch state, correct solely because `restore_vault_files` unwinds
+    /// newest-first). An abandoned batch must put back exactly what it found.
+    #[test]
+    fn a_failed_batched_pass_restores_the_pre_batch_manifest() {
+        use crate::index_only::{manifest_path, read_manifest, ManifestCipher};
+        let (dir, mut conn, _vault_id, first) = store_with_one_of_each();
+        let second = add_index_only(&conn, "s2", "Second pointer");
+        let cipher = ManifestCipher::from_master("vault-test", &[9u8; 32]);
+        let vault_dir = dir.path().join("vault");
+
+        // A manifest already on disk from an earlier pass — the bytes a rollback owes us.
+        {
+            let tx = conn.transaction().unwrap();
+            file_index_only(
+                &tx,
+                &vault_dir,
+                dir.path(),
+                &cipher,
+                first,
+                "Before",
+                ManifestWrite::PerDocument,
+            );
+            tx.commit().unwrap();
+        }
+        let pre_batch = std::fs::read(manifest_path(dir.path())).unwrap();
+        assert!(!pre_batch.is_empty());
+
+        // A batch that files both documents, flushes, and is then abandoned.
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+        {
+            let tx = conn.transaction().unwrap();
+            for (id, project) in [(first, "Project X"), (second, "Project Y")] {
+                written.extend(file_index_only(
+                    &tx,
+                    &vault_dir,
+                    dir.path(),
+                    &cipher,
+                    id,
+                    project,
+                    ManifestWrite::Batched,
+                ));
+            }
+            written.push(flush_manifest_batch(&tx, dir.path(), &cipher).unwrap());
+            // The DB half rolls back by dropping the transaction uncommitted.
+        }
+        assert_eq!(
+            written.len(),
+            1,
+            "one manifest snapshot for the whole batch"
+        );
+        assert_eq!(
+            written[0].1, pre_batch,
+            "the snapshot is the TRUE pre-batch manifest, not an intermediate one"
+        );
+
+        restore_vault_files(written);
+        assert_eq!(
+            std::fs::read(manifest_path(dir.path())).unwrap(),
+            pre_batch,
+            "the file is byte-identical to before the abandoned batch"
+        );
+        // Both rows were already in the mirror when the pre-batch manifest was written, so it carries
+        // two items either way. What the rollback has to undo is the FILING: s1 back to "Before" and
+        // s2 still sitting in the pre-triage bucket, with neither "Project X" nor "Project Y" landed.
+        let restored = read_manifest(dir.path(), &cipher).unwrap().unwrap();
+        let project_of = |source_id: &str| {
+            restored
+                .items
+                .iter()
+                .find(|i| i.source_id == source_id)
+                .unwrap_or_else(|| panic!("{source_id} is in the restored manifest"))
+                .project
+                .clone()
+        };
+        assert_eq!(
+            project_of("s1"),
+            "Before",
+            "the abandoned filing was undone"
+        );
+        assert_eq!(
+            project_of("s2"),
+            "Unsorted",
+            "the second filing never landed"
+        );
+    }
+
     /// Filing a document INTO a real project appends one `kind='ingest'` activity observation keyed
     /// to that project (source_ref = the document id); filing into the pre-triage `Unsorted` bucket
     /// appends nothing. `write_document_truth` is the single organize choke-point, so this locks the
@@ -6013,6 +6296,7 @@ mod tests {
                 dir.path(),
                 &cipher,
                 FilingActivity::Record,
+                ManifestWrite::PerDocument,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -6072,6 +6356,7 @@ mod tests {
             dir.path(),
             &cipher,
             FilingActivity::Suppress,
+            ManifestWrite::PerDocument,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -6802,6 +7087,7 @@ mod tests {
                 dir.path(),
                 &manifest,
                 FilingActivity::Record,
+                ManifestWrite::PerDocument,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -6878,6 +7164,7 @@ mod tests {
                 dir.path(),
                 &manifest,
                 FilingActivity::Suppress,
+                ManifestWrite::PerDocument,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -6911,6 +7198,7 @@ mod tests {
                 dir.path(),
                 &manifest,
                 FilingActivity::Suppress,
+                ManifestWrite::PerDocument,
             )
             .unwrap();
             tx.commit().unwrap();

@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.122.2-alpha",
+    date: "2026-08-04",
+    highlights: [
+      "Approving a big pile of documents no longer locks up the app. PM keeps one small index file describing everything it has indexed from a cloud drive, and it was rewriting that entire file — encrypting it from scratch — once for every single document you approved. Two hundred approvals meant two hundred full rewrites, all while holding the door to your library shut, which is why Windows started asking whether you wanted to close the program. It now writes that file once at the end, which is what it always meant. The same change speeds up deleting a label everywhere and renaming or merging a project, which were rewriting it per document too.",
+    ],
+  },
+  {
     version: "3.122.1-alpha",
     date: "2026-08-04",
     highlights: [
