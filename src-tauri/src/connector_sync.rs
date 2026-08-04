@@ -95,6 +95,27 @@ impl SyncQueue {
         self.targets.clear();
         self.all = false;
     }
+
+    /// Project what this run still owes onto the pair the UI reads: `(specific targets, all-targets
+    /// owed)`. The snapshot side of [`push`](Self::push) — a row that shows "Queued" has to survive
+    /// the view unmounting, and local React state cannot do that (#725).
+    ///
+    /// **Both halves are needed.** `all` is not derivable from the list: `push(None)` CLEARS the
+    /// specific targets, because one sweep over everything already covers them. So a user's named
+    /// request folded into a background poll leaves NOTHING in `targets` while still being owed, and
+    /// a snapshot mirroring only the list would put that row back to "Sync now".
+    ///
+    /// **Gated on `running`**, for the same reason `stop_requested` is, and it is not a formality:
+    /// [`SyncRunGuard::drop`] clears only `running`, and the queue is wiped by the NEXT `begin_pass`.
+    /// A pass that panicked or returned early therefore leaves `running = false` beside a non-empty
+    /// queue — and an ungated projection would advertise sweeps that will never happen, with no
+    /// terminal event coming to clear them.
+    pub fn owed(&self, running: bool) -> (Vec<String>, bool) {
+        if !running {
+            return (Vec::new(), false);
+        }
+        (self.targets.clone(), self.all)
+    }
 }
 
 /// What one pass of a run is being asked to do.
@@ -715,6 +736,37 @@ mod tests {
         assert_eq!(q.take_next(), Some(Some("b".into())));
         assert_eq!(q.take_next(), None, "drained");
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn owed_reports_the_waiting_targets_while_the_run_is_live() {
+        let mut q = SyncQueue::default();
+        q.push(Some("a".into()));
+        q.push(Some("b".into()));
+        assert_eq!(q.owed(true), (vec!["a".into(), "b".into()], false));
+    }
+
+    #[test]
+    fn owed_reports_an_all_sweep_that_names_nothing() {
+        // THE case a targets-only projection would miss, and the reason `owed` returns a pair. An
+        // all-request clears the specific targets, so after the 15-minute poller folds a user's named
+        // account into one, `targets` is EMPTY while a sweep is very much still owed. Mirroring only
+        // the list would put that row back to "Sync now" — the bug #725 is about.
+        let mut q = SyncQueue::default();
+        q.push(Some("a".into()));
+        q.push(None);
+        assert_eq!(q.owed(true), (Vec::new(), true));
+    }
+
+    #[test]
+    fn owed_reports_nothing_once_the_run_is_over() {
+        // The orphan guard. `SyncRunGuard::drop` clears `running` and never the queue, and only the
+        // next `begin_pass` wipes it — so a panicked pass leaves a populated queue with no run behind
+        // it and no terminal event coming. Ungated, the UI would show sweeps that never happen.
+        let mut q = SyncQueue::default();
+        q.push(Some("a".into()));
+        q.push(None);
+        assert_eq!(q.owed(false), (Vec::new(), false));
     }
 
     #[test]

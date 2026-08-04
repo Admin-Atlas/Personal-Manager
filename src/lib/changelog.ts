@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.122.3-alpha",
+    date: "2026-08-04",
+    highlights: [
+      "Press Sync now on a second account while the first is still indexing and the “Queued” label now stays put when you switch tabs or close Settings. The sync itself was always safe — PM had noted it down and did run it — but the label was remembered only by the screen you were looking at, so leaving and coming back showed “Sync now” again, as though your request had been dropped. It is now read back from the sync itself, so both agree.",
+      "It also says so when a background refresh has folded your request into a sweep of every account, which is what happens if the quarter-hourly check comes round mid-index. That used to leave nothing on screen at all, because the account you named was no longer what was waiting — a whole pass over everything was.",
+    ],
+  },
+  {
     version: "3.122.2-alpha",
     date: "2026-08-04",
     highlights: [

@@ -203,6 +203,18 @@ fn stop_requested(running: bool, cancel: &AtomicBool) -> bool {
     running && cancel.load(Ordering::SeqCst)
 }
 
+/// Project a run's owed sweeps onto the wire pair the UI reads (`queued`, `queued_all`).
+///
+/// The rules — including the `running` gate — live on [`crate::connector_sync::SyncQueue::owed`], so
+/// they stay beside the merge rules they belong to and are tested there. What this seam adds is the
+/// one thing a caller can still get wrong: the projection is taken from the clone [`sync_snapshot`]
+/// already holds, **never by re-locking the slot**. A second acquisition straddles
+/// `pass_complete`'s atomic take-and-retarget, so it can return the old account beside an
+/// already-drained queue — the row goes blank in exactly the window this exists to cover.
+fn queued_sweeps(running: bool, queue: &crate::connector_sync::SyncQueue) -> (Vec<String>, bool) {
+    queue.owed(running)
+}
+
 /// Shared engine behind the three `resume_*_sync` commands: read the connector's pending-sync
 /// marker, bail when there's nothing to resume or a sync is already running this session (don't
 /// stack), then hand the marker's parsed target (account/folder; `None` = all) to `spawn`.
@@ -235,6 +247,7 @@ fn resume_pending_sync(
 pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
     let mut snap = sync_snapshot(&state.drive_sync, "drive")?;
     snap.stopping = stop_requested(snap.running, &state.drive_sync_cancel);
+    (snap.queued, snap.queued_all) = queued_sweeps(snap.running, &snap.queue);
     Ok(snap)
 }
 
@@ -348,6 +361,7 @@ pub fn set_local_excludes(
 pub fn local_folder_sync_status(state: State<'_, AppState>) -> Result<crate::LocalFolderSyncState> {
     let mut snap = sync_snapshot(&state.local_sync, "local")?;
     snap.stopping = stop_requested(snap.running, &state.local_sync_cancel);
+    (snap.queued, snap.queued_all) = queued_sweeps(snap.running, &snap.queue);
     Ok(snap)
 }
 
@@ -832,6 +846,7 @@ pub fn set_onedrive_scope(
 pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
     let mut snap = sync_snapshot(&state.onedrive_sync, "onedrive")?;
     snap.stopping = stop_requested(snap.running, &state.onedrive_sync_cancel);
+    (snap.queued, snap.queued_all) = queued_sweeps(snap.running, &snap.queue);
     Ok(snap)
 }
 

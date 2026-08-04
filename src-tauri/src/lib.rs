@@ -219,9 +219,23 @@ pub struct CloudSyncState {
     /// pass was running (the user pressed "Sync now" for another account mid-index, or connected
     /// one). Each queued account gets its own follow-up pass, so `account` above moves to it in turn
     /// and its row reads "Queued" and then "Syncing…"; a request that named no account collapses them
-    /// into one all-accounts sweep. Not exposed to the UI.
+    /// into one all-accounts sweep. Projected onto `queued` / `queued_all` below at snapshot time;
+    /// never serialized raw, so the merge rules stay this type's business and not a wire contract.
     #[serde(skip)]
     pub queue: connector_sync::SyncQueue,
+    /// The accounts still awaiting a sweep, and whether an all-accounts sweep is owed. **Derived at
+    /// snapshot time from `queue`, never stored here** — same rule as `stopping` below.
+    ///
+    /// They exist for the same reason `stopping` does. "Queued" was local React state, and the
+    /// Connectors tab unmounts on a tab switch, so queueing a second account and stepping away came
+    /// back to a row reading "Sync now" beside a sync that was still genuinely owed one (#725).
+    ///
+    /// **Both halves are load-bearing.** `SyncQueue::push(None)` clears the specific targets, and the
+    /// app-scope poller fires an all-accounts sync every 15 minutes — so a named request made during
+    /// a long first sync is folded into an unnamed sweep well before it runs. Mirroring only
+    /// `queued` would leave that row blank and reproduce the very bug this fixes.
+    pub queued: Vec<String>,
+    pub queued_all: bool,
     /// The most recent finished sync's report (counts + the not-indexed list), so a user returning to
     /// Settings after a sync has completed still sees the result. Cleared when a new sync starts.
     pub last_report: Option<cloud_sync::CloudSyncReport>,
@@ -249,9 +263,19 @@ pub struct LocalFolderSyncState {
     /// The folder key being synced, or `None` for an all-folders pass.
     pub folder: Option<String>,
     /// Internal single-flight queue (the sweeps still owed to requests that arrived while a pass was
-    /// running) — see [`CloudSyncState::queue`]. Not exposed to the UI.
+    /// running) — see [`CloudSyncState::queue`]. Projected onto `queued` / `queued_all` at snapshot
+    /// time, never serialized raw.
     #[serde(skip)]
     pub queue: connector_sync::SyncQueue,
+    /// The folders still awaiting a sweep, and whether an all-folders sweep is owed — derived at
+    /// snapshot time. See [`CloudSyncState::queued`].
+    ///
+    /// Note for this connector specifically: the watcher enqueues sweeps the user never asked for
+    /// (`localfolder::` on a debounced on-disk change), so these can be non-empty with no click
+    /// behind them. That is why the UI renders the all-case as one connector-level line rather than
+    /// badging every row — a per-row "Queued" would narrate machine-initiated work as the user's.
+    pub queued: Vec<String>,
+    pub queued_all: bool,
     /// The most recent finished sync's report, so a user returning after a sync still sees the result.
     pub last_report: Option<localfolder::LocalSyncReport>,
     /// Whether a Stop has been requested for the running pass — derived at snapshot time from

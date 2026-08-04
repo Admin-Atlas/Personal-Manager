@@ -992,6 +992,16 @@ export interface DriveSyncState {
   /** The account (email) being synced, or null for an all-accounts pass. */
   account: string | null;
   last_report: SyncReport | null;
+  /** The targets still awaiting a sweep, and whether an all-targets sweep is owed. Both derived by
+   *  the backend from its own queue, so a row that reads "Queued" survives this view unmounting —
+   *  the same one-owner rule as `stopping` (#725).
+   *
+   *  `queued_all` is not redundant: queueing an all-targets sync CLEARS the specific ones (one sweep
+   *  covers them), and the app-scope poller fires exactly that every 15 minutes. So a named request
+   *  made during a long sync is folded into an unnamed sweep, and reading `queued` alone would show
+   *  nothing owed at all. */
+  queued: string[];
+  queued_all: boolean;
   /** True when a Stop has already been requested for the running pass. Derived by the backend from
    *  the connector's cancel flag, so the run's stop state has exactly ONE owner and a view mounting
    *  mid-stop reflects it rather than starting again from "not stopping" (#699). */
@@ -1213,6 +1223,16 @@ export interface OneDriveSyncState {
   started_at_ms: number | null;
   account: string | null;
   last_report: SyncReport | null;
+  /** The targets still awaiting a sweep, and whether an all-targets sweep is owed. Both derived by
+   *  the backend from its own queue, so a row that reads "Queued" survives this view unmounting —
+   *  the same one-owner rule as `stopping` (#725).
+   *
+   *  `queued_all` is not redundant: queueing an all-targets sync CLEARS the specific ones (one sweep
+   *  covers them), and the app-scope poller fires exactly that every 15 minutes. So a named request
+   *  made during a long sync is folded into an unnamed sweep, and reading `queued` alone would show
+   *  nothing owed at all. */
+  queued: string[];
+  queued_all: boolean;
   /** True when a Stop has already been requested for the running pass. Derived by the backend from
    *  the connector's cancel flag, so the run's stop state has exactly ONE owner and a view mounting
    *  mid-stop reflects it rather than starting again from "not stopping" (#699). */
@@ -1261,6 +1281,16 @@ export interface LocalFolderSyncState {
   /** The folder key being synced, or null for an all-folders pass. */
   folder: string | null;
   last_report: SyncReport | null;
+  /** The targets still awaiting a sweep, and whether an all-targets sweep is owed. Both derived by
+   *  the backend from its own queue, so a row that reads "Queued" survives this view unmounting —
+   *  the same one-owner rule as `stopping` (#725).
+   *
+   *  `queued_all` is not redundant: queueing an all-targets sync CLEARS the specific ones (one sweep
+   *  covers them), and the app-scope poller fires exactly that every 15 minutes. So a named request
+   *  made during a long sync is folded into an unnamed sweep, and reading `queued` alone would show
+   *  nothing owed at all. */
+  queued: string[];
+  queued_all: boolean;
   /** True when a Stop has already been requested for the running pass. Derived by the backend from
    *  the connector's cancel flag, so the run's stop state has exactly ONE owner and a view mounting
    *  mid-stop reflects it rather than starting again from "not stopping" (#699). */

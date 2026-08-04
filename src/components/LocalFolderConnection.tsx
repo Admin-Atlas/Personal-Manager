@@ -162,6 +162,16 @@ export function LocalFolderConnection() {
         </p>
       )}
 
+      {/* An all-folders sweep is owed after this pass — one line, not a badge per row. Here the
+          distinction matters more than it does for the cloud connectors: the watcher enqueues
+          all-sweeps on its own when files change on disk, so badging each row would report work the
+          user never asked for as though they had. */}
+      {syncing && ds.queuedAll && (
+        <p className="mt-3 text-xs text-ink4">
+          Every folder is queued for another pass once this one finishes.
+        </p>
+      )}
+
       {syncing && progress && (
         <SyncProgress
           startedAt={ds.startedAt}

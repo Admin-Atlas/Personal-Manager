@@ -26,6 +26,10 @@ export interface DetachedSyncSnapshot {
   /** Whether a Stop has already been requested for the running pass. The backend derives it from the
    *  cancel flag, so it is the one owner of that fact — this view only reflects it. */
   stopping: boolean;
+  /** The targets still awaiting a sweep, and whether an all-targets sweep is owed — the run's queue,
+   *  read back from its one owner so "Queued" survives this view unmounting (#725). */
+  queued: string[];
+  queued_all: boolean;
 }
 
 export interface DetachedSyncOptions<S extends DetachedSyncSnapshot> {
@@ -64,6 +68,12 @@ export interface DetachedSync {
   target: string | null;
   /** Targets queued mid-run (folded into the backend's follow-up pass) — their row shows "Queued". */
   queued: Set<string>;
+  /** An all-targets sweep is owed. Deliberately NOT folded into {@link queued}: the backend clears
+   *  the specific targets when an all-request subsumes them, so this is the only thing left saying
+   *  work is owed — and it belongs to no single row, so connectors render it as one line above the
+   *  list rather than badging every row. (The local-folder watcher enqueues all-sweeps nobody asked
+   *  for, so per-row badges would narrate machine-initiated work as the user's.) */
+  queuedAll: boolean;
   /** The most recent finished sync's report, or null. */
   report: SyncReport | null;
   dismissReport: () => void;
@@ -88,6 +98,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [target, setTarget] = useState<string | null>(null);
   const [queued, setQueued] = useState<Set<string>>(new Set());
+  const [queuedAll, setQueuedAll] = useState(false);
   const [report, setReport] = useState<SyncReport | null>(null);
   const [stopping, setStopping] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
@@ -95,6 +106,14 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
   // connect tail, which may fire mid-sync) can tell whether it owns the visible bar without hijacking
   // a running sync's progress.
   const syncingRef = useRef(false);
+  // Whether a live progress event has already told us about THIS pass. The mount effect starts
+  // `subscribe()` and `fetchStatus()` concurrently, and the snapshot is a read taken at some earlier
+  // instant — so a `counted` for the next target can land while that promise is still in flight. The
+  // snapshot would then overwrite it with the pass that has just finished. That already mis-set
+  // `target` today; once `queued` is restored from the same read it becomes a positively false
+  // "Queued" on the account that is actually syncing, which nothing clears until the run ends. So the
+  // live stream wins: it is strictly newer than any snapshot that has not resolved yet.
+  const sawEventRef = useRef(false);
   // Latest options in a ref, so the mount-once subscription always calls the current closures (the
   // caller passes fresh inline functions each render) without re-subscribing every render.
   const optsRef = useRef(opts);
@@ -114,6 +133,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
     let mounted = true;
     const unlistenP = optsRef.current.subscribe((ev) => {
       if (!mounted) return;
+      sawEventRef.current = true;
       if (ev.type === "counted") {
         setProgress({ processed: 0, total: ev.total });
         // Each PASS announces its own target, and a run sweeps the targets queued mid-run one at a
@@ -136,6 +156,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
         setStartedAt(null);
         setTarget(null);
         setQueued(new Set());
+        setQueuedAll(false);
         setStopping(false);
         // Clear any unconfirmed Stop prompt: the sync is over, so "Stop indexing?" is moot. Without
         // this it would stay latent (the dialog now lives in SyncProgress, which unmounts on finish)
@@ -154,6 +175,9 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
       .fetchStatus()
       .then((s) => {
         if (!mounted) return;
+        // A live event beat this read — it describes a later moment of the same run, so applying the
+        // snapshot now would rewind the pass indicator (and the queue) to a pass already over.
+        if (sawEventRef.current) return;
         if (s.running) {
           setProgress({ processed: s.processed, total: s.total });
           // The whole point: a bar restored on remount counts from when the BACKEND started, so
@@ -165,6 +189,11 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
           // beside a button that read "Stop indexing" again — the bar restored from the backend, the
           // button from local state that had just been thrown away.
           setStopping(s.stopping);
+          // …and the same for what the run still OWES. This was the last piece of run state the
+          // remount threw away: queueing a second account and switching tabs came back to a row
+          // reading "Sync now" beside a sweep the backend was still going to run (#725).
+          setQueued(new Set(s.queued));
+          setQueuedAll(s.queued_all);
         } else if (s.last_report) {
           setReport(s.last_report);
         }
@@ -206,14 +235,45 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
     } else if (tgt != null) {
       setQueued((q) => new Set(q).add(tgt));
     }
-    void optsRef.current.start(tgt).catch((e) => {
-      if (startsIt) {
+    void optsRef.current
+      .start(tgt)
+      .then(() => {
+        // Re-read what the run actually owes now the request has been recorded. The optimistic add
+        // above is a guess about a fact the BACKEND owns, and it can be wrong in both directions: an
+        // all-targets request (the 15-minute poller, or a connect) subsumes the specific ones and
+        // clears them, and this view has no way to know that happened. Reconciling here is also what
+        // covers the no-unmount case — a run started elsewhere emits `counted` only after its whole
+        // gather, so until then `syncing` is false and a click takes the `startsIt` branch above and
+        // paints a row "Syncing…" that the backend has merely queued.
+        void optsRef.current
+          .fetchStatus()
+          .then((s) => {
+            if (!s.running) return;
+            setTarget(optsRef.current.targetOf(s));
+            setProgress((p) => p ?? { processed: s.processed, total: s.total });
+            setStartedAt((a) => a ?? s.started_at_ms);
+            setQueued(new Set(s.queued));
+            setQueuedAll(s.queued_all);
+          })
+          .catch(() => {});
+      })
+      .catch((e) => {
         setError(String(e));
-        setProgress(null);
-        setStartedAt(null);
-        setTarget(null);
-      }
-    });
+        if (startsIt) {
+          setProgress(null);
+          setStartedAt(null);
+          setTarget(null);
+        } else if (tgt != null) {
+          // A refused request (a Rebuild is running, say) never reached the queue, so the optimistic
+          // badge would otherwise sit there for the rest of the run claiming a sweep nobody owes.
+          setQueued((q) => {
+            if (!q.has(tgt)) return q;
+            const next = new Set(q);
+            next.delete(tgt);
+            return next;
+          });
+        }
+      });
   }, []);
 
   // Stop the running sync (the caller gates this behind a confirm). The backend halts after the current
@@ -235,6 +295,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
     syncing: progress != null,
     target,
     queued,
+    queuedAll,
     report,
     dismissReport,
     stopping,
