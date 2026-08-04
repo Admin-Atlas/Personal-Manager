@@ -374,6 +374,17 @@ export function CloudDriveConnection({
             </div>
           )}
 
+          {/* An all-accounts sweep is owed after this pass. It belongs to no single row — and the
+              backend CLEARS the specific accounts when an all-request subsumes them, which the
+              15-minute poller does routinely — so it reads as one line rather than a badge on every
+              row. Without it, a user who queued one account mid-sync and came back would see nothing
+              at all, since the account they named is no longer what the queue holds. */}
+          {syncing && ds.queuedAll && (
+            <p className="mt-3 text-xs text-ink4">
+              Every account is queued for another pass once this one finishes.
+            </p>
+          )}
+
           {syncing && progress && (
             <SyncProgress
               startedAt={ds.startedAt}

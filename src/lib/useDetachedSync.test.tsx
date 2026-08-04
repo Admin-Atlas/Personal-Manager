@@ -31,6 +31,8 @@ const idle = (over: Partial<DriveSyncState> = {}): DriveSyncState => ({
   account: null,
   last_report: null,
   stopping: false,
+  queued: [],
+  queued_all: false,
   ...over,
 });
 
@@ -264,6 +266,121 @@ describe("useDetachedSync", () => {
     const { result } = renderHook(() => useDetachedSync(opts));
     await waitFor(() => expect(result.current.syncing).toBe(true));
     expect(result.current.stopping).toBe(false);
+  });
+
+  // --- the queue survives a remount (#725) ------------------------------------------------------
+  //
+  // "Queued" was local state, so switching tabs (which unmounts the Connectors subtree) or closing
+  // Settings threw it away while the backend went on owing the sweep. The row then read "Sync now"
+  // for a sync that was still coming.
+
+  it("restores queued targets when the view remounts mid-run", async () => {
+    const { opts } = makeOpts({
+      fetchStatus: vi.fn(async () =>
+        idle({ running: true, processed: 2, total: 9, account: "a@b.com", queued: ["c@d.com"] }),
+      ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.syncing).toBe(true));
+    expect(result.current.target).toBe("a@b.com");
+    expect([...result.current.queued]).toEqual(["c@d.com"]);
+  });
+
+  it("does not invent a queue the backend does not have", async () => {
+    // The false-positive guard, matching the `stopping` pair: an empty queue must read as empty, or
+    // every row would offer to cancel work nobody owes.
+    const { opts } = makeOpts({
+      fetchStatus: vi.fn(async () => idle({ running: true, processed: 2, total: 9 })),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.syncing).toBe(true));
+    expect(result.current.queued.size).toBe(0);
+    expect(result.current.queuedAll).toBe(false);
+  });
+
+  it("restores an all-targets sweep, which names no target at all", async () => {
+    // THE case a targets-only mirror would miss. `SyncQueue::push(None)` clears the specific targets,
+    // and the app-scope poller fires an all-targets sync every 15 minutes — so a user's named request
+    // made during a long first sync is folded into an unnamed sweep well before it runs. Reading the
+    // list alone would show nothing owed and put the row back to "Sync now": the original bug.
+    const { opts } = makeOpts({
+      fetchStatus: vi.fn(async () =>
+        idle({ running: true, processed: 2, total: 9, account: "a@b.com", queued_all: true }),
+      ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.syncing).toBe(true));
+    expect(result.current.queued.size).toBe(0);
+    expect(result.current.queuedAll).toBe(true);
+  });
+
+  it("lets a live event win over a snapshot that resolves after it", async () => {
+    // The mount effect races subscribe() against fetchStatus(). The snapshot is a read of an EARLIER
+    // instant, so a `counted` for the next target can land first — and applying the snapshot then
+    // would rewind the indicator to the pass that just ended, re-queueing the account now syncing.
+    let resolveStatus: (s: DriveSyncState) => void = () => {};
+    const { opts, emit } = makeOpts({
+      fetchStatus: vi.fn(
+        () =>
+          new Promise<DriveSyncState>((res) => {
+            resolveStatus = res;
+          }),
+      ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(opts.subscribe).toHaveBeenCalled());
+
+    // The run moves on to the queued account while the snapshot is still in flight.
+    emit({ type: "counted", total: 4, target: "c@d.com" });
+    expect(result.current.target).toBe("c@d.com");
+
+    // …and only now does the stale read land, still describing the previous pass.
+    await act(async () => {
+      resolveStatus(
+        idle({ running: true, processed: 9, total: 9, account: "a@b.com", queued: ["c@d.com"] }),
+      );
+    });
+    expect(result.current.target).toBe("c@d.com");
+    expect(result.current.queued.size).toBe(0);
+  });
+
+  it("drops the optimistic Queued badge when the request is refused", async () => {
+    // A sync refused before it reaches the queue (a Rebuild is running) used to leave the badge
+    // sitting there for the rest of the run, claiming a sweep nobody owed.
+    const { opts, emit } = makeOpts({
+      start: vi.fn(async () => {
+        throw new Error("a rebuild is running");
+      }),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(opts.fetchStatus).toHaveBeenCalled());
+    emit({ type: "counted", total: 10, target: "a@b.com" });
+
+    act(() => result.current.sync("c@d.com"));
+    await waitFor(() => expect(result.current.error).toContain("a rebuild is running"));
+    expect(result.current.queued.size).toBe(0);
+    // The running pass is untouched — only the refused request went away.
+    expect(result.current.target).toBe("a@b.com");
+  });
+
+  it("reconciles against the backend after a queued request is accepted", async () => {
+    // The no-unmount case. A run started by the poller emits `counted` only after its whole gather,
+    // so a mounted view can sit with progress==null for minutes; a click then looks like it STARTS a
+    // sync while the backend merely queues it. Re-reading after start() is what corrects that.
+    const { opts } = makeOpts({
+      fetchStatus: vi
+        .fn()
+        .mockResolvedValueOnce(idle())
+        .mockResolvedValue(
+          idle({ running: true, processed: 3, total: 12, account: "a@b.com", queued: ["c@d.com"] }),
+        ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(opts.fetchStatus).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.sync("c@d.com"));
+    await waitFor(() => expect(result.current.target).toBe("a@b.com"));
+    expect([...result.current.queued]).toEqual(["c@d.com"]);
   });
 
   it("unsubscribes on unmount", async () => {
