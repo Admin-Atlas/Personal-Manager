@@ -441,6 +441,29 @@ pub fn get_shared_cursor(conn: &Connection, email: &str, drive_id: &str) -> Resu
     Ok(read_cursors(conn, email)?.remove(drive_id))
 }
 
+/// Forget every delta cursor for an account, so the next pass re-enumerates the whole drive instead
+/// of asking the changes feed what moved. The "Re-index everything" control (#727).
+///
+/// This does not reach for a new code path: a pass that finds no cursor already takes the full
+/// enumerate-and-reconcile branch, which is the same one Google's own 410 cursor-expiry drives. So
+/// the walk this schedules is the best-tested one the connector has.
+///
+/// Nothing is deleted and nothing is re-downloaded needlessly — the reducer no-ops an item whose
+/// content hash still matches ([`crate::index_only::react`]), so a re-enumeration costs listing
+/// requests plus the metadata refresh, not a re-ingest. Deletions inferred from absence stay behind
+/// the F-30 truncation guard, so a listing cut short withholds them rather than reaping live files.
+///
+/// Whole-map, not just My Drive: every whole-drive shared selection keys its own cursor here, and
+/// leaving those would re-index the personal drive while the shared ones kept riding a delta feed
+/// the user has just asked PM to distrust.
+pub fn clear_cursors(conn: &Connection, email: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE connector_sources SET cursor = NULL WHERE id = ?1",
+        params![account_id(email)],
+    )?;
+    Ok(())
+}
+
 /// Record a clean sync: advance the My-Drive cursor (when My Drive synced this pass) and any
 /// whole-drive shared cursors that advanced, stamp the time, and clear any failure state. Cursors for
 /// corpora not touched this pass are left as-is, so a drive that errored mid-pass retries from its

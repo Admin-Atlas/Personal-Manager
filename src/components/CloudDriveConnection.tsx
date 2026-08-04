@@ -15,6 +15,8 @@ import {
   oneDriveSyncStatus,
   onDriveSync,
   onOneDriveSync,
+  reindexDrive,
+  reindexOneDrive,
   stopDriveSync,
   stopOneDriveSync,
   syncDrive,
@@ -75,6 +77,8 @@ interface CloudDriveMeta {
   connect: () => Promise<unknown>;
   disconnect: (email: string) => Promise<void>;
   sync: (target: string | null) => Promise<unknown>;
+  /** Re-index ONE account from scratch — forget its delta cursor, then sync. */
+  reindex: (email: string) => Promise<unknown>;
   stop: () => Promise<unknown>;
   subscribe: (cb: (ev: SyncEvent) => void) => Promise<UnlistenFn>;
   syncStatus: () => Promise<DriveSyncState | OneDriveSyncState>;
@@ -125,6 +129,7 @@ const CLOUD_DRIVE_META: Record<CloudProvider, CloudDriveMeta> = {
     connect: connectDrive,
     disconnect: disconnectDrive,
     sync: syncDrive,
+    reindex: reindexDrive,
     stop: stopDriveSync,
     subscribe: onDriveSync,
     syncStatus: driveSyncStatus,
@@ -171,6 +176,7 @@ const CLOUD_DRIVE_META: Record<CloudProvider, CloudDriveMeta> = {
     connect: connectOneDrive,
     disconnect: disconnectOneDrive,
     sync: syncOneDrive,
+    reindex: reindexOneDrive,
     stop: stopOneDriveSync,
     subscribe: onOneDriveSync,
     syncStatus: oneDriveSyncStatus,
@@ -204,6 +210,10 @@ export function CloudDriveConnection({
   const meta = CLOUD_DRIVE_META[provider];
   const [status, setStatus] = useState<DriveStatus | OneDriveStatus | null>(null);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
+  // The account awaiting a "re-index everything?" confirmation. Its own state, not folded into
+  // `confirmEmail`: the two dialogs say opposite things (one forgets an account, the other re-reads
+  // it) and sharing one slot is how a confirm ends up firing the wrong action.
+  const [confirmReindex, setConfirmReindex] = useState<string | null>(null);
 
   // The list refetch is called from the sync hook's "finished" event; a ref breaks the definition
   // cycle (the hook needs onSettled, `refresh` needs the hook's setError).
@@ -247,6 +257,16 @@ export function CloudDriveConnection({
       await meta.disconnect(email);
       await refresh();
     });
+
+  // Re-index one account from scratch. Fire-and-forget like `ds.sync`: the backend forgets the
+  // account's delta cursor and then runs an ordinary pass, so progress arrives on the same global
+  // event stream and the bar behaves exactly as it does for Sync now. Not routed through `ds.run` —
+  // that sets `busy`, which disables the whole connector, and this starts a detached sync rather
+  // than a short blocking action.
+  const reindex = (email: string) => {
+    setError(null);
+    void meta.reindex(email).catch((e) => setError(String(e)));
+  };
 
   const configured = status?.oauth_client_configured ?? false;
   const accounts: (DriveAccount | OneDriveAccount)[] = status?.accounts ?? [];
@@ -307,6 +327,16 @@ export function CloudDriveConnection({
                     // mid-index; only the syncing row and in-flight connect/disconnect block it.
                     syncDisabled={syncTarget === a.email || busy != null}
                     onSync={() => ds.sync(a.email)}
+                    onReindex={() => setConfirmReindex(a.email)}
+                    // Any sync in flight, not just this row's: the backend refuses a re-index while
+                    // one is running, because that pass ends by writing a fresh cursor and would
+                    // undo the clear. The control must say the same thing the command would.
+                    reindexDisabled={syncing || busy != null}
+                    reindexBlockedReason={
+                      syncing
+                        ? "Available once the current sync finishes."
+                        : "Available once the current action finishes."
+                    }
                     actionLabel="Disconnect"
                     actionDisabled={anyBusy}
                     onAction={() => setConfirmEmail(a.email)}
@@ -456,6 +486,35 @@ export function CloudDriveConnection({
       <SectionInfo title={`How ${meta.title} works`}>
         <p>{meta.blurb}</p>
       </SectionInfo>
+
+      <ConfirmDialog
+        open={confirmReindex != null}
+        title={`Re-index this ${meta.accountNoun} account?`}
+        confirmLabel="Re-index everything"
+        onConfirm={() => {
+          const email = confirmReindex;
+          setConfirmReindex(null);
+          if (email) reindex(email);
+        }}
+        onClose={() => setConfirmReindex(null)}
+      >
+        <p>
+          PM will read every file in this account&rsquo;s scope again, instead of asking{" "}
+          {meta.signInName} what has changed since last time. On a large account that takes a while
+          and uses bandwidth.
+        </p>
+        {/* What it does NOT do matters as much as what it does — "re-index" reads like "start over",
+            and someone with a filed library needs to know their work is safe before pressing it. */}
+        <p className="mt-2">
+          Nothing is deleted and nothing you have filed is lost. Files PM already has are recognised
+          and left alone, so this is mostly listing requests rather than re-downloading your
+          documents.
+        </p>
+        <p className="mt-2">
+          Worth doing when a file&rsquo;s details look out of date, or you suspect the account and
+          PM have drifted apart &mdash; a change feed only reports what it noticed at the time.
+        </p>
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={confirmEmail != null}

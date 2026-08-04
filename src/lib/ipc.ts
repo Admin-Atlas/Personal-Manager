@@ -1047,6 +1047,15 @@ export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive
 export const syncDrive = (email: string | null, includeSharedWithMe?: boolean) =>
   invoke<number>("sync_drive", { account: email, includeSharedWithMe });
 
+/** Re-index ONE Drive account from scratch: forget its delta cursor, then sync — so the pass
+ *  re-enumerates everything in scope instead of asking the provider what changed.
+ *
+ *  The everyday "Sync now" rides a delta cursor and costs one request that usually returns an empty
+ *  page. This costs a full listing, so it is a deliberate action behind a confirm, and the backend
+ *  REFUSES it while a sync is running: that pass would end by writing a fresh cursor and quietly undo
+ *  the clear. Nothing is deleted and unchanged files are not re-downloaded. */
+export const reindexDrive = (email: string) => invoke<number>("reindex_drive", { account: email });
+
 /** The current background-sync snapshot — used to restore the progress UI on returning to Settings,
  *  and to show the last finished sync's report. */
 export const driveSyncStatus = () => invoke<DriveSyncState>("drive_sync_status");
@@ -1163,6 +1172,16 @@ export const disconnectOneDrive = (email: string) => invoke<void>("disconnect_on
  *  arrives via the global `onedrive://sync` event (subscribe with {@link onOneDriveSync}). */
 export const syncOneDrive = (email: string | null) =>
   invoke<number>("sync_onedrive", { account: email });
+
+/** Re-index ONE OneDrive account from scratch: forget its delta cursor, then sync — so the pass
+ *  re-enumerates everything in scope instead of asking the provider what changed.
+ *
+ *  The everyday "Sync now" rides a delta cursor and costs one request that usually returns an empty
+ *  page. This costs a full listing, so it is a deliberate action behind a confirm, and the backend
+ *  REFUSES it while a sync is running: that pass would end by writing a fresh cursor and quietly undo
+ *  the clear. Nothing is deleted and unchanged files are not re-downloaded. */
+export const reindexOneDrive = (email: string) =>
+  invoke<number>("reindex_onedrive", { account: email });
 
 /** The current background-sync snapshot — used to restore the progress UI on returning to Settings. */
 export const oneDriveSyncStatus = () => invoke<OneDriveSyncState>("onedrive_sync_status");
