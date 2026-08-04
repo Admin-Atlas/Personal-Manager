@@ -70,9 +70,9 @@
       }
     },
     "cffi": {
-      "versions": ["2.1.0"],
+      "versions": ["2.1.1"],
       "licence": "MIT-0",
-      "stamp": "9350b7a14468b58a58a3fab753978749",
+      "stamp": "5dbd1b13c6116040446b19fa9961d834",
       "evidence": {
         "expression": "MIT-0",
         "license": null,
@@ -142,9 +142,9 @@
       }
     },
     "cryptography": {
-      "versions": ["49.0.0"],
+      "versions": ["50.0.0"],
       "licence": "Apache-2.0 OR BSD-3-Clause",
-      "stamp": "3673d905cd3c3b5ae972fff22768b62f",
+      "stamp": "164779bb87236a843951926a1800186d",
       "evidence": {
         "expression": "Apache-2.0 OR BSD-3-Clause",
         "license": null,
@@ -257,9 +257,9 @@
       }
     },
     "hf-xet": {
-      "versions": ["1.5.2"],
+      "versions": ["1.6.0"],
       "licence": "Apache-2.0",
-      "stamp": "7351c0b2de6e5dcc23d97b636656233b",
+      "stamp": "c4ec81b24b8c09b2bb6e122d85d4263b",
       "evidence": {
         "expression": "Apache-2.0",
         "license": null,
