@@ -1729,6 +1729,7 @@ async fn build_local_pointer(
         body: markdown,
         source_parent_folder_id: facts.parent_folder_id,
         source_parent_folder_name: facts.parent_folder_name,
+        source_folder_path: facts.folder_path,
         source_author: facts.author,
         source_last_modified_by: facts.last_modified_by,
         source_created_at: facts.created_at,
@@ -1759,7 +1760,30 @@ fn local_source_facts(file: &LocalFile, modified_at: Option<String>) -> index_on
         parent_folder_name: parent
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string()),
+        folder_path: Some(folder_trail(&file.rel_path)),
     }
+}
+
+/// The folders between the tracked folder's root and a file, root-most first (#736).
+///
+/// Free, unlike Drive's: `rel_path` is already the path relative to the root the user picked, so the
+/// trail is a split rather than a walk, and it is deliberately relative — the absolute one would open
+/// a breadcrumb with `C:` and the machine's user account, which says nothing about the document and
+/// names the person's own login in a list they might screenshot.
+///
+/// An empty trail is the real answer for a file sitting directly in the tracked folder, and stays
+/// distinct from the `None` that means PM never worked it out. Splits on BOTH separators because a
+/// `rel_path` is built with the host's, and a vault carried from one OS to another must not turn one
+/// folder into one crumb named `a/b/c`.
+fn folder_trail(rel_path: &str) -> Vec<String> {
+    let mut parts: Vec<String> = rel_path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    // The last component is the file itself; a breadcrumb names the folders above it.
+    parts.pop();
+    parts
 }
 
 /// A local file's filesystem facts with whatever the DOCUMENT stated about itself folded on top.
@@ -2352,6 +2376,25 @@ mod tests {
         // The item id is namespaced under its folder's source id, so a SourceFailure fan-out
         // (`source_id LIKE 'local:abc123:%'`) catches it.
         assert!(sid.starts_with(&format!("{}:", folder_source_id("abc123"))));
+    }
+
+    #[test]
+    fn a_local_files_breadcrumb_is_relative_to_the_folder_you_picked() {
+        // Free, unlike Drive's: `rel_path` is already relative to the tracked root, so the trail is
+        // a split rather than a walk — and relative on purpose. The absolute path would open the
+        // breadcrumb with `C:` and the machine's login name, which says nothing about the document
+        // and names the person in a list they might well screenshot.
+        assert_eq!(folder_trail("notes/2026/q3.md"), vec!["notes", "2026"]);
+        // Both separators: a `rel_path` is built with the host's, and a vault carried between two
+        // machines must not turn one folder into one crumb called `notes\\2026`.
+        assert_eq!(folder_trail("notes\\2026\\q3.md"), vec!["notes", "2026"]);
+        // A file directly in the tracked folder has an EMPTY trail, which is a real answer ("it sits
+        // at the top") and stays distinct from the NULL that means PM never worked it out.
+        assert_eq!(folder_trail("q3.md"), Vec::<String>::new());
+        assert_eq!(folder_trail(""), Vec::<String>::new());
+        // The last component is the file; a breadcrumb names the folders above it, never the file
+        // whose title is already on the line above.
+        assert!(!folder_trail("a/b/c.md").contains(&"c.md".to_string()));
     }
 
     #[test]

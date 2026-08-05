@@ -1096,6 +1096,7 @@ mod tests {
                 source_modified_at: None,
                 source_content_hash: None,
                 source_parent_folder_id: None,
+                source_folder_path: None,
                 source_parent_folder_name: None,
                 anchor: true,
             },

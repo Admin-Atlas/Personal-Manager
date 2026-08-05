@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.126.0-alpha",
+    date: "2026-08-05",
+    highlights: [
+      "Every document says which folders it sits in, the way Google Drive does — “My Drive › Projects › PM › documentation”, or “Shared with you › crisis › study guide”. It replaces the web address that used to sit there, which could tell you how to open a file and never where it was, so two files called “Notes” looked identical. The reader shows the trail too, and the address is still one click away: the caret beside “Open source” shows it in full, with a Copy button for when you want to send someone the link.",
+      "A file PM has found in more than one place shows a separate trail for each. That is the difference that matters when you are deciding whether something really is a duplicate — the same Drive file is “My Drive › Projects › Q3” to you and “Shared with you › crisis” to someone it was shared with, and until now those two copies read exactly alike on the one screen that asks you to delete one of them.",
+      "Where PM cannot see the whole trail, it shows what it can rather than guessing. Folders above something shared with you belong to whoever shared it, so the trail starts where your view of it does. Files already in your library fill their folders in as PM next syncs them; OneDrive shows the one folder it reports, and Drive files show the full path.",
+    ],
+  },
+  {
     version: "3.125.0-alpha",
     date: "2026-08-05",
     highlights: [

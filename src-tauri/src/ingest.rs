@@ -125,6 +125,15 @@ pub struct Document {
     /// rest of the folder" action, which groups by (source_type, source_parent_folder_id).
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// The folders ABOVE the item, root-most first — the breadcrumb (#736), and a mirror of the
+    /// anchor location's own trail maintained by `locations::sync_document`, so the Documents list
+    /// reads it without a join.
+    ///
+    /// `None` means PM has not resolved it (or the source has no folders to speak of); an empty
+    /// vector means the item sits at the top of its corpus. The corpus itself — "My Drive", "Shared
+    /// with you", "This device" — is never stored here: it is not something the provider said, and
+    /// the frontend already derives it from `source_id`.
+    pub source_folder_path: Option<Vec<String>>,
     /// What the SOURCE says about the document, as opposed to what PM measured at ingest (#701).
     /// `None` everywhere means the provider did not say — rendered as "Unknown", never blank and
     /// never attributed to the user. Only the two cloud connectors and the local folder can fill any
@@ -1189,7 +1198,8 @@ pub fn promote_spreadsheet(
             "UPDATE documents SET source_type = ?2, source_state = ?3, vault_path = ?4, \
                     content_hash = ?5, ext = ?6, byte_size = ?7, source_path = NULL, \
                     stored_summary = NULL, source_parent_folder_id = NULL, \
-                    source_parent_folder_name = NULL, ingested_at = ?8, last_activity = ?8 \
+                    source_parent_folder_name = NULL, source_folder_path = NULL, \
+                    ingested_at = ?8, last_activity = ?8 \
              WHERE id = ?1",
             params![
                 doc_id,
@@ -1468,7 +1478,8 @@ pub fn ingest_note_document(
                             content_hash = ?5, ext = ?6, title = ?7, byte_size = NULL, \
                             source_path = NULL, stored_summary = NULL, source_modified_at = NULL, \
                             source_content_hash = NULL, source_parent_folder_id = NULL, \
-                            source_parent_folder_name = NULL, ingested_at = ?8, last_activity = ?8 \
+                            source_parent_folder_name = NULL, source_folder_path = NULL, \
+                            ingested_at = ?8, last_activity = ?8 \
                      WHERE id = ?1",
                     params![
                         doc_id,
@@ -2495,8 +2506,9 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
          source_author = COALESCE(?24, source_author), \
          source_last_modified_by = COALESCE(?25, source_last_modified_by), \
          source_created_at = COALESCE(?26, source_created_at), \
-         source_size_bytes = COALESCE(?27, source_size_bytes) \
-         WHERE id = ?28",
+         source_size_bytes = COALESCE(?27, source_size_bytes), \
+         source_folder_path = COALESCE(?28, source_folder_path) \
+         WHERE id = ?29",
         params![
             meta.source_path,
             meta.title,
@@ -2525,6 +2537,12 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
             meta.source.source_last_modified_by,
             meta.source.source_created_at,
             meta.source.source_size_bytes,
+            // COALESCE'd like the four above it: a re-ingest that did not resolve the trail must not
+            // erase the one PM already had.
+            meta.source
+                .source_folder_path
+                .as_deref()
+                .map(crate::locations::encode_folder_path),
             doc_id,
         ],
     )?;
@@ -2564,9 +2582,10 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
           source_type, source_state, source_id, external_ref, source_modified_at, \
           source_content_hash, stored_summary, \
           source_parent_folder_id, source_parent_folder_name, source_account, \
-          source_author, source_last_modified_by, source_created_at, source_size_bytes) \
+          source_author, source_last_modified_by, source_created_at, source_size_bytes, \
+          source_folder_path) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             meta.source_path,
             meta.vault_path,
@@ -2596,6 +2615,10 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
             meta.source.source_last_modified_by,
             meta.source.source_created_at,
             meta.source.source_size_bytes,
+            meta.source
+                .source_folder_path
+                .as_deref()
+                .map(crate::locations::encode_folder_path),
         ],
     )?;
     let doc_id = tx.last_insert_rowid();
@@ -2862,7 +2885,7 @@ const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size
      d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity, \
      d.source_type, d.source_state, d.external_ref, d.source_id, \
      d.source_parent_folder_id, d.source_parent_folder_name,      d.source_author, d.source_last_modified_by, d.source_created_at, d.source_size_bytes, \
-     d.source_modified_at, COALESCE(d.pm_refreshed_at, d.ingested_at)";
+     d.source_modified_at, COALESCE(d.pm_refreshed_at, d.ingested_at), d.source_folder_path";
 
 /// Fill in each document's extra project memberships from the join, in ONE query for the whole
 /// list. A lookup per document would be an N+1 across the entire library — which is exactly the
@@ -2966,6 +2989,9 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         source_size_bytes: row.get(22)?,
         source_modified_at: row.get(23)?,
         pm_refreshed_at: row.get(24)?,
+        // Appended at the END of `DOCUMENT_COLUMNS` on purpose: this reader is POSITIONAL, so a new
+        // column inserted anywhere else silently shifts every field after it onto the wrong value.
+        source_folder_path: crate::locations::decode_folder_path(row.get(25)?),
     })
 }
 
@@ -3949,6 +3975,9 @@ pub(crate) struct SourceMeta {
     /// chunked or embedded. `None` for vault imports and any source without a folder concept.
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// The folders above it, root-most first (#736) — same ride-along, same three-way meaning of
+    /// `None` / `[]` / a trail.
+    pub source_folder_path: Option<Vec<String>>,
     /// What the SOURCE says about the document, as opposed to what PM measured at ingest (#701).
     /// `None` everywhere means the provider did not say — rendered as "Unknown", never blank and
     /// never attributed to the user. Only the two cloud connectors and the local folder can fill any
@@ -3975,6 +4004,7 @@ impl Default for SourceMeta {
             stored_summary: None,
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            source_folder_path: None,
             source_author: None,
             source_last_modified_by: None,
             source_created_at: None,

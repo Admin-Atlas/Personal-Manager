@@ -1031,6 +1031,7 @@ mod tests {
              ALTER TABLE documents DROP COLUMN stored_summary; \
              ALTER TABLE documents DROP COLUMN source_parent_folder_id; \
              ALTER TABLE documents DROP COLUMN source_parent_folder_name; \
+             ALTER TABLE documents DROP COLUMN source_folder_path; \
              ALTER TABLE documents DROP COLUMN source_account; \
              ALTER TABLE documents DROP COLUMN source_author; \
              ALTER TABLE documents DROP COLUMN source_last_modified_by; \
@@ -1217,6 +1218,7 @@ mod tests {
              ALTER TABLE documents DROP COLUMN stored_summary; \
              ALTER TABLE documents DROP COLUMN source_parent_folder_id; \
              ALTER TABLE documents DROP COLUMN source_parent_folder_name; \
+             ALTER TABLE documents DROP COLUMN source_folder_path; \
              ALTER TABLE documents DROP COLUMN source_account; \
              ALTER TABLE documents DROP COLUMN source_author; \
              ALTER TABLE documents DROP COLUMN source_last_modified_by; \

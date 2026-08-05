@@ -96,6 +96,50 @@ export function documentLocation(
 }
 
 /**
+ * Where a document sits, as folders you could point at: `My Drive › Projects › PM › documentation`,
+ * or `Shared with you › crisis › study guide` — the thing Drive itself shows above an open file, and
+ * the thing a URL cannot tell you (#736).
+ *
+ * Empty when PM has no trail to show, which the caller renders as nothing at all rather than as a
+ * placeholder. Three sources of emptiness, all honest: a vault document has no source folders, a
+ * connector item PM has not re-synced since the trail column landed has `null`, and a provider that
+ * only reports one folder contributes just that one.
+ *
+ * **The first crumb is PM's word, not the provider's.** Drive's own root folder answers to a real
+ * name ("My Drive") and arrives in the stored trail naturally, so nothing is prepended there. A
+ * shared-with-me trail has no root — the folders above the share boundary are not yours to see — so
+ * the collection's name is supplied here, from the `source_id` namespace `sourceLabel` already
+ * decodes. That is a fact about how the file reached you, not a guess about where it sits: the one
+ * thing a breadcrumb must never do is invent an ancestor.
+ */
+export function documentBreadcrumb(
+  doc: Pick<Document, "source_id" | "source_folder_path" | "source_parent_folder_name">,
+): string[] {
+  const id = doc.source_id;
+  if (id == null) return [];
+  // Falling back to the ONE folder PM has always known keeps two populations legible rather than
+  // blank: OneDrive, whose API reports no ancestry PM has verified, and every item indexed before
+  // the trail existed, which fills in on its next sync. A one-crumb breadcrumb is not a degraded
+  // trail — it is the whole truth PM holds about that item.
+  const trail =
+    doc.source_folder_path ??
+    (doc.source_parent_folder_name ? [doc.source_parent_folder_name] : []);
+
+  if (id.startsWith("gdrive:")) {
+    const rest = id.slice("gdrive:".length);
+    // Shared-with-me has no root of its own to climb to, so PM names the collection. An account's
+    // own Drive and a shared drive both already start at a real folder Drive named.
+    if (rest.startsWith("swm:")) return ["Shared with you", ...trail];
+    return trail;
+  }
+  // A tracked folder's trail is relative to the root you picked, so it needs saying whose folders
+  // these are — and a file sitting directly in that root still deserves the one crumb.
+  if (id.startsWith("local:")) return ["This device", ...trail];
+  if (id.startsWith("onedrive:")) return trail.length > 0 ? ["OneDrive", ...trail] : [];
+  return trail;
+}
+
+/**
  * Where a document lives, coarsely — the axis the Documents table's Source column sorts on.
  *
  * `source_type` alone CANNOT answer this, which is the trap worth writing down: a file in a tracked

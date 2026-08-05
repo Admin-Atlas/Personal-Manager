@@ -686,6 +686,9 @@ pub struct PointerInput {
     /// alongside the body but is never chunked or embedded. `None` for sources with no folder concept.
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// The folders above it, root-most first (#736) — same rules, same ride-along: never chunked,
+    /// never embedded, and `None` distinct from an empty trail.
+    pub source_folder_path: Option<Vec<String>>,
     /// What the SOURCE says about the item (#701) — its author, who last edited it, when it was
     /// created there, and how big it is. `None` means the provider did not say, which the UI renders
     /// as "Unknown". Rides alongside the body exactly like the parent folder above: never chunked,
@@ -719,6 +722,11 @@ pub struct SourceFacts {
     /// actually moved. `None` here means "don't touch the stored name", not "the folder is unnamed"
     /// — which is why [`refresh_source_facts`] treats it separately from the rest.
     pub parent_folder_name: Option<String>,
+    /// The folders above the item, root-most first (#736) — the breadcrumb. Filled on the same
+    /// terms as the name beside it and for the same reason: discovering it costs a request per
+    /// ancestor, so `None` means "leave the stored trail alone", never "it has no folders". An empty
+    /// vector is the separate, real answer "it sits at the top of its corpus".
+    pub folder_path: Option<Vec<String>>,
 }
 
 impl SourceFacts {
@@ -728,25 +736,45 @@ impl SourceFacts {
     }
 }
 
-/// The parent folder id currently stored for an item, so a caller can tell whether it has moved.
+/// What PM already knows about where an item sits, so a caller can tell whether it is worth asking
+/// the provider again: the parent folder id it was last seen in, and whether a folder trail was ever
+/// resolved for it.
 ///
-/// Exists to keep the folder-NAME lookup rare: on Drive a name costs an API call, and resolving one
-/// per distinct folder on every fifteen-minute poll would turn a settled library into a steady
-/// stream of requests. The id itself rides on the listing for free, so comparing ids is what decides
-/// whether the name is worth fetching. `Ok(None)` covers both "no such row" and "no folder".
-pub(crate) fn stored_parent_folder_id(
+/// Exists to keep the folder lookups rare: on Drive a folder's name costs an API call and its
+/// ancestry costs one per level, so resolving either per distinct folder on every fifteen-minute poll
+/// would turn a settled library into a steady stream of requests. The id itself rides on the listing
+/// for free, so comparing ids is what decides whether the rest is worth fetching.
+///
+/// The trail needs its own flag because the id alone cannot answer for it: an item PM has held since
+/// before #736 has an id that has never changed and no trail at all, so an id-only comparison would
+/// leave it blank forever.
+///
+/// Reads the mirror on `documents`, which matches only the ANCHOR location — a folded sibling
+/// reports `(None, false)` and is re-resolved, which the per-pass memo makes nearly free and which
+/// is how a sibling comes to have a trail of its own at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoredFolderContext {
+    pub parent_folder_id: Option<String>,
+    pub has_trail: bool,
+}
+
+pub(crate) fn stored_folder_context(
     conn: &Connection,
     source_id: &str,
-) -> Result<Option<String>> {
-    Ok(conn
+) -> Result<StoredFolderContext> {
+    let row: Option<(Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT source_parent_folder_id FROM documents \
+            "SELECT source_parent_folder_id, source_folder_path FROM documents \
              WHERE source_id = ?1 AND source_type = 'index_only'",
             params![source_id],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?
-        .flatten())
+        .optional()?;
+    let (parent_folder_id, trail) = row.unwrap_or((None, None));
+    Ok(StoredFolderContext {
+        parent_folder_id,
+        has_trail: trail.is_some(),
+    })
 }
 
 /// Bring one index-only row's source facts up to date, and stamp when that happened.
@@ -777,20 +805,29 @@ pub(crate) fn refresh_source_facts(
     // `documents.source_modified_at` is a mirror of the anchor's, so advancing only the mirror would
     // leave the location's own pointer stale — and the local-folder walk reads its mtime gate off the
     // location, so it would re-hash every tracked file on every poll instead of no-opping.
+    // Encoded once, used by both statements. `Some(vec![])` deliberately reaches SQL as `"[]"` and
+    // not as NULL — see `locations::encode_folder_path`.
+    let folder_path = facts
+        .folder_path
+        .as_deref()
+        .map(crate::locations::encode_folder_path);
     conn.execute(
         "UPDATE document_locations SET \
              source_modified_at        = COALESCE(?2, source_modified_at), \
              source_parent_folder_id   = COALESCE(?3, source_parent_folder_id), \
-             source_parent_folder_name = COALESCE(?4, source_parent_folder_name) \
+             source_parent_folder_name = COALESCE(?4, source_parent_folder_name), \
+             source_folder_path        = COALESCE(?5, source_folder_path) \
          WHERE source_id = ?1 AND ( \
              (?2 IS NOT NULL AND source_modified_at        IS NOT ?2) OR \
              (?3 IS NOT NULL AND source_parent_folder_id   IS NOT ?3) OR \
-             (?4 IS NOT NULL AND source_parent_folder_name IS NOT ?4))",
+             (?4 IS NOT NULL AND source_parent_folder_name IS NOT ?4) OR \
+             (?5 IS NOT NULL AND source_folder_path        IS NOT ?5))",
         params![
             source_id,
             facts.modified_at,
             facts.parent_folder_id,
             facts.parent_folder_name,
+            folder_path,
         ],
     )?;
     let changed = conn.execute(
@@ -802,7 +839,8 @@ pub(crate) fn refresh_source_facts(
              source_modified_at       = COALESCE(?6, source_modified_at), \
              source_parent_folder_id  = COALESCE(?7, source_parent_folder_id), \
              source_parent_folder_name = COALESCE(?8, source_parent_folder_name), \
-             pm_refreshed_at          = ?9 \
+             source_folder_path       = COALESCE(?9, source_folder_path), \
+             pm_refreshed_at          = ?10 \
          WHERE source_id = ?1 AND source_type = 'index_only' AND ( \
              (?2 IS NOT NULL AND source_author            IS NOT ?2) OR \
              (?3 IS NOT NULL AND source_last_modified_by  IS NOT ?3) OR \
@@ -810,7 +848,8 @@ pub(crate) fn refresh_source_facts(
              (?5 IS NOT NULL AND source_size_bytes        IS NOT ?5) OR \
              (?6 IS NOT NULL AND source_modified_at       IS NOT ?6) OR \
              (?7 IS NOT NULL AND source_parent_folder_id  IS NOT ?7) OR \
-             (?8 IS NOT NULL AND source_parent_folder_name IS NOT ?8))",
+             (?8 IS NOT NULL AND source_parent_folder_name IS NOT ?8) OR \
+             (?9 IS NOT NULL AND source_folder_path       IS NOT ?9))",
         params![
             source_id,
             facts.author,
@@ -820,6 +859,7 @@ pub(crate) fn refresh_source_facts(
             facts.modified_at,
             facts.parent_folder_id,
             facts.parent_folder_name,
+            folder_path,
             now,
         ],
     )?;
@@ -948,6 +988,7 @@ pub fn register_pointer(
                     source_content_hash: input.source_content_hash.clone(),
                     source_parent_folder_id: input.source_parent_folder_id.clone(),
                     source_parent_folder_name: input.source_parent_folder_name.clone(),
+                    source_folder_path: input.source_folder_path.clone(),
                     // Never the anchor: that id is assigned once, at birth, and this document was
                     // born somewhere else.
                     anchor: false,
@@ -997,6 +1038,7 @@ pub fn register_pointer(
             stored_summary: Some(summarize(body)),
             source_parent_folder_id: input.source_parent_folder_id,
             source_parent_folder_name: input.source_parent_folder_name,
+            source_folder_path: input.source_folder_path,
             source_author: input.source_author,
             source_last_modified_by: input.source_last_modified_by,
             source_created_at: input.source_created_at,
@@ -1030,6 +1072,7 @@ pub fn register_pointer(
                 source_content_hash: meta.source.source_content_hash.clone(),
                 source_parent_folder_id: meta.source.source_parent_folder_id.clone(),
                 source_parent_folder_name: meta.source.source_parent_folder_name.clone(),
+                source_folder_path: meta.source.source_folder_path.clone(),
                 anchor: true,
             },
         )?;
@@ -1231,10 +1274,12 @@ fn restore_item(
             source_modified_at: item.source_modified_at.clone(),
             source_content_hash: item.source_content_hash.clone(),
             stored_summary: item.stored_summary.clone(),
-            // The portable manifest doesn't carry the parent folder, so a Rebuild-from-manifest can't
-            // restore it — the folder tag re-populates on the next Drive refresh (no backfill here).
+            // The portable manifest doesn't carry the parent folder or the trail above it, so a
+            // Rebuild-from-manifest can't restore either — both re-populate on the next Drive
+            // refresh (no backfill here).
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            source_folder_path: None,
             // Same for what the source knows (#701), and deliberately the same answer: the manifest
             // is a PORTABLE format, so widening it is a compatibility surface of its own, and these
             // four are refetched on the very next sync anyway. A restored row shows "Unknown" until
@@ -1260,6 +1305,7 @@ fn restore_item(
             source_content_hash: item.source_content_hash.clone(),
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            source_folder_path: None,
             anchor: true,
         }];
         all.extend(item.locations.iter().map(|l| crate::locations::Location {
@@ -1270,6 +1316,10 @@ fn restore_item(
             source_content_hash: l.source_content_hash.clone(),
             source_parent_folder_id: l.source_parent_folder_id.clone(),
             source_parent_folder_name: l.source_parent_folder_name.clone(),
+            // The manifest carries a sibling's folder NAME but not its trail, for the same reason
+            // the anchor's is absent: widening a portable format is a compatibility surface, and the
+            // next sync refills this in one memoised walk.
+            source_folder_path: None,
             anchor: false,
         }));
         for loc in &all {
@@ -1804,7 +1854,8 @@ fn reembed_item(
                 source_size_bytes         = COALESCE(?8, source_size_bytes), \
                 source_parent_folder_id   = COALESCE(?9, source_parent_folder_id), \
                 source_parent_folder_name = COALESCE(?10, source_parent_folder_name), \
-                pm_refreshed_at           = ?11 \
+                source_folder_path        = COALESCE(?11, source_folder_path), \
+                pm_refreshed_at           = ?12 \
          WHERE id = ?1",
         params![
             doc_id,
@@ -1817,6 +1868,10 @@ fn reembed_item(
             input.source_size_bytes,
             input.source_parent_folder_id,
             input.source_parent_folder_name,
+            input
+                .source_folder_path
+                .as_deref()
+                .map(crate::locations::encode_folder_path),
             now,
         ],
     )?;
@@ -1834,6 +1889,7 @@ fn reembed_item(
             source_content_hash: Some(new_content_hash.to_string()),
             source_parent_folder_id: input.source_parent_folder_id.clone(),
             source_parent_folder_name: input.source_parent_folder_name.clone(),
+            source_folder_path: input.source_folder_path.clone(),
             anchor: anchor_id == source_id,
         },
     )?;
@@ -3157,13 +3213,13 @@ mod tests {
                  source_author TEXT, source_last_modified_by TEXT, source_created_at TEXT,
                  source_size_bytes INTEGER, source_modified_at TEXT,
                  source_parent_folder_id TEXT, source_parent_folder_name TEXT,
-                 pm_refreshed_at TEXT
+                 source_folder_path TEXT, pm_refreshed_at TEXT
              );
              CREATE TABLE document_locations (
                  id INTEGER PRIMARY KEY, document_id INTEGER, source_id TEXT UNIQUE,
                  source_state TEXT, external_ref TEXT, source_modified_at TEXT,
                  source_content_hash TEXT, source_parent_folder_id TEXT,
-                 source_parent_folder_name TEXT, first_seen_at TEXT
+                 source_parent_folder_name TEXT, source_folder_path TEXT, first_seen_at TEXT
              );
              INSERT INTO documents(source_type, source_id, source_author, source_last_modified_by,
                  source_created_at, source_size_bytes, source_modified_at,
@@ -3196,6 +3252,7 @@ mod tests {
             modified_at: Some("2026-05-01T00:00:00Z".into()),
             parent_folder_id: Some("fid-1".into()),
             parent_folder_name: Some("Invoices".into()),
+            folder_path: None,
         }
     }
 
@@ -3265,11 +3322,56 @@ mod tests {
         assert!(refresh_source_facts(&conn, "s1", &facts, "2026-08-02T10:00:00Z").unwrap());
         let (_, _, folder, _) = stored(&conn);
         assert_eq!(folder.as_deref(), Some("Archive 2026"));
+        let ctx = stored_folder_context(&conn, "s1").unwrap();
         assert_eq!(
-            stored_parent_folder_id(&conn, "s1").unwrap().as_deref(),
+            ctx.parent_folder_id.as_deref(),
             Some("fid-2"),
             "and the id the next pass compares against moves with it"
         );
+        assert!(
+            !ctx.has_trail,
+            "a move with no trail resolved leaves the next pass a reason to go and get one"
+        );
+    }
+
+    #[test]
+    fn a_resolved_trail_lands_on_both_tables_and_is_then_left_alone() {
+        // The two halves of the breadcrumb (#736): the location's own trail, and the mirror the
+        // Documents list reads. And the gate that keeps it cheap — once a trail is stored,
+        // `stored_folder_context` reports it, so the next pass over an unmoved file spends no
+        // requests climbing the same folders again.
+        let conn = facts_db();
+        let facts = SourceFacts {
+            folder_path: Some(vec!["My Drive".into(), "Projects".into(), "PM".into()]),
+            ..as_stored()
+        };
+        assert!(refresh_source_facts(&conn, "s1", &facts, "2026-08-05T10:00:00Z").unwrap());
+
+        let expected = Some(vec![
+            "My Drive".to_string(),
+            "Projects".to_string(),
+            "PM".to_string(),
+        ]);
+        for table in ["documents", "document_locations"] {
+            let raw: Option<String> = conn
+                .query_row(
+                    &format!("SELECT source_folder_path FROM {table} WHERE source_id = 's1'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                crate::locations::decode_folder_path(raw),
+                expected,
+                "{table} carries the trail"
+            );
+        }
+        assert!(stored_folder_context(&conn, "s1").unwrap().has_trail);
+
+        // Silence does not unlearn it, and an unchanged item still writes nothing — the whole point
+        // of the guard, on the path a fifteen-minute poll takes over a settled library.
+        assert!(!refresh_source_facts(&conn, "s1", &as_stored(), "2026-08-05T11:00:00Z").unwrap());
+        assert!(stored_folder_context(&conn, "s1").unwrap().has_trail);
     }
 
     #[test]

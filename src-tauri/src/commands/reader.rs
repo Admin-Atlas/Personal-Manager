@@ -126,6 +126,10 @@ pub struct DocumentPlace {
     pub external_ref: Option<String>,
     pub source_modified_at: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// The folders above THIS place, root-most first (#736) — the breadcrumb, per-place because that
+    /// is the level at which two copies of one file actually differ. `null` when PM has not resolved
+    /// it; an empty array means it sits at the top of its corpus.
+    pub source_folder_path: Option<Vec<String>>,
     /// True for the place whose id is the document's permanent identity anchor. Shown as "the
     /// original" ordering only — never as "the good copy", because it isn't one.
     pub anchor: bool,
@@ -147,6 +151,7 @@ pub fn document_locations(state: State<'_, AppState>, doc_id: i64) -> Result<Vec
             external_ref: l.external_ref,
             source_modified_at: l.source_modified_at,
             source_parent_folder_name: l.source_parent_folder_name,
+            source_folder_path: l.source_folder_path,
             anchor: l.anchor,
         })
         .collect())
