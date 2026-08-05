@@ -31,18 +31,39 @@ import remarkGfm from "remark-gfm";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeExternalLinks from "rehype-external-links";
 
+import { DASH_LIST_CLASS, remarkDashLists } from "./markdownDashLists";
+
 // Taken from react-markdown's own props rather than importing `unified` directly: `unified` is a
 // transitive dependency, not a declared one, so a type imported from it rides on hoisting.
 type RehypePlugins = NonNullable<React.ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>;
+type RemarkPlugins = NonNullable<React.ComponentProps<typeof ReactMarkdown>["remarkPlugins"]>;
 
-// Extend the default (safe) schema only to let the external-links plugin's `target`/`rel` survive
-// sanitization on anchors — everything else stays at the conservative default allowlist. Exported for
-// the T-07 unit test, which locks the allowlist against a regression that widens it.
+// Extend the default (safe) schema in exactly two places, both of them a SINGLE PINNED LITERAL
+// VALUE rather than an open attribute:
+//   * `a` gets `target`/`rel`, so the external-links plugin's output survives sanitization;
+//   * `ul` gets `className="pm-dash-list"`, so a note's dash points can be styled apart from its
+//     bullets. The value form (`["className", "…"]`) is the same one hast-util-sanitize's own github
+//     schema uses to admit `contains-task-list` and nothing else — so no OTHER class can pass, and
+//     because raw HTML is dropped upstream (no `rehype-raw`), no ingested document can carry a
+//     `class` attribute to the sanitizer in the first place. The widening is therefore inert for
+//     untrusted content: the only thing that can ever produce this class is PM's own remark plugin.
+// Everything else stays at the conservative default allowlist. Exported for the T-07 unit test,
+// which locks the allowlist against a regression that widens it further.
 export const SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
     a: [...(defaultSchema.attributes?.a ?? []), "target", "rel"],
+    // ONE `className` entry listing BOTH allowed literals, not two entries. `findDefinition` in
+    // hast-util-sanitize returns the FIRST entry matching a property name, so a second
+    // `["className", …]` appended here is dead code — the library's own `contains-task-list` entry
+    // wins and the added value is stripped, silently and with every test still green.
+    ul: [
+      ...(defaultSchema.attributes?.ul ?? []).filter(
+        (entry) => !(Array.isArray(entry) && entry[0] === "className"),
+      ),
+      ["className", "contains-task-list", DASH_LIST_CLASS],
+    ],
   },
 };
 
@@ -77,16 +98,34 @@ export const REHYPE_PLUGINS: RehypePlugins = [
   [rehypeSanitize, SCHEMA],
 ];
 
+// The remark side. Both arrays are module-level constants so a re-render hands react-markdown the
+// same identity rather than a fresh array every time. `remarkDashLists` is OPT-IN — it changes how a
+// `+`-bulleted list renders, and only the pinboard note (whose dialect emits that marker on purpose)
+// should be affected. Every other surface renders other people's Markdown and must keep rendering it
+// exactly as before. Unlike the rehype array, order here carries no security property: remark
+// plugins run on mdast, upstream of the entire rehype chain and therefore of the sanitizer.
+export const REMARK_PLUGINS: RemarkPlugins = [remarkGfm];
+export const REMARK_PLUGINS_WITH_DASH_LISTS: RemarkPlugins = [remarkGfm, remarkDashLists];
+
 /**
  * Render user-authored Markdown through the app's single sanitizing boundary. Element styling lives in
  * the `.pm-markdown` block in `src/index.css` (bound to design tokens — no typography plugin), so this
  * component stays purely about the parse+sanitize pipeline.
+ *
+ * `dashLists` opts into the note dialect's second bullet kind (see `markdownDashLists`). Off by
+ * default, deliberately: it is a rendering claim about a `+` bullet that only a PM note means.
  */
-export function Markdown({ children }: { children: string }) {
+export function Markdown({
+  children,
+  dashLists = false,
+}: {
+  children: string;
+  dashLists?: boolean;
+}) {
   return (
     <div className="pm-markdown">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={dashLists ? REMARK_PLUGINS_WITH_DASH_LISTS : REMARK_PLUGINS}
         rehypePlugins={REHYPE_PLUGINS}
         urlTransform={safeUrl}
       >

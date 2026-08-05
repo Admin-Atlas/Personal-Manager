@@ -4,7 +4,15 @@
 import { describe, it, expect } from "vitest";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeExternalLinks from "rehype-external-links";
-import { REHYPE_PLUGINS, safeUrl, SCHEMA } from "./markdown";
+import remarkGfm from "remark-gfm";
+import {
+  REHYPE_PLUGINS,
+  REMARK_PLUGINS,
+  REMARK_PLUGINS_WITH_DASH_LISTS,
+  safeUrl,
+  SCHEMA,
+} from "./markdown";
+import { remarkDashLists } from "./markdownDashLists";
 
 // The markdown pipeline is PM's single sanitizing boundary for untrusted, ingested content. These lock
 // the two pure pieces of that boundary so a refactor can't silently weaken it (T-07), plus the SHAPE
@@ -71,10 +79,10 @@ describe("SCHEMA", () => {
 
   // The assertion above reads hast-util-sanitize's own allow-list, because SCHEMA never sets
   // `tagNames` of its own — it would only catch PM literally appending "script". This is the
-  // PM-side pin: the ONLY thing we widen is `attributes.a`. Everything else, `protocols` above all
-  // (the list that makes a `javascript:` href die at the sanitizer even if urlTransform were
-  // bypassed), has to stay exactly the library default.
-  it("widens the default schema in exactly one place and no other", () => {
+  // PM-side pin: the ONLY things we widen are `attributes.a` and `attributes.ul`. Everything else,
+  // `protocols` above all (the list that makes a `javascript:` href die at the sanitizer even if
+  // urlTransform were bypassed), has to stay exactly the library default.
+  it("widens the default schema in exactly two places and no other", () => {
     const differing = Object.keys(defaultSchema).filter(
       (k) =>
         SCHEMA[k as keyof typeof SCHEMA] !== defaultSchema[k as keyof typeof defaultSchema] &&
@@ -86,8 +94,63 @@ describe("SCHEMA", () => {
     const attrs = SCHEMA.attributes as Record<string, unknown>;
     const defaults = (defaultSchema.attributes ?? {}) as Record<string, unknown>;
     const changedAttrs = Object.keys(defaults).filter((k) => attrs[k] !== defaults[k]);
-    expect(changedAttrs).toEqual(["a"]);
+    expect(changedAttrs).toEqual(["a", "ul"]);
     expect(Object.keys(attrs).sort()).toEqual(Object.keys(defaults).sort());
+  });
+
+  // Both widenings are VALUE-PINNED, which is what makes them narrow rather than an open door: the
+  // `["className", "…"]` form admits those literals and nothing else, exactly as the library's own
+  // schema admits `contains-task-list` on a `ul` and `task-list-item` on an `li`. A regression to a
+  // bare `"className"` would let any class through and would not be caught by the diff above.
+  //
+  // ONE entry listing both values, not two entries: `findDefinition` returns the FIRST entry whose
+  // name matches, so a second `["className", …]` would be dead code and the added class would be
+  // stripped — silently, and with every other test in this file still green.
+  it("admits exactly one extra class on a ul, by literal value, in a single entry", () => {
+    const ul = (SCHEMA.attributes as Record<string, unknown[]>).ul;
+    const classEntries = ul.filter(
+      (e) => e === "className" || (Array.isArray(e) && e[0] === "className"),
+    );
+    expect(classEntries).toEqual([["className", "contains-task-list", "pm-dash-list"]]);
+    expect(ul).not.toContain("className");
+  });
+
+  it("keeps every non-class ul attribute the library allowed", () => {
+    const ul = (SCHEMA.attributes as Record<string, unknown[]>).ul;
+    const defaults = (defaultSchema.attributes?.ul ?? []) as unknown[];
+    for (const entry of defaults) {
+      if (Array.isArray(entry) && entry[0] === "className") continue;
+      expect(ul).toContainEqual(entry);
+    }
+  });
+
+  it("only adds to the anchor allow-list, never replaces it", () => {
+    const a = (SCHEMA.attributes as Record<string, unknown[]>).a;
+    for (const entry of (defaultSchema.attributes?.a ?? []) as unknown[]) {
+      expect(a).toContainEqual(entry);
+    }
+    expect(a).toContain("target");
+    expect(a).toContain("rel");
+  });
+});
+
+// The dash-list plugin is a REMARK plugin, which is the property that keeps it out of the security
+// story: remark runs on mdast, upstream of the whole rehype chain, so it cannot put anything past
+// the sanitizer no matter what it emits. These pin that placement.
+describe("the remark pipeline", () => {
+  it("leaves the default surface untouched", () => {
+    expect(REMARK_PLUGINS).toHaveLength(1);
+    expect(REMARK_PLUGINS[0]).toBe(remarkGfm);
+  });
+
+  it("adds the dash-list plugin only on the opted-in surface", () => {
+    expect(REMARK_PLUGINS_WITH_DASH_LISTS).toHaveLength(2);
+    expect(REMARK_PLUGINS_WITH_DASH_LISTS[0]).toBe(remarkGfm);
+    expect(REMARK_PLUGINS_WITH_DASH_LISTS[1]).toBe(remarkDashLists);
+  });
+
+  it("does not touch the rehype array, whose ORDER is the security property", () => {
+    expect(REHYPE_PLUGINS).toHaveLength(2);
   });
 });
 

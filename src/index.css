@@ -186,6 +186,28 @@ body {
 .pm-markdown li {
   margin: 0.125rem 0;
 }
+/* Dash points — a pinboard note's second bullet kind (see src/lib/markdownDashLists.ts). The note
+   dialect emits "-" as a "+" bullet, and a remark plugin tags that list with this class; the class
+   is the ONLY thing that distinguishes it, since Markdown keeps no record of which marker character
+   an author typed.
+
+   A real list item, not prose with a dash typed in front: the en dash is absolutely positioned into
+   the `ul`'s existing 1.25rem of left padding, exactly where a disc would sit, so a line long enough
+   to wrap continues UNDER ITS OWN TEXT and a nested dash point still indents. `> li` so a nested
+   list of the other kind keeps its own marker. `--ink3` rather than the text colour, so a run of
+   dashes reads as punctuation and not as content. */
+.pm-markdown ul.pm-dash-list {
+  list-style: none;
+}
+.pm-markdown ul.pm-dash-list > li {
+  position: relative;
+}
+.pm-markdown ul.pm-dash-list > li::before {
+  content: "–";
+  position: absolute;
+  left: -1rem;
+  color: var(--ink3);
+}
 /* GFM task lists (from a note's `[]` / `[x]` markers): drop the redundant bullet beside the
    checkbox and give the box a little breathing room.
 
