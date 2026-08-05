@@ -25,6 +25,7 @@ import { SOURCE_FACT_KEYS, SOURCE_FACT_LABELS, type SourceFactKey } from "./sour
 export const DOC_COLUMN_KEYS = [
   "project",
   "importance",
+  "source",
   "chunks",
   ...SOURCE_FACT_KEYS,
   "ingested",
@@ -37,27 +38,40 @@ export type DocColumnKey = (typeof DOC_COLUMN_KEYS)[number];
 export const DOC_COLUMN_LABELS: Record<DocColumnKey, string> = {
   project: "Project",
   importance: "Importance",
+  source: "Source",
   chunks: "Chunks",
   ...SOURCE_FACT_LABELS,
   ingested: "Ingested",
   synced: "Last synced",
 };
 
-/** Fixed widths for the `table-fixed` layout. Title takes the leftover space, so every other column
- *  must name one — otherwise turning a column on steals width from the titles unpredictably. */
-export const DOC_COLUMN_WIDTHS: Record<DocColumnKey, string> = {
-  project: "w-40",
-  importance: "w-28",
-  chunks: "w-20",
-  author: "w-36",
-  modifiedBy: "w-36",
-  created: "w-28",
-  updated: "w-28",
-  size: "w-24",
-  // Both carry a time as well as a date, so they need more room than the date-only columns above.
-  ingested: "w-40",
-  synced: "w-40",
+/** How wide a column is allowed to get, for the columns that hold free text.
+ *
+ *  **The table sizes columns to their contents; these are ceilings, not widths.** It used to be
+ *  `table-fixed` with a fixed width per column and Title taking the leftover, which meant every
+ *  column was as wide as its worst case whether or not anything in it was that long — an Importance
+ *  column ten characters wide holding "high", a Chunks column holding "7" — and the slack all
+ *  collected in the Title cell as one visible hole.
+ *
+ *  Only free text needs a ceiling: an author's name or an absolute path has no natural width and one
+ *  long value in one row would otherwise set the width of the whole column. The fixed-format columns
+ *  (the dates, the sizes, the counts) are deliberately absent — they are self-limiting, so a ceiling
+ *  on them could only ever truncate a value that was going to fit anyway.
+ *
+ *  These are applied to an inner block, not to the cell: `truncate` needs a bounded box to put its
+ *  ellipsis in, and an `overflow: hidden` block is also what lets the column shrink below its text
+ *  when the window is narrow instead of pushing the table sideways. */
+export const DOC_COLUMN_CAPS: Partial<Record<DocColumnKey, string>> = {
+  project: "max-w-[12rem]",
+  source: "max-w-[15rem]",
+  author: "max-w-[11rem]",
+  modifiedBy: "max-w-[11rem]",
 };
+
+/** The ceiling on the title itself, and on the location line under it. Title still takes the
+ *  leftover width, so this only bites on a narrow window — it is here so the two lines of the Title
+ *  cell agree with each other rather than one of them setting the column's width. */
+export const DOC_TITLE_CAP = "max-w-[38rem]";
 
 /** Whether a column is a source fact (rendered from `sourceFacts`) rather than a PM-side field. */
 export function isSourceFactColumn(key: DocColumnKey): key is SourceFactKey {

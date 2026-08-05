@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { provenanceParts, sourceLabel } from "./sourceLabel";
+import {
+  documentLocation,
+  provenanceParts,
+  sourceGroup,
+  sourceLabel,
+  sourceSummary,
+} from "./sourceLabel";
 
 describe("sourceLabel — telling two otherwise-identical rows apart", () => {
   it("names the Google account a file lives in", () => {
@@ -68,5 +74,86 @@ describe("provenanceParts", () => {
     expect(
       provenanceParts({ source_id: null, source_parent_folder_name: null, source_path: null }),
     ).toEqual([]);
+  });
+});
+
+describe("documentLocation — the full path, for both ingest routes", () => {
+  it("reads the local path for a stored document", () => {
+    expect(
+      documentLocation({
+        source_type: "vault",
+        source_path: "C:/Users/bobby/Docs/board.pdf",
+        external_ref: null,
+      }),
+    ).toBe("C:/Users/bobby/Docs/board.pdf");
+  });
+
+  it("reads external_ref for an indexed one, which provenanceParts can never reach", () => {
+    // The whole defect: an index-only row's `source_path` is structurally null, so the table's
+    // path line rendered nothing — for a Drive file AND for a file in a tracked folder on this
+    // machine, whose absolute path was on the row the whole time under the other column name.
+    const drive = {
+      source_type: "index_only" as const,
+      source_path: null,
+      external_ref: "https://drive.google.com/file/d/1AbC/view",
+    };
+    expect(documentLocation(drive)).toBe("https://drive.google.com/file/d/1AbC/view");
+    expect(
+      documentLocation({
+        source_type: "index_only",
+        source_path: null,
+        external_ref: "/home/bobby/Tracked/report.docx",
+      }),
+    ).toBe("/home/bobby/Tracked/report.docx");
+    // The fallback that made this necessary: provenanceParts stops at source_path.
+    expect(
+      provenanceParts({ source_id: null, source_parent_folder_name: null, source_path: null }),
+    ).toEqual([]);
+  });
+
+  it("is null when neither column has anything, rather than an empty line", () => {
+    expect(
+      documentLocation({ source_type: "chat", source_path: null, external_ref: null }),
+    ).toBeNull();
+  });
+});
+
+describe("sourceGroup / sourceSummary — the axis the Source column sorts on", () => {
+  it("puts a tracked local folder on THIS DEVICE, not with the clouds", () => {
+    // `source_type` is "index_only" for these too, so the type cannot answer the question — the
+    // source_id namespace does.
+    expect(sourceGroup({ source_id: "local:k:1", source_state: "ok" })).toBe("device");
+    expect(sourceGroup({ source_id: "gdrive:me@example.com:1", source_state: "ok" })).toBe("drive");
+    expect(sourceGroup({ source_id: "onedrive:me@example.com:1", source_state: "ok" })).toBe(
+      "onedrive",
+    );
+    expect(sourceGroup({ source_id: null, source_state: "ok" })).toBe("vault");
+  });
+
+  it("lets reachability outrank origin, and keeps the two kinds of trouble apart", () => {
+    // The backend keeps them apart on purpose: an expired token means "ask again later", a missing
+    // source means "it is gone". Collapsing them would report an outage as a deletion.
+    expect(
+      sourceGroup({ source_id: "gdrive:me@example.com:1", source_state: "source_missing" }),
+    ).toBe("missing");
+    expect(sourceGroup({ source_id: "gdrive:me@example.com:1", source_state: "unreachable" })).toBe(
+      "unreachable",
+    );
+  });
+
+  it("does not file an unknown namespace as held here", () => {
+    // A pointer PM can't decode is still a pointer to something outside the vault.
+    expect(sourceGroup({ source_id: "future-connector:x:y", source_state: "ok" })).toBe("drive");
+  });
+
+  it("says what is wrong, so a column you sorted by explains its own order", () => {
+    expect(sourceSummary({ source_id: null, source_state: "ok" })).toBe("In your vault");
+    expect(sourceSummary({ source_id: "local:k:1", source_state: "ok" })).toBe("This device");
+    expect(
+      sourceSummary({ source_id: "gdrive:me@example.com:1", source_state: "source_missing" }),
+    ).toBe("Google Drive · me@example.com · not there any more");
+    expect(sourceSummary({ source_id: "local:k:1", source_state: "unreachable" })).toBe(
+      "This device · can’t reach it",
+    );
   });
 });

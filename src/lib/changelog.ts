@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.124.0-alpha",
+    date: "2026-08-05",
+    highlights: [
+      "Every document now says where it actually is. A file on your machine always showed its path under its title; anything indexed from a connected account showed nothing at all — including files in a folder you had asked PM to watch, whose full path was sitting on the row the whole time. They all say it now, with the whole of a long one on hover.",
+      "The Documents table stops wasting space. Each column is the width of what is in it, rather than reserving room for its worst case whether or not anything in it is that long — and all of that slack used to collect in one gap between a document's title and the buttons beside it. Names and paths still stop at a sensible width so one long one can't stretch a column; dates and sizes take exactly the room they need.",
+      "The order you put the table in stays put. Sorting by size and then going to look at something else no longer drops you back to newest-first when you come back, and it survives closing and reopening PM.",
+      "A new Source column, off until you switch it on from the Columns menu, says what PM is actually holding and what it is only pointing at: your vault, this device, each connected account, and — sorted to the end, whichever way round you click — the ones PM can't reach just now and the ones whose original has been deleted.",
+      "Sorting by a column most documents have no answer for now keeps the blanks at the bottom whichever way you sort, which is what it was always meant to do. One direction was doing it and the other was moving them all to the top, burying every document that did have an answer.",
+    ],
+  },
+  {
     version: "3.123.2-alpha",
     date: "2026-08-04",
     release: true,

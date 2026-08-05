@@ -42,14 +42,14 @@ import {
   writeActivityOpen,
   writeCopyPhotosToVault,
 } from "../lib/documentPrefs";
-import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
 import { useDepth, useTheme } from "../theme";
 import {
+  DOC_COLUMN_CAPS,
   DOC_COLUMN_KEYS,
   DOC_COLUMN_LABELS,
-  DOC_COLUMN_WIDTHS,
+  DOC_TITLE_CAP,
   defaultColumns,
   isSourceFactColumn,
   readColumns,
@@ -57,6 +57,15 @@ import {
   writeColumns,
   type DocColumnKey,
 } from "../lib/documentColumns";
+import {
+  nextDocSort,
+  readDocSort,
+  sortDocuments,
+  writeDocSort,
+  type DocSort,
+  type SortKey,
+} from "../lib/documentSort";
+import { documentLocation, sourceSummary } from "../lib/sourceLabel";
 import { sourceFactKnown, sourceFactValue } from "../lib/sourceFacts";
 import { Button, Card, Collapsible, ConfirmDialog, IconButton, Popover } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
@@ -87,43 +96,6 @@ interface Summary {
   /** Entries the walk could not read. Absent from every other counter AND from the total the bar
    *  filled, so this is the only thing that distinguishes a partial import from a complete one. */
   unreadable: number;
-}
-
-// Sorting for the document table: EVERY column sorts, plus the always-present title. A header only
-// sorts when it is rendered, so which keys are reachable follows the column picker. `null` = the
-// backend's default order (newest first). Importance is ranked high > medium > low > none > archive
-// rather than alphabetically.
-//
-// The source facts were originally display-only, on the reasoning that ordering by a column reading
-// "Unknown" for most rows just banks the Unknowns at one end. That is a real objection and it is
-// answered directly below rather than by refusing to sort: unknowns go LAST in both directions, so
-// clicking a header never buries the rows that have an answer.
-type SortKey = "title" | DocColumnKey;
-interface DocSort {
-  key: SortKey;
-  dir: "asc" | "desc";
-}
-// Columns where "biggest / most recent first" is the more useful default on first click.
-const SORT_DESC_FIRST = new Set<SortKey>([
-  "importance",
-  "chunks",
-  "created",
-  "updated",
-  "size",
-  "ingested",
-  "synced",
-]);
-
-/** Compare two possibly-absent values, keeping absent ones at the END whichever way the column is
- *  sorted. Returns `null` when both are present, so the caller compares them normally.
- *
- *  The direction factor is applied by the caller AFTER this, which is why the unknown cases return a
- *  value already multiplied back out — an unknown must not flip to the top when the arrow flips. */
-function unknownsLast<T>(a: T | null, b: T | null, factor: number): number | null {
-  if (a == null && b == null) return 0;
-  if (a == null) return 1 * factor;
-  if (b == null) return -1 * factor;
-  return null;
 }
 
 // Image extensions that go through the photo pipeline (mirrors `PHOTO_EXTS` in the Rust ingest). Used
@@ -193,7 +165,18 @@ export function DocumentsView({ onReviewClick }: Props) {
   // tabs: when the user trusts the AI's filing and hides those, the per-row Edit affordance hides
   // too (the table stays read-only).
   const { teachVisible } = useTheme();
-  const [sort, setSort] = useState<DocSort | null>(null);
+  // Persisted, because the tab router unmounts this view — see documentSort. `null` is the backend's
+  // own newest-first order.
+  const [sort, setSortState] = useState<DocSort | null>(readDocSort);
+  const setSort = (next: DocSort | null) => {
+    setSortState(next);
+    writeDocSort(next);
+  };
+  // A stored sort can name a column that is currently switched off — the picker and the sort are
+  // separate preferences and neither has to be written after the other. Order by it only while its
+  // header is on screen, so the table never shows an ordering with nothing to explain it. The stored
+  // value is deliberately left alone: tick the column back on and your sort is still there.
+  const activeSort = sort && (sort.key === "title" || shows(sort.key)) ? sort : null;
   // The row whose inline project/importance editor is open (one at a time). Both fields live in a
   // single working draft so one Save writes the whole tuple at once — two independent optimistic
   // saves (project onBlur + importance onChange) would race and silently drop one field, since a
@@ -735,86 +718,13 @@ export function DocumentsView({ onReviewClick }: Props) {
   // Click a column header to sort; same header again flips the direction. A new column starts in its
   // natural direction (descending for importance/chunks/ingested, ascending for title/project).
   function toggleSort(key: SortKey) {
-    setSort((cur) =>
-      cur?.key === key
-        ? { key, dir: cur.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: SORT_DESC_FIRST.has(key) ? "desc" : "asc" },
-    );
+    setSort(nextDocSort(activeSort, key));
   }
 
-  const sortedDocuments = useMemo(() => {
-    if (!sort) return documents;
-    const factor = sort.dir === "asc" ? 1 : -1;
-    return [...documents].sort((a, b) => {
-      let c = 0;
-      switch (sort.key) {
-        case "title":
-          c = a.title.localeCompare(b.title);
-          break;
-        case "project":
-          // The PRIMARY project: the column shows it, so it is what the header sorts by.
-          c = a.project.localeCompare(b.project);
-          break;
-        case "importance":
-          c = rankImportance(a.importance) - rankImportance(b.importance);
-          break;
-        case "chunks":
-          c = a.chunk_count - b.chunk_count;
-          break;
-        case "ingested":
-          c = a.ingested_at.localeCompare(b.ingested_at);
-          break;
-        case "synced":
-          // Never null in practice — the projection falls back to the ingest time — but typed as
-          // nullable, so it goes through the same guard as the rest rather than being special-cased.
-          {
-            const u = unknownsLast(a.pm_refreshed_at, b.pm_refreshed_at, factor);
-            if (u !== null) return u;
-            c = a.pm_refreshed_at!.localeCompare(b.pm_refreshed_at!);
-          }
-          break;
-        case "author":
-          {
-            const u = unknownsLast(a.source_author, b.source_author, factor);
-            if (u !== null) return u;
-            c = a.source_author!.localeCompare(b.source_author!);
-          }
-          break;
-        case "modifiedBy":
-          {
-            const u = unknownsLast(a.source_last_modified_by, b.source_last_modified_by, factor);
-            if (u !== null) return u;
-            c = a.source_last_modified_by!.localeCompare(b.source_last_modified_by!);
-          }
-          break;
-        case "created":
-          // ISO-8601 sorts lexicographically, which is why these compare as strings rather than
-          // being parsed into Dates for every comparison of every pair.
-          {
-            const u = unknownsLast(a.source_created_at, b.source_created_at, factor);
-            if (u !== null) return u;
-            c = a.source_created_at!.localeCompare(b.source_created_at!);
-          }
-          break;
-        case "updated":
-          {
-            const u = unknownsLast(a.source_modified_at, b.source_modified_at, factor);
-            if (u !== null) return u;
-            c = a.source_modified_at!.localeCompare(b.source_modified_at!);
-          }
-          break;
-        case "size":
-          {
-            const u = unknownsLast(a.source_size_bytes, b.source_size_bytes, factor);
-            if (u !== null) return u;
-            c = a.source_size_bytes! - b.source_size_bytes!;
-          }
-          break;
-      }
-      if (c === 0) c = a.title.localeCompare(b.title); // stable tiebreak
-      return c * factor;
-    });
-  }, [documents, sort]);
+  const sortedDocuments = useMemo(
+    () => sortDocuments(documents, activeSort),
+    [documents, activeSort],
+  );
 
   return (
     <div className="flex h-full flex-col">
@@ -1213,39 +1123,52 @@ export function DocumentsView({ onReviewClick }: Props) {
             {documents.length === 0 ? (
               <p className="text-sm text-ink4">No documents yet.</p>
             ) : (
-              // table-fixed + explicit column widths: the Title column takes the leftover space and
-              // truncates long titles/source paths instead of forcing the whole table (and page) to
-              // scroll sideways. The metadata columns are sized to their content.
-              <table className="w-full table-fixed text-left text-sm">
+              // Auto layout, so every column is as wide as what is actually in it — an Importance
+              // column holding "high" no longer reserves the width of the word "Importance" twice
+              // over. Title carries `w-full`, which is what hands it the leftover space; the free-text
+              // columns cap themselves through `DOC_COLUMN_CAPS` on an inner block, so one long path
+              // or author name can't set the width of a whole column or push the page sideways.
+              <table className="w-full text-left text-sm">
                 <thead className="text-xs font-medium tracking-wide text-ink3">
                   <tr className="border-b border-border">
-                    <SortHeader label="Title" sortKey="title" sort={sort} onSort={toggleSort} />
+                    <SortHeader
+                      label="Title"
+                      sortKey="title"
+                      sort={activeSort}
+                      onSort={toggleSort}
+                      widthClass="w-full"
+                    />
                     {shows("project") && (
                       <SortHeader
                         label="Project"
                         sortKey="project"
-                        sort={sort}
+                        sort={activeSort}
                         onSort={toggleSort}
-                        widthClass={DOC_COLUMN_WIDTHS.project}
                       />
                     )}
                     {shows("importance") && (
                       <SortHeader
                         label="Importance"
                         sortKey="importance"
-                        sort={sort}
+                        sort={activeSort}
                         onSort={toggleSort}
-                        widthClass={DOC_COLUMN_WIDTHS.importance}
+                      />
+                    )}
+                    {shows("source") && (
+                      <SortHeader
+                        label="Source"
+                        sortKey="source"
+                        sort={activeSort}
+                        onSort={toggleSort}
                       />
                     )}
                     {shows("chunks") && (
                       <SortHeader
                         label="Chunks"
                         sortKey="chunks"
-                        sort={sort}
+                        sort={activeSort}
                         onSort={toggleSort}
                         align="right"
-                        widthClass={DOC_COLUMN_WIDTHS.chunks}
                       />
                     )}
                     {DOC_COLUMN_KEYS.filter(isSourceFactColumn)
@@ -1255,99 +1178,121 @@ export function DocumentsView({ onReviewClick }: Props) {
                           key={key}
                           label={DOC_COLUMN_LABELS[key]}
                           sortKey={key}
-                          sort={sort}
+                          sort={activeSort}
                           onSort={toggleSort}
                           align={key === "size" ? "right" : undefined}
-                          widthClass={DOC_COLUMN_WIDTHS[key]}
                         />
                       ))}
                     {shows("ingested") && (
                       <SortHeader
                         label="Ingested"
                         sortKey="ingested"
-                        sort={sort}
+                        sort={activeSort}
                         onSort={toggleSort}
                         align="right"
-                        widthClass={DOC_COLUMN_WIDTHS.ingested}
                       />
                     )}
                     {shows("synced") && (
                       <SortHeader
                         label="Last synced"
                         sortKey="synced"
-                        sort={sort}
+                        sort={activeSort}
                         onSort={toggleSort}
                         align="right"
-                        widthClass={DOC_COLUMN_WIDTHS.synced}
                       />
                     )}
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedDocuments.map((doc) => (
-                    <Fragment key={doc.id}>
-                      <tr
-                        onClick={() => openReader(doc)}
-                        // Keyboard access without claiming role="button" (which would break the row's
-                        // table semantics and nest a button inside a button): make the row focusable and
-                        // open on Enter/Space, but only when the row ITSELF has focus — a keypress on the
-                        // inner edit button is a different target and is left to it.
-                        tabIndex={0}
-                        onKeyDown={(e) => {
-                          if (
-                            e.target === e.currentTarget &&
-                            (e.key === "Enter" || e.key === " ")
-                          ) {
-                            e.preventDefault();
-                            openReader(doc);
-                          }
-                        }}
-                        // F-48: let the browser skip layout/paint for off-screen rows (the table isn't
-                        // virtualized and grows with connector estates). `contain-intrinsic-size` reserves
-                        // a row-height placeholder so the scrollbar stays stable.
-                        style={{ contentVisibility: "auto", containIntrinsicSize: "auto 41px" }}
-                        className={`group cursor-pointer border-b border-rule hover:bg-surface ${
-                          readerDoc?.id === doc.id ? "bg-accent-soft" : ""
-                        }`}
-                      >
-                        <td className="py-2 pr-3">
-                          <div className="flex items-center gap-2">
-                            <div className="min-w-0 flex-1 truncate text-ink" title={doc.title}>
-                              {doc.title}
-                            </div>
-                            {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
-                            <DeleteDocumentButton onClick={() => setDeletingDoc(doc)} />
-                            {teachVisible && (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  if (editingId === doc.id) {
-                                    setEditingId(null);
-                                  } else {
-                                    setEditDraft({
-                                      projects: projectsOf(doc),
-                                      importance: doc.importance,
-                                    });
-                                    setEditingId(doc.id);
-                                  }
-                                }}
-                                className="shrink-0 text-xs text-ink4 hover:text-accent-text"
-                                title="Change project or importance"
-                                aria-expanded={editingId === doc.id}
+                  {sortedDocuments.map((doc) => {
+                    // The full path or URL this document can be reached at — `source_path` for one
+                    // ingest route, `external_ref` for the other. Resolved once per row.
+                    const location = documentLocation(doc);
+                    return (
+                      <Fragment key={doc.id}>
+                        <tr
+                          onClick={() => openReader(doc)}
+                          // Keyboard access without claiming role="button" (which would break the row's
+                          // table semantics and nest a button inside a button): make the row focusable and
+                          // open on Enter/Space, but only when the row ITSELF has focus — a keypress on the
+                          // inner edit button is a different target and is left to it.
+                          tabIndex={0}
+                          onKeyDown={(e) => {
+                            if (
+                              e.target === e.currentTarget &&
+                              (e.key === "Enter" || e.key === " ")
+                            ) {
+                              e.preventDefault();
+                              openReader(doc);
+                            }
+                          }}
+                          // F-48: let the browser skip layout/paint for off-screen rows (the table isn't
+                          // virtualized and grows with connector estates). `contain-intrinsic-size` reserves
+                          // a row-height placeholder so the scrollbar stays stable.
+                          style={{ contentVisibility: "auto", containIntrinsicSize: "auto 41px" }}
+                          className={`group cursor-pointer border-b border-rule hover:bg-surface ${
+                            readerDoc?.id === doc.id ? "bg-accent-soft" : ""
+                          }`}
+                        >
+                          <td className="py-2 pr-3 last:pr-0">
+                            <div className="flex items-center gap-2">
+                              {/* No `flex-1`: it stretched this to the full width of an over-wide Title
+                                cell and parked the badge and the row buttons against the far edge,
+                                which was the visible hole. Sized to the title, capped, and allowed to
+                                shrink, so the controls sit beside the text they belong to. */}
+                              <div
+                                className={`min-w-0 truncate text-ink ${DOC_TITLE_CAP}`}
+                                title={doc.title}
                               >
-                                {editingId === doc.id ? "Close" : "Edit"}
-                              </button>
-                            )}
-                          </div>
-                          {doc.source_type === "index_only" ? (
-                            // Row-level buttons stop propagation so they don't also open the reader.
-                            // Reading the full text and opening the source both live in the reader now
-                            // (click the row); only "Import fully" stays here as a one-off action.
+                                {doc.title}
+                              </div>
+                              {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
+                              <DeleteDocumentButton onClick={() => setDeletingDoc(doc)} />
+                              {teachVisible && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (editingId === doc.id) {
+                                      setEditingId(null);
+                                    } else {
+                                      setEditDraft({
+                                        projects: projectsOf(doc),
+                                        importance: doc.importance,
+                                      });
+                                      setEditingId(doc.id);
+                                    }
+                                  }}
+                                  className="shrink-0 text-xs text-ink4 hover:text-accent-text"
+                                  title="Change project or importance"
+                                  aria-expanded={editingId === doc.id}
+                                >
+                                  {editingId === doc.id ? "Close" : "Edit"}
+                                </button>
+                              )}
+                            </div>
+                            {/* Where the file actually is, for BOTH ingest routes. This used to be the
+                              else-arm of a ternary on `source_type`, so an indexed document got only
+                              the Sheets-gated "Import fully" button and every other connector file
+                              showed nothing at all — including a file in a tracked folder on this very
+                              machine, whose absolute path was sitting on the row the whole time under
+                              the other column name. */}
                             <div className="mt-0.5 flex items-center gap-3 text-xs">
-                              {/* A Google Sheet (its webViewLink points at /spreadsheets/) can be
-                                  imported fully — pulled grid-and-all into a local spreadsheet. */}
-                              {doc.source_state !== "source_missing" &&
+                              {location && (
+                                <div
+                                  className={`truncate text-ink4 ${DOC_TITLE_CAP}`}
+                                  title={location}
+                                >
+                                  {location}
+                                </div>
+                              )}
+                              {/* Row-level buttons stop propagation so they don't also open the reader.
+                                Reading the full text and opening the source both live in the reader
+                                now (click the row); only "Import fully" stays here as a one-off
+                                action. A Google Sheet (its webViewLink points at /spreadsheets/) can
+                                be imported fully — pulled grid-and-all into a local spreadsheet. */}
+                              {doc.source_type === "index_only" &&
+                                doc.source_state !== "source_missing" &&
                                 doc.external_ref?.includes("/spreadsheets/") && (
                                   <button
                                     type="button"
@@ -1356,165 +1301,182 @@ export function DocumentsView({ onReviewClick }: Props) {
                                       void promote(doc.id);
                                     }}
                                     disabled={promoting != null}
-                                    className="text-accent-text hover:brightness-110 disabled:opacity-50"
+                                    className="shrink-0 text-accent-text hover:brightness-110 disabled:opacity-50"
                                     title="Download the whole spreadsheet and index it locally"
                                   >
                                     {promoting === doc.id ? "Importing…" : "Import fully"}
                                   </button>
                                 )}
                             </div>
-                          ) : (
-                            doc.source_path && (
-                              <div className="truncate text-xs text-ink4" title={doc.source_path}>
-                                {doc.source_path}
-                              </div>
-                            )
-                          )}
-                        </td>
-                        {shows("project") && (
-                          <td className="py-2 pr-3 text-ink3">
-                            <span className="inline-flex items-center gap-1.5">
-                              {!doc.reviewed && (
-                                <span
-                                  className="inline-block h-1.5 w-1.5 rounded-full"
-                                  style={{ background: "var(--st-due)" }}
-                                  title="Awaiting review"
-                                />
-                              )}
-                              <ProjectSummary doc={doc} />
-                            </span>
                           </td>
-                        )}
-                        {shows("importance") && (
-                          <td className="py-2 pr-3 capitalize text-ink3">
-                            {doc.importance ?? "—"}
-                          </td>
-                        )}
-                        {shows("chunks") && (
-                          <td className="py-2 pr-3 text-right text-ink3">
-                            {devMode ? (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  void toggleChunks(doc.id);
-                                }}
-                                className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
-                                title="Inspect this document's chunk breakdown"
-                              >
-                                {doc.chunk_count}
-                              </button>
-                            ) : (
-                              doc.chunk_count
-                            )}
-                          </td>
-                        )}
-                        {DOC_COLUMN_KEYS.filter(isSourceFactColumn)
-                          .filter(shows)
-                          .map((key) => (
-                            <td
-                              key={key}
-                              className={`truncate py-2 pr-3 ${
-                                key === "size" ? "text-right" : ""
-                              } ${sourceFactKnown(doc, key) ? "text-ink3" : "text-ink4"}`}
-                              title={sourceFactValue(doc, key)}
-                            >
-                              {sourceFactValue(doc, key)}
+                          {shows("project") && (
+                            <td className="py-2 pr-3 text-ink3 last:pr-0">
+                              <span className="inline-flex max-w-full items-center gap-1.5">
+                                {!doc.reviewed && (
+                                  <span
+                                    className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
+                                    style={{ background: "var(--st-due)" }}
+                                    title="Awaiting review"
+                                  />
+                                )}
+                                <span className={`truncate ${DOC_COLUMN_CAPS.project}`}>
+                                  <ProjectSummary doc={doc} />
+                                </span>
+                              </span>
                             </td>
-                          ))}
-                        {/* Date AND time, in one cell rather than two columns: a separate time
-                            column would sort independently of its own date, which is a footgun. */}
-                        {shows("ingested") && (
-                          <td className="py-2 text-right text-ink4">
-                            {formatDateTime(doc.ingested_at)}
-                          </td>
-                        )}
-                        {shows("synced") && (
-                          <td className="py-2 text-right text-ink4">
-                            {doc.pm_refreshed_at ? formatDateTime(doc.pm_refreshed_at) : "—"}
-                          </td>
-                        )}
-                      </tr>
-                      {/* Dev-mode chunk breakdown, expanded directly under its document (read-only). */}
-                      {devMode && chunksFor === doc.id && (
-                        <tr>
-                          <td colSpan={columns.length + 1} className="pb-3">
-                            <div className="rounded-[var(--radius-sm)] border border-border bg-surface p-3">
-                              <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
-                                chunks · doc_id {doc.id}
-                                {chunkPage ? ` · ${chunkPage.total} total` : ""}
-                              </p>
-                              {chunkPage ? (
-                                <DevTableGrid page={chunkPage} />
+                          )}
+                          {shows("importance") && (
+                            <td className="whitespace-nowrap py-2 pr-3 capitalize text-ink3 last:pr-0">
+                              {doc.importance ?? "—"}
+                            </td>
+                          )}
+                          {/* Where this document lives, in the same words the badge beside the title
+                            uses — and the axis the header sorts on, which is what makes "show me the
+                            ones whose source is gone" a click rather than a hunt. */}
+                          {shows("source") && (
+                            <td className="py-2 pr-3 last:pr-0">
+                              <div
+                                className={`truncate ${DOC_COLUMN_CAPS.source} ${
+                                  doc.source_state === "ok" ? "text-ink3" : "text-[var(--st-due)]"
+                                }`}
+                                title={sourceSummary(doc)}
+                              >
+                                {sourceSummary(doc)}
+                              </div>
+                            </td>
+                          )}
+                          {shows("chunks") && (
+                            <td className="whitespace-nowrap py-2 pr-3 text-right text-ink3 last:pr-0">
+                              {devMode ? (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void toggleChunks(doc.id);
+                                  }}
+                                  className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
+                                  title="Inspect this document's chunk breakdown"
+                                >
+                                  {doc.chunk_count}
+                                </button>
                               ) : (
-                                <p className="text-xs text-ink4">Loading…</p>
+                                doc.chunk_count
                               )}
-                            </div>
-                          </td>
+                            </td>
+                          )}
+                          {DOC_COLUMN_KEYS.filter(isSourceFactColumn)
+                            .filter(shows)
+                            .map((key) => (
+                              <td
+                                key={key}
+                                className={`whitespace-nowrap py-2 pr-3 last:pr-0 ${
+                                  key === "size" ? "text-right" : ""
+                                } ${sourceFactKnown(doc, key) ? "text-ink3" : "text-ink4"}`}
+                                title={sourceFactValue(doc, key)}
+                              >
+                                {/* A name has no natural width, so it caps and truncates; a date or a
+                                  size is self-limiting and gets no cap at all. */}
+                                <div className={`truncate ${DOC_COLUMN_CAPS[key] ?? ""}`}>
+                                  {sourceFactValue(doc, key)}
+                                </div>
+                              </td>
+                            ))}
+                          {/* Date AND time, in one cell rather than two columns: a separate time
+                            column would sort independently of its own date, which is a footgun. */}
+                          {shows("ingested") && (
+                            <td className="whitespace-nowrap py-2 pr-3 text-right text-ink4 last:pr-0">
+                              {formatDateTime(doc.ingested_at)}
+                            </td>
+                          )}
+                          {shows("synced") && (
+                            <td className="whitespace-nowrap py-2 pr-3 text-right text-ink4 last:pr-0">
+                              {doc.pm_refreshed_at ? formatDateTime(doc.pm_refreshed_at) : "—"}
+                            </td>
+                          )}
                         </tr>
-                      )}
-                      {/* Inline reclassify (issue #333): project + importance for an already-filed
+                        {/* Dev-mode chunk breakdown, expanded directly under its document (read-only). */}
+                        {devMode && chunksFor === doc.id && (
+                          <tr>
+                            <td colSpan={columns.length + 1} className="pb-3">
+                              <div className="rounded-[var(--radius-sm)] border border-border bg-surface p-3">
+                                <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
+                                  chunks · doc_id {doc.id}
+                                  {chunkPage ? ` · ${chunkPage.total} total` : ""}
+                                </p>
+                                {chunkPage ? (
+                                  <DevTableGrid page={chunkPage} />
+                                ) : (
+                                  <p className="text-xs text-ink4">Loading…</p>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        {/* Inline reclassify (issue #333): project + importance for an already-filed
                           document, expanded under its row. One Save writes both at once (no racy
                           per-field optimistic saves). Tags stay out of this surface. */}
-                      {teachVisible && editingId === doc.id && (
-                        <tr>
-                          <td colSpan={columns.length + 1} className="pb-3">
-                            <div className="flex flex-col gap-2 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
-                              <div
-                                className="flex items-start gap-2 text-xs text-ink3"
-                                data-help="review-project"
-                              >
-                                <span className="w-20 shrink-0 pt-1">Projects</span>
-                                <ProjectPicker
-                                  value={editDraft.projects}
-                                  onChange={(projects) => setEditDraft((d) => ({ ...d, projects }))}
-                                  suggestions={projectNames}
-                                  listId={RECLASSIFY_PROJECTS_LIST_ID}
-                                  disabled={savingEdit}
-                                />
-                              </div>
-                              <div className="flex items-center gap-2 text-xs text-ink3">
-                                <span className="w-20 shrink-0">Importance</span>
-                                <ImportancePicker
-                                  value={editDraft.importance}
-                                  onChange={(importance) =>
-                                    setEditDraft((d) => ({ ...d, importance }))
-                                  }
-                                />
-                              </div>
-                              <div className="flex justify-end gap-2 pt-1">
-                                <Button
-                                  variant="tertiary"
-                                  size="sm"
-                                  onClick={() => setEditingId(null)}
+                        {teachVisible && editingId === doc.id && (
+                          <tr>
+                            <td colSpan={columns.length + 1} className="pb-3">
+                              <div className="flex flex-col gap-2 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
+                                <div
+                                  className="flex items-start gap-2 text-xs text-ink3"
+                                  data-help="review-project"
                                 >
-                                  Cancel
-                                </Button>
-                                <Button
-                                  variant="primary"
-                                  size="sm"
-                                  onClick={() => void saveMeta(doc)}
-                                  disabled={
-                                    savingEdit ||
-                                    // NUL as the separator: a project name may contain any
-                                    // printable character (commas are explicitly allowed),
-                                    // so an ordinary delimiter could make two different
-                                    // lists compare equal and leave Save disabled on a real
-                                    // change.
-                                    (editDraft.projects.join("\u0000") ===
-                                      projectsOf(doc).join("\u0000") &&
-                                      editDraft.importance === doc.importance)
-                                  }
-                                >
-                                  {savingEdit ? "Saving…" : "Save"}
-                                </Button>
+                                  <span className="w-20 shrink-0 pt-1">Projects</span>
+                                  <ProjectPicker
+                                    value={editDraft.projects}
+                                    onChange={(projects) =>
+                                      setEditDraft((d) => ({ ...d, projects }))
+                                    }
+                                    suggestions={projectNames}
+                                    listId={RECLASSIFY_PROJECTS_LIST_ID}
+                                    disabled={savingEdit}
+                                  />
+                                </div>
+                                <div className="flex items-center gap-2 text-xs text-ink3">
+                                  <span className="w-20 shrink-0">Importance</span>
+                                  <ImportancePicker
+                                    value={editDraft.importance}
+                                    onChange={(importance) =>
+                                      setEditDraft((d) => ({ ...d, importance }))
+                                    }
+                                  />
+                                </div>
+                                <div className="flex justify-end gap-2 pt-1">
+                                  <Button
+                                    variant="tertiary"
+                                    size="sm"
+                                    onClick={() => setEditingId(null)}
+                                  >
+                                    Cancel
+                                  </Button>
+                                  <Button
+                                    variant="primary"
+                                    size="sm"
+                                    onClick={() => void saveMeta(doc)}
+                                    disabled={
+                                      savingEdit ||
+                                      // NUL as the separator: a project name may contain any
+                                      // printable character (commas are explicitly allowed),
+                                      // so an ordinary delimiter could make two different
+                                      // lists compare equal and leave Save disabled on a real
+                                      // change.
+                                      (editDraft.projects.join("\u0000") ===
+                                        projectsOf(doc).join("\u0000") &&
+                                        editDraft.importance === doc.importance)
+                                    }
+                                  >
+                                    {savingEdit ? "Saving…" : "Save"}
+                                  </Button>
+                                </div>
                               </div>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </Fragment>
-                  ))}
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             )}
@@ -1672,12 +1634,19 @@ function SortHeader({
   sort: DocSort | null;
   onSort: (key: SortKey) => void;
   align?: "right";
-  /** Fixed column width (Tailwind class) for the table-fixed layout; omit to take the leftover space. */
+  /** Only Title passes one, as `w-full` — in an auto-layout table that is what makes it take the
+   *  leftover width while every other column stays the size of its own contents. */
   widthClass?: string;
 }) {
   const active = sort?.key === sortKey;
   return (
-    <th className={`py-2 font-medium ${widthClass ?? ""} ${align === "right" ? "text-right" : ""}`}>
+    // `pr-3` matches the cells below, so a header and its column sit on the same right edge; nowrap
+    // because a wrapped two-word heading would set the column's height, not its width.
+    <th
+      className={`whitespace-nowrap py-2 pr-3 font-medium last:pr-0 ${widthClass ?? ""} ${
+        align === "right" ? "text-right" : ""
+      }`}
+    >
       <button
         type="button"
         onClick={() => onSort(sortKey)}
