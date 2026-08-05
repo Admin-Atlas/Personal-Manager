@@ -1335,13 +1335,26 @@ export function DocumentsView({ onReviewClick }: Props) {
                             ones whose source is gone" a click rather than a hunt. */}
                           {shows("source") && (
                             <td className="py-2 pr-3 last:pr-0">
-                              <div
-                                className={`truncate ${DOC_COLUMN_CAPS.source} ${
-                                  doc.source_state === "ok" ? "text-ink3" : "text-[var(--st-due)]"
-                                }`}
-                                title={sourceSummary(doc)}
-                              >
-                                {sourceSummary(doc)}
+                              <div className="flex items-center gap-1">
+                                {/* A row you have to be able to FIND. The pill beside the title says
+                                    the same thing, but it sits wherever that title happens to end,
+                                    so a column of them cannot be scanned; here it is always in the
+                                    same place, which is what makes sorting by this column useful.
+                                    Same glyph and token the milestone list uses for a link that has
+                                    gone bad. */}
+                                {doc.source_state !== "ok" && (
+                                  <span className="shrink-0 text-st-due" aria-hidden>
+                                    ⚠
+                                  </span>
+                                )}
+                                <div
+                                  className={`truncate ${DOC_COLUMN_CAPS.source} ${
+                                    doc.source_state === "ok" ? "text-ink3" : "text-st-due"
+                                  }`}
+                                  title={sourceSummary(doc)}
+                                >
+                                  {sourceSummary(doc)}
+                                </div>
                               </div>
                             </td>
                           )}
