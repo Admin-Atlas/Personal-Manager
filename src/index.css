@@ -208,6 +208,13 @@ body {
   left: -1rem;
   color: var(--ink3);
 }
+/* ...except a task item, whose checkbox IS its marker. A literal `+ [x] done` passes through the
+   note dialect untouched (it has to — the tick-by-index mapping reads the source line), so it lands
+   in a dash list and would otherwise render a dash AND a checkbox. */
+.pm-markdown ul.pm-dash-list > li.task-list-item::before,
+.pm-markdown ul.pm-dash-list > li:has(> input[type="checkbox"])::before {
+  content: none;
+}
 /* GFM task lists (from a note's `[]` / `[x]` markers): drop the redundant bullet beside the
    checkbox and give the box a little breathing room.
 
@@ -227,18 +234,39 @@ body {
   margin-right: 0.4rem;
   transform: translateY(1px);
 }
-/* Pinboard notes only (scoped via `.pm-note-md`, so chat / the document reader keep their
-   indented lists): a top-level checklist sits FLUSH with the note's left edge — a lone
-   checkbox shouldn't look pre-indented. A Tab-nested checklist (rendered as a task list
-   inside a parent list item) keeps its indentation; the nested selectors' higher specificity
-   wins over the flush rules above them. */
-.pm-note-md .pm-markdown ul.contains-task-list,
-.pm-note-md .pm-markdown ul:has(> li > input[type="checkbox"]) {
+/* Pinboard notes only (scoped via `.pm-note-md`, so chat / the document reader keep their indented
+   lists): a checklist sits FLUSH with the note's left edge — a lone checkbox shouldn't look
+   pre-indented.
+   NARROWED, twice over, because the original rule applied to any list containing a checkbox at any
+   depth and cost more than it bought:
+     * **Top level only** (`> ul`, a direct child of the render root), which is what "flush with the
+       note's edge" ever meant. A nested checklist is indented BY ITS NESTING and previously needed
+       a second rule to undo the first.
+     * **Only a list that is ENTIRELY checkboxes.** A list holding a bullet as well as a checkbox
+       must keep its padding: `list-style: outside` draws a disc IN that padding, so zeroing it
+       painted the disc outside the box and a plain bullet silently lost its marker — reading as a
+       stray line of prose mid-list. That is a real note (". or this?" then "[] last one"), not an
+       edge case, because a marker change is what splits lists and a bullet followed by a checkbox
+       does not change marker.
+   There is no class-only twin for the second condition — "has a non-task child" is not something a
+   class can say. On an engine without `:has()` the rule simply doesn't apply and every checklist
+   keeps the ordinary list indent, which is the SAFE direction to degrade: a checkbox one notch
+   further in, never a bullet with no bullet. */
+.pm-note-md .pm-markdown > ul.contains-task-list:not(:has(> li:not(.task-list-item))),
+.pm-note-md
+  .pm-markdown
+  > ul:has(> li > input[type="checkbox"]):not(:has(> li:not(:has(> input)))) {
   padding-left: 0;
 }
-.pm-note-md .pm-markdown li ul.contains-task-list,
-.pm-note-md .pm-markdown li ul:has(> li > input[type="checkbox"]) {
-  padding-left: 1.25rem;
+/* Consecutive lists in a NOTE read as one block. Changing the marker character starts a new list in
+   CommonMark, which is exactly what makes the two bullet kinds distinguishable — but it also means
+   six lines typed in a row become three `<ul>`s, and the `ul` margin is four times the `li` one, so
+   the note came back with paragraph-sized gaps its author never typed. The marker change should
+   change the marker, not the spacing. */
+.pm-note-md .pm-markdown ul + ul,
+.pm-note-md .pm-markdown ul + ol,
+.pm-note-md .pm-markdown ol + ul {
+  margin-top: 0.125rem;
 }
 /* In a note, the box is a real control: clicking it ticks the item (PinboardView maps the click
    back to the source marker). The sanitizer forces `disabled` on every rendered input — which is
@@ -260,6 +288,18 @@ body {
 .pm-note-md .pm-markdown li:has(> input[type="checkbox"]) {
   padding-left: 1.35rem;
   text-indent: -1.35rem;
+}
+/* ...and STOP there. `text-indent` is inherited, so that negative value ran down into anything
+   nested under a checklist item and pulled the first line of every descendant 1.35rem to the left —
+   far enough to drag a bullet's disc out of its list's padding, where it is not painted. A Tab-
+   indented list under a checkbox therefore came back with its items shifted left and their markers
+   gone, which reads as "the indenting is broken" and is really this one inherited property.
+   The reset goes on the nested list rather than on its items so it also covers a wrapped line, and
+   it is not written twice: it resets an inherited value, so it is correct on any engine whether or
+   not the rule that set the value matched. */
+.pm-note-md .pm-markdown li ul,
+.pm-note-md .pm-markdown li ol {
+  text-indent: 0;
 }
 .pm-markdown strong {
   color: var(--ink);

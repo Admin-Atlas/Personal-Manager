@@ -153,6 +153,22 @@ describe("round bullets and dash points render as two kinds of list", () => {
     expect(out).not.toContain("pm-dash-list");
   });
 
+  it("puts a bullet and a checkbox in ONE list, and marks the non-task item", () => {
+    // The shape the flush-checklist CSS has to cope with. `ul.contains-task-list` gets its left
+    // padding zeroed so a checklist sits at the note's edge, and a plain bullet's disc is drawn in
+    // exactly that padding — so a non-task sibling silently lost its marker and read as a stray line
+    // of prose. The rule that gives it back keys on `li:not(.task-list-item)`, which only works if
+    // remark-gfm marks the task item and leaves the bullet unmarked, in the same list.
+    const { container } = render(<Markdown dashLists>{toRenderMarkdown(". a\n[] b")}</Markdown>);
+    const lists = container.querySelectorAll("ul");
+    expect(lists).toHaveLength(1);
+    expect(lists[0].className).toContain("contains-task-list");
+    const items = lists[0].querySelectorAll(":scope > li");
+    expect(items).toHaveLength(2);
+    expect(items[0].className).not.toContain("task-list-item");
+    expect(items[1].className).toContain("task-list-item");
+  });
+
   it("re-running the transform over a dash list changes nothing", () => {
     // "+" is in MARKER_RE for exactly this: without it the emitted line reads as prose on the next
     // pass and grows a second hard break every time — and this output is what reaches the vault.

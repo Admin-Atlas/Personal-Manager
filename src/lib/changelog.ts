@@ -28,6 +28,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     date: "2026-08-05",
     highlights: [
       "A note can tell a bullet from a dash. Starting a line with . gives you a round bullet and starting it with - now gives you an en dash — two kinds of point instead of one, so a list and the asides hanging off it don't have to look the same. Dash points are still proper list items: they nest under a bullet, and one long enough to wrap continues under its own text rather than back at the margin. Notes you have already written change shape once, wherever you used a dash.",
+      "A bullet sharing a list with a checkbox keeps its bullet. A note's checklist deliberately sits flush with the note's left edge, and a round bullet's dot is drawn in exactly the space that removes — so any ordinary bullet in the same run as a checkbox quietly lost its dot and read as a stray line of prose. The checklist still sits flush; the bullets beside it get their dot back. Lines you typed one after another also stay one block, instead of opening a gap wherever you switch between bullets, dashes and checkboxes.",
       "A new line in a note is brought into view before you type into it. When PM continues a list for you — the next bullet, the next number, a fresh checkbox — it places the cursor itself, and a browser only follows a cursor it moved on its own. On a note card a few lines tall that meant typing into a line just below the bottom edge. Tab, the formatting buttons and undo all placed the cursor the same way and are all fixed with it.",
     ],
   },
