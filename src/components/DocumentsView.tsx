@@ -1234,40 +1234,57 @@ export function DocumentsView({ onReviewClick }: Props) {
                         >
                           <td className="py-2 pr-3 last:pr-0">
                             <div className="flex items-center gap-2">
-                              {/* No `flex-1`: it stretched this to the full width of an over-wide Title
-                                cell and parked the badge and the row buttons against the far edge,
-                                which was the visible hole. Sized to the title, capped, and allowed to
-                                shrink, so the controls sit beside the text they belong to. */}
+                              {/* The title is sized to its text and capped — NOT `flex-1`, which is
+                                what used to stretch it and leave the hole. The trailing group below
+                                takes the leftover instead, which is a different thing: the gap ends
+                                up between the title and a COLUMN of badges rather than inside the
+                                title itself. */}
                               <div
                                 className={`min-w-0 truncate text-ink ${DOC_TITLE_CAP}`}
                                 title={doc.title}
                               >
                                 {doc.title}
                               </div>
-                              {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
-                              <DeleteDocumentButton onClick={() => setDeletingDoc(doc)} />
-                              {teachVisible && (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (editingId === doc.id) {
-                                      setEditingId(null);
-                                    } else {
-                                      setEditDraft({
-                                        projects: projectsOf(doc),
-                                        importance: doc.importance,
-                                      });
-                                      setEditingId(doc.id);
-                                    }
-                                  }}
-                                  className="shrink-0 text-xs text-ink4 hover:text-accent-text"
-                                  title="Change project or importance"
-                                  aria-expanded={editingId === doc.id}
-                                >
-                                  {editingId === doc.id ? "Close" : "Edit"}
-                                </button>
-                              )}
+                              {/* `ml-auto` parks these at the cell's right edge, so the badges line
+                                up down the table and a file with something wrong with it is findable
+                                by scanning one column rather than by reading every row. That
+                                alignment is the whole value of the badge; ragged, it may as well not
+                                be there. */}
+                              <div className="ml-auto flex shrink-0 items-center gap-2">
+                                {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
+                                <DeleteDocumentButton onClick={() => setDeletingDoc(doc)} />
+                                {teachVisible && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (editingId === doc.id) {
+                                        setEditingId(null);
+                                      } else {
+                                        setEditDraft({
+                                          projects: projectsOf(doc),
+                                          importance: doc.importance,
+                                        });
+                                        setEditingId(doc.id);
+                                      }
+                                    }}
+                                    // Quiet until the row is hovered or focused, like Delete beside
+                                    // it — a control on every row of a long list is chrome until you
+                                    // want it. Two things keep that from becoming a trap: it stays
+                                    // keyboard-reachable (`focus-visible`), so it never turns into a
+                                    // pointer-only action, and it stays lit while its own panel is
+                                    // OPEN, because a Close button you can only find by hovering is
+                                    // worse than one that was never hidden.
+                                    className={`shrink-0 text-xs text-ink4 transition-opacity hover:text-accent-text focus-visible:opacity-100 group-hover:opacity-100 ${
+                                      editingId === doc.id ? "opacity-100" : "opacity-0"
+                                    }`}
+                                    title="Change project or importance"
+                                    aria-expanded={editingId === doc.id}
+                                  >
+                                    {editingId === doc.id ? "Close" : "Edit"}
+                                  </button>
+                                )}
+                              </div>
                             </div>
                             {/* Where the file actually is — as FOLDERS, not as a URL (#736). The URL
                               this replaces answered "how do I open it", which the reader's Open

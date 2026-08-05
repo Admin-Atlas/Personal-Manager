@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.126.1-alpha",
+    date: "2026-08-05",
+    highlights: [
+      "The badges in the Documents list line up down the right of the title column again, so a file with something wrong with it is findable by scanning one column instead of reading every row. They had drifted in beside each title when the column stopped stretching, which fixed the gap and lost the alignment; the gap stays fixed and the alignment comes back.",
+      "The Edit button on a document row stays out of the way until you hover the row, like Delete beside it — and stays visible while its own panel is open, so there is always something to click to close it. It is still reachable by keyboard without hovering anything.",
+    ],
+  },
+  {
     version: "3.126.0-alpha",
     date: "2026-08-05",
     highlights: [
