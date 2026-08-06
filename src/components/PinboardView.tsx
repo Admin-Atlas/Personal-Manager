@@ -57,7 +57,13 @@ import { usePinboard } from "../lib/pinboard/usePinboard";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
 import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
+import { GAME_INFO, isSpent, livePool, playsGame, pool } from "../lib/pinboard/game";
+import { FolderGame, GameGlyph, GameMenu, PopOutButton } from "./FolderGame";
 import type { CellPoint, Rect, TimelineItem, Widget } from "../lib/pinboard/types";
+
+/** Which of an opened folder's two faces is showing: its cards, or the game it plays. Transient —
+ *  a folder remembers WHICH game it plays, never that you happened to be looking at it. */
+type FolderFace = "cards" | "play";
 import type { Milestone, MilestoneStatus } from "../lib/types";
 import { scrollBehavior, useDepth } from "../theme";
 import { DateField } from "./DateField";
@@ -179,12 +185,15 @@ function WidgetTile({
   px,
   showPower,
   onStartDrag,
+  dimmed,
   children,
 }: {
   widget: Widget;
   px: PxRect;
   showPower?: boolean;
   onStartDrag: (e: ReactPointerEvent, w: Widget, mode: DragMode) => void;
+  /** Drawn already this round, inside a game folder — recedes but stays, and stays fully usable. */
+  dimmed?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -196,7 +205,10 @@ function WidgetTile({
             ? "pinboard-timeline"
             : "pinboard-folder"
       }
-      className="absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none"
+      aria-label={dimmed ? "Already drawn this round" : undefined}
+      className={`absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none ${
+        dimmed ? "opacity-60 saturate-[0.4]" : ""
+      }`}
       style={{ left: px.x, top: px.y, width: px.w, height: px.h, ...tintStyle(widget.color) }}
     >
       {children}
@@ -283,6 +295,7 @@ export function PinboardView() {
     raiseWidget,
     raiseChild,
     popOutChild,
+    drawCard,
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,
@@ -299,8 +312,18 @@ export function PinboardView() {
   // The folder the pointer is currently over mid-drag (highlighted, and the one a release would file
   // into). Pointer targeting is otherwise invisible — nothing about the dragged rect shows intent.
   const [dropFolderId, setDropFolderId] = useState<string | null>(null);
-  // Which folder is currently expanded (transient — not persisted). At most one at a time.
-  const [expandedFolderId, setExpandedFolderId] = useState<string | null>(null);
+  // Which folder is open, and which of its two faces it is showing (transient — not persisted). At
+  // most one at a time. ONE piece of state, not two: the id and the face have to move together, and
+  // a second `useState` beside this one is a second thing to remember to clear — close a game, open
+  // a plain folder, and it would still be showing the game.
+  const [expanded, setExpanded] = useState<{ id: string; view: FolderFace } | null>(null);
+  const closeFolder = useCallback(() => setExpanded(null), []);
+  /** Flip the open folder between its cards and its game. The id comes from the open folder rather
+   *  than the caller, so a face can never be set on a folder that isn't the one on screen. */
+  const setFolderFace = useCallback(
+    (view: FolderFace) => setExpanded((e) => (e ? { ...e, view } : e)),
+    [],
+  );
   // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
   const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
 
@@ -426,17 +449,20 @@ export function PinboardView() {
   // longer removes it, so this no longer fires on the last child leaving — the panel stays open on
   // "This folder is empty.", ready to take something back.
   useEffect(() => {
-    if (
-      expandedFolderId &&
-      !board.widgets.some((w) => w.id === expandedFolderId && w.kind === "folder")
-    ) {
-      setExpandedFolderId(null);
+    if (expanded && !board.widgets.some((w) => w.id === expanded.id && w.kind === "folder")) {
+      setExpanded(null);
     }
-  }, [expandedFolderId, board.widgets]);
+  }, [expanded, board.widgets]);
 
-  const expandedFolder = expandedFolderId
-    ? board.widgets.find((w) => w.id === expandedFolderId && w.kind === "folder")
+  const expandedFolder = expanded
+    ? board.widgets.find((w) => w.id === expanded.id && w.kind === "folder")
     : undefined;
+  // Which face to draw. Derived from the folder as well as the request, so a game switched off
+  // while it was open (or a folder whose game was cleared) falls back to its cards instead of
+  // rendering a game that isn't there — the same "derive it, don't mirror it" rule that keeps
+  // `expandedFolder` itself honest.
+  const expandedFace: FolderFace =
+    expanded?.view === "play" && expandedFolder && playsGame(expandedFolder) ? "play" : "cards";
 
   const dropFolder = dropFolderId
     ? board.widgets.find((w) => w.id === dropFolderId && w.kind === "folder")
@@ -616,7 +642,10 @@ export function PinboardView() {
                   onChange={updateWidget}
                   onUngroup={removeWidget}
                   onStartDrag={startDrag}
-                  onOpen={() => setExpandedFolderId(w.id)}
+                  // A game folder's tile plays; a plain one opens its cards. Either way this is the
+                  // ONLY opener on the board, which is exactly why the game's own bar carries a way
+                  // back to the cards — see FolderPanelHeader.
+                  onOpen={() => setExpanded({ id: w.id, view: playsGame(w) ? "play" : "cards" })}
                 />
               )}
             </WidgetTile>
@@ -639,7 +668,7 @@ export function PinboardView() {
             ((expandedFolder.expandMode ?? "inline") === "overlay" ? (
               <Modal
                 open
-                onClose={() => setExpandedFolderId(null)}
+                onClose={closeFolder}
                 // The one dialog that names itself with `label` rather than `labelledBy`: its title
                 // is an editable <input>, not a heading, so there is no element whose text stays
                 // the name. Falls back to the placeholder the input shows when it is empty.
@@ -655,17 +684,20 @@ export function PinboardView() {
               >
                 <FolderBoard
                   folder={expandedFolder}
+                  face={expandedFace}
+                  onFace={setFolderFace}
                   showPower={showPower}
                   onChange={updateWidget}
                   onDelete={requestDelete}
                   onPopOut={popOutChild}
+                  onDraw={drawCard}
                   onRaiseChild={raiseChild}
                   onAddItem={addTimelineItem}
                   onUpdateItem={updateTimelineItem}
                   onRemoveItem={removeTimelineItem}
                   docStatus={docStatus}
                   onIngested={refreshDocs}
-                  onClose={() => setExpandedFolderId(null)}
+                  onClose={closeFolder}
                 />
               </Modal>
             ) : (
@@ -686,15 +718,18 @@ export function PinboardView() {
               >
                 <FolderPanel
                   folder={expandedFolder}
+                  face={expandedFace}
+                  onFace={setFolderFace}
                   onChange={updateWidget}
                   onDelete={requestDelete}
                   onPopOut={popOutChild}
+                  onDraw={drawCard}
                   onAddItem={addTimelineItem}
                   onUpdateItem={updateTimelineItem}
                   onRemoveItem={removeTimelineItem}
                   docStatus={docStatus}
                   onIngested={refreshDocs}
-                  onClose={() => setExpandedFolderId(null)}
+                  onClose={closeFolder}
                 />
               </div>
             ))}
@@ -930,22 +965,6 @@ function DragGrip() {
         [1, 5, 9].map((cy) => <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r="1" />),
       )}
     </svg>
-  );
-}
-
-/** "Move this card out of the folder, back onto the board" — shown on folder-panel children. */
-function PopOutButton({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={onClick}
-      title="Move out to the board"
-      aria-label="Move out to the board"
-      className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-xs text-ink4 hover:bg-surface hover:text-ink2"
-    >
-      ⤴
-    </button>
   );
 }
 
@@ -1542,11 +1561,17 @@ function FolderTile({
   onOpen: () => void;
 }) {
   const n = widget.children?.length ?? 0;
+  // A game folder wears its game's face, and says what is still in play rather than how much is
+  // inside — "3 left" is the number you want before deciding to click it. NO extra button goes on
+  // this tile: it is 72px wide at its floor, and the header's ✕ is what a second one would clip.
+  const game = playsGame(widget) ? widget.game : undefined;
+  const left = game ? livePool(widget).length : 0;
+  const total = game ? pool(widget).length : 0;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <WidgetHeader
         widget={widget}
-        placeholder="Folder"
+        placeholder={game ? GAME_INFO[game].label : "Folder"}
         deleteLabel="Ungroup (spill notes back onto the board)"
         onRename={(t) => onChange(widget.id, { title: t })}
         onDelete={() => onUngroup(widget.id)}
@@ -1556,12 +1581,19 @@ function FolderTile({
         type="button"
         onPointerDown={(e) => e.stopPropagation()}
         onClick={onOpen}
-        title="Open folder"
+        title={game ? `Play ${GAME_INFO[game].label}` : "Open folder"}
+        // Named for what it DOES. Without this the accessible name computes from the content below
+        // and announces "3 items, button", which says nothing about a tile that now plays a game.
+        aria-label={
+          game
+            ? `Play ${GAME_INFO[game].label} — ${left} of ${total} cards still in`
+            : `Open folder — ${n} item${n === 1 ? "" : "s"}`
+        }
         className="flex min-h-0 flex-1 flex-col items-center justify-center gap-0.5 text-ink3 hover:bg-surface"
       >
-        <FolderGlyph />
-        <span className="font-mono text-[0.625rem]">
-          {n} item{n === 1 ? "" : "s"}
+        {game ? <GameGlyph game={game} /> : <FolderGlyph />}
+        <span aria-hidden="true" className="font-mono text-[0.625rem]">
+          {game ? `${left} left` : `${n} item${n === 1 ? "" : "s"}`}
         </span>
       </button>
     </div>
@@ -1585,26 +1617,52 @@ function FolderGlyph() {
   );
 }
 
-/** The bar both expanded-folder presentations share: editable title, the In place / Overlay choice,
- *  and close. */
+/**
+ * The bar both expanded-folder presentations share: editable title, the dice, the Cards / Play
+ * choice, the In place / Overlay choice, and close.
+ *
+ * THIS BAR IS THE WAY BACK. A game folder's tile plays instead of opening, and the tile is the only
+ * opener on the board — there is no context menu and no keyboard route to a widget — so without the
+ * Cards switch here a folder that had been given a game would have no path left to its own notes.
+ * That is why the header renders on the game face too. The presentation toggle stays put beside it:
+ * a game folder is still a folder, and taking away its In place / Overlay choice would be lifting
+ * one thing at the cost of another. The title is `flex-1 min-w-0 truncate`, so it is what gives.
+ */
 function FolderPanelHeader({
   folder,
+  face,
+  onFace,
   onChange,
   onClose,
 }: {
   folder: Widget;
+  face: FolderFace;
+  onFace: (face: FolderFace) => void;
   onChange: (id: string, patch: Partial<Widget>) => void;
   onClose: () => void;
 }) {
+  const hasGame = playsGame(folder);
   return (
     <div className="flex shrink-0 items-center justify-between gap-2 border-b border-rule px-3 py-2">
       <input
         value={folder.title ?? ""}
         onChange={(e) => onChange(folder.id, { title: e.target.value })}
-        placeholder="Folder"
+        placeholder={hasGame && folder.game ? GAME_INFO[folder.game].label : "Folder"}
         aria-label="Folder title"
         className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-sm font-medium text-ink2 placeholder:text-ink4 focus:outline-none focus:ring-0"
       />
+      <GameMenu folder={folder} onChange={(patch) => onChange(folder.id, patch)} />
+      {hasGame && (
+        <SegmentedControl
+          ariaLabel="What this folder is showing"
+          value={face}
+          onChange={onFace}
+          options={[
+            { value: "cards", label: "Cards", title: "The notes in this folder" },
+            { value: "play", label: "Play", title: "Play this folder's game" },
+          ]}
+        />
+      )}
       <SegmentedControl
         ariaLabel="How this folder opens"
         value={folder.expandMode ?? "inline"}
@@ -1642,6 +1700,7 @@ function FolderBoard({
   onChange,
   onDelete,
   onPopOut,
+  onDraw,
   onRaiseChild,
   onAddItem,
   onUpdateItem,
@@ -1649,12 +1708,17 @@ function FolderBoard({
   docStatus,
   onIngested,
   onClose,
+  face,
+  onFace,
 }: {
   folder: Widget;
+  face: FolderFace;
+  onFace: (face: FolderFace) => void;
   showPower: boolean;
   onChange: (id: string, patch: Partial<Widget>) => void;
   onDelete: (id: string) => void;
   onPopOut: (folderId: string, childId: string) => void;
+  onDraw: (folderId: string, childId: string) => void;
   onRaiseChild: (folderId: string, childId: string) => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
@@ -1704,6 +1768,11 @@ function FolderBoard({
     (childId: string) => onPopOut(folder.id, childId),
     [onPopOut, folder.id],
   );
+  const drawCard = useCallback(
+    (childId: string) => onDraw(folder.id, childId),
+    [onDraw, folder.id],
+  );
+  const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
   const commitRect = useCallback((id: string, rect: Rect) => onChange(id, { rect }), [onChange]);
   const { draggingId, livePx, startDrag } = useBoardDrag({
     boundsRef,
@@ -1713,9 +1782,36 @@ function FolderBoard({
     onResizeEnd: commitRect,
   });
 
+  if (face === "play" && folder.game) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <FolderPanelHeader
+          folder={folder}
+          face={face}
+          onFace={onFace}
+          onChange={onChange}
+          onClose={onClose}
+        />
+        <FolderGame
+          folder={folder}
+          game={folder.game}
+          onDraw={drawCard}
+          onPopOut={popOut}
+          onResetRound={resetRound}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <FolderPanelHeader folder={folder} onChange={onChange} onClose={onClose} />
+      <FolderPanelHeader
+        folder={folder}
+        face={face}
+        onFace={onFace}
+        onChange={onChange}
+        onClose={onClose}
+      />
       <div ref={scrollRef} className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-3">
         <BoardSurface
           ref={surfaceRef}
@@ -1737,6 +1833,7 @@ function FolderBoard({
               px={draggingId === c.id && livePx ? livePx : rectToPx(c.rect)}
               showPower={showPower}
               onStartDrag={startDrag}
+              dimmed={isSpent(folder, c.id)}
             >
               {c.kind === "note" ? (
                 <NoteBody
@@ -1778,9 +1875,12 @@ function FolderBoard({
  *  wanting it gone. */
 function FolderPanel({
   folder,
+  face,
+  onFace,
   onChange,
   onDelete,
   onPopOut,
+  onDraw,
   onAddItem,
   onUpdateItem,
   onRemoveItem,
@@ -1789,9 +1889,12 @@ function FolderPanel({
   onClose,
 }: {
   folder: Widget;
+  face: FolderFace;
+  onFace: (face: FolderFace) => void;
   onChange: (id: string, patch: Partial<Widget>) => void;
   onDelete: (id: string) => void;
   onPopOut: (folderId: string, childId: string) => void;
+  onDraw: (folderId: string, childId: string) => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
   onRemoveItem: (id: string, itemId: string) => void;
@@ -1805,9 +1908,40 @@ function FolderPanel({
     (childId: string) => onPopOut(folder.id, childId),
     [onPopOut, folder.id],
   );
+  const drawCard = useCallback(
+    (childId: string) => onDraw(folder.id, childId),
+    [onDraw, folder.id],
+  );
+  const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
+  if (face === "play" && folder.game) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <FolderPanelHeader
+          folder={folder}
+          face={face}
+          onFace={onFace}
+          onChange={onChange}
+          onClose={onClose}
+        />
+        <FolderGame
+          folder={folder}
+          game={folder.game}
+          onDraw={drawCard}
+          onPopOut={popOut}
+          onResetRound={resetRound}
+        />
+      </div>
+    );
+  }
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <FolderPanelHeader folder={folder} onChange={onChange} onClose={onClose} />
+      <FolderPanelHeader
+        folder={folder}
+        face={face}
+        onFace={onFace}
+        onChange={onChange}
+        onClose={onClose}
+      />
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {children.length === 0 ? (
           <p className="text-xs text-ink4">This folder is empty.</p>
@@ -1820,7 +1954,14 @@ function FolderPanel({
             {children.map((c) => (
               <div
                 key={c.id}
-                className="flex h-64 flex-col overflow-hidden rounded-[var(--radius-sm)] border"
+                // A card already drawn this round recedes but stays: the whole point of the round is
+                // that you can still see what you've been given. `aria-describedby` isn't available
+                // on a plain div the card owns, so the state is said in plain words instead —
+                // dimming alone reaches nobody who can't see it.
+                aria-label={isSpent(folder, c.id) ? "Already drawn this round" : undefined}
+                className={`flex h-64 flex-col overflow-hidden rounded-[var(--radius-sm)] border ${
+                  isSpent(folder, c.id) ? "opacity-60 saturate-[0.4]" : ""
+                }`}
                 style={tintStyle(c.color)}
               >
                 {c.kind === "note" ? (

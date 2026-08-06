@@ -141,3 +141,147 @@ describe("usePinboard persistence", () => {
     expect(result.current.saveFailed).toBe(false);
   });
 });
+
+/** A stored board holding a game folder with two notes in it. */
+const GAME_BOARD: Board = {
+  version: BOARD_VERSION,
+  widgets: [
+    {
+      id: "f",
+      kind: "folder",
+      rect: { x: 0, y: 0, w: 3, h: 3 },
+      game: "roulette",
+      gameOn: true,
+      children: [
+        { id: "a", kind: "note", rect: { x: 0, y: 0, w: 7, h: 5 }, text: "first" },
+        { id: "b", kind: "note", rect: { x: 7, y: 0, w: 7, h: 5 }, text: "second" },
+      ],
+    },
+  ],
+};
+
+const folderOf = (b: Board) => b.widgets.find((w) => w.id === "f")!;
+
+describe("usePinboard — a game round outlives the app, but not the folder", () => {
+  it("keeps a drawn card greyed across a reload, and never re-offers it", async () => {
+    // The whole reason the round is stored rather than held in memory: shut the laptop, come back,
+    // and the game should not hand you the job you already took.
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result, unmount } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    await flushDebounce();
+    expect(folderOf(result.current.board).spent).toEqual(["a"]);
+
+    // What actually reached the store is what a relaunch will read back.
+    const written = JSON.parse(ipc.setPref.mock.lastCall![1] as string) as Board;
+    expect(folderOf(written).spent).toEqual(["a"]);
+    unmount();
+
+    ipc.getPref.mockResolvedValue(JSON.stringify(written));
+    const second = renderHook(() => usePinboard());
+    await settle();
+    expect(folderOf(second.result.current.board).spent).toEqual(["a"]);
+  });
+
+  it("forgets a card that left the folder while PM was closed", async () => {
+    // A card popped out, deleted or dragged away is not "already drawn" — it is gone, and carrying
+    // its id would quietly shorten the next round.
+    const stale: Board = {
+      version: BOARD_VERSION,
+      widgets: [{ ...folderOf(GAME_BOARD), spent: ["a", "vanished"] }],
+    };
+    ipc.getPref.mockResolvedValue(JSON.stringify(stale));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+    expect(folderOf(result.current.board).spent).toEqual(["a"]);
+  });
+
+  it("drops a spent list that isn't a list at all rather than trusting it", async () => {
+    const corrupt = JSON.stringify({
+      version: BOARD_VERSION,
+      widgets: [{ ...folderOf(GAME_BOARD), spent: "a" }],
+    });
+    ipc.getPref.mockResolvedValue(corrupt);
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+    expect(folderOf(result.current.board).spent).toEqual([]);
+  });
+
+  it("empties the round when the last card is drawn, so the next spin starts fresh", async () => {
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "b"));
+    expect(folderOf(result.current.board).spent).toEqual([]);
+  });
+
+  it("UNDO of an unrelated edit does not un-grey a card the game already drew", async () => {
+    // The reason `carryGameState` exists. History is a stack of whole boards, so without it a
+    // Ctrl+Z on a tint would roll the round back with it, mid-game.
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.updateWidget("f", { color: "st-due" }));
+    act(() => result.current.drawCard("f", "b"));
+    // Drawing "b" emptied the round; draw once more so there is something to lose.
+    act(() => result.current.drawCard("f", "a"));
+    expect(folderOf(result.current.board).spent).toEqual(["a"]);
+
+    act(() => result.current.undo());
+    // The tint edit came back out…
+    expect(folderOf(result.current.board).color).toBeUndefined();
+    // …and the round did NOT come back with it.
+    expect(folderOf(result.current.board).spent).toEqual(["a"]);
+
+    act(() => result.current.redo());
+    expect(folderOf(result.current.board).color).toBe("st-due");
+    expect(folderOf(result.current.board).spent).toEqual(["a"]);
+  });
+
+  it("a draw is not itself an undo step — a run through a folder can't bury real edits", async () => {
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.updateWidget("f", { title: "chores" }));
+    act(() => result.current.drawCard("f", "a"));
+
+    // One Ctrl+Z takes back the title, not the draw.
+    act(() => result.current.undo());
+    expect(folderOf(result.current.board).title).toBeUndefined();
+  });
+
+  it("moves the winner out to the board when the folder is set to, and doesn't call it spent", async () => {
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [{ ...folderOf(GAME_BOARD), autoPopOut: true }],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    const board = result.current.board;
+    expect(folderOf(board).children?.map((c) => c.id)).toEqual(["b"]);
+    expect(board.widgets.find((w) => w.id === "a")).toBeDefined();
+    // It left, so it is gone rather than "already drawn" — nothing to grey, nothing to prune later.
+    expect(folderOf(board).spent).toEqual([]);
+  });
+
+  it("ignores a draw naming a card the folder doesn't hold", async () => {
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    const before = result.current.board;
+    act(() => result.current.drawCard("f", "nope"));
+    expect(result.current.board).toBe(before);
+  });
+});
