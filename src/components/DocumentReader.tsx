@@ -24,6 +24,7 @@ import { Markdown } from "../lib/markdown";
 import { parentGroupStarts, segmentByLeaves, shadeLeaves } from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
 import { sourceFacts } from "../lib/sourceFacts";
+import { documentLocation } from "../lib/sourceLabel";
 import { DocumentPlaces } from "./DocumentPlaces";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
@@ -214,6 +215,11 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
   const renderedAsMarkdown = body != null && image == null && (!isIndexOnly || bodyFull);
   const canOverlay = renderedAsMarkdown && showPower;
 
+  // The full path or URL this document can be reached at — `source_path` for a stored document,
+  // `external_ref` for an indexed one. The reader had neither: it offered "Open source" as a button
+  // and never said where that would take you.
+  const location = documentLocation(doc);
+
   // Load the chunk spans for the current doc, tracking a loading/error state so the overlay panel can
   // say what's happening instead of silently rendering plain text (the old catch just turned the
   // toggle back off). Late resolves for a doc the reader has since left are dropped.
@@ -327,6 +333,15 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
               </div>
             ))}
           </dl>
+          {/* Where the file actually is. Its own line rather than a fifth pair in the `dl` above:
+              those are short values on one wrapping row, and a full Drive URL or an absolute path
+              would blow that row out. Clamped to two lines so a long one cannot push the document
+              itself down the panel, with the whole of it on the tooltip. */}
+          {location && (
+            <p className="mt-1 line-clamp-2 break-all text-xs text-ink4" title={location}>
+              {location}
+            </p>
+          )}
           {/* Every place this file lives (#710/#711). Renders nothing at all for a document with
               one place, which is nearly all of them — the source line above already said where it
               is, and "In 1 place" beneath it would be chrome restating the header. */}
