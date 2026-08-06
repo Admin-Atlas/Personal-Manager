@@ -442,6 +442,92 @@ body {
       background-color: transparent;
     }
   }
+
+  /* The Pinboard's folder games (FolderGame.tsx). Three motions the games can't express as a
+   * transition between two states, because the interesting part is the WOBBLE in between: a box
+   * being shaken, the slips jostling inside it, and the three-count bob before a throw of
+   * rock-paper-scissors. Each is pure theatre — every one of these games decides its answer before
+   * the motion starts — so under reduced motion the name simply doesn't resolve and the pieces sit
+   * still while the game still plays. Duration and repeat count are set per-element from the
+   * game's own timing, so there is one source of truth for how long a play takes. */
+  @keyframes pm-game-shake {
+    0%,
+    100% {
+      transform: translate3d(0, 0, 0) rotate(0deg);
+    }
+    12% {
+      transform: translate3d(-5px, 1px, 0) rotate(-3.5deg);
+    }
+    26% {
+      transform: translate3d(5px, -1px, 0) rotate(3.5deg);
+    }
+    40% {
+      transform: translate3d(-6px, 0, 0) rotate(-4deg);
+    }
+    54% {
+      transform: translate3d(6px, -1px, 0) rotate(4deg);
+    }
+    68% {
+      transform: translate3d(-4px, 1px, 0) rotate(-2.5deg);
+    }
+    82% {
+      transform: translate3d(3px, 0, 0) rotate(1.5deg);
+    }
+    92% {
+      transform: translate3d(-1px, 0, 0) rotate(-0.5deg);
+    }
+  }
+  @keyframes pm-game-jostle {
+    0%,
+    100% {
+      transform: translateY(0) rotate(0deg);
+    }
+    25% {
+      transform: translateY(-4px) rotate(-7deg);
+    }
+    55% {
+      transform: translateY(2px) rotate(5deg);
+    }
+    80% {
+      transform: translateY(-2px) rotate(-3deg);
+    }
+  }
+  @keyframes pm-game-bob {
+    0%,
+    100% {
+      transform: translateY(0) rotate(0deg);
+    }
+    45% {
+      transform: translateY(-14px) rotate(-8deg);
+    }
+  }
+  /* The coin's arc. The flip itself is a transition on the disc inside; this is the hand throwing
+   * it, so the two compose rather than fighting over one transform. */
+  @keyframes pm-game-toss {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-46px);
+    }
+  }
+}
+
+/* The classes those keyframes drive. Outside the reduced-motion guard so the RULES always exist —
+ * the animation-name doesn't resolve when the keyframes above aren't defined, which is the same
+ * "rests in its static state" contract .pm-locate uses. */
+.pm-game-shake {
+  animation: pm-game-shake linear 1;
+}
+.pm-game-jostle {
+  animation: pm-game-jostle ease-in-out infinite;
+}
+.pm-game-bob {
+  animation: pm-game-bob ease-in-out;
+}
+.pm-game-toss {
+  animation: pm-game-toss cubic-bezier(0.3, 0, 0.4, 1) 1;
 }
 
 /* The class the sub-nav stamps on. Outside the reduced-motion guard so the RULE always exists; the

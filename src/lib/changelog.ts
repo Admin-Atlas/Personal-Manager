@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.1-alpha",
+    date: "2026-08-06",
+    highlights: [
+      "The folder games now actually play. The wheel spins — several turns, slowing into the wedge it lands on — the straws are pulled from a fist to reveal the long one, and the box is given a proper shake, slips jostling inside it, before one is lifted out. Every piece carries the name of the card it stands for: written along its wedge, down its straw, on the slip that comes out. The coin is thrown in an arc and turns over as it goes, and a throw of rock, paper, scissors is counted out with both fists before either opens.",
+      "Smaller things around the games. With one card left there is nothing to gamble on, so the folder simply offers it rather than spinning a wheel with one wedge; and once you have taken the last one, the button that was 'Go again' says what it now does, which is start the round over. 'Move the winner out' has moved down beside 'Start the round over', where the rest of the round lives, and the list of games has gained 'Just a folder' at the top — one obvious way back to an ordinary folder, instead of having to press the game you are playing a second time.",
+      "And you can now turn the taking-turns off. 'Grey out what it picks', under the game, is what makes a round a round: leave it on and a card waits until every other one has had a go, or switch it off and there is no memory between plays at all — every card is in every draw and the same one can come up twice running. A fair share-out or an honest coin toss, whichever you actually wanted.",
+      "Three fixes. A card the folder had already drawn showed a stray piece of markup instead of its tick. A folder's own board came back without its ruled grid after a visit to the game. And a coin folder and a rock-paper-scissors folder both wore the box's icon on the board rather than their own.",
+    ],
+  },
+  {
     version: "3.128.0-alpha",
     date: "2026-08-06",
     highlights: [
