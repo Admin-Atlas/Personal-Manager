@@ -163,6 +163,44 @@ export function continueList(value: string, caret: number): ListEdit | null {
   };
 }
 
+// --- fenced code (pure) ----------------------------------------------------------------------
+//
+// Everything in this file rewrites lines by the marker they start with, and inside a fenced code
+// block that is exactly the wrong thing to do: a line there is not a list item, it is a picture of
+// one. The damage is not cosmetic. A `- ` line in a ```diff block is a REMOVED line, and rewriting
+// it to `+ ` turns it into an added one — the snippet now says the opposite of what was pasted, and
+// it says it in the vault copy too, because this output is what `ingestNote` files (F-52).
+//
+// The same blindness made a checkbox inside a fence tickable: `matchTask` saw `[] x` and counted it,
+// but the renderer emits it as literal text with no `<input>`, so every real checkbox after it was
+// off by one and a click ticked the wrong line.
+
+/** An opening or closing fence: up to three spaces, then three-or-more backticks or tildes. */
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/**
+ * Which lines are fenced code — the fence lines themselves included, since they are not content
+ * either.
+ *
+ * CommonMark's rules, kept because a note's fences also have to mean the same thing to the renderer
+ * downstream: a backtick fence's info string may not contain a backtick (that is what keeps inline
+ * code from opening a block), only a fence of the SAME character and at least the same length
+ * closes, and an unclosed fence runs to the end of the note rather than being abandoned.
+ */
+function fenceMask(lines: readonly string[]): boolean[] {
+  let open: { char: string; len: number } | null = null;
+  return lines.map((line) => {
+    const m = FENCE_RE.exec(line);
+    if (!open) {
+      if (!m || (m[1][0] === "`" && m[2].includes("`"))) return false;
+      open = { char: m[1][0], len: m[1].length };
+      return true;
+    }
+    if (m && m[1][0] === open.char && m[1].length >= open.len && m[2].trim() === "") open = null;
+    return true;
+  });
+}
+
 /** Whether a source line renders as a CONTAINER block — a list item or a blockquote — as opposed to
  *  inline text. The distinction matters for lazy continuation: CommonMark folds an unmarked line that
  *  follows one of these INTO it, so the author's line break disappears. Roman items are deliberately
@@ -193,15 +231,23 @@ function opensContainer(line: string): boolean {
  *  - a plain prose line that FOLLOWS a list item or quote gets a blank line inserted before it, so
  *    it ends the list instead of being swallowed by the last item (see below).
  *
+ * FENCED CODE PASSES THROUGH BYTE FOR BYTE — see {@link fenceMask}. Every rule above is about what
+ * a line MEANS, and inside a fence a line means only itself.
+ *
  * Line endings are normalised first. A pasted CRLF note would otherwise put the `\r` between the
  * text and the two-space hard break — `"line one\r  \n"` — which stops being a hard break and turns
  * the pair into two separate paragraphs.
  */
 export function toRenderMarkdown(raw: string): string {
   const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+  const code = fenceMask(lines);
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (code[i]) {
+      out.push(line);
+      continue;
+    }
     const m = matchMarker(line);
     if (!m) {
       // Plain prose: keep the author's own line breaks. A bare single newline is a GFM soft
@@ -217,7 +263,7 @@ export function toRenderMarkdown(raw: string): string {
       // "item plain"). In this dialect a marker is explicit, so an unmarked line is unambiguously
       // the author leaving the list — close it with a blank line. Two trailing spaces cannot save
       // this one: the problem is block-level, not a soft break inside a paragraph.
-      if (i > 0 && opensContainer(lines[i - 1])) out.push("");
+      if (i > 0 && !code[i - 1] && opensContainer(lines[i - 1])) out.push("");
       out.push(line.endsWith("  ") ? line : `${line}  `);
       continue;
     }
@@ -284,9 +330,14 @@ function matchTask(line: string): { checked: boolean } | null {
   return m ? { checked: m[2].toLowerCase() === "x" } : null;
 }
 
-/** How many tickable checkboxes the rendered note has — the bound the caller's index must respect. */
+/** How many tickable checkboxes the rendered note has — the bound the caller's index must respect.
+ *  Fenced code is skipped for the same reason it is in {@link toRenderMarkdown}: the renderer emits
+ *  a checkbox in a code block as literal text with no `<input>`, so counting it here would put every
+ *  real checkbox after it one out of step and a click would tick a different line. */
 export function countTasks(raw: string): number {
-  return raw.split("\n").reduce((n, line) => n + (matchTask(line) ? 1 : 0), 0);
+  const lines = raw.split("\n");
+  const code = fenceMask(lines);
+  return lines.reduce((n, line, i) => n + (!code[i] && matchTask(line) ? 1 : 0), 0);
 }
 
 /**
@@ -301,8 +352,10 @@ export function countTasks(raw: string): number {
 export function toggleTaskAt(raw: string, index: number, checked?: boolean): string | null {
   if (!Number.isInteger(index) || index < 0) return null;
   const lines = raw.split("\n");
+  const code = fenceMask(lines);
   let seen = -1;
   for (let i = 0; i < lines.length; i++) {
+    if (code[i]) continue;
     const hit = matchTask(lines[i]);
     if (!hit) continue;
     if (++seen !== index) continue;

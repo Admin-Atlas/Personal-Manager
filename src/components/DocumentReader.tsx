@@ -586,6 +586,15 @@ function OpenSourceButton({
           <button
             type="button"
             onClick={() => {
+              // `?.`, like every other clipboard call site here. `navigator.clipboard` is
+              // SecureContext-gated and PM is served over a custom scheme on macOS and Linux, so
+              // where it is absent an unguarded property access throws SYNCHRONOUSLY out of the
+              // handler — before any `.catch` exists — and the fallback message below, which is the
+              // whole reason the address is also selectable, would never appear.
+              if (!navigator.clipboard) {
+                setCopied("failed");
+                return;
+              }
               navigator.clipboard
                 .writeText(location)
                 .then(() => setCopied("done"))

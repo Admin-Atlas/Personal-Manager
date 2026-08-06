@@ -16,7 +16,11 @@
 // card is narrow, so lines wrap, and a wrapped line makes that arithmetic wrong by however many rows
 // it took. Instead the textarea is asked to measure itself: set its value to the text UP TO the
 // caret, read `scrollHeight` (the height that text occupies at this exact width, wrapping and all),
-// then put the value back. It costs one synchronous layout on a keypress and is exact.
+// then put the value back. It costs one synchronous layout on a keypress.
+//
+// It is exact in one direction only: `scrollHeight` is floored at the element's own visible height,
+// so it can say "at least this far down" and, within the first screenful, nothing finer.
+// `nextScrollTop` owns what to do about that, and its doc comment is the place it is written down.
 
 /** How much room to leave below the caret's line, as a multiple of the line height. A caret pinned
  *  exactly to the bottom edge reads as "the box ends here" — a line of slack shows there is room to
@@ -28,7 +32,8 @@ export interface CaretRevealGeometry {
   scrollTop: number;
   /** The visible height of the box. */
   clientHeight: number;
-  /** Distance from the top of the CONTENT to the bottom of the caret's line. */
+  /** Distance from the top of the CONTENT to the bottom of the caret's line, AS `scrollHeight`
+   *  reports it — see {@link nextScrollTop} for why that distinction is the whole ballgame. */
   caretBottom: number;
   /** One line's height, used both to find the top of the caret's line and to size the padding. */
   lineHeight: number;
@@ -43,6 +48,21 @@ export interface CaretRevealGeometry {
  * minimum needed in either direction — a caret above the fold pulls the view up to its line, one
  * below pushes it down just far enough, and a caret already comfortably inside moves nothing, so
  * this can be called after every edit without fighting the person scrolling.
+ *
+ * **`caretBottom` arrives with a FLOOR under it, and the first branch is what that floor costs.**
+ * It is measured by asking the textarea for the `scrollHeight` of the text up to the caret, and
+ * `scrollHeight` can never report less than the element's own visible height — the same floor
+ * `Composer.tsx` relies on to auto-grow. So a caret anywhere in the first screenful comes back as
+ * exactly `clientHeight`, indistinguishable from a caret genuinely resting on the bottom edge. Read
+ * literally that says "the line ends where the box ends", and the minimum-scroll rule below then
+ * scrolls DOWN a line to make room for a line that was already on screen — hiding the note's first
+ * line on almost every Enter, which is the precise opposite of the job.
+ *
+ * What the floor does still tell us is a bound: the caret's line ends no lower than one boxful into
+ * the content, so scrolling to the top is guaranteed to show it. Not the minimum scroll — the exact
+ * position is not knowable from a floored number — but the only offset that is certainly right, and
+ * it is also the answer the other direction wants, since an undo that puts the caret back near the
+ * top of a scrolled note should pull the view back up to the top with it.
  */
 export function nextScrollTop(geom: CaretRevealGeometry): number {
   const { scrollTop, clientHeight, caretBottom, lineHeight, maxScrollTop } = geom;
@@ -51,6 +71,9 @@ export function nextScrollTop(geom: CaretRevealGeometry): number {
 
   const clamp = (v: number) => Math.max(0, Math.min(v, Math.max(0, maxScrollTop)));
 
+  // Inside the first screenful, as far as a floored measurement can say. The top of the box shows
+  // it, whichever side of the caret the view is currently sitting on.
+  if (caretBottom <= clientHeight) return 0;
   // Below the fold — scroll down until the line plus its slack is inside. Clamped, so a caret on the
   // very last line asks for padding that doesn't exist and simply lands at the bottom.
   if (caretBottom + pad > scrollTop + clientHeight) {

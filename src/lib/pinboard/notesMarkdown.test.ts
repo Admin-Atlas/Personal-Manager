@@ -228,3 +228,87 @@ describe("caretForRestore — where the caret lands after an undo", () => {
     }
   });
 });
+
+describe("fenced code is not a list — it is a picture of one", () => {
+  // A `- ` line inside a ```diff block is a REMOVED line. Rewriting it to the dash-point marker
+  // makes it read as an ADDED one, so the snippet says the opposite of what was pasted — and says it
+  // in the vault copy too, since this output is what gets ingested.
+  it("leaves a pasted diff meaning what it said", () => {
+    const note = [
+      "Patch to review:",
+      "",
+      "```diff",
+      '- const BULLET = "-";',
+      '+ const BULLET = "*";',
+      "```",
+    ].join("\n");
+    const out = toRenderMarkdown(note).split("\n");
+    expect(out).toContain('- const BULLET = "-";');
+    expect(out).toContain('+ const BULLET = "*";');
+  });
+
+  it("leaves a YAML list, and every other marker, exactly as typed", () => {
+    // Not only the dash: the round-bullet, checkbox and roman branches all rewrite a line by its
+    // first token, and all of them are wrong inside a fence. The hard-break and blank-line rules
+    // are too — two trailing spaces in a code block are two characters of code.
+    const body = [
+      "- name: build",
+      ". not a bullet",
+      "[] not a checkbox",
+      "i. not roman",
+      "plain line",
+    ];
+    const note = ["```yaml", ...body, "```"].join("\n");
+    expect(toRenderMarkdown(note)).toBe(note);
+  });
+
+  it("still transforms the note either side of the fence", () => {
+    const out = toRenderMarkdown(["- before", "```", "- inside", "```", "- after"].join("\n"));
+    expect(out.split("\n")).toEqual(["+ before", "```", "- inside", "```", "+ after"]);
+  });
+
+  it("is idempotent over a note containing a fence", () => {
+    // The pass runs on every render AND on every ingest, so a note that is edited twice must not
+    // drift. Anything that grows on a second run corrupts the filed document, not just the view.
+    const note = [
+      "intro",
+      "",
+      "```sh",
+      "- ls -la",
+      "",
+      "  indented output",
+      "```",
+      "",
+      "outro",
+    ].join("\n");
+    const once = toRenderMarkdown(note);
+    expect(toRenderMarkdown(once)).toBe(once);
+  });
+
+  it("respects the fence rules that decide where a block ends", () => {
+    // A backtick fence with a backtick in its info string does not open one (that is what keeps
+    // inline code from swallowing the rest of a note); only a fence of the same character and at
+    // least the same length closes; and an unclosed fence runs to the end.
+    expect(toRenderMarkdown("``` `- x`\n- y").split("\n")).toEqual(["``` `- x`  ", "+ y"]);
+    expect(toRenderMarkdown("~~~~\n- a\n~~~\n- b\n~~~~\n- c").split("\n")).toEqual([
+      "~~~~",
+      "- a",
+      "~~~",
+      "- b",
+      "~~~~",
+      "+ c",
+    ]);
+    expect(toRenderMarkdown("```\n- a\n- b").split("\n")).toEqual(["```", "- a", "- b"]);
+  });
+
+  it("does not offer a checkbox inside a fence, so the real ones stay in step", () => {
+    // The renderer emits a fenced checkbox as literal text with no `<input>`. Counting it here would
+    // make every real box after it one out of step, and a click would tick a different line.
+    const note = ["[] real one", "```", "[] not tickable", "```", "[] real two"].join("\n");
+    expect(countTasks(note)).toBe(2);
+    expect(toggleTaskAt(note, 1)).toBe(
+      ["[] real one", "```", "[] not tickable", "```", "[x] real two"].join("\n"),
+    );
+    expect(toggleTaskAt(note, 2)).toBeNull();
+  });
+});

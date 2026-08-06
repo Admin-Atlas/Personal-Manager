@@ -330,8 +330,16 @@ function DrawGame({
     [],
   );
 
-  // Switching game mid-round would otherwise leave the previous game's winner on the stage.
+  // Switching game mid-round would otherwise leave the previous game's winner on the stage — and,
+  // if the switch lands mid-spin, the OLD game's timer is still counting down. It would fire into
+  // the new game and move it to "done" with the winner it was just told to forget, so the screen
+  // announces a result nothing on it names. The play it belonged to is already recorded, so there
+  // is nothing to finish: drop it.
   useEffect(() => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
     setPhase("idle");
     setWinnerId(null);
     setStaged(null);
@@ -478,6 +486,12 @@ function VerdictGame({
   );
 
   const clear = useCallback(() => {
+    // A settle in flight belongs to the card being cleared away. Left running it would land on
+    // whatever is on the table next and call it decided — so it goes with the card.
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
     setOfferedId(null);
     setHeld([]);
     setPhase("idle");

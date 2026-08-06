@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.2-alpha",
+    date: "2026-08-06",
+    highlights: [
+      "A card you WIN at a coin toss or at rock, paper, scissors stays in its folder. It was being moved onto your board anyway, if you had asked for winners to be moved out — so the screen said you were off the hook while the job quietly landed on the board regardless. Winning means you don't have to do it, which is the entire point of playing for it.",
+      "A tick-list in a note sits flush against the note's edge again, rather than indented as though it were nested inside something.",
+      "Notes stop scrolling themselves. Pressing Enter, Tab or a formatting button near the top of a note pushed the note down a line and took its first line off the top of the card; and an undo that put the cursor back near the top left it just above the edge instead of scrolling up to it. Both are the same miscount, in opposite directions.",
+      "Code pasted into a note is left exactly as pasted. A line beginning with a dash inside a fenced code block was being rewritten as a dash point, which in a diff turns a removed line into an added one — the snippet said the opposite of what was pasted, in the note and in the copy filed into your library. Tick-boxes drawn inside code are no longer offered as tick-boxes either, so the real ones stay in step.",
+      "A document's folder trail is either right or absent, never plausibly wrong. If PM was throttled or briefly couldn't reach a folder part-way up the chain, it saved the short path it had got as though that were the whole answer — and a saved trail is never looked at again, so `Clients › Acme › Invoices` stayed `Acme › Invoices` for good. It now waits and asks again on the next sync. With two Google accounts connected, one account being refused a folder no longer answers the question on the other's behalf.",
+      "Smaller things around the folder games: switching game mid-spin no longer announces a result for a game you've left, taking a card out of a folder by hand or deleting it now takes it out of the round too (the count could read '-1 of 1 still in'), and choosing a game or flipping either of its switches no longer costs you a Ctrl+Z that does nothing.",
+    ],
+  },
+  {
     version: "3.128.1-alpha",
     date: "2026-08-06",
     highlights: [
@@ -84,7 +96,7 @@ export const CHANGELOG: ChangelogEntry[] = [
       "Every document now says where it actually is, in the table AND when you open it. A file on your machine always showed its path under its title; anything indexed from a connected account showed nothing at all — including files in a folder you had asked PM to watch, whose full path was sitting on the row the whole time. They all say it now, with the whole of a long one on hover, and the reader says it too rather than only offering a button that opens it.",
       "The Documents table stops wasting space. Each column is the width of what is in it, rather than reserving room for its worst case whether or not anything in it is that long — and all of that slack used to collect in one gap between a document's title and the buttons beside it. Names and paths still stop at a sensible width so one long one can't stretch a column; dates and sizes take exactly the room they need.",
       "The order you put the table in stays put. Sorting by size and then going to look at something else no longer drops you back to newest-first when you come back, and it survives closing and reopening PM.",
-      "A new Source column, off until you switch it on from the Columns menu, says what PM is actually holding and what it is only pointing at: your vault, this device, each connected account, and — sorted to the end, whichever way round you click — the ones PM can't reach just now and the ones whose original has been deleted. Anything with something wrong with it is marked in that column, so a whole library's worth of trouble is one click of the heading away.",
+      "A new Source column, off until you switch it on from the Columns menu, says what PM is actually holding and what it is only pointing at: your vault, this device, each connected account, and, last of all, the ones PM can't reach just now and the ones whose original has been deleted. Anything with something wrong with it is marked in that column, so clicking the heading gathers a whole library's worth of trouble at one end — the bottom, or the top if you click again.",
       "Sorting by a column most documents have no answer for now keeps the blanks at the bottom whichever way you sort, which is what it was always meant to do. One direction was doing it and the other was moving them all to the top, burying every document that did have an answer.",
     ],
   },

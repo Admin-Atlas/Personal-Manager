@@ -251,11 +251,17 @@ body {
    There is no class-only twin for the second condition — "has a non-task child" is not something a
    class can say. On an engine without `:has()` the rule simply doesn't apply and every checklist
    keeps the ordinary list indent, which is the SAFE direction to degrade: a checkbox one notch
-   further in, never a bullet with no bullet. */
-.pm-note-md .pm-markdown > ul.contains-task-list:not(:has(> li:not(.task-list-item))),
-.pm-note-md
-  .pm-markdown
-  > ul:has(> li > input[type="checkbox"]):not(:has(> li:not(:has(> input)))) {
+   further in, never a bullet with no bullet.
+
+   ONE SELECTOR, ON ITS OWN, and that is load-bearing. This shipped as a two-selector list whose
+   second half was `ul:has(…):not(:has(> li:not(:has(> input))))` — a `:has()` inside a `:has()`,
+   which Selectors-4 §5.1 declares invalid, and an invalid selector anywhere in a comma-separated
+   list takes the WHOLE rule down with it. So the working class-only half died alongside it and
+   every checklist silently regained the indent this rule exists to remove. The classes are not a
+   fallback for a missing `:has()` here, they are the primary spelling: `remark-gfm` emits
+   `contains-task-list` on the list and `task-list-item` on each box, `markdown.tsx`'s sanitiser
+   schema admits exactly those two, and `markdown.test.ts` pins that it still does. */
+.pm-note-md .pm-markdown > ul.contains-task-list:not(:has(> li:not(.task-list-item))) {
   padding-left: 0;
 }
 /* Consecutive lists in a NOTE read as one block. Changing the marker character starts a new list in

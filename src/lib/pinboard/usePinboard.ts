@@ -10,7 +10,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
-import { carryGameState, keepsRound, markDrawn, pruneSpent } from "./game";
+import {
+  carryGameState,
+  GAME_FIELDS,
+  keepsRound,
+  markDrawn,
+  pruneSpent,
+  withPrunedRound,
+} from "./game";
 import {
   clampRect,
   COLS,
@@ -181,6 +188,14 @@ function commitForPatch(id: string, patch: Partial<Widget>): CommitKind {
   // Ingest metadata mirrors a REAL vault document, which undo cannot delete. Rolling these fields
   // back would only make the note lie about whether it had been filed.
   if ("ingestedAt" in patch || "ingestedHash" in patch) return { mode: "silent" };
+  // A folder's game and the round in progress are deliberately outside the undoable document:
+  // `carryGameState` re-grafts the LIVE values onto whatever board undo restores, so a step that
+  // only touches them would be a keystroke that visibly does nothing — and, since it still consumes
+  // one, a second Ctrl+Z is then needed to reach the edit the user actually meant.
+  const touched = Object.keys(patch);
+  if (touched.length > 0 && touched.every((k) => (GAME_FIELDS as readonly string[]).includes(k))) {
+    return { mode: "silent" };
+  }
   // Linking a timeline to a project writes real milestones to the backend BEFORE this patch lands.
   // No board snapshot can retract them, and restoring the freeform entries they were made from would
   // draw both on the calendar — so a link is where the board's history honestly ends. (Unlinking
@@ -455,7 +470,8 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
           ...b,
           widgets: b.widgets.map((w) =>
             w.kind === "folder" && w.children?.some((c) => c.id === id)
-              ? { ...w, children: (w.children ?? []).filter((c) => c.id !== id) }
+              ? // Deleted, so it is out of the round too — see `withPrunedRound`.
+                withPrunedRound({ ...w, children: (w.children ?? []).filter((c) => c.id !== id) })
               : w,
           ),
         };
@@ -478,7 +494,12 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
         // findFreeRect falls back to an OVERLAPPING origin when the board is full, which would let a
         // card pop straight back into the folder it just came out of.
         const landing = findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
-        const ws = b.widgets.map((w) => (w.id === folderId ? { ...w, children: remaining } : w));
+        // The card has left, so it is no longer "drawn this round" — it is gone. Same reasoning as
+        // the draw's own pop-out branch: the round has to stay the same length as the pool it
+        // describes, or the legend counts a card that is not there.
+        const ws = b.widgets.map((w) =>
+          w.id === folderId ? withPrunedRound({ ...w, children: remaining }) : w,
+        );
         return { ...b, widgets: [...ws, { ...child, rect: landing }] };
       });
     },
@@ -503,9 +524,16 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
    * draws are assignments. A verdict game (a coin, a throw) also takes cards OFF the table — you
    * won, so you dodged that one — and a card you dodged has still had its turn this round but is
    * emphatically not a job to move onto your board. Only an assignment is ever popped out.
+   *
+   * REQUIRED, with no default, and that is the point. It had one, and every caller in the app went
+   * through a `(childId) => onDraw(folder.id, childId)` adapter that silently dropped it — so a
+   * dodged card was popped out anyway, and TypeScript could not say so: a parameter with a default
+   * is optional, which assigns cleanly to a prop type declared one argument short. A card that a
+   * game has told you you are off the hook for must not land on your board, so the compiler is the
+   * thing that has to catch the next adapter that forgets.
    */
   const drawCard = useCallback(
-    (folderId: string, childId: string, assigned = true) => {
+    (folderId: string, childId: string, assigned: boolean) => {
       change((b) => {
         const { cols, rows } = boundsRef.current;
         const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");

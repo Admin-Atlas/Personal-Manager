@@ -170,7 +170,7 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     const { result, unmount } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
     await flushDebounce();
     expect(folderOf(result.current.board).spent).toEqual(["a"]);
 
@@ -214,8 +214,8 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     const { result } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
-    act(() => result.current.drawCard("f", "b"));
+    act(() => result.current.drawCard("f", "a", true));
+    act(() => result.current.drawCard("f", "b", true));
     expect(folderOf(result.current.board).spent).toEqual([]);
   });
 
@@ -226,11 +226,11 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     const { result } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
     act(() => result.current.updateWidget("f", { color: "st-due" }));
-    act(() => result.current.drawCard("f", "b"));
+    act(() => result.current.drawCard("f", "b", true));
     // Drawing "b" emptied the round; draw once more so there is something to lose.
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
     expect(folderOf(result.current.board).spent).toEqual(["a"]);
 
     act(() => result.current.undo());
@@ -250,7 +250,7 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     await settle();
 
     act(() => result.current.updateWidget("f", { title: "chores" }));
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
 
     // One Ctrl+Z takes back the title, not the draw.
     act(() => result.current.undo());
@@ -267,7 +267,7 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     const { result } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
     const board = result.current.board;
     expect(folderOf(board).children?.map((c) => c.id)).toEqual(["b"]);
     expect(board.widgets.find((w) => w.id === "a")).toBeDefined();
@@ -301,7 +301,7 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     await settle();
 
     const before = result.current.board;
-    act(() => result.current.drawCard("f", "nope"));
+    act(() => result.current.drawCard("f", "nope", true));
     expect(result.current.board).toBe(before);
   });
 });
@@ -317,8 +317,8 @@ describe("usePinboard — a folder that repeats keeps no round at all", () => {
     const { result } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
+    act(() => result.current.drawCard("f", "a", true));
     expect(folderOf(result.current.board).spent ?? []).toEqual([]);
     // And nothing left the folder either — a draw is a suggestion, not a move.
     expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["a", "b"]);
@@ -335,8 +335,8 @@ describe("usePinboard — a folder that repeats keeps no round at all", () => {
     const writes = ipc.setPref.mock.calls.length;
 
     const before = result.current.board;
-    act(() => result.current.drawCard("f", "a"));
-    act(() => result.current.drawCard("f", "b"));
+    act(() => result.current.drawCard("f", "a", true));
+    act(() => result.current.drawCard("f", "b", true));
     // The very same board object, so React never re-renders and the persist effect never runs.
     expect(result.current.board).toBe(before);
     await flushDebounce();
@@ -353,7 +353,7 @@ describe("usePinboard — a folder that repeats keeps no round at all", () => {
     const { result } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
     expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["b"]);
     expect(result.current.board.widgets.find((w) => w.id === "a")).toBeDefined();
     expect(folderOf(result.current.board).spent ?? []).toEqual([]);
@@ -371,9 +371,95 @@ describe("usePinboard — a folder that repeats keeps no round at all", () => {
     const { result } = renderHook(() => usePinboard());
     await settle();
 
-    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a", true));
     expect(folderOf(result.current.board).spent).toEqual([]);
     // It was never held back in the first place — the list was already being ignored.
     expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("usePinboard — every way a card leaves takes it out of the round too", () => {
+  // The round is a list of ids and the counter is "pool minus round", so the two have to be
+  // maintained together. `drawCard`'s own pop-out branch did it; the three other exits did not, and
+  // a folder down to one card in a finished round rendered "-1 of 1 still in".
+  const started = () =>
+    JSON.stringify({
+      version: BOARD_VERSION,
+      widgets: [{ ...folderOf(GAME_BOARD), spent: ["a"] }],
+    });
+
+  it("forgets a card popped out of the folder by hand", async () => {
+    ipc.getPref.mockResolvedValue(started());
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.popOutChild("f", "a"));
+    expect(folderOf(result.current.board).spent).toEqual([]);
+    // And it really did move — the pruning must not be quietly standing in for the pop-out.
+    expect(result.current.board.widgets.find((w) => w.id === "a")).toBeTruthy();
+  });
+
+  it("forgets a card deleted out of the folder", async () => {
+    ipc.getPref.mockResolvedValue(started());
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.removeWidget("a"));
+    expect(folderOf(result.current.board).spent).toEqual([]);
+    expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["b"]);
+  });
+
+  it("leaves a folder that is not playing a game exactly as it was", async () => {
+    // No `spent` field goes on unless there already is one: a plain folder must not pick up a
+    // game's bookkeeping just because a card was taken out of it.
+    ipc.getPref.mockResolvedValue(JSON.stringify(STORED));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+    const plain = result.current.board.widgets.find((w) => w.kind === "folder");
+    if (plain?.children?.length) {
+      act(() => result.current.popOutChild(plain.id, plain.children![0].id));
+      const after = result.current.board.widgets.find((w) => w.id === plain.id)!;
+      expect(after.spent ?? []).toEqual([]);
+    }
+  });
+});
+
+describe("usePinboard — a game setting is not an undo step", () => {
+  // `carryGameState` re-grafts the LIVE game fields onto whatever board undo restores, so a step
+  // that only touches them restores nothing visible. Pushing one anyway costs a keystroke that
+  // appears to do nothing, and then a second to reach the edit the user actually meant.
+  it("does not push a step for choosing a game, or for either round switch", async () => {
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.updateWidget("f", { title: "Chores" }));
+    act(() => result.current.updateWidget("f", { game: "coin" }));
+    act(() => result.current.updateWidget("f", { autoPopOut: true }));
+    act(() => result.current.updateWidget("f", { repeat: true }));
+    act(() => result.current.updateWidget("f", { spent: [] }));
+
+    // One Ctrl+Z reaches past all four of them to the title, which is the real edit.
+    act(() => result.current.undo());
+    expect(folderOf(result.current.board).title).toBeUndefined();
+    // ...and the live game state is carried across the restore rather than rolled back with it.
+    expect(folderOf(result.current.board).game).toBe("coin");
+    expect(folderOf(result.current.board).repeat).toBe(true);
+  });
+
+  it("still pushes a step for a patch that touches anything else as well", async () => {
+    // The rule is "ONLY game fields". A patch that carries a real edit alongside one is a real edit.
+    ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.updateWidget("f", { title: "Chores" }));
+    act(() =>
+      result.current.updateWidget("f", { gameOn: false, rect: { x: 5, y: 5, w: 3, h: 3 } }),
+    );
+    act(() => result.current.undo());
+    // The move came back, so the patch was a step; the title it was stacked on is still there.
+    expect(folderOf(result.current.board).rect).toEqual({ x: 0, y: 0, w: 3, h: 3 });
+    expect(folderOf(result.current.board).title).toBe("Chores");
   });
 });

@@ -17,9 +17,10 @@ const box = (over: Partial<Parameters<typeof nextScrollTop>[0]>) =>
 
 describe("nextScrollTop", () => {
   it("moves nothing when the caret is comfortably inside the view", () => {
-    // Line 3 of 5 visible, nowhere near either edge — calling this after every edit must not fight
-    // someone who has scrolled deliberately.
-    expect(box({ scrollTop: 0, caretBottom: 60 })).toBe(0);
+    // Scrolled to 40, so lines 3-7 are showing; the caret is on line 5, nowhere near either edge.
+    // Calling this after every edit must not fight someone who has scrolled deliberately. The
+    // measurement is above `clientHeight`, so it is a real one rather than the floor below.
+    expect(box({ scrollTop: 40, caretBottom: 120 })).toBe(40);
   });
 
   it("scrolls down just enough, plus a line of slack", () => {
@@ -28,9 +29,36 @@ describe("nextScrollTop", () => {
   });
 
   it("scrolls up to a caret above the fold, again with slack", () => {
-    // Caret on line 2 (top at 20) while scrolled to 100 → its line, less one line of padding.
-    expect(box({ scrollTop: 100, caretBottom: 40 })).toBe(0);
-    expect(box({ scrollTop: 100, caretBottom: 100 })).toBe(60);
+    // Caret on line 7 (top at 120) while scrolled to 180 → its line, less one line of padding.
+    expect(box({ scrollTop: 180, caretBottom: 140, maxScrollTop: 200 })).toBe(100);
+  });
+
+  // `caretBottom` comes from `scrollHeight`, which cannot report below the element's own height. So
+  // every caret in the first screenful measures as exactly `clientHeight` — it is not a position,
+  // it is the floor — and reading it as one is what made pressing Enter on line 2 of a note scroll
+  // the note down and take line 1 off the screen.
+  describe("a measurement sitting on the scrollHeight floor", () => {
+    it("does not scroll down to make room for a line that is already showing", () => {
+      // The regression: caret on line 2 of a note scrolled to the top. Treated as a real position
+      // this reads as "the line ends exactly at the bottom edge" and asks for a line of slack below
+      // it — one line down, and the first line of the note is gone.
+      expect(box({ scrollTop: 0, caretBottom: 100 })).toBe(0);
+    });
+
+    it("pulls a scrolled note back to the top, not to somewhere in the middle", () => {
+      // The other half, and the case the whole function was written for: undo puts the caret back
+      // near the top of a note you had scrolled down. The floor cannot say which line, but it does
+      // say "within the first screenful", and the top of the box is the one offset that shows every
+      // line in it.
+      expect(box({ scrollTop: 100, caretBottom: 100 })).toBe(0);
+      expect(box({ scrollTop: 100, caretBottom: 20 })).toBe(0);
+    });
+
+    it("still trusts a measurement that clears the floor", () => {
+      // One pixel past `clientHeight` is a genuine measurement again, and the ordinary minimum-scroll
+      // rule takes over — no special case bleeding past the boundary.
+      expect(box({ scrollTop: 0, caretBottom: 101 })).toBe(21);
+    });
   });
 
   it("never asks for a scroll the box cannot reach", () => {

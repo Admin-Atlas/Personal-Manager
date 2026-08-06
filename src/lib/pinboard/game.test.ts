@@ -22,6 +22,7 @@ import {
   THROWS,
   wedgeAngles,
   weightOf,
+  withPrunedRound,
 } from "./game";
 import { BOARD_VERSION } from "./types";
 import type { Board, Widget } from "./types";
@@ -291,6 +292,33 @@ describe("pruneSpent — a card that left is not 'already drawn'", () => {
   it("drops a card that became a timeline's problem — pool is notes only", () => {
     const f = folder("f", [timeline("t")], { spent: ["t"] });
     expect(pruneSpent(f)).toEqual([]);
+  });
+});
+
+describe("withPrunedRound — the form every card-removing call site should use", () => {
+  it("keeps the round the same length as the pool it describes", () => {
+    // The counter reads "pool minus round". A card popped out by hand used to leave its id behind,
+    // so a one-card folder in a finished round rendered "-1 of 1 still in".
+    const f = folder("f", [note("a")], { spent: ["a", "gone"] });
+    expect(withPrunedRound(f).spent).toEqual(["a"]);
+  });
+
+  it("returns the SAME folder when nothing needs dropping, so a caller can skip the write", () => {
+    const f = folder("f", [note("a"), note("b")], { spent: ["a"] });
+    expect(withPrunedRound(f)).toBe(f);
+  });
+
+  it("never puts a round on a folder that has none", () => {
+    // A plain folder is not a game folder. Writing `spent: []` onto it would change the stored board
+    // for nothing and give every folder a game's bookkeeping.
+    const plain = folder("f", [note("a")]);
+    expect(withPrunedRound(plain)).toBe(plain);
+    expect("spent" in withPrunedRound(plain)).toBe(false);
+  });
+
+  it("leaves an empty round alone rather than replacing the array", () => {
+    const f = folder("f", [note("a")], { spent: [] });
+    expect(withPrunedRound(f)).toBe(f);
   });
 });
 
