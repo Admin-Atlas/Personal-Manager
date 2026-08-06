@@ -11,7 +11,7 @@ export type WidgetKind = "note" | "timeline" | "folder";
  *  Lives here rather than beside the rules because it is part of the persisted board shape, and
  *  `types.ts` is where that shape is declared. **Only ever add to this union**: dropping a value
  *  would leave stored boards naming a game that no longer exists. */
-export type GameKind = "roulette" | "straws" | "box";
+export type GameKind = "roulette" | "straws" | "box" | "coin" | "rps";
 
 /** A widget's position and size, in grid cells (top-left origin). */
 export interface Rect {
@@ -97,6 +97,12 @@ export interface Widget {
   /** Whether a drawn card also leaves the folder for the board (the same move the ⤴ makes). Absent
    *  → it stays put and merely greys out. Optional and additive, so `BOARD_VERSION` stays 1. */
   autoPopOut?: boolean;
+  /** A folder CHILD's share of the draw, where the game has a visible proportion to give it — the
+   *  roulette wheel, and only that one. `1` is an even share and is what every card is worth until
+   *  it is changed, so absent means the same as 1 and an untouched folder draws uniformly. Read
+   *  through `weightOf`, which is where the range is enforced. Optional and additive, so old boards
+   *  parse unchanged and `BOARD_VERSION` stays 1. */
+  weight?: number;
 }
 
 export interface Board {

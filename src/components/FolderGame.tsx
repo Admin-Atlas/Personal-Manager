@@ -24,7 +24,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { Button, Popover, Toggle, VisuallyHidden } from "./ui";
+import { Button, Popover, Select, Toggle, VisuallyHidden } from "./ui";
 import { prefersReducedMotion } from "../theme/motion";
 import {
   cardLabel,
@@ -34,12 +34,25 @@ import {
   isSpent,
   livePool,
   pool,
+  rpsOutcome,
+  shares,
+  THROW_LABEL,
+  THROWS,
+  WEIGHT_CHOICES,
+  weightOf,
+  type Throw,
 } from "../lib/pinboard/game";
 import { TINT_PALETTE } from "../lib/pinboard/palette";
 import type { GameKind, Widget } from "../lib/pinboard/types";
 
 /** How long each game's theatre runs, in ms. Collapsed to 0 when motion is reduced. */
-const SPIN_MS: Record<GameKind, number> = { roulette: 2600, straws: 1500, box: 1300 };
+const SPIN_MS: Record<GameKind, number> = {
+  roulette: 2600,
+  straws: 1500,
+  box: 1300,
+  coin: 1100,
+  rps: 900,
+};
 
 /** A uniform number in [0, 1) from the platform CSPRNG, falling back to `Math.random` where it
  *  isn't there. Randomness lives HERE and nowhere else — `game.ts` takes the number as an argument
@@ -81,19 +94,47 @@ export function FolderGame({
   game,
   onDraw,
   onPopOut,
+  onWeight,
   onResetRound,
 }: {
   folder: Widget;
   game: GameKind;
-  onDraw: (childId: string) => void;
+  onDraw: (childId: string, assigned: boolean) => void;
   onPopOut: (childId: string) => void;
+  onWeight: (childId: string, weight: number) => void;
   onResetRound: () => void;
 }) {
+  const cards = useMemo(() => pool(folder), [folder]);
+  if (cards.length === 0) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-3">
+        <EmptyGame />
+      </div>
+    );
+  }
+  const props = { folder, game, cards, onDraw, onPopOut, onWeight, onResetRound };
+  // The two shapes are genuinely different games, not one game with two skins: a wheel picks out of
+  // all of them, a coin puts ONE to you and lets you play for it. Splitting here keeps each one's
+  // state where it belongs instead of a single component holding both sets.
+  return GAME_INFO[game].shape === "draw" ? <DrawGame {...props} /> : <VerdictGame {...props} />;
+}
+
+interface GameProps {
+  folder: Widget;
+  game: GameKind;
+  cards: Widget[];
+  onDraw: (childId: string, assigned: boolean) => void;
+  onPopOut: (childId: string) => void;
+  onWeight: (childId: string, weight: number) => void;
+  onResetRound: () => void;
+}
+
+/** The three that pick one card out of the whole folder: the wheel, the straws, the box. */
+function DrawGame({ folder, game, cards, onDraw, onPopOut, onWeight, onResetRound }: GameProps) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [winnerId, setWinnerId] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const cards = useMemo(() => pool(folder), [folder]);
   const inPlay = useMemo(() => livePool(folder), [folder]);
   const info = GAME_INFO[game];
 
@@ -114,12 +155,12 @@ export function FolderGame({
 
   const play = useCallback(() => {
     if (phase === "playing" || inPlay.length === 0) return;
-    const winner = draw(inPlay, randomUnit());
+    const winner = draw(inPlay, randomUnit(), info.weighted);
     if (!winner) return;
     // Recorded NOW, not when the theatre finishes: the round is the honest part, and it must
     // survive the surface being closed (or PM being quit) halfway through a spin.
     setWinnerId(winner.id);
-    onDraw(winner.id);
+    onDraw(winner.id, true);
     const wait = prefersReducedMotion() ? 0 : SPIN_MS[game];
     if (wait === 0) {
       setPhase("done");
@@ -127,7 +168,7 @@ export function FolderGame({
     }
     setPhase("playing");
     timer.current = setTimeout(() => setPhase("done"), wait);
-  }, [phase, inPlay, game, onDraw]);
+  }, [phase, inPlay, game, info.weighted, onDraw]);
 
   const replay = useCallback(() => {
     setPhase("idle");
@@ -149,41 +190,304 @@ export function FolderGame({
       </VisuallyHidden>
 
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-auto p-3">
-        {cards.length === 0 ? (
-          <EmptyGame />
+        <Stage
+          game={game}
+          inPlay={inPlay}
+          winnerId={winnerId}
+          spinning={spinning}
+          settled={settled}
+          weighted={info.weighted}
+        />
+        <Verdict
+          info={info}
+          settled={settled}
+          spinning={spinning}
+          winner={winner}
+          remaining={inPlay.length}
+          onPlay={play}
+          onAgain={replay}
+          onPopOut={onPopOut}
+        />
+      </div>
+
+      <Legend
+        folder={folder}
+        cards={cards}
+        winnerId={settled ? winnerId : null}
+        weighted={info.weighted}
+        onWeight={onWeight}
+        onReset={onResetRound}
+      />
+    </div>
+  );
+}
+
+/** The two that put ONE card to you and let you play for it: the coin and the throw.
+ *
+ *  The loop is the same for both — offer a card, play a two-outcome round, lose and it's yours,
+ *  win and it offers the next one. Only the theatre differs, and who counts as having won. Either
+ *  way that card has had its turn this round, which is what stops a folder putting the same job to
+ *  you over and over; but a card you DODGED is not work, so it is never popped out to the board. */
+function VerdictGame({ folder, game, cards, onDraw, onPopOut, onWeight, onResetRound }: GameProps) {
+  const [offeredId, setOfferedId] = useState<string | null>(null);
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [heads, setHeads] = useState(false);
+  const [mine, setMine] = useState<Throw | null>(null);
+  const [theirs, setTheirs] = useState<Throw | null>(null);
+  const [result, setResult] = useState<"do" | "dodge" | "tie" | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const inPlay = useMemo(() => livePool(folder), [folder]);
+  const info = GAME_INFO[game];
+  const offered = offeredId ? cards.find((c) => c.id === offeredId) : undefined;
+
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  const clear = useCallback(() => {
+    setOfferedId(null);
+    setPhase("idle");
+    setMine(null);
+    setTheirs(null);
+    setResult(null);
+  }, []);
+
+  // Changing game mid-round must not leave the previous one's card sitting on the table.
+  useEffect(() => clear(), [game, clear]);
+
+  /** Put the next card on the table. Nothing is spent yet — it hasn't been decided. */
+  const offer = useCallback(() => {
+    const next = draw(inPlay, randomUnit());
+    if (!next) return;
+    setOfferedId(next.id);
+    setPhase("idle");
+    setMine(null);
+    setTheirs(null);
+    setResult(null);
+  }, [inPlay]);
+
+  /** Settle the offered card. Decided FIRST, exactly as in the draw games — the animation is
+   *  theatre, and under reduced motion there isn't one. */
+  const settleWith = useCallback(
+    (outcome: "do" | "dodge") => {
+      if (!offeredId) return;
+      onDraw(offeredId, outcome === "do");
+      const wait = prefersReducedMotion() ? 0 : SPIN_MS[game];
+      setResult(outcome);
+      if (wait === 0) {
+        setPhase("done");
+        return;
+      }
+      setPhase("playing");
+      timer.current = setTimeout(() => setPhase("done"), wait);
+    },
+    [offeredId, game, onDraw],
+  );
+
+  const flip = useCallback(() => {
+    if (phase === "playing" || !offeredId) return;
+    const isHeads = randomUnit() < 0.5;
+    setHeads(isHeads);
+    settleWith(isHeads ? "do" : "dodge");
+  }, [phase, offeredId, settleWith]);
+
+  const throwHand = useCallback(
+    (hand: Throw) => {
+      if (phase === "playing" || !offeredId) return;
+      const pm = THROWS[Math.min(2, Math.floor(randomUnit() * 3))];
+      setMine(hand);
+      setTheirs(pm);
+      const outcome = rpsOutcome(hand, pm);
+      if (outcome === "tie") {
+        // Nobody won, so the card has NOT had its turn — throw again on the same one.
+        setResult("tie");
+        setPhase("done");
+        return;
+      }
+      settleWith(outcome === "lose" ? "do" : "dodge");
+    },
+    [phase, offeredId, settleWith],
+  );
+
+  const busy = phase === "playing";
+  const settled = phase === "done";
+  const announcement =
+    settled && result === "do"
+      ? `That one is yours: ${offered ? cardLabel(offered) : "your card"}.`
+      : settled && result === "dodge"
+        ? "You won — off the hook for that one."
+        : settled && result === "tie"
+          ? "A tie. Throw again."
+          : "";
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <VisuallyHidden role="status" aria-live="polite">
+        {announcement}
+      </VisuallyHidden>
+
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-auto p-3">
+        {!offered ? (
+          <div className="flex flex-col items-center gap-2 text-center">
+            <p className="max-w-xs text-xs text-ink4">{info.blurb}</p>
+            <Button size="sm" onClick={offer} disabled={inPlay.length === 0}>
+              {inPlay.length === 0 ? "Nothing left to offer" : "Offer me one"}
+            </Button>
+          </div>
         ) : (
           <>
-            <Stage
-              game={game}
-              folder={folder}
-              cards={cards}
-              inPlay={inPlay}
-              winnerId={winnerId}
-              spinning={spinning}
-              settled={settled}
-            />
-            <Verdict
-              info={info}
-              settled={settled}
-              spinning={spinning}
-              winner={winner}
-              remaining={inPlay.length}
-              onPlay={play}
-              onAgain={replay}
-              onPopOut={onPopOut}
-            />
+            <div className="max-w-xs text-center">
+              <p className="text-xs uppercase tracking-wide text-ink4">On the table</p>
+              <p className="mt-1 text-sm font-medium text-ink">{cardLabel(offered)}</p>
+            </div>
+
+            {game === "coin" ? (
+              <Coin heads={heads} spinning={busy} settled={settled} />
+            ) : (
+              <Hands mine={mine} theirs={theirs} spinning={busy} />
+            )}
+
+            {busy ? (
+              <p className="text-xs text-ink4">{info.verb}ing&hellip;</p>
+            ) : settled ? (
+              <div className="flex flex-col items-center gap-2 text-center">
+                <p className="max-w-xs text-sm font-medium text-ink">
+                  {result === "do"
+                    ? "That one's yours."
+                    : result === "dodge"
+                      ? "You're off the hook."
+                      : "A tie — go again."}
+                </p>
+                <div className="flex items-center gap-2">
+                  {result === "do" && (
+                    <Button variant="secondary" size="sm" onClick={() => onPopOut(offered.id)}>
+                      Move out to the board
+                    </Button>
+                  )}
+                  {result === "tie" ? (
+                    <Button size="sm" onClick={() => setPhase("idle")}>
+                      Throw again
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="tertiary"
+                      size="sm"
+                      onClick={offer}
+                      disabled={inPlay.length === 0}
+                    >
+                      {inPlay.length === 0 ? "That was the last one" : "Offer me another"}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ) : game === "coin" ? (
+              <Button size="sm" onClick={flip}>
+                Flip for it
+              </Button>
+            ) : (
+              <div className="flex items-center gap-2">
+                {THROWS.map((t) => (
+                  <Button key={t} variant="secondary" size="sm" onClick={() => throwHand(t)}>
+                    {THROW_LABEL[t]}
+                  </Button>
+                ))}
+              </div>
+            )}
           </>
         )}
       </div>
 
-      {cards.length > 0 && (
-        <Legend
-          folder={folder}
-          cards={cards}
-          winnerId={settled ? winnerId : null}
-          onReset={onResetRound}
-        />
-      )}
+      <Legend
+        folder={folder}
+        cards={cards}
+        winnerId={settled && result === "do" ? offeredId : null}
+        weighted={info.weighted}
+        onWeight={onWeight}
+        onReset={onResetRound}
+      />
+    </div>
+  );
+}
+
+/** The coin: one disc that turns over and comes up heads or tails. */
+function Coin({
+  heads,
+  spinning,
+  settled,
+}: {
+  heads: boolean;
+  spinning: boolean;
+  settled: boolean;
+}) {
+  const shown = spinning || settled;
+  // Five whole turns of theatre, landing on the face it already decided on.
+  const turns = shown ? 360 * 5 + (heads ? 0 : 180) : 0;
+  return (
+    <div
+      role="img"
+      aria-label={shown ? (heads ? "Heads" : "Tails") : "A coin, not yet flipped"}
+      className="flex h-24 w-24 items-center justify-center"
+      style={{ perspective: "400px" }}
+    >
+      <div
+        className="flex h-20 w-20 items-center justify-center rounded-full border-2 text-sm font-medium"
+        style={{
+          borderColor: "var(--border2)",
+          background: "color-mix(in oklab, var(--st-look) 40%, var(--panel))",
+          color: "var(--ink2)",
+          transform: `rotateY(${turns}deg)`,
+          transitionProperty: "transform",
+          transitionDuration: spinning ? `${SPIN_MS.coin}ms` : "0ms",
+          transitionTimingFunction: "cubic-bezier(0.2, 0.8, 0.2, 1)",
+        }}
+      >
+        <span style={{ transform: shown && !heads ? "rotateY(180deg)" : undefined }}>
+          {shown ? (heads ? "Heads" : "Tails") : "Flip"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** The two throws, side by side. */
+function Hands({
+  mine,
+  theirs,
+  spinning,
+}: {
+  mine: Throw | null;
+  theirs: Throw | null;
+  spinning: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-6">
+      <HandFace label="You" hand={mine} />
+      <span aria-hidden="true" className="text-xs uppercase tracking-wide text-ink4">
+        vs
+      </span>
+      <HandFace label="PM" hand={spinning ? null : theirs} />
+    </div>
+  );
+}
+
+function HandFace({ label, hand }: { label: string; hand: Throw | null }) {
+  return (
+    <div className="flex flex-col items-center gap-1">
+      <div
+        className="flex h-16 w-16 items-center justify-center rounded-[var(--radius)] border text-xs"
+        style={{
+          borderColor: "var(--border2)",
+          background: "color-mix(in oklab, var(--st-track) 30%, var(--panel))",
+          color: "var(--ink2)",
+        }}
+      >
+        {hand ? THROW_LABEL[hand] : "?"}
+      </div>
+      <span className="text-[0.625rem] uppercase tracking-wide text-ink4">{label}</span>
     </div>
   );
 }
@@ -257,27 +561,18 @@ function Verdict({
 }
 
 /** Which game is drawn on the stage. */
-function Stage(props: {
-  game: GameKind;
-  folder: Widget;
-  cards: Widget[];
-  inPlay: Widget[];
-  winnerId: string | null;
-  spinning: boolean;
-  settled: boolean;
-}) {
+function Stage(props: StageProps & { game: GameKind }) {
   if (props.game === "roulette") return <Wheel {...props} />;
   if (props.game === "straws") return <Straws {...props} />;
   return <Box {...props} />;
 }
 
 interface StageProps {
-  folder: Widget;
-  cards: Widget[];
   inPlay: Widget[];
   winnerId: string | null;
   spinning: boolean;
   settled: boolean;
+  weighted: boolean;
 }
 
 const WHEEL = 168;
@@ -293,14 +588,27 @@ function wedgePath(from: number, to: number): string {
   return `M ${R} ${R} L ${p(from)} A ${R} ${R} 0 ${large} 1 ${p(to)} Z`;
 }
 
-/** The roulette wheel: a wedge per card still in play, spun to land the winner under the pointer. */
-function Wheel({ inPlay, winnerId, spinning, settled }: StageProps) {
-  const n = Math.max(inPlay.length, 1);
-  const step = 360 / n;
+/** The roulette wheel: a wedge per card still in play, sized by that card's share of the draw and
+ *  spun to land the winner under the pointer. The wedges are cut from the SAME shares the draw
+ *  uses, so a wheel can never show one thing and pick by another. */
+function Wheel({ inPlay, winnerId, spinning, settled, weighted }: StageProps) {
+  const fractions = useMemo(() => shares(inPlay, weighted), [inPlay, weighted]);
+  // Each wedge's start angle, and the middle of the winner's — what the wheel spins to.
+  const starts = useMemo(() => {
+    let acc = 0;
+    return fractions.map((f) => {
+      const start = acc * 360;
+      acc += f;
+      return start;
+    });
+  }, [fractions]);
   const index = inPlay.findIndex((c) => c.id === winnerId);
-  // Four whole turns for the theatre, then whatever brings the winner's wedge to the top. Held
-  // once the spin is over so the wheel doesn't snap back on re-render.
-  const angle = index >= 0 && (spinning || settled) ? 360 * 4 - (index * step + step / 2) : 0;
+  // Four whole turns for the theatre, then whatever brings the middle of the winner's wedge to the
+  // top. Held once the spin is over so the wheel doesn't snap back on re-render.
+  const angle =
+    index >= 0 && (spinning || settled)
+      ? 360 * 4 - (starts[index] + (fractions[index] * 360) / 2)
+      : 0;
   const style: CSSProperties = {
     transform: `rotate(${angle}deg)`,
     transitionProperty: "transform",
@@ -328,7 +636,7 @@ function Wheel({ inPlay, winnerId, spinning, settled }: StageProps) {
         {inPlay.map((c, i) => (
           <path
             key={c.id}
-            d={wedgePath(i * step, (i + 1) * step)}
+            d={wedgePath(starts[i], starts[i] + fractions[i] * 360)}
             fill={fillOf(cardToken(c, i), false)}
             stroke="var(--panel)"
             strokeWidth={1}
@@ -426,11 +734,17 @@ function Legend({
   folder,
   cards,
   winnerId,
+  weighted,
+  onWeight,
   onReset,
 }: {
   folder: Widget;
   cards: Widget[];
   winnerId: string | null;
+  /** Whether this game gives out shares — only the wheel does, so only the wheel offers to edit
+   *  them. Putting a share control on a game that ignores it would be a lie in a dropdown. */
+  weighted: boolean;
+  onWeight: (childId: string, weight: number) => void;
   onReset: () => void;
 }) {
   const drawn = (folder.spent ?? []).length;
@@ -446,31 +760,59 @@ function Legend({
           </Button>
         )}
       </div>
-      <ul className="flex max-h-16 flex-wrap gap-1 overflow-auto">
+      <ul className={`flex flex-wrap gap-1 overflow-auto ${weighted ? "max-h-24" : "max-h-16"}`}>
         {cards.map((c, i) => {
           const spent = isSpent(folder, c.id);
-          return (
-            <li
-              key={c.id}
-              // Colour alone can't carry "already drawn" — the text says it too, for anyone who
-              // can't see the dimming.
-              aria-label={
-                spent
-                  ? `${cardLabel(c)} — already drawn this round`
-                  : c.id === winnerId
-                    ? `${cardLabel(c)} — just drawn`
-                    : cardLabel(c)
-              }
-              className={`flex max-w-[11rem] items-center gap-1 rounded-[var(--radius-sm)] border px-1.5 py-0.5 text-[0.6875rem] ${
-                spent ? "text-ink4" : "text-ink3"
-              } ${c.id === winnerId ? "ring-1 ring-accent" : ""}`}
-              style={{
-                background: fillOf(cardToken(c, i), spent),
-                borderColor: "var(--border2)",
-              }}
-            >
+          const chip = (
+            <>
               <span className="truncate">{cardLabel(c)}</span>
               {spent && <span aria-hidden="true">&check;</span>}
+            </>
+          );
+          const tint = {
+            background: fillOf(cardToken(c, i), spent),
+            borderColor: "var(--border2)",
+          };
+          const shell = `flex max-w-[13rem] items-center gap-1 rounded-[var(--radius-sm)] border px-1.5 py-0.5 text-[0.6875rem] ${
+            spent ? "text-ink4" : "text-ink3"
+          } ${c.id === winnerId ? "ring-1 ring-accent" : ""}`;
+          // Colour alone can't carry "already drawn" — the text says it too, for anyone who can't
+          // see the dimming.
+          const said = spent
+            ? `${cardLabel(c)} — already drawn this round`
+            : c.id === winnerId
+              ? `${cardLabel(c)} — just drawn`
+              : cardLabel(c);
+          return (
+            <li key={c.id}>
+              {weighted ? (
+                // A <label> wrapping the Select, so the card's name IS the control's name — no
+                // second string to keep in step, and nothing announced as an unnamed dropdown.
+                <label
+                  className={shell}
+                  style={tint}
+                  title={`How big a share ${cardLabel(c)} gets`}
+                >
+                  <span className="sr-only">{said}, share of the wheel</span>
+                  {chip}
+                  <Select
+                    compact
+                    value={String(weightOf(c))}
+                    onChange={(e) => onWeight(c.id, Number(e.currentTarget.value))}
+                    className="ml-0.5 border-0 bg-transparent px-0.5 py-0 text-[0.6875rem]"
+                  >
+                    {WEIGHT_CHOICES.map((w) => (
+                      <option key={w} value={String(w)}>
+                        {w === 1 ? "even" : `${w}×`}
+                      </option>
+                    ))}
+                  </Select>
+                </label>
+              ) : (
+                <span aria-label={said} className={shell} style={tint}>
+                  {chip}
+                </span>
+              )}
             </li>
           );
         })}

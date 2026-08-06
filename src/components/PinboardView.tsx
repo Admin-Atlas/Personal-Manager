@@ -1773,6 +1773,11 @@ function FolderBoard({
     [onDraw, folder.id],
   );
   const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
+  // A child's share. `updateWidget` walks one level down, so the same call reaches a folder child.
+  const setWeight = useCallback(
+    (childId: string, weight: number) => onChange(childId, { weight }),
+    [onChange],
+  );
   const commitRect = useCallback((id: string, rect: Rect) => onChange(id, { rect }), [onChange]);
   const { draggingId, livePx, startDrag } = useBoardDrag({
     boundsRef,
@@ -1797,6 +1802,7 @@ function FolderBoard({
           game={folder.game}
           onDraw={drawCard}
           onPopOut={popOut}
+          onWeight={setWeight}
           onResetRound={resetRound}
         />
       </div>
@@ -1913,6 +1919,11 @@ function FolderPanel({
     [onDraw, folder.id],
   );
   const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
+  // A child's share. `updateWidget` walks one level down, so the same call reaches a folder child.
+  const setWeight = useCallback(
+    (childId: string, weight: number) => onChange(childId, { weight }),
+    [onChange],
+  );
   if (face === "play" && folder.game) {
     return (
       <div className="flex h-full min-h-0 flex-col">
@@ -1928,6 +1939,7 @@ function FolderPanel({
           game={folder.game}
           onDraw={drawCard}
           onPopOut={popOut}
+          onWeight={setWeight}
           onResetRound={resetRound}
         />
       </div>

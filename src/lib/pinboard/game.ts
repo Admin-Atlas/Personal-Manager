@@ -22,29 +22,101 @@
 
 import type { Board, GameKind, Widget } from "./types";
 
-/** The games on offer, in the order the menu lists them. */
-export const GAME_KINDS: readonly GameKind[] = ["roulette", "straws", "box"];
+/** The games on offer, in the order the menu lists them: the three that pick one card out of all of
+ *  them, then the two that put a single card to you and let you play for it. */
+export const GAME_KINDS: readonly GameKind[] = ["roulette", "straws", "box", "coin", "rps"];
 
-/** What each game is called, and how it is described where it is chosen. The blurb is the honest
- *  one-liner — every one of these picks uniformly at random; the difference is entirely theatre,
- *  and the copy should never imply otherwise. */
-export const GAME_INFO: Record<GameKind, { label: string; blurb: string; verb: string }> = {
+/**
+ * How a game decides.
+ *
+ * - `draw` — it picks one card out of the whole pool. The card it lands on is the answer.
+ * - `verdict` — it offers ONE card and you play a round for it. Lose and you do it; win and it
+ *   offers the next one. Either way that card has had its turn this round, so the folder is worked
+ *   through rather than the same job being put to you over and over.
+ *
+ * This is the distinction the original list of six games glossed over. A coin has two faces and a
+ * throw of rock-paper-scissors has one winner — neither can choose between seven notes, and
+ * pretending otherwise would be a wheel wearing a coin's clothes.
+ */
+export type GameShape = "draw" | "verdict";
+
+/** What each game is called, how it is described where it is chosen, and how it decides. The blurb
+ *  is the honest one-liner: nothing here is skill, and the copy should never imply otherwise. */
+export const GAME_INFO: Record<
+  GameKind,
+  { label: string; blurb: string; verb: string; shape: GameShape; weighted: boolean }
+> = {
   roulette: {
     label: "Roulette",
     blurb: "A wheel with a wedge for every card. Spin it and see where it stops.",
     verb: "Spin",
+    shape: "draw",
+    // The only game with a visible proportion to hand out: a wedge is as wide as its share.
+    weighted: true,
   },
   straws: {
     label: "Straws",
     blurb: "A fist of straws, one per card. Pull one and find out if it is the long one.",
     verb: "Draw",
+    shape: "draw",
+    // A straw's length IS the outcome, so there is nothing left for a weight to change.
+    weighted: false,
   },
   box: {
     label: "Paper in a box",
     blurb: "A folded slip for every card, shaken in a box. Reach in and take one.",
     verb: "Pick",
+    shape: "draw",
+    weighted: false,
+  },
+  coin: {
+    label: "Flip a coin",
+    blurb: "One card at a time. Heads you do it, tails you're off the hook.",
+    verb: "Flip",
+    shape: "verdict",
+    // Two faces and one card — no pool to take shares of.
+    weighted: false,
+  },
+  rps: {
+    label: "Rock, paper, scissors",
+    blurb: "Play PM for it. Win and it offers you something else; lose and the job is yours.",
+    verb: "Throw",
+    shape: "verdict",
+    weighted: false,
   },
 };
+
+/** The moves in a throw of rock-paper-scissors. */
+export type Throw = "rock" | "paper" | "scissors";
+export const THROWS: readonly Throw[] = ["rock", "paper", "scissors"];
+export const THROW_LABEL: Record<Throw, string> = {
+  rock: "Rock",
+  paper: "Paper",
+  scissors: "Scissors",
+};
+
+/** Who won a throw, from the player's side. A tie is played again on the SAME card — nobody has
+ *  won anything, so the card must not be counted as having had its turn. */
+export function rpsOutcome(mine: Throw, theirs: Throw): "win" | "lose" | "tie" {
+  if (mine === theirs) return "tie";
+  const beats: Record<Throw, Throw> = { rock: "scissors", paper: "rock", scissors: "paper" };
+  return beats[mine] === theirs ? "win" : "lose";
+}
+
+/** The lowest and highest share a card may be given, and the steps offered between them. A weight
+ *  is a MULTIPLE of an even share, so 1 is "the same as everyone else" — which is what every card
+ *  is worth until somebody says otherwise. */
+export const WEIGHT_CHOICES: readonly number[] = [0.25, 0.5, 1, 2, 3];
+const MIN_WEIGHT = 0.25;
+const MAX_WEIGHT = 3;
+
+/** A card's share of the draw. The one place the range is enforced, so a hand-edited or
+ *  out-of-range board can't hand a wheel a negative wedge or an infinite one. */
+export function weightOf(card: Widget): number {
+  const w = card.weight;
+  if (typeof w !== "number" || !Number.isFinite(w)) return 1;
+  return Math.min(MAX_WEIGHT, Math.max(MIN_WEIGHT, w));
+}
 
 /** Is this folder currently a game folder — i.e. does clicking its tile play rather than open?
  *  Both halves matter: a folder can remember a game while having it switched off, which is how
@@ -74,14 +146,33 @@ export function isSpent(folder: Widget, childId: string): boolean {
  * Draw one card from `candidates` using `rnd` — a number in [0, 1), supplied by the caller so the
  * draw is deterministic under test and the randomness has exactly one home in the app.
  *
- * Uniform: every candidate is equally likely. `rnd` is scaled to the list rather than used to walk
- * it, so a value of exactly 1 (which the contract excludes, but a caller could still pass) lands on
- * the last card instead of running off the end.
+ * `weighted` gives each card a share of the line proportional to {@link weightOf}; without it every
+ * card gets the same share. The two agree exactly when no weight has been set, since an untouched
+ * card weighs 1 — so turning weighting on for a folder nobody has tuned changes nothing.
+ *
+ * `rnd` is scaled to the total rather than used to walk the list, and the last card is the
+ * fallback, so a value of exactly 1 (which the contract excludes, but a caller could still pass)
+ * lands on the last card instead of running off the end.
  */
-export function draw(candidates: readonly Widget[], rnd: number): Widget | null {
+export function draw(candidates: readonly Widget[], rnd: number, weighted = false): Widget | null {
   if (candidates.length === 0) return null;
-  const i = Math.min(candidates.length - 1, Math.max(0, Math.floor(rnd * candidates.length)));
-  return candidates[i];
+  const shares = candidates.map((c) => (weighted ? weightOf(c) : 1));
+  const total = shares.reduce((n, s) => n + s, 0);
+  const target = Math.min(1, Math.max(0, rnd)) * total;
+  let acc = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    acc += shares[i];
+    if (acc > target) return candidates[i];
+  }
+  return candidates[candidates.length - 1];
+}
+
+/** Each candidate's share of the wheel as a fraction of the whole, in the order given — what the
+ *  wedges are drawn from, so what you see is exactly what the draw uses. */
+export function shares(candidates: readonly Widget[], weighted: boolean): number[] {
+  const raw = candidates.map((c) => (weighted ? weightOf(c) : 1));
+  const total = raw.reduce((n, s) => n + s, 0);
+  return total > 0 ? raw.map((s) => s / total) : raw.map(() => 0);
 }
 
 /**
