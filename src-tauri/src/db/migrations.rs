@@ -1590,6 +1590,39 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE document_locations ADD COLUMN provenance_key TEXT;
     CREATE INDEX idx_document_locations_provenance ON document_locations(provenance_key);
     "#,
+    // v56: the folder TRAIL above a file, not just the folder it sits in (#736).
+    //
+    // `source_parent_folder_name` has been one hop since it shipped, which is enough to say "it was
+    // in `documentation`" and not enough to say WHICH `documentation` — the question a person
+    // actually asks, and the one Drive's own UI answers with `My Drive › Projects › PM ›
+    // documentation`. PM had no second hop to give: the only ancestry lookup it owned projected
+    // `fields=name`, so the chain dead-ended at the first parent by construction.
+    //
+    // A JSON array of folder NAMES, root-most first, of the folders ABOVE the file (never the file
+    // itself). JSON rather than a delimited string because a folder name may legitimately contain
+    // any separator worth choosing — `/`, `\`, `>`, `·` — so every delimiter is lossy on real data,
+    // and a breadcrumb that silently splits one folder into two is worse than none.
+    //
+    // Three values, three meanings, and they are NOT interchangeable: NULL is "PM does not know",
+    // `[]` is "it sits at the top of its corpus" (a real answer), and a non-empty array is the trail
+    // PM could actually see. The distinction is what keeps the shared-with-me case honest — a walk
+    // up from a shared file stops at the share boundary, because the folders above it are not yours
+    // to look at, and the visible remainder is the truth rather than a truncation to apologise for.
+    //
+    // On BOTH tables for the same reason every other source fact is: `document_locations` is where a
+    // place's own facts live (one file in two Drive accounts has two different trails, which is
+    // exactly what makes a duplicate legible), and `documents` mirrors the anchor's copy so the
+    // list query stays a single table read. `locations::sync_document` remains the only writer of
+    // the mirror.
+    //
+    // Not backfilled. A trail costs a request per ancestor folder to discover, so a backfill would
+    // mean a burst of Drive traffic at first open on behalf of a column nothing yet reads; instead
+    // each item fills its own in as its connector next passes over it, memoised per pass so one
+    // folder is fetched once however many files sit under it.
+    r#"
+    ALTER TABLE document_locations ADD COLUMN source_folder_path TEXT;
+    ALTER TABLE documents          ADD COLUMN source_folder_path TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1642,7 +1675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
         conn.execute_batch(
-            "DROP TABLE document_locations; PRAGMA user_version = 53;
+            "DROP TABLE document_locations;              ALTER TABLE documents DROP COLUMN source_folder_path; PRAGMA user_version = 53;
              INSERT INTO documents(vault_path, title, content_hash, project, source_type,
                  source_id, source_state, external_ref, source_content_hash)
              VALUES ('idx://gdrive:a@x.com:f1','A','h1','Unsorted','index_only',
@@ -1722,7 +1755,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 55,
+            version, 56,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1749,7 +1782,8 @@ mod tests {
              group tags join the registry is v47; \
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
-             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54; \n             which file a location points at is v55)"
+             documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54; \n             which file a location points at is v55; \
+             the folder trail above a file is v56)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

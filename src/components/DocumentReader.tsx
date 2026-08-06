@@ -11,7 +11,7 @@ import {
   useState,
 } from "react";
 import type { ChunkSpan, Document, ImageData } from "../lib/types";
-import { IconButton } from "./ui";
+import { IconButton, Popover } from "./ui";
 import {
   documentChunkSpans,
   fetchIndexOnlyBody,
@@ -24,7 +24,7 @@ import { Markdown } from "../lib/markdown";
 import { parentGroupStarts, segmentByLeaves, shadeLeaves } from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
 import { sourceFacts } from "../lib/sourceFacts";
-import { documentLocation } from "../lib/sourceLabel";
+import { DocumentBreadcrumb } from "./DocumentBreadcrumb";
 import { DocumentPlaces } from "./DocumentPlaces";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
@@ -215,11 +215,6 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
   const renderedAsMarkdown = body != null && image == null && (!isIndexOnly || bodyFull);
   const canOverlay = renderedAsMarkdown && showPower;
 
-  // The full path or URL this document can be reached at — `source_path` for a stored document,
-  // `external_ref` for an indexed one. The reader had neither: it offered "Open source" as a button
-  // and never said where that would take you.
-  const location = documentLocation(doc);
-
   // Load the chunk spans for the current doc, tracking a loading/error state so the overlay panel can
   // say what's happening instead of silently rendering plain text (the old catch just turned the
   // toggle back off). Late resolves for a doc the reader has since left are dropped.
@@ -333,15 +328,11 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
               </div>
             ))}
           </dl>
-          {/* Where the file actually is. Its own line rather than a fifth pair in the `dl` above:
-              those are short values on one wrapping row, and a full Drive URL or an absolute path
-              would blow that row out. Clamped to two lines so a long one cannot push the document
-              itself down the panel, with the whole of it on the tooltip. */}
-          {location && (
-            <p className="mt-1 line-clamp-2 break-all text-xs text-ink4" title={location}>
-              {location}
-            </p>
-          )}
+          {/* Where the file actually is, as folders (#736). Its own line rather than a fifth pair in
+              the `dl` above: those are short values on one wrapping row and a trail would blow it
+              out. The URL that used to sit here has moved to the Open source button below, which is
+              where it is actually actionable — and stays copyable from the caret beside it. */}
+          <DocumentBreadcrumb doc={doc} className="mt-1" />
           {/* Every place this file lives (#710/#711). Renders nothing at all for a document with
               one place, which is nearly all of them — the source line above already said where it
               is, and "In 1 place" beneath it would be chrome restating the header. */}
@@ -538,6 +529,82 @@ function InlineAction({ label, onClick }: { label: string; onClick: () => void }
   );
 }
 
+/**
+ * Open the source, with the exact address it opens tucked behind a caret (#736).
+ *
+ * A split button rather than a plain one because the breadcrumb above answers "where is this" and
+ * deliberately does not answer "what is its address" — and the address is the thing you want when
+ * you are sending the file to someone else, which no amount of folder names substitutes for. It sits
+ * behind a caret rather than on the page because that is a once-in-a-while need, and a full Drive
+ * URL printed under every indexed document is a line of noise on every other read.
+ *
+ * The copy uses the async Clipboard API with no fallback: this runs in a webview PM controls, on a
+ * user gesture, over a same-origin page — the conditions the API requires. A failure is reported in
+ * place rather than silently, since "I clicked Copy and pasted the old thing" is the one outcome
+ * worth protecting against.
+ */
+function OpenSourceButton({
+  docId,
+  location,
+  label,
+  isLocal,
+}: {
+  docId: number;
+  location: string;
+  label: string;
+  isLocal: boolean;
+}) {
+  const [copied, setCopied] = useState<"idle" | "done" | "failed">("idle");
+  return (
+    <div className="flex items-stretch">
+      <button
+        type="button"
+        onClick={() => void openSource(docId).catch(() => {})}
+        className="rounded-l-[var(--radius-sm)] bg-accent px-3 py-1.5 text-sm text-accent-ink hover:brightness-110"
+      >
+        {label}
+      </button>
+      <Popover
+        align="left"
+        panelClassName="max-w-[24rem] p-2"
+        ariaLabel={isLocal ? "Full file path" : "Full source address"}
+        trigger={({ open, toggle }) => (
+          <button
+            type="button"
+            onClick={toggle}
+            aria-expanded={open}
+            aria-label={isLocal ? "Show the full file path" : "Show the full address"}
+            title={isLocal ? "Show the full file path" : "Show the full address"}
+            className="ml-px rounded-r-[var(--radius-sm)] bg-accent px-2 py-1.5 text-sm text-accent-ink hover:brightness-110"
+          >
+            <span aria-hidden>▾</span>
+          </button>
+        )}
+      >
+        <p className="break-all text-xs text-ink2">{location}</p>
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              navigator.clipboard
+                .writeText(location)
+                .then(() => setCopied("done"))
+                .catch(() => setCopied("failed"));
+            }}
+            className="rounded-[var(--radius-sm)] border border-border px-2 py-1 text-xs text-ink2 hover:bg-surface"
+          >
+            Copy
+          </button>
+          {copied === "done" && <span className="text-xs text-ink4">Copied</span>}
+          {copied === "failed" && (
+            <span className="text-xs text-st-due">Couldn’t copy — select it above instead</span>
+          )}
+        </div>
+      </Popover>
+    </div>
+  );
+}
+
 /** Index-only reader: the live-fetched full body when the source is reachable (so it reads like any
  *  local document), otherwise the offline summary — always with one button to open the real source. */
 function IndexOnlyBody({
@@ -557,13 +624,12 @@ function IndexOnlyBody({
   return (
     <div>
       {doc.external_ref && (
-        <button
-          type="button"
-          onClick={() => void openSource(doc.id).catch(() => {})}
-          className="rounded-[var(--radius-sm)] bg-accent px-3 py-1.5 text-sm text-accent-ink hover:brightness-110"
-        >
-          {isLocal ? "Reveal in file manager" : "Open source"}
-        </button>
+        <OpenSourceButton
+          docId={doc.id}
+          location={doc.external_ref}
+          label={isLocal ? "Reveal in file manager" : "Open source"}
+          isLocal={isLocal}
+        />
       )}
       {full ? (
         <div className="mt-3">

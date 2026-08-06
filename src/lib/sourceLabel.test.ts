@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  documentBreadcrumb,
   documentLocation,
   provenanceParts,
   sourceGroup,
@@ -155,5 +156,75 @@ describe("sourceGroup / sourceSummary — the axis the Source column sorts on", 
     expect(sourceSummary({ source_id: "local:k:1", source_state: "unreachable" })).toBe(
       "This device · can’t reach it",
     );
+  });
+});
+
+describe("documentBreadcrumb — where a file sits, as folders (#736)", () => {
+  /** Only the fields the breadcrumb reads; every caller passes a whole `Document`. */
+  const at = (
+    source_id: string | null,
+    source_folder_path: string[] | null,
+    source_parent_folder_name: string | null = null,
+  ) => ({ source_id, source_folder_path, source_parent_folder_name });
+
+  it("reads a My Drive trail straight through — Drive's own root is already named in it", () => {
+    // The shape Bobby asked for. "My Drive" is a real folder Drive reports a name for, so the walk
+    // reaches it naturally and PM must NOT prepend a second corpus label on top of it.
+    expect(documentBreadcrumb(at("gdrive:a@x.com:F1", ["My Drive", "Projects", "PM"]))).toEqual([
+      "My Drive",
+      "Projects",
+      "PM",
+    ]);
+  });
+
+  it("names the collection for a file shared with you, whose trail has no root", () => {
+    // The climb stops at the share boundary — the folders above it belong to someone else and are
+    // invisible to this account — so the corpus name is the one crumb PM supplies. That is a fact
+    // about how the file reached you, not a guess about where it sits.
+    expect(documentBreadcrumb(at("gdrive:swm:R9:F1", ["crisis", "study guide"]))).toEqual([
+      "Shared with you",
+      "crisis",
+      "study guide",
+    ]);
+  });
+
+  it("says whose folders a tracked-folder trail is, and still says it at the root", () => {
+    expect(documentBreadcrumb(at("local:k1:f2", ["notes", "2026"]))).toEqual([
+      "This device",
+      "notes",
+      "2026",
+    ]);
+    // An empty trail is a real answer — the file sits directly in the folder you picked — and must
+    // not collapse to "nothing to show".
+    expect(documentBreadcrumb(at("local:k1:f2", []))).toEqual(["This device"]);
+  });
+
+  it("falls back to the one folder PM has always known, rather than to nothing", () => {
+    // Two populations depend on this: OneDrive, whose ancestry PM has not verified a field for, and
+    // every item indexed before the trail column existed. A one-crumb breadcrumb is not a degraded
+    // trail — it is everything PM holds about that item, and it improves on its next sync.
+    expect(documentBreadcrumb(at("gdrive:a@x.com:F1", null, "documentation"))).toEqual([
+      "documentation",
+    ]);
+    expect(documentBreadcrumb(at("onedrive:a@x.com:01I", null, "Invoices"))).toEqual([
+      "OneDrive",
+      "Invoices",
+    ]);
+    // But it never invents a corpus label with no folder to hang it on: a bare "OneDrive" says
+    // nothing the Source column doesn't already say.
+    expect(documentBreadcrumb(at("onedrive:a@x.com:01I", null, null))).toEqual([]);
+  });
+
+  it("distinguishes an unresolved trail from a resolved empty one", () => {
+    // NULL is "PM hasn't looked", [] is "it sits at the top" — the difference the sync path spends
+    // (or saves) requests on, and it must survive all the way to the render.
+    expect(documentBreadcrumb(at("gdrive:swm:R9:F1", []))).toEqual(["Shared with you"]);
+    expect(documentBreadcrumb(at("gdrive:swm:R9:F1", null))).toEqual(["Shared with you"]);
+    expect(documentBreadcrumb(at("gdrive:a@x.com:F1", null))).toEqual([]);
+  });
+
+  it("has nothing to say about a document no connector found", () => {
+    expect(documentBreadcrumb(at(null, null))).toEqual([]);
+    expect(documentBreadcrumb(at(null, ["ignored"]))).toEqual([]);
   });
 });

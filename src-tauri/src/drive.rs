@@ -1454,8 +1454,9 @@ impl DriveFile {
         source_id: String,
         body: String,
         folder_name: Option<String>,
+        folder_path: Option<Vec<String>>,
     ) -> index_only::PointerInput {
-        let facts = self.source_facts(folder_name);
+        let facts = self.source_facts(folder_name, folder_path);
         index_only::PointerInput {
             source_id,
             title: self.name.clone(),
@@ -1465,6 +1466,7 @@ impl DriveFile {
             body,
             source_parent_folder_id: facts.parent_folder_id,
             source_parent_folder_name: facts.parent_folder_name,
+            source_folder_path: facts.folder_path,
             source_author: facts.author,
             source_last_modified_by: facts.last_modified_by,
             source_created_at: facts.created_at,
@@ -1476,9 +1478,14 @@ impl DriveFile {
     ///
     /// The same values `pointer` carries, reachable on the path where nothing needs re-embedding —
     /// which is the overwhelmingly common case on a settled library, and the one where these facts
-    /// used to go stale forever. `folder_name` is passed in because resolving it costs an API call
-    /// (Drive gives ids, not names) and the caller only pays for it when the file has actually moved.
-    pub fn source_facts(&self, folder_name: Option<String>) -> index_only::SourceFacts {
+    /// used to go stale forever. `folder_name` and `folder_path` are passed in because resolving them
+    /// costs API calls (Drive gives ids, not names — and the trail costs one per level), and the
+    /// caller only pays when the file has actually moved or PM has no trail for it yet.
+    pub fn source_facts(
+        &self,
+        folder_name: Option<String>,
+        folder_path: Option<Vec<String>>,
+    ) -> index_only::SourceFacts {
         index_only::SourceFacts {
             author: self.owner_name.clone(),
             last_modified_by: self.last_modified_by.clone(),
@@ -1487,6 +1494,7 @@ impl DriveFile {
             modified_at: self.modified_time.clone(),
             parent_folder_id: self.parent_id.clone(),
             parent_folder_name: folder_name,
+            folder_path,
         }
     }
 }
@@ -2499,17 +2507,49 @@ pub async fn export_sheet_xlsx(token_key: &str, file: &DriveFile) -> Result<Path
     stage_temp("pm-drive-", "export.xlsx", &bytes)
 }
 
-/// Resolve a folder id to its display name — the label a synced file is tagged with. A folder is just
-/// a file in Drive, so this projects only `name`. Best-effort: `None` if the folder can't be reached
-/// (deleted, out of scope, or the id was never resolvable), since folder context is a soft review hint
-/// and must never fail a sync. `supportsAllDrives` so a shared-drive folder resolves too. Callers
-/// cache by id per sync run so each unique folder is fetched at most once.
-pub async fn fetch_folder_name(token_key: &str, folder_id: &str) -> Option<String> {
-    let url = format!("{DRIVE_API}/files/{folder_id}?fields=name&supportsAllDrives=true");
-    google::authorized_get(token_key, &url)
-        .await
-        .ok()
-        .and_then(|v| v.get("name").and_then(Value::as_str).map(String::from))
+/// One folder, as the ancestry walk needs it: what it is called, and what it hangs off.
+///
+/// `parent: None` is a *finding*, not a gap — it means Drive reported no parents, which is true of
+/// exactly one folder per corpus: My Drive's root, or a shared drive's own top folder. That is the
+/// signal [`crate::cloud_sync`] terminates the climb on, so it must not be confused with an
+/// unreachable folder (which is `fetch_folder_node` returning `None` outright).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderNode {
+    pub name: String,
+    pub parent: Option<String>,
+}
+
+/// Read one folder's name and its own parent — a folder is just a file in Drive, so this is a plain
+/// `files.get` with a two-field projection.
+///
+/// **Why `parents` and not only `name`.** Until #736 this projected `fields=name` alone, which made
+/// the folder trail unbuildable *by construction*: with no parent id there was nowhere to climb to,
+/// so PM could say "it was in `documentation`" and never "which `documentation`". Both names are
+/// already proven against live traffic — `name` by this very call, `parents` by [`FILE_FIELDS`] —
+/// which matters more here than anywhere: the v3 `fields` mask is fail-closed, and one unknown name
+/// 400s the **whole** request rather than dropping that field (#481 → #538).
+///
+/// Best-effort: `None` if the folder can't be reached (deleted, out of scope, or never resolvable),
+/// since folder context is a soft hint and must never fail a sync. On a shared-with-me file the climb
+/// ends on exactly this answer — the folders above the share boundary are not yours to see, and the
+/// visible remainder is the honest trail rather than a truncated one.
+///
+/// `supportsAllDrives` so a shared-drive folder resolves too. Callers memoise by id per sync run, so
+/// one folder is fetched once however many files sit under it.
+pub async fn fetch_folder_node(token_key: &str, folder_id: &str) -> Option<FolderNode> {
+    let url = format!("{DRIVE_API}/files/{folder_id}?fields=name,parents&supportsAllDrives=true");
+    let v = google::authorized_get(token_key, &url).await.ok()?;
+    Some(FolderNode {
+        name: v.get("name").and_then(Value::as_str)?.to_string(),
+        // A folder has at most one parent in practice; the first is the one the trail follows, the
+        // same choice `parse_file` makes for a file's own parent.
+        parent: v
+            .get("parents")
+            .and_then(Value::as_array)
+            .and_then(|ps| ps.first())
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
 }
 
 /// True if a Drive API error is the "page token expired" 410 — the signal to discard the cursor and

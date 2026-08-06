@@ -636,6 +636,7 @@ pub(super) async fn reindex_index_only_core(app: &AppHandle, doc_id: i64) -> Res
             // existing folder and source-metadata columns are left untouched.
             source_parent_folder_id: None,
             source_parent_folder_name: None,
+            source_folder_path: None,
             source_author: None,
             source_last_modified_by: None,
             source_created_at: None,

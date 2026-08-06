@@ -97,6 +97,7 @@ function doc(id: number, title: string, source_type: Document["source_type"] = "
     source_modified_at: null,
     source_parent_folder_id: null,
     source_parent_folder_name: null,
+    source_folder_path: null,
     source_author: null,
     source_last_modified_by: null,
     source_created_at: null,

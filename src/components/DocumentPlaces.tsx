@@ -25,6 +25,7 @@ import { documentLocations } from "../lib/ipc";
 import { formatDateTime } from "../lib/format";
 import { provenanceParts } from "../lib/sourceLabel";
 import type { DocumentLocation } from "../lib/types";
+import { DocumentBreadcrumb } from "./DocumentBreadcrumb";
 import { Collapsible } from "./ui";
 
 /** What PM can currently do at one place, in the words a person would use. `null` for a healthy one
@@ -40,7 +41,8 @@ function reachability(state: DocumentLocation["state"]): string | null {
   }
 }
 
-/** One place, as a line: where it is, which folder, and anything wrong with it. */
+/** One place, as a line: which account it is in, the folders it sits in there, and anything wrong
+ *  with it. */
 function PlaceRow({ place }: { place: DocumentLocation }) {
   // Reuses the document labeller rather than a second copy of the connectors' namespace rules —
   // `external_ref` stands in for `source_path`, which is what it is for a location.
@@ -55,6 +57,23 @@ function PlaceRow({ place }: { place: DocumentLocation }) {
       <p className="break-words text-xs text-ink2">
         {parts.length > 0 ? parts.join(" · ") : place.source_id}
       </p>
+      {/* Each place's OWN trail (#736), which is the whole reason a place is worth showing: the same
+          Drive file is `My Drive › Projects › Q3` to its owner and `Shared with you › crisis` to
+          whoever it was shared with, and until this line the two copies read identically on the one
+          screen that asks you to delete one of them. */}
+      <DocumentBreadcrumb
+        doc={{
+          source_id: place.source_id,
+          source_folder_path: place.source_folder_path,
+          source_parent_folder_name: place.source_parent_folder_name,
+          // A location is always a connector's, so the crumbs come from the trail; these two only
+          // satisfy the shared shape and never decide anything here.
+          source_type: "index_only",
+          source_path: null,
+          external_ref: place.external_ref,
+        }}
+        className="mt-0.5"
+      />
       <p className="mt-0.5 text-xs text-ink4">
         {place.source_modified_at && <>Changed {formatDateTime(place.source_modified_at)}</>}
         {place.source_modified_at && problem && " · "}

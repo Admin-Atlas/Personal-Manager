@@ -99,14 +99,48 @@ pub struct Location {
     pub source_content_hash: Option<String>,
     pub source_parent_folder_id: Option<String>,
     pub source_parent_folder_name: Option<String>,
+    /// The folders ABOVE this place, root-most first — the breadcrumb (#736). See
+    /// [`encode_folder_path`] for what the three possible values mean; the short version is that
+    /// `None` and `Some(vec![])` are different answers and must not be collapsed.
+    ///
+    /// Per-location rather than per-document because that is where it differs: one Drive file is
+    /// `My Drive › Projects › Q3` to its owner and `crisis › study guide` to whoever it was shared
+    /// with, and showing both is what makes a duplicate legible instead of two identical-looking
+    /// rows.
+    pub source_folder_path: Option<Vec<String>>,
     /// True for the location matching `documents.source_id` — the identity anchor. Never a
     /// statement about which copy is better or which is live.
     pub anchor: bool,
 }
 
+/// The folder trail as stored: a JSON array of names, root-most first.
+///
+/// JSON and not a delimited string because there is no separator a folder name cannot contain —
+/// `/`, `\`, `>` and `·` are all legal in Drive, OneDrive and on disk — so every delimiter is lossy
+/// on somebody's real data, and a breadcrumb that splits one folder into two is worse than no
+/// breadcrumb.
+///
+/// An empty trail encodes as `"[]"`, NOT as NULL: "this file sits at the top of its corpus" is an
+/// answer, and the column's NULL already means "PM has not found out yet". Collapsing the two would
+/// make a root-level file indistinguishable from an unvisited one, and the sync path decides whether
+/// to spend a request on the lookup by exactly that difference.
+pub fn encode_folder_path(path: &[String]) -> String {
+    // A `Vec<String>` cannot fail to serialise; the fallback keeps the signature infallible rather
+    // than propagating an error that cannot happen.
+    serde_json::to_string(path).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Read a stored trail back. A row written by an older build, or one somehow holding text that is
+/// not a JSON array of strings, reads as `None` — "PM does not know" — which every caller already
+/// has to handle, rather than a parse error that would fail a whole list query over one bad row.
+pub fn decode_folder_path(stored: Option<String>) -> Option<Vec<String>> {
+    serde_json::from_str(&stored?).ok()
+}
+
 const COLUMNS: &str = "l.source_id, l.source_state, l.external_ref, l.source_modified_at, \
                        l.source_content_hash, l.source_parent_folder_id, \
-                       l.source_parent_folder_name, (l.source_id IS d.source_id)";
+                       l.source_parent_folder_name, l.source_folder_path, \
+                       (l.source_id IS d.source_id)";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Location> {
     let state: String = r.get(1)?;
@@ -118,7 +152,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Location> {
         source_content_hash: r.get(4)?,
         source_parent_folder_id: r.get(5)?,
         source_parent_folder_name: r.get(6)?,
-        anchor: r.get(7)?,
+        source_folder_path: decode_folder_path(r.get(7)?),
+        anchor: r.get(8)?,
     })
 }
 
@@ -185,8 +220,8 @@ pub fn record(conn: &Connection, document_id: i64, loc: &Location) -> Result<()>
     conn.execute(
         "INSERT INTO document_locations (document_id, source_id, source_state, external_ref, \
              source_modified_at, source_content_hash, source_parent_folder_id, \
-             source_parent_folder_name, provenance_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             source_parent_folder_name, source_folder_path, provenance_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
          ON CONFLICT(source_id) DO UPDATE SET \
              document_id = excluded.document_id, \
              source_state = excluded.source_state, \
@@ -195,7 +230,8 @@ pub fn record(conn: &Connection, document_id: i64, loc: &Location) -> Result<()>
              source_modified_at = COALESCE(excluded.source_modified_at, source_modified_at), \
              source_content_hash = COALESCE(excluded.source_content_hash, source_content_hash), \
              source_parent_folder_id = COALESCE(excluded.source_parent_folder_id, source_parent_folder_id), \
-             source_parent_folder_name = COALESCE(excluded.source_parent_folder_name, source_parent_folder_name)",
+             source_parent_folder_name = COALESCE(excluded.source_parent_folder_name, source_parent_folder_name), \
+             source_folder_path = COALESCE(excluded.source_folder_path, source_folder_path)",
         params![
             document_id,
             loc.source_id,
@@ -205,6 +241,10 @@ pub fn record(conn: &Connection, document_id: i64, loc: &Location) -> Result<()>
             loc.source_content_hash,
             loc.source_parent_folder_id,
             loc.source_parent_folder_name,
+            // Encoded only when the caller HAS an answer. `Some(vec![])` still writes `"[]"` —
+            // the COALESCE above is what makes silence non-destructive, so the empty trail has to
+            // reach it as a value rather than as a null.
+            loc.source_folder_path.as_deref().map(encode_folder_path),
             provenance_key(&loc.source_id),
         ],
     )?;
@@ -428,7 +468,10 @@ pub fn sync_document(conn: &Connection, document_id: i64) -> Result<()> {
                   WHERE document_id = ?1 AND source_id IS documents.source_id), source_modified_at), \
              source_content_hash = COALESCE( \
                  (SELECT source_content_hash FROM document_locations \
-                  WHERE document_id = ?1 AND source_id IS documents.source_id), source_content_hash) \
+                  WHERE document_id = ?1 AND source_id IS documents.source_id), source_content_hash), \
+             source_folder_path = COALESCE( \
+                 (SELECT source_folder_path FROM document_locations \
+                  WHERE document_id = ?1 AND source_id IS documents.source_id), source_folder_path) \
          WHERE id = ?1",
         params![document_id, rollup(&states).as_str()],
     )?;
@@ -645,6 +688,7 @@ mod tests {
                 source_content_hash: None,
                 source_parent_folder_id: None,
                 source_parent_folder_name: None,
+                source_folder_path: None,
                 anchor: false,
             },
         )
@@ -690,6 +734,7 @@ mod tests {
                 source_content_hash: None,
                 source_parent_folder_id: None,
                 source_parent_folder_name: None,
+                source_folder_path: None,
                 anchor: false,
             },
         )
@@ -732,6 +777,7 @@ mod tests {
                 source_content_hash: None,
                 source_parent_folder_id: None,
                 source_parent_folder_name: None,
+                source_folder_path: None,
                 anchor: false,
             },
         )
@@ -768,6 +814,7 @@ mod tests {
                 source_content_hash: Some("sibling-hash".into()),
                 source_parent_folder_id: None,
                 source_parent_folder_name: None,
+                source_folder_path: None,
                 anchor: false,
             },
         )
@@ -832,6 +879,7 @@ mod tests {
                 source_content_hash: Some("new".into()),
                 source_parent_folder_id: None,
                 source_parent_folder_name: None,
+                source_folder_path: None,
                 anchor: true,
             },
         )
@@ -869,6 +917,7 @@ mod tests {
                 source_content_hash: None,
                 source_parent_folder_id: None,
                 source_parent_folder_name: None,
+                source_folder_path: None,
                 anchor: true,
             },
         )
@@ -990,6 +1039,109 @@ mod tests {
         assert!(!known_ids(&conn, "gdrive:swm:rootB:", None)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_trail_round_trips_and_keeps_root_level_apart_from_unknown() {
+        // The distinction the whole column rests on. `[]` says "it sits at the top of its corpus",
+        // NULL says "PM has not looked yet", and the sync path decides whether to spend a request
+        // on the ancestry lookup by exactly that difference — collapse them and every root-level
+        // file is re-walked on every pass, forever.
+        let conn = open();
+        let id = doc(&conn, "gdrive:a@x.com:f1");
+        record(
+            &conn,
+            id,
+            &Location {
+                source_id: "gdrive:a@x.com:f1".into(),
+                state: SourceState::Ok,
+                external_ref: None,
+                source_modified_at: None,
+                source_content_hash: None,
+                source_parent_folder_id: Some("F9".into()),
+                source_parent_folder_name: Some("documentation".into()),
+                source_folder_path: Some(vec![]),
+                anchor: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(list(&conn, id).unwrap()[0].source_folder_path, Some(vec![]));
+
+        // A real trail replaces it, and survives the JSON round trip with separators intact — the
+        // reason it is stored as JSON rather than joined with one.
+        let trail = vec![
+            "My Drive".to_string(),
+            "Q3 / Q4".to_string(),
+            "a › b".into(),
+        ];
+        record(
+            &conn,
+            id,
+            &Location {
+                source_id: "gdrive:a@x.com:f1".into(),
+                state: SourceState::Ok,
+                external_ref: None,
+                source_modified_at: None,
+                source_content_hash: None,
+                source_parent_folder_id: None,
+                source_parent_folder_name: None,
+                source_folder_path: Some(trail.clone()),
+                anchor: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(list(&conn, id).unwrap()[0].source_folder_path, Some(trail));
+
+        // And silence does not unlearn it: a connector that reported no trail has not discovered
+        // there isn't one, exactly as for every other nullable fact on the row.
+        record(
+            &conn,
+            id,
+            &Location {
+                source_id: "gdrive:a@x.com:f1".into(),
+                state: SourceState::Ok,
+                external_ref: None,
+                source_modified_at: None,
+                source_content_hash: None,
+                source_parent_folder_id: None,
+                source_parent_folder_name: None,
+                source_folder_path: None,
+                anchor: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            list(&conn, id).unwrap()[0].source_folder_path.as_deref(),
+            Some(["My Drive".to_string(), "Q3 / Q4".into(), "a › b".into()].as_slice())
+        );
+
+        // The mirror follows the anchor, so the Documents list reads the same trail without a join.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT source_folder_path FROM documents WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            decode_folder_path(stored),
+            Some(vec![
+                "My Drive".to_string(),
+                "Q3 / Q4".into(),
+                "a › b".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_trail_pm_cannot_read_is_unknown_rather_than_an_error() {
+        // A whole list query failing over one malformed row would take out the Documents tab; not
+        // knowing where one file sits costs a line of the UI.
+        assert_eq!(decode_folder_path(None), None);
+        assert_eq!(decode_folder_path(Some("not json".into())), None);
+        assert_eq!(decode_folder_path(Some("{\"a\":1}".into())), None);
+        assert_eq!(decode_folder_path(Some("[1,2]".into())), None);
+        assert_eq!(decode_folder_path(Some("[]".into())), Some(vec![]));
     }
 
     #[test]

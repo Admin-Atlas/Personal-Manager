@@ -65,7 +65,8 @@ import {
   type DocSort,
   type SortKey,
 } from "../lib/documentSort";
-import { documentLocation, sourceSummary } from "../lib/sourceLabel";
+import { sourceSummary } from "../lib/sourceLabel";
+import { DocumentBreadcrumb } from "./DocumentBreadcrumb";
 import { sourceFactKnown, sourceFactValue } from "../lib/sourceFacts";
 import { Button, Card, Collapsible, ConfirmDialog, IconButton, Popover } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
@@ -1205,9 +1206,6 @@ export function DocumentsView({ onReviewClick }: Props) {
                 </thead>
                 <tbody>
                   {sortedDocuments.map((doc) => {
-                    // The full path or URL this document can be reached at — `source_path` for one
-                    // ingest route, `external_ref` for the other. Resolved once per row.
-                    const location = documentLocation(doc);
                     return (
                       <Fragment key={doc.id}>
                         <tr
@@ -1271,21 +1269,13 @@ export function DocumentsView({ onReviewClick }: Props) {
                                 </button>
                               )}
                             </div>
-                            {/* Where the file actually is, for BOTH ingest routes. This used to be the
-                              else-arm of a ternary on `source_type`, so an indexed document got only
-                              the Sheets-gated "Import fully" button and every other connector file
-                              showed nothing at all — including a file in a tracked folder on this very
-                              machine, whose absolute path was sitting on the row the whole time under
-                              the other column name. */}
+                            {/* Where the file actually is — as FOLDERS, not as a URL (#736). The URL
+                              this replaces answered "how do I open it", which the reader's Open
+                              source button answers better; the question a list of documents raises is
+                              which of two files called "Notes" this one is, and only the folders
+                              above it can settle that. */}
                             <div className="mt-0.5 flex items-center gap-3 text-xs">
-                              {location && (
-                                <div
-                                  className={`truncate text-ink4 ${DOC_TITLE_CAP}`}
-                                  title={location}
-                                >
-                                  {location}
-                                </div>
-                              )}
+                              <DocumentBreadcrumb doc={doc} className={DOC_TITLE_CAP} />
                               {/* Row-level buttons stop propagation so they don't also open the reader.
                                 Reading the full text and opening the source both live in the reader
                                 now (click the row); only "Import fully" stays here as a one-off

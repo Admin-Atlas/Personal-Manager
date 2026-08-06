@@ -629,6 +629,7 @@ pub async fn dev_apply_change_event(
                         // provider to ask about author/created/size either.
                         source_parent_folder_id: None,
                         source_parent_folder_name: None,
+                        source_folder_path: None,
                         source_author: None,
                         source_last_modified_by: None,
                         source_created_at: None,
@@ -658,6 +659,7 @@ pub async fn dev_apply_change_event(
                         // provider to ask about author/created/size either.
                         source_parent_folder_id: None,
                         source_parent_folder_name: None,
+                        source_folder_path: None,
                         source_author: None,
                         source_last_modified_by: None,
                         source_created_at: None,

@@ -251,14 +251,15 @@ trait CloudDriver: Send + Sync + Clone {
     /// can be renamed, resized, moved, or handed to a new editor without a byte of its content
     /// changing, and #704 wrote these columns only on first sight.
     ///
-    /// `stored_parent_id` is what PM currently has, so a provider that must PAY for a folder name can
-    /// skip the lookup unless the file has actually moved. `cache` is the same per-pass memo
-    /// `make_pointer` uses, so the two share every resolution.
+    /// `stored` is what PM currently has about where the item sits, so a provider that must PAY for
+    /// folder context can skip the lookup unless the file has actually moved — or unless PM has never
+    /// resolved its trail at all, which is true of every item indexed before #736. `cache` is the same
+    /// per-pass memo `make_pointer` uses, so the two share every resolution.
     fn refresh_facts(
         &self,
         token_key: &str,
         file: &Self::File,
-        stored_parent_id: Option<&str>,
+        stored: &index_only::StoredFolderContext,
         cache: &mut Self::FolderCache,
     ) -> impl std::future::Future<Output = index_only::SourceFacts> + Send;
 }
@@ -801,12 +802,12 @@ async fn run_cloud_pass<C: CloudDriver>(
             // rows out from under each other (`drive::adopt_legacy_swm_row`), so a plan built by an
             // earlier gather is only judged against the store as it stands now — see
             // [`baseline_my_drive`]'s note on legacy shared-with-me rows.
-            let (current, stored_parent) = {
+            let (current, stored_folder) = {
                 let state = app.state::<AppState>();
                 let conn = state.conn()?;
                 (
                     C::read_item_state(&conn, &source_id)?,
-                    index_only::stored_parent_folder_id(&conn, &source_id)?,
+                    index_only::stored_folder_context(&conn, &source_id)?,
                 )
             };
             let actions = index_only::react(event, current.as_ref());
@@ -827,7 +828,7 @@ async fn run_cloud_pass<C: CloudDriver>(
             // whole mirror every idle pass for a change it does not even hold.
             if let Some(f) = file {
                 let facts = driver
-                    .refresh_facts(&w.token_key, f, stored_parent.as_deref(), &mut folder_cache)
+                    .refresh_facts(&w.token_key, f, &stored_folder, &mut folder_cache)
                     .await;
                 if !facts.is_empty() {
                     let state = app.state::<AppState>();
@@ -1019,22 +1020,93 @@ async fn run_cloud_pass<C: CloudDriver>(
 
 // --- Google Drive driver -------------------------------------------------------------------------
 
-/// Resolve a Drive folder id to its display name for sorting-review context, memoising by id across a
-/// whole sync pass (folder ids are globally unique in Drive) so tagging many files in one folder costs
-/// a single lookup. Best-effort: an unreachable folder yields `None` and the file still indexes,
-/// untagged. This is the only folder-name lookup path — `list_drive_folders` is a lazy picker tree,
-/// not an id→name cache, so there is nothing to reuse.
-async fn resolve_folder_name(
+/// Every folder this pass has looked up, by id — the memo the two resolvers below share.
+///
+/// Keyed by id alone because Drive folder ids are globally unique, so one map serves every account
+/// and corpus in the pass. `None` records "asked, couldn't reach it", which is worth remembering:
+/// without it a folder above a share boundary would be re-requested for every single file beneath it.
+type DriveFolderCache = std::collections::HashMap<String, Option<drive::FolderNode>>;
+
+/// The most folders PM will climb through above one file. A Drive tree is nowhere near this deep in
+/// practice; the cap exists so a cycle Drive should not be able to produce, or a pathological
+/// hierarchy, costs a bounded number of requests instead of hanging a sync pass.
+const MAX_FOLDER_DEPTH: usize = 32;
+
+/// Look one folder up, memoised across the whole pass so many files in one folder cost one request.
+async fn resolve_folder(
     token_key: &str,
     folder_id: &str,
-    cache: &mut std::collections::HashMap<String, Option<String>>,
-) -> Option<String> {
+    cache: &mut DriveFolderCache,
+) -> Option<drive::FolderNode> {
     if let Some(hit) = cache.get(folder_id) {
         return hit.clone();
     }
-    let name = drive::fetch_folder_name(token_key, folder_id).await;
-    cache.insert(folder_id.to_string(), name.clone());
-    name
+    let node = drive::fetch_folder_node(token_key, folder_id).await;
+    cache.insert(folder_id.to_string(), node.clone());
+    node
+}
+
+/// A Drive folder id → its display name, for sorting-review context. Thin wrapper over
+/// [`resolve_folder`] so the name and the trail can never disagree about what a folder is called.
+async fn resolve_folder_name(
+    token_key: &str,
+    folder_id: &str,
+    cache: &mut DriveFolderCache,
+) -> Option<String> {
+    resolve_folder(token_key, folder_id, cache)
+        .await
+        .map(|n| n.name)
+}
+
+/// The folder trail above a file, root-most first — the breadcrumb (#736).
+///
+/// Climbs `parent` links from the file's own folder, memoised at every step, so a settled tree costs
+/// one request per distinct folder for the whole pass rather than one per file. `None` only when the
+/// file's immediate folder itself couldn't be read; anything reachable below that is returned.
+///
+/// **The climb stops for two different reasons, and both are answers.** A node with no parent is the
+/// top of its corpus (My Drive's root, or a shared drive's own folder), so the trail is complete. A
+/// node PM cannot read is the *share boundary*: on a file shared with you, the folders above the
+/// shared root are not yours to see, and the visible remainder — `crisis › study guide` — is exactly
+/// what Drive itself shows you. Neither case guesses at a name, which is the one thing a breadcrumb
+/// must never do: a fabricated ancestor is worse than a short trail, because it reads as certainty.
+///
+/// The corpus label ("My Drive", "Shared with you") is deliberately NOT prepended here. My Drive's
+/// root folder answers to a real name of its own and arrives as the first segment naturally; a shared
+/// root does not, and the frontend — which already decodes `source_id` into those words — supplies it
+/// there rather than PM storing a label the provider never said.
+async fn resolve_folder_path(
+    token_key: &str,
+    folder_id: &str,
+    cache: &mut DriveFolderCache,
+) -> Option<Vec<String>> {
+    let mut trail: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut next = Some(folder_id.to_string());
+    while let Some(id) = next {
+        // A repeat means the parent chain loops. Drive should never produce one, and if it somehow
+        // does, stopping with what we have beats climbing until the depth cap.
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        if trail.len() >= MAX_FOLDER_DEPTH {
+            eprintln!("drive: folder trail hit the depth guard at {MAX_FOLDER_DEPTH}");
+            break;
+        }
+        let Some(node) = resolve_folder(token_key, &id, cache).await else {
+            // Unreadable. If it was the file's OWN folder there is nothing to show; higher up, it is
+            // the share boundary and the trail below it stands.
+            break;
+        };
+        trail.push(node.name);
+        next = node.parent;
+    }
+    if trail.is_empty() {
+        return None;
+    }
+    // Climbed leaf-first; the breadcrumb reads root-first.
+    trail.reverse();
+    Some(trail)
 }
 
 /// One unit of sync work for a Drive account, gathered off the lock in phase 1.
@@ -1494,7 +1566,7 @@ struct DriveDriver {
 impl CloudDriver for DriveDriver {
     type File = drive::DriveFile;
     type Item = DriveItem;
-    type FolderCache = std::collections::HashMap<String, Option<String>>;
+    type FolderCache = DriveFolderCache;
 
     /// A follow-up sweep always re-walks Shared with me.
     ///
@@ -1792,34 +1864,53 @@ impl CloudDriver for DriveDriver {
         file: &drive::DriveFile,
         source_id: String,
         body: String,
-        cache: &mut std::collections::HashMap<String, Option<String>>,
+        cache: &mut DriveFolderCache,
     ) -> index_only::PointerInput {
-        // Snapshot the parent-folder name (cached per pass) alongside the body — plain review context
-        // for the sorting proposal, resolved off the file's first `parents` entry.
-        let folder_name = match file.parent_id.as_deref() {
-            Some(pid) => resolve_folder_name(token_key, pid, cache).await,
-            None => None,
-        };
-        file.pointer(source_id, body, folder_name)
+        // Snapshot the parent-folder name and the trail above it (both cached per pass) alongside the
+        // body — plain context, resolved off the file's first `parents` entry, never chunked.
+        let (folder_name, folder_path) = drive_folder_context(token_key, file, cache).await;
+        file.pointer(source_id, body, folder_name, folder_path)
     }
 
     async fn refresh_facts(
         &self,
         token_key: &str,
         file: &drive::DriveFile,
-        stored_parent_id: Option<&str>,
-        cache: &mut std::collections::HashMap<String, Option<String>>,
+        stored: &index_only::StoredFolderContext,
+        cache: &mut DriveFolderCache,
     ) -> index_only::SourceFacts {
-        // The name is the only thing here that costs a request, so it is fetched only when the file
-        // has genuinely changed folder. Everything else — owner, last editor, created, size, modified
-        // — is already on the listing payload PM has in hand.
-        let folder_name = match file.parent_id.as_deref() {
-            Some(pid) if stored_parent_id != Some(pid) => {
-                resolve_folder_name(token_key, pid, cache).await
-            }
-            _ => None,
-        };
-        file.source_facts(folder_name)
+        // The folder context is the only thing here that costs requests, so it is fetched only when
+        // there is a reason to: the file has genuinely moved, or PM has no trail for it yet (every
+        // item indexed before #736, which is how they come to have one at all — there is no backfill).
+        // Everything else — owner, last editor, created, size, modified — is already on the listing
+        // payload PM has in hand.
+        let moved = file.parent_id.as_deref() != stored.parent_folder_id.as_deref();
+        if !moved && stored.has_trail {
+            return file.source_facts(None, None);
+        }
+        let (folder_name, folder_path) = drive_folder_context(token_key, file, cache).await;
+        // A file that has NOT moved keeps the name PM already stored — re-reporting it would be a
+        // no-op write, and the point of this branch is the trail.
+        file.source_facts(if moved { folder_name } else { None }, folder_path)
+    }
+}
+
+/// The folder name and the folder trail for one Drive file, from the same memo.
+///
+/// A file Drive reports no parent for sits at the top of its corpus — `parents` is explicitly asked
+/// for in [`drive::FILE_FIELDS`], so its absence is an answer rather than a silence — and an empty
+/// trail is how that is recorded, distinct from the `None` that means PM has not looked.
+async fn drive_folder_context(
+    token_key: &str,
+    file: &drive::DriveFile,
+    cache: &mut DriveFolderCache,
+) -> (Option<String>, Option<Vec<String>>) {
+    match file.parent_id.as_deref() {
+        Some(pid) => (
+            resolve_folder_name(token_key, pid, cache).await,
+            resolve_folder_path(token_key, pid, cache).await,
+        ),
+        None => (None, Some(Vec::new())),
     }
 }
 
@@ -2152,11 +2243,17 @@ impl CloudDriver for OneDriveDriver {
         &self,
         _token_key: &str,
         file: &onedrive::DriveItem,
-        _stored_parent_id: Option<&str>,
+        _stored: &index_only::StoredFolderContext,
         _cache: &mut (),
     ) -> index_only::SourceFacts {
         // Graph carries the parent folder's name inline, so unlike Drive there is nothing to resolve
         // and no reason to care whether the item moved — the answer is already in hand.
+        //
+        // It carries only the ONE name, though, so OneDrive contributes no folder trail (#736) and
+        // its breadcrumb is that single folder. Graph does expose `parentReference.path`, which looks
+        // like the whole answer — but nothing in this repo has seen a live response containing it,
+        // and the one time PM put an unverified field name in a cloud request it took out every Drive
+        // path in the app until #538. It stays out until a real response proves it.
         file.source_facts()
     }
 }
@@ -2190,6 +2287,109 @@ pub(crate) async fn onedrive_sync_core(app: &AppHandle, account: Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder tree, seeded straight into the pass memo.
+    ///
+    /// This is what makes the climb testable without a network: [`resolve_folder`] answers from the
+    /// cache when the id is present, so a fully-seeded map exercises every branch of the walk — and
+    /// a deliberate `None` entry is exactly how an unreachable folder behaves, since that is what
+    /// gets memoised when the fetch fails.
+    fn tree(entries: &[(&str, &str, Option<&str>)]) -> DriveFolderCache {
+        entries
+            .iter()
+            .map(|(id, name, parent)| {
+                (
+                    (*id).to_string(),
+                    Some(drive::FolderNode {
+                        name: (*name).to_string(),
+                        parent: parent.map(str::to_string),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_trail_climbs_to_the_root_and_reads_root_first() {
+        // The whole feature in one assertion: `My Drive › Projects › PM`, built from the parent
+        // links Drive already hands back, and ordered the way a person reads a path rather than the
+        // way the climb walks it.
+        let mut cache = tree(&[
+            ("root", "My Drive", None),
+            ("p", "Projects", Some("root")),
+            ("pm", "PM", Some("p")),
+        ]);
+        assert_eq!(
+            resolve_folder_path("tok", "pm", &mut cache).await,
+            Some(vec![
+                "My Drive".to_string(),
+                "Projects".to_string(),
+                "PM".to_string()
+            ])
+        );
+        // And the leaf folder alone is a complete trail when it IS the root.
+        assert_eq!(
+            resolve_folder_path("tok", "root", &mut cache).await,
+            Some(vec!["My Drive".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_boundary_ends_the_climb_without_inventing_what_is_above_it() {
+        // The shared-with-me case, and the one that decides whether this feature can be trusted: the
+        // folders above a shared root belong to someone else and are not readable by this account,
+        // so the climb stops there and the VISIBLE remainder stands. Guessing at the hidden
+        // ancestors would read as certainty about a path PM cannot see.
+        let mut cache = tree(&[
+            ("crisis", "crisis", Some("theirs")),
+            ("guide", "study guide", Some("crisis")),
+        ]);
+        cache.insert("theirs".to_string(), None); // 403/404 — memoised as unreachable
+        assert_eq!(
+            resolve_folder_path("tok", "guide", &mut cache).await,
+            Some(vec!["crisis".to_string(), "study guide".to_string()]),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_pm_cannot_read_at_all_yields_no_trail_rather_than_a_blank_one() {
+        // Nothing visible means nothing to say. `None` leaves the stored trail alone (every write is
+        // COALESCE'd), so an outage cannot erase a breadcrumb PM had already resolved.
+        let mut cache: DriveFolderCache = DriveFolderCache::new();
+        cache.insert("gone".to_string(), None);
+        assert_eq!(resolve_folder_path("tok", "gone", &mut cache).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_parent_cycle_stops_instead_of_climbing_forever() {
+        // Drive should not be able to produce one. If it ever does, a sync pass must not hang — and
+        // the depth guard alone would still burn its whole budget on the same two folders.
+        let mut cache = tree(&[("a", "A", Some("b")), ("b", "B", Some("a"))]);
+        assert_eq!(
+            resolve_folder_path("tok", "a", &mut cache).await,
+            Some(vec!["B".to_string(), "A".to_string()]),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pathological_depth_is_capped() {
+        // A bounded number of requests, whatever the tree does.
+        let ids: Vec<String> = (0..MAX_FOLDER_DEPTH + 10)
+            .map(|i| format!("f{i}"))
+            .collect();
+        let mut cache = DriveFolderCache::new();
+        for (i, id) in ids.iter().enumerate() {
+            cache.insert(
+                id.clone(),
+                Some(drive::FolderNode {
+                    name: format!("L{i}"),
+                    parent: ids.get(i + 1).cloned(),
+                }),
+            );
+        }
+        let trail = resolve_folder_path("tok", "f0", &mut cache).await.unwrap();
+        assert_eq!(trail.len(), MAX_FOLDER_DEPTH);
+    }
 
     #[test]
     fn stage_temp_writes_unique_openable_files() {

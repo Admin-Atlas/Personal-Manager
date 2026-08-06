@@ -411,6 +411,7 @@ impl DriveItem {
             body,
             source_parent_folder_id: facts.parent_folder_id,
             source_parent_folder_name: facts.parent_folder_name,
+            source_folder_path: facts.folder_path,
             source_author: facts.author,
             source_last_modified_by: facts.last_modified_by,
             source_created_at: facts.created_at,
@@ -433,6 +434,11 @@ impl DriveItem {
             modified_at: self.modified_time.clone(),
             parent_folder_id: self.parent_id.clone(),
             parent_folder_name: self.parent_name.clone(),
+            // No trail (#736): `parentReference` names the ONE folder above the item and nothing
+            // higher, so OneDrive's breadcrumb is that single folder. `parentReference.path` looks
+            // like the whole answer, and is left alone until a live response proves the field —
+            // guessing a name into a cloud request is what took out every Drive path in #481.
+            folder_path: None,
         }
     }
 }

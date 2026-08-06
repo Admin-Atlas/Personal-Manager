@@ -491,6 +491,14 @@ export interface Document {
    *  Review "apply this filing to the rest of the folder" action. */
   source_parent_folder_id: string | null;
   source_parent_folder_name: string | null;
+  /** The folders ABOVE the item, root-most first — the breadcrumb (#736), mirroring the anchor
+   *  location's trail so the list reads it without a second query.
+   *
+   *  Three values, three meanings: `null` is "PM hasn't worked it out", `[]` is "it sits at the top
+   *  of its corpus", and an array is the trail. The corpus itself — My Drive, Shared with you, this
+   *  device — is NOT in here; `documentBreadcrumb` adds it from `source_id`, because it is a name PM
+   *  gives the place rather than something the provider said. */
+  source_folder_path: string[] | null;
   /** What the SOURCE says about the document, as opposed to what PM measured at ingest (#701).
    *  `null` means the provider did not say — rendered as "Unknown", never blank and never
    *  attributed to you. Only the two cloud connectors and the local folder fill any of these. */
@@ -1989,6 +1997,10 @@ export interface DocumentLocation {
   external_ref: string | null;
   source_modified_at: string | null;
   source_parent_folder_name: string | null;
+  /** The folders above THIS place, root-most first (#736). Per-place because that is where two
+   *  copies of one file differ: the same Drive file is `My Drive › Projects › Q3` to its owner and
+   *  `crisis › study guide` to whoever it was shared with. Same three meanings as on `Document`. */
+  source_folder_path: string[] | null;
   /** The place whose id is the document's permanent identity anchor — an ordering, never a claim
    *  that this copy is the good one. */
   anchor: boolean;
