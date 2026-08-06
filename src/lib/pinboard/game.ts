@@ -130,16 +130,32 @@ export function pool(folder: Widget): Widget[] {
   return (folder.children ?? []).filter((c) => c.kind === "note");
 }
 
+/**
+ * Does this folder keep a round at all?
+ *
+ * Off (`repeat`) there is no memory between plays: every card is in every draw and the same one can
+ * come up twice running. That is a legitimate thing to want — a round is a fairness promise, and
+ * sometimes you would rather have the honest coin. It is one flag with three consequences, all
+ * routed through here and the two functions below, so nothing can honour it by halves: nothing is
+ * recorded as drawn, nothing greys out, and nothing is held back from the next play.
+ */
+export function keepsRound(folder: Widget): boolean {
+  return folder.repeat !== true;
+}
+
 /** The cards still in play this round: the pool minus everything already drawn. This is what a
- *  game actually offers, and what the surface should show as available. */
+ *  game actually offers, and what the surface should show as available. A folder that repeats has
+ *  no round, so its whole pool is always in play — including anything a previously-kept round left
+ *  behind in `spent`, which must never quietly shrink a wheel that has stopped keeping one. */
 export function livePool(folder: Widget): Widget[] {
+  if (!keepsRound(folder)) return pool(folder);
   const spent = new Set(folder.spent ?? []);
   return pool(folder).filter((c) => !spent.has(c.id));
 }
 
 /** Has this card already been drawn in the round now in progress? (What "greyed out" means.) */
 export function isSpent(folder: Widget, childId: string): boolean {
-  return (folder.spent ?? []).includes(childId);
+  return keepsRound(folder) && (folder.spent ?? []).includes(childId);
 }
 
 /**
@@ -173,6 +189,53 @@ export function shares(candidates: readonly Widget[], weighted: boolean): number
   const raw = candidates.map((c) => (weighted ? weightOf(c) : 1));
   const total = raw.reduce((n, s) => n + s, 0);
   return total > 0 ? raw.map((s) => s / total) : raw.map(() => 0);
+}
+
+/** Where each wedge sits on the wheel: degrees clockwise from the top, which is where the pointer
+ *  is. `mid` is what a spin aims at, and what a wedge's label is laid along. */
+export function wedgeAngles(
+  fractions: readonly number[],
+): { start: number; end: number; mid: number }[] {
+  let acc = 0;
+  return fractions.map((f) => {
+    const start = acc * 360;
+    acc += f;
+    const end = acc * 360;
+    return { start, end, mid: (start + end) / 2 };
+  });
+}
+
+/**
+ * The rotation that brings the wedge at `mid` to rest under the pointer, having turned at least
+ * `turns` whole times on the way.
+ *
+ * The wheel's angle ACCUMULATES rather than being recomputed from zero each spin. Resetting it
+ * would make the second spin unwind backwards to reach a wedge earlier in the list, which reads as
+ * the wheel changing its mind; and holding one growing number means the CSS transition on the
+ * transform is armed at a constant duration and simply runs whenever the number moves — the one
+ * shape that reliably animates, since a transition that is switched on in the same style change as
+ * the property it animates is at the mercy of how the engine batches that recalculation.
+ */
+export function spinTo(from: number, mid: number, turns = 4): number {
+  const base = from + 360 * Math.max(1, turns);
+  // The extra 0–360° that lands the wedge's middle exactly on the pointer.
+  const delta = (((-mid - base) % 360) + 360) % 360;
+  return base + delta;
+}
+
+/**
+ * How long each straw is once the fist opens, in pixels.
+ *
+ * The winner's is always the longest, by a margin nobody has to squint at; every other straw gets a
+ * stable length from its position, so a re-render mid-pull can't shuffle them. Deterministic on
+ * purpose — the randomness already happened when the card was drawn, and a straw's length is a
+ * picture of that answer rather than a second, disagreeing draw.
+ */
+export function strawHeights(count: number, winner: number, tall = 176, short = 62): number[] {
+  const spread = Math.max(1, tall - short - 24);
+  return Array.from({ length: count }, (_, i) =>
+    i === winner ? tall : short + ((i * 37) % spread),
+  );
 }
 
 /**
@@ -224,7 +287,7 @@ export function cardLabel(w: Widget): string {
 }
 
 /** The fields that hold a folder's game and the round in progress. */
-const GAME_FIELDS = ["game", "gameOn", "spent", "autoPopOut"] as const;
+const GAME_FIELDS = ["game", "gameOn", "spent", "autoPopOut", "repeat"] as const;
 
 /**
  * Re-graft the LIVE game state onto a board restored by undo or redo.

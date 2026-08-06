@@ -305,3 +305,75 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     expect(result.current.board).toBe(before);
   });
 });
+
+describe("usePinboard — a folder that repeats keeps no round at all", () => {
+  const repeating = JSON.stringify({
+    version: BOARD_VERSION,
+    widgets: [{ ...folderOf(GAME_BOARD), repeat: true }],
+  });
+
+  it("records nothing when it draws, so the same card can come up twice running", async () => {
+    ipc.getPref.mockResolvedValue(repeating);
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "a"));
+    expect(folderOf(result.current.board).spent ?? []).toEqual([]);
+    // And nothing left the folder either — a draw is a suggestion, not a move.
+    expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["a", "b"]);
+  });
+
+  it("does not write a board per spin when there is nothing to record", async () => {
+    // Every write is a full overwrite of the one stored blob. A game that saved on every press
+    // would rewrite the whole board a dozen times an afternoon to say nothing.
+    ipc.getPref.mockResolvedValue(repeating);
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    await flushDebounce();
+    const writes = ipc.setPref.mock.calls.length;
+
+    const before = result.current.board;
+    act(() => result.current.drawCard("f", "a"));
+    act(() => result.current.drawCard("f", "b"));
+    // The very same board object, so React never re-renders and the persist effect never runs.
+    expect(result.current.board).toBe(before);
+    await flushDebounce();
+    expect(ipc.setPref.mock.calls.length).toBe(writes);
+  });
+
+  it("still moves the winner out when the folder is set to — that is a different promise", async () => {
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [{ ...folderOf(GAME_BOARD), repeat: true, autoPopOut: true }],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["b"]);
+    expect(result.current.board.widgets.find((w) => w.id === "a")).toBeDefined();
+    expect(folderOf(result.current.board).spent ?? []).toEqual([]);
+  });
+
+  it("clears a round left over from before it stopped keeping one", async () => {
+    // Loading is where a stale list would otherwise survive: the folder repeats now, so the ids the
+    // old round recorded must not quietly shorten a draw.
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [{ ...folderOf(GAME_BOARD), repeat: true, spent: ["a"] }],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a"));
+    expect(folderOf(result.current.board).spent).toEqual([]);
+    // It was never held back in the first place — the list was already being ignored.
+    expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["a", "b"]);
+  });
+});

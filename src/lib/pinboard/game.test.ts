@@ -9,6 +9,7 @@ import {
   GAME_INFO,
   GAME_KINDS,
   isSpent,
+  keepsRound,
   livePool,
   markDrawn,
   playsGame,
@@ -16,7 +17,10 @@ import {
   pruneSpent,
   rpsOutcome,
   shares,
+  spinTo,
+  strawHeights,
   THROWS,
+  wedgeAngles,
   weightOf,
 } from "./game";
 import { BOARD_VERSION } from "./types";
@@ -384,5 +388,134 @@ describe("carryGameState — a round is not part of the undoable document", () =
       folder("f", [note("a")], { game: "box", gameOn: true, spent: b.widgets[0].spent }),
     ]);
     expect(carryGameState(b, live)).toBe(b);
+  });
+});
+
+describe("wedgeAngles — where each wedge sits, and what a spin aims at", () => {
+  it("lays the wedges end to end around the whole circle", () => {
+    const a = wedgeAngles(shares([note("a"), note("b"), note("c")], false));
+    expect(a[0].start).toBeCloseTo(0);
+    expect(a[0].end).toBeCloseTo(120);
+    expect(a[1].start).toBeCloseTo(a[0].end);
+    expect(a[2].end).toBeCloseTo(360);
+  });
+
+  it("puts mid in the middle of its own wedge, which is what the wheel stops on", () => {
+    for (const w of wedgeAngles(shares([note("a"), note("b"), note("c")], false))) {
+      expect(w.mid).toBeCloseTo((w.start + w.end) / 2);
+    }
+  });
+
+  it("follows the shares, so an uneven wheel has uneven wedges", () => {
+    const cards = [note("a", { weight: 3 }), note("b")];
+    const a = wedgeAngles(shares(cards, true));
+    expect(a[0].end).toBeCloseTo(270);
+    expect(a[1].end - a[1].start).toBeCloseTo(90);
+  });
+
+  it("has nothing to say about an empty wheel", () => {
+    expect(wedgeAngles([])).toEqual([]);
+  });
+});
+
+/** How far the wheel, left at `angle`, is from resting with `mid` under the pointer at the top. */
+const offBy = (angle: number, mid: number) => {
+  const off = (((angle + mid) % 360) + 360) % 360;
+  return Math.min(off, 360 - off);
+};
+
+describe("spinTo — the wheel only ever goes forward, and lands where it said it would", () => {
+  it("brings the wedge's middle to rest exactly under the pointer", () => {
+    for (const mid of [0, 37.5, 90, 180, 271.3, 359.9]) {
+      expect(offBy(spinTo(0, mid), mid)).toBeLessThan(1e-9);
+    }
+  });
+
+  it("turns at least the whole number of times it was asked for", () => {
+    expect(spinTo(0, 90, 4)).toBeGreaterThanOrEqual(4 * 360);
+    expect(spinTo(0, 90, 1)).toBeGreaterThanOrEqual(360);
+    expect(spinTo(1000, 90, 4)).toBeGreaterThanOrEqual(1000 + 4 * 360);
+  });
+
+  it("never unwinds — a wedge earlier in the list is reached by going round again", () => {
+    // The bug this rules out: recomputing the angle from zero each spin, so landing on wedge 0
+    // after wedge 3 rotates the wheel BACKWARDS, which reads as it changing its mind.
+    let angle = 0;
+    for (const mid of [300, 30, 200, 10, 359]) {
+      const next = spinTo(angle, mid);
+      expect(next).toBeGreaterThan(angle);
+      expect(offBy(next, mid)).toBeLessThan(1e-9);
+      angle = next;
+    }
+  });
+
+  it("still turns once when asked for none, so a spin is always a spin", () => {
+    expect(spinTo(0, 90, 0)).toBeGreaterThanOrEqual(360);
+    expect(spinTo(0, 90, -3)).toBeGreaterThanOrEqual(360);
+  });
+});
+
+describe("strawHeights — the winner's is the long one, and nothing shuffles mid-pull", () => {
+  it("gives one length per straw", () => {
+    expect(strawHeights(5, 2)).toHaveLength(5);
+    expect(strawHeights(1, 0)).toHaveLength(1);
+    expect(strawHeights(0, -1)).toEqual([]);
+  });
+
+  it("makes the winner strictly the tallest, at every size of folder", () => {
+    for (const count of [1, 2, 3, 5, 8, 13, 30]) {
+      for (let winner = 0; winner < count; winner++) {
+        const h = strawHeights(count, winner);
+        const others = h.filter((_, i) => i !== winner);
+        expect(others.every((x) => x < h[winner])).toBe(true);
+      }
+    }
+  });
+
+  it("keeps every straw within the range it was given", () => {
+    const h = strawHeights(12, 4, 176, 62);
+    expect(Math.min(...h)).toBeGreaterThanOrEqual(62);
+    expect(Math.max(...h)).toBe(176);
+  });
+
+  it("is the same every time — a re-render mid-pull must not reshuffle the fist", () => {
+    expect(strawHeights(7, 3)).toEqual(strawHeights(7, 3));
+  });
+
+  it("does not fall over before anything has been drawn", () => {
+    const h = strawHeights(4, -1);
+    expect(h).toHaveLength(4);
+    expect(h.every((x) => Number.isFinite(x))).toBe(true);
+  });
+});
+
+describe("keepsRound — the folder that would rather have an honest coin toss", () => {
+  it("keeps a round by default, and by explicit choice", () => {
+    expect(keepsRound(folder("f", []))).toBe(true);
+    expect(keepsRound(folder("f", [], { repeat: false }))).toBe(true);
+  });
+
+  it("keeps none when the folder is set to repeat", () => {
+    expect(keepsRound(folder("f", [], { repeat: true }))).toBe(false);
+  });
+
+  it("puts every card in every draw, so the same one can come up twice running", () => {
+    const f = folder("f", [note("a"), note("b"), note("c")], { repeat: true, spent: ["a", "b"] });
+    expect(livePool(f).map((w) => w.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("greys nothing, even where a round left ids behind", () => {
+    // The half-honoured version of this flag is the dangerous one: a folder that stopped keeping a
+    // round but kept greying what the old one had recorded would show cards as unavailable while
+    // happily drawing them.
+    const f = folder("f", [note("a"), note("b")], { repeat: true, spent: ["a"] });
+    expect(isSpent(f, "a")).toBe(false);
+    expect(livePool(f)).toHaveLength(2);
+  });
+
+  it("goes straight back to the round it kept when repeating is switched off again", () => {
+    const f = folder("f", [note("a"), note("b")], { repeat: false, spent: ["a"] });
+    expect(isSpent(f, "a")).toBe(true);
+    expect(livePool(f).map((w) => w.id)).toEqual(["b"]);
   });
 });

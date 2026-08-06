@@ -1732,6 +1732,12 @@ function FolderBoard({
   const surfaceRef = useRef<HTMLDivElement>(null);
 
   // Measure the body so the canvas fills it. p-3 on the scroller, hence the 12px inset.
+  //
+  // `face` is a real dependency, not a defensive one: the game face returns before the scroller is
+  // rendered at all, so on the mount of a folder that opens straight into its game there is no
+  // element to measure and no element to observe. Coming back to the cards then left the canvas at
+  // its 1×1 seed, sized only to whatever the cards themselves reached — a board with no ruled grid
+  // showing anywhere they weren't. Re-running when the face changes is what puts the ruling back.
   const [measured, setMeasured] = useState({ cols: 1, rows: 1 });
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -1746,7 +1752,7 @@ function FolderBoard({
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [face]);
 
   // The canvas fills the body, then grows to contain any card sitting past it — cards are never
   // re-flowed to fit (that would resize them, which is exactly what this view exists to preserve),
@@ -1773,6 +1779,19 @@ function FolderBoard({
     [onDraw, folder.id],
   );
   const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
+  // Whether a drawn card leaves the folder. It sits in the game's own bottom bar, beside "start the
+  // round over" — both are about the round in front of you rather than about which game this is.
+  const setAutoPopOut = useCallback(
+    (next: boolean) => onChange(folder.id, { autoPopOut: next }),
+    [onChange, folder.id],
+  );
+  // Whether the game keeps a round at all. Either way the round in progress is dropped: switching
+  // it off means nothing should be left greyed, and switching it back on should start clean rather
+  // than resume a round from before the folder stopped keeping one.
+  const setRepeat = useCallback(
+    (next: boolean) => onChange(folder.id, { repeat: next, spent: [] }),
+    [onChange, folder.id],
+  );
   // A child's share. `updateWidget` walks one level down, so the same call reaches a folder child.
   const setWeight = useCallback(
     (childId: string, weight: number) => onChange(childId, { weight }),
@@ -1800,10 +1819,13 @@ function FolderBoard({
         <FolderGame
           folder={folder}
           game={folder.game}
+          roomy
           onDraw={drawCard}
           onPopOut={popOut}
           onWeight={setWeight}
           onResetRound={resetRound}
+          onAutoPopOut={setAutoPopOut}
+          onRepeat={setRepeat}
         />
       </div>
     );
@@ -1919,6 +1941,19 @@ function FolderPanel({
     [onDraw, folder.id],
   );
   const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
+  // Whether a drawn card leaves the folder. It sits in the game's own bottom bar, beside "start the
+  // round over" — both are about the round in front of you rather than about which game this is.
+  const setAutoPopOut = useCallback(
+    (next: boolean) => onChange(folder.id, { autoPopOut: next }),
+    [onChange, folder.id],
+  );
+  // Whether the game keeps a round at all. Either way the round in progress is dropped: switching
+  // it off means nothing should be left greyed, and switching it back on should start clean rather
+  // than resume a round from before the folder stopped keeping one.
+  const setRepeat = useCallback(
+    (next: boolean) => onChange(folder.id, { repeat: next, spent: [] }),
+    [onChange, folder.id],
+  );
   // A child's share. `updateWidget` walks one level down, so the same call reaches a folder child.
   const setWeight = useCallback(
     (childId: string, weight: number) => onChange(childId, { weight }),
@@ -1937,10 +1972,13 @@ function FolderPanel({
         <FolderGame
           folder={folder}
           game={folder.game}
+          roomy={false}
           onDraw={drawCard}
           onPopOut={popOut}
           onWeight={setWeight}
           onResetRound={resetRound}
+          onAutoPopOut={setAutoPopOut}
+          onRepeat={setRepeat}
         />
       </div>
     );

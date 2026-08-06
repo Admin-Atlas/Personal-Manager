@@ -97,6 +97,13 @@ export interface Widget {
   /** Whether a drawn card also leaves the folder for the board (the same move the ⤴ makes). Absent
    *  → it stays put and merely greys out. Optional and additive, so `BOARD_VERSION` stays 1. */
   autoPopOut?: boolean;
+  /** Whether a card can be drawn again straight away — TRUE random, with no memory between plays.
+   *  Absent (the default) → a drawn card greys out and waits for the round to loop, which is the
+   *  behaviour {@link spent} describes. `true` → nothing is ever recorded as drawn, every card is
+   *  in every play, and the wheel can hand you the same job twice running. A whole-folder choice
+   *  rather than a per-play one, because it is a statement about how you want to be nagged.
+   *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
+  repeat?: boolean;
   /** A folder CHILD's share of the draw, where the game has a visible proportion to give it — the
    *  roulette wheel, and only that one. `1` is an even share and is what every card is worth until
    *  it is changed, so absent means the same as 1 and an untouched folder draws uniformly. Read

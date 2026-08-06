@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
-import { carryGameState, markDrawn, pruneSpent } from "./game";
+import { carryGameState, keepsRound, markDrawn, pruneSpent } from "./game";
 import {
   clampRect,
   COLS,
@@ -511,8 +511,13 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
         const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
         const child = folder?.children?.find((c) => c.id === childId);
         if (!folder || !child) return b;
-        const spent = markDrawn(folder, childId);
+        // A folder set to repeat keeps no round at all, so a draw records nothing: every card stays
+        // in every play and the same one can come up twice running. `keepsRound` is the single gate
+        // for that — greying and the live pool read it too, so the three can't disagree.
+        const spent = keepsRound(folder) ? markDrawn(folder, childId) : [];
         if (!folder.autoPopOut || !assigned) {
+          // Nothing changed and nothing is being moved: don't mint a board (and a write) per spin.
+          if (!keepsRound(folder) && (folder.spent ?? []).length === 0) return b;
           return {
             ...b,
             widgets: b.widgets.map((w) => (w.id === folderId ? { ...w, spent } : w)),
