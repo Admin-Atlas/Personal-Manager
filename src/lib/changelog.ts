@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.127.0-alpha",
+    date: "2026-08-06",
+    highlights: [
+      "A folder on the pinboard can pick your next task for you. Put the jobs you're dithering between into a folder, press the dice in its top bar, and choose a game: a roulette wheel, a fist of straws, or a box of folded slips. Each has a piece for every note in the folder, each picks one entirely at random, and whatever it lands on is what you do next. The folder's tile on the board changes to show which game it plays and how many cards are still in, and clicking it plays rather than opening — 'Cards' in the top bar is always the way back to the notes themselves.",
+      "A card the folder has already picked greys out and stays where it is, and isn't offered again until every other card has had a turn — then the round loops all the way back and starts over. That round is remembered between visits, so you can shut PM, go out for the afternoon, and come back to a folder that still knows what it has already handed you rather than one that starts again from the top. If you would rather a chosen card left the folder for the board, there's a switch for that beside the games.",
+      "Undoing something else on the board no longer un-picks what a game already drew. Timelines can live in a game folder but are never drawn — a dated track isn't a task somebody can be told to go and do. And if you have motion turned down in Settings, the games skip the spin and go straight to the answer.",
+    ],
+  },
+  {
     version: "3.126.1-alpha",
     date: "2026-08-05",
     highlights: [

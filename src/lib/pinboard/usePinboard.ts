@@ -10,6 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
+import { carryGameState, markDrawn, pruneSpent } from "./game";
 import {
   clampRect,
   COLS,
@@ -125,7 +126,15 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
           ...c,
           rect: clampRect(c.rect, MAX_BOARD_CELLS, MAX_BOARD_CELLS, minSize(c.kind)),
         }));
-        return { ...w, rect, children };
+        // The round a game folder is part-way through. Sanitised then pruned on the way in, because
+        // this is the one moment we know the folder's real contents after an arbitrary gap: PM may
+        // have been shut for an hour or a fortnight, and a card that left in between is not
+        // "already drawn" — it is gone. Doing it here also means every later reader can trust the
+        // list without re-checking it, which is what makes "only offer the cards that aren't greyed
+        // out" true at launch and not merely true while the app stays open.
+        const folder = { ...w, rect, children };
+        const spent = Array.isArray(w.spent) ? w.spent.filter((s) => typeof s === "string") : [];
+        return { ...folder, spent: pruneSpent({ ...folder, spent }) };
       }
       return { ...w, rect };
     });
@@ -271,8 +280,24 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
     });
   }, []);
 
-  const undoBoard = useCallback(() => setHist((h) => undo(h)), []);
-  const redoBoard = useCallback(() => setHist((h) => redo(h)), []);
+  // Undo and redo both restore a whole past board, so both must re-graft the live round onto it —
+  // see `carryGameState`. Without this, undoing a tint would un-grey cards a game had already drawn.
+  const undoBoard = useCallback(
+    () =>
+      setHist((h) => {
+        const next = undo(h);
+        return next === h ? h : { ...next, present: carryGameState(next.present, h.present) };
+      }),
+    [],
+  );
+  const redoBoard = useCallback(
+    () =>
+      setHist((h) => {
+        const next = redo(h);
+        return next === h ? h : { ...next, present: carryGameState(next.present, h.present) };
+      }),
+    [],
+  );
 
   const boardRef = useRef(board);
   boardRef.current = board;
@@ -460,6 +485,50 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
     [change],
   );
 
+  /**
+   * Record that a game drew `childId` from `folderId`, and — when the folder is set to — move that
+   * card out onto the board in the same step.
+   *
+   * SILENT, and for the same reason `ingestedAt` is: a draw is a record of something that already
+   * happened, not an edit to the board. Ctrl+Z cannot un-draw a card, and if it recorded a step
+   * then a run through a twenty-card folder would bury every real edit under twenty of them. The
+   * write still persists — silence keeps it out of the history, not out of the store — which is the
+   * whole point of storing the round: shut PM and the game is where you left it.
+   *
+   * The pop-out is folded in here rather than left to a second call so the two land as ONE board,
+   * and so `markDrawn` sees the folder BEFORE the card leaves it: it decides whether that draw ends
+   * the round, and a pool that had already shrunk would loop back one card early.
+   */
+  const drawCard = useCallback(
+    (folderId: string, childId: string) => {
+      change((b) => {
+        const { cols, rows } = boundsRef.current;
+        const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
+        const child = folder?.children?.find((c) => c.id === childId);
+        if (!folder || !child) return b;
+        const spent = markDrawn(folder, childId);
+        if (!folder.autoPopOut) {
+          return {
+            ...b,
+            widgets: b.widgets.map((w) => (w.id === folderId ? { ...w, spent } : w)),
+          };
+        }
+        // Same landing rule as popOutChild: a free slot, so the card arrives in the clear.
+        const landing = findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
+        const remaining = (folder.children ?? []).filter((c) => c.id !== childId);
+        const ws = b.widgets.map((w) =>
+          w.id === folderId
+            ? // The card has left, so it is no longer "drawn this round" — it is gone. Pruning here
+              // keeps the round the same length as the pool it describes.
+              { ...w, children: remaining, spent: spent.filter((id) => id !== childId) }
+            : w,
+        );
+        return { ...b, widgets: [...ws, { ...child, rect: landing }] };
+      }, SILENT);
+    },
+    [change],
+  );
+
   /** Move a widget to the end of the list (= painted on top) when it's interacted with. SILENT: it
    *  fires on every grab, so recording it would make merely touching a card an undo step — and undoing
    *  a z-order change nobody asked for is worse than not being able to. */
@@ -566,6 +635,7 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
     raiseWidget,
     raiseChild,
     popOutChild,
+    drawCard,
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,

@@ -7,6 +7,12 @@
 
 export type WidgetKind = "note" | "timeline" | "folder";
 
+/** The games a folder can play — see `game.ts` for the rules and `FolderGame.tsx` for the table.
+ *  Lives here rather than beside the rules because it is part of the persisted board shape, and
+ *  `types.ts` is where that shape is declared. **Only ever add to this union**: dropping a value
+ *  would leave stored boards naming a game that no longer exists. */
+export type GameKind = "roulette" | "straws" | "box";
+
 /** A widget's position and size, in grid cells (top-left origin). */
 export interface Rect {
   x: number;
@@ -74,6 +80,23 @@ export interface Widget {
    *  panel); `"overlay"` opens a centred modal. Whether the folder is *currently* expanded is
    *  transient UI state and is deliberately NOT stored here. */
   expandMode?: "inline" | "overlay";
+  /** Which game a folder plays when you open it — see `game.ts`. Unset means it has never been
+   *  given one. Choosing a game does NOT by itself change what the tile does; {@link gameOn} is
+   *  the switch. Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
+  game?: GameKind;
+  /** Whether this folder's game is turned on. Absent or `false` → the tile opens the cards, exactly
+   *  as a folder always has; `true` → the tile plays the game and the cards are one click away
+   *  inside it. Kept apart from {@link game} so turning a game off remembers which one it was.
+   *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
+  gameOn?: boolean;
+  /** The cards already drawn in the round now in progress, oldest first. They stay in the folder,
+   *  greyed, and are not drawn again until the round loops all the way back — at which point this
+   *  empties itself. Persisted deliberately: a round should survive closing the lid on the laptop
+   *  and coming back to it. Optional and additive, so `BOARD_VERSION` stays 1. */
+  spent?: string[];
+  /** Whether a drawn card also leaves the folder for the board (the same move the ⤴ makes). Absent
+   *  → it stays put and merely greys out. Optional and additive, so `BOARD_VERSION` stays 1. */
+  autoPopOut?: boolean;
 }
 
 export interface Board {
