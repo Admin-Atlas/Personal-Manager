@@ -1020,12 +1020,19 @@ async fn run_cloud_pass<C: CloudDriver>(
 
 // --- Google Drive driver -------------------------------------------------------------------------
 
-/// Every folder this pass has looked up, by id — the memo the two resolvers below share.
+/// Every folder this pass has looked up — the memo the resolvers below share.
 ///
-/// Keyed by id alone because Drive folder ids are globally unique, so one map serves every account
-/// and corpus in the pass. `None` records "asked, couldn't reach it", which is worth remembering:
-/// without it a folder above a share boundary would be re-requested for every single file beneath it.
-type DriveFolderCache = std::collections::HashMap<String, Option<drive::FolderNode>>;
+/// **Keyed by (account, folder id), not by id alone.** Drive folder ids ARE globally unique, which
+/// is what made one map for the whole pass look right; but `drive.file` authority is per-GRANT, so
+/// the same id is a different question asked by a different account. Two Google accounts in one
+/// pass, one folder shared into both: whichever resolved it first decided the answer for the other,
+/// and if that first answer was "can't read it" the second account's breadcrumb was truncated using
+/// a refusal aimed at somebody else — then frozen, because a trail is written once and trusted.
+///
+/// `None` records "asked, definitively can't reach it", which is worth remembering: without it a
+/// folder above a share boundary would be re-requested for every single file beneath it. A
+/// [`drive::FolderLookup::Retry`] is NOT recorded, because it is not an answer — see that type.
+type DriveFolderCache = std::collections::HashMap<(String, String), Option<drive::FolderNode>>;
 
 /// The most folders PM will climb through above one file. A Drive tree is nowhere near this deep in
 /// practice; the cap exists so a cycle Drive should not be able to produce, or a pathological
@@ -1033,43 +1040,57 @@ type DriveFolderCache = std::collections::HashMap<String, Option<drive::FolderNo
 const MAX_FOLDER_DEPTH: usize = 32;
 
 /// Look one folder up, memoised across the whole pass so many files in one folder cost one request.
+///
+/// A [`drive::FolderLookup::Retry`] deliberately falls through WITHOUT being cached: it says nothing
+/// about the folder, so remembering it would spread one throttled request to every file underneath
+/// it for the rest of the pass — the shape of failure that turns a blip into a permanent wrong
+/// answer. It costs a repeat request per file in that folder while the fault lasts, which is the
+/// right way round: the throttle is temporary and the stored breadcrumb would not be.
 async fn resolve_folder(
     token_key: &str,
     folder_id: &str,
     cache: &mut DriveFolderCache,
-) -> Option<drive::FolderNode> {
-    if let Some(hit) = cache.get(folder_id) {
-        return hit.clone();
+) -> drive::FolderLookup {
+    let key = (token_key.to_string(), folder_id.to_string());
+    if let Some(hit) = cache.get(&key) {
+        return match hit {
+            Some(node) => drive::FolderLookup::Found(node.clone()),
+            None => drive::FolderLookup::Unreachable,
+        };
     }
-    let node = drive::fetch_folder_node(token_key, folder_id).await;
-    cache.insert(folder_id.to_string(), node.clone());
-    node
-}
-
-/// A Drive folder id → its display name, for sorting-review context. Thin wrapper over
-/// [`resolve_folder`] so the name and the trail can never disagree about what a folder is called.
-async fn resolve_folder_name(
-    token_key: &str,
-    folder_id: &str,
-    cache: &mut DriveFolderCache,
-) -> Option<String> {
-    resolve_folder(token_key, folder_id, cache)
-        .await
-        .map(|n| n.name)
+    let found = drive::fetch_folder_node(token_key, folder_id).await;
+    match &found {
+        drive::FolderLookup::Found(node) => {
+            cache.insert(key, Some(node.clone()));
+        }
+        drive::FolderLookup::Unreachable => {
+            cache.insert(key, None);
+        }
+        drive::FolderLookup::Retry => {}
+    }
+    found
 }
 
 /// The folder trail above a file, root-most first — the breadcrumb (#736).
 ///
 /// Climbs `parent` links from the file's own folder, memoised at every step, so a settled tree costs
-/// one request per distinct folder for the whole pass rather than one per file. `None` only when the
-/// file's immediate folder itself couldn't be read; anything reachable below that is returned.
+/// one request per distinct folder for the whole pass rather than one per file. `None` when the
+/// file's immediate folder itself couldn't be read, and when any step of the climb hit something
+/// retryable; anything below a definitive refusal is returned.
 ///
-/// **The climb stops for two different reasons, and both are answers.** A node with no parent is the
-/// top of its corpus (My Drive's root, or a shared drive's own folder), so the trail is complete. A
-/// node PM cannot read is the *share boundary*: on a file shared with you, the folders above the
-/// shared root are not yours to see, and the visible remainder — `crisis › study guide` — is exactly
-/// what Drive itself shows you. Neither case guesses at a name, which is the one thing a breadcrumb
-/// must never do: a fabricated ancestor is worse than a short trail, because it reads as certainty.
+/// **The climb stops for three different reasons, and only two of them are answers.** A node with no
+/// parent is the top of its corpus (My Drive's root, or a shared drive's own folder), so the trail is
+/// complete. A node PM is definitively refused is the *share boundary*: on a file shared with you,
+/// the folders above the shared root are not yours to see, and the visible remainder — `crisis ›
+/// study guide` — is exactly what Drive itself shows you. Neither case guesses at a name, which is
+/// the one thing a breadcrumb must never do: a fabricated ancestor is worse than a short trail,
+/// because it reads as certainty.
+///
+/// The third is a throttle or a server fault, and it is not an answer about anything — so the whole
+/// trail is ABANDONED rather than returned short. `refresh_facts` writes nothing for a `None` and
+/// leaves `has_trail` false, so the next pass asks again; returning the partial trail instead would
+/// persist a plausible, complete-looking, permanently-wrong path, since a stored trail is never
+/// revisited. A shorter breadcrumb one pass later beats a wrong one forever.
 ///
 /// The corpus label ("My Drive", "Shared with you") is deliberately NOT prepended here. My Drive's
 /// root folder answers to a real name of its own and arrives as the first segment naturally; a shared
@@ -1093,10 +1114,13 @@ async fn resolve_folder_path(
             eprintln!("drive: folder trail hit the depth guard at {MAX_FOLDER_DEPTH}");
             break;
         }
-        let Some(node) = resolve_folder(token_key, &id, cache).await else {
-            // Unreadable. If it was the file's OWN folder there is nothing to show; higher up, it is
-            // the share boundary and the trail below it stands.
-            break;
+        let node = match resolve_folder(token_key, &id, cache).await {
+            drive::FolderLookup::Found(node) => node,
+            // Definitively refused. If it was the file's OWN folder there is nothing to show; higher
+            // up, it is the share boundary and the trail below it stands.
+            drive::FolderLookup::Unreachable => break,
+            // Says nothing about the folder, so there is no honest trail to return this pass.
+            drive::FolderLookup::Retry => return None,
         };
         trail.push(node.name);
         next = node.parent;
@@ -1889,27 +1913,37 @@ impl CloudDriver for DriveDriver {
             return file.source_facts(None, None);
         }
         let (folder_name, folder_path) = drive_folder_context(token_key, file, cache).await;
-        // A file that has NOT moved keeps the name PM already stored — re-reporting it would be a
-        // no-op write, and the point of this branch is the trail.
-        file.source_facts(if moved { folder_name } else { None }, folder_path)
+        // The name goes back whenever the climb produced one, moved or not. It used to be withheld
+        // unless `moved`, on the reasoning that an unmoved file keeps the name PM already stored —
+        // true, but only as long as this branch is reached ONLY when the file moved, and it is also
+        // reached for every item that has no trail yet. `refresh_source_facts` writes a column only
+        // when the value actually differs, so re-reporting an unchanged name costs nothing, and
+        // reporting it covers a folder that was renamed in Drive without anything moving.
+        file.source_facts(folder_name, folder_path)
     }
 }
 
-/// The folder name and the folder trail for one Drive file, from the same memo.
+/// The folder name and the folder trail for one Drive file.
 ///
 /// A file Drive reports no parent for sits at the top of its corpus — `parents` is explicitly asked
 /// for in [`drive::FILE_FIELDS`], so its absence is an answer rather than a silence — and an empty
 /// trail is how that is recorded, distinct from the `None` that means PM has not looked.
+///
+/// The NAME is the last segment of the trail rather than a lookup of its own. It is the same folder
+/// asked about twice, so this is not only one fewer request on the failure path — it is what makes
+/// "the name and the trail can never disagree about what a folder is called" true by construction
+/// instead of by both of them happening to consult the same memo.
 async fn drive_folder_context(
     token_key: &str,
     file: &drive::DriveFile,
     cache: &mut DriveFolderCache,
 ) -> (Option<String>, Option<Vec<String>>) {
     match file.parent_id.as_deref() {
-        Some(pid) => (
-            resolve_folder_name(token_key, pid, cache).await,
-            resolve_folder_path(token_key, pid, cache).await,
-        ),
+        Some(pid) => {
+            let trail = resolve_folder_path(token_key, pid, cache).await;
+            let name = trail.as_ref().and_then(|t| t.last().cloned());
+            (name, trail)
+        }
         None => (None, Some(Vec::new())),
     }
 }
@@ -2288,18 +2322,26 @@ pub(crate) async fn onedrive_sync_core(app: &AppHandle, account: Option<String>)
 mod tests {
     use super::*;
 
-    /// A folder tree, seeded straight into the pass memo.
+    /// The pass memo's key: one account's view of one folder id. Spelled out here because the pair
+    /// IS the fix — the same id asked by two accounts is two different questions, since `drive.file`
+    /// authority is granted per account.
+    fn key(token: &str, id: &str) -> (String, String) {
+        (token.to_string(), id.to_string())
+    }
+
+    /// A folder tree as seen by ONE account, seeded straight into the pass memo.
     ///
     /// This is what makes the climb testable without a network: [`resolve_folder`] answers from the
-    /// cache when the id is present, so a fully-seeded map exercises every branch of the walk — and
-    /// a deliberate `None` entry is exactly how an unreachable folder behaves, since that is what
-    /// gets memoised when the fetch fails.
-    fn tree(entries: &[(&str, &str, Option<&str>)]) -> DriveFolderCache {
+    /// cache when the key is present, so a fully-seeded map exercises every branch of the walk — and
+    /// a deliberate `None` entry is exactly how a definitively unreachable folder behaves, since
+    /// that is what gets memoised for one. A `Retry` is deliberately NOT representable here: it is
+    /// never cached, which is the point of it.
+    fn tree_for(token: &str, entries: &[(&str, &str, Option<&str>)]) -> DriveFolderCache {
         entries
             .iter()
             .map(|(id, name, parent)| {
                 (
-                    (*id).to_string(),
+                    key(token, id),
                     Some(drive::FolderNode {
                         name: (*name).to_string(),
                         parent: parent.map(str::to_string),
@@ -2307,6 +2349,10 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn tree(entries: &[(&str, &str, Option<&str>)]) -> DriveFolderCache {
+        tree_for("tok", entries)
     }
 
     #[tokio::test]
@@ -2344,7 +2390,7 @@ mod tests {
             ("crisis", "crisis", Some("theirs")),
             ("guide", "study guide", Some("crisis")),
         ]);
-        cache.insert("theirs".to_string(), None); // 403/404 — memoised as unreachable
+        cache.insert(key("tok", "theirs"), None); // 403/404 — memoised as unreachable
         assert_eq!(
             resolve_folder_path("tok", "guide", &mut cache).await,
             Some(vec!["crisis".to_string(), "study guide".to_string()]),
@@ -2356,7 +2402,7 @@ mod tests {
         // Nothing visible means nothing to say. `None` leaves the stored trail alone (every write is
         // COALESCE'd), so an outage cannot erase a breadcrumb PM had already resolved.
         let mut cache: DriveFolderCache = DriveFolderCache::new();
-        cache.insert("gone".to_string(), None);
+        cache.insert(key("tok", "gone"), None);
         assert_eq!(resolve_folder_path("tok", "gone", &mut cache).await, None);
     }
 
@@ -2380,7 +2426,7 @@ mod tests {
         let mut cache = DriveFolderCache::new();
         for (i, id) in ids.iter().enumerate() {
             cache.insert(
-                id.clone(),
+                key("tok", id),
                 Some(drive::FolderNode {
                     name: format!("L{i}"),
                     parent: ids.get(i + 1).cloned(),
@@ -2389,6 +2435,76 @@ mod tests {
         }
         let trail = resolve_folder_path("tok", "f0", &mut cache).await.unwrap();
         assert_eq!(trail.len(), MAX_FOLDER_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn one_account_s_refusal_does_not_answer_another_account_s_climb() {
+        // `drive.file` authority is per-GRANT, so the same globally-unique folder id is a different
+        // question depending on who is asking. Account A owns the tree and can read all of it;
+        // account B has the leaf shared into it and nothing above. Keyed by id alone, whichever ran
+        // first decided for both — and since a trail is written once and then trusted, the loser was
+        // left with a plausible, complete-looking, permanently wrong breadcrumb.
+        let mut cache = tree_for(
+            "a@x.com",
+            &[
+                ("root", "My Drive", None),
+                ("clients", "Clients", Some("root")),
+                ("acme", "Acme", Some("clients")),
+            ],
+        );
+        // B sees the leaf and is refused the folder above it.
+        cache.extend(tree_for("b@x.com", &[("acme", "Acme", Some("clients"))]));
+        cache.insert(key("b@x.com", "clients"), None);
+
+        assert_eq!(
+            resolve_folder_path("b@x.com", "acme", &mut cache).await,
+            Some(vec!["Acme".to_string()]),
+            "B sees only as far as its own grant reaches",
+        );
+        assert_eq!(
+            resolve_folder_path("a@x.com", "acme", &mut cache).await,
+            Some(vec![
+                "My Drive".to_string(),
+                "Clients".to_string(),
+                "Acme".to_string()
+            ]),
+            "A's own grant still resolves the whole trail",
+        );
+    }
+
+    #[test]
+    fn only_a_definitive_refusal_is_an_answer_about_a_folder() {
+        // The classifier behind the three-way lookup. A 403 that is Drive's usage-limit throttle
+        // wears the same status code as a genuine permission denial, so it is asked about FIRST —
+        // reading it as a denial is what would bake a truncated breadcrumb during a rate-limit
+        // episode. Anything PM cannot place resolves to Retry, because asking twice costs one
+        // request and being wrong costs a path that never corrects itself.
+        use crate::error::Error;
+        let retryable = [
+            "Google API request failed (403 Forbidden): userRateLimitExceeded",
+            "Google API request failed (429 Too Many Requests): rateLimitExceeded",
+            "Google API request failed (500 Internal Server Error): backendError",
+            "Google API request failed (503 Service Unavailable): ",
+            "Google API request failed (400 Bad Request): invalid field selection",
+            "error sending request for url",
+        ];
+        for msg in retryable {
+            assert_eq!(
+                drive::classify_folder_failure(&Error::Other(msg.into())),
+                drive::FolderLookup::Retry,
+                "{msg}",
+            );
+        }
+        for msg in [
+            "Google API request failed (403 Forbidden): insufficientFilePermissions",
+            "Google API request failed (404 Not Found): File not found",
+        ] {
+            assert_eq!(
+                drive::classify_folder_failure(&Error::Other(msg.into())),
+                drive::FolderLookup::Unreachable,
+                "{msg}",
+            );
+        }
     }
 
     #[test]

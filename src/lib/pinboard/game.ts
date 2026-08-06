@@ -270,6 +270,28 @@ export function pruneSpent(folder: Widget): string[] {
   return kept.length === spent.length ? spent : kept;
 }
 
+/**
+ * The same folder with its round pruned to the cards it still holds — the form to reach for at any
+ * site that takes a card OUT of a folder.
+ *
+ * {@link pruneSpent} ran in only two places: on the way in from the store, and on the draw that pops
+ * its own winner. Every OTHER way a card leaves — popped out by hand, deleted, dragged onto the
+ * board — left its id behind in the round, so the legend counted a card that was no longer there
+ * and a folder with one card left in a finished round read "-1 of 1 still in". The count is derived
+ * from the two lists, so they have to be maintained together; doing it here is what makes that
+ * structural rather than a rule every future call site has to remember.
+ *
+ * Returns the SAME folder object when nothing needs dropping, so a caller can skip a write — and
+ * never ADDS a `spent` field to a folder that has none, which would put a game's bookkeeping on a
+ * plain folder and change the stored board for nothing.
+ */
+export function withPrunedRound(folder: Widget): Widget {
+  const spent = folder.spent;
+  if (!spent?.length) return folder;
+  const kept = pruneSpent(folder);
+  return kept === spent ? folder : { ...folder, spent: kept };
+}
+
 /** A card's name in a game: its title, else the first line of its text with any list or heading
  *  marker taken off, else a placeholder. A wedge or a straw has room for a handful of words, and
  *  "- [ ] ring the dentist" should read as "ring the dentist". */
@@ -286,8 +308,10 @@ export function cardLabel(w: Widget): string {
   return stripped || "Untitled note";
 }
 
-/** The fields that hold a folder's game and the round in progress. */
-const GAME_FIELDS = ["game", "gameOn", "spent", "autoPopOut", "repeat"] as const;
+/** The fields that hold a folder's game and the round in progress. Exported because
+ *  `commitForPatch` has to recognise a patch that only touches them — see {@link carryGameState}
+ *  for why a change to one of these cannot be undone, and therefore must not offer to be. */
+export const GAME_FIELDS = ["game", "gameOn", "spent", "autoPopOut", "repeat"] as const;
 
 /**
  * Re-graft the LIVE game state onto a board restored by undo or redo.

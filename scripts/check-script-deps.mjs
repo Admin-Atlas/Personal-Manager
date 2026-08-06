@@ -91,6 +91,13 @@ const ALLOWED = [
       "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
   },
   {
+    file: "scripts/design-tokens.test.mjs",
+    specifier: "jsdom",
+    why: "\"Is this selector legal CSS?\" is a parser's question, and the one that has to be answered here is a NESTING rule — `:has()` inside `:has()` — which a regex cannot see. It shipped: an invalid selector sat in a comma-separated list and silently took the whole rule, including its valid twin, out of the stylesheet. jsdom's engine (nwsapi) is spec-faithful on exactly this and agrees with Blink/WebKit/Gecko. It is already a devDependency for the ~40 jsdom-environment component tests, so nothing new is installed, and this file is collected by `just frontend-test` (which has node_modules) rather than by pr.yml's dependency-free hygiene job — the same footing as the vitest import beside it.",
+    pinExempt:
+      "Same reason as the vitest entries: jsdom is a repo-wide devDependency on a `^` range, governed by the normal npm/Dependabot flow and used by every component test in the tree. One scripts/ test must not dictate its version for all of them.",
+  },
+  {
     file: "scripts/generate-local-catalog.test.mjs",
     specifier: "vitest",
     why: "The repo's existing test runner, reached by a scripts/ test the same way 56 src/ tests reach it. It adds no new dependency — `just frontend-test` already runs this file via a vitest include glob.",

@@ -2519,6 +2519,49 @@ pub struct FolderNode {
     pub parent: Option<String>,
 }
 
+/// How a folder lookup went — three outcomes, and the third one is the whole reason this is not an
+/// `Option`.
+///
+/// A breadcrumb is written once and then trusted: `refresh_facts` skips the climb entirely for any
+/// item that already has a trail, so whatever is stored on the first successful pass is what the
+/// user reads until the file moves or its content changes. Folding every failure into "unreadable"
+/// therefore does not degrade gracefully — it BAKES the degradation. One 5xx or one usage-limit 403
+/// on a mid-level ancestor, and `Clients › Acme › Invoices` is persisted as `Acme › Invoices`, which
+/// renders as a complete and entirely plausible path with nothing to mark it short. Worse, the memo
+/// spreads that one failure to every file under that folder for the rest of the pass.
+///
+/// So: only a *definitive* refusal is an answer about the folder. Everything else is an answer about
+/// the network, and the honest thing to store for it is nothing at all — leaving `has_trail` false
+/// so the next pass simply asks again. Ambiguity resolves towards `Retry` deliberately; asking twice
+/// costs one request, and being wrong costs a breadcrumb that never corrects itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderLookup {
+    Found(FolderNode),
+    /// Definitively not ours to read — deleted, out of scope, or above a share boundary. A real
+    /// answer, and the one the climb stops on.
+    Unreachable,
+    /// A throttle, a server fault, or a transport error. Says nothing about the folder.
+    Retry,
+}
+
+/// Classify a failed `files.get` on a folder. String-matched off the error, the same way
+/// [`is_rate_limited`] and [`is_cursor_expired`] already are — `google::json_or_err` formats the
+/// status into the message and there is no typed status to reach for.
+pub(crate) fn classify_folder_failure(err: &Error) -> FolderLookup {
+    // Drive's other throttle shape is a 403, indistinguishable from an auth 403 without reading the
+    // body — which `is_rate_limited` does, so it is asked FIRST.
+    if is_rate_limited(err) {
+        return FolderLookup::Retry;
+    }
+    let s = err.to_string();
+    // Only these two are the folder saying no. A 400 (a fields-mask fault — PM's own bug), a 401
+    // (the account needs reconnecting), a 5xx and a bare transport error all mean "not now".
+    if s.contains("(403") || s.contains("(404") {
+        return FolderLookup::Unreachable;
+    }
+    FolderLookup::Retry
+}
+
 /// Read one folder's name and its own parent — a folder is just a file in Drive, so this is a plain
 /// `files.get` with a two-field projection.
 ///
@@ -2529,18 +2572,27 @@ pub struct FolderNode {
 /// which matters more here than anywhere: the v3 `fields` mask is fail-closed, and one unknown name
 /// 400s the **whole** request rather than dropping that field (#481 → #538).
 ///
-/// Best-effort: `None` if the folder can't be reached (deleted, out of scope, or never resolvable),
-/// since folder context is a soft hint and must never fail a sync. On a shared-with-me file the climb
-/// ends on exactly this answer — the folders above the share boundary are not yours to see, and the
-/// visible remainder is the honest trail rather than a truncated one.
+/// Best-effort, but never *silently* best-effort: the three-way [`FolderLookup`] is what separates
+/// "not yours to see" from "ask again later", and that distinction is the difference between an
+/// honest short breadcrumb and a permanently wrong one. On a shared-with-me file the climb ends on
+/// `Unreachable` — the folders above the share boundary are not yours to see, and the visible
+/// remainder is the honest trail rather than a truncated one.
 ///
-/// `supportsAllDrives` so a shared-drive folder resolves too. Callers memoise by id per sync run, so
-/// one folder is fetched once however many files sit under it.
-pub async fn fetch_folder_node(token_key: &str, folder_id: &str) -> Option<FolderNode> {
+/// `supportsAllDrives` so a shared-drive folder resolves too. Callers memoise per (account, id) per
+/// sync run, so one folder is fetched once however many files sit under it.
+pub async fn fetch_folder_node(token_key: &str, folder_id: &str) -> FolderLookup {
     let url = format!("{DRIVE_API}/files/{folder_id}?fields=name,parents&supportsAllDrives=true");
-    let v = google::authorized_get(token_key, &url).await.ok()?;
-    Some(FolderNode {
-        name: v.get("name").and_then(Value::as_str)?.to_string(),
+    let v = match google::authorized_get(token_key, &url).await {
+        Ok(v) => v,
+        Err(e) => return classify_folder_failure(&e),
+    };
+    let Some(name) = v.get("name").and_then(Value::as_str).map(String::from) else {
+        // A 200 with no `name` is a shape PM does not understand. Nothing to retry and nothing to
+        // show, so it reads as unreadable rather than as a transient fault that will clear itself.
+        return FolderLookup::Unreachable;
+    };
+    FolderLookup::Found(FolderNode {
+        name,
         // A folder has at most one parent in practice; the first is the one the trail follows, the
         // same choice `parse_file` makes for a file's own parent.
         parent: v

@@ -1718,7 +1718,7 @@ function FolderBoard({
   onChange: (id: string, patch: Partial<Widget>) => void;
   onDelete: (id: string) => void;
   onPopOut: (folderId: string, childId: string) => void;
-  onDraw: (folderId: string, childId: string) => void;
+  onDraw: (folderId: string, childId: string, assigned: boolean) => void;
   onRaiseChild: (folderId: string, childId: string) => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
@@ -1774,8 +1774,11 @@ function FolderBoard({
     (childId: string) => onPopOut(folder.id, childId),
     [onPopOut, folder.id],
   );
+  // `assigned` is forwarded, not dropped: a verdict game reports a card you DODGED with `false`,
+  // and swallowing it here popped that card onto the board while the screen said you were off the
+  // hook. It is a required parameter on the hook now, so an adapter that forgets it fails to build.
   const drawCard = useCallback(
-    (childId: string) => onDraw(folder.id, childId),
+    (childId: string, assigned: boolean) => onDraw(folder.id, childId, assigned),
     [onDraw, folder.id],
   );
   const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);
@@ -1922,7 +1925,7 @@ function FolderPanel({
   onChange: (id: string, patch: Partial<Widget>) => void;
   onDelete: (id: string) => void;
   onPopOut: (folderId: string, childId: string) => void;
-  onDraw: (folderId: string, childId: string) => void;
+  onDraw: (folderId: string, childId: string, assigned: boolean) => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
   onRemoveItem: (id: string, itemId: string) => void;
@@ -1936,8 +1939,11 @@ function FolderPanel({
     (childId: string) => onPopOut(folder.id, childId),
     [onPopOut, folder.id],
   );
+  // `assigned` is forwarded, not dropped: a verdict game reports a card you DODGED with `false`,
+  // and swallowing it here popped that card onto the board while the screen said you were off the
+  // hook. It is a required parameter on the hook now, so an adapter that forgets it fails to build.
   const drawCard = useCallback(
-    (childId: string) => onDraw(folder.id, childId),
+    (childId: string, assigned: boolean) => onDraw(folder.id, childId, assigned),
     [onDraw, folder.id],
   );
   const resetRound = useCallback(() => onChange(folder.id, { spent: [] }), [onChange, folder.id]);

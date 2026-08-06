@@ -255,3 +255,64 @@ describe("the token map, the bootstrap :root and the runtime writer agree", () =
     expect(unbootstrapped).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Selector validity — the same failure mode as an unknown utility, one level up.
+// ---------------------------------------------------------------------------------------------
+//
+// A style rule whose selector list contains ONE invalid selector is discarded ENTIRELY. Not the bad
+// half — the whole rule, every declaration in it, silently, with no warning from Tailwind, no build
+// failure and nothing in a diff to look at. It is the token-typo bug with a bigger blast radius,
+// because the selector that dies is usually not the one that was wrong.
+//
+// It has already happened once: `> ul:has(…):not(:has(> li:not(:has(> input))))` — a `:has()` inside
+// a `:has()`, which Selectors-4 §5.1 forbids — sat beside a perfectly good class-only selector and
+// took it down with it, so every note checklist quietly regained the indent the rule removes.
+//
+// `nwsapi` (jsdom's engine) is the arbiter rather than a regex, because "is this selector legal" is
+// a parser's question. It is stricter than a regex could be and it agrees with Blink/WebKit/Gecko on
+// the nesting rules that matter here. Selectors it cannot know about are excluded by construction:
+// `@`-prefixed lines, Tailwind's `theme(…)`/`@apply` bodies, and anything holding a `&`.
+describe("every selector in index.css is one a browser will accept", () => {
+  // The selector lists of PM's own style rules. Comments are stripped first — this file is more
+  // prose than CSS, and a comment's closing delimiter sitting on the line above a rule would
+  // otherwise be read as part of that rule's selector. Naive brace-matching does the rest: there is
+  // no string literal containing `{`, and at-rule preludes are excluded by the `@` in the class.
+  const selectorLists = () => {
+    const out = [];
+    const bare = CSS.replace(/\/\*[\s\S]*?\*\//g, "\n");
+    for (const m of bare.matchAll(/(^|[};])\s*([^{};@]+?)\s*\{/g)) {
+      const prelude = m[2].trim().replace(/\s+/g, " ");
+      // `&` is nesting (resolved against a parent this scan does not track), and a bare `--custom`
+      // line is a property, not a rule.
+      if (!prelude || prelude.includes("&") || prelude.startsWith("--")) continue;
+      // A `@keyframes` stop is a percentage, not a selector — a different grammar in the same shape.
+      if (/^(from|to|-?[\d.]+%)(\s*,\s*(from|to|-?[\d.]+%))*$/.test(prelude)) continue;
+      if (!/[.#:[\w*]/.test(prelude[0])) continue;
+      out.push(prelude);
+    }
+    return out;
+  };
+
+  it("parses, every one of them", async () => {
+    const { JSDOM } = await import("jsdom");
+    const { document } = new JSDOM("<!doctype html><div></div>").window;
+    const rejected = [];
+    for (const list of selectorLists()) {
+      try {
+        document.querySelector(list);
+      } catch (e) {
+        rejected.push(`${list}  →  ${e.message}`);
+      }
+    }
+    expect(rejected).toEqual([]);
+  });
+
+  it("finds the rules it is meant to be looking at", () => {
+    // Without this the scan could quietly match nothing and pass forever. The checklist rule is the
+    // one the guard was written for, so it is the one named here.
+    const lists = selectorLists();
+    expect(lists.length).toBeGreaterThan(20);
+    expect(lists.some((s) => s.includes("ul.contains-task-list"))).toBe(true);
+  });
+});

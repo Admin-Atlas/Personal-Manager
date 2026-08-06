@@ -39,7 +39,11 @@ function CommandLine({ command }: { command: string }) {
       <Button
         variant="tertiary"
         onClick={() => {
-          void navigator.clipboard.writeText(command).then(() => {
+          // `?.` short-circuits the whole chain, so a webview without a clipboard leaves the button
+          // inert instead of throwing out of the handler. Not in this release's range, but it is the
+          // same one-character omission as the reader's Copy — and this one is on the recovery path,
+          // which is the worst possible place for a click to raise.
+          void navigator.clipboard?.writeText(command).then(() => {
             setCopied(true);
             setTimeout(() => setCopied(false), 1500);
           });
