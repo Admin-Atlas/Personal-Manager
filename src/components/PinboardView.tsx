@@ -1819,6 +1819,7 @@ function FolderBoard({
         <FolderGame
           folder={folder}
           game={folder.game}
+          roomy
           onDraw={drawCard}
           onPopOut={popOut}
           onWeight={setWeight}
@@ -1971,6 +1972,7 @@ function FolderPanel({
         <FolderGame
           folder={folder}
           game={folder.game}
+          roomy={false}
           onDraw={drawCard}
           onPopOut={popOut}
           onWeight={setWeight}

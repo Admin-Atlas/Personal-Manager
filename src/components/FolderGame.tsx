@@ -8,7 +8,7 @@
 // a coin, or a throw of rock-paper-scissors. It lands on one of the notes inside. That note is the
 // next thing you do.
 //
-// THREE RULES THIS FILE EXISTS TO HOLD:
+// FOUR RULES THIS FILE EXISTS TO HOLD:
 //
 // 1. THE OUTCOME IS DECIDED BEFORE THE ANIMATION STARTS, never by it. PM has two reduced-motion
 //    signals and they fail in OPPOSITE directions — under the OS query the keyframes are never
@@ -22,12 +22,18 @@
 //    the winner out of `livePool` on the very next render, so a stage rendered straight from the
 //    live pool loses the card it is supposed to be pointing at: the wheel could not find the wedge
 //    to stop on, the winning straw was not among the straws, and the slip that rises out of the box
-//    was never drawn. Every draw game therefore plays against `staged` — the candidates exactly as
-//    they were when the button was pressed — until the next round is asked for. That is what makes
-//    the animations exist at all, and it is also why a winner that auto-pops-out to the board can
-//    still be shown as the answer instead of a shrug.
+//    was never drawn. Every draw game therefore plays against `staged` — the cards exactly as they
+//    were when the button was pressed — until the next round is asked for. That is what makes the
+//    animations exist at all, and it is also why a winner that auto-pops-out to the board can still
+//    be shown as the answer instead of a shrug.
 //
-// 3. A TRANSITION IS ARMED BEFORE THE VALUE IT ANIMATES MOVES. Switching a transition on in the
+// 3. NOTHING ON SCREEN KNOWS THE ANSWER BEFORE THE STAGE SAYS IT. The same early recording that
+//    rule 2 works around also greys the drawn card's chip, ticks it, and drops the "still in" count
+//    — all while the wheel is still turning. So every surface that reads the round takes a
+//    `hiddenId`: the card the game has recorded but not yet revealed, drawn as though it were still
+//    in play until the theatre lands. A spoiler in the corner makes the animation pointless.
+//
+// 4. A TRANSITION IS ARMED BEFORE THE VALUE IT ANIMATES MOVES. Switching a transition on in the
 //    same style change as the property it animates leaves the result at the mercy of how the engine
 //    batches that recalculation. So durations are held in state, set at click time, and stay put —
 //    the transform/height/offset alone is what changes when a play begins.
@@ -38,6 +44,7 @@
 // region that ALREADY existed — one that appears alongside its own first message says nothing.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { Button, Popover, Select, Toggle, VisuallyHidden } from "./ui";
 import { prefersReducedMotion } from "../theme/motion";
 import {
@@ -74,8 +81,116 @@ const SPIN_MS: Record<GameKind, number> = {
   rps: 1350,
 };
 
-/** Every stage is this tall, so the controls under it don't jump as the game changes. */
-const STAGE = 190;
+/**
+ * How big the surface is drawn.
+ *
+ * A folder opened IN PLACE gets a fixed 576px panel; the Overlay presentation gets 80% of the whole
+ * board, which on any real screen is several times the room. One set of sizes for both leaves the
+ * wheel either cramped or marooned in the middle of a very large rectangle, so there are two — and
+ * the extra room buys longer names at a bigger size, which is the part worth having.
+ *
+ * Everything here is one table so a size is tuned in one place rather than hunted through six
+ * components.
+ */
+interface Metrics {
+  /** The wheel's rendered width. Its coordinate space is fixed (see `WHEEL`), so this one number
+   *  scales every wedge, rim, hub and label together. */
+  wheel: number;
+  /** The height every stage occupies, so the controls under it don't jump between games. */
+  stage: number;
+  /** The wedge label, in the WHEEL'S OWN UNITS — smaller on the bigger wheel, because the whole
+   *  drawing scales up around it. That is what buys the extra characters at a bigger apparent size
+   *  rather than the same handful of words set larger. */
+  wedgeFont: number;
+  wedgeChars: number;
+  /** The narrowest wedge that still gets a name, as arc length in the wheel's own units. */
+  wedgeMinArc: number;
+  strawW: number;
+  strawGap: number;
+  strawFont: number;
+  strawTall: number;
+  strawShort: number;
+  strawIdle: number;
+  fistW: number;
+  fistH: number;
+  boxW: number;
+  boxH: number;
+  slipW: number;
+  slipH: number;
+  noteW: number;
+  noteFont: number;
+  noteChars: number;
+  /** How far the box travels at the peak of its shake, and a fist at the top of its bob. */
+  shake: number;
+  bob: number;
+  coin: number;
+  hand: number;
+  handGlyph: number;
+  /** The two bits of prose that carry the answer, and how tall the chip list may grow. */
+  answer: string;
+  legend: { plain: string; weighted: string };
+}
+
+const METRICS: Record<"snug" | "roomy", Metrics> = {
+  snug: {
+    wheel: 200,
+    stage: 190,
+    wedgeFont: 9,
+    wedgeChars: 13,
+    wedgeMinArc: 11,
+    strawW: 24,
+    strawGap: 6,
+    strawFont: 8,
+    strawTall: 176,
+    strawShort: 62,
+    strawIdle: 104,
+    fistW: 224,
+    fistH: 44,
+    boxW: 160,
+    boxH: 112,
+    slipW: 16,
+    slipH: 20,
+    noteW: 112,
+    noteFont: 9,
+    noteChars: 20,
+    shake: 5,
+    bob: 14,
+    coin: 96,
+    hand: 80,
+    handGlyph: 40,
+    answer: "text-sm",
+    legend: { plain: "max-h-16", weighted: "max-h-24" },
+  },
+  roomy: {
+    wheel: 340,
+    stage: 310,
+    wedgeFont: 7,
+    wedgeChars: 20,
+    wedgeMinArc: 8,
+    strawW: 44,
+    strawGap: 10,
+    strawFont: 12,
+    strawTall: 292,
+    strawShort: 98,
+    strawIdle: 172,
+    fistW: 400,
+    fistH: 70,
+    boxW: 272,
+    boxH: 190,
+    slipW: 28,
+    slipH: 36,
+    noteW: 208,
+    noteFont: 13,
+    noteChars: 34,
+    shake: 9,
+    bob: 24,
+    coin: 168,
+    hand: 132,
+    handGlyph: 68,
+    answer: "text-lg",
+    legend: { plain: "max-h-24", weighted: "max-h-32" },
+  },
+};
 
 /** A uniform number in [0, 1) from the platform CSPRNG, falling back to `Math.random` where it
  *  isn't there. Randomness lives HERE and nowhere else — `game.ts` takes the number as an argument
@@ -120,6 +235,7 @@ type Phase = "idle" | "playing" | "done";
 export function FolderGame({
   folder,
   game,
+  roomy,
   onDraw,
   onPopOut,
   onWeight,
@@ -129,6 +245,8 @@ export function FolderGame({
 }: {
   folder: Widget;
   game: GameKind;
+  /** The Overlay presentation, which has several times the room of the in-place panel. */
+  roomy: boolean;
   onDraw: (childId: string, assigned: boolean) => void;
   onPopOut: (childId: string) => void;
   onWeight: (childId: string, weight: number) => void;
@@ -148,6 +266,7 @@ export function FolderGame({
     folder,
     game,
     cards,
+    m: METRICS[roomy ? "roomy" : "snug"],
     onDraw,
     onPopOut,
     onWeight,
@@ -165,6 +284,7 @@ interface GameProps {
   folder: Widget;
   game: GameKind;
   cards: Widget[];
+  m: Metrics;
   onDraw: (childId: string, assigned: boolean) => void;
   onPopOut: (childId: string) => void;
   onWeight: (childId: string, weight: number) => void;
@@ -178,6 +298,7 @@ function DrawGame({
   folder,
   game,
   cards,
+  m,
   onDraw,
   onPopOut,
   onWeight,
@@ -187,11 +308,13 @@ function DrawGame({
 }: GameProps) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [winnerId, setWinnerId] = useState<string | null>(null);
-  // The candidates AS THEY WERE when the play began — see rule 2 at the top of this file.
-  const [staged, setStaged] = useState<Widget[] | null>(null);
+  // The cards AS THEY WERE when the play began — see rule 2 at the top of this file. `table` is
+  // what the game was choosing between; `all` is the whole folder, which the legend needs because
+  // a winner set to move out has already left `cards` by the time the wheel starts turning.
+  const [staged, setStaged] = useState<{ table: Widget[]; all: Widget[] } | null>(null);
   // The wheel's accumulated rotation and the timing every stage animates at. Both live here rather
   // than in the stage so they survive the stage re-rendering, and so the duration is already in
-  // place before the value it governs moves (rule 3).
+  // place before the value it governs moves (rule 4).
   const [spin, setSpin] = useState({ angle: 0, ms: SPIN_MS[game] });
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -222,7 +345,7 @@ function DrawGame({
     if (!winner) return;
     const index = table.indexOf(winner);
     const wait = prefersReducedMotion() || table.length < 2 ? 0 : SPIN_MS[game];
-    setStaged(table);
+    setStaged({ table, all: cards });
     setWinnerId(winner.id);
     setSpin((s) => ({
       angle: spinTo(s.angle, wedgeAngles(shares(table, info.weighted))[index].mid),
@@ -237,7 +360,7 @@ function DrawGame({
     }
     setPhase("playing");
     timer.current = setTimeout(() => setPhase("done"), wait);
-  }, [phase, inPlay, game, info.weighted, onDraw]);
+  }, [phase, inPlay, cards, game, info.weighted, onDraw]);
 
   const replay = useCallback(() => {
     setPhase("idle");
@@ -252,7 +375,7 @@ function DrawGame({
   const spinning = phase === "playing";
   const settled = phase === "done";
   // The stage plays against the frozen table; the live pool is what the CONTROLS reason about.
-  const table = staged ?? inPlay;
+  const table = staged?.table ?? inPlay;
   const winner = winnerId ? table.find((c) => c.id === winnerId) : undefined;
   // Still in the folder, so there is still something to move out of it.
   const stillHere = !!winner && cards.some((c) => c.id === winner.id);
@@ -269,6 +392,7 @@ function DrawGame({
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-auto p-3">
         <Stage
           game={game}
+          m={m}
           cards={table}
           winnerId={winnerId}
           spinning={spinning}
@@ -279,6 +403,7 @@ function DrawGame({
         />
         <Verdict
           info={info}
+          m={m}
           settled={settled}
           spinning={spinning}
           winner={winner}
@@ -292,8 +417,12 @@ function DrawGame({
 
       <Legend
         folder={folder}
-        cards={cards}
+        m={m}
+        // Mid-spin the folder still has every card it had, whatever the round already recorded —
+        // rule 3. Once it settles, a winner that moved out really has gone.
+        cards={spinning && staged ? staged.all : cards}
         winnerId={settled ? winnerId : null}
+        hiddenId={spinning ? winnerId : null}
         weighted={info.weighted}
         onWeight={onWeight}
         onReset={onResetRound}
@@ -314,6 +443,7 @@ function VerdictGame({
   folder,
   game,
   cards,
+  m,
   onDraw,
   onPopOut,
   onWeight,
@@ -322,6 +452,10 @@ function VerdictGame({
   onRepeat,
 }: GameProps) {
   const [offeredId, setOfferedId] = useState<string | null>(null);
+  // The folder as it was when this card was put on the table — the same freeze the draw games do,
+  // for the same reason: a card set to move out leaves the folder the instant it is settled, and
+  // the table it was on must not empty itself while the coin is still in the air.
+  const [held, setHeld] = useState<Widget[]>([]);
   const [phase, setPhase] = useState<Phase>("idle");
   const [heads, setHeads] = useState(false);
   const [mine, setMine] = useState<Throw | null>(null);
@@ -332,9 +466,9 @@ function VerdictGame({
 
   const inPlay = useMemo(() => livePool(folder), [folder]);
   const info = GAME_INFO[game];
-  // The card is looked up in the whole pool, not the live one: it stops being "in play" the instant
-  // it is settled, and it is still the card on the table until you ask for another.
-  const offered = offeredId ? cards.find((c) => c.id === offeredId) : undefined;
+  const offered = offeredId
+    ? (cards.find((c) => c.id === offeredId) ?? held.find((c) => c.id === offeredId))
+    : undefined;
 
   useEffect(
     () => () => {
@@ -345,6 +479,7 @@ function VerdictGame({
 
   const clear = useCallback(() => {
     setOfferedId(null);
+    setHeld([]);
     setPhase("idle");
     setMine(null);
     setTheirs(null);
@@ -364,11 +499,12 @@ function VerdictGame({
       return;
     }
     setOfferedId(pick.id);
+    setHeld(cards);
     setPhase("idle");
     setMine(null);
     setTheirs(null);
     setResult(null);
-  }, [inPlay, onResetRound, clear]);
+  }, [inPlay, cards, onResetRound, clear]);
 
   /** Settle the offered card. Decided FIRST, exactly as in the draw games — the animation is
    *  theatre, and under reduced motion there isn't one. */
@@ -442,29 +578,29 @@ function VerdictGame({
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-auto p-3">
         {!offered ? (
           <div className="flex flex-col items-center gap-2 text-center">
-            <p className="max-w-xs text-xs text-ink4">{info.blurb}</p>
+            <p className="max-w-sm text-xs text-ink4">{info.blurb}</p>
             <Button size="sm" onClick={offer}>
               {inPlay.length === 0 ? "Start the round over" : "Offer me one"}
             </Button>
           </div>
         ) : (
           <>
-            <div className="max-w-xs text-center">
+            <div className="max-w-md text-center">
               <p className="text-[0.625rem] uppercase tracking-wide text-ink4">On the table</p>
-              <p className="mt-1 text-sm font-medium text-ink">{cardLabel(offered)}</p>
+              <p className={`mt-1 font-medium text-ink ${m.answer}`}>{cardLabel(offered)}</p>
             </div>
 
             {game === "coin" ? (
-              <Coin heads={heads} tossing={busy} shown={busy || settled} ms={ms} />
+              <Coin heads={heads} tossing={busy} shown={busy || settled} ms={ms} m={m} />
             ) : (
-              <Hands mine={mine} theirs={theirs} shaking={busy} ms={ms} />
+              <Hands mine={mine} theirs={theirs} shaking={busy} ms={ms} m={m} />
             )}
 
             {busy ? (
               <p className="text-xs text-ink4">{info.verb}ing&hellip;</p>
             ) : settled ? (
               <div className="flex flex-col items-center gap-2 text-center">
-                <p className="max-w-xs text-sm font-medium text-ink">
+                <p className={`max-w-md font-medium text-ink ${m.answer}`}>
                   {result === "do"
                     ? "That one's yours."
                     : result === "dodge"
@@ -512,8 +648,10 @@ function VerdictGame({
 
       <Legend
         folder={folder}
-        cards={cards}
+        m={m}
+        cards={busy && held.length > 0 ? held : cards}
         winnerId={settled && result === "do" ? offeredId : null}
+        hiddenId={busy ? offeredId : null}
         weighted={info.weighted}
         onWeight={onWeight}
         onReset={onResetRound}
@@ -532,11 +670,13 @@ function Coin({
   tossing,
   shown,
   ms,
+  m,
 }: {
   heads: boolean;
   tossing: boolean;
   shown: boolean;
   ms: number;
+  m: Metrics;
 }) {
   const turns = shown ? 360 * 3 + (heads ? 0 : 180) : 0;
   return (
@@ -544,12 +684,22 @@ function Coin({
       role="img"
       aria-label={shown ? (heads ? "Heads" : "Tails") : "A coin, not yet flipped"}
       className="flex items-center justify-center"
-      style={{ height: STAGE, width: STAGE, perspective: "700px" }}
+      style={{ height: m.stage, width: m.stage, perspective: `${m.coin * 7}px` }}
     >
-      <div className={tossing ? "pm-game-toss" : ""} style={{ animationDuration: `${ms}ms` }}>
+      <div
+        className={tossing ? "pm-game-toss" : ""}
+        style={
+          {
+            animationDuration: `${ms}ms`,
+            "--pm-toss": `${Math.round(m.coin * 0.55)}px`,
+          } as CSSProperties
+        }
+      >
         <div
-          className="relative h-24 w-24"
+          className="relative"
           style={{
+            width: m.coin,
+            height: m.coin,
             transformStyle: "preserve-3d",
             transform: `rotateX(${turns}deg)`,
             transitionProperty: "transform",
@@ -557,26 +707,27 @@ function Coin({
             transitionTimingFunction: "cubic-bezier(0.25, 0.6, 0.2, 1)",
           }}
         >
-          <CoinFace label="Heads" />
-          <CoinFace label="Tails" back />
+          <CoinFace label="Heads" size={m.coin} />
+          <CoinFace label="Tails" size={m.coin} back />
         </div>
       </div>
     </div>
   );
 }
 
-function CoinFace({ label, back }: { label: string; back?: boolean }) {
+function CoinFace({ label, size, back }: { label: string; size: number; back?: boolean }) {
   return (
     <div
       aria-hidden="true"
-      className="absolute inset-0 flex items-center justify-center rounded-full border-2 text-xs font-medium uppercase tracking-wide"
+      className="absolute inset-0 flex items-center justify-center rounded-full border-2 font-medium uppercase tracking-wide"
       style={{
         backfaceVisibility: "hidden",
         transform: back ? "rotateX(180deg)" : undefined,
         borderColor: "var(--border2)",
         background: `radial-gradient(circle at 34% 30%, color-mix(in oklab, var(--st-look) 62%, var(--panel)), color-mix(in oklab, var(--st-look) 26%, var(--panel)))`,
         color: "var(--ink2)",
-        boxShadow: "inset 0 0 0 4px color-mix(in oklab, var(--panel) 55%, transparent)",
+        fontSize: Math.round(size * 0.14),
+        boxShadow: `inset 0 0 0 ${Math.round(size * 0.05)}px color-mix(in oklab, var(--panel) 55%, transparent)`,
       }}
     >
       {label}
@@ -590,20 +741,23 @@ function Hands({
   theirs,
   shaking,
   ms,
+  m,
 }: {
   mine: Throw | null;
   theirs: Throw | null;
   shaking: boolean;
   ms: number;
+  m: Metrics;
 }) {
   const beat = Math.max(1, Math.round(ms / 3));
+  const props = { shaking, beat, m };
   return (
-    <div className="flex items-center justify-center gap-5" style={{ height: STAGE }}>
-      <HandFace label="You" hand={shaking ? "rock" : mine} shaking={shaking} beat={beat} />
+    <div className="flex items-center justify-center gap-5" style={{ height: m.stage }}>
+      <HandFace label="You" hand={shaking ? "rock" : mine} {...props} />
       <span aria-hidden="true" className="text-xs uppercase tracking-wide text-ink4">
         vs
       </span>
-      <HandFace label="PM" hand={shaking ? "rock" : theirs} shaking={shaking} beat={beat} />
+      <HandFace label="PM" hand={shaking ? "rock" : theirs} {...props} />
     </div>
   );
 }
@@ -613,30 +767,39 @@ function HandFace({
   hand,
   shaking,
   beat,
+  m,
 }: {
   label: string;
   hand: Throw | null;
   shaking: boolean;
   beat: number;
+  m: Metrics;
 }) {
   return (
     <div className="flex flex-col items-center gap-1.5">
       <div
-        className={`flex h-20 w-20 items-center justify-center rounded-[var(--radius)] border ${
+        className={`flex items-center justify-center rounded-[var(--radius)] border ${
           shaking ? "pm-game-bob" : ""
         }`}
-        style={{
-          borderColor: "var(--border2)",
-          background: "color-mix(in oklab, var(--st-track) 34%, var(--panel))",
-          color: "var(--ink2)",
-          animationDuration: `${beat}ms`,
-          animationIterationCount: 3,
-        }}
+        style={
+          {
+            width: m.hand,
+            height: m.hand,
+            borderColor: "var(--border2)",
+            background: "color-mix(in oklab, var(--st-track) 34%, var(--panel))",
+            color: "var(--ink2)",
+            animationDuration: `${beat}ms`,
+            animationIterationCount: 3,
+            "--pm-bob": `${m.bob}px`,
+          } as CSSProperties
+        }
       >
         {hand ? (
-          <ThrowGlyph hand={hand} className="h-10 w-10" />
+          <ThrowGlyph hand={hand} className="" size={m.handGlyph} />
         ) : (
-          <span className="text-lg text-ink4">?</span>
+          <span className="text-ink4" style={{ fontSize: Math.round(m.handGlyph * 0.5) }}>
+            ?
+          </span>
         )}
       </div>
       <span className="text-[0.625rem] uppercase tracking-wide text-ink4">{label}</span>
@@ -647,10 +810,12 @@ function HandFace({
 /** Rock, paper and scissors as the THINGS rather than as hands: a stone, a sheet, a pair of
  *  scissors. Hand-rolled like every other glyph in the app, and far more legible at 16px than an
  *  attempt at three fists would be. */
-function ThrowGlyph({ hand, className }: { hand: Throw; className: string }) {
+function ThrowGlyph({ hand, className, size }: { hand: Throw; className: string; size?: number }) {
   const common = {
     viewBox: "0 0 24 24",
     className,
+    width: size,
+    height: size,
     fill: "none",
     stroke: "currentColor",
     strokeWidth: 1.5,
@@ -699,6 +864,7 @@ function EmptyGame() {
 /** The play button and what the game has to say for itself. */
 function Verdict({
   info,
+  m,
   settled,
   spinning,
   winner,
@@ -709,6 +875,7 @@ function Verdict({
   onPopOut,
 }: {
   info: { label: string; blurb: string; verb: string };
+  m: Metrics;
   settled: boolean;
   spinning: boolean;
   winner?: Widget;
@@ -726,7 +893,7 @@ function Verdict({
     return (
       <div className="flex flex-col items-center gap-2 text-center">
         <p className="text-[0.625rem] uppercase tracking-wide text-ink4">Do this next</p>
-        <p className="max-w-xs text-sm font-medium text-ink">
+        <p className={`max-w-md font-medium text-ink ${m.answer}`}>
           {winner ? cardLabel(winner) : "It moved out to your board."}
         </p>
         <div className="flex items-center gap-2">
@@ -749,7 +916,7 @@ function Verdict({
   const sole = remaining === 1;
   return (
     <div className="flex flex-col items-center gap-2 text-center">
-      <p className="max-w-xs text-xs text-ink4">
+      <p className="max-w-sm text-xs text-ink4">
         {sole ? "One card in here — nothing to gamble on." : info.blurb}
       </p>
       <Button size="sm" onClick={onPlay} disabled={remaining === 0}>
@@ -762,6 +929,7 @@ function Verdict({
 interface StageProps {
   /** The frozen table — see rule 2 at the top of this file. */
   cards: Widget[];
+  m: Metrics;
   winnerId: string | null;
   spinning: boolean;
   settled: boolean;
@@ -780,11 +948,12 @@ function Stage(props: StageProps & { game: GameKind }) {
   return <Box {...props} />;
 }
 
+/** The wheel's own coordinate space, FIXED. How big it is drawn is `Metrics.wheel`, and because
+ *  everything below is in these units one number scales the whole drawing. */
 const WHEEL = 200;
 const R = WHEEL / 2;
-/** Where a wedge's label sits, as a fraction of the radius: far enough out to have room, near
- *  enough in that the longest label still clears the rim. */
-const LABEL_IN = 0.3;
+/** Where a wedge's label starts and how far out it may run, as fractions of the radius. */
+const LABEL_IN = 0.28;
 const LABEL_OUT = 0.94;
 
 /** One wedge path, drawn from the centre. */
@@ -800,16 +969,18 @@ function wedgePath(from: number, to: number): string {
 /** The roulette wheel: a wedge per card still in play, sized by that card's share of the draw,
  *  named along its own spoke, and spun to land the winner under the pointer. The wedges are cut
  *  from the SAME shares the draw uses, so a wheel can never show one thing and pick by another. */
-function Wheel({ cards, winnerId, settled, weighted, angle, ms }: StageProps) {
+function Wheel({ cards, m, winnerId, settled, weighted, angle, ms }: StageProps) {
   const fractions = useMemo(() => shares(cards, weighted), [cards, weighted]);
   const angles = useMemo(() => wedgeAngles(fractions), [fractions]);
+  const pointer = Math.round(m.wheel * 0.07);
   return (
-    <div className="relative" style={{ width: WHEEL, height: WHEEL + 12 }}>
+    <div className="relative" style={{ width: m.wheel, height: m.wheel + pointer * 0.9 }}>
       {/* The pointer the wedge stops under. */}
       <svg
         viewBox="0 0 14 12"
         aria-hidden="true"
-        className="absolute left-1/2 top-0 z-10 w-3.5 -translate-x-1/2 text-accent"
+        className="absolute left-1/2 top-0 z-10 -translate-x-1/2 text-accent"
+        style={{ width: pointer }}
         fill="currentColor"
       >
         <path d="M7 12 L0 0 L14 0 Z" />
@@ -820,8 +991,8 @@ function Wheel({ cards, winnerId, settled, weighted, angle, ms }: StageProps) {
         aria-label={`A wheel with ${cards.length} wedge${cards.length === 1 ? "" : "s"}`}
         className="absolute bottom-0"
         style={{
-          width: WHEEL,
-          height: WHEEL,
+          width: m.wheel,
+          height: m.wheel,
           transform: `rotate(${angle}deg)`,
           transitionProperty: "transform",
           transitionDuration: `${ms}ms`,
@@ -833,9 +1004,9 @@ function Wheel({ cards, winnerId, settled, weighted, angle, ms }: StageProps) {
         {cards.map((c, i) => {
           const a = angles[i];
           const won = settled && c.id === winnerId;
-          const label = clip(cardLabel(c), 13);
+          const label = clip(cardLabel(c), m.wedgeChars);
           // Room for the label is the ARC the wedge occupies where the text sits, not its angle:
-          // a thin wedge on a big wheel can still be too tight for 9px type.
+          // a thin wedge on a big wheel can still be too tight for the type.
           const room = 2 * Math.PI * R * ((LABEL_IN + LABEL_OUT) / 2) * fractions[i];
           // On the left half the spoke runs right-to-left, so the text would read upside down.
           // Anchor it at the far end and turn it the other way instead.
@@ -850,18 +1021,18 @@ function Wheel({ cards, winnerId, settled, weighted, angle, ms }: StageProps) {
                 opacity={settled && !won ? 0.4 : 1}
                 style={{ transitionProperty: "opacity", transitionDuration: "260ms" }}
               />
-              {room >= 11 && (
+              {room >= m.wedgeMinArc && (
                 <text
                   x={flip ? R - R * LABEL_IN : R + R * LABEL_IN}
                   y={R}
                   transform={`rotate(${flip ? a.mid + 90 : a.mid - 90} ${R} ${R})`}
                   textAnchor={flip ? "end" : "start"}
                   dominantBaseline="middle"
-                  fontSize={9}
+                  fontSize={m.wedgeFont}
                   fontWeight={500}
                   fill="var(--ink2)"
                   stroke="var(--panel)"
-                  strokeWidth={2.5}
+                  strokeWidth={m.wedgeFont * 0.28}
                   strokeLinejoin="round"
                   paintOrder="stroke"
                   opacity={settled && !won ? 0.4 : 1}
@@ -881,34 +1052,40 @@ function Wheel({ cards, winnerId, settled, weighted, angle, ms }: StageProps) {
 
 /** Straws: one per card, held in a fist, each with its card's name written down it. Unpulled they
  *  all show the same stub — that IS the game — and the pull reveals the winner's as the long one. */
-function Straws({ cards, winnerId, spinning, settled, ms }: StageProps) {
+function Straws({ cards, m, winnerId, spinning, settled, ms }: StageProps) {
   const revealed = spinning || settled;
   const winner = cards.findIndex((c) => c.id === winnerId);
-  const heights = useMemo(() => strawHeights(cards.length, winner), [cards.length, winner]);
+  const heights = useMemo(
+    () => strawHeights(cards.length, winner, m.strawTall, m.strawShort),
+    [cards.length, winner, m.strawTall, m.strawShort],
+  );
   return (
     <div
       role="img"
       aria-label={`${cards.length} straw${cards.length === 1 ? "" : "s"} in a fist`}
-      className="relative flex items-end justify-center gap-1.5"
-      style={{ height: STAGE }}
+      className="relative flex items-end justify-center"
+      style={{ height: m.stage, gap: m.strawGap }}
     >
       {/* The fist, behind the straws so every name still reads. */}
       <div
         aria-hidden="true"
-        className="absolute bottom-3 left-1/2 h-11 w-[min(100%,14rem)] -translate-x-1/2 rounded-[var(--radius)] border"
+        className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-[var(--radius)] border"
         style={{
+          width: `min(100%, ${m.fistW}px)`,
+          height: m.fistH,
           background: "color-mix(in oklab, var(--st-track) 40%, var(--panel))",
           borderColor: "var(--border2)",
         }}
       />
       {cards.map((c, i) => {
         const isWinner = c.id === winnerId;
-        const h = revealed ? heights[i] : 104;
+        const h = revealed ? heights[i] : m.strawIdle;
         return (
           <div
             key={c.id}
-            className="relative flex w-6 justify-center overflow-hidden rounded-t-full border border-b-0"
+            className="relative flex justify-center overflow-hidden rounded-t-full border border-b-0"
             style={{
+              width: m.strawW,
               height: h,
               background: fillOf(cardToken(c, i), false),
               borderColor: isWinner && settled ? "var(--accent)" : "var(--border2)",
@@ -918,13 +1095,15 @@ function Straws({ cards, winnerId, spinning, settled, ms }: StageProps) {
               transitionTimingFunction: "cubic-bezier(0.2, 0.85, 0.2, 1)",
             }}
           >
-            {/* Written DOWN the straw from its tip, so the name is legible at every length and
-                the short ones simply run out of room rather than being clipped mid-word. */}
+            {/* Written DOWN the straw from its tip, so the name is legible at every length and the
+                short ones simply run out of room rather than being clipped mid-word. */}
             <span
-              className="pt-2 text-[0.5rem] leading-none text-ink2"
+              className="leading-none text-ink2"
               style={{
                 writingMode: "vertical-rl",
-                maxHeight: Math.max(0, h - 14),
+                fontSize: m.strawFont,
+                paddingTop: Math.round(m.strawW * 0.3),
+                maxHeight: Math.max(0, h - m.strawW * 0.7),
                 overflow: "hidden",
                 whiteSpace: "nowrap",
                 textOverflow: "ellipsis",
@@ -942,7 +1121,7 @@ function Straws({ cards, winnerId, spinning, settled, ms }: StageProps) {
 /** Paper in a box: the box is shaken, the slips jostle inside it, and then one is lifted out with
  *  its name on it. The shake is a keyframe animation rather than a transition because the point of
  *  it is the wobble in between, which two end states can't express. */
-function Box({ cards, winnerId, spinning, settled, ms }: StageProps) {
+function Box({ cards, m, winnerId, spinning, settled, ms }: StageProps) {
   const out = spinning || settled;
   const index = cards.findIndex((c) => c.id === winnerId);
   const winner = index >= 0 ? cards[index] : undefined;
@@ -952,15 +1131,17 @@ function Box({ cards, winnerId, spinning, settled, ms }: StageProps) {
       role="img"
       aria-label={`A box of ${cards.length} folded slip${cards.length === 1 ? "" : "s"}`}
       className="relative flex items-end justify-center"
-      style={{ height: STAGE, width: STAGE }}
+      style={{ height: m.stage, width: m.stage }}
     >
       {/* The drawn slip, on its way out. Mounted ALWAYS, and merely invisible until there is one to
           lift: an element that first appears at its destination has nothing to travel from. */}
       <div
         aria-hidden="true"
-        className="absolute left-1/2 flex w-28 -translate-x-1/2 justify-center rounded-[var(--radius-sm)] border px-1.5 py-1.5 shadow-sm"
+        className="absolute left-1/2 flex -translate-x-1/2 justify-center rounded-[var(--radius-sm)] border shadow-sm"
         style={{
-          bottom: out && winner ? 132 : 72,
+          width: m.noteW,
+          padding: `${Math.round(m.noteFont * 0.6)}px ${Math.round(m.noteFont * 0.8)}px`,
+          bottom: out && winner ? m.boxH + m.stage * 0.1 : m.boxH * 0.64,
           opacity: out && winner ? 1 : 0,
           background: winner ? fillOf(cardToken(winner, index), false) : "var(--panel)",
           borderColor: "var(--border2)",
@@ -971,28 +1152,40 @@ function Box({ cards, winnerId, spinning, settled, ms }: StageProps) {
           transitionTimingFunction: "cubic-bezier(0.2, 0.8, 0.2, 1)",
         }}
       >
-        <span className="truncate text-[0.5625rem] leading-tight text-ink2">
-          {winner ? clip(cardLabel(winner), 20) : ""}
+        <span className="truncate leading-tight text-ink2" style={{ fontSize: m.noteFont }}>
+          {winner ? clip(cardLabel(winner), m.noteChars) : ""}
         </span>
       </div>
 
       <div
-        className={`relative h-28 w-40 overflow-hidden rounded-[var(--radius-sm)] border border-border2 bg-surface ${
+        className={`relative overflow-hidden rounded-[var(--radius-sm)] border border-border2 bg-surface ${
           spinning ? "pm-game-shake" : ""
         }`}
-        style={{ animationDuration: `${shake}ms` }}
+        style={
+          {
+            width: m.boxW,
+            height: m.boxH,
+            animationDuration: `${shake}ms`,
+            "--pm-shake": `${m.shake}px`,
+          } as CSSProperties
+        }
       >
         <div className="absolute inset-x-1 bottom-1 flex flex-wrap items-end justify-center gap-1">
           {cards.slice(0, 16).map((c, i) => (
             <div
               key={c.id}
-              className={`h-5 w-4 rounded-[2px] border ${spinning ? "pm-game-jostle" : ""}`}
-              style={{
-                background: fillOf(cardToken(c, i), false),
-                borderColor: "var(--border2)",
-                animationDuration: `${Math.max(1, Math.round(shake / 3))}ms`,
-                animationDelay: `${i * 35}ms`,
-              }}
+              className={`rounded-[2px] border ${spinning ? "pm-game-jostle" : ""}`}
+              style={
+                {
+                  width: m.slipW,
+                  height: m.slipH,
+                  background: fillOf(cardToken(c, i), false),
+                  borderColor: "var(--border2)",
+                  animationDuration: `${Math.max(1, Math.round(shake / 3))}ms`,
+                  animationDelay: `${i * 35}ms`,
+                  "--pm-jostle": `${Math.round(m.slipH * 0.2)}px`,
+                } as CSSProperties
+              }
             />
           ))}
         </div>
@@ -1005,15 +1198,22 @@ function Box({ cards, winnerId, spinning, settled, ms }: StageProps) {
  * Every card in the folder and where it stands this round — the readable answer to "what is still
  * in play", which is the part of the game a wheel can't state plainly.
  *
- * The bar above it holds the three things you reach for BETWEEN plays: whether the game takes turns
- * at all, whether a drawn card leaves the folder, and starting over. All three live here rather
- * than in the dice menu because they are about the round in front of you, not about which game this
- * folder is.
+ * `hiddenId` is rule 3 at the top of this file: the card the game has already recorded but has not
+ * yet shown you. It is drawn here as though it were still in play — no tint drop, no tick, and not
+ * counted against the total — until the wheel stops. Otherwise the corner of the screen announces
+ * the answer while the theatre is still building to it.
+ *
+ * The bar above the chips holds the three things you reach for BETWEEN plays: whether the game
+ * takes turns at all, whether a drawn card leaves the folder, and starting over. All three live
+ * here rather than in the dice menu because they are about the round in front of you, not about
+ * which game this folder is.
  */
 function Legend({
   folder,
   cards,
+  m,
   winnerId,
+  hiddenId,
   weighted,
   onWeight,
   onReset,
@@ -1022,7 +1222,9 @@ function Legend({
 }: {
   folder: Widget;
   cards: Widget[];
+  m: Metrics;
   winnerId: string | null;
+  hiddenId: string | null;
   /** Whether this game gives out shares — only the wheel does, so only the wheel offers to edit
    *  them. Putting a share control on a game that ignores it would be a lie in a dropdown. */
   weighted: boolean;
@@ -1032,7 +1234,8 @@ function Legend({
   onRepeat: (next: boolean) => void;
 }) {
   const round = keepsRound(folder);
-  const drawn = round ? (folder.spent ?? []).length : 0;
+  const spentIds = round ? (folder.spent ?? []).filter((id) => id !== hiddenId) : [];
+  const drawn = spentIds.length;
   return (
     <div className="shrink-0 border-t border-rule px-3 py-2">
       <div className="mb-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
@@ -1073,9 +1276,11 @@ function Legend({
           )}
         </div>
       </div>
-      <ul className={`flex flex-wrap gap-1 overflow-auto ${weighted ? "max-h-24" : "max-h-16"}`}>
+      <ul
+        className={`flex flex-wrap gap-1 overflow-auto ${weighted ? m.legend.weighted : m.legend.plain}`}
+      >
         {cards.map((c, i) => {
-          const spent = isSpent(folder, c.id);
+          const spent = isSpent(folder, c.id) && c.id !== hiddenId;
           const chip = (
             <>
               <span className="truncate">{cardLabel(c)}</span>

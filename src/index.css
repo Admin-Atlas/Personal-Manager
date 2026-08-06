@@ -449,32 +449,34 @@ body {
    * rock-paper-scissors. Each is pure theatre — every one of these games decides its answer before
    * the motion starts — so under reduced motion the name simply doesn't resolve and the pieces sit
    * still while the game still plays. Duration and repeat count are set per-element from the
-   * game's own timing, so there is one source of truth for how long a play takes. */
+   * game's own timing, and how FAR each one travels from `--pm-shake` / `--pm-jostle` / `--pm-bob` /
+   * `--pm-toss`, so the same wobble reads at the in-place panel's size and at the Overlay's. One
+   * source of truth for both, in FolderGame's METRICS table rather than spread through here. */
   @keyframes pm-game-shake {
     0%,
     100% {
       transform: translate3d(0, 0, 0) rotate(0deg);
     }
     12% {
-      transform: translate3d(-5px, 1px, 0) rotate(-3.5deg);
+      transform: translate3d(calc(var(--pm-shake, 5px) * -1), 1px, 0) rotate(-3.5deg);
     }
     26% {
-      transform: translate3d(5px, -1px, 0) rotate(3.5deg);
+      transform: translate3d(var(--pm-shake, 5px), -1px, 0) rotate(3.5deg);
     }
     40% {
-      transform: translate3d(-6px, 0, 0) rotate(-4deg);
+      transform: translate3d(calc(var(--pm-shake, 5px) * -1.2), 0, 0) rotate(-4deg);
     }
     54% {
-      transform: translate3d(6px, -1px, 0) rotate(4deg);
+      transform: translate3d(calc(var(--pm-shake, 5px) * 1.2), -1px, 0) rotate(4deg);
     }
     68% {
-      transform: translate3d(-4px, 1px, 0) rotate(-2.5deg);
+      transform: translate3d(calc(var(--pm-shake, 5px) * -0.8), 1px, 0) rotate(-2.5deg);
     }
     82% {
-      transform: translate3d(3px, 0, 0) rotate(1.5deg);
+      transform: translate3d(calc(var(--pm-shake, 5px) * 0.6), 0, 0) rotate(1.5deg);
     }
     92% {
-      transform: translate3d(-1px, 0, 0) rotate(-0.5deg);
+      transform: translate3d(calc(var(--pm-shake, 5px) * -0.2), 0, 0) rotate(-0.5deg);
     }
   }
   @keyframes pm-game-jostle {
@@ -483,13 +485,13 @@ body {
       transform: translateY(0) rotate(0deg);
     }
     25% {
-      transform: translateY(-4px) rotate(-7deg);
+      transform: translateY(calc(var(--pm-jostle, 4px) * -1)) rotate(-7deg);
     }
     55% {
-      transform: translateY(2px) rotate(5deg);
+      transform: translateY(calc(var(--pm-jostle, 4px) * 0.5)) rotate(5deg);
     }
     80% {
-      transform: translateY(-2px) rotate(-3deg);
+      transform: translateY(calc(var(--pm-jostle, 4px) * -0.5)) rotate(-3deg);
     }
   }
   @keyframes pm-game-bob {
@@ -498,7 +500,7 @@ body {
       transform: translateY(0) rotate(0deg);
     }
     45% {
-      transform: translateY(-14px) rotate(-8deg);
+      transform: translateY(calc(var(--pm-bob, 14px) * -1)) rotate(-8deg);
     }
   }
   /* The coin's arc. The flip itself is a transition on the disc inside; this is the hand throwing
@@ -509,7 +511,7 @@ body {
       transform: translateY(0);
     }
     50% {
-      transform: translateY(-46px);
+      transform: translateY(calc(var(--pm-toss, 46px) * -1));
     }
   }
 }
