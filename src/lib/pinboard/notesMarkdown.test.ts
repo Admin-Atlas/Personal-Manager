@@ -63,13 +63,19 @@ describe("toggleTaskAt / countTasks — ticking a box in the RENDERED note", () 
 
 describe("toRenderMarkdown — shorthand dialect → GFM (F-52)", () => {
   it("normalises checkbox markers to GFM task-list items", () => {
-    expect(toRenderMarkdown("[] buy milk")).toBe("- [ ] buy milk");
-    expect(toRenderMarkdown("[x] done")).toBe("- [x] done");
-    expect(toRenderMarkdown("[X] done")).toBe("- [x] done"); // case-folded to lowercase x
+    // On the BULLET marker, so a checklist and the round bullets around it stay ONE list — a marker
+    // change starts a new list in CommonMark, and two lists carry a `ul` margin between them.
+    expect(toRenderMarkdown("[] buy milk")).toBe("* [ ] buy milk");
+    expect(toRenderMarkdown("[x] done")).toBe("* [x] done");
+    expect(toRenderMarkdown("[X] done")).toBe("* [x] done"); // case-folded to lowercase x
   });
 
-  it("maps '.' bullets to '-' bullets (GFM has no distinct dot marker)", () => {
-    expect(toRenderMarkdown(". first")).toBe("- first");
+  it("emits the two bullet kinds as two DIFFERENT GFM markers", () => {
+    // The whole point: "." and "-" used to collapse to the same "- " item, so nothing downstream
+    // could tell a round bullet from a dash point. The round one is NOT "-" any more — "-" is the
+    // dash point's own input marker now, so the transform would read its own output back as dashes.
+    expect(toRenderMarkdown(". first")).toBe("* first");
+    expect(toRenderMarkdown("- first")).toBe("+ first");
   });
 
   it("keeps roman labels but appends a hard break so a run stays multi-line", () => {
@@ -79,13 +85,24 @@ describe("toRenderMarkdown — shorthand dialect → GFM (F-52)", () => {
   });
 
   it("preserves indentation on transformed markers", () => {
-    expect(toRenderMarkdown("  . nested")).toBe("  - nested");
-    expect(toRenderMarkdown("  [] task")).toBe("  - [ ] task");
+    expect(toRenderMarkdown("  . nested")).toBe("  * nested");
+    expect(toRenderMarkdown("  - nested")).toBe("  + nested");
+    expect(toRenderMarkdown("  [] task")).toBe("  * [ ] task");
   });
 
   it("leaves native list/quote markers byte-for-byte", () => {
-    const native = "- bullet\n1. one\n> quote";
+    // "-" is deliberately no longer among them: it is the dash point's marker, and a dash point is
+    // a different rendering from a plain bullet, so passing it through would BE the reported bug.
+    const native = "* bullet\n+ dash\n1. one\n> quote";
     expect(toRenderMarkdown(native)).toBe(native);
+  });
+
+  it("leaves a literal GFM task alone whichever bullet carries it", () => {
+    // countTasks and toggleTaskAt match the SOURCE line, so a rendered checkbox whose source
+    // counterpart had moved would tick a different line than the one clicked.
+    for (const line of ["- [x] done", "* [ ] todo", "+ [x] done"]) {
+      expect(toRenderMarkdown(line)).toBe(line);
+    }
   });
 
   it("gives plain prose lines a hard break so manual line breaks survive rendering (#394)", () => {
@@ -98,15 +115,19 @@ describe("toRenderMarkdown — shorthand dialect → GFM (F-52)", () => {
   });
 
   it("actually changes a dialect note (the ingest wiring is not a no-op)", () => {
-    const raw = "[] task one\n. a bullet\ni. roman";
+    const raw = "[] task one\n. a bullet\n- a dash point\ni. roman";
     const rendered = toRenderMarkdown(raw);
     expect(rendered).not.toBe(raw); // ingesting `rendered` differs from ingesting `raw`
-    expect(rendered).toBe("- [ ] task one\n- a bullet\ni. roman  ");
+    expect(rendered).toBe("* [ ] task one\n* a bullet\n+ a dash point\ni. roman  ");
   });
 
-  it("is idempotent on already-native content", () => {
-    const native = "- a\n- b\n\nsome prose";
-    expect(toRenderMarkdown(toRenderMarkdown(native))).toBe(toRenderMarkdown(native));
+  it("is idempotent on its own OUTPUT alphabet", () => {
+    // Which is what has to round-trip: this output is the copy that reaches the vault, so a second
+    // pass appending another hard break would grow whitespace on every re-promote.
+    for (const note of ["* a\n+ b\n\nsome prose", "- a\n. b\n[] c\nprose", "* [x] done\n* a"]) {
+      const once = toRenderMarkdown(note);
+      expect(toRenderMarkdown(once)).toBe(once);
+    }
   });
 });
 

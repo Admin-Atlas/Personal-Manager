@@ -13,6 +13,13 @@ import { toRenderMarkdown } from "./notesMarkdown";
 // as one run-on paragraph. Rendering through the real <Markdown> boundary is the only way to catch
 // that class of bug; a string assertion on the transform alone passes either way.
 function html(note: string): string {
+  const { container } = render(<Markdown dashLists>{toRenderMarkdown(note)}</Markdown>);
+  return container.innerHTML;
+}
+
+/** The same note through the DEFAULT boundary — what every other surface sees, and what the vault
+ *  copy is read back through in the reader. */
+function plainHtml(note: string): string {
   const { container } = render(<Markdown>{toRenderMarkdown(note)}</Markdown>);
   return container.innerHTML;
 }
@@ -28,7 +35,7 @@ describe("a note's own line breaks survive rendering", () => {
   });
 
   it("leaves list items alone — each already renders on its own line", () => {
-    const out = html("- one\n- two");
+    const out = html(". one\n. two");
     expect(out.match(/<li>/g)?.length).toBe(2);
     expect(out).not.toContain("<br>");
   });
@@ -97,5 +104,77 @@ describe("toRenderMarkdown stays idempotent", () => {
     const out = html("[] todo");
     expect(out).toContain("contains-task-list");
     expect(out).toContain("task-list-item");
+  });
+});
+
+// The two bullet kinds. Both stay REAL list items — nesting and hanging indent are the whole reason
+// not to render a dash point as prose with a dash typed in front of it — while staying
+// distinguishable enough for CSS to give them different markers.
+describe("round bullets and dash points render as two kinds of list", () => {
+  it("makes a '.' line a plain bullet list and a '-' line a dash list", () => {
+    const dots = html(". one\n. two");
+    expect(dots.match(/<li>/g)?.length).toBe(2);
+    expect(dots).not.toContain("pm-dash-list");
+
+    const dashes = html("- one\n- two");
+    expect(dashes.match(/<li>/g)?.length).toBe(2);
+    expect(dashes).toContain("pm-dash-list");
+  });
+
+  it("keeps them as SEPARATE lists when a note mixes them", () => {
+    // Changing the bullet character starts a new list in CommonMark, which is what makes a per-list
+    // class the right granularity: a list is homogeneous by construction.
+    const out = html(". bullet\n- dash");
+    expect(out.match(/<ul/g)?.length).toBe(2);
+    expect(out.match(/pm-dash-list/g)?.length).toBe(1);
+  });
+
+  it("tags a NESTED dash list too", () => {
+    // A nested list's position starts at its indentation, so reading the character AT the offset
+    // instead of scanning past the whitespace would leave every nested list unmarked.
+    const out = html(". parent\n  - nested dash");
+    expect(out).toContain("pm-dash-list");
+    expect(out.match(/<ul/g)?.length).toBe(2);
+  });
+
+  it("leaves a literal GFM task alone, so the tick-by-index mapping still holds", () => {
+    // countTasks/toggleTaskAt match the SOURCE line. A rendered checkbox with no source counterpart
+    // in the same order would tick a different line than the one clicked.
+    const out = html("- [x] done\n- [ ] todo");
+    expect(out.match(/type="checkbox"/g)?.length).toBe(2);
+    expect(out).not.toContain("pm-dash-list");
+  });
+
+  it("renders as an ORDINARY bullet everywhere the opt-in is off", () => {
+    // Which is what the vault copy is read through: "+" is standard GFM, so a promoted note stays
+    // portable and no other surface's Markdown is restyled by this.
+    const out = plainHtml("- one\n- two");
+    expect(out.match(/<li>/g)?.length).toBe(2);
+    expect(out).not.toContain("pm-dash-list");
+  });
+
+  it("puts a bullet and a checkbox in ONE list, and marks the non-task item", () => {
+    // The shape the flush-checklist CSS has to cope with. `ul.contains-task-list` gets its left
+    // padding zeroed so a checklist sits at the note's edge, and a plain bullet's disc is drawn in
+    // exactly that padding — so a non-task sibling silently lost its marker and read as a stray line
+    // of prose. The rule that gives it back keys on `li:not(.task-list-item)`, which only works if
+    // remark-gfm marks the task item and leaves the bullet unmarked, in the same list.
+    const { container } = render(<Markdown dashLists>{toRenderMarkdown(". a\n[] b")}</Markdown>);
+    const lists = container.querySelectorAll("ul");
+    expect(lists).toHaveLength(1);
+    expect(lists[0].className).toContain("contains-task-list");
+    const items = lists[0].querySelectorAll(":scope > li");
+    expect(items).toHaveLength(2);
+    expect(items[0].className).not.toContain("task-list-item");
+    expect(items[1].className).toContain("task-list-item");
+  });
+
+  it("re-running the transform over a dash list changes nothing", () => {
+    // "+" is in MARKER_RE for exactly this: without it the emitted line reads as prose on the next
+    // pass and grows a second hard break every time — and this output is what reaches the vault.
+    for (const note of ["- one\n- two", ". bullet\n- dash\nplain after"]) {
+      const once = toRenderMarkdown(note);
+      expect(toRenderMarkdown(once)).toBe(once);
+    }
   });
 });

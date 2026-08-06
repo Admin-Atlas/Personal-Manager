@@ -27,6 +27,7 @@ import {
   setMilestoneStatus,
   updateMilestone,
 } from "../lib/ipc";
+import { revealCaret } from "../lib/caretReveal";
 import { Markdown } from "../lib/markdown";
 import { CELL, folderAtPointer } from "../lib/pinboard/grid";
 import {
@@ -1035,6 +1036,8 @@ const NoteBody = memo(function NoteBody({
     }
     if (!ta || from === text || document.activeElement !== ta) return;
     ta.selectionStart = ta.selectionEnd = caretForRestore(from, text);
+    // Undo landing three lines above the fold is the same problem in the other direction.
+    revealCaret(ta);
   }, [text]);
   /** Change this note's text, flagging it as ours so the caret restore above stands aside. */
   const editText = useCallback(
@@ -1103,6 +1106,8 @@ const NoteBody = memo(function NoteBody({
         t.focus();
         t.selectionStart = res.selStart;
         t.selectionEnd = res.selEnd;
+        // The engine only reveals a caret it moved itself, and this one was moved by us.
+        revealCaret(t);
       });
     },
     [text, editText],
@@ -1147,7 +1152,12 @@ const NoteBody = memo(function NoteBody({
     e.preventDefault();
     editText(res.text);
     requestAnimationFrame(() => {
-      if (taRef.current) taRef.current.selectionStart = taRef.current.selectionEnd = res.caret;
+      const t = taRef.current;
+      if (!t) return;
+      t.selectionStart = t.selectionEnd = res.caret;
+      // The new bullet is the thing you are about to type into, so it has to be on screen before
+      // you start — on a note card a few lines tall it lands below the fold otherwise.
+      revealCaret(t);
     });
   }
 
@@ -1253,7 +1263,10 @@ const NoteBody = memo(function NoteBody({
           }}
           title="Click to edit"
         >
-          <Markdown>{toRenderMarkdown(text)}</Markdown>
+          {/* `dashLists`: the note dialect emits its "-" dash points as "+" bullets, and this is
+              the one surface that means that by them. Every other <Markdown> host renders other
+              people's Markdown and must keep rendering a "+" bullet as an ordinary bullet. */}
+          <Markdown dashLists>{toRenderMarkdown(text)}</Markdown>
         </div>
       )}
       {/* Footer: only render when it has something to show — the format toolbar + colour swatches

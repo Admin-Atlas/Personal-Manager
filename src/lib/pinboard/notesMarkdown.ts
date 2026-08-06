@@ -11,10 +11,25 @@
 //   • toRenderMarkdown — normalise the note's shorthand marker dialect to the GFM the renderer
 //     understands, leaving everything else byte-for-byte.
 //
-// Supported line markers (each needs a trailing space): "." and "-" bullets, "1." numbered,
-// "i." roman, ">" arrow/quote, "[]" checkbox (also "[x]"). "." and "-" both render as bullets
-// (GFM has no distinct dot marker); ">" renders as a blockquote (its native Markdown meaning);
-// roman items keep their exact labels. These fidelity choices are documented, not accidental.
+// Supported line markers (each needs a trailing space): "." round bullets, "-" dash points, "1."
+// numbered, "i." roman, ">" arrow/quote, "[]" checkbox (also "[x]"). ">" renders as a blockquote (its
+// native Markdown meaning) and roman items keep their exact labels. These fidelity choices are
+// documented, not accidental.
+//
+// **"." and "-" are two kinds of BULLET, not a bullet and some prose.** They used to render
+// identically, because both became the same GFM `- ` item and Markdown records nothing about which
+// character an author typed. They are now emitted as two different GFM bullet characters — "." as
+// `*`, "-" as `+` — which a remark plugin reads back off the source to tag the list (see
+// `src/lib/markdownDashLists.ts`), so one gets a disc and the other an en dash. Both stay real list
+// items: nesting and hanging indent are the point, and a dash point rendered as prose with a dash
+// typed in front of it would lose both. Both are ordinary GFM, so the copy this hands to the vault
+// stays portable and reads as a plain bullet anywhere outside the board.
+//
+// Note that "-" is no longer a passthrough marker and round bullets are no longer emitted as "-".
+// That pairing is forced, not stylistic: "-" is now an INPUT marker meaning "dash point", so if
+// round bullets still came out as "-" the transform would read its own output back as dash points.
+
+import { DASH_MARKER } from "../markdownDashLists";
 
 /** One marker match on a single line: the leading indent, the marker token (no trailing space),
  *  and the content after it. */
@@ -27,7 +42,21 @@ interface MarkerMatch {
 // A line is a list item when it is: optional indent, a marker token, at least one space, then
 // content. The alternation order matters — "." must be tried before "\d+\." / roman so a bare
 // dot bullet isn't mis-read, and digits before roman letters.
-const MARKER_RE = /^(\s*)(-|\.|>|\[[ xX]?\]|\d+\.|[ivxlcdmIVXLCDM]+\.)\s+(.*)$/;
+//
+// "*" and "+" are here because they are what the two bullet kinds are EMITTED as. Without them,
+// re-running the transform over its own output would read every list line as prose and append a
+// second hard break each time — and that output is what gets ingested into the vault, so a
+// repeatedly-promoted note would grow whitespace. Including them also means a pasted "*" or "+"
+// list is READ as the kind it already RENDERS as, which is the only self-consistent answer.
+const MARKER_RE = /^(\s*)(-|\+|\.|\*|>|\[[ xX]?\]|\d+\.|[ivxlcdmIVXLCDM]+\.)\s+(.*)$/;
+
+/** The GFM bullet a round "." bullet is emitted as.
+ *
+ *  NOT "-", which is what it used to be: "-" is now the dash point's own input marker, so emitting
+ *  round bullets as "-" would make the transform read its own output back as dash points. The two
+ *  alphabets have to stay disjoint. "*" and "+" both render as an ordinary disc anywhere outside a
+ *  PM note, which is what keeps the vault copy portable. */
+const BULLET_MARKER = "*";
 
 function matchMarker(line: string): MarkerMatch | null {
   const m = MARKER_RE.exec(line);
@@ -88,7 +117,7 @@ function isRomanToken(token: string): boolean {
 
 /** The marker that should begin the NEXT item after one whose token is `token`. */
 function nextMarker(token: string): string | null {
-  if (token === "-" || token === "." || token === ">") return `${token} `;
+  if (token.length === 1 && "-+.*>".includes(token)) return `${token} `;
   if (/^\[[ xX]?\]$/.test(token)) return "[] "; // a continued checkbox is always fresh/unchecked
   if (/^\d+\.$/.test(token)) return `${parseInt(token, 10) + 1}. `;
   if (isRomanToken(token)) {
@@ -147,8 +176,13 @@ function opensContainer(line: string): boolean {
 
 /**
  * Normalise a note's shorthand marker dialect to GFM for the shared <Markdown> renderer:
- *  - "[]" / "[x]" → GFM task-list items ("- [ ]" / "- [x]");
- *  - "." bullets → "-" bullets (GFM has no separate dot marker);
+ *  - "[]" / "[x]" → GFM task-list items ("* [ ]" / "* [x]"), on the bullet marker so a checklist
+ *    and the bullets around it stay one list;
+ *  - "." bullets → "*" bullets (a disc, once rendered);
+ *  - "-" dash points → "+" bullets, which `remarkDashLists` tags so they render with an en dash —
+ *    EXCEPT a literal GFM task ("- [ ] x"), which passes through untouched: `countTasks` and
+ *    `toggleTaskAt` match the SOURCE line, so a rendered checkbox that no longer has a source
+ *    counterpart in the same order would tick the wrong line;
  *  - roman items keep their label but gain a hard line break so a run stays multi-line and
  *    isn't collapsed into one paragraph (GFM merges single newlines);
  *  - "-", "1.", ">" already render natively (bullet, ordered list, blockquote) — untouched.
@@ -191,12 +225,23 @@ export function toRenderMarkdown(raw: string): string {
 
     const cb = /^\[([ xX]?)\]$/.exec(token);
     if (cb) {
-      out.push(`${indent}- [${cb[1].toLowerCase() === "x" ? "x" : " "}] ${content}`);
+      // The BULLET marker, so a checklist and the round bullets above it stay ONE list. A marker
+      // change starts a new list in CommonMark, and two lists carry the `ul` margin between them
+      // where a shared one carries only the much smaller `li` one.
+      out.push(`${indent}${BULLET_MARKER} [${cb[1].toLowerCase() === "x" ? "x" : " "}] ${content}`);
       continue;
     }
 
-    if (token === ".") {
-      out.push(`${indent}- ${content}`);
+    if (token === "." || token === BULLET_MARKER) {
+      out.push(GFM_TASK_RE.test(line) ? line : `${indent}${BULLET_MARKER} ${content}`);
+      continue;
+    }
+
+    // A dash point becomes a "+" bullet, which survives the parse as a distinguishable marker. A
+    // literal GFM task keeps its "-" so it stays an ordinary task item in an ordinary list — see the
+    // doc comment above for why that one must not move.
+    if (token === "-" || token === DASH_MARKER) {
+      out.push(GFM_TASK_RE.test(line) ? line : `${indent}${DASH_MARKER} ${content}`);
       continue;
     }
 
@@ -292,7 +337,8 @@ export type LineMarkerKind = "bullet" | "number" | "checkbox" | "heading" | "quo
 
 /** The marker each kind writes (number counts up per line, so it's templated below). */
 const LINE_PREFIX: Record<Exclude<LineMarkerKind, "number">, string> = {
-  bullet: "- ",
+  // "." not "-": the button is called Bullet, and "-" is now the dash point.
+  bullet: ". ",
   checkbox: "[] ",
   heading: "# ",
   quote: "> ",
@@ -300,7 +346,9 @@ const LINE_PREFIX: Record<Exclude<LineMarkerKind, "number">, string> = {
 
 /** Length of the given kind's marker at the start of a line (incl. indent + trailing space), or 0. */
 const MARKER_LEN_RE: Record<LineMarkerKind, RegExp> = {
-  bullet: /^(\s*)- /,
+  // Both spellings: "." is what the button writes, "*" is what the transform emits, so a note
+  // round-tripped through the vault still reads as bulleted.
+  bullet: /^(\s*)[.*] /,
   number: /^(\s*)\d+\. /,
   checkbox: /^(\s*)\[[ xX]?\] /,
   heading: /^(\s*)#{1,6} /,
