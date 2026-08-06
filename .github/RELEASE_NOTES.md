@@ -1,4 +1,4 @@
-PM desktop release — **v3.123.2-alpha**.
+PM desktop release — **v3.128.3-alpha**.
 
 ## Install
 
@@ -45,79 +45,67 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.123.2-alpha
+## What's new in 3.128.3-alpha
 
-This release rolls up everything since v3.114.9 — here's the tour at a glance:
+This release rolls up everything since v3.123.2 — here's the tour at a glance:
 
-- **A little tidying when you first open this one.** PM joins up files it can *prove* it was holding
-  twice — the same Google Drive file reached two ways — into one document that knows both places it
-  lives. Your filing is merged rather than chosen between, and nothing is deleted to do it. It happens
-  on the first launch and on the next Drive sync, and needs nothing from you. If you have never opened
-  the Documents table's **Columns** menu, that table also starts from a slightly different set of
-  columns than before; if you have ever ticked anything, your choice is untouched.
-- **One file is one document, however many places it lives.** If you own a file and a colleague has
-  also shared it with you, PM used to hold it twice — two rows, two filings, and no way to tell them
-  apart on screen. It now recognises them as the same file and keeps one document living in two
-  places, both still checked, so the document stays readable as long as either one is there. It only
-  ever joins two records when the provider's own id says they are the same file; two documents that
-  merely look alike are still shown to you to decide on. The duplicate check has moved out of Settings
-  onto the **Documents** tab, runs quietly after any sync that brought something new in, and now shows
-  where each copy came from — which account, which shared drive, which folder — so you can tell the two
-  sides apart. You can also say **keep both**, and PM remembers.
-- **Your documents say who wrote them — and keep saying it truthfully.** Author, last editor, creation
-  date and size now come through from Google Drive, OneDrive and your own machine. Word, PowerPoint,
-  Excel and PDF files carry that information inside the file itself, so a document from a folder on
-  your computer fills in the same columns as one from Drive. **Created** now means when the document
-  was created, not when the copy on your disk was made — for anything emailed, downloaded or restored
-  from a backup those are wildly different dates. And every sync brings it all up to date, including
-  the folder a file has been moved into; PM used to ask once, when it first saw the file, and never
-  again. Where a source says nothing, the field reads "Unknown" — and something PM was once told is
-  never blanked just because the source has gone quiet.
-- **A Documents table you can shape.** A **Columns** menu turns each column on or off; every column
-  sorts, with the rows that have no answer always settling at the bottom so sorting by author never
-  buries the files that have one. Two new facts join them: **Updated**, when the file itself last
-  changed at its source, and **Last synced**, when PM last had something new to write down about it.
-  Between them they separate "nobody has edited this since March" from "this connector stopped working
-  in March", which until now looked identical from outside.
-- **Sync you can stop, leave, and ask again from scratch.** **Stop indexing** now takes effect inside
-  the file listing, so it lands in seconds rather than after a whole account. Press **Sync now** on a
-  second account while the first is indexing and the "Queued" label stays put when you switch tabs. And
-  a new **Re-index everything**, behind the small arrow next to Sync now, reads every file in an account
-  again — for when PM and the account look like they have drifted apart. It asks first, because it takes
-  a while; nothing is deleted, and files PM already has are recognised and left alone.
-- **Re-tagging your library is something you can walk away from.** Both halves — choosing the vocabulary
-  and labelling every document — show a real progress bar, and leaving the Teach tab and coming back
-  rejoins the pass where it is instead of showing you nothing. The vocabulary step is a model call, and
-  its result is now kept rather than thrown away when you look at something else. A pass that ends says
-  so, however it ended, and PM refuses to start a second re-tag over a first.
-- **Everything about where your data lives, in one place — and an export that says what it is.** The
-  folder is written above the button that opens it, and on a vault you have moved or shared, PM names
-  its own settings folder separately. Export asks what you actually want — everything or just your
-  documents, plain or encrypted — with a sentence for each combination saying exactly what it produces
-  and how private the result is. The export archive now also carries the vault's key file, your entity
-  rules and every cloud pointer, which it had been leaving out: unzipped on another machine, the old one
-  gave you a vault PM could not open.
-- **Backups that show their work.** The progress bar now appears under the button you pressed rather
-  than five sections up the page, and the first stage shimmers instead of sitting frozen at 0%. Your
-  backups are listed by date and time rather than a 68-character filename with the date on the end. The
-  "a destination failed" banner can be dismissed and stays dismissed — and most of the time it was never
-  a failure at all: PM was reporting a tidy-up of older backups as the backup itself failing.
-- **A missing library is reported, never quietly re-created.** If PM's store has been deleted or moved
-  from outside PM, it now stops, names the file, and tells you it has deleted and re-created nothing, so
-  you can put it back or restore a backup first. It used to start over silently, opening looking perfectly
-  normal with nothing in it. "Start fresh" now also says that it deletes your notes, which it always did.
-- **Things you can see.** Switches have a visible edge and a visible off state at every theme, mode,
-  accent and contrast level — and PM's own contrast audit checks them now, so they cannot quietly fade
-  again. Disabled buttons dim once instead of twice. The calendar opens on an ordinary Monday-to-Sunday
-  week, and swiping sideways across it keeps working past the first day. The rebuild activity list keeps
-  every file in the pass, scrolls, and survives the rebuild finishing.
-- **And under the hood.** Approving a large pile of documents no longer locks up the app — PM was
-  rewriting and re-encrypting its whole index file once per document, so two hundred approvals meant two
-  hundred full rewrites. Security updates landed for three of the libraries PM builds on. A pre-release
-  review also closed several faults in the work above, before any of it reached you: files in a connected
-  account being reported as missing when they were fine, a duplicate merge quietly undoing your filing on
-  the next launch, and an edit to a tracked file being skipped for good if PM could not read it the first
-  time.
+- **A folder on the pinboard can pick your next task for you.** Put the jobs you're dithering between
+  into one folder, press the dice in its top bar, and choose how it should decide: a roulette wheel, a
+  fist of straws, a box of folded slips, a coin toss, or rock-paper-scissors against PM. The first
+  three pick one card out of all of them; the last two put a single card to you and let you play for
+  it — lose and it's yours, win and you're off the hook. Whatever it lands on is what you do next.
+  Nothing checks up on you afterwards: it is there to be argued with, not obeyed.
+- **Each game is properly played, not just announced.** The wheel turns several times and slows into
+  its wedge, the straws are pulled from a fist to reveal the long one, the box is shaken with the slips
+  jostling inside before one is lifted out, the coin is thrown in an arc and turns over as it goes, and
+  a throw is counted out with both fists before either opens. Every piece carries the name of the card
+  it stands for — along its wedge, down its straw, on the slip that comes out — and a folder opened as
+  an overlay draws all of it larger, with room for longer names. Motion turned down in Settings skips
+  straight to the answer.
+- **A round that remembers.** A card the folder has picked greys out and waits its turn, and isn't
+  offered again until every other card has had one — then the round loops back and starts over. That
+  round survives closing PM, so you can come back in the afternoon to a folder that still knows what it
+  has already handed you. If you'd rather have no memory between plays at all — every card in every
+  draw, the same one twice running — there's a switch for that, beside the one that sends a chosen card
+  straight to your board. On the wheel, cards can also be given a bigger or smaller share, and the
+  wedges are cut from exactly those shares, so it can never show you one thing and pick by another.
+- **Every document says where it actually is.** The folders it sits in, the way Google Drive shows
+  them — “My Drive › Projects › PM › documentation”, or “Shared with you › crisis › study guide”. That
+  replaces a web address which could tell you how to open a file and never where it lived, so two files
+  called “Notes” looked identical. A file PM has found in more than one place shows a separate trail
+  for each, which is the difference that matters on the screen asking whether they're duplicates. Where
+  PM cannot see the whole trail it shows what it can rather than guessing — the folders above something
+  shared with you belong to whoever shared it — and the address is still one click away, with a Copy
+  button.
+- **A Documents table that stops wasting space and keeps the shape you give it.** Each column is the
+  width of what's in it rather than reserving room for its worst case, and all that slack used to
+  collect in one gap between a title and the buttons beside it. Sorting by size and going to look at
+  something else no longer drops you back to newest-first when you return, and the order survives
+  closing PM. A new **Source** column, off until you switch it on, says what PM is holding and what
+  it's only pointing at — and clicking its heading gathers a whole library's worth of trouble at one
+  end.
+- **A note can tell a bullet from a dash.** Starting a line with `.` gives a round bullet and `-` now
+  gives an en dash — two kinds of point instead of one, so a list and the asides hanging off it don't
+  have to look the same. Both stay proper list items, so they nest, and one long enough to wrap
+  continues under its own text. A checklist sits flush against the note's edge, the bullets sharing a
+  list with it keep their dots, and code pasted into a note is left exactly as pasted — a line
+  beginning with a dash inside a code block stays one, which in a diff is the difference between a line
+  being removed and a line being added.
+- **A new line in a note is brought into view before you type into it.** When PM continues a list for
+  you it places the cursor itself, and a browser only follows a cursor it moved on its own — so on a
+  note card a few lines tall you were typing into a line just below the bottom edge. Tab, the
+  formatting buttons and undo all place the cursor the same way and are fixed with it, in both
+  directions: the note no longer scrolls itself when the line was already showing.
+- **Smaller things you'll see.** The badges in the Documents list line up down the right of the title
+  column again, so a file with something wrong with it is findable by scanning one column instead of
+  reading every row. The **Edit** button on a row stays out of the way until you hover it, like
+  **Delete** beside it. And sorting by a column most documents have no answer for keeps the blanks at
+  the bottom whichever way you sort.
+- **Under the hood**, a review of everything in this release closed fourteen faults before any of it
+  reached you — among them a folder game that moved a card onto your board after telling you you'd won
+  it, a tick-list that had quietly lost its alignment, notes that scrolled themselves whenever you
+  pressed Enter near the top, and a document's folder trail that could be saved wrong and stay wrong if
+  Google happened to be busy at the moment PM asked.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
