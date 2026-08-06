@@ -275,6 +275,26 @@ describe("usePinboard — a game round outlives the app, but not the folder", ()
     expect(folderOf(board).spent).toEqual([]);
   });
 
+  it("does NOT move out a card you dodged — winning a throw isn't being given work", async () => {
+    // The verdict games take cards off the table both ways. A card you beat has had its turn this
+    // round, but it is emphatically not a job, so auto pop-out must not fire for it.
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [{ ...folderOf(GAME_BOARD), autoPopOut: true }],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.drawCard("f", "a", false));
+    const board = result.current.board;
+    expect(folderOf(board).children?.map((c) => c.id)).toEqual(["a", "b"]);
+    expect(board.widgets.find((w) => w.id === "a")).toBeUndefined();
+    // It still counts as having had its turn, so the folder isn't offering it again.
+    expect(folderOf(board).spent).toEqual(["a"]);
+  });
+
   it("ignores a draw naming a card the folder doesn't hold", async () => {
     ipc.getPref.mockResolvedValue(JSON.stringify(GAME_BOARD));
     const { result } = renderHook(() => usePinboard());

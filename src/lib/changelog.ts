@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.0-alpha",
+    date: "2026-08-06",
+    highlights: [
+      "Two more ways for a folder to settle it, and these two play you rather than picking for you. Flip a coin and heads the job is yours, tails you’re off the hook. Or throw rock, paper, scissors against PM: it puts a card on the table, you throw, and you only have to do it if PM wins. Nothing checks up on you afterwards — it is there to be argued with, not obeyed. Either way that card has had its turn, so the folder moves on to the next one instead of putting the same job to you all afternoon, and a card you dodged is never moved out to your board, because dodging it is the opposite of being given it.",
+      "On the roulette wheel, some cards can matter more than others. Each one starts on an even share and can be nudged up to three times that or down to a quarter, from the list under the wheel. The wedges are cut from exactly those shares, so a wheel can never show you one thing and pick by another — and a folder nobody has tuned spins exactly as it did before. The other games don’t offer it: a straw’s length is already the answer, and a coin has two faces and one card, so there is no share to hand out.",
+    ],
+  },
+  {
     version: "3.127.0-alpha",
     date: "2026-08-06",
     highlights: [

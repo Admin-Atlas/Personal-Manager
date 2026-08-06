@@ -498,16 +498,21 @@ export function usePinboard(viewport: { cols: number; rows: number } = { cols: C
    * The pop-out is folded in here rather than left to a second call so the two land as ONE board,
    * and so `markDrawn` sees the folder BEFORE the card leaves it: it decides whether that draw ends
    * the round, and a pool that had already shrunk would loop back one card early.
+   *
+   * `assigned` is what separates the two kinds of game. A wheel only ever hands you work, so its
+   * draws are assignments. A verdict game (a coin, a throw) also takes cards OFF the table — you
+   * won, so you dodged that one — and a card you dodged has still had its turn this round but is
+   * emphatically not a job to move onto your board. Only an assignment is ever popped out.
    */
   const drawCard = useCallback(
-    (folderId: string, childId: string) => {
+    (folderId: string, childId: string, assigned = true) => {
       change((b) => {
         const { cols, rows } = boundsRef.current;
         const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
         const child = folder?.children?.find((c) => c.id === childId);
         if (!folder || !child) return b;
         const spent = markDrawn(folder, childId);
-        if (!folder.autoPopOut) {
+        if (!folder.autoPopOut || !assigned) {
           return {
             ...b,
             widgets: b.widgets.map((w) => (w.id === folderId ? { ...w, spent } : w)),

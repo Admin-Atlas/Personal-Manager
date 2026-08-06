@@ -6,12 +6,18 @@ import {
   cardLabel,
   carryGameState,
   draw,
+  GAME_INFO,
+  GAME_KINDS,
   isSpent,
   livePool,
   markDrawn,
   playsGame,
   pool,
   pruneSpent,
+  rpsOutcome,
+  shares,
+  THROWS,
+  weightOf,
 } from "./game";
 import { BOARD_VERSION } from "./types";
 import type { Board, Widget } from "./types";
@@ -85,6 +91,51 @@ describe("livePool — the round in progress", () => {
   });
 });
 
+describe("weightOf — the range is enforced in one place", () => {
+  it("is 1 for a card nobody has tuned, so an untouched folder draws evenly", () => {
+    expect(weightOf(note("a"))).toBe(1);
+  });
+
+  it("takes a real weight as given", () => {
+    expect(weightOf(note("a", { weight: 0.5 }))).toBe(0.5);
+    expect(weightOf(note("a", { weight: 3 }))).toBe(3);
+  });
+
+  it("clamps a hand-edited board rather than handing a wheel a silly wedge", () => {
+    expect(weightOf(note("a", { weight: 0 }))).toBe(0.25);
+    expect(weightOf(note("a", { weight: -5 }))).toBe(0.25);
+    expect(weightOf(note("a", { weight: 9000 }))).toBe(3);
+  });
+
+  it("falls back to 1 on anything that isn't a finite number", () => {
+    expect(weightOf(note("a", { weight: Number.NaN }))).toBe(1);
+    expect(weightOf(note("a", { weight: Number.POSITIVE_INFINITY }))).toBe(1);
+    expect(weightOf({ ...note("a"), weight: "2" } as unknown as Widget)).toBe(1);
+  });
+});
+
+describe("shares — what the wheel draws is what the wheel uses", () => {
+  it("splits evenly when weighting is off, whatever the cards say", () => {
+    const cards = [note("a", { weight: 3 }), note("b"), note("c", { weight: 0.5 })];
+    expect(shares(cards, false)).toEqual([1 / 3, 1 / 3, 1 / 3]);
+  });
+
+  it("gives each card its share of the total when weighting is on", () => {
+    const cards = [note("a", { weight: 3 }), note("b", { weight: 1 })];
+    expect(shares(cards, true)).toEqual([0.75, 0.25]);
+  });
+
+  it("always sums to one", () => {
+    const cards = [note("a", { weight: 0.25 }), note("b", { weight: 2 }), note("c")];
+    const total = shares(cards, true).reduce((n, s) => n + s, 0);
+    expect(total).toBeCloseTo(1, 10);
+  });
+
+  it("returns no shares for no cards rather than dividing by zero", () => {
+    expect(shares([], true)).toEqual([]);
+  });
+});
+
 describe("draw — uniform, and the caller owns the randomness", () => {
   const cards = [note("a"), note("b"), note("c"), note("d")];
 
@@ -110,6 +161,77 @@ describe("draw — uniform, and the caller owns the randomness", () => {
 
   it("always returns the only candidate", () => {
     expect(draw([note("solo")], 0.99)?.id).toBe("solo");
+  });
+
+  it("gives a weighted card a proportionally bigger slice of [0,1)", () => {
+    // a is worth 3, b is worth 1 — so a takes the first three quarters of the line.
+    const weighted = [note("a", { weight: 3 }), note("b", { weight: 1 })];
+    expect(draw(weighted, 0, true)?.id).toBe("a");
+    expect(draw(weighted, 0.74, true)?.id).toBe("a");
+    expect(draw(weighted, 0.75, true)?.id).toBe("b");
+    expect(draw(weighted, 0.99, true)?.id).toBe("b");
+  });
+
+  it("ignores weights entirely when the game doesn't weigh", () => {
+    const weighted = [note("a", { weight: 3 }), note("b", { weight: 1 })];
+    expect(draw(weighted, 0.4, false)?.id).toBe("a");
+    expect(draw(weighted, 0.6, false)?.id).toBe("b");
+  });
+
+  it("is unchanged by turning weighting on for a folder nobody has tuned", () => {
+    const plain = [note("a"), note("b"), note("c"), note("d")];
+    for (const r of [0, 0.1, 0.24, 0.25, 0.5, 0.74, 0.75, 0.99]) {
+      expect(draw(plain, r, true)?.id).toBe(draw(plain, r, false)?.id);
+    }
+  });
+});
+
+describe("rpsOutcome — from the player's side", () => {
+  it("knows what beats what", () => {
+    expect(rpsOutcome("rock", "scissors")).toBe("win");
+    expect(rpsOutcome("paper", "rock")).toBe("win");
+    expect(rpsOutcome("scissors", "paper")).toBe("win");
+  });
+
+  it("knows what it loses to", () => {
+    expect(rpsOutcome("scissors", "rock")).toBe("lose");
+    expect(rpsOutcome("rock", "paper")).toBe("lose");
+    expect(rpsOutcome("paper", "scissors")).toBe("lose");
+  });
+
+  it("calls a match a tie — nobody has won, so the card has not had its turn", () => {
+    for (const t of THROWS) expect(rpsOutcome(t, t)).toBe("tie");
+  });
+
+  it("is decided for every pairing there is", () => {
+    for (const a of THROWS) {
+      for (const b of THROWS) {
+        expect(["win", "lose", "tie"]).toContain(rpsOutcome(a, b));
+      }
+    }
+  });
+});
+
+describe("GAME_INFO — the shape of each game is stated, not assumed", () => {
+  it("marks the three pool games as draws and the two one-card games as verdicts", () => {
+    expect(GAME_INFO.roulette.shape).toBe("draw");
+    expect(GAME_INFO.straws.shape).toBe("draw");
+    expect(GAME_INFO.box.shape).toBe("draw");
+    expect(GAME_INFO.coin.shape).toBe("verdict");
+    expect(GAME_INFO.rps.shape).toBe("verdict");
+  });
+
+  it("weighs the wheel and nothing else — it is the only one with a visible proportion", () => {
+    const weighted = GAME_KINDS.filter((k) => GAME_INFO[k].weighted);
+    expect(weighted).toEqual(["roulette"]);
+  });
+
+  it("describes every game it offers", () => {
+    for (const k of GAME_KINDS) {
+      expect(GAME_INFO[k].label.length).toBeGreaterThan(0);
+      expect(GAME_INFO[k].blurb.length).toBeGreaterThan(0);
+      expect(GAME_INFO[k].verb.length).toBeGreaterThan(0);
+    }
   });
 });
 
