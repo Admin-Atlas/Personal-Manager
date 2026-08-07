@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.4-alpha",
+    date: "2026-08-07",
+    highlights: [
+      "Under-the-hood tidying, with nothing to see. Building PM on a developer's machine was leaving behind far more than it needed to — one checkout had quietly grown to 123 GB of build leftovers, most of it debugging detail kept from every version of the code ever compiled there. Development builds now keep only the part that makes a crash report readable and drop the rest. Nothing about the app you run changes.",
+    ],
+  },
+  {
     version: "3.128.3-alpha",
     date: "2026-08-06",
     release: true,
