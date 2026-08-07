@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.128.3-alpha"
+version = "3.128.4-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -11,13 +11,28 @@ license = "AGPL-3.0-or-later"
 # binary and can speed hot paths; the trade is a slower release compile. Size / build-time / runtime
 # impact is PENDING MEASUREMENT (per the goal directive — no numbers asserted). Debug builds and the
 # `just check` gate are unaffected (they use the dev profile).
-# Incremental compilation is disabled for dev builds. On this large crate every rebuild minted a
-# fresh per-fingerprint `target/debug/incremental/<crate>-<hash>` directory (each ~1–1.5 GB) that
-# Cargo never garbage-collected, so the cache grew unbounded (~300 GB observed). Turning it off
-# trades a slightly slower warm rebuild for a bounded target dir; correctness and the `just check`
-# gate are unaffected. Contributors who want incremental back can override locally in .cargo/config.toml.
+# Two settings, one job: bound what dev builds leave behind in `target/`. Neither affects
+# correctness or the `just check` gate.
+#
+# `incremental = false` (#308). On this large crate every rebuild minted a fresh per-fingerprint
+# `target/debug/incremental/<crate>-<hash>` directory (each ~1–1.5 GB) that Cargo never garbage-
+# collected, so that cache grew unbounded (~300 GB observed). It works — measured 2026-08-07,
+# `target/debug/incremental` was 0 bytes. But it governs ONLY that directory, which is why the
+# problem came back looking identical: by that same measurement `target/` had reached 122.9 GB,
+# with 81.7 GB in `deps/` and 38.7 GB in `build/` and nothing at all in `incremental/`.
+#
+# `debug = "line-tables-only"` attacks the larger half. 60.4 GB of that `deps/` total was 529 `.pdb`
+# files — 248 of them `pm_lib-<hash>.pdb` at ~240 MB each, one per code state Cargo had compiled
+# since #308. Line tables keep file/line in backtraces and panic locations (what CI logs and a bug
+# report actually need); what is dropped is variable and type info, so stepping in a debugger can no
+# longer inspect locals. Override locally in `.cargo/config.toml` if you need a full-symbol build.
+#
+# Neither setting is a garbage collector, and Cargo has none: a new fingerprint always mints a new
+# hash-suffixed artifact set in `deps/` and `build/` and keeps the old one forever. Reclaiming still
+# means an occasional `cargo clean` (or `cargo sweep`); these settings only slow the accumulation.
 [profile.dev]
 incremental = false
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"
