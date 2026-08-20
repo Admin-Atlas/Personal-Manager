@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.9-alpha",
+    date: "2026-08-20",
+    highlights: [
+      "Transcribing a recording is back to full speed on a smaller machine. The change that stopped PM hogging your processor set a limit that a second part of PM — the one that turns speech into text — quietly read as its own, and took roughly half the processors it had been using on a laptop with four cores or fewer. Machines with eight or more were unaffected, and larger ones were already faster. Transcription now works out its own figure: never fewer than it used before, and more on a machine that has it to give.",
+      "A correction to what the last release said. PM stepping back when you are doing something else covers everything that part of PM does — reading and filing new documents, yes, but also the work behind a chat answer or a search. The note described it as indexing alone, which undersold where it applies.",
+    ],
+  },
+  {
     version: "3.128.8-alpha",
     date: "2026-08-20",
     highlights: [

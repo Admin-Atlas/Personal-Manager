@@ -1022,6 +1022,68 @@ class ConvertCharsetRetryTest(unittest.TestCase):
         self.assertEqual([s.charset if s else None for s in seen], [None, "utf-8"])
 
 
+class TranscribeThreadBudgetTest(unittest.TestCase):
+    """Transcription must not silently inherit a number chosen by measuring embedding.
+
+    faster-whisper's `cpu_threads` defaults to 0, which its docstring defines as "a non zero value
+    overrides the OMP_NUM_THREADS environment variable" — zero means OMP wins. This module sets
+    OMP_NUM_THREADS for the embedding pools, so leaving `cpu_threads` unset handed transcription the
+    embedding budget: on 4 cores that was 4 threads -> 2, half speed, with nothing to connect it to.
+    """
+
+    def _budget(self, cores, env=None):
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            for k in ("PM_SIDECAR_TRANSCRIBE_THREADS",):
+                if not (env or {}).get(k):
+                    os.environ.pop(k, None)
+            with mock.patch.object(S.os, "cpu_count", lambda: cores):
+                return S._transcribe_thread_budget()
+
+    def test_no_machine_transcribes_slower_than_ctranslate2_would_alone(self):
+        # 4 is faster-whisper's own default. Below 8 cores the general budget would say 2 or 3.
+        for cores in (1, 2, 4, 6, 8):
+            self.assertEqual(self._budget(cores), 4, f"{cores} cores")
+
+    def test_it_still_scales_up_with_the_machine(self):
+        for cores, want in ((10, 5), (12, 6), (16, 8), (24, 8), (128, 8)):
+            self.assertEqual(self._budget(cores), want, f"{cores} cores")
+        self.assertEqual(self._budget(None), 4, "unknown core count takes the floor")
+
+    def test_the_two_budgets_diverge_exactly_where_the_bug_was(self):
+        # They agree from 8 cores up; the divergence below that IS the fix, so a refactor that
+        # collapsed them into one function would pass every other test in this class.
+        with mock.patch.object(S.os, "cpu_count", lambda: 4):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PM_SIDECAR_THREADS", None)
+                os.environ.pop("PM_SIDECAR_TRANSCRIBE_THREADS", None)
+                self.assertEqual(S._thread_budget(), 2)
+                self.assertEqual(S._transcribe_thread_budget(), 4)
+
+    def test_rust_outranks_the_local_guess_and_junk_falls_back(self):
+        self.assertEqual(self._budget(24, {"PM_SIDECAR_TRANSCRIBE_THREADS": "3"}), 3)
+        self.assertEqual(self._budget(4, {"PM_SIDECAR_TRANSCRIBE_THREADS": "banana"}), 4)
+
+    def test_the_model_is_actually_told_the_number(self):
+        # The budget existing is worth nothing if the kwarg is not passed: an unset `cpu_threads`
+        # is 0, and 0 is exactly the "let OMP_NUM_THREADS decide" case this class exists to close.
+        captured = {}
+
+        class _Model:
+            def __init__(self, name, **kw):
+                captured.update(kw)
+
+        pkg = types.ModuleType("faster_whisper")
+        pkg.WhisperModel = _Model
+        with mock.patch.dict(sys.modules, {"faster_whisper": pkg}):
+            S._whisper = None
+            try:
+                S.get_whisper(None)
+            finally:
+                S._whisper = None
+        self.assertEqual(captured.get("cpu_threads"), S._TRANSCRIBE_THREADS)
+        self.assertGreaterEqual(captured["cpu_threads"], 4)
+
+
 CORE_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties
     xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
