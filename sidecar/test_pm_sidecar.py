@@ -778,11 +778,17 @@ def _fake_markitdown():
     than captured per call. Building a fresh package for the exception and another for the engine
     mints two unrelated class objects, so `except MarkItDownException` matches neither and every
     assertion passes for the wrong reason.
+
+    `pkg._raises` takes either one exception — raised on EVERY call, which is what the verdict
+    tests want — or a list consumed one entry per call, so a test can make the first attempt fail
+    and the retry succeed. `pkg._calls` records the `stream_info` each attempt was given, which is
+    the only way to tell a retry apart from a first pass.
     """
     import types
 
     pkg = types.ModuleType("markitdown")
     pkg._raises = None
+    pkg._calls = []
 
     class MarkItDownException(Exception):
         pass
@@ -800,12 +806,23 @@ def _fake_markitdown():
         text_content = "hello"
         title = "T"
 
+    class StreamInfo:
+        """The real one is a frozen dataclass of optional hints; `charset` is all PM sets."""
+
+        def __init__(self, charset=None):
+            self.charset = charset
+
     class MarkItDown:
-        def convert_local(self, path):
-            if pkg._raises is not None:
-                raise pkg._raises
+        def convert_local(self, path, *, stream_info=None):
+            pkg._calls.append(stream_info)
+            raises = pkg._raises
+            if isinstance(raises, list):
+                raises = raises[len(pkg._calls) - 1] if len(pkg._calls) <= len(raises) else None
+            if raises is not None:
+                raise raises
             return _Result()
 
+    pkg.StreamInfo = StreamInfo
     pkg.MarkItDownException = MarkItDownException
     pkg.UnsupportedFormatException = UnsupportedFormatException
     pkg.FileConversionException = FileConversionException
@@ -916,6 +933,93 @@ class ConvertVerdictWireTest(unittest.TestCase):
         self.assertFalse(reply["ok"])
         # The tag Rust renders as `sidecar convert failed [unconvertible]:` and classifies on.
         self.assertEqual(reply.get("error_kind"), "unconvertible")
+
+
+def _ascii_decode_error():
+    """The real shape of the failure: MarkItDown labelled the file `ascii` from its first 4 KB."""
+    return UnicodeDecodeError("ascii", b"\xe2\x80\x94", 0, 1, "ordinal not in range(128)")
+
+
+class ConvertCharsetRetryTest(unittest.TestCase):
+    """A charset guessed from 4 KB must not condemn the other 23.
+
+    MarkItDown reads `file_stream.read(4096)` to guess a charset, then hands that one guess to
+    every converter, which decode the WHOLE file with it. A 27 KB JSON file whose first 4 KB is
+    plain ASCII is therefore labelled `ascii`, and one em dash further in raises
+    `UnicodeDecodeError` — out of `accepts()`, the sniffing pass, which MarkItDown guards against
+    `NotImplementedError` and nothing else. So the *notebook* converter declining to sniff took
+    down the plain-text converter that would have read the file.
+
+    Observed live on 2026-08-20 against a real library, repeating every time the file came round.
+    It escaped `do_convert` untagged, so Rust read it as an engine fault and re-offered the item
+    forever instead of moving the cursor past it.
+    """
+
+    def setUp(self):
+        self.pkg = _fake_markitdown()
+
+    def _convert(self, raises=None, path="/pm/test/doc.json"):
+        self.pkg._raises = raises
+        with mock.patch.dict(sys.modules, {"markitdown": self.pkg}):
+            S._markitdown = None
+            try:
+                return S.do_convert({"path": path})
+            finally:
+                S._markitdown = None
+
+    def test_a_healthy_file_is_never_given_a_forced_charset(self):
+        # The retry is a fallback, not a policy: forcing UTF-8 up front would misread a file that
+        # genuinely is cp1252 or UTF-16, which the detector had right.
+        self.assertEqual(self._convert()["markdown"], "hello")
+        self.assertEqual(self.pkg._calls, [None])
+
+    def test_a_charset_misguess_is_retried_as_utf8_and_the_file_survives(self):
+        result = self._convert(raises=[_ascii_decode_error(), None])
+        self.assertEqual(result["markdown"], "hello")
+        self.assertEqual(len(self.pkg._calls), 2, "expected exactly one retry")
+        self.assertIsNone(self.pkg._calls[0], "the first pass must keep the detected charset")
+        self.assertEqual(self.pkg._calls[1].charset, "utf-8")
+
+    def test_a_file_in_some_other_encoding_is_a_verdict_not_an_engine_fault(self):
+        # ASCII is a strict subset of UTF-8, so a file that fails BOTH is genuinely unreadable.
+        # It must carry the `unconvertible` marker: untagged is what pinned the cursor.
+        with self.assertRaises(S.Unconvertible):
+            self._convert(raises=[_ascii_decode_error(), _ascii_decode_error()])
+        self.assertEqual(len(self.pkg._calls), 2)
+
+    def test_only_a_decode_failure_earns_a_second_attempt(self):
+        # A converter that read the file and refused it will refuse it again. Retrying every
+        # failure would double the cost of every genuinely unconvertible file in the library.
+        with self.assertRaises(S.Unconvertible):
+            self._convert(raises=self.pkg.UnsupportedFormatException("cannot handle .xyz"))
+        self.assertEqual(self.pkg._calls, [None])
+
+    def test_a_broken_engine_is_still_not_retried_into_a_verdict(self):
+        # MissingDependencyException stays account-fatal, retry or no retry.
+        with self.assertRaises(Exception) as caught:
+            self._convert(raises=self.pkg.MissingDependencyException("needs pdfminer.six"))
+        self.assertNotIsInstance(caught.exception, S.Unconvertible)
+        self.assertEqual(self.pkg._calls, [None])
+
+    def test_the_helper_alone_is_pure_and_needs_no_package(self):
+        # `convert_local_tolerating_charset` takes the StreamInfo class rather than importing it,
+        # so the decision is testable in a gate whose Python has no venv.
+        class _Info:
+            def __init__(self, charset=None):
+                self.charset = charset
+
+        seen = []
+
+        class _Engine:
+            def convert_local(self, path, *, stream_info=None):
+                seen.append(stream_info)
+                if len(seen) == 1:
+                    raise _ascii_decode_error()
+                return "converted"
+
+        out = S.convert_local_tolerating_charset(_Engine(), "/x.json", _Info)
+        self.assertEqual(out, "converted")
+        self.assertEqual([s.charset if s else None for s in seen], [None, "utf-8"])
 
 
 CORE_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

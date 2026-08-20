@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.8-alpha",
+    date: "2026-08-20",
+    highlights: [
+      "A dash or an accented name no longer stops PM reading a document. PM works out what alphabet a file is written in by looking at its first few kilobytes, and a file that happens to open with plain English was being treated as though all of it were plain English — so the first em dash, curly quote or accented name further down made the whole document unreadable. It was worse than losing one file: PM kept handing the same one back to itself instead of moving on, so a single document could quietly hold up everything queued behind it. PM now re-reads those files properly, and a file genuinely written in an alphabet it cannot read is set aside once rather than tried forever.",
+    ],
+  },
+  {
     version: "3.128.7-alpha",
     date: "2026-08-20",
     release: true,
