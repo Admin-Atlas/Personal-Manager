@@ -1,4 +1,4 @@
-PM desktop release — **v3.128.3-alpha**.
+PM desktop release — **v3.128.7-alpha**.
 
 ## Install
 
@@ -45,67 +45,30 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.128.3-alpha
+## What's new in 3.128.7-alpha
 
-This release rolls up everything since v3.123.2 — here's the tour at a glance:
+A short release with one large fix — how much of your machine PM takes while it works — plus
+the housekeeping since v3.128.3.
 
-- **A folder on the pinboard can pick your next task for you.** Put the jobs you're dithering between
-  into one folder, press the dice in its top bar, and choose how it should decide: a roulette wheel, a
-  fist of straws, a box of folded slips, a coin toss, or rock-paper-scissors against PM. The first
-  three pick one card out of all of them; the last two put a single card to you and let you play for
-  it — lose and it's yours, win and you're off the hook. Whatever it lands on is what you do next.
-  Nothing checks up on you afterwards: it is there to be argued with, not obeyed.
-- **Each game is properly played, not just announced.** The wheel turns several times and slows into
-  its wedge, the straws are pulled from a fist to reveal the long one, the box is shaken with the slips
-  jostling inside before one is lifted out, the coin is thrown in an arc and turns over as it goes, and
-  a throw is counted out with both fists before either opens. Every piece carries the name of the card
-  it stands for — along its wedge, down its straw, on the slip that comes out — and a folder opened as
-  an overlay draws all of it larger, with room for longer names. Motion turned down in Settings skips
-  straight to the answer.
-- **A round that remembers.** A card the folder has picked greys out and waits its turn, and isn't
-  offered again until every other card has had one — then the round loops back and starts over. That
-  round survives closing PM, so you can come back in the afternoon to a folder that still knows what it
-  has already handed you. If you'd rather have no memory between plays at all — every card in every
-  draw, the same one twice running — there's a switch for that, beside the one that sends a chosen card
-  straight to your board. On the wheel, cards can also be given a bigger or smaller share, and the
-  wedges are cut from exactly those shares, so it can never show you one thing and pick by another.
-- **Every document says where it actually is.** The folders it sits in, the way Google Drive shows
-  them — “My Drive › Projects › PM › documentation”, or “Shared with you › crisis › study guide”. That
-  replaces a web address which could tell you how to open a file and never where it lived, so two files
-  called “Notes” looked identical. A file PM has found in more than one place shows a separate trail
-  for each, which is the difference that matters on the screen asking whether they're duplicates. Where
-  PM cannot see the whole trail it shows what it can rather than guessing — the folders above something
-  shared with you belong to whoever shared it — and the address is still one click away, with a Copy
-  button.
-- **A Documents table that stops wasting space and keeps the shape you give it.** Each column is the
-  width of what's in it rather than reserving room for its worst case, and all that slack used to
-  collect in one gap between a title and the buttons beside it. Sorting by size and going to look at
-  something else no longer drops you back to newest-first when you return, and the order survives
-  closing PM. A new **Source** column, off until you switch it on, says what PM is holding and what
-  it's only pointing at — and clicking its heading gathers a whole library's worth of trouble at one
-  end.
-- **A note can tell a bullet from a dash.** Starting a line with `.` gives a round bullet and `-` now
-  gives an en dash — two kinds of point instead of one, so a list and the asides hanging off it don't
-  have to look the same. Both stay proper list items, so they nest, and one long enough to wrap
-  continues under its own text. A checklist sits flush against the note's edge, the bullets sharing a
-  list with it keep their dots, and code pasted into a note is left exactly as pasted — a line
-  beginning with a dash inside a code block stays one, which in a diff is the difference between a line
-  being removed and a line being added.
-- **A new line in a note is brought into view before you type into it.** When PM continues a list for
-  you it places the cursor itself, and a browser only follows a cursor it moved on its own — so on a
-  note card a few lines tall you were typing into a line just below the bottom edge. Tab, the
-  formatting buttons and undo all place the cursor the same way and are fixed with it, in both
-  directions: the note no longer scrolls itself when the line was already showing.
-- **Smaller things you'll see.** The badges in the Documents list line up down the right of the title
-  column again, so a file with something wrong with it is findable by scanning one column instead of
-  reading every row. The **Edit** button on a row stays out of the way until you hover it, like
-  **Delete** beside it. And sorting by a column most documents have no answer for keeps the blanks at
-  the bottom whichever way you sort.
-- **Under the hood**, a review of everything in this release closed fourteen faults before any of it
-  reached you — among them a folder game that moved a card onto your board after telling you you'd won
-  it, a tick-list that had quietly lost its alignment, notes that scrolled themselves whenever you
-  pressed Enter near the top, and a document's folder trail that could be saved wrong and stay wrong if
-  Google happened to be busy at the moment PM asked.
+- **PM stops holding on to memory it has finished with.** The part of PM that reads your
+  documents and turns them into something searchable was asking for far more memory at a time
+  than the work needed, and then never giving it back — so a session left open all day could
+  end up sitting on five gigabytes it had no further use for. On a laptop that is the
+  difference between PM being one open app among many and PM being the reason everything else
+  starts swapping. It now works in batches sized to your machine and hands back what it
+  borrows as each batch finishes. It turned out to be quicker this way too: the oversized
+  batches were slower, not faster.
+- **PM gets out of the way when you're doing something else.** Indexing used to reach for
+  every processor core on the machine at once, which is why opening PM could make everything
+  else feel sluggish while it caught up on your files. That work now runs at a lower priority
+  than whatever you're actually working in: it still uses the whole machine when nothing else
+  wants it, and steps back the moment you do. There's nothing to switch on, and it applies
+  whether you have indexing set to Fast or to Gentle.
+- **Under the hood.** Fifteen of the libraries PM is built from moved up to their latest patch
+  releases — among them the database layer your library is stored in, and the hashing and
+  encoding PM uses to keep track of your files. Building PM on a developer's machine also
+  stopped leaving behind tens of gigabytes of debugging detail nobody needed. Nothing about
+  the app you run changes.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.

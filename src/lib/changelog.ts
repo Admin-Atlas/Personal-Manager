@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.7-alpha",
+    date: "2026-08-20",
+    release: true,
+    highlights: [
+      "PM stops holding on to memory it has finished with. The part of PM that reads your documents and turns them into something searchable was asking for far more memory at a time than the work needed, and then never giving it back — so a session left open all day could end up sitting on five gigabytes it had no further use for. On a laptop that is the difference between PM being one open app among many and PM being the reason everything else starts swapping. It now works in batches sized to your machine and hands back what it borrows as each batch finishes. It turned out to be quicker this way too: the oversized batches were slower, not faster.",
+      "PM gets out of the way when you are doing something else. Indexing used to reach for every processor core on the machine at once, which is why opening PM could make everything else feel sluggish while it caught up on your files. That work now runs at a lower priority than whatever you are actually working in: it still uses the whole machine when nothing else wants it, and steps back the moment you do. There is nothing to switch on, and it applies whether you have indexing set to Fast or to Gentle.",
+      "Under the hood, fifteen of the libraries PM is built from moved up to their latest patch releases — among them the database layer your library is stored in, and the hashing and encoding PM uses to keep track of your files. Building PM on a developer's machine also stopped leaving behind tens of gigabytes of debugging detail nobody needed. Nothing about the app you run changes.",
+    ],
+  },
+  {
     version: "3.128.6-alpha",
     date: "2026-08-20",
     highlights: [
