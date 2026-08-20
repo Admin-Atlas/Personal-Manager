@@ -80,9 +80,44 @@ const GENTLE_INDEX_PAUSE_MS: u64 = 250;
 
 /// Embedding batch cap in "gentle" mode: the sidecar embeds at most this many chunks per forward
 /// pass, bounding peak activation memory so indexing on a low-memory machine doesn't spike RAM.
-/// "fast" passes `None` (the embedder's own default batch — max throughput). Small enough to bound
-/// memory, large enough that per-batch overhead stays negligible.
+/// Also the floor of [`embed_batch_for_ram`] — gentle is never larger than what fast would pick.
 const GENTLE_EMBED_BATCH: usize = 8;
+
+/// The largest batch "fast" mode will ever ask for.
+///
+/// This is a measured ceiling, not a memory budget. On a 24-core CPU, embedding throughput for
+/// `bge-small` is flat from a batch of 8 to 32 (~15-16 chunks/s) and then *falls* — 64 and 128
+/// measured 11-14 chunks/s. A bigger batch buys nothing on CPU, where the matmul already has every
+/// core; it only enlarges the single biggest tensor in flight. fastembed's own default is 256,
+/// which is a GPU-shaped number: it costs a 256 x 12 x 512 x 512 fp32 attention tensor — exactly
+/// 3 GiB — to run slower than a batch of 32.
+const MAX_EMBED_BATCH: usize = 32;
+
+/// RAM (GiB) at or above which a machine gets the full [`MAX_EMBED_BATCH`].
+const AMPLE_RAM_GB: f64 = 8.0;
+
+/// RAM (GiB) at or above which a machine gets the middle rung.
+const MODEST_RAM_GB: f64 = 4.0;
+
+/// The index-time embedding batch for a machine with `total_ram_gb` of RAM.
+///
+/// Peak activation scales linearly with the batch — for `bge-small` (12 heads, a 512-token window,
+/// fp32) it is almost exactly `batch x 12 MiB`, so the ladder below spends 96 MiB / 192 MiB /
+/// 384 MiB. Pure so the ladder is testable without a machine to read; `None` (a platform that won't
+/// report its RAM) takes the smallest rung, because the failure that matters is being too greedy on
+/// a small machine, not too shy on a large one.
+pub fn embed_batch_for_ram(total_ram_gb: Option<f64>) -> usize {
+    match total_ram_gb {
+        Some(gb) if gb >= AMPLE_RAM_GB => MAX_EMBED_BATCH,
+        Some(gb) if gb >= MODEST_RAM_GB => MAX_EMBED_BATCH / 2,
+        _ => GENTLE_EMBED_BATCH,
+    }
+}
+
+/// The machine's total RAM, read once. Physical memory doesn't change while the app runs, and
+/// [`indexing_embed_batch`] is deliberately re-read between files, so this must not become a
+/// `/proc/meminfo` parse per document.
+static TOTAL_RAM_GB: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
 
 /// How long indexing should pause between files for the current speed setting (0 unless "gentle").
 /// Cheap to read, so callers re-read it between files — flipping Fast/Gentle then takes effect on
@@ -94,14 +129,21 @@ pub fn indexing_pause_ms(conn: &Connection) -> u64 {
     }
 }
 
-/// The index-time embedding batch cap for the current speed setting: `Some(GENTLE_EMBED_BATCH)` in
-/// "gentle" mode (bounded memory), `None` otherwise (embedder default). Read alongside
-/// [`indexing_pause_ms`]; the Drive path re-reads it per item, so gentle batching also engages
-/// mid-sync.
+/// The index-time embedding batch cap for the current speed setting. Read alongside
+/// [`indexing_pause_ms`]; the Drive path re-reads it per item, so a mid-sync flip takes effect on
+/// the next one.
+///
+/// Always `Some`. This used to hand "fast" mode `None`, meaning "whatever the embedder likes" —
+/// which was fastembed's default of 256 and a 3 GiB attention tensor that onnxruntime's arena then
+/// kept for the life of the sidecar. Nothing about that was a decision anyone made; it was a
+/// library default inherited by omission. "Fast" now means the largest batch that is actually
+/// fastest ([`embed_batch_for_ram`]), which is both smaller and quicker.
 pub fn indexing_embed_batch(conn: &Connection) -> Option<usize> {
     match get_setting(conn, INDEXING_SPEED_KEY) {
         Ok(Some(v)) if v == "gentle" => Some(GENTLE_EMBED_BATCH),
-        _ => None,
+        _ => Some(embed_batch_for_ram(
+            *TOTAL_RAM_GB.get_or_init(crate::hardware::total_ram_gb),
+        )),
     }
 }
 
@@ -1287,6 +1329,54 @@ mod tests {
             )
             .is_err(),
             "source_type CHECK must reject an unknown value"
+        );
+    }
+
+    #[test]
+    fn embed_batch_ladder_spends_peak_activation_in_proportion_to_ram() {
+        // bge-small activations are ~12 MiB per unit of batch, so these rungs are 96 / 192 / 384 MiB.
+        assert_eq!(embed_batch_for_ram(Some(32.0)), MAX_EMBED_BATCH);
+        assert_eq!(embed_batch_for_ram(Some(16.0)), MAX_EMBED_BATCH);
+        assert_eq!(embed_batch_for_ram(Some(AMPLE_RAM_GB)), MAX_EMBED_BATCH);
+        assert_eq!(embed_batch_for_ram(Some(7.9)), MAX_EMBED_BATCH / 2);
+        assert_eq!(
+            embed_batch_for_ram(Some(MODEST_RAM_GB)),
+            MAX_EMBED_BATCH / 2
+        );
+        assert_eq!(embed_batch_for_ram(Some(3.9)), GENTLE_EMBED_BATCH);
+        assert_eq!(embed_batch_for_ram(Some(1.0)), GENTLE_EMBED_BATCH);
+    }
+
+    #[test]
+    fn unknown_ram_takes_the_smallest_rung() {
+        // A platform that won't report its RAM must not be treated as a large one: being too greedy
+        // on a small machine is the failure that matters.
+        assert_eq!(embed_batch_for_ram(None), GENTLE_EMBED_BATCH);
+    }
+
+    #[test]
+    fn fast_mode_never_asks_for_an_unbounded_batch() {
+        // The whole defect in one assertion: `None` here meant "whatever fastembed likes", which was
+        // 256 and a 3 GiB attention tensor the onnxruntime arena never gave back.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("speed.sqlite"), KEY).unwrap();
+        assert!(
+            indexing_embed_batch(&conn).is_some(),
+            "fast mode (the default, with no setting stored) must still cap the batch"
+        );
+
+        set_setting(&conn, INDEXING_SPEED_KEY, "fast").unwrap();
+        let fast = indexing_embed_batch(&conn).expect("fast mode caps the batch");
+        set_setting(&conn, INDEXING_SPEED_KEY, "gentle").unwrap();
+        let gentle = indexing_embed_batch(&conn).expect("gentle mode caps the batch");
+
+        assert!(
+            fast <= MAX_EMBED_BATCH,
+            "fast batch {fast} exceeds the measured ceiling"
+        );
+        assert!(
+            gentle <= fast,
+            "gentle ({gentle}) must never ask for more than fast ({fast})"
         );
     }
 }
