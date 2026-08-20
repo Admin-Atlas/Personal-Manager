@@ -108,6 +108,24 @@ pub fn scan(data_dir: Option<&std::path::Path>) -> Hardware {
     hw
 }
 
+/// Total physical RAM in GiB on its own — no GPU probe, no disk walk.
+///
+/// [`scan`] is the right call for the Workbench, but it shells out to `nvidia-smi` / CIM / sysfs to
+/// fill in the GPU, which is far too heavy for something read on an indexing path. This is the same
+/// `sysinfo` read [`fill_ram_cpu_disk`] makes and nothing else. `None` rather than `0.0` when the
+/// platform won't say, so a caller keeps its own default instead of acting on a zero it can't tell
+/// apart from a real answer.
+pub fn total_ram_gb() -> Option<f64> {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_memory();
+    match sys.total_memory() {
+        0 => None,
+        bytes => Some(round1(bytes as f64 / GIB)),
+    }
+}
+
 /// RAM / CPU / disk via `sysinfo` — one API, every OS. Each field is best-effort.
 fn fill_ram_cpu_disk(hw: &mut Hardware, data_dir: Option<&std::path::Path>) {
     use sysinfo::System;

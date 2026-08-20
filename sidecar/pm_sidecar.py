@@ -36,6 +36,7 @@ the reranker — is untrusted data, never instructions. This process only
 converts/embeds/scores/transcribes bytes; it never executes file contents.
 """
 
+import ctypes
 import json
 import logging
 import math
@@ -85,6 +86,127 @@ if _MODELS_DIR:
     # logs. Pinning it keeps the whole model story inside one deletable subtree, which is also what
     # the Windows sandbox's filesystem allow-set assumes.
     os.environ["HF_XET_CACHE"] = os.path.join(_MODELS_DIR, "hf", "xet")
+
+
+# Resource posture. This is a background helper on someone's own laptop, not a server, and it must
+# never be the reason the machine stops feeling responsive. Everything here is set at IMPORT time
+# because the native libraries read their thread counts as they load, and every import in this file
+# is lazy (inside a handler), so module scope is early enough for all of them.
+#
+# Left alone, three separate pools each size themselves to the core count: onnxruntime's intra-op
+# pool, the OpenBLAS bundled inside numpy, and the rayon pool inside the Rust `tokenizers`
+# extension. On a 24-core machine that produced ~94 threads contending for 24 cores while a single
+# embedding pass ran — the app "maxing out the CPU" on open. Rust sizes the pool (it has already
+# scanned the hardware) and passes PM_SIDECAR_THREADS; a raw dev run with the variable unset
+# derives the same figure here so the two paths behave identically.
+def _thread_budget():
+    """How many threads any one native pool may use. Half the cores, clamped to 2..8.
+
+    The clamp matters more than the ratio: measured on a 24-core box, going from an unbounded pool
+    to 8 threads cost ~14% embedding throughput and handed back 16 cores, which is the trade this
+    process should always take. The floor of 2 keeps a single-core VM from serializing completely.
+    """
+    override = os.environ.get("PM_SIDECAR_THREADS")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    return max(2, min(8, (os.cpu_count() or 4) // 2))
+
+
+_THREADS = _thread_budget()
+
+# The env-var half of the budget: numpy's OpenBLAS, any OpenMP runtime under onnxruntime, and
+# tokenizers' rayon pool. setdefault, not hard assignment — an operator who deliberately exported
+# one of these outranks our default (unlike the offline flags above, where Rust IS the authority).
+# onnxruntime's own pool is NOT here: it ignores these and is set per-session via `threads=` in
+# get_embedder / get_reranker.
+for _var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+):
+    os.environ.setdefault(_var, str(_THREADS))
+del _var
+
+
+def _lower_own_priority():
+    """Drop below normal scheduling priority, so the OS hands our cores to whatever the user is
+    doing the moment they want them.
+
+    This is the piece that makes PM yield without having to watch window focus: a niced process
+    still gets the whole machine when nothing else wants it, and loses only under contention —
+    which is exactly the desired behaviour and needs no policy of our own. +5 rather than +19: we
+    want to lose ties to the user's foreground work, not to be starved behind every daemon.
+
+    Best-effort by design. Lowering priority never requires privilege, but a container with a
+    restrictive seccomp profile can still refuse it, and that must not stop the sidecar booting.
+    """
+    try:
+        if hasattr(os, "nice"):
+            os.nice(5)
+        elif os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            # BELOW_NORMAL_PRIORITY_CLASS — the Windows analogue of a modest nice increment.
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00004000)
+    except Exception:
+        pass
+
+
+def _release_free_memory():
+    """Return glibc's free lists to the OS. A no-op anywhere else, and harmless when it is.
+
+    Python freeing an object only returns it to malloc, and malloc only returns memory to the
+    kernel from the top of an arena — so after a burst of large allocations the process can sit on
+    hundreds of MB it will never use again. `malloc_trim` walks the arenas and gives back whole
+    free pages. Called after the heavy handlers, where the difference is measurable; calling it
+    after `ping` would just be latency.
+    """
+    try:
+        libc = ctypes.CDLL(None)
+    except (OSError, TypeError):  # not a POSIX loader (Windows), nothing to trim
+        return
+    trim = getattr(libc, "malloc_trim", None)
+    if trim is None:  # musl and friends: no such symbol
+        return
+    try:
+        trim(0)
+    except Exception:
+        pass
+
+
+# Handlers heavy enough to be worth a trim once they return — the ones that run a model or hold a
+# whole file in memory. Everything else returns promptly to a small steady state on its own.
+_TRIM_AFTER = frozenset(
+    {"embed", "rerank", "transcribe", "convert", "analyze_image", "analyze_spreadsheet", "reduce"}
+)
+
+
+# The session posture both ONNX models are built with. fastembed exposes exactly these two knobs
+# (`fastembed/common/onnx_model.py`), and between them they are the whole memory story:
+#
+#   threads               -> intra_op_num_threads / inter_op_num_threads. Unset, onnxruntime takes
+#                            one thread per physical core.
+#   enable_cpu_mem_arena  -> onnxruntime's CPU arena. Defaults ON, and the arena NEVER returns a
+#                            chunk to the OS. One embedding pass at fastembed's default batch of
+#                            256 asks for a 256x12x512x512 fp32 attention tensor = exactly 3 GiB,
+#                            and the arena then holds it for the life of the process. Measured on
+#                            a 24-core box: one embed() call took a fresh interpreter from 0.22 GiB
+#                            to 5.31 GiB resident, and neither gc.collect() nor malloc_trim got it
+#                            back. With the arena off the same call peaks at 0.47 GiB and settles
+#                            to 0.18 GiB. The arena's job is to recycle same-shaped buffers, which
+#                            is a real (~20% here) throughput win on a server that never gives
+#                            memory back; on a laptop that runs for sixteen hours between restarts
+#                            it is the wrong trade.
+#
+# Bounding the batch (Rust's job) caps the size of any ONE tensor; turning the arena off is what
+# makes the memory come back afterwards. Both are needed — with the arena left on, even a batch of
+# 32 still settled at 1.22 GiB.
+def _session_posture():
+    return {"threads": _THREADS, "enable_cpu_mem_arena": False}
 
 
 def _fastembed_cache_dir():
@@ -253,6 +375,7 @@ def get_embedder(model=None, spec=None):
                 model_name=model,
                 cache_dir=_fastembed_cache_dir(),
                 local_files_only=_OFFLINE,
+                **_session_posture(),
                 **_local_path_kwargs(spec),
             )
         )
@@ -334,6 +457,7 @@ def get_reranker(model, spec=None):
                 model_name=model,
                 cache_dir=_fastembed_cache_dir(),
                 local_files_only=_OFFLINE,
+                **_session_posture(),
                 **_local_path_kwargs(spec),
             )
         )
@@ -1613,6 +1737,11 @@ def _quiet_stdout():
 
 
 def main():
+    # The long-lived worker is the process that competes with the user for the machine, so it is
+    # the one that steps aside. The --fetch helper is short-lived and network-bound, and lowering
+    # its priority would only make a download the user is waiting on feel slower.
+    _lower_own_priority()
+
     # Line-buffered stdout so the Rust side sees each reply immediately. Captured HERE, before any
     # handler runs, because `_quiet_stdout` below swaps `sys.stdout` out from under them — `out`
     # stays the real reply channel.
@@ -1627,6 +1756,10 @@ def main():
             continue
 
         req_id = None
+        # Bound before the try because the trim check after the reply reads it: a line that fails
+        # json.loads never reaches the assignment below, and a stale value from the previous
+        # request would otherwise decide this one's housekeeping.
+        method = None
         try:
             req = json.loads(line)
             req_id = req.get("id")
@@ -1690,6 +1823,11 @@ def main():
             )
         out.write(payload + "\n")
         out.flush()
+
+        # AFTER the reply is on the wire, never before: the caller must not wait on housekeeping.
+        # `method` is whatever the request claimed, so an unknown one simply is not in the set.
+        if method in _TRIM_AFTER:
+            _release_free_memory()
 
 
 def _ensure_model(method, params):

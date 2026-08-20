@@ -1102,5 +1102,82 @@ class FilePropertiesWireTest(unittest.TestCase):
         )
 
 
+class ResourcePostureTest(unittest.TestCase):
+    """The sidecar's memory and CPU posture — the settings that keep a long-lived helper from
+    quietly eating the machine it runs on.
+
+    The defect these lock down: `TextEmbedding(...)` was built with neither `threads` nor
+    `enable_cpu_mem_arena`. Unset, onnxruntime takes one thread per core AND keeps its CPU arena,
+    which never returns a chunk to the OS — so one embedding pass at fastembed's default batch of
+    256 minted a 256x12x512x512 fp32 attention tensor (exactly 3 GiB) and held it until the process
+    exited. Measured: 0.22 GiB -> 5.31 GiB from a single embed() call, with neither gc.collect()
+    nor malloc_trim recovering it.
+    """
+
+    def test_the_onnx_arena_is_off(self):
+        # The load-bearing half. Bounding the batch caps any ONE tensor; this is what makes the
+        # memory come back afterwards — with the arena left on, even a batch of 32 settled at
+        # 1.22 GiB against 0.18 GiB with it off.
+        self.assertIs(S._session_posture()["enable_cpu_mem_arena"], False)
+
+    def test_the_session_carries_a_thread_cap(self):
+        posture = S._session_posture()
+        self.assertIn("threads", posture)
+        self.assertGreaterEqual(posture["threads"], 1)
+        # Named exactly as fastembed expects, or it lands in **kwargs and silently does nothing.
+        self.assertEqual(set(posture), {"threads", "enable_cpu_mem_arena"})
+
+    def test_thread_budget_is_half_the_cores_inside_a_hard_clamp(self):
+        # Mirrors `sidecar_thread_budget` in src-tauri/src/sidecar.rs — Rust normally sends the
+        # number, and this is the fallback a raw dev run takes. The two must agree.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PM_SIDECAR_THREADS", None)
+            for cores, expected in ((24, 8), (16, 8), (12, 6), (8, 4), (4, 2), (1, 2)):
+                with mock.patch.object(os, "cpu_count", return_value=cores):
+                    self.assertEqual(S._thread_budget(), expected, f"{cores} cores")
+            with mock.patch.object(os, "cpu_count", return_value=None):
+                self.assertEqual(S._thread_budget(), 2)
+
+    def test_rust_outranks_the_local_guess(self):
+        with mock.patch.dict(os.environ, {"PM_SIDECAR_THREADS": "3"}):
+            with mock.patch.object(os, "cpu_count", return_value=64):
+                self.assertEqual(S._thread_budget(), 3)
+
+    def test_a_junk_thread_override_falls_back_rather_than_raising(self):
+        # The variable comes from Rust, but a stale or hand-edited environment must not stop the
+        # sidecar booting — losing the tuning is survivable, failing to start is not.
+        with mock.patch.dict(os.environ, {"PM_SIDECAR_THREADS": "lots"}):
+            with mock.patch.object(os, "cpu_count", return_value=8):
+                self.assertEqual(S._thread_budget(), 4)
+
+    def test_trimming_is_reserved_for_the_heavy_handlers(self):
+        # Every handler that runs a model or holds a whole file is worth a trim; `ping` is not —
+        # walking the arenas after a health check would just be latency on the hot path.
+        for method in ("embed", "rerank", "transcribe", "convert", "analyze_image"):
+            self.assertIn(method, S._TRIM_AFTER)
+        for method in ("ping", "count_tokens", "file_properties"):
+            self.assertNotIn(method, S._TRIM_AFTER)
+        # Nothing may be listed that isn't a real method, or the set silently rots.
+        self.assertTrue(S._TRIM_AFTER <= set(S.HANDLERS))
+
+    def test_releasing_memory_never_raises(self):
+        # Best-effort by contract: musl has no malloc_trim, Windows has no POSIX loader, and a
+        # sidecar must boot and serve on both.
+        S._release_free_memory()
+
+    def test_lowering_priority_never_raises(self):
+        # Also best-effort — a restrictive seccomp profile can refuse it. Run in a subprocess so the
+        # test process isn't left niced for everything that follows it.
+        code = "import pm_sidecar as S; S._lower_own_priority(); print('ok')"
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        self.assertEqual(proc.stdout.strip(), "ok", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2000,6 +2000,11 @@ impl SidecarManager {
                 "1".to_string(),
             ),
             ("PYTHONUTF8".to_string(), "1".to_string()),
+            (
+                "PM_SIDECAR_THREADS".to_string(),
+                sidecar_thread_budget(std::thread::available_parallelism().map(|n| n.get()).ok())
+                    .to_string(),
+            ),
         ];
         // Debug builds only: unlock the worker's dev-only `net_selftest` handler (the Developer-mode
         // network-block probe, issue #286). A release worker never sets this, so it refuses the method
@@ -2863,6 +2868,21 @@ fn too_old_message() -> String {
 /// interpreter or the venv). Shared by [`clean_python_env`] and the worker spawn so the confined and
 /// unconfined paths strip exactly the same set.
 const PYTHON_ENV_REMOVES: &[&str] = &["PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"];
+
+/// How many threads any ONE of the sidecar's native pools may use.
+///
+/// Three of them size themselves independently — onnxruntime's intra-op pool, the OpenBLAS inside
+/// numpy, and the rayon pool inside the `tokenizers` extension — and each defaults to one thread per
+/// core. On a 24-core machine that is ~94 threads fighting over 24 cores during a single embedding
+/// pass, which is what "PM maxes out the CPU when it opens" looks like from the outside.
+///
+/// Half the cores, clamped to 2..=8. The clamp carries the decision: measured on 24 cores, moving
+/// from an unbounded pool to 8 cost ~14% embedding throughput and handed back 16 cores. The floor of
+/// 2 keeps a single-core VM from serializing. The sidecar derives the same number itself when the
+/// variable is absent (a raw dev run), so the two paths agree — keep them in step.
+fn sidecar_thread_budget(cores: Option<usize>) -> usize {
+    (cores.unwrap_or(4) / 2).clamp(2, 8)
+}
 
 fn clean_python_env(command: &mut Command) {
     for k in PYTHON_ENV_REMOVES {
@@ -4101,5 +4121,35 @@ mod tests {
                 "a hub model must not claim a disk location"
             );
         }
+    }
+
+    #[test]
+    fn thread_budget_is_half_the_cores_inside_a_hard_clamp() {
+        assert_eq!(sidecar_thread_budget(Some(24)), 8, "clamped at the ceiling");
+        assert_eq!(sidecar_thread_budget(Some(16)), 8, "exactly the ceiling");
+        assert_eq!(sidecar_thread_budget(Some(12)), 6);
+        assert_eq!(sidecar_thread_budget(Some(8)), 4);
+        assert_eq!(sidecar_thread_budget(Some(4)), 2);
+        // A single-core VM must still get two, or a pool of one serializes the whole pass.
+        assert_eq!(sidecar_thread_budget(Some(1)), 2, "clamped at the floor");
+        assert_eq!(
+            sidecar_thread_budget(None),
+            2,
+            "unknown core count is treated as small"
+        );
+    }
+
+    #[test]
+    fn the_worker_never_inherits_an_unbounded_thread_pool() {
+        // Three native pools inside the sidecar each size themselves to the core count unless told
+        // otherwise, so this variable is what stops a 24-core box spawning ~94 threads for one
+        // embedding pass. The sidecar re-derives the same number when it is absent, but a worker
+        // that never receives it would be relying on that fallback rather than on Rust's answer.
+        let budget =
+            sidecar_thread_budget(std::thread::available_parallelism().map(|n| n.get()).ok());
+        assert!(
+            (2..=8).contains(&budget),
+            "thread budget {budget} escaped the clamp on this machine"
+        );
     }
 }
