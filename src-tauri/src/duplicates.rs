@@ -115,8 +115,10 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// Decode the raw little-endian `f32` blob `chunk_vec` stores — the inverse of
 /// [`crate::ingest::embedding_blob`]. A trailing partial float is ignored rather than panicking.
 pub fn decode_embedding(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
