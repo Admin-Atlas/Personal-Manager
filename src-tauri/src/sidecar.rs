@@ -2005,6 +2005,16 @@ impl SidecarManager {
                 sidecar_thread_budget(std::thread::available_parallelism().map(|n| n.get()).ok())
                     .to_string(),
             ),
+            // Separate from the general budget on purpose: transcription is the one workload whose
+            // library picks its own default when we say nothing, so it needs its own floor rather
+            // than a number chosen by measuring embedding.
+            (
+                "PM_SIDECAR_TRANSCRIBE_THREADS".to_string(),
+                sidecar_transcribe_thread_budget(
+                    std::thread::available_parallelism().map(|n| n.get()).ok(),
+                )
+                .to_string(),
+            ),
         ];
         // Debug builds only: unlock the worker's dev-only `net_selftest` handler (the Developer-mode
         // network-block probe, issue #286). A release worker never sets this, so it refuses the method
@@ -2882,6 +2892,27 @@ const PYTHON_ENV_REMOVES: &[&str] = &["PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP
 /// variable is absent (a raw dev run), so the two paths agree — keep them in step.
 fn sidecar_thread_budget(cores: Option<usize>) -> usize {
     (cores.unwrap_or(4) / 2).clamp(2, 8)
+}
+
+/// The same shape for transcription, with a HIGHER FLOOR — and the floor is the whole point.
+///
+/// faster-whisper takes `cpu_threads = 0` by default, which its own docstring defines as "a non
+/// zero value overrides the OMP_NUM_THREADS environment variable" — i.e. zero means OMP wins. Once
+/// #769 started setting `OMP_NUM_THREADS`, transcription silently inherited a figure derived by
+/// measuring EMBEDDING, and a 4-core laptop went from ctranslate2's flat 4 threads to 2: half speed,
+/// with nothing in the release notes to connect it to a memory fix.
+///
+/// 4 is that library default, so no machine transcribes slower than it did before this existed;
+/// above 8 cores the budget scales up exactly as the general one does. The ceiling is inherited
+/// rather than measured — ctranslate2's own scaling past 8 intra-op threads has not been benchmarked
+/// here, so 8 is a deliberate carry-over, not a finding.
+///
+/// Uses `available_parallelism` like its sibling rather than `hardware::scan()`: that reports
+/// PHYSICAL cores via sysinfo and runs a GPU probe to do it, while this figure wants the LOGICAL,
+/// cgroup-aware count — a container with a CPU quota must size its pools to the quota, not to the
+/// host.
+fn sidecar_transcribe_thread_budget(cores: Option<usize>) -> usize {
+    (cores.unwrap_or(8) / 2).clamp(4, 8)
 }
 
 fn clean_python_env(command: &mut Command) {
@@ -4151,5 +4182,45 @@ mod tests {
             (2..=8).contains(&budget),
             "thread budget {budget} escaped the clamp on this machine"
         );
+    }
+
+    #[test]
+    fn transcription_never_drops_below_the_library_default_it_replaced() {
+        // The regression this exists to prevent: OMP_NUM_THREADS started governing ctranslate2 the
+        // moment #769 set it, so every machine under 8 cores lost threads it used to have. 4 is
+        // faster-whisper's own default, so the floor means no machine is slower than before.
+        for cores in [1usize, 2, 4, 6, 8] {
+            assert_eq!(
+                sidecar_transcribe_thread_budget(Some(cores)),
+                4,
+                "{cores} cores must keep ctranslate2's own default of 4"
+            );
+        }
+    }
+
+    #[test]
+    fn transcription_scales_up_with_the_machine_inside_the_same_ceiling() {
+        for (cores, want) in [(10usize, 5usize), (12, 6), (16, 8), (24, 8), (128, 8)] {
+            assert_eq!(
+                sidecar_transcribe_thread_budget(Some(cores)),
+                want,
+                "{cores} cores"
+            );
+        }
+        assert_eq!(
+            sidecar_transcribe_thread_budget(None),
+            4,
+            "unknown core count takes the floor, not the ceiling"
+        );
+    }
+
+    #[test]
+    fn transcription_is_never_handed_the_embedding_budget_by_accident() {
+        // Both are half-the-cores inside a clamp, and they agree from 8 cores up — the divergence
+        // below that is the entire fix, so a refactor that collapsed them into one call would pass
+        // every other test here.
+        let cores = Some(4);
+        assert_eq!(sidecar_thread_budget(cores), 2);
+        assert_eq!(sidecar_transcribe_thread_budget(cores), 4);
     }
 }

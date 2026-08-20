@@ -117,6 +117,32 @@ def _thread_budget():
 
 _THREADS = _thread_budget()
 
+
+def _transcribe_thread_budget():
+    """Threads for transcription specifically. Half the cores, clamped to 4..8.
+
+    A separate number from `_thread_budget` because of one line in faster-whisper's own docstring:
+    "cpu_threads: Number of threads to use when running on CPU (4 by default). A non zero value
+    overrides the OMP_NUM_THREADS environment variable." Zero — the default we were taking by not
+    passing the argument — means OMP wins. So the moment this module started setting
+    `OMP_NUM_THREADS`, transcription silently began using a figure derived from measuring
+    EMBEDDING, and every machine below 8 cores lost threads: a 4-core laptop went 4 -> 2.
+
+    The floor of 4 is ctranslate2's own default, so no machine transcribes slower than it did
+    before any of this existed. The ceiling of 8 is carried over from the general budget rather
+    than measured — ctranslate2's scaling past 8 intra-op threads is not benchmarked here.
+    """
+    override = os.environ.get("PM_SIDECAR_TRANSCRIBE_THREADS")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    return max(4, min(8, (os.cpu_count() or 8) // 2))
+
+
+_TRANSCRIBE_THREADS = _transcribe_thread_budget()
+
 # The env-var half of the budget: numpy's OpenBLAS, any OpenMP runtime under onnxruntime, and
 # tokenizers' rayon pool. setdefault, not hard assignment — an operator who deliberately exported
 # one of these outranks our default (unlike the offline flags above, where Rust IS the authority).
@@ -479,6 +505,10 @@ def get_whisper(model_dir):
                 WHISPER_MODEL,
                 device="cpu",
                 compute_type="int8",
+                # Stated, never inferred. Left unset it is 0, which faster-whisper documents as
+                # "OMP_NUM_THREADS wins" — and this module sets OMP_NUM_THREADS for the embedding
+                # pools, so silence here means transcription quietly takes embedding's budget.
+                cpu_threads=_TRANSCRIBE_THREADS,
                 download_root=model_dir or None,
                 local_files_only=_OFFLINE,
             )
