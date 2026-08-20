@@ -791,6 +791,35 @@ def do_file_properties(params):
     return read_document_properties(path)
 
 
+def convert_local_tolerating_charset(engine, path, stream_info_cls):
+    """`engine.convert_local(path)`, retried once as UTF-8 if the first pass could not decode.
+
+    MarkItDown guesses a file's charset from its **first 4 KB** (`_get_stream_info_guesses` reads
+    `file_stream.read(4096)` and hands it to `charset_normalizer`), then gives that one guess to
+    every converter, each of which decodes the WHOLE file with it. So a file whose opening 4 KB
+    happens to be plain ASCII is labelled `ascii`, and a single accented character further in
+    raises `UnicodeDecodeError`.
+
+    That would merely lose one converter, except the raise comes out of `accepts()` — the sniffing
+    pass — and MarkItDown's `_convert` guards `accepts()` against `NotImplementedError` and nothing
+    else. One converter declining to sniff therefore takes down the converters that would have
+    succeeded: a 27 KB JSON file with an em dash in it is refused by the *notebook* converter's
+    sniff, and never reaches the plain-text one.
+
+    Retrying as UTF-8 is safe rather than optimistic: **ASCII is a strict subset of UTF-8**, so
+    re-reading can only widen what decodes — it cannot corrupt a file the first pass would have
+    read, and it cannot rescue one that is genuinely some other encoding. Those fail again and are
+    skipped by the caller, which is the same outcome as before, minus the pinned cursor.
+
+    `stream_info_cls` is passed in rather than imported so this stays testable without markitdown
+    installed — the gate's Python has no venv (see `get_markitdown`'s lazy import).
+    """
+    try:
+        return engine.convert_local(path)
+    except UnicodeDecodeError:
+        return engine.convert_local(path, stream_info=stream_info_cls(charset="utf-8"))
+
+
 def do_convert(params):
     """Convert one file to Markdown. Returns its text and a best-effort title."""
     path = params["path"]
@@ -811,7 +840,7 @@ def do_convert(params):
     # `get_markitdown`), and naming its exceptions at module level would load the whole package
     # on every sidecar start — including for `embed`, `rerank` and `transcribe`, which never
     # convert anything. Safe at this point: the engine has already imported successfully.
-    from markitdown import MarkItDownException, MissingDependencyException
+    from markitdown import MarkItDownException, MissingDependencyException, StreamInfo
 
     # `convert_local`, NOT `convert`: MarkItDown's `convert` dispatches on the STRING, and a path
     # beginning `http:` / `https:` / `file:` / `data:` is routed to `convert_uri` — a network fetch
@@ -819,15 +848,21 @@ def do_convert(params):
     # the user's own paths, so this is not reachable today; the local entry point makes it
     # unreachable by construction rather than by luck.
     try:
-        result = engine.convert_local(path)
+        result = convert_local_tolerating_charset(engine, path, StreamInfo)
     except MissingDependencyException:
         # A MarkItDownException, but NOT a verdict on the file: this format needs an optional
         # package the venv is missing. Repairing the engine fixes it, so let it stay account-fatal
         # rather than skipping every file of that type forever.
         raise
-    except MarkItDownException as exc:
+    except (MarkItDownException, UnicodeDecodeError) as exc:
         # UnsupportedFormatException / FileConversionException: the engine read this file and
         # refused it. Retrying forever is what pins the account, so this one is a skip.
+        #
+        # A `UnicodeDecodeError` arriving here has already survived the UTF-8 retry above, so the
+        # file really is in some encoding the engine cannot read — a verdict, not a broken engine.
+        # Before it was listed here it escaped to `main`'s catch-all and came back WITHOUT
+        # `error_kind`, which Rust reads as an engine fault: the item was retried forever and the
+        # delta cursor never moved past it.
         raise Unconvertible(str(exc)) from exc
     title = (getattr(result, "title", None) or "").strip()
     return {
