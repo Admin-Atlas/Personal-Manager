@@ -10,8 +10,10 @@ PM desktop release — **v3.128.7-alpha**.
 others; or install the native **`.rpm`** (Fedora/RHEL) or **`.deb`** (Debian/Ubuntu). One-line
 commands and how to pick are in the **Linux guide** near the bottom of this page.
 
-That's it. PM is **self-contained** — everything it needs (including a private Python
-runtime for the document features) is inside that one file. Nothing else to install.
+That's it — nothing else to install. On **Windows and Linux** that one file is
+**self-contained**: everything PM needs, including a private Python runtime for the document
+features, is inside it. On **macOS** the app fetches that runtime itself the first time you use
+a document feature, so the first use needs a connection.
 
 **🪟 Windows — if a blue "Windows protected your PC" box appears.** The installer isn't
 code-signed yet, so SmartScreen is cautious. Click **More info → Run anyway**.
@@ -85,7 +87,7 @@ land in your app menu with no fuss.
 | --- | --- | --- | --- | --- |
 | **Any distro** | `PM_*.AppImage` | `chmod +x PM_*.AppImage`, then `./PM_*.AppImage` | **Automatic**, in-app (like Windows/macOS) | Add it yourself |
 | Fedora · RHEL · openSUSE | `PM-*.rpm` | `sudo dnf install ./PM-*.rpm` | Manual — reinstall the newer `.rpm` | Added for you |
-| Debian · Ubuntu · Mint · Pop!_OS | `pm_*.deb` | `sudo apt install ./pm_*.deb` | Manual — reinstall the newer `.deb` | Added for you |
+| Debian · Ubuntu · Mint · Pop!_OS | `PM_*.deb` | `sudo apt install ./PM_*.deb` | Manual — reinstall the newer `.deb` | Added for you |
 
 Every file is **self-contained** — the private Python runtime for the document features is inside,
 so there's nothing else to install. (Tip: to type a filename, press **Tab** to auto-complete it.)
@@ -106,8 +108,8 @@ update later, download the new release's package and run the same install comman
 
 **Your data outlives any uninstall.** Removing PM (either format, or deleting the AppImage) leaves
 your vault and the regenerable `runtime/` (Python venv + models) under
-`~/.local/share/Personal Manager`. Clear it from **Settings → Storage** or **Settings → Remove PM
-data** before uninstalling, or delete that folder by hand.
+`~/.local/share/Personal Manager`. Clear it from **Settings → Storage**, or from **Settings →
+Data & Security → Remove PM data**, before uninstalling — or delete that folder by hand.
 
 **Secrets need a running keychain.** PM stores its encryption keys in the freedesktop Secret Service
 — KWallet (KDE) or GNOME Keyring — over D-Bus. Every mainstream desktop provides one, so expect a
@@ -123,9 +125,9 @@ document features. Python itself is distributed under the PSF License Agreement.
 That runtime is not only CPython: it links **OpenSSL, SQLite, libffi, liblzma, mpdecimal,
 bzip2, expat and zlib**, each under its own terms. PM therefore ships the licence-bearing
 build rather than the smaller `install_only` one, so every component's licence travels with
-the binary — `python/LICENSE.txt` for CPython and `python/licenses/` for the rest, both
-inside the installed app. The licence files come from the exact build PM pins, so they cannot
-drift from what is actually linked.
+the binary: `python/licenses/` inside the installed app holds one file per component,
+CPython's own among them as `LICENSE.cpython.txt`. The licence files come from the exact build
+PM pins, so they cannot drift from what is actually linked.
 
 PM's own third-party dependencies and their licences are listed in `THIRD-PARTY-NOTICES.txt`,
 attached to each release: the Rust crates it is built from, and the npm packages compiled
