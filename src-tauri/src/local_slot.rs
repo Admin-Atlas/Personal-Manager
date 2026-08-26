@@ -491,6 +491,10 @@ pub struct LocalRuntime {
     health: Mutex<HealthState>,
     windows: Mutex<std::collections::HashMap<String, WindowInfo>>,
     last_probe: Mutex<Option<Instant>>,
+    /// The RESULT of the last reachability observation, so a debounced status read can report what
+    /// was actually last seen. `None` means nothing has been observed yet, which is NOT the same as
+    /// reachable — the status chip must never claim health it has not witnessed.
+    last_reachable: Mutex<Option<bool>>,
     /// The last hardware scan (#296), cached until a `force` re-scan. Reset on restart with the rest
     /// of this runtime — hardware rarely changes mid-session, and a stale figure is one click away.
     hardware: Mutex<Option<crate::hardware::Hardware>>,
@@ -501,9 +505,32 @@ pub struct LocalRuntime {
 
 impl LocalRuntime {
     /// Record a call's outcome against host health (poison-tolerant — health is advisory).
+    ///
+    /// Real traffic is better evidence of reachability than a 30 s probe, so an outcome that settles
+    /// the question also updates the last-known figure. `Neutral` (a chat preemption — the GPU was
+    /// briefly busy, not the host's fault) says nothing either way and leaves it alone.
     pub fn record(&self, outcome: CallOutcome) {
         if let Ok(mut h) = self.health.lock() {
             h.observe(outcome, Instant::now());
+        }
+        match outcome {
+            // `Alive` counts as reached: the host ANSWERED — a 503 while a model warms up or a 4xx
+            // about a model id is a reply, which is exactly what reachability means here.
+            CallOutcome::Ok | CallOutcome::Alive => self.set_last_reachable(true),
+            CallOutcome::Strike => self.set_last_reachable(false),
+            CallOutcome::Neutral => {}
+        }
+    }
+
+    /// The last observed reachability, or `None` if nothing has been observed yet (poison-tolerant).
+    pub fn last_reachable(&self) -> Option<bool> {
+        self.last_reachable.lock().ok().and_then(|r| *r)
+    }
+
+    /// Remember what a probe or a real call just observed (poison-tolerant — advisory, like health).
+    pub fn set_last_reachable(&self, reachable: bool) {
+        if let Ok(mut r) = self.last_reachable.lock() {
+            *r = Some(reachable);
         }
     }
 
@@ -842,6 +869,36 @@ mod tests {
         );
         // A different model on the same endpoint is a separate entry.
         assert_eq!(rt.cached_window("http://localhost:11434", "qwen2.5"), None);
+    }
+
+    #[test]
+    fn reachability_is_remembered_and_starts_unknown_rather_than_healthy() {
+        let rt = LocalRuntime::default();
+        // Nothing observed yet. The status command reads this as unreachable on purpose: the chip
+        // must never claim health it has not witnessed. It used to answer `!in_cooldown` instead,
+        // which is green for a server that has never once been reached.
+        assert_eq!(rt.last_reachable(), None);
+
+        // Real traffic settles the question as well as a probe does.
+        rt.record(CallOutcome::Ok);
+        assert_eq!(rt.last_reachable(), Some(true));
+
+        // One strike is enough to stop claiming reachable — well before any cooldown opens, which is
+        // exactly the window where a failed chat call used to leave the chip green.
+        rt.record(CallOutcome::Strike);
+        assert_eq!(rt.last_reachable(), Some(false));
+        assert!(
+            !rt.health().in_cooldown(Instant::now()),
+            "no cooldown after one strike"
+        );
+
+        // A 503-while-loading or a 4xx means the host ANSWERED — that is what reachable means here.
+        rt.record(CallOutcome::Alive);
+        assert_eq!(rt.last_reachable(), Some(true));
+
+        // A chat preemption is not the host's fault and says nothing either way.
+        rt.record(CallOutcome::Neutral);
+        assert_eq!(rt.last_reachable(), Some(true));
     }
 
     // ---- the single-inference slot: the "chat always wins" invariant (async) ----

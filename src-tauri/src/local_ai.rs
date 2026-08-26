@@ -583,7 +583,8 @@ pub async fn pull_local_model(
 pub struct LocalLlmStatus {
     /// A base URL is configured.
     pub configured: bool,
-    /// The endpoint answered a `/v1/models` probe on the last check (debounced — see below).
+    /// The endpoint answered on the last observation — a `/v1/models` probe, or a real call whose
+    /// outcome settled the question. `false` until something has actually been observed.
     pub reachable: bool,
     /// The host is resting inside its dead-host cooldown after repeated failures.
     pub in_cooldown: bool,
@@ -634,17 +635,30 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
     // often than it probes. A refused endpoint reports unreachable rather than erroring — the status
     // chip must keep rendering — and no token is fetched or sent.
     let reachable = if probe_now {
-        match configured_endpoint(&app).await? {
+        let observed = match configured_endpoint(&app).await? {
             Endpoint::Ready(base_url, token) => {
                 openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
                     .await
                     .is_ok()
             }
             Endpoint::Refused | Endpoint::Unconfigured => false,
-        }
+        };
+        app.state::<AppState>()
+            .local_ai
+            .set_last_reachable(observed);
+        observed
     } else {
-        // No fresh probe this call; report "not in cooldown" as the best available liveness proxy.
-        !in_cooldown
+        // No fresh probe this call — report the LAST KNOWN result, which is what this field's own
+        // documentation always claimed and the code never did. It used to infer liveness from
+        // `!in_cooldown`, and those are not the same thing: a host can fail twice before any
+        // cooldown opens. The failure path made that concrete — a failed chat call EMITS the status
+        // event, the UI refetches, the 30 s debounce skips the probe, and with one or two strikes
+        // there is no cooldown yet, so the chip turned green at the exact moment chat broke. Nothing
+        // observed yet reads as unreachable: the chip must never claim health it has not witnessed.
+        app.state::<AppState>()
+            .local_ai
+            .last_reachable()
+            .unwrap_or(false)
     };
 
     Ok(LocalLlmStatus {
