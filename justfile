@@ -254,9 +254,14 @@ model-licences:
 # Regenerate the sidecar dependency locks and refresh the licence evidence behind them. Needs `uv`
 # on PATH; both halves reach the network. Run after any change to sidecar/requirements.txt or the
 # optional pins in sidecar.rs, review anything the second half flags, then commit the result.
+# `sidecar/licences.json` is one of the few generated files Prettier still owns, and
+# `JSON.stringify(…, null, 2)` never collapses a short array the way Prettier does — so the
+# generator's own output failed `just prettier` every single time it ran. Format it here rather
+# than leaving every lock-regen to end in a formatting failure with no hint that it was expected.
 lock-regen:
     node scripts/regen-sidecar-locks.mjs
     node scripts/regen-sidecar-licences.mjs
+    npx prettier --write sidecar/licences.json
 
 # --- release-only ---------------------------------------------------------
 

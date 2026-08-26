@@ -40,9 +40,9 @@
       }
     },
     "av": {
-      "versions": ["17.1.0", "18.0.0"],
+      "versions": ["17.1.0", "18.1.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "3b026d53df107bb008426de37a2a6c7b",
+      "stamp": "b2b5d3746cadfbb34e2a29918ad9b713",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
@@ -80,9 +80,9 @@
       }
     },
     "charset-normalizer": {
-      "versions": ["3.4.9"],
+      "versions": ["3.5.1"],
       "licence": "MIT",
-      "stamp": "4696f7c2f96ba1947455945cfc385f58",
+      "stamp": "ed521e8e1e0661b23228ffeced5db664",
       "evidence": {
         "expression": null,
         "license": "MIT",
@@ -142,9 +142,9 @@
       }
     },
     "cryptography": {
-      "versions": ["50.0.0"],
+      "versions": ["50.0.1"],
       "licence": "Apache-2.0 OR BSD-3-Clause",
-      "stamp": "164779bb87236a843951926a1800186d",
+      "stamp": "7e32e7c7576a97d2205933b28e57ee31",
       "evidence": {
         "expression": "Apache-2.0 OR BSD-3-Clause",
         "license": null,
@@ -215,9 +215,9 @@
       }
     },
     "filelock": {
-      "versions": ["3.32.2"],
+      "versions": ["3.32.4"],
       "licence": "MIT",
-      "stamp": "f237aa0952d6c8c6e2832387577a5b08",
+      "stamp": "9c56bfa25dc071882642146334d01f44",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -287,9 +287,9 @@
       }
     },
     "huggingface-hub": {
-      "versions": ["1.26.0"],
+      "versions": ["1.28.0"],
       "licence": "Apache-2.0",
-      "stamp": "aa3082a555f83445f23c9a8c8c55eb12",
+      "stamp": "a8aa8d62f0785c3af2ce81344f7229ec",
       "evidence": {
         "expression": null,
         "license": "Apache-2.0",
@@ -307,9 +307,9 @@
       }
     },
     "idna": {
-      "versions": ["3.18"],
+      "versions": ["3.19"],
       "licence": "BSD-3-Clause",
-      "stamp": "96204c1eefe79a4f03df40d551a2ba58",
+      "stamp": "bd02afba345d6f54df6b06e01715cf2b",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
@@ -338,9 +338,9 @@
       "note": "Classifier only; the project's LICENSE is the MIT text."
     },
     "lxml": {
-      "versions": ["6.1.1"],
+      "versions": ["6.1.2"],
       "licence": "BSD-3-Clause",
-      "stamp": "39bde5792bb0d1c4aa6cf5b591368de8",
+      "stamp": "62ffd0b3688681f778e817d6afd83404",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause",
@@ -379,9 +379,9 @@
       "note": "Classifier only; the project's LICENSE is the MIT text."
     },
     "markitdown": {
-      "versions": ["0.1.6"],
+      "versions": ["0.1.7"],
       "licence": "MIT",
-      "stamp": "75d1e054b729b98540d278c2f3ffb7e1",
+      "stamp": "24792a57dcb7e80d042821cf48e6fdd5",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -389,9 +389,9 @@
       }
     },
     "mmh3": {
-      "versions": ["5.2.1"],
+      "versions": ["5.3.0"],
       "licence": "MIT",
-      "stamp": "66d2eb706eab7cd5d341f7de9589ee08",
+      "stamp": "7356083020b51f7592d1ab4b7b080eaf",
       "evidence": {
         "expression": null,
         "license": "MIT License Copyright (c) 2011-2026 Hajime Senuma Permission is hereby granted, free of charge, to any person obtaini...",
@@ -411,9 +411,9 @@
       "note": "`license: \"BSD\"`; the project's LICENSE is the three-clause text."
     },
     "narwhals": {
-      "versions": ["2.24.0"],
+      "versions": ["2.25.0"],
       "licence": "MIT",
-      "stamp": "a1f64b00c30b491721fc95832e607e39",
+      "stamp": "db104591e80e74d4e56a19f7287dc85e",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -421,9 +421,9 @@
       }
     },
     "numpy": {
-      "versions": ["2.2.6", "2.4.6", "2.5.1"],
+      "versions": ["2.2.6", "2.4.6", "2.5.2"],
       "licence": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
-      "stamp": "04fd448617b9b37de70d9353329859e6",
+      "stamp": "2588cc6c0587e23a6376427e4dc878e1",
       "evidence": {
         "2.2.6": {
           "expression": null,
@@ -435,7 +435,7 @@
           "license": null,
           "classifiers": []
         },
-        "2.5.1": {
+        "2.5.2": {
           "expression": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
           "license": null,
           "classifiers": []
@@ -466,9 +466,9 @@
       "note": "Classifier only; the project's LICENSE is the three-clause text."
     },
     "onnxruntime": {
-      "versions": ["1.23.2", "1.28.0"],
+      "versions": ["1.23.2", "1.29.0"],
       "licence": "MIT",
-      "stamp": "703d87ec3a3542719bd93e0611f18ef9",
+      "stamp": "88f848740d394d4012bfefd146fd81c7",
       "evidence": {
         "expression": null,
         "license": "MIT License",
@@ -507,9 +507,9 @@
       }
     },
     "packaging": {
-      "versions": ["26.2"],
+      "versions": ["26.3"],
       "licence": "Apache-2.0 OR BSD-2-Clause",
-      "stamp": "b1cfe4452bbb208e7645009d5beb96e4",
+      "stamp": "14a34cacd27627db3440741a0444e367",
       "evidence": {
         "expression": "Apache-2.0 OR BSD-2-Clause",
         "license": null,
@@ -577,9 +577,9 @@
       }
     },
     "protobuf": {
-      "versions": ["7.35.1"],
+      "versions": ["7.36.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "d5256481a0dd67176561f41ed6be48be",
+      "stamp": "8db267b733d3e8408933cf409d0b5b18",
       "evidence": {
         "expression": null,
         "license": "3-Clause BSD License",
@@ -619,9 +619,9 @@
       }
     },
     "pypdfium2": {
-      "versions": ["5.12.1"],
+      "versions": ["5.13.0"],
       "licence": "Apache-2.0 OR BSD-3-Clause",
-      "stamp": "6a8ca2df97413e0192a05ffc502b464a",
+      "stamp": "30ae3ea4938a37568119ebfda68f0765",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause, Apache-2.0, dependency licenses",
@@ -655,9 +655,9 @@
       "note": "`license: \"Dual License\"`, and the two classifiers name Apache and BSD without saying which applies. The LICENSE file carries both texts and lets the user pick."
     },
     "python-dotenv": {
-      "versions": ["1.2.2"],
+      "versions": ["1.2.3"],
       "licence": "BSD-3-Clause",
-      "stamp": "b09535ce6de3e94098ed92d54b88b7dc",
+      "stamp": "bd0c5abda52da9c90ca892dbf5a7e1d2",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause",
@@ -725,9 +725,9 @@
       }
     },
     "scipy": {
-      "versions": ["1.15.3", "1.17.1", "1.18.0"],
+      "versions": ["1.15.3", "1.17.1", "1.18.1"],
       "licence": "BSD-3-Clause",
-      "stamp": "fe03df13223671373369ed6c26f8840c",
+      "stamp": "bf0d942ba99183242f795defc7b10773",
       "evidence": {
         "1.15.3": {
           "expression": null,
@@ -739,7 +739,7 @@
           "license": "Copyright (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights reserved. Redistribution and use in source...",
           "classifiers": ["License :: OSI Approved :: BSD License"]
         },
-        "1.18.0": {
+        "1.18.1": {
           "expression": null,
           "license": "Copyright (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights reserved. Redistribution and use in source...",
           "classifiers": ["License :: OSI Approved :: BSD License"]
@@ -748,9 +748,9 @@
       "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
     },
     "setuptools": {
-      "versions": ["83.0.0"],
+      "versions": ["84.0.0"],
       "licence": "MIT",
-      "stamp": "962d5fa1e5e09750c1c61d2badd9aaeb",
+      "stamp": "9e4ef2fba3931c6d557a480047d5165c",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -779,9 +779,9 @@
       }
     },
     "soupsieve": {
-      "versions": ["2.9.1"],
+      "versions": ["2.9.2"],
       "licence": "MIT",
-      "stamp": "35387e08e827335a9ee9a871c5c97e36",
+      "stamp": "42d23bf7b2291b0d0d8ea8b13e58d2af",
       "evidence": {
         "expression": "MIT",
         "license": null,

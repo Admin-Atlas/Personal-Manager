@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.11-alpha",
+    date: "2026-08-26",
+    highlights: [
+      "The part of PM that reads your documents — the one that opens PDFs, Office files and images and turns them into something PM can search — has had its whole set of underlying libraries moved up to current versions. That includes the document reader itself and the engine behind on-device search and voice notes. This is maintenance rather than a new capability: nothing you do in PM changes, and the licence behind every one of those libraries was read again before it went in.",
+    ],
+  },
+  {
     version: "3.128.10-alpha",
     date: "2026-08-26",
     highlights: [
