@@ -1753,11 +1753,6 @@ export interface LocalHardware {
   notes: string[];
 }
 
-/** How to install a recommended model (only Ollama has a native pull today). */
-export interface LocalInstallHints {
-  ollama: string | null;
-}
-
 /** The relationship between a model's highest-quality (system-RAM) config and a faster GPU-resident
  *  config (fit.rs GpuFit, `#[serde(tag = "kind")]`). `single` = one config is the whole story;
  *  `split` = a distinct faster config that fits VRAM (`fit`); `no_gpu_resident` = a GPU exists but
@@ -1789,7 +1784,13 @@ export interface LocalRecommendation {
   context_length: number;
   multimodal: boolean;
   reasoning: boolean | null;
-  install: LocalInstallHints;
+  /** The Ollama pull target for the quant `fit` chose (`hf.co/<repo>:<QUANT>`), or null when there
+   *  is none to offer — a sharded GGUF, or a quant whose registry manifest didn't match the bytes
+   *  the catalogue measured. Null means "checked, not offerable": render no button, and say why. */
+  ollama_pull: string | null;
+  /** The fitted quant ships as split GGUF shards, which Ollama's registry route refuses — the one
+   *  reason a model PM would otherwise offer has no Download button. */
+  sharded_quant: boolean;
   /** What the weights are licensed under — labels every row, and gates the download on restricted
    *  terms. */
   licence: LocalModelLicence;
@@ -1846,6 +1847,9 @@ export interface LocalRecommendations {
   /** Which runners' model folders exist on this machine — so "Ollama is here with nothing
    *  downloaded" can be said differently from "Ollama isn't installed". */
   disk_sources_present: LocalDiskSource[];
+  /** How many models the crawl found on disk BEFORE the already-served ones were removed. Separates
+   *  "no model folder here" from "a folder, with nothing downloaded in it". */
+  disk_found: number;
   /** The crawl hit its bound, so `on_disk` is a prefix rather than everything on disk. */
   disk_truncated: boolean;
   /** The extra folder the crawl includes, when one is set. */

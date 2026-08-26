@@ -567,11 +567,25 @@ pub async fn pull_local_model(
         }
         Endpoint::Refused => return Err(Error::Other(CALL_TIME_REFUSAL.into())),
     };
-    openai_compat::pull_ollama_model(&base_url, &model, token.as_ref().map(|s| s.expose()), |p| {
-        let _ = on_event.send(p);
-    })
-    .await
-    .map_err(|f| {
+    let outcome = openai_compat::pull_ollama_model(
+        &base_url,
+        &model,
+        token.as_ref().map(|s| s.expose()),
+        |p| {
+            let _ = on_event.send(p);
+        },
+    )
+    .await;
+    // The pull just changed what is on disk, so the cached crawl (#449) is now a lie — and it is
+    // cached for the whole process, so without this PM answers its own download with its own
+    // pre-download picture until the app restarts. Cleared unconditionally: a pull that dies after
+    // Ollama has written the manifest would otherwise leave real weights invisible.
+    //
+    // Lock-safe: `clear_disk_models` takes only `LocalRuntime.disk_models` for one assignment and
+    // never re-enters `state.conn()`, and `configured_endpoint` above dropped its connection before
+    // its own await. Same shape as `set_local_model_scan_dir`.
+    app.state::<AppState>().local_ai.clear_disk_models();
+    outcome.map_err(|f| {
         Error::Other(format!(
             "couldn't download the model ({})",
             crate::error::truncate_detail(&f.detail)
@@ -885,6 +899,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
                     (fit, gpu)
                 }
             };
+            let (ollama_pull, sharded_quant) = pull_target_for(e, fit.quant);
             Recommendation {
                 repo: e.repo.clone(),
                 display_name: e.display_name.clone(),
@@ -895,7 +910,13 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
                 context_length: e.context_length,
                 multimodal: e.multimodal,
                 reasoning: e.reasoning,
-                install: e.install.clone(),
+                // Resolved from the quant the FIT actually picked, not from the entry: the card's
+                // memory verdict is about one specific quantization, so offering a download for a
+                // different one would make that verdict describe a file the button never fetches.
+                // Compared through `from_label` — the same function `entry_to_spec` used to build
+                // the candidate list — so the round-trip is exact by construction.
+                ollama_pull,
+                sharded_quant,
                 licence: e.licence.clone(),
                 fit,
                 gpu,
@@ -1019,6 +1040,9 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         installed,
         on_disk,
         disk_sources_present: disk.sources_present.clone(),
+        // Pre-filter: `on_disk` has already had everything the endpoint serves removed from it, so
+        // it cannot answer "is there anything downloaded here at all".
+        disk_found: disk.models.len(),
         disk_truncated: disk.truncated,
         scan_dir: scan_dir_setting(&app),
         terms_accepted,
@@ -1200,6 +1224,30 @@ fn verdict_rank(v: fit::Verdict) -> u8 {
     }
 }
 
+/// The Ollama pull target for the quant a fit actually chose, and whether that quant is sharded.
+///
+/// Keyed on the FITTED quant, never the entry: the card's memory verdict is about one specific
+/// quantization, so a per-entry tag would offer a download for a file the card never sized — and the
+/// number it showed would be a lie about the thing the button fetches. Matched through
+/// [`fit::Quant::from_label`], the same function [`local_catalog::entry_to_spec`] used to build the
+/// candidate list, so the round-trip is exact rather than a string comparison that could drift.
+///
+/// Pure, so the invariant is testable across the whole catalogue without an `AppHandle`.
+fn pull_target_for(
+    entry: &local_catalog::CatalogEntry,
+    chosen: Option<fit::Quant>,
+) -> (Option<String>, bool) {
+    let Some(row) = chosen.and_then(|c| {
+        entry
+            .quants
+            .iter()
+            .find(|q| fit::Quant::from_label(&q.quant) == Some(c))
+    }) else {
+        return (None, false);
+    };
+    (row.ollama.clone(), row.sharded)
+}
+
 /// One curated model, scored against this machine.
 #[derive(Serialize)]
 pub struct Recommendation {
@@ -1212,7 +1260,14 @@ pub struct Recommendation {
     pub context_length: u32,
     pub multimodal: bool,
     pub reasoning: Option<bool>,
-    pub install: local_catalog::InstallHints,
+    /// The Ollama pull target for the quant `fit` chose, or `None` when there is none to offer.
+    /// `None` is the honest answer, not a gap: the UI must render no Download button rather than one
+    /// that fails, and it says why when the reason is a sharded GGUF.
+    pub ollama_pull: Option<String>,
+    /// The fitted quant ships as split GGUF shards. Ollama's registry route refuses those by design,
+    /// so this is the one reason a model PM would otherwise offer has no Download button — and the
+    /// UI says so rather than leaving a silent gap.
+    pub sharded_quant: bool,
     /// What the weights are licensed under. Rides with the row so the UI can label every model and
     /// show the terms before a restricted download without a second call.
     pub licence: local_catalog::EntryLicence,
@@ -1290,6 +1345,11 @@ pub struct Recommendations {
     /// Which runners' model folders exist on this machine, so the UI can say "Ollama is here with
     /// nothing downloaded" rather than implying it isn't installed.
     pub disk_sources_present: Vec<local_disk::DiskSource>,
+    /// How many models the crawl found on disk, BEFORE `on_disk` removed the ones already served.
+    /// Lets the UI separate "no model folder here" from "a folder, with nothing downloaded in it" —
+    /// two different sentences, and the second is what a user sees the moment they remove their
+    /// last model.
+    pub disk_found: usize,
     /// The crawl hit its bound, so `on_disk` is a prefix rather than everything on disk.
     pub disk_truncated: bool,
     /// The extra folder the crawl includes, when one is set.
@@ -1301,6 +1361,54 @@ pub struct Recommendations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_download_button_always_names_the_quant_the_card_sized() {
+        // The defect this pins: the pull hint used to be per-ENTRY, so the button could fetch a
+        // different quantization from the one the card's memory verdict described. Swept over the
+        // whole committed catalogue rather than a fixture, so a future entry cannot slip past.
+        let cat = local_catalog::catalog();
+        let mut offered = 0usize;
+        for e in &cat.entries {
+            // Nothing to download when the fit could not pick a quant at all.
+            assert_eq!(pull_target_for(e, None), (None, false), "{}", e.repo);
+
+            for q in &e.quants {
+                let chosen = fit::Quant::from_label(&q.quant)
+                    .unwrap_or_else(|| panic!("{}: unknown quant {}", e.repo, q.quant));
+                let (tag, sharded) = pull_target_for(e, Some(chosen));
+                assert_eq!(sharded, q.sharded, "{} {}: sharded flag", e.repo, q.quant);
+                match tag {
+                    Some(t) => {
+                        assert_eq!(
+                            t,
+                            format!("hf.co/{}:{}", e.repo, q.quant),
+                            "{}: asked for {} and got a tag for something else",
+                            e.repo,
+                            q.quant
+                        );
+                        assert!(
+                            !q.sharded,
+                            "{} {}: offered a sharded GGUF, which Ollama's registry refuses",
+                            e.repo, q.quant
+                        );
+                        offered += 1;
+                    }
+                    // The only legitimate refusal in the committed catalogue.
+                    None => assert!(
+                        q.sharded,
+                        "{} {}: no tag, and not because it is sharded",
+                        e.repo, q.quant
+                    ),
+                }
+            }
+        }
+        // Guards the shipped state this replaced: every row null, and nothing noticed.
+        assert!(
+            offered >= 60,
+            "only {offered} quant rows are downloadable — the catalogue lost its pull tags"
+        );
+    }
 
     #[test]
     fn quant_labels_from_a_config_blob_are_bounded_before_they_reach_the_ui() {

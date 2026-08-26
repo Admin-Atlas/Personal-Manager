@@ -18,6 +18,7 @@ import {
   contentHash,
   gib,
   isDraftHead,
+  ollamaTagFor,
   isEmbeddingOrReranker,
   isMoe,
   isUnmodelledArch,
@@ -218,6 +219,103 @@ describe("activeFromHeader", () => {
   it("returns null when the inactive experts would exceed the whole model", () => {
     // A wrong header must not produce a negative or zero active count that then sails into fit.rs.
     expect(activeFromHeader(header(), 1_000_000)).toBeNull();
+  });
+});
+
+describe("ollamaTagFor", () => {
+  // Ollama routes by the HOST in a model name and Hugging Face serves Ollama manifests at
+  // /v2/{repo}/manifests/{QUANT}, so `hf.co/<repo>:<QUANT>` pulls the file this row measured — no
+  // curated name list to drift. The size check is EXACT because both sides are the same artefact:
+  // the manifest's image.model layer size IS the repo tree's file size. All numbers below were
+  // measured against the live registry on 27-08-2026.
+  const manifest = (...layers) => ({
+    layers: layers.map(([mediaType, size]) => ({ mediaType, size })),
+  });
+  const MODEL = "application/vnd.ollama.image.model";
+
+  it("offers the tag when the manifest layer is the byte count this row measured", () => {
+    expect(
+      ollamaTagFor({
+        repo: "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        quant: "Q4_K_M",
+        sharded: false,
+        bytes: 4_683_074_240,
+        manifest: manifest([MODEL, 4_683_074_240], ["application/vnd.ollama.image.template", 1478]),
+      }),
+    ).toBe("hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M");
+  });
+
+  it("compares bytes, not the rounded file_gb the catalogue displays", () => {
+    // SmolVLM's rounded 0.41 GiB is 0.78% off its real size. Rounding is a display concern; if this
+    // compared gib() values it would need a tolerance band, and a tolerance is where drift hides.
+    expect(
+      ollamaTagFor({
+        repo: "ggml-org/SmolVLM-500M-Instruct-GGUF",
+        quant: "Q8_0",
+        sharded: false,
+        bytes: 436_806_912,
+        manifest: manifest(
+          [MODEL, 436_806_912],
+          ["application/vnd.ollama.image.projector", 108_783_360],
+        ),
+      }),
+    ).toBe("hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0");
+  });
+
+  it("refuses a single byte in either direction", () => {
+    // Symmetric on purpose: the requirement is that the file IS the file, not that it fits the
+    // budget. A smaller file is just as wrong as a larger one — it is a different artefact.
+    for (const size of [4_683_074_239, 4_683_074_241]) {
+      expect(
+        ollamaTagFor({
+          repo: "r/x",
+          quant: "Q4_K_M",
+          sharded: false,
+          bytes: 4_683_074_240,
+          manifest: manifest([MODEL, size]),
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("refuses Ollama's own conversion when it is a different file", () => {
+    // gemma3:4b-it-q4_k_m folds the vision tower into the model layer: 3_338_801_664 against this
+    // repo's 2_490_720_384, +34%. Offering it would download something the card never sized — and
+    // it is why the library route is not used at all.
+    expect(
+      ollamaTagFor({
+        repo: "ggml-org/gemma-3-4b-it-GGUF",
+        quant: "Q4_K_M",
+        sharded: false,
+        bytes: 2_490_720_384,
+        manifest: manifest([MODEL, 3_338_801_664]),
+      }),
+    ).toBeNull();
+  });
+
+  it("refuses a sharded row without consulting any manifest", () => {
+    // Hugging Face's shim 400s on split GGUF by design, so the generator must not spend the request
+    // and the UI must not render a button that cannot work.
+    expect(
+      ollamaTagFor({
+        repo: "bartowski/Qwen2.5-72B-Instruct-GGUF",
+        quant: "Q8_0",
+        sharded: true,
+        bytes: 77_264_000_000,
+        manifest: manifest([MODEL, 77_264_000_000]),
+      }),
+    ).toBeNull();
+  });
+
+  it("refuses when the manifest is missing or carries no model layer", () => {
+    const args = { repo: "r/x", quant: "Q4_K_M", sharded: false, bytes: 100 };
+    expect(ollamaTagFor({ ...args, manifest: null })).toBeNull();
+    expect(
+      ollamaTagFor({
+        ...args,
+        manifest: manifest(["application/vnd.ollama.image.projector", 100]),
+      }),
+    ).toBeNull();
   });
 });
 
