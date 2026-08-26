@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.129.1-alpha",
+    date: "2026-08-26",
+    release: true,
+    highlights: [
+      "Running an AI model on your own machine is now something PM can walk you through. It works with three local servers — Ollama, LM Studio and llama-server — but until now it had instructions for only one of them, and a recommended model you hadn't downloaded yet gave you no way to get it. All three now have proper instructions for your operating system, alongside what each one is good at, how models get into it, and the thing most likely to rule it out for you. Every recommended model shows a command that fetches and runs it. Every one of those commands was checked against the makers' own documentation rather than written from memory. If you have ever wanted PM to keep working without an internet connection, this is the release to try it on.",
+      "The numbers PM showed you about your own machine are now true. It worked out how much memory you had free once, when you opened the tab, then judged every model against that one reading for the rest of the session — so opening PM while your machine was busy could rule out a model that fits perfectly well. On Linux it never recognised your graphics card at all. And laptop graphics were borrowing the speed of the desktop card that shares their name, which overstated some laptops by around double. All three are fixed, seventeen laptop chips now carry their own verified figures, and a card PM has no real figure for says so rather than guessing. A model that only just fits now tells you that it only just fits.",
+      "Two things that made a perfectly good local model look broken. If your machine has a proxy set up — common behind a work network, or with a VPN client running — PM was sending requests to your own computer through it, which cannot work; after three failures it concluded your model was dead and stopped using it for minutes at a time. And the Local AI status light was showing green from a guess rather than from anything it had actually seen, so it could sit there reassuring you while chat was failing. Requests to your own machine now go straight there, and the light reports what really happened.",
+      "Elsewhere: a document containing a single em dash or accented name no longer becomes unreadable, and no longer holds up everything queued behind it. Transcribing a recording is back to full speed on a laptop with four processor cores or fewer. Help mode stopped explaining a project status PM removed a long time ago, and now checks itself against the statuses PM really has, so a retired one cannot quietly survive there again. The libraries behind reading documents, on-device search and voice notes all moved up to current versions, with every licence read again before it went in.",
+    ],
+  },
+  {
     version: "3.129.0-alpha",
     date: "2026-08-26",
     highlights: [
