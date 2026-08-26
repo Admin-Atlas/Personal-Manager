@@ -39,7 +39,7 @@
 #     whatever the resolver happens to pick.
 #   defusedxml — hardens the stdlib XML parser (openpyxl's fallback) against entity-expansion / XXE
 #     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
-markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.6
+markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.7
 fastembed==0.8.0
 faster-whisper==1.2.1
 openpyxl==3.1.5
