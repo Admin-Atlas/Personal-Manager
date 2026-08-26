@@ -730,7 +730,12 @@ pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit
         None => scan_hardware(&app).await?,
     };
     let fit_hw = fit::FitHardware {
-        available_ram_gb: hardware.available_ram_gb,
+        // Free RAM re-read LIVE, not taken from the cached scan: it is the one scanned field that
+        // moves while the app is open, and a verdict frozen to whatever the machine looked like when
+        // the tab was first opened is a verdict about a machine that no longer exists. Everything
+        // else here stays cached — the GPU, CPU and disk probes are the expensive half and they do
+        // not change mid-session. Falls back to the scanned figure where the platform won't say.
+        available_ram_gb: crate::hardware::available_ram_gb().unwrap_or(hardware.available_ram_gb),
         vram_gb: hardware.vram_gb,
         gpu_bandwidth_gbps: hardware.gpu_bandwidth_gbps,
         unified_memory: hardware.unified_memory,
@@ -835,7 +840,12 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         None => scan_hardware(&app).await?,
     };
     let fit_hw = fit::FitHardware {
-        available_ram_gb: hardware.available_ram_gb,
+        // Free RAM re-read LIVE, not taken from the cached scan: it is the one scanned field that
+        // moves while the app is open, and a verdict frozen to whatever the machine looked like when
+        // the tab was first opened is a verdict about a machine that no longer exists. Everything
+        // else here stays cached — the GPU, CPU and disk probes are the expensive half and they do
+        // not change mid-session. Falls back to the scanned figure where the platform won't say.
+        available_ram_gb: crate::hardware::available_ram_gb().unwrap_or(hardware.available_ram_gb),
         vram_gb: hardware.vram_gb,
         gpu_bandwidth_gbps: hardware.gpu_bandwidth_gbps,
         unified_memory: hardware.unified_memory,
@@ -1147,9 +1157,9 @@ fn score_on_disk(
         weight_gb: model.size_gb,
     }];
     // The file set on THIS disk is ground truth for both terms, so the measured projector replaces
-    // the catalog's figure. `Some(0.0)`, never `None`: a multimodal spec with `projector_gb: None`
-    // is refused as fit-unknown (see `fit::fit_within`), and "no projector on disk" is a measurement,
-    // not a gap. Leaving the catalog value here while `weight_gb` came from disk was the
+    // the catalog's figure. `Some(0.0)`, never `None`: "no projector on disk" is a measurement, not a
+    // gap, and the two must stay distinguishable even now that an unsized projector no longer refuses
+    // the whole fit. Leaving the catalog value here while `weight_gb` came from disk was the
     // double-count: `local_disk` had already folded the projector into `size_gb`.
     spec.projector_gb = Some(model.sidecar_gb);
     fit::fit(&spec, hw)

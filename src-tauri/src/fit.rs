@@ -48,8 +48,19 @@ const COMFORT_MARGIN_GB: f64 = 1.5;
 /// Below this we'd rather say `StayOnCloud` than promise a window we can't honour.
 const CONTEXT_FLOOR: u32 = 4096;
 
-/// System-RAM read bandwidth used for the CPU/mmap throughput estimate. CALIBRATE: ~40 GB/s is a
-/// dual-channel DDR4 ballpark; real numbers vary widely by kit and channel population.
+/// System-RAM read bandwidth used for the CPU/mmap throughput estimate.
+///
+/// 40 GB/s is not a neutral middle: it is arithmetically dual-channel DDR4-2400 (2 x 8 B x 2400 MT/s
+/// = 38.4), so a dual-channel DDR5-5600 laptop — 89.6 GB/s peak — has its RAM-resident speed
+/// understated by roughly 1.5x. It stays anyway, deliberately, for two reasons. Detecting the real
+/// figure is not cheap or portable: Windows can read `Win32_PhysicalMemory` and Apple Silicon is a
+/// per-chip constant, but on Linux the DMI tables are root-only and there is no unprivileged node
+/// for memory generation or channel population — so the honest options are a per-OS seam or a
+/// constant, and a constant that is wrong on two platforms is not better than one that is low on
+/// three. And the direction matters: a RAM-resident config is the one that trips
+/// `BACKGROUND_TOTAL_TIMEOUT`, where three slow calls in a row cool the endpoint down. Under-
+/// promising costs a missed recommendation; over-promising costs a dead endpoint. CALIBRATE against
+/// a real rig before raising it — nobody has yet.
 const SYSTEM_BANDWIDTH_GBPS: f64 = 40.0;
 
 /// Fallback dedicated-GPU read bandwidth, used only when the footprint fits in VRAM *and* the card
@@ -237,9 +248,10 @@ pub struct ModelSpec {
     pub arch: Architecture,
     pub active_params_b: f64,
     pub target_context: u32,
-    pub multimodal: bool,
-    /// The multimodal projector's size in GB. `Some(0.0)`/`None` differ: for a multimodal model a
-    /// missing projector means we can't size it, so the fit is `Unknown`.
+    /// The multimodal projector's size in GB, or `None` when the source didn't say. Charged into
+    /// [`footprint_gb`] when known: an Ollama tag pulls the projector layer with the weights and
+    /// the server holds it resident whether or not anything ever sends an image, and the on-disk
+    /// scan measures a projector that is genuinely already there.
     pub projector_gb: Option<f64>,
     pub candidates: Vec<QuantCandidate>,
 }
@@ -256,8 +268,8 @@ pub enum Verdict {
     HalvedContext,
     /// Doesn't fit even at the smallest quant and floor context — use the cloud.
     StayOnCloud,
-    /// We can't compute a trustworthy fit (unmodelled architecture, or a multimodal model whose
-    /// projector size is unknown). Never guessed.
+    /// We can't compute a trustworthy fit — an unmodelled architecture, or (from the installed
+    /// scan) a model that isn't in the catalog. Never guessed.
     Unknown,
 }
 
@@ -387,11 +399,6 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
             arch_label(spec.arch)
         ));
     }
-    if spec.multimodal && spec.projector_gb.is_none() {
-        return unknown(
-            "Fit can't be estimated: the vision projector's size is unknown.".to_string(),
-        );
-    }
     if spec.candidates.is_empty() {
         return unknown(
             "Fit can't be estimated: no known quantizations for this model.".to_string(),
@@ -437,15 +444,22 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
                         "Larger than your GPU's memory — runs in system RAM (slower).".to_string(),
                     );
                 }
-                match verdict {
-                    Verdict::HalvedContext => notes.push(format!(
+                // The notes are derived from the FACTS, not from the verdict. `Verdict` holds one
+                // value, and `halved` claims it first — so a pick that had to halve its context AND
+                // landed on the budget floor used to report the halving and stay silent about the
+                // headroom. The configs scraping the floor were exactly the ones carrying no
+                // warning: the suite's own `halves_context_when_even_a_q8_0_cache_does_not_fit_full_context`
+                // sits 39 MB under its budget and says nothing about it. Both are true at once, they
+                // answer different questions — what was given up, and what is left over — so both
+                // are said. No verdict VALUE changes, so nothing that ranks or gates on one moves.
+                if halved {
+                    notes.push(format!(
                         "Context reduced to {ctx} tokens (from {}) to fit your memory.",
                         spec.target_context
-                    )),
-                    Verdict::Tight => {
-                        notes.push("Fits, but with little memory headroom.".to_string());
-                    }
-                    _ => {}
+                    ));
+                }
+                if headroom < COMFORT_MARGIN_GB {
+                    notes.push("Fits, but with little memory headroom.".to_string());
                 }
 
                 return FitResult {
@@ -517,9 +531,9 @@ pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFi
     GpuFit::Split { fit: gpu }
 }
 
-/// A fit result for a model we deliberately won't score — an unmodelled architecture, a multimodal
-/// model with no known projector, or (from the installed scan) a model not in the catalog. The
-/// verdict is `Unknown`; `reason` is the single user-facing note.
+/// A fit result for a model we deliberately won't score — an unmodelled architecture, or (from the
+/// installed scan) a model not in the catalog. The verdict is `Unknown`; `reason` is the single
+/// user-facing note.
 pub fn unknown(reason: String) -> FitResult {
     FitResult {
         verdict: Verdict::Unknown,
@@ -559,7 +573,6 @@ mod tests {
             arch: Architecture::Dense,
             active_params_b: active_b,
             target_context: ctx,
-            multimodal: false,
             projector_gb: None,
             candidates,
         }
@@ -791,9 +804,8 @@ mod tests {
     }
 
     #[test]
-    fn multimodal_projector_adds_memory_and_missing_projector_is_unknown() {
+    fn multimodal_projector_adds_memory_and_an_unsized_one_is_still_scored() {
         let base = ModelSpec {
-            multimodal: true,
             projector_gb: Some(1.5),
             ..dense(7.0, 4096, vec![q(Quant::Q4_K_M, 4.3)])
         };
@@ -809,6 +821,9 @@ mod tests {
         .unwrap();
         assert!((with_proj - no_proj - 1.5).abs() < 0.01);
 
+        // A projector whose size the source didn't report used to make the WHOLE model unscoreable,
+        // even though the quant, the context and the weights were all known. PM can't send an image
+        // to any model, so refusing to size the rest over that one term was never a fit question.
         let missing = fit(
             &ModelSpec {
                 projector_gb: None,
@@ -816,7 +831,9 @@ mod tests {
             },
             &ram(32.0),
         );
-        assert_eq!(missing.verdict, Verdict::Unknown);
+        assert_eq!(missing.verdict, Verdict::Comfortable);
+        assert_eq!(missing.quant, Some(Quant::Q4_K_M));
+        assert!((missing.est_memory_gb.unwrap() - no_proj).abs() < 0.01);
     }
 
     #[test]
@@ -994,7 +1011,6 @@ mod tests {
     #[test]
     fn gpu_fit_multimodal_projector_counts_against_vram() {
         let base = ModelSpec {
-            multimodal: true,
             projector_gb: Some(1.0),
             ..dense(7.0, 32768, vec![q(Quant::Q8_0, 7.5), q(Quant::Q4_K_M, 4.4)])
         };
@@ -1008,14 +1024,42 @@ mod tests {
             }
             other => panic!("expected Split, got {other:?}"),
         }
-        // No projector size for a multimodal model → unscoreable → no invented GPU config.
+        // An unsized projector no longer sinks the GPU config either: the same Split is offered,
+        // one projector lighter, instead of the model being refused a score altogether.
         let missing = ModelSpec {
             projector_gb: None,
             ..base
         };
         let rfm = fit(&missing, &hw);
-        assert_eq!(rfm.verdict, Verdict::Unknown);
-        assert_eq!(gpu_fit(&missing, &hw, &rfm), GpuFit::Single);
+        assert_eq!(rfm.verdict, Verdict::Comfortable);
+        match gpu_fit(&missing, &hw, &rfm) {
+            GpuFit::Split { fit } => assert_eq!(fit.quant, Some(Quant::Q4_K_M)),
+            other => panic!("expected Split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_halved_context_still_warns_when_the_headroom_is_thin() {
+        // The pair that used to be mutually exclusive. `Verdict` holds one value and `halved` takes
+        // it, so a pick that both compromised its context AND landed on the budget floor reported
+        // only the compromise. Both notes are facts about the same result; both are now said.
+        // KV-dominated on purpose, and one quant only: with a small model the q8_0 cache rescues the
+        // full context at rung 0 (which is the ladder working correctly) and it never halves at all.
+        let spec = dense(30.0, 8192, vec![q(Quant::Q4_K_M, 2.0)]);
+        let budget = footprint_gb(&spec, &spec.candidates[0], 4096, KvCache::F16) + 0.01;
+        let r = fit_within(&spec, budget, &ram(64.0));
+        assert_eq!(r.verdict, Verdict::HalvedContext);
+        assert_eq!(r.context, Some(4096));
+        assert!(
+            r.notes.iter().any(|n| n.contains("Context reduced")),
+            "notes: {:?}",
+            r.notes
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("little memory headroom")),
+            "notes: {:?}",
+            r.notes
+        );
     }
 
     #[test]

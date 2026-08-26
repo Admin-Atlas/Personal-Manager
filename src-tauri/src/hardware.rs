@@ -126,6 +126,28 @@ pub fn total_ram_gb() -> Option<f64> {
     }
 }
 
+/// Free RAM in GiB on its own — the same cheap read as [`total_ram_gb`], and for the same reason.
+///
+/// This one exists because free RAM is the only field of a [`Hardware`] scan that moves on the scale
+/// of minutes. The scan is cached until the user clicks Re-scan, which is right for the GPU, the CPU
+/// and the disk — they do not change mid-session — but wrong for this: a scan taken while the machine
+/// was busy freezes a smaller budget for the rest of the session, and one taken while it was idle
+/// freezes a budget the machine no longer has. Measured drift on one dev box in a single sitting was
+/// 16.5 GiB to 13.4 GiB, which is 1.5x `PM_RESERVE_GB` and enough to move a model between verdicts.
+/// Scoring re-reads this live so the answer is about the machine now; everything expensive stays
+/// cached. `None` when the platform won't say, so a caller keeps the scanned figure rather than
+/// acting on a zero.
+pub fn available_ram_gb() -> Option<f64> {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_memory();
+    match sys.available_memory() {
+        0 => None,
+        bytes => Some(round1(bytes as f64 / GIB)),
+    }
+}
+
 /// RAM / CPU / disk via `sysinfo` — one API, every OS. Each field is best-effort.
 fn fill_ram_cpu_disk(hw: &mut Hardware, data_dir: Option<&std::path::Path>) {
     use sysinfo::System;
@@ -223,11 +245,15 @@ fn probe_gpu() -> GpuProbe {
     }
 
     // nvidia-smi is authoritative for NVIDIA VRAM — prefer it over the AdapterRAM guess.
-    if let Some(mib) =
-        run_capture("nvidia-smi", &NVIDIA_SMI_ARGS).and_then(|s| parse_nvidia_smi_csv(&s))
-    {
+    if let Some((name, mib)) = nvidia_smi_read() {
         probe.vram_gb = Some(round1(mib / 1024.0));
         probe.source = Some("nvidia-smi".to_string());
+        // Strictly a backstop: CIM normally names the card here, and this fires only when it came
+        // back with nothing. It cannot flip `probe.unified` (that short-circuits on `source` below)
+        // nor re-enter the DXGI branch (gated on `vram_gb.is_none()`, which is now set).
+        if probe.name.is_none() {
+            probe.name = name;
+        }
     }
 
     // Shared-memory (integrated) GPU → no distinct faster pool, so no GPU Split. nvidia-smi VRAM is
@@ -337,10 +363,11 @@ fn probe_gpu() -> GpuProbe {
     }
 
     // NVIDIA first (authoritative), then the AMD sysfs node, then the Intel DRM query (#461).
-    if let Some(mib) =
-        run_capture("nvidia-smi", &NVIDIA_SMI_ARGS).and_then(|s| parse_nvidia_smi_csv(&s))
-    {
-        probe.name = Some("NVIDIA GPU".to_string());
+    if let Some((name, mib)) = nvidia_smi_read() {
+        // The card's real model when nvidia-smi says, so `GPU_BANDWIDTH_TABLE` can match it; the
+        // generic string only when it won't. This used to be hardcoded generic, which meant no
+        // NVIDIA card on Linux ever calibrated its speed estimate.
+        probe.name = Some(name.unwrap_or_else(|| "NVIDIA GPU".to_string()));
         probe.vendor = Some("NVIDIA".to_string());
         probe.vram_gb = Some(round1(mib / 1024.0));
         probe.source = Some("nvidia-smi".to_string());
@@ -395,8 +422,37 @@ fn probe_gpu() -> GpuProbe {
 }
 
 // nvidia-smi is queried by the Windows and Linux probes; macOS never shells out to it.
+//
+// `name` is asked for as well as `memory.total`, and it is asked for FIRST so the number stays the
+// last column — `parse_nvidia_smi_csv` splits on the LAST comma, which is what makes a comma inside a
+// card's marketing name harmless. Without the name the Linux probe had nothing to report but the
+// literal "NVIDIA GPU", which matches no key in `GPU_BANDWIDTH_TABLE`, so every NVIDIA card on Linux
+// fell through to the flat fallback and the readout said its model "wasn't recognised" — even for
+// cards the table has carried all along.
 #[cfg(any(windows, target_os = "linux"))]
-const NVIDIA_SMI_ARGS: [&str; 2] = ["--query-gpu=memory.total", "--format=csv,noheader,nounits"];
+const NVIDIA_SMI_ARGS: [&str; 2] = [
+    "--query-gpu=name,memory.total",
+    "--format=csv,noheader,nounits",
+];
+
+/// The pre-`name` query, retried when the one above fails. An nvidia-smi too old to know a field
+/// exits non-zero for the WHOLE query rather than dropping the column, and reading no VRAM at all is
+/// a much worse outcome than reading it without a model name — on Windows it would silently demote
+/// the authoritative figure back to the AdapterRAM guess.
+#[cfg(any(windows, target_os = "linux"))]
+const NVIDIA_SMI_ARGS_LEGACY: [&str; 2] =
+    ["--query-gpu=memory.total", "--format=csv,noheader,nounits"];
+
+/// Ask nvidia-smi for the largest card's name and VRAM, falling back to the memory-only query.
+#[cfg(any(windows, target_os = "linux"))]
+fn nvidia_smi_read() -> Option<(Option<String>, f64)> {
+    run_capture("nvidia-smi", &NVIDIA_SMI_ARGS)
+        .and_then(|s| parse_nvidia_smi_csv(&s))
+        .or_else(|| {
+            run_capture("nvidia-smi", &NVIDIA_SMI_ARGS_LEGACY)
+                .and_then(|s| parse_nvidia_smi_csv(&s))
+        })
+}
 
 /// Run a command and capture stdout as a string, or `None` if it can't be run or fails. On Windows a
 /// no-op-elsewhere `no_window` flag keeps a console from flashing. Only the Windows/Linux probes shell
@@ -798,15 +854,46 @@ fn utf16_trim_to_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end]).trim().to_string()
 }
 
-/// The largest `memory.total` (MiB) across `nvidia-smi --query-gpu` lines, or `None`.
+/// The largest card across `nvidia-smi --query-gpu` lines, as `(name, memory.total MiB)`.
+///
+/// nvidia-smi emits one row per GPU, so the name and the memory have to travel together — taking the
+/// max memory and the first name would mate the biggest card's VRAM with a different card's model.
+/// The split is `rsplit_once(',')` because the number is always the last column: a marketing name
+/// containing a comma then cannot eat it. A row with no comma at all is the legacy memory-only reply,
+/// which still parses — that is what lets `nvidia_smi_read` retry the old query and get a usable
+/// answer instead of nothing.
 #[cfg(any(windows, target_os = "linux", test))]
-fn parse_nvidia_smi_csv(csv: &str) -> Option<f64> {
+fn parse_nvidia_smi_csv(csv: &str) -> Option<(Option<String>, f64)> {
     csv.lines()
-        .filter_map(|l| l.trim().parse::<f64>().ok())
-        .filter(|&m| m > 0.0)
-        .fold(None, |acc: Option<f64>, m| {
-            Some(acc.map_or(m, |a| a.max(m)))
+        .filter_map(|line| {
+            let line = line.trim();
+            let (name, mib) = match line.rsplit_once(',') {
+                Some((n, m)) => (nvidia_smi_name(n), m),
+                None => (None, line),
+            };
+            let mib = mib.trim().parse::<f64>().ok().filter(|&m| m > 0.0)?;
+            Some((name, mib))
         })
+        .fold(None, |acc: Option<(Option<String>, f64)>, row| match acc {
+            Some(best) if best.1 >= row.1 => Some(best),
+            _ => Some(row),
+        })
+}
+
+/// A card name from nvidia-smi, or `None` for one of its "I don't know" sentinels — which are plain
+/// strings in this output, not empty fields, and would otherwise be matched against the bandwidth
+/// table and shown to the user as a model name.
+#[cfg(any(windows, target_os = "linux", test))]
+fn nvidia_smi_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name.eq_ignore_ascii_case("[N/A]")
+        || name.eq_ignore_ascii_case("[Not Supported]")
+        || name.eq_ignore_ascii_case("[Unknown Error]")
+    {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// A GPU vendor guessed from the controller name, or `None` if unrecognized.
@@ -1111,6 +1198,42 @@ enum Bandwidth {
 }
 
 const GPU_BANDWIDTH_TABLE: &[(&str, Bandwidth)] = &[
+    // ---- NVIDIA laptop parts ----
+    //
+    // A mobile chip shares its desktop namesake's NAME and almost never its memory. Matching is
+    // substring containment, so without these keys "…RTX 4070 Laptop GPU" claims the desktop 4070's
+    // 504 GB/s against a real 256 — a 97% over-claim, and the 4090 and 3080 Laptop parts are as bad.
+    // `gpu_bandwidth_gbps` refuses any mobile name that has no key here, so an unlisted one falls to
+    // the flat default rather than inheriting a desktop figure.
+    //
+    // Every row below was read from a vendor/TechPowerUp spec, and the RTX 5060 Laptop — the part
+    // this was found on — was settled against the silicon, because the published sources disagreed:
+    // `nvidia-smi --query-gpu=clocks.max.memory` reports 12001 MHz, i.e. 24 Gbps effective over a
+    // 128-bit bus = 384 GB/s, NOT the 28 Gbps some spec sites list. A Ti part needs its own key: it
+    // does not contain the non-Ti key, so it would otherwise fall through to the desktop Ti.
+    //
+    // Deliberately absent: the RTX 5070 Laptop (three sources, three different memory clocks — none
+    // verifiable, so it takes the honest fallback) and every 20-series mobile part (NVIDIA only added
+    // the "Laptop GPU" suffix with the 30-series, so a substring key cannot reach them; their desktop
+    // figures happen to match anyway). Max-Q variants report an identical name at a lower memory
+    // clock, so these can still over-claim by up to ~25% on one — far better than the ~100% before.
+    ("rtx 5090 laptop", Bandwidth::Fixed(896.0)),
+    ("rtx 5080 laptop", Bandwidth::Fixed(896.0)),
+    ("rtx 5070 ti laptop", Bandwidth::Fixed(672.0)),
+    ("rtx 5060 laptop", Bandwidth::Fixed(384.0)),
+    ("rtx 4090 laptop", Bandwidth::Fixed(576.0)),
+    ("rtx 4080 laptop", Bandwidth::Fixed(432.0)),
+    ("rtx 4070 laptop", Bandwidth::Fixed(256.0)),
+    ("rtx 4060 laptop", Bandwidth::Fixed(256.0)),
+    ("rtx 4050 laptop", Bandwidth::Fixed(192.0)),
+    ("rtx 3080 ti laptop", Bandwidth::Fixed(512.0)),
+    ("rtx 3080 laptop", Bandwidth::Fixed(448.0)),
+    ("rtx 3070 ti laptop", Bandwidth::Fixed(448.0)),
+    ("rtx 3070 laptop", Bandwidth::Fixed(448.0)),
+    ("rtx 3060 laptop", Bandwidth::Fixed(336.0)), // the one the desktop key UNDER-claimed
+    ("rtx 3050 ti laptop", Bandwidth::Fixed(192.0)),
+    ("rtx a5000 laptop", Bandwidth::Fixed(448.0)),
+    ("rtx a4000 laptop", Bandwidth::Fixed(384.0)),
     // ---- NVIDIA GeForce RTX 50-series ----
     ("rtx 5090", Bandwidth::Fixed(1792.0)),
     ("rtx 5080", Bandwidth::Fixed(960.0)),
@@ -1244,6 +1367,24 @@ fn match_bandwidth(name: &str, table: &[(&str, Bandwidth)]) -> Option<Bandwidth>
 /// unrecognised card — or a capacity-ambiguous one whose VRAM we couldn't read (the caller then falls
 /// back to fit-scoring's flat default). Pure; safe on every platform.
 pub fn gpu_bandwidth_gbps(name: &str, vram_gb: Option<f64>) -> Option<f64> {
+    // A mobile part is NOT its desktop namesake. The table is keyed on desktop models and matched by
+    // substring, so "NVIDIA GeForce RTX 3080 Laptop GPU" contains "rtx 3080" and would inherit the
+    // desktop card's 912 GB/s — against a real 448, a 2x over-claim. Mobile chips routinely use a
+    // narrower bus and slower memory than the desktop model they are named after, and there is no way
+    // to derive one from the other. So unless the table carries an explicit laptop key (longest-match
+    // finds it, and it wins), a mobile name falls through to the flat default plus the readout's
+    // honest "this card's exact model wasn't recognised" line. That is the module's stated contract
+    // at the top of this file — a number PM prints has to be the card's own.
+    //
+    // This was already live on Windows, where CIM reports the full "… Laptop GPU" string; reading the
+    // name on Linux would have spread it there too.
+    let n = normalize_gpu_name(name);
+    let explicit_mobile_key = GPU_BANDWIDTH_TABLE
+        .iter()
+        .any(|(key, _)| key.contains("laptop") && n.contains(key));
+    if is_mobile_gpu_name(&n) && !explicit_mobile_key {
+        return None;
+    }
     match match_bandwidth(name, GPU_BANDWIDTH_TABLE)? {
         Bandwidth::Fixed(gbps) => Some(gbps),
         Bandwidth::ByVram {
@@ -1252,6 +1393,12 @@ pub fn gpu_bandwidth_gbps(name: &str, vram_gb: Option<f64>) -> Option<f64> {
             low,
         } => vram_gb.map(|v| if v >= threshold_gb { high } else { low }),
     }
+}
+
+/// Whether a NORMALISED name is a mobile/laptop part. Both words appear in the wild: NVIDIA settled on
+/// "… Laptop GPU", AMD and older NVIDIA parts use "Mobile"/"Max-Q".
+fn is_mobile_gpu_name(normalised: &str) -> bool {
+    normalised.contains("laptop") || normalised.contains("mobile") || normalised.contains("max q")
 }
 
 fn round1(x: f64) -> f64 {
@@ -1332,10 +1479,56 @@ mod tests {
 
     #[test]
     fn nvidia_smi_takes_the_largest_gpu() {
-        assert_eq!(parse_nvidia_smi_csv("8192\n24576\n"), Some(24576.0));
-        assert_eq!(parse_nvidia_smi_csv("12288"), Some(12288.0));
+        // The legacy memory-only reply still parses — `nvidia_smi_read` retries with it when an
+        // older nvidia-smi rejects the `name` field outright, and a version that cannot answer must
+        // still yield VRAM rather than nothing.
+        assert_eq!(parse_nvidia_smi_csv("8192\n24576\n"), Some((None, 24576.0)));
+        assert_eq!(parse_nvidia_smi_csv("12288"), Some((None, 12288.0)));
         assert_eq!(parse_nvidia_smi_csv(""), None);
         assert_eq!(parse_nvidia_smi_csv("no gpu found"), None);
+    }
+
+    #[test]
+    fn nvidia_smi_keeps_each_card_name_with_its_own_memory() {
+        // The real reply on the machine this was found on.
+        assert_eq!(
+            parse_nvidia_smi_csv("NVIDIA GeForce RTX 5060 Laptop GPU, 8151\n"),
+            Some((
+                Some("NVIDIA GeForce RTX 5060 Laptop GPU".to_string()),
+                8151.0
+            ))
+        );
+        // Two cards: the winner's NAME must travel with the winner's memory. Taking the max MiB and
+        // the first name would have reported a 24 GB RTX 3050.
+        assert_eq!(
+            parse_nvidia_smi_csv("NVIDIA GeForce RTX 3050, 8192\nNVIDIA RTX A5000, 24576\n"),
+            Some((Some("NVIDIA RTX A5000".to_string()), 24576.0))
+        );
+    }
+
+    #[test]
+    fn nvidia_smi_survives_a_comma_in_the_card_name() {
+        // Splitting on the LAST comma is what makes this safe — the number is always the last
+        // column, so nothing in the name can eat it.
+        assert_eq!(
+            parse_nvidia_smi_csv("Some Card, Special Edition, 16384"),
+            Some((Some("Some Card, Special Edition".to_string()), 16384.0))
+        );
+    }
+
+    #[test]
+    fn nvidia_smi_sentinels_are_not_treated_as_card_names() {
+        // These come back as literal strings, not empty fields, so they would otherwise be matched
+        // against the bandwidth table and printed to the user as a model.
+        assert_eq!(
+            parse_nvidia_smi_csv("[N/A], 8192"),
+            Some((None, 8192.0)),
+            "[N/A] is nvidia-smi saying it doesn't know, not a card called [N/A]"
+        );
+        assert_eq!(
+            parse_nvidia_smi_csv("[Not Supported], 8192"),
+            Some((None, 8192.0))
+        );
     }
 
     #[test]
@@ -1527,6 +1720,58 @@ mod tests {
             gpu_bandwidth_gbps("Intel(R) Arc(TM) Graphics", Some(2.0)),
             None
         ); // Core-Ultra iGPU
+    }
+
+    #[test]
+    fn a_laptop_part_never_inherits_its_desktop_namesakes_bandwidth() {
+        // The trap the whole mobile guard exists for: matching is substring containment, so this
+        // name CONTAINS "rtx 3080" and would have been scored at the desktop card's 912 GB/s.
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080 Laptop GPU", Some(16.0)),
+            Some(448.0),
+            "the mobile part's own figure, not the desktop 3080's 912"
+        );
+        // The machine this was found on. Its published specs disagreed, so the number came off the
+        // silicon: clocks.max.memory 12001 MHz = 24 Gbps over 128 bits = 384 GB/s, where the desktop
+        // key would have said 448.
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 5060 Laptop GPU", Some(8.0)),
+            Some(384.0)
+        );
+        // A Ti part does NOT contain the non-Ti laptop key, so it needs one of its own or it falls
+        // straight through to the desktop Ti.
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080 Ti Laptop GPU", Some(16.0)),
+            Some(512.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 4090 Laptop GPU", Some(16.0)),
+            Some(576.0)
+        );
+        // A mobile part with no key of its own takes the flat default and the honest "not
+        // recognised" readout rather than borrowing a desktop number.
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 5070 Laptop GPU", Some(8.0)),
+            None,
+            "three sources give three memory clocks, so PM declines to print one"
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 4080 Mobile", Some(12.0)),
+            None
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 4070 Max-Q", Some(8.0)),
+            None
+        );
+        // Desktop cards are untouched by the guard.
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 5060", Some(8.0)),
+            Some(448.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080", Some(12.0)),
+            Some(912.0)
+        );
     }
 
     // --- Intel DRM query (#461) ---------------------------------------------------------------

@@ -198,7 +198,6 @@ pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
         ),
         active_params_b: entry.active_parameters_b,
         target_context: entry.context_length,
-        multimodal: entry.multimodal,
         projector_gb: entry.projector_gb,
         candidates,
     }
