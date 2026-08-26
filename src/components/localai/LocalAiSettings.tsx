@@ -42,7 +42,7 @@ import type {
   PullProgress,
 } from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
-import { ollamaGuide } from "../../lib/workbenchGuide";
+import { installCommand, runnerGuides } from "../../lib/workbenchGuide";
 import {
   Button,
   Callout,
@@ -710,11 +710,18 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 {saving ? "Connecting…" : "Connect"}
               </Button>
             </div>
-            <Collapsible title="Don't have a local server yet?" defaultOpen={false}>
-              <RunnerInstall />
-            </Collapsible>
           </div>
         )}
+
+        {/* Outside the `configured` branch on purpose. It used to live inside the not-yet-connected
+            half, so the moment you connected anything the comparison vanished — and "was one of the
+            others a better choice for me?" is a question you mostly ask AFTER trying one. */}
+        <Collapsible
+          title={configured ? "Compare the three local servers" : "Don't have a local server yet?"}
+          defaultOpen={false}
+        >
+          <RunnerInstall />
+        </Collapsible>
 
         <SectionInfo title="What leaves your device">
           <p>
@@ -949,6 +956,39 @@ function ollamaTag(hint: string | null): string | null {
   return m ? m[1] : null;
 }
 
+/** How to get a model PM can't download for you.
+ *
+ *  Honest per runner rather than one command pretending to be universal: the three name models three
+ *  different ways, and the same weights are `qwen2.5:7b-instruct-q4_K_M` to Ollama, `…@q4_k_m` to LM
+ *  Studio and `user/repo:Q4_K_M` to llama-server. Pasting one into another gets you nothing. So PM
+ *  prints the command it can stand behind and describes the route for the two it can't. */
+function ModelInstallHint({ repo, quant }: { repo: string; quant: string | null }) {
+  const cmd = installCommand("llama-server", repo, quant);
+  return (
+    <div className="mt-2 space-y-1.5">
+      {cmd && (
+        <div className="flex items-center gap-2">
+          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
+            {cmd}
+          </code>
+          <Button
+            variant="tertiary"
+            size="sm"
+            onClick={() => void navigator.clipboard?.writeText(cmd)}
+          >
+            Copy
+          </Button>
+        </div>
+      )}
+      <p className="text-[0.6875rem] text-ink4">
+        That command downloads and serves it in one step. In LM Studio, paste{" "}
+        <span className="font-mono text-ink3">{repo}</span> into the Discover tab's search. Ollama
+        names models its own way, so search its library for this one.
+      </p>
+    </div>
+  );
+}
+
 function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
   const h = recs.hardware;
   const rows: Array<[string, string]> = [
@@ -1106,7 +1146,6 @@ function RecommendationCard({
   const f = rec.fit;
   // MoE when fewer params are active per token than the model holds (matches the catalog's own rule).
   const isMoe = rec.active_parameters_b + 0.01 < rec.parameters_b;
-  const tag = ollamaTag(rec.install.ollama);
   const pct =
     pullProg && pullProg.total_bytes
       ? Math.min(100, Math.round((100 * (pullProg.completed_bytes ?? 0)) / pullProg.total_bytes))
@@ -1211,19 +1250,13 @@ function RecommendationCard({
         </div>
       )}
 
-      {!installed && !canPull && tag && (
-        <div className="mt-2 flex items-center gap-2">
-          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
-            ollama pull {tag}
-          </code>
-          <Button
-            variant="tertiary"
-            size="sm"
-            onClick={() => void navigator.clipboard?.writeText(`ollama pull ${tag}`)}
-          >
-            Copy
-          </Button>
-        </div>
+      {!installed && !canPull && (
+        // The row that offers a way to GET this model when PM can't fetch it for you. It used to be
+        // gated on an `ollama pull` hint parsed out of the catalogue — and every entry carries a
+        // null one, so this rendered for nobody: an un-installed model had no Download button AND
+        // no command, just a card. The Hugging Face repo id is already here and is what
+        // llama-server takes directly, so at least one runner now gets a real command.
+        <ModelInstallHint repo={rec.repo} quant={f.quant} />
       )}
 
       {rec.gpu.kind === "split"
@@ -1362,21 +1395,43 @@ function RoleRow({
   );
 }
 
+/** All three runners, with the choice explained before the instructions.
+ *
+ *  This used to be the Ollama guide plus one sentence conceding the other two exist, which left a
+ *  user who had never installed any of them with no way to tell them apart — and PM auto-detects
+ *  all three, so "which one?" is a question PM creates and ought to answer. */
 function RunnerInstall() {
-  const g = ollamaGuide();
+  const guides = runnerGuides();
   return (
     <div className="mt-1 text-xs text-ink4">
-      <p className="text-ink2">{g.name}</p>
-      <p className="mt-0.5">{g.summary}</p>
-      <ol className="ml-4 mt-1.5 list-decimal space-y-1">
-        {g.steps.map((s, i) => (
-          <li key={i}>{s}</li>
-        ))}
-      </ol>
-      <p className="mt-1.5">
-        LM Studio and llama-server also work — connect them by URL above (they have no one-click
-        download, so you pick models in their own app).
+      <p>
+        PM works with any of these three. It doesn't bundle or install one — you pick and install it
+        yourself, and it fetches the model weights, not PM. They differ in how much of an app comes
+        with them and how you get models; all three end up serving the same models to PM.
       </p>
+      <div className="mt-3 space-y-3">
+        {guides.map((g) => (
+          <div key={g.name} className="rounded-[var(--radius-sm)] border border-border p-2.5">
+            <div className="flex flex-wrap items-baseline gap-x-2">
+              <span className="text-sm text-ink2">{g.name}</span>
+              <span className="font-mono text-[0.625rem] text-ink4">port {g.port}</span>
+            </div>
+            <p className="mt-0.5">{g.summary}</p>
+            <p className="mt-1.5 text-ink3">{g.bestFor}</p>
+            <p className="mt-1">
+              <span className="text-ink3">Models:</span> {g.models}
+            </p>
+            {/* Unfolded, never a caret: a hardware exclusion or a "it stops when you close the
+                window" is a gating fact, and the settings doctrine folds prose but not those. */}
+            {g.caveat && <p className="mt-1 text-ink3">Worth knowing: {g.caveat}</p>}
+            <ol className="ml-4 mt-1.5 list-decimal space-y-1">
+              {g.steps.map((s, i) => (
+                <li key={i}>{s}</li>
+              ))}
+            </ol>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
