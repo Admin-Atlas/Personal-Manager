@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.129.0-alpha",
+    date: "2026-08-26",
+    highlights: [
+      "Local AI now explains the choice it was quietly asking you to make. PM works with three local servers — Ollama, LM Studio and llama-server — but only ever gave you instructions for one of them and a single line conceding the others existed, which is no help at all if you have never installed any. All three now get proper instructions for your operating system, alongside what each is actually good for, how you get models into it, and the thing most likely to rule it out for you. Every command was checked against the makers' own documentation rather than written from memory.",
+      "That comparison also stays reachable after you have connected something. It used to disappear the moment you had a server set up, which is roughly when you start wondering whether one of the others would have suited you better.",
+      "Every recommended model now tells you how to get it. Before this, a model you hadn't downloaded offered nothing at all — no download button and no command — because PM's list of models carries no Ollama names to hand its downloader. Each one now shows a single command that fetches and runs it, and points you at the right place to find it in the other two apps. The three name models differently enough that a command from one does nothing in another, so PM only shows a command where it knows it is right.",
+    ],
+  },
+  {
     version: "3.128.15-alpha",
     date: "2026-08-26",
     highlights: [
