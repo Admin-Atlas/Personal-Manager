@@ -1,4 +1,4 @@
-PM desktop release — **v3.128.7-alpha**.
+PM desktop release — **v3.129.1-alpha**.
 
 ## Install
 
@@ -47,30 +47,40 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.128.7-alpha
+## What's new in 3.129.1-alpha
 
-A short release with one large fix — how much of your machine PM takes while it works — plus
-the housekeeping since v3.128.3.
+This one is about **running AI on your own machine** — setting it up, and PM being honest with
+you about what your machine can actually manage. Plus the fixes and housekeeping since v3.128.7.
 
-- **PM stops holding on to memory it has finished with.** The part of PM that reads your
-  documents and turns them into something searchable was asking for far more memory at a time
-  than the work needed, and then never giving it back — so a session left open all day could
-  end up sitting on five gigabytes it had no further use for. On a laptop that is the
-  difference between PM being one open app among many and PM being the reason everything else
-  starts swapping. It now works in batches sized to your machine and hands back what it
-  borrows as each batch finishes. It turned out to be quicker this way too: the oversized
-  batches were slower, not faster.
-- **PM gets out of the way when you're doing something else.** Indexing used to reach for
-  every processor core on the machine at once, which is why opening PM could make everything
-  else feel sluggish while it caught up on your files. That work now runs at a lower priority
-  than whatever you're actually working in: it still uses the whole machine when nothing else
-  wants it, and steps back the moment you do. There's nothing to switch on, and it applies
-  whether you have indexing set to Fast or to Gentle.
-- **Under the hood.** Fifteen of the libraries PM is built from moved up to their latest patch
-  releases — among them the database layer your library is stored in, and the hashing and
-  encoding PM uses to keep track of your files. Building PM on a developer's machine also
-  stopped leaving behind tens of gigabytes of debugging detail nobody needed. Nothing about
-  the app you run changes.
+- **PM can now walk you through setting up local AI.** It works with three local servers —
+  Ollama, LM Studio and llama-server — but until now it had instructions for only one of them,
+  and a recommended model you hadn't downloaded yet gave you no way to get it. All three now
+  have proper instructions for your operating system, alongside what each one is good at, how
+  models get into it, and the thing most likely to rule it out for you. Every recommended model
+  shows a command that fetches and runs it. Every one of those commands was checked against the
+  makers' own documentation rather than written from memory. If you have ever wanted PM to keep
+  working without an internet connection, this is the release to try it on.
+- **The numbers PM showed about your machine are now true.** It worked out how much memory you
+  had free once, when you opened the tab, then judged every model against that one reading for
+  the rest of the session — so opening PM while your machine was busy could rule out a model
+  that fits perfectly well. On Linux it never recognised your graphics card at all. And laptop
+  graphics were borrowing the speed of the desktop card that shares their name, which overstated
+  some laptops by around double. All three are fixed, seventeen laptop chips now carry their own
+  verified figures, and a card PM has no real figure for says so rather than guessing. A model
+  that only just fits now tells you that it only just fits.
+- **Two things that made a perfectly good local model look broken.** If your machine has a proxy
+  set up — common behind a work network, or with a VPN client running — PM was sending requests
+  to your own computer through it, which cannot work; after three failures it concluded your
+  model was dead and stopped using it for minutes at a time. And the Local AI status light was
+  showing green from a guess rather than from anything it had actually seen, so it could sit
+  there reassuring you while chat was failing. Requests to your own machine now go straight
+  there, and the light reports what really happened.
+- **Elsewhere.** A document containing a single em dash or accented name no longer becomes
+  unreadable, and no longer holds up everything queued behind it. Transcribing a recording is
+  back to full speed on a laptop with four processor cores or fewer. Help mode stopped
+  explaining a project status PM removed a long time ago, and now checks itself against the
+  statuses PM really has. The libraries behind reading documents, on-device search and voice
+  notes all moved up to current versions, with every licence read again before it went in.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
