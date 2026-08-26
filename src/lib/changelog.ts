@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.15-alpha",
+    date: "2026-08-26",
+    highlights: [
+      "If your machine has a proxy set up — common behind a work network or with a VPN client running — PM was sending its requests to your own local AI server through it. A proxy has no route back to your own machine, so the request failed, and after three of those PM concluded your local model was dead and stopped using it for a few minutes at a time. Requests to a server on your own machine now go there directly, as they always should have. A local server you have deliberately pointed at another machine still uses your proxy, because that one is a real network destination.",
+      "The Local AI status light no longer shows green while chat is failing. PM only checks your server every thirty seconds, and in between it was guessing from whether the model was in a cooldown — so a server that had just failed, but not yet failed often enough to be put in one, still showed as connected. It now reports what was actually last seen, and a server that has never once answered no longer shows green at all. Real chat traffic counts as a check, so the light is also more current than it was.",
+    ],
+  },
+  {
     version: "3.128.14-alpha",
     date: "2026-08-26",
     highlights: [

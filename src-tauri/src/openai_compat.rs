@@ -28,21 +28,40 @@ use crate::error::{Error, Result};
 use crate::local_slot::tunables;
 use crate::openrouter::{drain_lines, ChatMessage, Completion, Usage};
 
-/// HTTP clients for local-endpoint calls. Two of them, differing ONLY in connect timeout: a
-/// loopback server that isn't listening RSTs instantly (2 s is ample), while a remote (LAN /
-/// Tailscale) endpoint may take longer to connect. Separate from `openrouter::HTTP` so the cloud
-/// path can never be perturbed (strict additivity), and — crucially — NEITHER sets a `read_timeout`:
-/// streaming manages a two-phase (first-token vs inter-token) deadline itself, and the non-streaming
-/// calls set a per-request total `timeout`. A single flat read timeout cannot tell a legitimate 60 s
-/// cold model load from a dead stream.
+/// HTTP clients for local-endpoint calls. Two of them, differing in connect timeout and in whether
+/// they honour a system proxy: a loopback server that isn't listening RSTs instantly (2 s is ample),
+/// while a remote (LAN / Tailscale) endpoint may take longer to connect. Separate from
+/// `openrouter::HTTP` so the cloud path can never be perturbed (strict additivity), and — crucially
+/// — NEITHER sets a `read_timeout`: streaming manages a two-phase (first-token vs inter-token)
+/// deadline itself, and the non-streaming calls set a per-request total `timeout`. A single flat read
+/// timeout cannot tell a legitimate 60 s cold model load from a dead stream.
 static LOCAL_HTTP_LOOPBACK: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| build_local_client(tunables::CONNECT_TIMEOUT_LOOPBACK));
+    std::sync::LazyLock::new(|| build_local_client(tunables::CONNECT_TIMEOUT_LOOPBACK, true));
 static LOCAL_HTTP_REMOTE: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| build_local_client(tunables::CONNECT_TIMEOUT_REMOTE));
+    std::sync::LazyLock::new(|| build_local_client(tunables::CONNECT_TIMEOUT_REMOTE, false));
 
-fn build_local_client(connect_timeout: std::time::Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(connect_timeout)
+/// `bypass_proxy` is the whole point of the loopback/remote split beyond the timeout.
+///
+/// reqwest defaults to auto-system-proxy, and neither reqwest nor hyper-util's matcher has any
+/// loopback special-casing — `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` are read unconditionally. So
+/// on a machine with a proxy variable set, which is the normal state of affairs behind a corporate
+/// network or a VPN client, PM's request to the user's OWN Ollama on `127.0.0.1:11434` was handed to
+/// the proxy. The proxy has no route to the user's loopback, the connect fails, and the failure is
+/// scored as a `Strike` — three of those and the circuit breaker cools a perfectly healthy local
+/// model down for 60 s escalating to 300 s, taking chat with it.
+///
+/// Only the loopback client bypasses. A remote endpoint is a real network destination and may
+/// legitimately need the proxy to reach it, so that client is left exactly as it was. reqwest does
+/// not offer a middle ground: `ClientBuilder::proxy()` sets `auto_sys_proxy = false`, so adding a
+/// NO_PROXY-style rule on top of the system proxies would mean re-implementing the env parsing.
+fn build_local_client(connect_timeout: std::time::Duration, bypass_proxy: bool) -> reqwest::Client {
+    let builder = reqwest::Client::builder().connect_timeout(connect_timeout);
+    let builder = if bypass_proxy {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .build()
         .expect("reqwest client with a static connect timeout should build")
 }
