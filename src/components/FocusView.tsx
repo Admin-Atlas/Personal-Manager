@@ -756,7 +756,7 @@ function MetaEditor({
             onClick={onSuggest}
             disabled={suggestDisabled}
             data-help="focus-suggest"
-            title="Let the AI propose a size, parent, blocker and deadline for this project"
+            title="Let the AI propose a size, blocker and deadline for this project"
           >
             {suggesting ? "Suggesting…" : "Suggest attributes (AI)"}
           </Button>

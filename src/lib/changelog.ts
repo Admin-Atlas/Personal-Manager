@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.13-alpha",
+    date: "2026-08-26",
+    highlights: [
+      "Help mode was still teaching a project status PM no longer has. \"Part of\" was removed a long time ago — it hid a project's own status behind a parent's name, and Merge into… does honestly what it was really being used for — but four help notes and a button tooltip went on describing it. One still told you to set a parent that is no longer a field, and two promised the AI would suggest one, which it is no longer even asked to do. All five now describe what PM actually offers. PM will also notice next time: the help text for statuses is now checked against the statuses PM can really show, so a retired one cannot quietly survive in the help again.",
+    ],
+  },
+  {
     version: "3.128.12-alpha",
     date: "2026-08-26",
     highlights: [
