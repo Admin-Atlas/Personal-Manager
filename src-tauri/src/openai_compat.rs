@@ -433,12 +433,24 @@ pub fn normalize_base_url(raw: &str) -> Result<String> {
 }
 
 /// Whether a JSON body is a plausible OpenAI `/v1/models` response — the check that distinguishes a
-/// real LLM server from any other web server that happens to answer on the port. Accepts either the
-/// `object == "list"` marker or a non-empty `data` array whose entries carry string `id`s (Ollama,
-/// LM Studio and llama-server all satisfy this; a random page's HTML/JSON does not).
+/// real LLM server from any other web server that happens to answer on the port.
+///
+/// Two branches, trusting different evidence. An explicit `object == "list"` marker is itself the
+/// proof that this is the OpenAI-compat route, so `data` only has to be list-SHAPED: an array or
+/// `null` both mean "a list, possibly with nothing in it". Ollama builds that response from a Go
+/// nil slice when its store is empty, and Go marshals a nil slice as `null` — so a freshly
+/// installed one, before anything has been pulled into it, answers `{"object":"list","data":null}`
+/// (measured against 0.33.0, 26-08-2026). LM Studio spells the same state `[]`, which was always
+/// accepted; rejecting the other spelling made a working server undetectable at exactly the moment
+/// a first-time user has no models yet.
+///
+/// Without the marker there is no such proof, so the second branch still demands a NON-EMPTY `data`
+/// array of entries carrying string `id`s as its only evidence. That one must stay strict: a null
+/// `data` under no marker is the ubiquitous `{"code":…,"msg":…,"data":null}` REST envelope, and
+/// services in that idiom answer an unknown path with 200 — on 8080, next to llama-server.
 pub fn is_models_list(value: &serde_json::Value) -> bool {
     if value.get("object").and_then(|o| o.as_str()) == Some("list") {
-        return value.get("data").map(|d| d.is_array()).unwrap_or(false);
+        return matches!(value.get("data"), Some(d) if d.is_array() || d.is_null());
     }
     value
         .get("data")
@@ -1236,7 +1248,23 @@ mod tests {
         assert!(is_models_list(&openai));
         assert_eq!(models_from_list(&openai), vec!["llama3.2", "qwen"]);
 
-        // Ollama returns a data array without the explicit object=="list" marker on some versions.
+        // A runner with nothing downloaded into it yet is still a runner. Byte-exact from a live
+        // server: Ollama 0.33.0, zero models pulled, GET /v1/models, 26-08-2026. Its handler never
+        // appends to a Go `var data []Model`, and Go marshals a nil slice as `null` — so this is
+        // the shape EVERY first-time Ollama user's server returns, before they have pulled
+        // anything. Rejecting it made a running server report as "No local server found".
+        let ollama_empty = serde_json::json!({"object":"list","data":null});
+        assert!(is_models_list(&ollama_empty));
+        assert!(models_from_list(&ollama_empty).is_empty());
+        // LM Studio's spelling of that same state, which was always accepted.
+        assert!(is_models_list(
+            &serde_json::json!({"object":"list","data":[]})
+        ));
+
+        // A minimal OpenAI-compat shim that omits the object=="list" marker. Not attributed to any
+        // named runner: all three measured ones send the marker, and a fixture that claims a
+        // producer nobody has seen is a test passing for free. The fall-through branch is real and
+        // wants coverage; who emits it is the part we don't know.
         let bare = serde_json::json!({"data":[{"id":"phi3","object":"model"}]});
         assert!(is_models_list(&bare));
 
@@ -1247,6 +1275,15 @@ mod tests {
             &serde_json::json!({"data":[{"name":"no-id"}]})
         ));
         assert!(!is_models_list(&serde_json::json!("<html>hi</html>")));
+        // The trap in accepting a null `data`: it is list-shaped ONLY under the object=="list"
+        // marker. The ubiquitous Go/Java REST envelope has a null `data` and no marker, and a
+        // service in that idiom will happily 200 an unknown path — on 8080, llama-server's port.
+        assert!(!is_models_list(
+            &serde_json::json!({"code":404,"msg":"not found","data":null})
+        ));
+        // A missing `data` key stays rejected too: no measured server omits it, and the marker
+        // alone is thinner evidence than we need on a contested port.
+        assert!(!is_models_list(&serde_json::json!({"object":"list"})));
     }
 
     #[test]

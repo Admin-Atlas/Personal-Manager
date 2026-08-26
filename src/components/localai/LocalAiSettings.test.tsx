@@ -325,6 +325,69 @@ describe("the endpoint form", () => {
   });
 });
 
+describe("a server that answers with nothing in it", () => {
+  // #790. A freshly installed runner has no models by definition, and until the endpoint check
+  // learned to accept that state the Workbench never had to say anything about it — the server
+  // simply failed to connect. Now it connects, so every readout that speaks for it has to be true.
+
+  it("says why both role pickers are empty, rather than leaving them bare", async () => {
+    listLocalLlmModels.mockResolvedValue([]);
+    await loaded();
+
+    expect(await screen.findByText(/isn't serving any models yet/i)).toBeTruthy();
+  });
+
+  it("says nothing about what a server serves until the listing has answered", async () => {
+    // `served` starts empty, so an unguarded check would flash "this server has no models" at
+    // every user with a working endpoint before the listing resolves.
+    listLocalLlmModels.mockReturnValue(new Promise(() => {}));
+    await loaded();
+
+    expect(screen.queryByText(/isn't serving any models yet/i)).toBeNull();
+  });
+
+  it("never claims a server serves nothing when PM could not ask", async () => {
+    // A failed listing leaves `served` empty too. "We could not reach it" and "it has nothing"
+    // are different facts and only one of them is knowable here.
+    listLocalLlmModels.mockRejectedValue(new Error("connection refused"));
+    await loaded();
+
+    expect(screen.queryByText(/isn't serving any models yet/i)).toBeNull();
+  });
+
+  it("leaves a server that does serve models alone", async () => {
+    await loaded();
+
+    expect(screen.queryByText(/isn't serving any models yet/i)).toBeNull();
+  });
+
+  it("does not report an empty endpoint as a clean pass", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    checkLocalLlmEndpoint.mockResolvedValue({
+      reachable: true,
+      normalized_url: "http://127.0.0.1:11434",
+      models: [],
+      assignable: [],
+      posture: "loopback",
+      scheme_verdict: "ok",
+      exposed_on_network: false,
+      message: null,
+    });
+    render(<LocalAiSettings />);
+
+    fireEvent.change(await screen.findByLabelText("Endpoint URL"), {
+      target: { value: "http://127.0.0.1:11434" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^check$/i }));
+
+    // Reachable and serving nothing is a true readout, but on its own it reads as "you are set"
+    // at the exact moment there is still a download to do.
+    const heading = await screen.findByText(/Reachable . 0 model\(s\)/i);
+    expect(heading.getAttribute("style")).toContain("--st-look");
+    expect(screen.getByText(/no models in it yet/i)).toBeTruthy();
+  });
+});
+
 describe("model licence terms", () => {
   // The catalogue ships models under bespoke publisher terms (Gemma, Llama, the largest Qwen 2.5)
   // alongside genuinely open ones. These pin the promise the UI makes about that difference.

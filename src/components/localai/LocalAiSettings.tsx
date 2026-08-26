@@ -67,6 +67,12 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const [config, setConfig] = useState<LocalLlmConfig | null>(null);
   const [status, setStatus] = useState<LocalLlmStatus | null>(null);
   const [served, setServed] = useState<LocalServedModel[]>([]);
+  // Whether `served` is an ANSWER rather than a starting value. It starts empty and is filled
+  // asynchronously, and a listing that fails leaves it empty too — so "empty" alone cannot tell
+  // "this server serves nothing" from "we haven't asked yet" or "we asked and couldn't reach it".
+  // Only a resolved listing sets this, so copy that speaks for the empty case can never claim a
+  // server serves nothing when PM simply doesn't know.
+  const [servedLoaded, setServedLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Endpoint form.
@@ -107,10 +113,17 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     if (cfg.base_url) {
       setUrlInput((u) => u || cfg.base_url || "");
       listLocalLlmModels()
-        .then(setServed)
-        .catch(() => setServed([]));
+        .then((m) => {
+          setServed(m);
+          setServedLoaded(true);
+        })
+        .catch(() => {
+          setServed([]);
+          setServedLoaded(false);
+        });
     } else {
       setServed([]);
+      setServedLoaded(false);
     }
   }
 
@@ -127,7 +140,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         if (cfg.base_url) {
           setUrlInput(cfg.base_url);
           listLocalLlmModels()
-            .then((m) => !cancelled && setServed(m))
+            .then((m) => {
+              if (cancelled) return;
+              setServed(m);
+              setServedLoaded(true);
+            })
             .catch(() => {});
         }
       } catch (e) {
@@ -774,6 +791,17 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               onModel={(m) => changeRoleModel("background", m)}
               onRouting={(p) => changeRouting("background", p)}
             />
+            {servedLoaded && served.length === 0 && (
+              // Unfolded, for the same reason as the two hints below: the settings doctrine folds
+              // prose but never a gating hint, and "both dropdowns are empty, and here is why" is
+              // exactly one. This state only became something a user can sit in once the endpoint
+              // check learned to accept a server with an empty model list (#790) — before that a
+              // fresh runner failed to connect at all, so nothing here had to speak for it.
+              <p className="text-xs text-ink4">
+                This server isn't serving any models yet, so there is nothing to assign and both
+                roles stay on cloud. Download a model into it and it will appear here.
+              </p>
+            )}
             {bothLocal && twoModels && (
               // Unfolded, for the same reason as the gating hint below: the doctrine folds prose but
               // never a loss warning, and this is one. Chat and Background share ONE endpoint, so
@@ -1299,7 +1327,12 @@ function StatusChip({ status }: { status: LocalLlmStatus | null }) {
 
 function EndpointCheckResult({ check }: { check: EndpointCheck }) {
   const bad = check.scheme_verdict === "refused_public_cleartext" || !check.reachable;
+  // A server that answers but serves nothing is not a pass, and the fall-through token is the
+  // green one — which reads as "you're set" at the exact moment there is still a download to do.
+  // Unreachable before #790, so nothing here had to account for it.
+  const empty = check.reachable && check.models.length === 0;
   const warn =
+    empty ||
     check.posture !== "loopback" ||
     check.exposed_on_network ||
     check.scheme_verdict === "warn_unencrypted";
@@ -1317,6 +1350,12 @@ function EndpointCheckResult({ check }: { check: EndpointCheck }) {
         {check.reachable ? `Reachable · ${check.models.length} model(s)` : "Not reachable"}
         {check.posture !== "loopback" ? ` · ${check.posture}` : ""}
       </p>
+      {empty && (
+        <p className="mt-1">
+          It's running, but there are no models in it yet — so there is nothing for PM to send work
+          to. Download one into it, then check again.
+        </p>
+      )}
       {check.posture !== "loopback" && check.scheme_verdict !== "refused_public_cleartext" && (
         <p className="mt-1">
           This is a remote server — your chats will be sent to it. PM can't vouch for what it does

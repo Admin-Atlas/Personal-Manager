@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.129.3-alpha",
+    date: "2026-08-26",
+    highlights: [
+      'PM couldn\'t find Ollama on your own machine until you had already downloaded a model into it. Asked which models it has, a freshly installed Ollama answers "none" in a particular way, and PM read that answer as "this isn\'t a model server at all" — so auto-detect kept telling you nothing was installed while your server was running and answering it every time. Which is exactly the wrong way round: a server you have only just installed has nothing in it yet, so this landed on people at the one moment it mattered most. PM now recognises a working server with nothing in it, and says so.',
+      "It also tells you what to do about that. A connected server with no models used to report as a clean pass, in green, and then leave you with two empty dropdowns and nothing anywhere explaining why. It now reads as something still to do, and says plainly that a model needs downloading into it before PM has anywhere to send work.",
+    ],
+  },
+  {
     version: "3.129.2-alpha",
     date: "2026-08-26",
     highlights: [
