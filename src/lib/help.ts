@@ -18,7 +18,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Sidebar / navigation
   "nav-focus": {
     title: "Focus",
-    body: "Your home screen: every active project on one page, each with a single status that answers 'should I look at this now?' — Due soon, Quick win, Take a look, Blocked, Part of, or On track. Click a project to narrow everything to just it.",
+    body: "Your home screen: every active project on one page, each with a single status that answers 'should I look at this now?' — Due soon, Quick win, Take a look, Blocked, or On track. Click a project to narrow everything to just it.",
   },
   "nav-chat": {
     title: "Chats",
@@ -525,7 +525,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-suggest": {
     title: "Suggest attributes",
-    body: "Asks the AI to propose a size, a parent project, a blocker, and (if your documents mention one) a deadline for each project. Nothing is applied until you confirm it in a project's Triage panel — AI proposes, you decide.",
+    body: "Asks the AI to propose a size, a blocker, and (if your documents mention one) a deadline for each project. Nothing is applied until you confirm it in a project's Triage panel — AI proposes, you decide.",
   },
   "focus-box": {
     title: "Say what you mean",
@@ -545,11 +545,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-status-badge": {
     title: "Status",
-    body: "The one thing this project is telling you. Due soon = a deadline is near. Quick win = small enough to finish fast. Take a look = it's gone quiet. Blocked = waiting on another project. Part of = a piece of a bigger project. On track = nothing needed now.",
+    body: "The one thing this project is telling you. Due soon = a deadline is near. Quick win = small enough to finish fast. Take a look = it's gone quiet. Blocked = waiting on another project. On track = nothing needed now.",
   },
   "focus-triage": {
     title: "Triage a project",
-    body: "Set a size (a 'quick' project becomes a Quick win), a priority (High/Medium/Low — or Auto, which shows no tag), a blocker (drives Blocked), or a parent (drives Part of), and add milestones — the project's deadlines. Priority is yours to set: it's no longer guessed from your documents, and you can sort the focus list by it. If the AI suggested values, 'Use it' fills the form so you can confirm or tweak before saving.",
+    body: "Set a size (a 'quick' project becomes a Quick win), a priority (High/Medium/Low — or Auto, which shows no tag), or a blocker (drives Blocked), and add milestones — the project's deadlines. Priority is yours to set: it's no longer guessed from your documents, and you can sort the focus list by it. If the AI suggested values, 'Use it' fills the form so you can confirm or tweak before saving. If a project turns out to have always belonged to another one, 'Merge into…' moves everything across and deletes the source.",
   },
   "project-milestones": {
     title: "Milestones",
