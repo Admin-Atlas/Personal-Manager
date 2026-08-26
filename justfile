@@ -84,8 +84,16 @@ fetch-python:
 # `check` (it must never make the PR gate flaky). Uses the @huggingface/gguf
 # devDependency; `--discover` prints the top GGUF repos as a curation aid. Idempotent —
 # rewrites only on a real content change.
+#
+# `local_models.json` is `.prettierignore`d (the generator owns its format), but the licence ledger
+# it writes alongside is NOT — and `JSON.stringify(…, null, 2)` never collapses a short array the
+# way Prettier does. So even a run that changed nothing left `model_licences.json` dirty and failed
+# `just prettier`, which reads as a broken gate rather than the expected output of a generator. Same
+# trap as `lock-regen`; formatted here for the same reason. This matters most for #447, where a
+# scheduled Action opens the PR and nobody is watching to re-run the formatter by hand.
 generate-local-catalog:
     node scripts/generate-local-catalog.mjs
+    npx prettier --write src-tauri/model_licences.json
 
 cargo-fmt:
     cargo fmt --check --manifest-path {{manifest}}

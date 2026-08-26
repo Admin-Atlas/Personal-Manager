@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "catalog_version": 2,
-  "content_hash": "sha256:d6338b4c84b39657fcc3121d1696be23c18c32e8607b004262f5398db135524f",
-  "generated_at": "2026-07-31",
+  "catalog_version": 3,
+  "content_hash": "sha256:4e7fc8c70dc165b68d4381246a6e857f1b1089fc82e406fe3e3251820f620fe3",
+  "generated_at": "2026-08-26",
   "source": "huggingface-gguf",
   "entries": [
     {
@@ -525,8 +525,8 @@
         },
         {
           "quant": "Q8_0",
-          "file_gb": 12.23,
-          "sharded": true
+          "file_gb": 11.8,
+          "sharded": false
         }
       ],
       "install": {
@@ -625,8 +625,8 @@
         },
         {
           "quant": "Q8_0",
-          "file_gb": 25.45,
-          "sharded": true
+          "file_gb": 25.02,
+          "sharded": false
         }
       ],
       "install": {
