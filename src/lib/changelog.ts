@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.12-alpha",
+    date: "2026-08-26",
+    highlights: [
+      "Two of the models PM suggests for running on your own machine were listed as bigger than they really are. Some publishers ship an optional extra file alongside a model to help it generate faster, and PM was counting that file as part of the model itself — so both Gemma 4 models looked around half a gigabyte heavier at their highest quality, and were described as arriving in several pieces when they arrive in one. On a machine where those models sat near the edge of what fits, that was the difference between PM recommending one and warning you off it. Both are now listed at their real size, and PM will offer to re-check your machine against the corrected figures.",
+      "The rest of the list was checked against Hugging Face the same day and was already current — no other model's size, quality options or context length had moved.",
+    ],
+  },
+  {
     version: "3.128.11-alpha",
     date: "2026-08-26",
     highlights: [

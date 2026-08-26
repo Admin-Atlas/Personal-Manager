@@ -17,6 +17,7 @@ import {
   activeFromHeader,
   contentHash,
   gib,
+  isDraftHead,
   isEmbeddingOrReranker,
   isMoe,
   isUnmodelledArch,
@@ -82,9 +83,37 @@ describe("sumQuantShards", () => {
     expect(sumQuantShards(files, "Q4_K_M")).toEqual({ bytes: 500, sharded: false });
   });
 
+  it("EXCLUDES a multi-token-prediction draft head, wherever it sits in the tree", () => {
+    // Real paths from unsloth/gemma-4-12b-it-GGUF, which is what caught this: the draft head carries
+    // the SAME quant token as the model, so it summed in and flipped `sharded` to true. Sizes are
+    // the live ones — 11.80 GiB of weights beside a 0.433 GiB head that shipped as 12.23 GiB.
+    const files = [
+      f("gemma-4-12b-it-Q8_0.gguf", 12_670_000_000),
+      f("MTP/mtp-gemma-4-12b-it-Q8_0.gguf", 465_000_000),
+      f("mtp-gemma-4-12b-it.gguf", 465_000_000),
+    ];
+    expect(sumQuantShards(files, "Q8_0")).toEqual({ bytes: 12_670_000_000, sharded: false });
+  });
+
   it("returns null when nothing matches or the sizes are all zero", () => {
     expect(sumQuantShards([f("m-Q8_0.gguf", 500)], "Q4_K_M")).toBeNull();
     expect(sumQuantShards([f("m-Q4_K_M.gguf", 0)], "Q4_K_M")).toBeNull();
+  });
+});
+
+describe("isDraftHead", () => {
+  it("spots a draft head by filename prefix or by its MTP folder", () => {
+    expect(isDraftHead("MTP/mtp-gemma-4-12b-it-Q8_0.gguf")).toBe(true);
+    expect(isDraftHead("mtp-gemma-4-26B-A4B-it.gguf")).toBe(true);
+    expect(isDraftHead("MTP/anything.gguf")).toBe(true);
+  });
+
+  it("leaves the model's own weights alone", () => {
+    // The prefix is anchored and separator-terminated on purpose: a real model whose name merely
+    // begins with those three letters is not a draft head.
+    expect(isDraftHead("gemma-4-12b-it-Q8_0.gguf")).toBe(false);
+    expect(isDraftHead("mtpmodel-Q8_0.gguf")).toBe(false);
+    expect(isDraftHead("Q8_0/gemma-4-12b-it-00001-of-00002.gguf")).toBe(false);
   });
 });
 

@@ -348,10 +348,25 @@ export function activeFromHeader(metadata, totalParams) {
 // --- small pure helpers ------------------------------------------------------------------------
 
 export function sumQuantShards(files, label) {
-  const parts = files.filter((f) => matchesQuant(f.path, label) && !/mmproj/i.test(f.path));
+  const parts = files.filter(
+    (f) => matchesQuant(f.path, label) && !/mmproj/i.test(f.path) && !isDraftHead(f.path),
+  );
   if (parts.length === 0) return null;
   const bytes = parts.reduce((n, f) => n + (Number(f.size) || 0), 0);
   return bytes > 0 ? { bytes, sharded: parts.length > 1 } : null;
+}
+
+// A multi-token-prediction draft head — `MTP/mtp-<model>-Q8_0.gguf` in unsloth's Gemma 4 repos — is
+// an OPTIONAL second model for speculative decoding, not a shard of the weights. It carries the same
+// quant token as the model it accelerates, so it matched `matchesQuant` and summed straight in:
+// gemma-4-12b-it Q8_0 shipped as 12.23 GiB against a real 11.80, and gemma-4-26B-A4B-it Q8_0 as
+// 25.45 against 25.02 — both also wrongly flagged `sharded`, since two files matched where one
+// exists. Same class of mistake as counting an mmproj, and excluded the same way.
+export function isDraftHead(path) {
+  const segs = path.split("/");
+  return (
+    /^mtp[._-]/i.test(segs[segs.length - 1]) || segs.slice(0, -1).some((s) => /^mtp$/i.test(s))
+  );
 }
 
 // A file belongs to `label` only when the label is the EXACT quant token right before `.gguf` (or a
