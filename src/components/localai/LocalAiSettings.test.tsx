@@ -254,6 +254,34 @@ describe("assigning a model to a role", () => {
     expect(screen.getByText(/can't be chosen/i)).toBeTruthy();
   });
 
+  it("warns that two local models share one machine, and only when they actually do", async () => {
+    // Nothing else in PM says this. Both roles hit ONE endpoint, so two different models are both
+    // resident and their memory adds up — while every Workbench verdict was worked out for a single
+    // model against the whole budget. The better-fit check compares against the LARGER of the two,
+    // never the sum, so it cannot warn about it either.
+    const both = /holds both at once/i;
+
+    // Default fixture: chat is local, background is on cloud — one model, nothing to warn about.
+    await loaded();
+    expect(screen.queryByText(both)).toBeNull();
+
+    // Both local, but the SAME model on each: one resident model, the verdict already covers it.
+    cleanup();
+    getLocalLlmConfig.mockResolvedValue(
+      cfg({ background_routing: "local", background_model: "llama3.2:1b" }),
+    );
+    await loaded();
+    expect(screen.queryByText(both)).toBeNull();
+
+    // Both local, two different models — the one case where the choices interact.
+    cleanup();
+    getLocalLlmConfig.mockResolvedValue(
+      cfg({ background_routing: "local", background_model: "qwen2.5:7b" }),
+    );
+    await loaded();
+    expect(screen.getByText(both)).toBeTruthy();
+  });
+
   it("keeps a saved model selectable even when the endpoint stops serving it", async () => {
     // Otherwise the picker silently drops the user's own choice back to "use cloud".
     listLocalLlmModels.mockResolvedValue(served({ id: "some-other-model", embedding: false }));

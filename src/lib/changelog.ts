@@ -24,6 +24,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.128.14-alpha",
+    date: "2026-08-26",
+    highlights: [
+      "Local AI Workbench: several of the numbers PM showed about your machine weren't true, and they are now. The biggest is that PM worked out how much memory you had free once, when you first opened the tab, and then judged every model against that figure for the rest of the session — so opening PM while your machine was busy could rule out a model that fits perfectly well an hour later. That reading is now taken fresh each time PM scores models; the slower checks, like your graphics card, stay cached as before.",
+      "On Linux, PM never recognised your graphics card. It knew one was there and how much memory it had, but not which model — so the speed estimates always fell back to a generic figure, and the readout said so. PM now reads the card's name and works the speed out from that card's real specification.",
+      "Laptop graphics also stopped borrowing a desktop card's numbers. A laptop chip shares its name with a desktop card and almost never its memory — a laptop RTX 4070 has less than half the desktop one's — so PM was overstating some laptops' speed by around double. Seventeen laptop chips now carry their own verified figures, and any laptop card PM doesn't have a real figure for keeps the generic estimate and says so, rather than borrowing a number that isn't its.",
+      "A model that had to shrink its context to fit now also tells you when it barely fits. Those two things were competing for one line, so the models scraping the very bottom of your memory were the ones saying nothing about it.",
+      'The "vision" label is gone from the model list. It was true of the models, but not of PM: chat messages carry text only, so PM cannot send a picture to any model, local or cloud. PM reads images a different way entirely. Labelling it made a heavier model look more useful for PM\'s purposes than a lighter one, which is backwards.',
+      "PM also no longer refuses to size a model just because the publisher didn't say how big its unused image component was — everything else about it was perfectly measurable.",
+      "If you give Chat and Background two different local models, PM now says plainly that both live on the same server at the same time, so your machine holds both. Every fit PM shows is for one model on its own, and two that each fit alone may not fit together.",
+      "Machines without a separate graphics card — including Apple Silicon — are now told how much memory PM keeps free when sizing models. That line only ever appeared next to the graphics-card figure, so the people with no graphics-card figure never saw it.",
+    ],
+  },
+  {
     version: "3.128.13-alpha",
     date: "2026-08-26",
     highlights: [

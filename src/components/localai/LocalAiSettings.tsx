@@ -89,6 +89,14 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const [termsFor, setTermsFor] = useState<LocalRecommendation | null>(null);
 
   const configured = !!config?.base_url;
+  // Both roles actually going to the local server, and going there with DIFFERENT models — the only
+  // case where the two choices interact, since one server holding one model costs what the Workbench
+  // said it would. Guarded this narrowly so the warning never fires on the common setups.
+  const bothLocal = config?.chat_routing !== "cloud" && config?.background_routing !== "cloud";
+  const twoModels =
+    !!config?.chat_model &&
+    !!config?.background_model &&
+    config.chat_model !== config.background_model;
   // Whether the connected endpoint is an Ollama server (the only runner with a one-click pull API).
   // Heuristic: Ollama's default port. A non-Ollama endpoint gets a copy-paste command instead.
   const isOllama = !!config?.base_url?.includes(":11434");
@@ -759,6 +767,20 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               onModel={(m) => changeRoleModel("background", m)}
               onRouting={(p) => changeRouting("background", p)}
             />
+            {bothLocal && twoModels && (
+              // Unfolded, for the same reason as the gating hint below: the doctrine folds prose but
+              // never a loss warning, and this is one. Chat and Background share ONE endpoint, so
+              // two different models are both resident on one machine and their memory adds up —
+              // while every verdict in the Workbench was worked out for a single model against the
+              // whole budget. Two independently "Comfortable" models can be jointly impossible, and
+              // nothing else in PM says so: the better-fit check compares against the LARGER of the
+              // two, never their sum, so it cannot warn about this either.
+              <p className="text-xs text-ink4">
+                Chat and Background go to the same server, so picking a different model for each
+                means your machine holds both at once. The fit shown in Local AI Workbench is for
+                one model on its own — two that each fit alone may not fit together.
+              </p>
+            )}
             {served.some((m) => m.embedding) && (
               // Unfolded on purpose. The settings doctrine folds prose but never gating hints, and
               // "this one is listed but you can't pick it" is exactly a gating hint (same call as
@@ -959,12 +981,18 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
         </p>
       )}
       {h.notes.length > 0 && <p className="mt-1.5 text-xs text-ink4">{h.notes.join(" ")}</p>}
-      {h.vram_gb != null && !h.unified_memory && (
-        <p className="mt-1.5 text-xs text-ink4">
-          Sized with ~{recs.reserve_gb.toFixed(0)} GB of RAM and ~{recs.gpu_reserve_gb.toFixed(0)}{" "}
-          GB of GPU memory kept free.
-        </p>
-      )}
+      {/* The RAM reserve is subtracted on EVERY machine, so it is stated on every machine. This whole
+          line used to be gated on having a discrete GPU, which meant a CPU-only box, an Apple
+          Silicon Mac and any laptop on integrated graphics were never told their fit was scored
+          against free RAM minus a reserve — the one number most likely to explain a verdict they
+          disagreed with. Only the GPU half is conditional now. */}
+      <p className="mt-1.5 text-xs text-ink4">
+        Sized with ~{recs.reserve_gb.toFixed(0)} GB of RAM
+        {h.vram_gb != null && !h.unified_memory
+          ? ` and ~${recs.gpu_reserve_gb.toFixed(0)} GB of GPU memory`
+          : ""}{" "}
+        kept free, measured as PM scored these models.
+      </p>
       {h.vram_gb != null && !h.unified_memory && h.gpu_bandwidth_gbps == null && (
         <p className="mt-1.5 text-xs text-ink4">
           Speed estimates use a default graphics-memory bandwidth — this card's exact model wasn't
@@ -1091,7 +1119,12 @@ function RecommendationCard({
             <span className="text-sm font-medium text-ink">{rec.display_name}</span>
             <FitBadge verdict={f.verdict} />
             {isMoe && <span className="text-[0.625rem] text-ink4">MoE</span>}
-            {rec.multimodal && <span className="text-[0.625rem] text-ink4">vision</span>}
+            {/* No "vision" chip, though `rec.multimodal` still says so. This row is what PM will do
+                with the model, and PM cannot send it an image: chat messages carry a plain string,
+                so no picture reaches any model, cloud or local. PM reads images through the sidecar
+                instead. Advertising it here made a heavier model look more capable for PM's purposes
+                than a lighter one, which is the opposite of true. A chip has no room for the caveat,
+                which is itself the argument for leaving it out. */}
             {rec.reasoning && <span className="text-[0.625rem] text-ink4">reasoning</span>}
             {rec.role_hint && (
               <span className="text-[0.625rem] text-ink4">suits {rec.role_hint}</span>
