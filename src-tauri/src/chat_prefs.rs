@@ -137,7 +137,7 @@ fn persist_extraction(
 /// Returns how many records were inserted. Mirrors `chat_title::generate_title`'s lock discipline.
 pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -> Result<usize> {
     // 1. Short read lock: how far have we read, and what are the new turns?
-    let (cursor_to, user_turns) = {
+    let (mut cursor_to, mut pairs) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         let cursor: Option<Option<i64>> = conn
@@ -166,9 +166,9 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
         let Some(cursor_to) = pairs.iter().map(|p| p.turn_id).max() else {
             return Ok(0); // caught up
         };
-        let user_turns = extractable_user_turns(&pairs);
-        (cursor_to, user_turns)
+        (cursor_to, pairs)
     };
+    let mut user_turns = extractable_user_turns(&pairs);
 
     // Nothing substantive to scan ⇒ advance the cursor past it (never re-examined) and stop — no call.
     let content_chars: usize = user_turns.iter().map(|t| t.chars().count()).sum();
@@ -193,6 +193,38 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
         let conn = state.conn()?;
         entities::canonical_project_names(&conn)?
     };
+
+    // 2b. Size the span to what the answering server can actually read, and re-derive the cursor from
+    //     the TRIMMED span. `MAX_EXTRACT_PAIRS` alone is not a size: a turn is capped only at
+    //     `MAX_MESSAGE_CHARS` (100k), so forty of them is a prompt no local window holds. The cursor
+    //     rule is the one already documented above — advance only over turns we actually scan — and it
+    //     is the rule that breaks when the SERVER does the trimming instead of PM, because then the
+    //     cursor still advances over all forty. The overflow is picked up next run, unchanged.
+    let ceiling = crate::llm_gateway::prompt_ceiling_for(app, &route);
+    let keep = crate::context_budget::largest_fitting(pairs.len(), ceiling, |n| {
+        crate::context_budget::est_messages_tokens_upper(
+            preferences::render_chat_extract_request(
+                &extractable_user_turns(&pairs[..n]),
+                &project_names,
+            )
+            .iter()
+            .map(|m| m.content.as_str()),
+        )
+    });
+    if keep < pairs.len() {
+        let deferred = pairs.len() - keep;
+        eprintln!(
+            "chat-prefs: session {conversation_id} — the local server's context window fits {keep} of \
+             these turn-pairs, deferring {deferred} to the next run"
+        );
+        pairs.truncate(keep);
+        user_turns = extractable_user_turns(&pairs);
+        cursor_to = pairs
+            .iter()
+            .map(|p| p.turn_id)
+            .max()
+            .expect("largest_fitting never returns 0 for a non-empty span");
+    }
 
     // 3. Extract (async, no lock held). A model/parse failure propagates so the cursor is NOT advanced
     //    and the turns are retried next time.

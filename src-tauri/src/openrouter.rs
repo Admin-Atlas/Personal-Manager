@@ -41,6 +41,28 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Bound *and* single-line one untrusted field on its way into a prompt.
+///
+/// Two jobs, and they are the same job. The **clip** is sizing: a title is a filename, filenames run
+/// to 255 characters, and a prompt built from four hundred of them is a prompt no local server will
+/// hold. The **collapse** is what makes clipping correct: every prompt that carries these fields
+/// builds them into a line-oriented block — `=== Document N ===`, `Title: …`, one title per line —
+/// so an embedded CR/LF in a value forges a structural line the model reads as PM's own framing. A
+/// document title is untrusted (an HTML `<title>`, PDF metadata, a filename in a shared Drive
+/// folder) and nothing sanitises it between ingest and the prompt: `ingest::yaml_quote` collapses on
+/// the way into the vault manifest, not on the way into `documents.title`.
+///
+/// Only for fields that are supposed to be ONE line. Document bodies are not, and are handled by the
+/// untrusted-data framing instead.
+pub fn clip_prompt_line(s: &str, max: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Token usage OpenRouter reports for one completion. Any field may be absent
 /// (a provider that doesn't report usage, or a degraded/early-terminated response),
 /// so the cost logger stores NULLs and shows the spend as unknown rather than zero.

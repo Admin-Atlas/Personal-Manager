@@ -816,6 +816,26 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 one model on its own — two that each fit alone may not fit together.
               </p>
             )}
+            {status?.served_window != null && status.served_window < COMFORTABLE_WINDOW && (
+              // Unfolded: a loss warning, not prose. This is the number that explains the symptom
+              // people blame on model size. A server serving 4096 tokens (Ollama's default, applied
+              // silently) cannot hold one filing batch, so PM now sends fewer documents per call —
+              // and past a point it stops rather than let the server cut the instructions off the
+              // front of the prompt and answer anyway.
+              <p className="text-xs text-ink4">
+                Your server is serving{" "}
+                <span className="text-ink2">
+                  {status.served_window.toLocaleString()} tokens
+                  {status.served_window_proven ? "" : " (PM's estimate — it hasn't measured yet)"}
+                </span>{" "}
+                of context. PM's background work — sorting proposals, summaries, learning — sends
+                more than that in one go, so it will send smaller batches to fit. Raising it makes
+                that work better: Ollama uses{" "}
+                <span className="text-ink2">OLLAMA_CONTEXT_LENGTH</span>, llama-server uses{" "}
+                <span className="text-ink2">--ctx-size</span>, and LM Studio has a context-length
+                slider on the model.
+              </p>
+            )}
             {served.some((m) => m.embedding) && (
               // Unfolded on purpose. The settings doctrine folds prose but never gating hints, and
               // "this one is listed but you can't pick it" is exactly a gating hint (same call as
@@ -1395,6 +1415,12 @@ function EndpointCheckResult({ check }: { check: EndpointCheck }) {
     </div>
   );
 }
+
+/// Below this served window PM says so under Assign roles. One filing batch is ~3.5k tokens of
+/// prompt before the reply reserve, so 8192 is the point at which a batch stops being comfortable
+/// rather than the point at which it breaks — a user is better told early than told by the work
+/// quietly getting worse.
+const COMFORTABLE_WINDOW = 8192;
 
 const ROUTING_OPTIONS = [
   { value: "cloud", label: "Cloud" },

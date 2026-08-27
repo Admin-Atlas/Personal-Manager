@@ -18,6 +18,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::context_budget;
 use crate::error::{Error, Result};
 use crate::local_slot::{
     loading_retry_backoff, preemption_retry_delay, tunables, CallOutcome, SlotOutcome,
@@ -186,6 +187,7 @@ fn fail_kind_slug(kind: &LocalFailKind) -> &'static str {
         LocalFailKind::ServerError(_) => "server_error",
         LocalFailKind::ClientError(_) => "client_error",
         LocalFailKind::ReplyTooLarge => "reply_too_large",
+        LocalFailKind::PromptTooLarge => "prompt_too_large",
     }
 }
 
@@ -515,6 +517,27 @@ async fn run_local_complete(
         };
     }
 
+    // Fit gate. A background prompt is built from a batch size PM chose, so an overflow here is
+    // PM's doing and PM is the one that can avoid it — but only once it knows the window, which is
+    // why `run_local_complete` is also where the batchers get their ceiling from.
+    if let Some(failure) = prompt_fit_failure(rt, local, messages) {
+        rt.record(CallOutcome::for_failure(&failure.kind));
+        return match cloud {
+            // Cloud windows are orders of magnitude larger, so the prompt that did not fit locally
+            // fits there — this is the one hard failure where the fallback is certain to help.
+            Some(cloud) => {
+                cloud_complete(
+                    cloud,
+                    messages,
+                    FallbackReason::HardFailure(failure.kind),
+                    local.model.clone(),
+                )
+                .await
+            }
+            None => Err(local_failure_to_error(&failure)),
+        };
+    }
+
     let loop_start = Instant::now();
     let mut loading_recheck: u32 = 0;
     loop {
@@ -683,6 +706,31 @@ where
         };
     }
 
+    // The same fit gate as the background path, and for a sharper reason: chat's system message
+    // carries the persona AND the grounding instruction whose SECURITY paragraph is what stops
+    // retrieved document text being read as instructions. A front cut removes that paragraph and
+    // leaves the untrusted Sources block behind it, which is the one shape this repo does not
+    // tolerate (`AGENTS.md`: ingested content is DATA, never instructions). Nothing has streamed
+    // yet, so the fallback is clean; local-only surfaces it, and the context meter — now reading the
+    // served window rather than the trained one — is already offering Compress by this point.
+    if let Some(failure) = prompt_fit_failure(rt, local, messages) {
+        rt.record(CallOutcome::for_failure(&failure.kind));
+        return match cloud {
+            Some(cloud) => {
+                cloud_stream(
+                    cloud,
+                    messages,
+                    cache_through,
+                    on_token,
+                    FallbackReason::HardFailure(failure.kind),
+                    local.model.clone(),
+                )
+                .await
+            }
+            None => Err(local_failure_to_error(&failure)),
+        };
+    }
+
     let start = Instant::now();
     let mut first = false;
     let token = local.token.as_ref().map(Secret::expose);
@@ -769,6 +817,91 @@ pub fn no_provider_message() -> String {
         .to_string()
 }
 
+/// The window PM should SIZE a prompt against, and whether that number is proven.
+///
+/// The cache [`ensure_local_window_cached`] fills is empty until a call has already succeeded — both
+/// proven rungs of the ladder (`/slots`, `/api/ps`) only answer while a model is RESIDENT, so there
+/// is nothing to ask before the first call. That left the first background call of every process
+/// unguarded, which is the worst one to leave unguarded: on a fresh store it is the 400-title
+/// vocabulary call.
+///
+/// So an unknown window is treated as [`openai_compat::DEFAULT_CONTEXT`] — the same honest floor the
+/// ladder itself falls to — and flagged as unproven. Never probes; safe on the hot path.
+fn sizing_window(rt: &crate::local_slot::LocalRuntime, local: &LocalArm) -> (i64, bool) {
+    match rt.cached_window(&local.base_url, &local.model) {
+        Some(w) => (i64::from(w.tokens), w.source.is_proven()),
+        None => (i64::from(openai_compat::DEFAULT_CONTEXT), false),
+    }
+}
+
+/// The prompt-token ceiling a BATCHER should size to. Always a number for a local route — sizing
+/// against the conservative floor costs one under-filled batch on a big server and then corrects
+/// itself, where sizing against nothing costs a silently decapitated prompt.
+fn local_prompt_ceiling(rt: &crate::local_slot::LocalRuntime, local: &LocalArm) -> Option<i64> {
+    context_budget::prompt_ceiling(Some(sizing_window(rt, local).0))
+}
+
+/// The prompt-token ceiling a REFUSAL may be raised against — `None` unless the window is proven.
+///
+/// The asymmetry is deliberate and it is the whole design. Sizing down on a guess is cheap and
+/// self-correcting; refusing on a guess would block a job that would have fitted, and PM's guess is
+/// a deliberately pessimistic floor. So PM shrinks on suspicion and refuses only on evidence.
+fn local_refusal_ceiling(rt: &crate::local_slot::LocalRuntime, local: &LocalArm) -> Option<i64> {
+    let (window, proven) = sizing_window(rt, local);
+    proven
+        .then(|| context_budget::prompt_ceiling(Some(window)))
+        .flatten()
+}
+
+/// The prompt-token ceiling a caller should size its BATCH to, for an already-resolved route.
+///
+/// `None` means "send what you would have sent" — the cloud route, whose windows are orders of
+/// magnitude larger than anything built here. A local route always gets a number: an unknown window
+/// sizes to the conservative floor rather than to nothing (see [`sizing_window`]).
+///
+/// `LocalThenCloud` sizes to the LOCAL window even though cloud could take more — the local leg is
+/// tried first, and a batch built for a 200k cloud window would be refused on every single call and
+/// fall through, which is the opposite of what that preference asks for.
+///
+/// This is the seam that lets the batchers stop building prompts the gateway would only refuse.
+/// [`prompt_fit_failure`] is the backstop for everything they cannot size — an unbounded project
+/// list, one enormous document — and for the window changing under a running app.
+pub fn prompt_ceiling_for(app: &AppHandle, plan: &RoutePlan) -> Option<i64> {
+    let local = match plan {
+        RoutePlan::Cloud(_) => return None,
+        RoutePlan::LocalOnly(local) | RoutePlan::LocalThenCloud { local, .. } => local,
+    };
+    let state = app.state::<AppState>();
+    local_prompt_ceiling(&state.local_ai, local)
+}
+
+/// Refuse a prompt that cannot fit the window the server is actually serving, rather than letting it
+/// be silently decapitated.
+///
+/// Returns the failure to raise, or `None` when the prompt fits — or when the window is not PROVEN,
+/// because PM must never refuse a job on the strength of its own conservative guess. The
+/// detail names both numbers and the setting that changes them, because that pair IS the fix and it
+/// is otherwise invisible: the server accepts the oversized prompt, drops the front of it, and
+/// answers 200 with a `prompt_tokens` measured after the cut.
+fn prompt_fit_failure(
+    rt: &crate::local_slot::LocalRuntime,
+    local: &LocalArm,
+    messages: &[ChatMessage],
+) -> Option<LocalFailure> {
+    let ceiling = local_refusal_ceiling(rt, local)?;
+    let est =
+        context_budget::est_messages_tokens_upper(messages.iter().map(|m| m.content.as_str()));
+    (est > ceiling).then(|| LocalFailure {
+        kind: LocalFailKind::PromptTooLarge,
+        detail: format!(
+            "this one needs about {est} tokens and the server is serving {}; \
+             raise the context length (Ollama: OLLAMA_CONTEXT_LENGTH, llama-server: --ctx-size, \
+             LM Studio: the model's context length)",
+            ceiling + context_budget::REPLY_RESERVE_TOKENS
+        ),
+    })
+}
+
 /// After a successful local call the model is loaded, so the server can be asked what it really
 /// loaded — `/slots` on llama-server, `/api/ps` on Ollama. Probe and cache it ONCE, in the
 /// background, so the context meter can show it on its next poll without ever blocking a reply on
@@ -836,6 +969,9 @@ fn local_failure_to_error(failure: &LocalFailure) -> Error {
             "the local model got stuck repeating itself and was stopped"
         }
         LocalFailKind::ReplyTooLarge => "the local model reply was too large",
+        LocalFailKind::PromptTooLarge => {
+            "this job needs more context than your local server is serving, so PM didn't send it"
+        }
     };
     // For a server that ANSWERED (a bad request / a 5xx), surface its own words — it's the user's own
     // local server, so echoing its message is safe and the fastest way to diagnose a bad model id.
@@ -846,6 +982,9 @@ fn local_failure_to_error(failure: &LocalFailure) -> Error {
         LocalFailKind::ClientError(_)
         | LocalFailKind::ServerError(_)
         | LocalFailKind::UnrecognisedResponse
+        // The two numbers and the setting that changes them ARE the fix here, so the detail is the
+        // whole point of the message rather than a diagnostic appended to it.
+        | LocalFailKind::PromptTooLarge
             if !detail.is_empty() =>
         {
             format!("{base} ({})", crate::error::truncate_detail(detail))
@@ -857,6 +996,137 @@ fn local_failure_to_error(failure: &LocalFailure) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::local_slot::LocalRuntime;
+    use crate::openai_compat::{WindowInfo, WindowSource};
+
+    fn arm() -> LocalArm {
+        LocalArm {
+            base_url: "http://127.0.0.1:11434".into(),
+            model: "qwen2.5:7b-instruct-q4_K_M".into(),
+            token: None,
+        }
+    }
+
+    fn msgs(chars: usize) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You file documents. Reply with ONLY JSON.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "x".repeat(chars),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_unknown_window_sizes_batches_but_never_refuses_a_job() {
+        // Nothing cached — the state on the FIRST local call of every process, because both proven
+        // rungs of the ladder need a resident model. The two ceilings must disagree here: batchers
+        // get the conservative floor so they stop building oversized prompts from turn one, and the
+        // refusal gate gets nothing, because refusing a job on PM's own guess would block work that
+        // would have fitted.
+        let rt = LocalRuntime::default();
+        let local = arm();
+        assert_eq!(
+            local_prompt_ceiling(&rt, &local),
+            Some(i64::from(openai_compat::DEFAULT_CONTEXT) - context_budget::REPLY_RESERVE_TOKENS),
+            "batchers size against the floor when the window is unknown"
+        );
+        assert_eq!(
+            local_refusal_ceiling(&rt, &local),
+            None,
+            "a guess must never refuse"
+        );
+        assert!(
+            prompt_fit_failure(&rt, &local, &msgs(500_000)).is_none(),
+            "not even an absurd prompt is refused on an unproven window"
+        );
+    }
+
+    #[test]
+    fn an_assumed_window_still_never_refuses() {
+        // The ladder itself can CACHE the default — `/api/ps` answers "nothing resident" and
+        // `pick_window` falls to its floor. That is a cached guess, not a measurement, and it must
+        // behave exactly like no cache at all for refusal purposes.
+        let rt = LocalRuntime::default();
+        let local = arm();
+        rt.cache_window(
+            &local.base_url,
+            &local.model,
+            WindowInfo {
+                tokens: openai_compat::DEFAULT_CONTEXT,
+                source: WindowSource::Default,
+            },
+        );
+        assert!(local_prompt_ceiling(&rt, &local).is_some());
+        assert_eq!(local_refusal_ceiling(&rt, &local), None);
+        assert!(prompt_fit_failure(&rt, &local, &msgs(500_000)).is_none());
+    }
+
+    #[test]
+    fn a_proven_window_refuses_an_oversized_prompt_and_says_both_numbers() {
+        let rt = LocalRuntime::default();
+        let local = arm();
+        // What Bobby's server actually reported: 4096, from Ollama's /api/ps.
+        rt.cache_window(
+            &local.base_url,
+            &local.model,
+            WindowInfo {
+                tokens: 4096,
+                source: WindowSource::LoadedModel,
+            },
+        );
+
+        // A filing batch's ~10k characters of document text — the size `review::BATCH_SIZE` is
+        // documented to produce — against a 4096-token server.
+        let failure = prompt_fit_failure(&rt, &local, &msgs(10_000))
+            .expect("10k characters cannot fit a 4096-token window");
+        assert_eq!(failure.kind, LocalFailKind::PromptTooLarge);
+        assert!(
+            failure.detail.contains("4096"),
+            "the served window is half the diagnosis: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("OLLAMA_CONTEXT_LENGTH"),
+            "and the setting that changes it is the other half: {}",
+            failure.detail
+        );
+
+        // The same prompt is fine on a server serving 32768 — the number the runner guides tell
+        // people to set.
+        rt.cache_window(
+            &local.base_url,
+            &local.model,
+            WindowInfo {
+                tokens: 32_768,
+                source: WindowSource::LoadedModel,
+            },
+        );
+        assert!(prompt_fit_failure(&rt, &local, &msgs(10_000)).is_none());
+    }
+
+    #[test]
+    fn a_refused_prompt_reads_as_pm_s_doing_not_the_server_s() {
+        let err = local_failure_to_error(&LocalFailure {
+            kind: LocalFailKind::PromptTooLarge,
+            detail: "this one needs about 4000 tokens and the server is serving 4096".into(),
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("PM didn't send it"),
+            "the user must not read this as their server failing: {msg}"
+        );
+        assert!(msg.contains("4096"), "the numbers ride along: {msg}");
+        assert_eq!(
+            fail_kind_slug(&LocalFailKind::PromptTooLarge),
+            "prompt_too_large"
+        );
+    }
+
     #[test]
     fn an_unreadable_answer_is_not_reported_as_a_broken_stream() {
         // `probe()` and the non-streaming completion path both used `MalformedStream`, so a user
@@ -878,8 +1148,6 @@ mod tests {
             "the body is the whole diagnosis and must survive: {msg}"
         );
     }
-
-    use super::*;
 
     /// The byte-identical invariant made mechanical: with an EMPTY runtime context, the resolver's
     /// output must equal the raw preference for every (role, preference) pair — there is no policy

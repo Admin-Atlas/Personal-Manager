@@ -19,6 +19,8 @@ const st = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   probed_now: true,
   chat_local_model: null,
   background_local_model: null,
+  served_window: null,
+  served_window_proven: false,
   ...over,
 });
 

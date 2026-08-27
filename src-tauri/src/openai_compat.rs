@@ -156,6 +156,17 @@ pub enum LocalFailKind {
     ClientError(u16),
     /// The reply or a single line exceeded the untrusted-output byte caps.
     ReplyTooLarge,
+    /// PM's own prompt is larger than the window the server is serving, so it was NOT sent.
+    ///
+    /// The only failure kind raised before the request leaves PM, and the only one that is PM's
+    /// fault rather than the host's. It exists because the alternative is unobservable: a server
+    /// running with `--context-shift` accepts an oversized prompt, silently discards the front of it
+    /// (the system message — the output contract and the untrusted-data guard), answers 200, and
+    /// reports a `prompt_tokens` measured after the cut. Every downstream check passes and the
+    /// result is wrong. Refusing by name is the only way the user ever learns the window is the
+    /// problem. Never a strike: the host is healthy, and ejecting it would rest a working server for
+    /// a prompt PM chose to build.
+    PromptTooLarge,
 }
 
 /// A local failure with its human-readable detail (server body, or a short description). The

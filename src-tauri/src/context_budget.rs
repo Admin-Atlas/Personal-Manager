@@ -79,6 +79,117 @@ pub fn est_tokens(text: &str) -> i64 {
     (chars + 3) / 4
 }
 
+/// Tokens held back from the window for the model's own reply, when deciding whether a background
+/// prompt fits. The window covers prompt AND completion; filling it with prompt leaves the reply
+/// nowhere to go, and a front-truncating server resolves that by discarding prompt.
+///
+/// Sized to PM's largest background reply rather than its typical one: a filing batch returns an
+/// index-matched array of five classifications, the re-tag vocabulary call returns up to
+/// [`crate::retag::VOCAB_CEILING`] labels. Generous on purpose — this reserve is cheap and the
+/// failure it prevents is silent.
+pub const REPLY_RESERVE_TOKENS: i64 = 1024;
+
+/// Per-message overhead a chat template adds around each message (role markers, turn delimiters,
+/// the assistant priming at the end). Small, constant, and it must not be forgotten: a prompt sized
+/// to exactly the window overflows by the scaffolding alone.
+pub const PER_MESSAGE_OVERHEAD_TOKENS: i64 = 4;
+
+/// A deliberately PESSIMISTIC token count, for deciding whether a prompt will FIT.
+///
+/// [`est_tokens`]'s flat ~4 chars/token is a fair average for English prose and the wrong answer for
+/// what background prompts are actually made of. Measured across PM's own prompt shapes: English
+/// prose ~3.98 chars/token, the JSON-and-braces its contracts ask for ~2.77, CJK ~1.69. So the
+/// average under-counts exactly the content most likely to overflow.
+///
+/// An under-count here is not a rounding error. It is PM deciding a prompt fits, sending it, and a
+/// server running with `--context-shift` discarding the FRONT of it — the system message, which is
+/// where the output contract and the untrusted-data guard live — then answering 200 with a
+/// `finish_reason` of `stop` and a `prompt_tokens` measured AFTER the cut. Nothing downstream can
+/// see that happened, which is why this has to be wrong in the safe direction.
+///
+/// So it counts by class rather than by a single rate: ASCII letters and spaces at 3.2 chars/token,
+/// every other ASCII character (digits, quotes, braces, commas, newlines — what JSON is made of) at
+/// 1.2, and each non-ASCII character as a token of its own, plus a second for anything above the BMP
+/// where one emoji really can cost several. Every rate sits below the measured one, so the answer is
+/// an over-count on all three shapes — by roughly a third on prose and half on JSON, which is the
+/// margin worth paying to never send a prompt that gets silently cut.
+///
+/// Used ONLY for fit decisions. The meter the user reads stays the measured `prompt_tokens`.
+pub fn est_tokens_upper(text: &str) -> i64 {
+    let (mut wordish, mut dense, mut wide, mut astral) = (0i64, 0i64, 0i64, 0i64);
+    for c in text.chars() {
+        if c.is_ascii_alphabetic() || c == ' ' {
+            wordish += 1;
+        } else if c.is_ascii() {
+            dense += 1;
+        } else {
+            wide += 1;
+            if c.len_utf8() == 4 {
+                astral += 1;
+            }
+        }
+    }
+    let ceil_div = |n: i64, d: i64| (n + d - 1) / d;
+    ceil_div(wordish * 10, 32) + ceil_div(dense * 10, 12) + wide + astral
+}
+
+/// [`est_tokens_upper`] over a whole message list, paying [`PER_MESSAGE_OVERHEAD_TOKENS`] per
+/// message. Takes the contents as strings rather than a message type so this module keeps no
+/// dependency on the wire structs.
+pub fn est_messages_tokens_upper<'a, I: IntoIterator<Item = &'a str>>(contents: I) -> i64 {
+    contents
+        .into_iter()
+        .map(|c| est_tokens_upper(c) + PER_MESSAGE_OVERHEAD_TOKENS)
+        .sum()
+}
+
+/// How many prompt tokens may be sent to a server serving `window` tokens. `None` when the window is
+/// unknown (nothing to size against) or so small that the reply reserve alone exhausts it — a caller
+/// that gets `None` sends what it would have sent anyway, which is the pre-existing behaviour.
+pub fn prompt_ceiling(window: Option<i64>) -> Option<i64> {
+    let w = window?;
+    let ceiling = w - REPLY_RESERVE_TOKENS;
+    (ceiling > 0).then_some(ceiling)
+}
+
+/// The largest batch size in `1..=max` whose prompt fits under `ceiling`, found by halving.
+///
+/// `cost(n)` must return the token size of the prompt this caller would build for `n` items, and it
+/// must not shrink as `n` grows (every batcher here appends, so it doesn't). Callers pass a closure
+/// that BUILDS the real prompt and measures it with [`est_messages_tokens_upper`], rather than
+/// estimating its parts — a parallel estimate is a second copy of the prompt's shape and would drift
+/// away from the builder the first time anyone edits one. `cost` is called ~log2(max) times, and a
+/// prompt builder is a few string joins, so that is cheap next to the model call it precedes.
+///
+/// **Never returns zero.** `None` (no ceiling — a cloud route, or a local window PM has not learned
+/// yet) returns `max` unchanged, which is the pre-existing behaviour. A single item too large for
+/// any ceiling comes back as a batch of one, so the gateway refuses it by name instead of the caller
+/// reading an empty batch as "nothing to do" and skipping it forever.
+pub fn largest_fitting(
+    max: usize,
+    ceiling: Option<i64>,
+    mut cost: impl FnMut(usize) -> i64,
+) -> usize {
+    let Some(ceiling) = ceiling else { return max };
+    if max <= 1 {
+        return max;
+    }
+    if cost(max) <= ceiling {
+        return max;
+    }
+    // `lo` is the largest size known (or assumed) to fit; `hi` is the smallest known not to.
+    let (mut lo, mut hi) = (1usize, max);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if cost(mid) <= ceiling {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// The meter's reading: measured prompt tokens over the selected model's window, in `[0, ∞)` (the UI caps the
 /// bar at 100%). `None` when either input is unknown — a custom model with no catalogued window, or a
 /// conversation with no reply yet — so the meter honestly shows "unknown" rather than a fabricated number.
@@ -146,6 +257,122 @@ mod tests {
             name: id.into(),
             context_length: window,
         }
+    }
+
+    #[test]
+    fn upper_estimate_never_undercounts_the_shapes_that_overflow() {
+        // The three measured shapes from `est_tokens_upper`'s doc comment, each sized so the TRUE
+        // token count is known within a few percent. The upper bound must sit ABOVE all of them —
+        // an estimate that lands under is the bug this function exists to prevent.
+        let english = "the quick brown fox jumps over the lazy dog. ".repeat(40); // 1800 chars
+        let true_english = english.chars().count() as i64 * 100 / 398; // ≈3.98 chars/token
+        assert!(
+            est_tokens_upper(&english) > true_english,
+            "prose: {} must exceed {true_english}",
+            est_tokens_upper(&english)
+        );
+
+        let json = r#"{"index":1,"tags":["invoice","finance"]},"#.repeat(40);
+        let true_json = json.chars().count() as i64 * 100 / 277; // ≈2.77 chars/token
+        assert!(
+            est_tokens_upper(&json) > true_json,
+            "json: {} must exceed {true_json}",
+            est_tokens_upper(&json)
+        );
+
+        let cjk =
+            "\u{6211}\u{4eec}\u{9700}\u{8981}\u{8ba8}\u{8bba}\u{8fd9}\u{4e2a}\u{9879}\u{76ee}"
+                .repeat(40);
+        let true_cjk = cjk.chars().count() as i64 * 100 / 169; // ≈1.69 chars/token
+        assert!(
+            est_tokens_upper(&cjk) > true_cjk,
+            "cjk: {} must exceed {true_cjk}",
+            est_tokens_upper(&cjk)
+        );
+
+        // Pessimistic, but not uselessly so: an estimate that doubles the truth would refuse
+        // prompts that fit and starve every background job on a modest window. Both directions are
+        // pinned so a later correction to either rate has to stay inside the band.
+        assert!(
+            est_tokens_upper(&english) < true_english * 2,
+            "prose margin runaway"
+        );
+        assert!(
+            est_tokens_upper(&json) < true_json * 2,
+            "json margin runaway"
+        );
+        assert!(est_tokens_upper(&cjk) < true_cjk * 2, "cjk margin runaway");
+
+        // And it is strictly more pessimistic than the meter's average, which is the whole point.
+        assert!(est_tokens_upper(&english) > est_tokens(&english));
+        assert_eq!(est_tokens_upper(""), 0);
+    }
+
+    #[test]
+    fn message_overhead_is_paid_per_message() {
+        let one = est_messages_tokens_upper(["abcdef"]);
+        let two = est_messages_tokens_upper(["abc", "def"]);
+        assert_eq!(one, 2 + PER_MESSAGE_OVERHEAD_TOKENS);
+        assert_eq!(
+            two,
+            one + PER_MESSAGE_OVERHEAD_TOKENS,
+            "splitting the same text across two messages costs one more overhead"
+        );
+    }
+
+    #[test]
+    fn prompt_ceiling_holds_back_the_reply_and_gives_up_on_a_tiny_window() {
+        assert_eq!(
+            prompt_ceiling(Some(4096)),
+            Some(4096 - REPLY_RESERVE_TOKENS)
+        );
+        assert_eq!(prompt_ceiling(None), None, "unknown window ⇒ no ceiling");
+        assert_eq!(
+            prompt_ceiling(Some(REPLY_RESERVE_TOKENS)),
+            None,
+            "a window the reply alone fills is not a budget"
+        );
+        assert_eq!(prompt_ceiling(Some(REPLY_RESERVE_TOKENS + 1)), Some(1));
+    }
+
+    #[test]
+    fn largest_fitting_finds_the_boundary_and_honours_no_ceiling() {
+        // A prompt costing 100 per item on top of a 200-token system message: 8 items = 1000, which
+        // is the last size that fits a 1000 ceiling; 9 would be 1100.
+        let cost = |n: usize| 200 + 100 * n as i64;
+        assert_eq!(largest_fitting(20, Some(1000), cost), 8);
+        assert_eq!(
+            largest_fitting(5, Some(1000), cost),
+            5,
+            "the cap wins when it fits"
+        );
+        assert_eq!(
+            largest_fitting(20, None, cost),
+            20,
+            "no ceiling ⇒ no shrinking"
+        );
+    }
+
+    #[test]
+    fn largest_fitting_never_returns_an_empty_batch() {
+        // One item that cannot fit ANY ceiling still comes back as a batch of one. Returning 0 would
+        // read to the caller as "nothing to do" and skip that document forever; sending it lets the
+        // gateway refuse it by name, which is something the user can act on.
+        assert_eq!(largest_fitting(5, Some(10), |n| 9_999 * n as i64), 1);
+        assert_eq!(largest_fitting(1, Some(10), |_| 9_999), 1);
+    }
+
+    #[test]
+    fn largest_fitting_calls_cost_a_logarithmic_number_of_times() {
+        // The guard against someone "simplifying" this into a linear scan: `cost` builds a real
+        // prompt, so a linear walk over a 400-title sample would build 400 of them.
+        let mut calls = 0usize;
+        let n = largest_fitting(1024, Some(1000), |n| {
+            calls += 1;
+            n as i64
+        });
+        assert_eq!(n, 1000);
+        assert!(calls <= 12, "halving search, not a scan (was {calls})");
     }
 
     #[test]

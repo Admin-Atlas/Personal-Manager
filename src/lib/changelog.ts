@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.3-alpha",
+    date: "2026-08-27",
+    highlights: [
+      "PM was sending its background work — sorting proposals, summaries, the things it learns about how you file — in single lumps far larger than a local server can hold. What happens then is the part worth knowing: the server does not refuse. It quietly throws away the beginning of the message and answers anyway. The beginning is where PM's instructions are, so what arrives is a pile of your documents with nothing telling the model what to do with them, and nothing telling it that the documents are not instructions.",
+      "PM now knows how much room your server actually has and works within it. It sends fewer documents per batch on a small server and the full batch on a large one, and it decides that before it sends rather than finding out afterwards. Where it cannot make something fit, it stops and tells you the two numbers — what the job needed, and what your server is serving — along with the one setting that changes it. It never fails your server for this; the size of the message was PM's choice, not your machine's fault.",
+      "It also stops advancing past work it did not really do. When a batch has to shrink, PM only marks off the part it actually sent, so the rest is picked up next time instead of being skipped forever.",
+      "And the Local AI tab now tells you the number outright when it is small. Ollama gives 4,096 tokens unless you tell it otherwise, and never mentions it — so the setup instructions for all three servers now include the line that raises it.",
+      "One thing found while measuring, and fixed here: a document title can contain a line break, and PM was putting titles straight into a list where each line means something. A file named to look like PM's own text could add a line to that list. Titles and folder names are now kept to one line, and shortened — which is also what stops four hundred long filenames from filling a small server on their own.",
+    ],
+  },
+  {
     version: "3.130.2-alpha",
     date: "2026-08-27",
     highlights: [

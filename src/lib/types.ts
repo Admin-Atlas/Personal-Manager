@@ -1944,6 +1944,13 @@ export interface LocalLlmStatus {
   chat_local_model: string | null;
   /** The same for background work. */
   background_local_model: string | null;
+  /** The context window the server is actually serving for the demanding role (background if it is
+   *  local, else chat). Null until a call has loaded a model — both proven rungs of the ladder only
+   *  answer while one is resident. */
+  served_window: number | null;
+  /** Whether `served_window` was measured or is PM's conservative floor. Never present a guess as a
+   *  reading. */
+  served_window_proven: boolean;
 }
 
 /** One progress tick from an Ollama model pull (openai_compat.rs PullProgress). */
