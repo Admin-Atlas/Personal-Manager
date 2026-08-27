@@ -510,18 +510,46 @@ pub fn chat_body(model: &str, messages: &[ChatMessage], stream: bool) -> serde_j
 // Context-window ladder — the *selection* is pure; the probes that populate it are I/O.
 // ---------------------------------------------------------------------------------------------
 
-/// Where a discovered context window came from — surfaced so the UI can say "assumed" for a
-/// conservative default rather than presenting a guess as measured.
+/// Where a discovered context window came from — surfaced so the UI can say "assumed" rather than
+/// presenting a guess as measured. [`Self::is_proven`] is the line that matters.
+///
+/// The distinction the ladder got wrong: a model's TRAINED capacity and the window a server actually
+/// LOADED are different physical quantities. `num_ctx` is a server setting; no model card can know
+/// it. Ollama on a 7-8 GiB card silently loads 4096 for a model trained at 32768, and reading the
+/// model's number as the server's number overstated it 8x — which is not a small error, because the
+/// meter's numerator is capped by the truncation it is meant to warn about while the denominator is
+/// fiction, so the alert can never fire (#792).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowSource {
     /// llama-server `/slots` — the proven window of the actually-loaded model.
     Slots,
-    /// A `/v1/models` entry's metadata (`n_ctx_train` / `max_context_length`).
+    /// Ollama `/api/ps` `context_length` — the proven window of the actually-loaded model. Ollama
+    /// does not proxy llama-server's `/slots`, so before this rung existed there was no way to ask
+    /// the runner PM recommends first what it had really loaded.
+    LoadedModel,
+    /// A `/v1/models` entry's metadata (`n_ctx_train` / `max_context_length`). The server's own
+    /// claim, but about the MODEL rather than this load — an upper bound, not a measurement.
     ModelsMeta,
-    /// The curated catalog's default for a matched model (#296 hook).
-    Catalog,
     /// The conservative fallback — nothing else was discoverable.
     Default,
+}
+
+impl WindowSource {
+    /// Whether the server told us what it actually loaded, as opposed to PM inferring it. Only a
+    /// proven window may be presented as a measurement.
+    pub fn is_proven(self) -> bool {
+        matches!(self, WindowSource::Slots | WindowSource::LoadedModel)
+    }
+
+    /// A stable identifier for the IPC boundary, so the UI never string-matches a Debug format.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowSource::Slots => "slots",
+            WindowSource::LoadedModel => "loaded_model",
+            WindowSource::ModelsMeta => "models_meta",
+            WindowSource::Default => "default",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -534,12 +562,20 @@ pub struct WindowInfo {
 /// nothing is discoverable would make the context meter lie. 4096 is the honest floor.
 pub const DEFAULT_CONTEXT: u32 = 4096;
 
-/// The ladder's preference order, as a pure choice over what each rung found: proven `/slots`, then
-/// `/v1/models` metadata, then catalog metadata, else the conservative default.
+/// The ladder's preference order, as a pure choice over what each rung found: the two PROVEN rungs
+/// first (`/slots`, then Ollama's `/api/ps`), then the server's own claim about the model, else the
+/// conservative default.
+///
+/// The catalog rung is gone. It supplied the model's TRAINED capacity, which is a property of the
+/// weights and not of this load, and it outranked [`DEFAULT_CONTEXT`] — so on Ollama, where neither
+/// live rung answers, PM read 32768 off a model card while the server served 4096 (#792). The
+/// comment on `DEFAULT_CONTEXT` argued for exactly this and was unreachable for the one server it
+/// was written to protect against. A conservative floor makes PM compress a little early; a
+/// confident guess makes it send prompts that are silently cut in half, and never say so.
 pub fn pick_window(
     slots: Option<u32>,
+    loaded_model: Option<u32>,
     models_meta: Option<u32>,
-    catalog: Option<u32>,
 ) -> WindowInfo {
     if let Some(tokens) = slots {
         return WindowInfo {
@@ -547,16 +583,16 @@ pub fn pick_window(
             source: WindowSource::Slots,
         };
     }
+    if let Some(tokens) = loaded_model {
+        return WindowInfo {
+            tokens,
+            source: WindowSource::LoadedModel,
+        };
+    }
     if let Some(tokens) = models_meta {
         return WindowInfo {
             tokens,
             source: WindowSource::ModelsMeta,
-        };
-    }
-    if let Some(tokens) = catalog {
-        return WindowInfo {
-            tokens,
-            source: WindowSource::Catalog,
         };
     }
     WindowInfo {
@@ -917,21 +953,66 @@ pub async fn complete(
 /// `/slots` (llama-server) is tried first for the proven window; `/v1/models` metadata second; the
 /// catalog hook is filled in by #296 (PR4). A conservative default is never an error — it is the
 /// bottom rung by design.
-pub async fn probe_window(
-    base_url: &str,
-    model: &str,
-    token: Option<&str>,
-    catalog: Option<u32>,
-) -> WindowInfo {
+pub async fn probe_window(base_url: &str, model: &str, token: Option<&str>) -> WindowInfo {
     let slots = probe_slots_ctx(base_url, token).await;
-    let models_meta = if slots.is_none() {
+    // Each rung costs a request, so ask only while the answer is still unknown.
+    let loaded = if slots.is_none() {
+        probe_loaded_ctx(base_url, model, token).await
+    } else {
+        None
+    };
+    let models_meta = if slots.is_none() && loaded.is_none() {
         probe_models_ctx(base_url, model, token).await
     } else {
         None
     };
-    // The catalog rung — a matched curated model's advertised window (#296) — is supplied by the
-    // gateway, which owns the catalog lookup so this protocol module stays catalog-free.
-    pick_window(slots, models_meta, catalog)
+    pick_window(slots, loaded, models_meta)
+}
+
+/// Ollama `/api/ps` reports the RESIDENT models and, for each, the `context_length` it was actually
+/// loaded with — the same number `ollama ps` prints and the one llama-server was launched with.
+///
+/// This is the truth the ladder was missing. Ollama does not proxy `/slots`, and its `/v1/models`
+/// entries carry only `id`/`object`/`created`/`owned_by`, so both live rungs came back empty and PM
+/// fell through to a guess. Returns `None` when nothing is resident, which is correct rather than a
+/// failure: there is no served window until something is loaded, and the ladder should say so by
+/// falling to its floor.
+///
+/// Matched on the model id so a machine serving several models cannot answer for the wrong one.
+async fn probe_loaded_ctx(base_url: &str, model: &str, token: Option<&str>) -> Option<u32> {
+    let url = format!("{base_url}/api/ps");
+    let mut req = client_for(base_url)
+        .get(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    loaded_ctx_from_ps(&value, model)
+}
+
+/// The `context_length` `/api/ps` reports for `model`, if it is resident. Pure, so the matching —
+/// including the "several models loaded, answer for the right one" case — is testable without a
+/// server.
+pub fn loaded_ctx_from_ps(value: &serde_json::Value, model: &str) -> Option<u32> {
+    value
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|m| {
+            // Ollama echoes the name as pulled. `model` is what PM sends on the wire, so an exact
+            // match is the honest test; anything looser risks answering for a different load.
+            m.get("name").and_then(|n| n.as_str()) == Some(model)
+                || m.get("model").and_then(|n| n.as_str()) == Some(model)
+        })?
+        .get("context_length")?
+        .as_u64()
+        .and_then(|c| u32::try_from(c).ok())
+        .filter(|c| *c > 0)
 }
 
 /// llama-server `/slots` returns per-slot `n_ctx` for the loaded model. 404/501/timeout → None (not
@@ -1297,28 +1378,78 @@ mod tests {
     }
 
     #[test]
-    fn window_ladder_prefers_slots_then_models_then_catalog_then_default() {
+    fn window_ladder_prefers_what_the_server_actually_loaded() {
+        // Both proven rungs outrank the server's claim about the model.
         assert_eq!(
-            pick_window(Some(8192), Some(4096), Some(2048)),
+            pick_window(Some(8192), Some(4096), Some(32768)),
             WindowInfo {
                 tokens: 8192,
                 source: WindowSource::Slots
             }
         );
         assert_eq!(
-            pick_window(None, Some(4096), Some(2048)).source,
-            WindowSource::ModelsMeta
+            pick_window(None, Some(4096), Some(32768)),
+            WindowInfo {
+                tokens: 4096,
+                source: WindowSource::LoadedModel
+            },
+            "a served window of 4096 must beat a trained capacity of 32768 — they are different \
+             quantities, and only one of them describes this load"
         );
         assert_eq!(
-            pick_window(None, None, Some(32768)),
-            WindowInfo {
-                tokens: 32768,
-                source: WindowSource::Catalog
-            }
+            pick_window(None, None, Some(32768)).source,
+            WindowSource::ModelsMeta
         );
+
+        // Nothing discoverable falls to the honest floor, NOT to a model card's number. This is the
+        // rung the catalogue used to sit above, and doing so overstated Ollama 8x (#792).
         let fallback = pick_window(None, None, None);
         assert_eq!(fallback.tokens, DEFAULT_CONTEXT);
         assert_eq!(fallback.source, WindowSource::Default);
+        assert!(!fallback.source.is_proven());
+        assert!(!WindowSource::ModelsMeta.is_proven());
+        assert!(WindowSource::Slots.is_proven());
+        assert!(WindowSource::LoadedModel.is_proven());
+    }
+
+    #[test]
+    fn api_ps_answers_for_the_right_load_or_not_at_all() {
+        // Byte-shaped after a live Ollama 0.33.0 answering with one model resident, 27-08-2026.
+        let ps = serde_json::json!({"models":[
+            {"name":"qwen2.5:7b-instruct-q4_K_M","model":"qwen2.5:7b-instruct-q4_K_M",
+             "context_length":4096,"size_vram":4748056984u64},
+            {"name":"llama3.2:1b","model":"llama3.2:1b","context_length":32768}
+        ]});
+        assert_eq!(
+            loaded_ctx_from_ps(&ps, "qwen2.5:7b-instruct-q4_K_M"),
+            Some(4096)
+        );
+        // A machine serving several models must never answer for the wrong one.
+        assert_eq!(loaded_ctx_from_ps(&ps, "llama3.2:1b"), Some(32768));
+        assert_eq!(loaded_ctx_from_ps(&ps, "mistral:7b"), None);
+
+        // Nothing resident is not a failure — there is no served window yet, and the ladder should
+        // fall to its floor rather than invent one. This is what an idle Ollama returns.
+        assert_eq!(
+            loaded_ctx_from_ps(&serde_json::json!({"models":[]}), "qwen2.5:7b"),
+            None
+        );
+        // A non-Ollama server's 200 must not be mined for a number.
+        assert_eq!(
+            loaded_ctx_from_ps(
+                &serde_json::json!({"object":"list","data":[]}),
+                "qwen2.5:7b"
+            ),
+            None
+        );
+        // A zero is a missing value, not a window.
+        assert_eq!(
+            loaded_ctx_from_ps(
+                &serde_json::json!({"models":[{"name":"m","context_length":0}]}),
+                "m"
+            ),
+            None
+        );
     }
 
     #[test]

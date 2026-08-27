@@ -769,9 +769,13 @@ pub fn no_provider_message() -> String {
         .to_string()
 }
 
-/// After a successful local call the model is loaded, so `/slots` (llama-server) reports the real
-/// context window — probe and cache it ONCE, in the background, so the context meter can show it on
-/// its next poll without ever blocking a reply on the network. A no-op once the window is cached.
+/// After a successful local call the model is loaded, so the server can be asked what it really
+/// loaded — `/slots` on llama-server, `/api/ps` on Ollama. Probe and cache it ONCE, in the
+/// background, so the context meter can show it on its next poll without ever blocking a reply on
+/// the network. A no-op once the window is cached.
+///
+/// Timing matters here: both proven rungs only answer while a model is RESIDENT, which is why this
+/// runs after a successful call rather than at configure time.
 fn ensure_local_window_cached(app: &AppHandle, local: &LocalArm) {
     let state = app.state::<AppState>();
     if state
@@ -781,20 +785,18 @@ fn ensure_local_window_cached(app: &AppHandle, local: &LocalArm) {
     {
         return;
     }
-    // The catalog rung is a cheap in-memory lookup — resolve it here (sync) and hand it to the probe.
-    let catalog = crate::local_catalog::context_window_for(&local.model);
     let app = app.clone();
     let base_url = local.base_url.clone();
     let model = local.model.clone();
     let token = local.token.as_ref().map(|s| s.expose().to_string());
     tauri::async_runtime::spawn(async move {
         // This task fires its own token-bearing request OUTSIDE both gateway gates, so it carries
-        // the call-time posture check itself. Silent on refusal: the context meter simply keeps its
-        // catalog/default rung, which is exactly what an unreachable `/slots` already does.
+        // the call-time posture check itself. Silent on refusal: the meter simply keeps the
+        // conservative default, which is exactly what an unreachable `/slots` already does.
         if crate::local_ai::endpoint_refused_now(&base_url).await {
             return;
         }
-        let info = openai_compat::probe_window(&base_url, &model, token.as_deref(), catalog).await;
+        let info = openai_compat::probe_window(&base_url, &model, token.as_deref()).await;
         app.state::<AppState>()
             .local_ai
             .cache_window(&base_url, &model, info);

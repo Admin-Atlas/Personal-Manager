@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.2-alpha",
+    date: "2026-08-27",
+    highlights: [
+      "PM was measuring your local model's context against a number it made up. Every model is trained to handle a certain amount of conversation at once, but the server running it decides how much to actually give it — and those are different numbers. Ollama in particular usually gives far less than the model can take, and never mentions it. PM read the model's number, so on a typical laptop it believed it had eight times the room it really had.",
+      "That is worse than a wrong percentage. The warning that tells you a conversation is getting too long, and the offer to compress it, both fire at 80% — and with the wrong number underneath, the meter could never reach 80% no matter how long the conversation got. So the warning could not fire at all, while your older messages were being quietly dropped by the server. PM now asks Ollama what it actually loaded, and asks llama-server the same question it always did.",
+      "And when it genuinely cannot find out, it says so instead of guessing. It falls back to a small, safe figure and the context panel tells you the number is assumed. A model's own specification is no longer treated as an answer to a question only your server can answer.",
+    ],
+  },
+  {
     version: "3.130.1-alpha",
     date: "2026-08-27",
     highlights: [
