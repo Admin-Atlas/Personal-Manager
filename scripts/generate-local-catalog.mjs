@@ -34,7 +34,7 @@ import { dirname, join } from "node:path";
 const HF = "https://huggingface.co";
 const UA = "pm-local-catalog-generator (Personal-Manager)";
 const DEFAULT_QUANTS = ["Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"];
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 // Bounded retries for transient Hugging Face failures (network drop / HTTP 5xx) before we give up.
 const MAX_ATTEMPTS = 4;
 
@@ -240,7 +240,21 @@ async function buildEntry(seed) {
   const quants = [];
   for (const label of seed.quants || DEFAULT_QUANTS) {
     const size = sumQuantShards(ggufFiles, label);
-    if (size) quants.push({ quant: label, file_gb: gib(size.bytes), sharded: size.sharded });
+    if (!size) continue;
+    // `size.bytes` is the raw pre-gib() figure, which is what makes the comparison exact.
+    const manifest = size.sharded ? null : await fetchOllamaManifest(repo, label);
+    quants.push({
+      quant: label,
+      file_gb: gib(size.bytes),
+      sharded: size.sharded,
+      ollama: ollamaTagFor({
+        repo,
+        quant: label,
+        sharded: size.sharded,
+        bytes: size.bytes,
+        manifest,
+      }),
+    });
   }
   if (quants.length === 0) {
     return drop("none of the curated quants present in the tree");
@@ -285,7 +299,6 @@ async function buildEntry(seed) {
     projector_gb: projectorGb,
     fit,
     quants,
-    install: { ollama: null },
   };
   return { entry, evidence };
 }
@@ -346,6 +359,59 @@ export function activeFromHeader(metadata, totalParams) {
 }
 
 // --- small pure helpers ------------------------------------------------------------------------
+
+/** The Ollama pull target for one quant, or `null` when PM must not offer a download for it.
+ *
+ *  Ollama parses the HOST out of a model name and uses it as the registry, and Hugging Face serves
+ *  Ollama-format manifests at `/v2/{repo}/manifests/{QUANT}`. So `hf.co/<repo>:<QUANT>` is a pure
+ *  function of two fields the catalogue already carries, and it pulls THE FILE THIS ROW MEASURED —
+ *  no curated name list, nothing to drift. Ollama's own library is deliberately not used: its build
+ *  of a family is frequently a different conversion (`gemma3:4b-it-q4_k_m` folds the vision tower
+ *  into the model layer and runs +34% over this repo's measurement), so a card's fit verdict would
+ *  describe a different file from the one the button downloads.
+ *
+ *  The size check is EXACT, not a tolerance. The manifest's `image.model` layer size is the repo
+ *  tree's file size for the same artefact, so anything other than equality means we are looking at
+ *  a different file and must not offer it. `null` here means "checked, and not offerable" — never
+ *  "nobody looked"; the caller warns rather than aborting, so an unreachable registry degrades the
+ *  download button without shrinking the catalogue. */
+export function ollamaTagFor({ repo, quant, sharded, bytes, manifest }) {
+  // Hugging Face's shim 400s on split GGUF by design ("Ollama does not yet support pulling sharded
+  // GGUF via the registry"), so never spend a request — and never render a button that cannot work.
+  if (sharded) return null;
+  if (!manifest) return null;
+  const model = (manifest.layers ?? [])
+    .filter((l) => l.mediaType === "application/vnd.ollama.image.model")
+    .reduce((n, l) => n + (Number(l.size) || 0), 0);
+  if (model === 0 || model !== bytes) return null;
+  return `hf.co/${repo}:${quant}`;
+}
+
+/** Fetch the Ollama-format manifest Hugging Face serves for one quant, or `null`.
+ *
+ *  Degrades rather than aborts: a manifest we cannot read costs one Download button, while an
+ *  `AbortRun` would cost the whole catalogue. That is the opposite trade from the file tree, which
+ *  aborts because a missing tree silently shrinks the catalogue itself. */
+async function fetchOllamaManifest(repo, quant) {
+  const url = `${HF}/v2/${repo}/manifests/${quant}`;
+  let res;
+  try {
+    res = await hfFetch(url, { Accept: "application/vnd.docker.distribution.manifest.v2+json" });
+  } catch (e) {
+    console.warn(`    ${url} → ${e?.message || e}; no Ollama tag for this quant`);
+    return null;
+  }
+  if (!res.ok) {
+    console.warn(`    ${url} → HTTP ${res.status}; no Ollama tag for this quant`);
+    return null;
+  }
+  try {
+    return await res.json();
+  } catch {
+    console.warn(`    ${url} → unparseable manifest; no Ollama tag for this quant`);
+    return null;
+  }
+}
 
 export function sumQuantShards(files, label) {
   const parts = files.filter(

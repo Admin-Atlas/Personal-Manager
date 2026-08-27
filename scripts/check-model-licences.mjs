@@ -40,6 +40,11 @@ const CATALOG_RS = "src-tauri/src/local_catalog.rs";
 
 /** Fewest models the catalogue can plausibly hold; below this something has truncated it. */
 const MODEL_FLOOR = 10;
+/** How many entries must carry at least one Ollama pull tag. A floor, not a total: some rows are
+ *  legitimately un-offerable (sharded GGUF). The shipped bug this guards was that ALL of them were
+ *  null and nothing noticed for three releases, so the number only has to be far enough above zero
+ *  to catch a generator that silently stopped writing tags. */
+const OLLAMA_TAG_FLOOR = 12;
 
 /** The licence block a catalogue entry carries, in the order the generator writes it. */
 const LICENCE_FIELDS = ["id", "name", "url", "open", "summary"];
@@ -181,12 +186,56 @@ export function scan(root) {
         `is truncated, or this parser has stopped matching`,
     );
   }
+  // --- Ollama pull tags -------------------------------------------------------------------------
+  // Derived from the row, never regex-matched: a /^hf\.co\// test passes for free on a stale or
+  // hand-edited tag, which is exactly the failure this is here to catch.
+  let tagged = 0;
+  for (const e of entries) {
+    if ("install" in e) {
+      problems.push(`${e.repo} still carries the retired per-entry \`install\` key`);
+    }
+    let any = false;
+    for (const q of e.quants ?? []) {
+      if (!("ollama" in q)) {
+        problems.push(
+          `${e.repo} ${q.quant}: no \`ollama\` field — the generator did not write one`,
+        );
+        continue;
+      }
+      if (q.ollama === null) continue;
+      any = true;
+      const expected = `hf.co/${e.repo}:${q.quant}`;
+      if (q.ollama !== expected) {
+        problems.push(`${e.repo} ${q.quant}: tag is "${q.ollama}", expected "${expected}"`);
+      }
+      if (q.sharded) {
+        problems.push(
+          `${e.repo} ${q.quant}: sharded GGUF carries a pull tag — Ollama's registry refuses those, ` +
+            `so the Download button would fail`,
+        );
+      }
+    }
+    if (any) tagged += 1;
+  }
+  if (tagged < OLLAMA_TAG_FLOOR) {
+    problems.push(
+      `only ${tagged} of ${entries.length} entries carry an Ollama pull tag (expected at least ` +
+        `${OLLAMA_TAG_FLOOR}) — the one-click download is dead for the rest`,
+    );
+  }
+
   const restricted = entries.filter((e) => e.licence && !e.licence.open).length;
-  return { problems, count: entries.length, restricted, ledgerCount: Object.keys(models).length };
+  return {
+    problems,
+    count: entries.length,
+    restricted,
+    tagged,
+    ledgerCount: Object.keys(models).length,
+  };
 }
 
 function main() {
-  const { problems, count, restricted, ledgerCount } = scan(repoRoot);
+  const { problems, count, restricted, tagged, ledgerCount } = scan(repoRoot);
   if (problems.length > 0) {
     console.error("✗ model-licences:\n");
     for (const p of problems) console.error(`  • ${p}`);
@@ -194,7 +243,8 @@ function main() {
   }
   console.log(
     `✓ model-licences: all ${count} catalogued models (${restricted} under restricted terms) carry ` +
-      `a reviewed licence matching ${LEDGER_FILE}'s ${ledgerCount} rows`,
+      `a reviewed licence matching ${LEDGER_FILE}'s ${ledgerCount} rows; ${tagged} carry an Ollama ` +
+      `pull tag`,
   );
 }
 

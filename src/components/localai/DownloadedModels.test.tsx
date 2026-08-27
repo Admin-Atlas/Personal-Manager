@@ -85,6 +85,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     installed: [],
     on_disk: [MODEL],
     disk_sources_present: ["lm_studio"],
+    disk_found: 1,
     disk_truncated: false,
     scan_dir: null,
     terms_accepted: [],
@@ -129,5 +130,38 @@ describe("DownloadedModels — the unserved gating hint", () => {
     );
     expect(container.textContent).not.toContain("can be assigned");
     expect(container.textContent).not.toContain("Connect an endpoint");
+  });
+});
+
+describe("a runner that is installed but empty", () => {
+  // #790's sibling. `on_disk` has already had everything the endpoint serves removed from it, so an
+  // empty list cannot tell "no runner on this machine" from "a runner with nothing in it" — and the
+  // second is exactly what a user sees the moment they remove their last model, or the first time
+  // they install Ollama. It used to be told, wrongly, that everything it had was already served.
+  const render3 = (over: Partial<LocalRecommendations>) =>
+    render(
+      <DownloadedModels
+        recs={recs({ on_disk: [], ...over })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+
+  it("says the folder is empty rather than claiming everything is already served", () => {
+    const { container } = render3({ disk_sources_present: ["lm_studio"], disk_found: 0 });
+    expect(container.textContent).toContain("but nothing downloaded into it yet");
+    expect(container.textContent).not.toContain("already being served");
+  });
+
+  it("still says 'already being served' when the crawl did find something", () => {
+    const { container } = render3({ disk_sources_present: ["lm_studio"], disk_found: 3 });
+    expect(container.textContent).toContain("already being served");
+    expect(container.textContent).not.toContain("but nothing downloaded into it yet");
+  });
+
+  it("still says no folder at all when no runner is present", () => {
+    const { container } = render3({ disk_sources_present: [], disk_found: 0 });
+    expect(container.textContent).toContain("No model folder found");
   });
 });

@@ -368,7 +368,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   }
 
   async function pull(rec: LocalRecommendation) {
-    const tag = ollamaTag(rec.install.ollama);
+    const tag = rec.ollama_pull;
     if (!tag) return;
     setPulling(rec.repo);
     setPullProg(null);
@@ -481,7 +481,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 key={rec.repo}
                 rec={rec}
                 installed={installedRepos.has(rec.repo)}
-                canPull={configured && isOllama && !!ollamaTag(rec.install.ollama)}
+                canPull={configured && isOllama && !!rec.ollama_pull}
                 pulling={pulling === rec.repo}
                 pullProg={pulling === rec.repo ? pullProg : null}
                 onPull={() => requestPull(rec)}
@@ -878,9 +878,15 @@ export function DownloadedModels({
     <div className="mt-2">
       {recs.on_disk.length === 0 ? (
         <p className="text-xs text-ink4">
-          {found.length > 0
-            ? `Found ${listJoin(found)} on this device, with nothing downloaded that isn't already being served.`
-            : `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`}
+          {/* Three states, not two. `on_disk` has already had everything the endpoint serves
+              removed from it, so "empty" alone cannot tell a machine with no runner installed from
+              one whose runner is installed but empty — which is exactly what a user sees the moment
+              they remove their last model. `disk_found` is the pre-filter count. */}
+          {found.length === 0
+            ? `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`
+            : recs.disk_found === 0
+              ? `Found ${listJoin(found)} on this device, but nothing downloaded into it yet.`
+              : `Found ${listJoin(found)} on this device, with nothing downloaded that isn't already being served.`}
         </p>
       ) : (
         <>
@@ -977,20 +983,23 @@ function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
   );
 }
 
-/** The `ollama pull <tag>` install hint reduced to just the tag (for the pull API / a copy button). */
-function ollamaTag(hint: string | null): string | null {
-  if (!hint) return null;
-  const m = hint.trim().match(/ollama\s+(?:pull|run)\s+(\S+)/i);
-  return m ? m[1] : null;
-}
-
 /** How to get a model PM can't download for you.
  *
  *  Honest per runner rather than one command pretending to be universal: the three name models three
  *  different ways, and the same weights are `qwen2.5:7b-instruct-q4_K_M` to Ollama, `…@q4_k_m` to LM
  *  Studio and `user/repo:Q4_K_M` to llama-server. Pasting one into another gets you nothing. So PM
  *  prints the command it can stand behind and describes the route for the two it can't. */
-function ModelInstallHint({ repo, quant }: { repo: string; quant: string | null }) {
+function ModelInstallHint({
+  repo,
+  quant,
+  ollamaPull,
+  shardedQuant,
+}: {
+  repo: string;
+  quant: string | null;
+  ollamaPull: string | null;
+  shardedQuant: boolean;
+}) {
   const cmd = installCommand("llama-server", repo, quant);
   return (
     <div className="mt-2 space-y-1.5">
@@ -1008,10 +1017,26 @@ function ModelInstallHint({ repo, quant }: { repo: string; quant: string | null 
           </Button>
         </div>
       )}
+      {ollamaPull && (
+        <div className="flex items-center gap-2">
+          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
+            {`ollama pull ${ollamaPull}`}
+          </code>
+          <Button
+            variant="tertiary"
+            size="sm"
+            onClick={() => void navigator.clipboard?.writeText(`ollama pull ${ollamaPull}`)}
+          >
+            Copy
+          </Button>
+        </div>
+      )}
       <p className="text-[0.6875rem] text-ink4">
         That command downloads and serves it in one step. In LM Studio, paste{" "}
-        <span className="font-mono text-ink3">{repo}</span> into the Discover tab's search. Ollama
-        names models its own way, so search its library for this one.
+        <span className="font-mono text-ink3">{repo}</span> into the Discover tab's search.
+        {shardedQuant
+          ? " Ollama can't fetch this quantization — it ships as split files, which Ollama won't pull. A smaller one of the same model will work."
+          : ""}
       </p>
     </div>
   );
@@ -1279,12 +1304,16 @@ function RecommendationCard({
       )}
 
       {!installed && !canPull && (
-        // The row that offers a way to GET this model when PM can't fetch it for you. It used to be
-        // gated on an `ollama pull` hint parsed out of the catalogue — and every entry carries a
-        // null one, so this rendered for nobody: an un-installed model had no Download button AND
-        // no command, just a card. The Hugging Face repo id is already here and is what
-        // llama-server takes directly, so at least one runner now gets a real command.
-        <ModelInstallHint repo={rec.repo} quant={f.quant} />
+        // The row that offers a way to GET this model when PM can't fetch it for you — no endpoint
+        // connected, or the endpoint isn't Ollama. Both commands are real: llama-server takes the
+        // Hugging Face repo id directly, and Ollama takes the catalogue's verified `hf.co/…` tag.
+        // When the fitted quant is sharded there is no Ollama command to give, and it says why.
+        <ModelInstallHint
+          repo={rec.repo}
+          quant={f.quant}
+          ollamaPull={rec.ollama_pull}
+          shardedQuant={rec.sharded_quant}
+        />
       )}
 
       {rec.gpu.kind === "split"

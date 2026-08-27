@@ -1,7 +1,7 @@
 {
-  "schema_version": 2,
-  "catalog_version": 3,
-  "content_hash": "sha256:4e7fc8c70dc165b68d4381246a6e857f1b1089fc82e406fe3e3251820f620fe3",
+  "schema_version": 3,
+  "catalog_version": 4,
+  "content_hash": "sha256:81d3e95aa3df0b3e51af3ecdc675bb734c9928c86a386ca45091e9a4cbf92735",
   "generated_at": "2026-08-26",
   "source": "huggingface-gguf",
   "entries": [
@@ -21,12 +21,10 @@
         {
           "quant": "Q8_0",
           "file_gb": 0.41,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -51,17 +49,16 @@
         {
           "quant": "Q4_K_M",
           "file_gb": 0.75,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
         },
         {
           "quant": "Q8_0",
           "file_gb": 1,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/ggml-org/gemma-3-1b-it-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "gemma",
         "name": "Gemma Terms of Use",
@@ -86,27 +83,28 @@
         {
           "quant": "Q4_K_M",
           "file_gb": 0.75,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 0.85,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 0.95,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 1.23,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "llama3.2",
         "name": "Llama 3.2 Community License",
@@ -131,27 +129,28 @@
         {
           "quant": "Q4_K_M",
           "file_gb": 1.59,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 1.79,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 2,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 2.59,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "gemma",
         "name": "Gemma Terms of Use",
@@ -176,27 +175,28 @@
         {
           "quant": "Q4_K_M",
           "file_gb": 1.88,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 2.16,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 2.46,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 3.19,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "llama3.2",
         "name": "Llama 3.2 Community License",
@@ -221,32 +221,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 1.82,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 2.23,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 2.62,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 2.92,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 3.78,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "mit",
         "name": "MIT License",
@@ -271,17 +273,16 @@
         {
           "quant": "Q4_K_M",
           "file_gb": 2.32,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
         },
         {
           "quant": "Q8_0",
           "file_gb": 3.85,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "gemma",
         "name": "Gemma Terms of Use",
@@ -306,32 +307,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 2.14,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 2.55,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 2.93,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 3.28,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 4.17,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -356,32 +359,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 3.55,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 4.36,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 5.07,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 5.82,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 7.54,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -406,32 +411,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 3.74,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 4.58,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 5.34,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 6.14,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 7.95,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "llama3.1",
         "name": "Llama 3.1 Community License",
@@ -456,32 +463,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 4.35,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 5.29,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 6.13,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 6.95,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 8.87,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -506,32 +515,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 5.3,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 6.63,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 7.84,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 9.11,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 11.8,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -556,32 +567,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 6.84,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 8.37,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 9.79,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 11.29,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 14.62,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -606,32 +619,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 11.85,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 15.78,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 19.7,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 21.58,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 25.02,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -656,32 +671,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 12.65,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 15.66,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 18.17,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 20.98,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 26.63,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -706,32 +723,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 15.46,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 20.61,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 24.64,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M"
         },
         {
           "quant": "Q6_K",
           "file_gb": 27.3,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q6_K"
         },
         {
           "quant": "Q8_0",
           "file_gb": 34.37,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q8_0"
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "apache-2.0",
         "name": "Apache License 2.0",
@@ -756,32 +775,34 @@
         {
           "quant": "Q3_K_M",
           "file_gb": 35.11,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q3_K_M"
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 44.16,
-          "sharded": false
+          "sharded": false,
+          "ollama": "hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q4_K_M"
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 50.71,
-          "sharded": true
+          "sharded": true,
+          "ollama": null
         },
         {
           "quant": "Q6_K",
           "file_gb": 59.93,
-          "sharded": true
+          "sharded": true,
+          "ollama": null
         },
         {
           "quant": "Q8_0",
           "file_gb": 71.96,
-          "sharded": true
+          "sharded": true,
+          "ollama": null
         }
       ],
-      "install": {
-        "ollama": null
-      },
       "licence": {
         "id": "qwen",
         "name": "Qwen License Agreement",

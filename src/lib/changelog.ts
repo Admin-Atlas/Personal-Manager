@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.0-alpha",
+    date: "2026-08-27",
+    highlights: [
+      "Every recommended model now has a Download button that works. PM has been showing you a list of models it thought would suit your machine, with no way to get any of them — the button was there in the code and could never appear, because the list carried no name Ollama would recognise for a single one of them. All seventeen now do. Pick one, press Download, and your own Ollama fetches it.",
+      "It fetches exactly the file PM measured, too. The sizes and speeds on each card were worked out from a specific file, and the same model packaged elsewhere can be a third larger — enough to turn a model that fits into one that doesn't. PM now downloads from the same place it took its measurements, so what the card promised is what lands on your disk. Where it can't do that honestly it offers no button and says why instead.",
+      'And the list stops contradicting itself after you use it. Downloading a model used to leave the "already downloaded" section showing the picture from before you pressed the button, until you restarted PM. It also told anyone with a model folder but nothing in it that everything they had was already loaded — which is what you see the moment you delete your last model, or the first time you install one of these apps.',
+    ],
+  },
+  {
     version: "3.129.3-alpha",
     date: "2026-08-26",
     highlights: [

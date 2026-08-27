@@ -134,6 +134,7 @@ const recs = (): LocalRecommendations => ({
   installed: [],
   on_disk: [],
   disk_sources_present: [],
+  disk_found: 0,
   disk_truncated: false,
   scan_dir: null,
   terms_accepted: [],
@@ -392,9 +393,10 @@ describe("model licence terms", () => {
   // The catalogue ships models under bespoke publisher terms (Gemma, Llama, the largest Qwen 2.5)
   // alongside genuinely open ones. These pin the promise the UI makes about that difference.
   //
-  // NOTE: this flow cannot be reached by clicking the real app today — every shipped catalogue entry
-  // has `install.ollama: null`, so `canPull` is false and no Download button renders. These fixtures
-  // populate it deliberately. Without them the gate would be dead code that nothing exercises.
+  // The tags below are the shape the generator really emits (`hf.co/<repo>:<QUANT>`) and name each
+  // fixture's OWN repo and fitted quant — the invariant `pull_target_for` enforces in Rust. An
+  // invented literal here would pass against the component while describing a download PM could
+  // never perform, which is how this flow went three releases without a single reachable button.
   const model = (over: Partial<LocalRecommendation> = {}): LocalRecommendation => ({
     repo: "bartowski/gemma-2-2b-it-GGUF",
     display_name: "gemma 2 2b it",
@@ -405,7 +407,8 @@ describe("model licence terms", () => {
     context_length: 8192,
     multimodal: false,
     reasoning: null,
-    install: { ollama: "ollama pull gemma2:2b" },
+    ollama_pull: "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M",
+    sharded_quant: false,
     licence: {
       id: "gemma",
       name: "Gemma Terms of Use",
@@ -430,7 +433,7 @@ describe("model licence terms", () => {
     model({
       repo: "bartowski/Phi-3.5-mini-instruct-GGUF",
       display_name: "Phi 3.5 mini instruct",
-      install: { ollama: "ollama pull phi3.5:3.8b" },
+      ollama_pull: "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
       licence: {
         id: "mit",
         name: "MIT License",
@@ -475,7 +478,10 @@ describe("model licence terms", () => {
     fireEvent.click(await screen.findByRole("button", { name: /accept and download/i }));
 
     await waitFor(() =>
-      expect(pullLocalModel).toHaveBeenCalledWith("gemma2:2b", expect.anything()),
+      expect(pullLocalModel).toHaveBeenCalledWith(
+        "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M",
+        expect.anything(),
+      ),
     );
     expect(acceptLocalModelTerms).toHaveBeenCalledWith("gemma");
   });
@@ -510,7 +516,10 @@ describe("model licence terms", () => {
     fireEvent.click(await screen.findByRole("button", { name: /download/i }));
 
     await waitFor(() =>
-      expect(pullLocalModel).toHaveBeenCalledWith("phi3.5:3.8b", expect.anything()),
+      expect(pullLocalModel).toHaveBeenCalledWith(
+        "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
+        expect.anything(),
+      ),
     );
     expect(screen.queryByRole("button", { name: /accept and download/i })).toBeNull();
   });

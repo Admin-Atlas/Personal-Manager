@@ -52,7 +52,7 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
     bestFor:
       "Pick this if you want the least to think about. It starts with your machine and stays running, so PM just finds it.",
     models:
-      "From Ollama's own library, by a name like `qwen2.5:7b-instruct-q4_K_M`. It's the only one PM can download into for you.",
+      "Its own library, by a name like `qwen2.5:7b-instruct-q4_K_M` — or any Hugging Face GGUF repo, as `hf.co/<user>/<repo>:<QUANT>`. It's the only runner PM can download into for you, and it does so through Hugging Face, so the file you get is the one the model list measured.",
     caveat: null,
   };
   switch (platform) {
@@ -203,9 +203,12 @@ export function runnerGuides(platform: SetupPlatform = PLATFORM): RunnerGuide[] 
  *   * LM Studio names models its own way and its `lms get` documentation never says a raw Hugging
  *     Face repo id is accepted — so PM points at the Discover tab, which documents accepting one,
  *     rather than printing a command that may not work.
- *   * Ollama's registry uses names of its own (`qwen2.5:7b-instruct-q4_K_M`) that cannot be derived
- *     from a Hugging Face repo id. PM will offer a one-click download once the catalogue carries
- *     those names; guessing one would produce a command that fails.
+ *   * Ollama gets no command HERE because it does not need one: it has a Download button. Ollama
+ *     routes by the host in a model name and Hugging Face serves Ollama manifests, so
+ *     `hf.co/<repo>:<QUANT>` pulls the exact file the catalogue measured — but that tag is written
+ *     by the generator only after it has checked the registry, and it reaches the UI from the
+ *     catalogue through Rust. This display helper must not re-derive it: a composed-here tag would
+ *     be a guess wearing a verified tag's clothes.
  */
 export function installCommand(
   runner: "ollama" | "lmstudio" | "llama-server",

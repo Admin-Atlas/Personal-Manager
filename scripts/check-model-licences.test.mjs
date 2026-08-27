@@ -46,10 +46,15 @@ const licenceBlock = (id, term) => ({
   summary: term.summary,
 });
 
-/** One catalogue entry; only the fields this gate looks at need to be real. */
+/** One catalogue entry; only the fields this gate looks at need to be real.
+ *
+ *  The quant row carries a real-shaped `ollama` tag because the gate now derives the expected value
+ *  from the row itself — a fixture with no tag is a catalogue whose Download button is dead, which
+ *  is precisely the shipped state the tag rules exist to catch. */
 const entry = (repo, id, term, over = {}) => ({
   repo,
   licence: licenceBlock(id, term),
+  quants: [{ quant: "Q4_K_M", file_gb: 1.5, sharded: false, ollama: `hf.co/${repo}:Q4_K_M` }],
   ...over,
 });
 
@@ -206,5 +211,46 @@ describe("scan", () => {
     const { entries, models } = filler(2);
     const root = fixture({ entries, terms: { "apache-2.0": APACHE }, models });
     expect(scan(root).problems.join(" ")).toMatch(/catalogue is truncated, or this parser/);
+  });
+
+  // The Ollama pull tags. The shipped bug these guard is that every entry carried a null one for
+  // three releases and no gate looked, so the Download button could not render for any model.
+  const tagged = (over) => {
+    const { entries, models } = filler(12);
+    Object.assign(entries[0].quants[0], over);
+    return fixture({ entries, terms: { "apache-2.0": APACHE }, models });
+  };
+
+  it("catches a tag that names another model", () => {
+    // Derived from the row, not pattern-matched: a /^hf\.co\// test would wave this through, and
+    // pointing the Download button at a different model is the worst version of this failure.
+    expect(scan(tagged({ ollama: "hf.co/someone/else:Q4_K_M" })).problems.join(" ")).toMatch(
+      /tag is "hf\.co\/someone\/else:Q4_K_M", expected/,
+    );
+  });
+
+  it("catches a tag on a sharded quant, which Ollama's registry refuses", () => {
+    expect(scan(tagged({ sharded: true })).problems.join(" ")).toMatch(
+      /sharded GGUF carries a pull tag/,
+    );
+  });
+
+  it("catches a quant row the generator wrote no tag field onto at all", () => {
+    const { entries, models } = filler(12);
+    delete entries[0].quants[0].ollama;
+    const root = fixture({ entries, terms: { "apache-2.0": APACHE }, models });
+    expect(scan(root).problems.join(" ")).toMatch(/the generator did not write one/);
+  });
+
+  it("catches the shipped state: no entry downloadable, and the retired install key", () => {
+    const { entries, models } = filler(12);
+    for (const e of entries) {
+      e.quants[0].ollama = null;
+      e.install = { ollama: null };
+    }
+    const root = fixture({ entries, terms: { "apache-2.0": APACHE }, models });
+    const problems = scan(root).problems.join(" ");
+    expect(problems).toMatch(/only 0 of 12 entries carry an Ollama pull tag/);
+    expect(problems).toMatch(/still carries the retired per-entry/);
   });
 });

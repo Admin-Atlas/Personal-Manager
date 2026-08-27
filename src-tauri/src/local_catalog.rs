@@ -55,7 +55,6 @@ pub struct CatalogEntry {
     pub projector_gb: Option<f64>,
     pub fit: FitClass,
     pub quants: Vec<CatalogQuant>,
-    pub install: InstallHints,
     /// What this model's weights are licensed under. Required, not optional: an entry with no
     /// licence must never reach a user, and the generator refuses to write one
     /// (`scripts/generate-local-catalog.mjs`). The decision behind each value lives in
@@ -90,12 +89,14 @@ pub struct CatalogQuant {
     pub quant: String,
     pub file_gb: f64,
     pub sharded: bool,
-}
-
-/// Optional per-runtime install hints (Ollama has no catalog API, so these are curated, often null).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstallHints {
+    /// The Ollama pull target for THIS quant (`hf.co/<repo>:<QUANT>`), or `None` when the generator
+    /// checked and found none offerable — a sharded GGUF, or a manifest whose model layer did not
+    /// match the byte count this row measured. `None` means "checked, not offerable", never "nobody
+    /// looked": the generator writes the field on every row it emits.
+    ///
+    /// Per-QUANT rather than per-entry on purpose. The card's fit verdict is about one specific
+    /// quantization, so a single per-entry tag would download a different file from the one the card
+    /// sized, and the memory figure it showed would be a lie.
     pub ollama: Option<String>,
 }
 
@@ -319,7 +320,7 @@ mod tests {
         // Pinned, not `>=`: the version is decoration unless something compares it. Bumping it in
         // the generator without landing the matching Rust change fails here rather than at runtime.
         assert_eq!(
-            cat.schema_version, 2,
+            cat.schema_version, 3,
             "catalog schema version must match what this module parses"
         );
         assert!(
@@ -373,7 +374,35 @@ mod tests {
                     q.quant
                 );
                 assert!(q.file_gb > 0.0, "{}: quant {} size", e.repo, q.quant);
+
+                // The Ollama pull target, if the generator wrote one. Derived from THIS row rather
+                // than pattern-matched: a `starts_with("hf.co/")` check would pass for free on a
+                // stale or hand-edited tag pointing at another model entirely.
+                if let Some(tag) = &q.ollama {
+                    assert_eq!(
+                        tag,
+                        &format!("hf.co/{}:{}", e.repo, q.quant),
+                        "{}: quant {} carries a tag that is not its own",
+                        e.repo,
+                        q.quant
+                    );
+                    assert!(
+                        !q.sharded,
+                        "{}: quant {} is sharded and must carry no tag — Ollama's registry refuses \
+                         split GGUF, so the Download button would fail",
+                        e.repo,
+                        q.quant
+                    );
+                }
             }
+
+            // A floor, not a total: some rows are legitimately un-offerable. The shipped bug was
+            // that EVERY row was null for three releases and nothing noticed.
+            assert!(
+                e.quants.iter().any(|q| q.ollama.is_some()),
+                "{}: no quant carries an Ollama pull tag — the Download button is dead for it",
+                e.repo
+            );
 
             // Every entry names a licence, and a restricted one carries the text the UI promises to
             // show before a download. An empty summary here would mean an empty dialog there.
