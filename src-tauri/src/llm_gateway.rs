@@ -546,7 +546,18 @@ async fn run_local_complete(
         let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
         match rt.slot.run_background(attempt).await {
             SlotOutcome::Ran(Ok(completion)) => {
-                rt.record(CallOutcome::Ok);
+                // A reply that stopped at the model's token ceiling is not a clean success.
+                // `Ok` clears the strike streak, the cooldown AND the ejection count, so a server
+                // that truncates every reply — an over-tight `num_predict`, a model that will not
+                // stop — looked perfectly healthy no matter how many times it had been ejected.
+                // `Alive` says what is actually known: it answered. It clears the streak, so this
+                // can never cause a cooldown on its own, and it leaves the escalation record of a
+                // host that keeps not finishing.
+                rt.record(if completion.truncated {
+                    CallOutcome::Alive
+                } else {
+                    CallOutcome::Ok
+                });
                 ping_status(app);
                 ensure_local_window_cached(app, local);
                 return Ok(LlmOutcome {
@@ -751,7 +762,12 @@ where
     };
     match local_result {
         Ok(completion) => {
-            rt.record(CallOutcome::Ok);
+            // Same rule as the background arm: answered is not the same as finished.
+            rt.record(if completion.truncated {
+                CallOutcome::Alive
+            } else {
+                CallOutcome::Ok
+            });
             ping_status(app);
             ensure_local_window_cached(app, local);
             Ok(LlmOutcome {

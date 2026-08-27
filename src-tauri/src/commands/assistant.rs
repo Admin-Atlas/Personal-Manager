@@ -469,7 +469,14 @@ pub async fn route_focus_input(app: AppHandle, text: String) -> Result<flags::Fo
             &meta,
         );
     }
-    let route = flags::parse_route(&completion.text, &candidates, &text);
+    // This router's output is an action — `resolve` crosses a flag off — so a reply that stopped
+    // mid-word must not be read as a decision. `parse_route` is defensive and would fall through to
+    // its own default, but "the model did not finish" and "the model chose the default" are not the
+    // same thing and only one of them should act.
+    let route = match completion.usable_text() {
+        Some(text_out) => flags::parse_route(text_out, &candidates, &text),
+        None => flags::FocusRoute::Unclear,
+    };
 
     // Resolve the entity for a project-scoped preference draft (read-only — never invent an entity the
     // user hasn't confirmed; a name that doesn't resolve falls back to a global preference, exactly like

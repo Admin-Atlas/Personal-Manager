@@ -285,6 +285,35 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
         let crate::llm_gateway::LlmOutcome { completion, meta } =
             crate::llm_gateway::complete(app, &route, &messages, false).await?;
 
+        // An unusable reply is NOT a result. `apply_extension` advances the cursor whether or not
+        // the segment is empty — deliberately, so a permanently-failing span cannot wedge the fold
+        // forever — and that is right for "the model read those five pairs and found nothing
+        // durable". It is wrong for "the model was cut off mid-sentence", which arrives looking
+        // exactly the same: HTTP 200, text attached, no error. Advancing there folds real
+        // conversation into nothing, permanently, because the summary is append-only and has no undo
+        // outside Compress. So: leave the cursor, stop this pass, retry on the next tick. The wedge
+        // this trades against is a cheap idle-timer call; the loss it prevents is the user's history.
+        let Some(segment_text) = completion.usable_text() else {
+            eprintln!(
+                "chat-summary: session {conversation_id} — {}; leaving the cursor so the span is \
+                 summarised again next pass",
+                completion
+                    .unusable_reason()
+                    .unwrap_or("the reply could not be used")
+            );
+            // The call went out and was billed, so it is logged for the same reason a lost
+            // compare-and-swap below is: the spend happened whatever became of the answer.
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            let model = completion
+                .model
+                .as_deref()
+                .or(Some(route.primary_model_id()));
+            crate::commands::log_usage(&conn, "chat_summary", model, &completion.usage, &meta);
+            break;
+        };
+        let segment_text = segment_text.to_string();
+
         // 4. Short write lock: append + advance the cursor together (compare-and-swap on the cursor so a
         //    racing compress can't double-fold the same span — F-36), and log the spend.
         let applied = {
@@ -294,7 +323,7 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
                 &mut conn,
                 conversation_id,
                 plan.prev_cursor,
-                &completion.text,
+                &segment_text,
                 plan.new_cursor,
             )?;
             // Log the spend regardless — the model call was made and billed even if a concurrent pass beat
@@ -416,7 +445,28 @@ pub(crate) async fn compress_now(
     let messages = render_summary_request(snapshot.prev_summary.as_deref(), &segment);
     let crate::llm_gateway::LlmOutcome { completion, meta } =
         crate::llm_gateway::complete(app, &route, &messages, false).await?;
-    let bullets = completion.text.trim().to_string();
+    // Same rule as the automatic fold, and it matters more here: `condensed_bullets` is the HITL
+    // surface showing the user what they just permanently folded, and `reclaimed_est` is written
+    // into the context meter. A cut-off reply would make both of those lie. "Nothing folded" is a
+    // state the caller already handles — the alert stays up and the user can press again.
+    let Some(bullets) = completion.usable_text() else {
+        eprintln!(
+            "chat-compress: session {conversation_id} — {}; nothing folded",
+            completion
+                .unusable_reason()
+                .unwrap_or("the reply could not be used")
+        );
+        // Billed either way.
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let model = completion
+            .model
+            .as_deref()
+            .or(Some(route.primary_model_id()));
+        crate::commands::log_usage(&conn, "chat_compress", model, &completion.usage, &meta);
+        return Ok(None);
+    };
+    let bullets = bullets.to_string();
 
     // Estimated reclaim: the raw tokens leaving the verbatim window, minus the bullets we add back.
     let raw_folded: String = segment

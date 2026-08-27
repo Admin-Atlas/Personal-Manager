@@ -326,7 +326,23 @@ pub fn parse_assignments(
                 break;
             }
         }
-        out[entry.index - 1] = Some(tags);
+        // The distinction this function's own doc comment makes, applied to the case it missed. An
+        // empty `tags` means one of two things, and only one of them is an answer:
+        //
+        //   * the model returned `"tags": []` — "none of the vocabulary applies", which the prompt
+        //     explicitly calls a valid and often correct reply. That IS an answer, and it should
+        //     clear the document's tags.
+        //   * the model named tags and EVERY ONE was dropped as off-vocabulary. That is the model
+        //     failing to use the list at all — and it is exactly what a model does when the system
+        //     message carrying the vocabulary was cut off the front of the prompt. Recorded as
+        //     `Some(vec![])` it became "clear this document's tags", staged as a real change over
+        //     tags the user may have written by hand.
+        //
+        // The second is not an answer, so it is `None` — untouched, like a document the model
+        // skipped.
+        if entry.tags.is_empty() || !tags.is_empty() {
+            out[entry.index - 1] = Some(tags);
+        }
     }
     out
 }
@@ -781,6 +797,42 @@ mod tests {
         let rows = pending(&conn).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].document_id, 3);
+    }
+
+    /// The other half of "no answer versus no tags", and the destructive one. A model that ignores
+    /// the vocabulary and names its own labels had every one of them dropped — correctly — and the
+    /// document then came back `Some(vec![])`, which this pass stages as "clear this document's
+    /// tags". That is exactly what a model does when the system message carrying the vocabulary was
+    /// discarded off the front of the prompt: it invents labels, none match, and the pass proposes
+    /// wiping tags the user may have written by hand.
+    #[test]
+    fn a_reply_that_ignored_the_vocabulary_proposes_nothing_rather_than_clearing() {
+        let vocab = vec!["invoice".to_string(), "tax".to_string()];
+
+        // The model named tags; none of them are in the list. Not an answer.
+        let out = parse_assignments(
+            r#"{"assignments":[{"index":1,"tags":["chair-application","ammun"]}]}"#,
+            1,
+            &vocab,
+        );
+        assert_eq!(out, vec![None], "an off-vocabulary reply is not a proposal");
+
+        // The model said the list has nothing that fits. That IS an answer, and the prompt
+        // explicitly calls it a valid and often correct one — it stays a real "clear the tags".
+        let out = parse_assignments(r#"{"assignments":[{"index":1,"tags":[]}]}"#, 1, &vocab);
+        assert_eq!(
+            out,
+            vec![Some(vec![])],
+            "an explicit empty list still clears"
+        );
+
+        // And a partial match is still an answer: what survived is what applies.
+        let out = parse_assignments(
+            r#"{"assignments":[{"index":1,"tags":["ammun","invoice"]}]}"#,
+            1,
+            &vocab,
+        );
+        assert_eq!(out, vec![Some(vec!["invoice".to_string()])]);
     }
 
     /// Clearing a document's tags entirely is a real proposal — that is how a one-off label like

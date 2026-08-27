@@ -90,6 +90,52 @@ pub struct Completion {
     pub truncated: bool,
 }
 
+impl Completion {
+    /// The reply, but only when it can be treated as a FINISHED answer — `None` otherwise.
+    ///
+    /// There are two ways a reply is not one, and to every parser in this tree they look identical
+    /// to a reply that simply had nothing to say:
+    ///
+    ///   * the model hit its token ceiling mid-sentence (`truncated`), so the JSON has no closing
+    ///     bracket and the prose has no last clause; or
+    ///   * it returned nothing at all.
+    ///
+    /// Both arrive as HTTP 200 with text attached. Every structured parser here is deliberately
+    /// defensive — `parse_chat_preferences`, `parse_assignments`, `parse_vocabulary`, `parse_batch`
+    /// all degrade to an empty result rather than raise — which is right against a reliable model
+    /// and wrong against an unreliable one, because the callers then write that empty result down as
+    /// a real finding and advance a cursor past the turns it came from. Two outcomes PM could not
+    /// tell apart: "I read those forty turn-pairs and there was nothing worth learning", and "I lost
+    /// the thread". Only the first should ever be recorded.
+    ///
+    /// This is the one check that separates them, and it belongs before the parse rather than
+    /// inside it: the parsers are pure functions over a string and cannot see `finish_reason`.
+    ///
+    /// It does NOT catch a prompt cut at the FRONT — a `--context-shift` server answers `stop` and
+    /// reports its `prompt_tokens` after the cut, so nothing in the response says it happened. That
+    /// is what the pre-flight sizing in #797 is for; the two are complementary halves of "the reply
+    /// PM got back is not the reply it asked for".
+    pub fn usable_text(&self) -> Option<&str> {
+        if self.truncated {
+            return None;
+        }
+        let text = self.text.trim();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Why [`Self::usable_text`] said no, phrased for a log line or an error the user may see.
+    /// `None` when the reply was usable.
+    pub fn unusable_reason(&self) -> Option<&'static str> {
+        if self.truncated {
+            Some("the model's reply was cut off before it finished")
+        } else if self.text.trim().is_empty() {
+            Some("the model returned an empty reply")
+        } else {
+            None
+        }
+    }
+}
+
 /// The error a stream chunk reports, if any.
 ///
 /// Mid-stream failures do NOT arrive as an HTTP status — the response was already 200 and some
@@ -681,6 +727,66 @@ pub async fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completion(text: &str, truncated: bool) -> Completion {
+        Completion {
+            text: text.into(),
+            model: None,
+            usage: Usage::default(),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn a_finished_answer_and_a_failed_one_are_now_different_things() {
+        // The pair PM could not tell apart. Both arrive as HTTP 200 with text attached, and every
+        // structured parser in the tree degrades to an empty result rather than raising — so the
+        // caller wrote both down as "there was nothing to find" and moved a cursor past the turns
+        // they came from.
+        assert_eq!(
+            completion("[]", false).usable_text(),
+            Some("[]"),
+            "an empty ARRAY is a real answer — most conversations state no preference"
+        );
+        assert_eq!(
+            completion("  - a bullet  ", false).usable_text(),
+            Some("- a bullet"),
+            "usable text comes back trimmed"
+        );
+
+        // Cut off at the token ceiling: the JSON has no closing bracket and the prose has no last
+        // clause, but nothing about the response says so except this flag.
+        assert_eq!(completion(r#"[{"scope":"glob"#, true).usable_text(), None);
+        // Nothing at all.
+        assert_eq!(completion("", false).usable_text(), None);
+        assert_eq!(completion("   \n  ", false).usable_text(), None);
+
+        // The reason is the part a user can act on, so it has to distinguish the two as well.
+        assert!(completion("x", true)
+            .unusable_reason()
+            .unwrap()
+            .contains("cut off"));
+        assert!(completion(" ", false)
+            .unusable_reason()
+            .unwrap()
+            .contains("empty"));
+        assert_eq!(completion("fine", false).unusable_reason(), None);
+    }
+
+    #[test]
+    fn a_prompt_cut_at_the_front_is_deliberately_not_caught_here() {
+        // The complementary half, stated so nobody widens this into a claim it cannot make. A
+        // server running with `--context-shift` discards the front of an over-long prompt, answers
+        // `finish_reason: stop`, and reports its `prompt_tokens` AFTER the cut. The reply is a
+        // complete, well-formed answer to a question PM did not ask, and there is nothing in the
+        // response to detect it by — which is why the sizing check that prevents it has to run
+        // BEFORE the request goes out.
+        let answered_a_decapitated_prompt = completion(r#"{"assignments":[]}"#, false);
+        assert!(
+            answered_a_decapitated_prompt.usable_text().is_some(),
+            "this check is about the REPLY; input truncation is unobservable from here"
+        );
+    }
 
     #[test]
     fn a_mid_stream_error_chunk_is_an_error() {

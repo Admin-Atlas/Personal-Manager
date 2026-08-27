@@ -400,7 +400,20 @@ pub async fn generate(
         completion: c,
         meta,
     } = crate::llm_gateway::complete(app, plan, &messages, false).await?;
-    Ok((clean(&c.text), c.usage, c.model, meta))
+    // A cut-off briefing is worse than no briefing, because of how the refresh gate works:
+    // `save_briefing` stores the body together with the FINGERPRINT of the facts it was written
+    // from, and `auto_refresh_due` only regenerates when that fingerprint changes. So a briefing
+    // that stops after two sentences is stored as the current answer for the current facts and no
+    // automatic trigger — not launch, not the hourly tick, not an inputs-changed nudge — will ever
+    // replace it. Only a manual Refresh escapes. Erroring here leaves yesterday's briefing (or none)
+    // and the next tick tries again.
+    let Some(text) = c.usable_text() else {
+        return Err(crate::error::Error::Other(format!(
+            "couldn't write the briefing — {}",
+            c.unusable_reason().unwrap_or("the reply could not be used")
+        )));
+    };
+    Ok((clean(text), c.usage, c.model, meta))
 }
 
 /// Build the briefing prompt: the snapshot in, a short plain-text briefing out. The

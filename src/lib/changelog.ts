@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.4-alpha",
+    date: "2026-08-27",
+    highlights: [
+      'PM could not tell a bad answer from an empty one, and it wrote both down as an answer. When a model gets cut off mid-sentence, what comes back looks the same as a model that simply found nothing to say — the same successful response, with text attached. PM\'s readers are built to shrug and carry on rather than complain, so a half-finished reply quietly became "there was nothing here", and PM then marked that work done and moved past it.',
+      "That mattered most where moving past it is permanent. A cut-off summary was folded into your conversation's running summary and the messages behind it were never read again. A cut-off pass over your chat history marked those messages as scanned, so anything you had said about how you like things done was lost with them. The one-time import of your old profile notes stamped itself as complete and would never have run again. A cut-off daily briefing was saved as the answer for today's facts, so nothing would have replaced it until those facts changed.",
+      "None of those now count as an answer. PM leaves the work where it is and tries again next time, and says which of the two happened rather than reporting nothing found.",
+      'One more, and this one was rewriting your files: in the whole-library re-tagging pass, a model that ignored the tag list and invented its own labels had all of them thrown away — correctly — and the document then came back with no tags at all, which PM offered as "remove every tag from this document". A model saying "none of these fit" is a real answer and still does that. A model that never used the list is not, and now proposes nothing.',
+    ],
+  },
+  {
     version: "3.130.3-alpha",
     date: "2026-08-27",
     highlights: [

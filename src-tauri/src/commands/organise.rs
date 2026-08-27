@@ -258,7 +258,14 @@ pub async fn propose_metadata(
             let messages = retag::vocabulary_messages(&sample, max);
             match llm_gateway::complete(&app, &plan, &messages, false).await {
                 Ok(outcome) => {
-                    let seeded = retag::parse_vocabulary(&outcome.completion.text, max);
+                    // An unusable reply yields no vocabulary, not a partial one — and the
+                    // `!seeded.is_empty()` guard below is what keeps it from being persisted as
+                    // this import's settled answer.
+                    let seeded = outcome
+                        .completion
+                        .usable_text()
+                        .map(|t| retag::parse_vocabulary(t, max))
+                        .unwrap_or_default();
                     usage_rows.push((
                         outcome.completion.model.clone(),
                         outcome.completion.usage,
@@ -541,7 +548,11 @@ async fn propose_vocabulary_inner(app: &AppHandle, sink: &retag::RetagSink) -> R
         retag::vocabulary_messages(&retag::sample_titles_within(&titles, max, ceiling), max);
     // No cache_prefix: one call per pass, so there is no prefix to reuse.
     let outcome = llm_gateway::complete(app, &plan, &messages, false).await?;
-    let vocabulary = retag::parse_vocabulary(&outcome.completion.text, max);
+    let vocabulary = outcome
+        .completion
+        .usable_text()
+        .map(|t| retag::parse_vocabulary(t, max))
+        .unwrap_or_default();
     log_background_usage(
         app,
         plan.models(),
@@ -697,7 +708,13 @@ async fn retag_assign(
                     outcome.completion.usage,
                     outcome.meta,
                 ));
-                retag::parse_assignments(&outcome.completion.text, chunk.len(), vocabulary)
+                match outcome.completion.usable_text() {
+                    Some(text) => retag::parse_assignments(text, chunk.len(), vocabulary),
+                    // A cut-off reply is not an empty one. Left as `None` slots, which this pass
+                    // already treats as "no proposal for these documents" — they keep the tags they
+                    // have rather than being staged as a change.
+                    None => vec![None; chunk.len()],
+                }
             }
             // Best-effort, like the filing pass: a failed batch leaves those documents unproposed
             // rather than sinking the run. They keep the tags they have.

@@ -534,7 +534,25 @@ pub async fn distill_blob(
     // Distillation doesn't record usage, so the serving metadata is discarded.
     let crate::llm_gateway::LlmOutcome { completion: c, .. } =
         crate::llm_gateway::complete(app, plan, &messages, false).await?;
-    Ok(parse_pref_array(&c.text))
+    // This one must not degrade quietly. Its caller — `commands::prefs::migrate_preferences_once` —
+    // stamps `MIGRATED_FLAG_KEY` in the same transaction as the records it inserts, and that flag is
+    // a ONE-WAY DOOR: the migration is guarded on it and never runs again. An unreadable reply
+    // returning an empty Vec therefore converted the whole legacy Learning-You blob into zero
+    // records, for good. (The blob itself is archived under `LEGACY_PROFILE_KEY`, not deleted, so
+    // nothing is unrecoverable by hand — but nothing in the app would ever look at it again.)
+    // Erroring leaves the blob unstamped, and a later trigger retries.
+    let Some(text) = c.usable_text() else {
+        return Err(crate::error::Error::Other(format!(
+            "couldn't read the imported profile — {}",
+            c.unusable_reason().unwrap_or("the reply could not be used")
+        )));
+    };
+    if extract_json(text, '[', ']').is_none() {
+        return Err(crate::error::Error::Other(
+            "couldn't read the imported profile — the model's reply held no readable list".into(),
+        ));
+    }
+    Ok(parse_pref_array(text))
 }
 
 /// Cap on the already-known list injected into the distil prompt. A user with hundreds of records
@@ -705,8 +723,22 @@ pub fn render_chat_extract_request(
 /// ALLOWED (a chat can name a project — the caller resolves the name to an entity), capped at
 /// [`MAX_CHAT_PREFS`]. The reply is untrusted model output, extracted + validated defensively exactly
 /// like [`parse_pref_array`]. Pure — unit-tested without a model.
-pub fn parse_chat_preferences(raw: &str) -> Vec<DraftPreference> {
-    parse_pref_array_inner(raw, true, MAX_CHAT_PREFS)
+///
+/// Returns an `Option` rather than a bare `Vec` because `Some(vec![])` and `None` are the two
+/// outcomes the defensive parse has always collapsed into one,
+/// and the caller writes both down the same way — as "there was nothing to learn in those turns" —
+/// then advances the extraction cursor past them, so they are never offered again.
+///
+///   * `Some(records)` — a JSON array was found and yielded these records. An empty one is a real,
+///     common and correct answer: most conversations state no preference.
+///   * `None` — no JSON array was found. The reply was prose, an apology, or an array cut off before
+///     its closing bracket. `extract_json` is first-`[`-to-last-`]` and a record contains no nested
+///     array, so a truncated reply has no `]` anywhere and lands here.
+///
+/// Only the first is a result.
+pub fn parse_chat_preferences(raw: &str) -> Option<Vec<DraftPreference>> {
+    extract_json(raw, '[', ']')?;
+    Some(parse_pref_array_inner(raw, true, MAX_CHAT_PREFS))
 }
 
 // --- defensive parsing of untrusted model JSON ------------------------------
@@ -1123,6 +1155,38 @@ mod tests {
         );
     }
 
+    /// The distinction the extraction cursor turns on. `parse_chat_preferences` returns a `Vec` and
+    /// cannot say which of these it is looking at, and the caller advances `prefs_covers_up_to_turn_id`
+    /// either way — so an unreadable reply marked the turns scanned and lost whatever the user
+    /// stated in them, permanently (the reconcile query only ever offers turns PAST the cursor).
+    #[test]
+    fn an_empty_list_and_an_unreadable_reply_are_no_longer_the_same_answer() {
+        // A real, common, correct answer: nothing was stated.
+        assert_eq!(parse_chat_preferences("[]"), Some(vec![]));
+        assert_eq!(
+            parse_chat_preferences("Nothing stated.\n```json\n[]\n```"),
+            Some(vec![]),
+            "still an answer through a code fence"
+        );
+
+        // Not an answer: prose instead of a list.
+        assert_eq!(
+            parse_chat_preferences("I'm sorry, I can't help with that."),
+            None
+        );
+        // Not an answer: cut off at the token ceiling. `extract_json` is first-`[` to last-`]`, and a
+        // preference record holds no nested array, so a truncated reply has no `]` anywhere.
+        assert_eq!(
+            parse_chat_preferences(r#"[{"scope":"global","value":"file invoices und"#),
+            None
+        );
+        assert_eq!(parse_chat_preferences(""), None);
+
+        // A readable list still yields its records.
+        let good = r#"[{"scope":"global","value":"file invoices under Finances"}]"#;
+        assert_eq!(parse_chat_preferences(good).unwrap().len(), 1);
+    }
+
     #[test]
     fn parse_pref_array_is_defensive() {
         // Wrapped in prose + code fences, with a bad scope, a missing value, and a junk row.
@@ -1351,16 +1415,18 @@ mod tests {
             {\"scope\":\"global\",\"value\":\"Use DD-MM-YYYY dates\"},\
             {\"scope\":\"project\",\"project\":\"Atlas\",\"value\":\"Keep replies terse\"}\
             ]\n```";
-        let drafts = parse_chat_preferences(raw);
+        let drafts = parse_chat_preferences(raw).expect("a readable array");
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts[0].scope, SCOPE_GLOBAL);
         assert_eq!(drafts[0].value, "Use DD-MM-YYYY dates");
         assert_eq!(drafts[1].scope, SCOPE_PROJECT);
         assert_eq!(drafts[1].project_name.as_deref(), Some("Atlas"));
 
-        // "no preferences" reply → empty (the common case on ordinary chatter).
-        assert!(parse_chat_preferences("[]").is_empty());
-        assert!(parse_chat_preferences("nothing here").is_empty());
+        // "no preferences" reply → an empty list, which is an ANSWER (the common case on ordinary
+        // chatter). Prose with no list in it is not, and is now `None` — see
+        // `an_empty_list_and_an_unreadable_reply_are_no_longer_the_same_answer`.
+        assert_eq!(parse_chat_preferences("[]"), Some(vec![]));
+        assert_eq!(parse_chat_preferences("nothing here"), None);
     }
 
     #[test]

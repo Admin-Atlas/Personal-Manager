@@ -181,7 +181,9 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
     let messages = render_title_request(&segment);
     let crate::llm_gateway::LlmOutcome { completion, meta } =
         crate::llm_gateway::complete(app, &route, &messages, false).await?;
-    let Some(title) = clamp_title(&completion.text) else {
+    // `apply_title` is guarded on `pending`, so a title that lands is the one this conversation
+    // keeps — a name cut off mid-word would stick until the user renamed it by hand.
+    let Some(title) = completion.usable_text().and_then(clamp_title) else {
         return Ok(false);
     };
 
