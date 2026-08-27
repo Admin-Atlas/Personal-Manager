@@ -617,6 +617,18 @@ pub struct LocalLlmStatus {
     pub chat_local_model: Option<String>,
     /// The same for background work (filing, titles, summaries, learning).
     pub background_local_model: Option<String>,
+    /// The context window the server is actually serving for the model bound to the demanding role
+    /// — background if it is local, else chat. `None` until a call has loaded a model, because both
+    /// proven rungs of the ladder only answer while one is resident.
+    ///
+    /// Here because it is the number that explains the symptom. PM already probes it, caches it, and
+    /// sizes every prompt against it — and until now the only thing that could read it was the chat
+    /// meter. A user whose server is serving Ollama's default 4096 has no way to learn that from PM,
+    /// and no reason to connect it to filing suddenly getting worse.
+    pub served_window: Option<u32>,
+    /// Whether [`Self::served_window`] was measured (`/slots`, `/api/ps`) or is PM's conservative
+    /// floor. The UI must not present a guess as a reading.
+    pub served_window_proven: bool,
 }
 
 /// The local model a role will really use, or `None` when the role goes to cloud.
@@ -638,10 +650,11 @@ pub fn role_local_model(routing: Option<&str>, bound: Option<&str>) -> Option<St
 #[tauri::command]
 pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
     // One connection for every setting this needs, dropped before the first await.
-    let (configured, chat_local_model, background_local_model) = {
+    let (base_url, configured, chat_local_model, background_local_model) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let configured = db::get_setting(&conn, LOCAL_BASE_URL_KEY)?.is_some();
+        let base_url = db::get_setting(&conn, LOCAL_BASE_URL_KEY)?;
+        let configured = base_url.is_some();
         let chat = role_local_model(
             db::get_setting(&conn, CHAT_ROUTING_KEY)?.as_deref(),
             db::get_setting(&conn, LOCAL_CHAT_MODEL_KEY)?.as_deref(),
@@ -650,7 +663,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             db::get_setting(&conn, BACKGROUND_ROUTING_KEY)?.as_deref(),
             db::get_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?.as_deref(),
         );
-        (configured, chat, background)
+        (base_url, configured, chat, background)
     };
     if !configured {
         return Ok(LocalLlmStatus {
@@ -661,6 +674,8 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             probed_now: false,
             chat_local_model: None,
             background_local_model: None,
+            served_window: None,
+            served_window_proven: false,
         });
     }
 
@@ -710,6 +725,23 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             .unwrap_or(false)
     };
 
+    // Background first: it is the demanding role — the one sending index-matched arrays over several
+    // documents — so when the two roles run different models its window is the one worth reporting.
+    let (served_window, served_window_proven) = match (
+        base_url.as_deref(),
+        background_local_model
+            .as_deref()
+            .or(chat_local_model.as_deref()),
+    ) {
+        (Some(url), Some(model)) => {
+            match app.state::<AppState>().local_ai.cached_window(url, model) {
+                Some(w) => (Some(w.tokens), w.source.is_proven()),
+                None => (None, false),
+            }
+        }
+        _ => (None, false),
+    };
+
     Ok(LocalLlmStatus {
         configured: true,
         reachable,
@@ -718,6 +750,8 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         probed_now: probe_now,
         chat_local_model,
         background_local_model,
+        served_window,
+        served_window_proven,
     })
 }
 

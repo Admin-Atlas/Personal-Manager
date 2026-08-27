@@ -158,6 +158,42 @@ fn render_summary_request(existing: Option<&str>, segment: &[chat::TurnPair]) ->
     ]
 }
 
+/// Trim a planned segment to what the answering server can actually read, returning the cursor it now
+/// advances to. `None` (a cloud route, or a local window PM has not learned yet) changes nothing.
+///
+/// **The cursor is recomputed from the TRIMMED span, and that is the entire point.**
+/// [`apply_extension`] advances the cursor to `new_cursor` whether or not the model produced
+/// anything usable, so a cursor that runs past turns the model never saw folds those turns into
+/// nothing — permanently, since the summary is append-only and has no undo outside the explicit
+/// Compress path. That is the exact loss a front-truncating server causes today: the pairs beyond
+/// the window are discarded by the server, the cursor advances over them anyway.
+///
+/// `compress_now`'s segment is the one genuinely unbounded prompt in the tree — `compress_segment`
+/// folds every pair above [`COMPRESS_FLOOR_PAIRS`] with no upper bound, so a 200-pair backlog builds
+/// a prompt thirty times a 4096-token window. The [`crate::context_budget::SUMMARY_CAP_FRAC`] guard
+/// does not cover it: that one only decides whether the UI *offers* the button.
+///
+/// Never returns an empty segment — a single pair too large for the window is sent and refused by
+/// name, which the user can act on, rather than skipped, which they cannot see.
+fn fit_segment(
+    existing: Option<&str>,
+    segment: &mut Vec<chat::TurnPair>,
+    ceiling: Option<i64>,
+) -> Option<i64> {
+    if segment.is_empty() {
+        return None;
+    }
+    let n = context_budget::largest_fitting(segment.len(), ceiling, |n| {
+        context_budget::est_messages_tokens_upper(
+            render_summary_request(existing, &segment[..n])
+                .iter()
+                .map(|m| m.content.as_str()),
+        )
+    });
+    segment.truncate(n);
+    segment.last().map(|p| p.turn_id)
+}
+
 /// Land one extension atomically: append `new_segment` to the stored summary (re-reading it inside the
 /// transaction so the append is consistent) and advance the cursor to `new_cursor` — together, so a crash
 /// between the model call and this write simply re-summarises the same span next run (idempotent; never a
@@ -235,7 +271,16 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
             break;
         };
 
-        // 3. Summarise the new span (async, no lock held).
+        // 3. Summarise the new span (async, no lock held). Sized to the served window first: the
+        //    cursor advances to the end of what we SEND, so it must never run past what the model
+        //    could read.
+        let mut plan = plan;
+        let ceiling = crate::llm_gateway::prompt_ceiling_for(app, &route);
+        if let Some(fitted) =
+            fit_segment(plan.existing_summary.as_deref(), &mut plan.segment, ceiling)
+        {
+            plan.new_cursor = fitted;
+        }
         let messages = render_summary_request(plan.existing_summary.as_deref(), &plan.segment);
         let crate::llm_gateway::LlmOutcome { completion, meta } =
             crate::llm_gateway::complete(app, &route, &messages, false).await?;
@@ -358,7 +403,16 @@ pub(crate) async fn compress_now(
         return Ok(None);
     };
 
-    // 3. Summarise the folded span (async, no lock held).
+    // 3. Summarise the folded span (async, no lock held). Sized to the served window first — this
+    //    is the unbounded one: `compress_segment` folds every pair above the verbatim floor, so a
+    //    long backlog builds a prompt many times a small window. Folding fewer pairs per press is
+    //    the right degradation; the user can press Compress again.
+    let mut segment = segment;
+    let mut new_cursor = new_cursor;
+    let ceiling = crate::llm_gateway::prompt_ceiling_for(app, &route);
+    if let Some(fitted) = fit_segment(snapshot.prev_summary.as_deref(), &mut segment, ceiling) {
+        new_cursor = fitted;
+    }
     let messages = render_summary_request(snapshot.prev_summary.as_deref(), &segment);
     let crate::llm_gateway::LlmOutcome { completion, meta } =
         crate::llm_gateway::complete(app, &route, &messages, false).await?;

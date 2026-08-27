@@ -250,7 +250,12 @@ pub async fn propose_metadata(
         review::SeedPlan::Reuse(seeded) => seeded,
         review::SeedPlan::Ask => {
             let max = retag::vocab_max(backlog_titles.len());
-            let messages = retag::vocabulary_messages(&retag::sample_titles(&backlog_titles), max);
+            // Sized to the local server's served window when there is one. This is the first
+            // background call a fresh store makes, and at 400 uncapped titles it is also the one
+            // most likely to overflow — see `retag::sample_titles_within`.
+            let ceiling = llm_gateway::prompt_ceiling_for(&app, &plan);
+            let sample = retag::sample_titles_within(&backlog_titles, max, ceiling);
+            let messages = retag::vocabulary_messages(&sample, max);
             match llm_gateway::complete(&app, &plan, &messages, false).await {
                 Ok(outcome) => {
                     let seeded = retag::parse_vocabulary(&outcome.completion.text, max);
@@ -287,15 +292,25 @@ pub async fn propose_metadata(
     // cached system prefix; each document's folder rides in the user message beside it, as data
     // (#509). A folder BIASES its own document's proposal but never pre-assigns a project — the
     // review checkpoint is unchanged.
-    for chunk in review::batches(&pending) {
-        let docs: Vec<review::DocInput<'_>> = chunk
+    //
+    // The batch is sized DOWN when the answering server's window can't hold five documents plus the
+    // run-wide system prefix; `review::BATCH_SIZE` is still the ceiling.
+    let filing_ceiling = llm_gateway::prompt_ceiling_for(&app, &plan);
+    let mut cursor = 0usize;
+    while cursor < pending.len() {
+        let all: Vec<review::DocInput<'_>> = pending[cursor..]
             .iter()
+            .take(review::BATCH_SIZE)
             .map(|p| review::DocInput {
                 title: &p.title,
                 body: &p.body,
                 folder: folder_context(p.folder.as_deref()),
             })
             .collect();
+        let take = review::batch_within(&all, &projects, &tags, profile.as_deref(), filing_ceiling);
+        let chunk = &pending[cursor..cursor + take];
+        cursor += take;
+        let docs: Vec<review::DocInput<'_>> = all.into_iter().take(take).collect();
         let mut outcome =
             review::propose_batch(&app, &plan, &docs, &projects, &tags, profile.as_deref()).await;
         let batch_error = outcome.error.clone();
@@ -521,7 +536,9 @@ async fn propose_vocabulary_inner(app: &AppHandle, sink: &retag::RetagSink) -> R
     }
     let titles: Vec<String> = docs.iter().map(|d| d.title.clone()).collect();
     let max = retag::vocab_max(docs.len());
-    let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
+    let ceiling = llm_gateway::prompt_ceiling_for(app, &plan);
+    let messages =
+        retag::vocabulary_messages(&retag::sample_titles_within(&titles, max, ceiling), max);
     // No cache_prefix: one call per pass, so there is no prefix to reuse.
     let outcome = llm_gateway::complete(app, &plan, &messages, false).await?;
     let vocabulary = retag::parse_vocabulary(&outcome.completion.text, max);
@@ -655,14 +672,21 @@ async fn retag_assign(
 
     let total = docs.len();
     let mut done = 0usize;
-    for chunk in docs.chunks(retag::ASSIGN_BATCH) {
-        let inputs: Vec<retag::RetagInput<'_>> = chunk
+    let ceiling = llm_gateway::prompt_ceiling_for(app, plan);
+    let mut cursor = 0usize;
+    while cursor < docs.len() {
+        let all: Vec<retag::RetagInput<'_>> = docs[cursor..]
             .iter()
+            .take(retag::ASSIGN_BATCH)
             .map(|d| retag::RetagInput {
                 title: &d.title,
                 body: &d.body,
             })
             .collect();
+        let take = retag::assign_batch_within(&all, vocabulary, ceiling);
+        let chunk = &docs[cursor..cursor + take];
+        cursor += take;
+        let inputs: Vec<retag::RetagInput<'_>> = all.into_iter().take(take).collect();
         let messages = retag::assign_messages(&inputs, vocabulary);
         // cache_prefix: the system message holds only the vocabulary + instructions, identical for
         // every call in the run, so the provider serves it from cache (#509).

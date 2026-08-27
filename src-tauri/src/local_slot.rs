@@ -314,6 +314,10 @@ impl CallOutcome {
             // ANSWERED. A 200 settles liveness more firmly than a 404 does, and striking it would
             // eject a working server for what is a config or compatibility problem — hiding the
             // body PM could not read behind a cooldown instead of surfacing it.
+            // `PromptTooLarge` never reached the wire at all, so it says nothing about the host —
+            // it is `Neutral` rather than `Alive` for exactly that reason: an unsent request must
+            // neither strike a healthy server nor clear the strikes of a failing one.
+            LocalFailKind::PromptTooLarge => CallOutcome::Neutral,
             LocalFailKind::ModelLoading
             | LocalFailKind::ClientError(_)
             | LocalFailKind::UnrecognisedResponse => CallOutcome::Alive,
@@ -807,6 +811,13 @@ mod tests {
         assert_eq!(
             CallOutcome::for_failure(&LocalFailKind::ServerError(500)),
             CallOutcome::Strike
+        );
+        // A prompt PM refused to send says nothing about the host: it must neither strike a healthy
+        // server (a background sizing problem would otherwise put CHAT into cooldown — HealthState
+        // is shared across roles) nor clear the strikes of a failing one.
+        assert_eq!(
+            CallOutcome::for_failure(&LocalFailKind::PromptTooLarge),
+            CallOutcome::Neutral
         );
         assert_eq!(
             CallOutcome::for_failure(&LocalFailKind::ModelLoading),
