@@ -412,6 +412,12 @@ export interface ContextStatus {
   used_tokens: number | null;
   percent: number | null;
   alerting: boolean;
+  /** Where a LOCAL model's window came from: "slots" | "loaded_model" | "models_meta" | "default".
+   *  Null for a catalogued cloud model, whose window is published fact. */
+  window_source: string | null;
+  /** The window is what the server said it actually loaded, rather than something PM inferred. An
+   *  inferred window must never be rendered as if it were measured (#792). */
+  window_proven: boolean;
   compress: CompressDecision;
   upgrade: ModelOption[];
 }

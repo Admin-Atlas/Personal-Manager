@@ -121,12 +121,6 @@ pub fn catalog() -> &'static Catalog {
     })
 }
 
-/// The catalog rung of the endpoint window ladder: a matched model's advertised context window, or
-/// `None` (the ladder then falls to its conservative default). Best-effort name matching.
-pub fn context_window_for(model_id: &str) -> Option<u32> {
-    match_installed(model_id).map(|e| e.context_length)
-}
-
 /// Best-effort match of an installed/served model name back to a catalog row. Endpoints report names
 /// in many shapes — an Ollama tag (`qwen2.5:7b`), a file path, a bare repo name — so we compare on an
 /// alphanumeric-only normalization and accept a containment match either way, preferring the longest.
@@ -480,12 +474,11 @@ mod tests {
                     Some(&e.repo),
                     "failed to match {name}"
                 );
-                assert_eq!(context_window_for(name), Some(e.context_length));
             }
         }
-        // A name matching nothing returns None (the ladder falls through to its default).
+        // A name matching nothing returns None.
         assert!(match_installed("totally-unknown-model-xyz").is_none());
-        assert!(context_window_for("").is_none());
+        assert!(match_installed("").is_none());
     }
 
     #[test]

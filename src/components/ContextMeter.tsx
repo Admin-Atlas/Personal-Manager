@@ -102,6 +102,10 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
   const known = status.percent != null;
   const pct = Math.round((status.percent ?? 0) * 100);
   const alerting = status.alerting;
+  // A window PM inferred, not one the server confirmed. Only local models can be unproven: a
+  // catalogued cloud model's window is published fact and carries no source at all. Rendering the
+  // two identically is what let an 8x overstatement look like a measurement (#792).
+  const assumed = status.window_source != null && !status.window_proven;
 
   // Minimal depth stays out of the way entirely until usage is in alert territory.
   if (minimal && !alerting) return null;
@@ -156,7 +160,7 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
             onClick={toggle}
             title={
               known
-                ? `${pct}% of ${status.model}'s context used`
+                ? `${pct}% of ${status.model}'s context used${assumed ? " — assumed window, see details" : ""}`
                 : `Context usage is unknown for ${status.model}`
             }
             data-help="context-meter"
@@ -206,6 +210,15 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
               ? `This conversation is filling ${status.model}'s context (${known ? `${pct}%` : "—"}).`
               : `${status.model}'s context is ${known ? `${pct}%` : "—"} full.`}
           </p>
+          {assumed && (
+            // Unfolded on purpose: the settings doctrine folds prose but never a caveat that
+            // changes how a number should be read, and this one says the number may be wrong.
+            <p className="mt-1 text-xs text-ink4">
+              This is an assumed window — your server hasn't told PM how much context it actually
+              loaded, so the percentage could be well off. Ollama, for one, often loads far less
+              than a model can handle and says nothing about it.
+            </p>
+          )}
           <div className="mt-2 flex flex-wrap items-center gap-2">
             {status.compress.available ? (
               <Button variant="primary" onClick={handleCompress} disabled={compressing}>

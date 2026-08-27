@@ -871,15 +871,31 @@ pub struct ContextStatus {
     /// Whether usage has crossed the alert fraction — decided in Rust (the one source of truth) so the UI
     /// just renders. Always false when `percent` is unknown.
     pub alerting: bool,
+    /// Where a LOCAL model's window came from (`"slots"` | `"loaded_model"` | `"models_meta"` |
+    /// `"default"`), or `None` for a catalogued cloud model whose window is published fact.
+    /// Rendered, not decorative: an unproven window must not look like a measurement.
+    pub window_source: Option<String>,
+    /// The window is what the server said it actually loaded, rather than something PM inferred.
+    pub window_proven: bool,
     pub compress: context_budget::CompressDecision,
     pub upgrade: Vec<context_budget::ModelOption>,
 }
 
-/// The usable context budget for a configured LOCAL model: 85% of its proven window (leaving
-/// headroom), from the in-memory cache the gateway fills after a local reply. `None` when the model
-/// isn't the configured local chat/background model, or its window hasn't been probed yet. Cache-only
-/// (no network, no await) — the meter must never block on the endpoint.
-fn local_budget_window(app: &AppHandle, conn: &Connection, model: &str) -> Option<i64> {
+/// The usable context budget for a configured LOCAL model: 85% of its discovered window (leaving
+/// headroom), from the in-memory cache the gateway fills after a local reply, WITH where that window
+/// came from. `None` when the model isn't the configured local chat/background model, or its window
+/// hasn't been probed yet. Cache-only (no network, no await) — the meter must never block on the
+/// endpoint.
+///
+/// The source rides along because it is not decoration. This used to say "proven window" and drop
+/// `.source` on the floor, and on Ollama the ladder always landed on a guess at the model's TRAINED
+/// capacity — so the meter showed 9% where the truth was 61%, and could not have shown otherwise
+/// (#792). A window PM inferred must be labelled as inferred wherever it is displayed.
+fn local_budget_window(
+    app: &AppHandle,
+    conn: &Connection,
+    model: &str,
+) -> Option<(i64, crate::openai_compat::WindowSource)> {
     let base_url = db::get_setting(conn, llm_gateway::LOCAL_BASE_URL_KEY)
         .ok()
         .flatten()?;
@@ -896,7 +912,10 @@ fn local_budget_window(app: &AppHandle, conn: &Connection, model: &str) -> Optio
         .state::<AppState>()
         .local_ai
         .cached_window(&base_url, model)?;
-    Some(((info.tokens as f64 * 0.85).floor() as i64).max(1))
+    Some((
+        ((info.tokens as f64 * 0.85).floor() as i64).max(1),
+        info.source,
+    ))
 }
 
 /// How full the SELECTED model's context window is for a conversation, plus what the user can do about it
@@ -935,10 +954,13 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
         .find(|m| m.id == model)
         .and_then(|m| m.context_length)
         .map(|v| v as i64)
-        // A local model is uncatalogued — read its proven window from the in-memory cache the gateway
-        // fills after the first local reply. `None` (never chatted locally yet) → the meter stays
-        // honestly "unknown" rather than guessing.
-        .or_else(|| local_budget_window(&app, &conn, &model));
+        .map(|w| (w, None))
+        // A local model is uncatalogued — read its window from the in-memory cache the gateway fills
+        // after the first local reply. `None` (never chatted locally yet) → the meter stays honestly
+        // "unknown" rather than guessing.
+        .or_else(|| local_budget_window(&app, &conn, &model).map(|(w, s)| (w, Some(s))));
+    let window_source = context_window.and_then(|(_, s)| s);
+    let context_window = context_window.map(|(w, _)| w);
 
     // Per-conversation state: the measured last prompt size, the summary, and its cursor.
     let session: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
@@ -983,6 +1005,8 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
         used_tokens,
         percent,
         alerting: context_budget::is_alerting(percent),
+        window_source: window_source.map(|s| s.as_str().to_string()),
+        window_proven: window_source.is_some_and(|s| s.is_proven()),
         compress,
         upgrade,
     })
