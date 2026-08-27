@@ -134,6 +134,16 @@ pub enum LocalFailKind {
     /// The SSE stream broke down: an oversized line, an undecodable frame, a mid-stream `error`
     /// object, or a stream that stopped without any clean end signal.
     MalformedStream,
+    /// The endpoint answered with a success status, and PM could not read the body: unparseable
+    /// JSON, or a shape that is not the one this route returns.
+    ///
+    /// Split out of [`Self::MalformedStream`] because nothing streamed. It was raised by the
+    /// `/v1/models` probe and by the non-streaming completion path, which meant a user whose
+    /// endpoint answered 200 with an unexpected body was told "the local model stream ended
+    /// unexpectedly" about a call with no stream in it — and the one diagnosable part, the body
+    /// itself, was dropped. The host ANSWERED, so the policy treats this as alive: a server that
+    /// replies is not a dead host, and ejecting it would hide the problem behind a cooldown.
+    UnrecognisedResponse,
     /// The degenerate-stream guard tripped on an obvious token loop.
     DegenerateStream,
     /// A 503 whose body looks like "model is loading" — the host is ALIVE, just warming up. The
@@ -586,10 +596,10 @@ pub async fn probe(base_url: &str, token: Option<&str>) -> LocalResult<Vec<Strin
     let value: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| LocalFailure::new(LocalFailKind::MalformedStream, e.to_string()))?;
+        .map_err(|e| LocalFailure::new(LocalFailKind::UnrecognisedResponse, e.to_string()))?;
     if !is_models_list(&value) {
         return Err(LocalFailure::new(
-            LocalFailKind::MalformedStream,
+            LocalFailKind::UnrecognisedResponse,
             "the endpoint answered but did not look like an OpenAI /v1/models list",
         ));
     }
@@ -885,13 +895,13 @@ pub async fn complete(
     let value: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| LocalFailure::new(LocalFailKind::MalformedStream, e.to_string()))?;
+        .map_err(|e| LocalFailure::new(LocalFailKind::UnrecognisedResponse, e.to_string()))?;
     let text = value["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| {
             LocalFailure::new(
-                LocalFailKind::MalformedStream,
+                LocalFailKind::UnrecognisedResponse,
                 "the local response had no message content",
             )
         })?;

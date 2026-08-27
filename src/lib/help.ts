@@ -58,7 +58,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "sidebar-models": {
     title: "Models in use",
-    body: "The models PM is currently using — 'Chat' for your conversations and 'Tasks' for background work (sorting and learning). A '+N' badge means auto-switch is on with N fallback models behind it. Click to change them in Settings.",
+    body: "The models PM is currently using — 'Chat' for your conversations and 'Tasks' for background work (sorting and learning). Each row names whatever will actually answer: if you have pointed that role at a model on your own machine, that is the name you see, and the cloud model behind it becomes the fallback. A '+N' badge means auto-switch is on with N fallback models behind it. 'Local' below them is your own model server's connection. Click to change any of it in Settings.",
   },
   "sidebar-search": {
     title: "Search",

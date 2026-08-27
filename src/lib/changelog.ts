@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.1-alpha",
+    date: "2026-08-27",
+    highlights: [
+      'The model list at the bottom of the sidebar was naming the wrong model. If you had pointed PM at a model on your own machine, it kept showing the cloud model\'s name — and put "Local: connected" directly underneath, which read as "cloud is doing the work, your machine is standing by" when the exact opposite was true. Each row now names whatever will actually answer, and hovering tells you what\'s behind it as a fallback.',
+      "And a local server that answers with something PM doesn't understand no longer claims a stream broke. That message appeared for checks that never streamed anything, and it threw away the one useful part — what the server actually said. PM now says plainly that it couldn't read the answer, shows you the answer, and stops treating a server that replied as one that died.",
+    ],
+  },
+  {
     version: "3.130.0-alpha",
     date: "2026-08-27",
     highlights: [

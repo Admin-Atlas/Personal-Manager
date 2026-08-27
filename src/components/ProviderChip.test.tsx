@@ -17,6 +17,8 @@ const st = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   in_cooldown: false,
   cooldown_remaining_s: 0,
   probed_now: true,
+  chat_local_model: null,
+  background_local_model: null,
   ...over,
 });
 
