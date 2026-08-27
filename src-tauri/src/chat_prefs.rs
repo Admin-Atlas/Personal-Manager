@@ -34,7 +34,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::{AppHandle, Manager};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::preferences::{self, DraftPreference};
 use crate::{chat, entities, secrets, AppState};
 
@@ -231,7 +231,26 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
     let messages = preferences::render_chat_extract_request(&user_turns, &project_names);
     let crate::llm_gateway::LlmOutcome { completion, meta } =
         crate::llm_gateway::complete(app, &route, &messages, false).await?;
-    let drafts = preferences::parse_chat_preferences(&completion.text);
+    // The comment above has always claimed a parse failure keeps the cursor put. Only the CALL
+    // error did: `parse_chat_preferences` never fails — it is deliberately defensive, so an
+    // unreadable reply became an empty Vec, and `persist_extraction` advanced the cursor over those
+    // turns regardless. The two outcomes it could not tell apart were "I read those forty turn-pairs
+    // and there was nothing worth learning" and "I lost the thread", and only the first is a result.
+    // Now both halves of that are real errors: a reply that was cut off or empty, and a reply with
+    // no JSON array in it at all.
+    let Some(text) = completion.usable_text() else {
+        return Err(Error::Other(format!(
+            "couldn't extract preferences — {}",
+            completion
+                .unusable_reason()
+                .unwrap_or("the reply could not be used")
+        )));
+    };
+    let Some(drafts) = preferences::parse_chat_preferences(text) else {
+        return Err(Error::Other(
+            "couldn't extract preferences — the model's reply held no readable list".into(),
+        ));
+    };
 
     // 4. Short write lock: land the records (resolve + dedup) and advance the cursor together; log spend.
     let inserted = {

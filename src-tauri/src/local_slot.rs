@@ -882,6 +882,33 @@ mod tests {
         assert_eq!(jitter_up_to(Duration::ZERO), Duration::ZERO);
     }
 
+    /// `Ok` is the strongest signal in the enum — it clears the strike streak, lifts an active
+    /// cooldown AND resets the ejection count that drives the escalation. A host that answers but
+    /// never finishes must not get that, or a server truncating every reply looks perfectly healthy
+    /// however many times it has already been ejected. `Alive` is the honest reading: it responded.
+    #[test]
+    fn alive_says_the_host_responded_without_wiping_its_record() {
+        let mut h = HealthState::default();
+        let t0 = Instant::now();
+
+        // Three strikes: ejected, and the escalation counter is now 1.
+        for _ in 0..tunables::COOLDOWN_FAILURE_THRESHOLD {
+            h.observe(CallOutcome::Strike, t0);
+        }
+        assert!(h.in_cooldown(t0), "three strikes ⇒ resting");
+
+        // An answered-but-truncated call clears the streak and does NOT lift the cooldown early.
+        h.observe(CallOutcome::Alive, t0);
+        assert!(
+            h.in_cooldown(t0),
+            "a host that answered without finishing has not earned its way out"
+        );
+
+        // A genuinely clean reply does lift it, and resets the escalation.
+        h.observe(CallOutcome::Ok, t0);
+        assert!(!h.in_cooldown(t0));
+    }
+
     #[test]
     fn window_cache_round_trips_per_endpoint_and_model() {
         use crate::openai_compat::{WindowInfo, WindowSource};

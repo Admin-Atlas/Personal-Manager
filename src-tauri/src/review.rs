@@ -362,11 +362,23 @@ pub async fn propose_batch(
         Ok(crate::llm_gateway::LlmOutcome {
             completion: c,
             meta,
-        }) => BatchOutcome {
-            proposals: parse_batch(&c.text, docs.len()),
-            usage: Some((c.usage, c.model, meta)),
-            error: None,
-        },
+        }) => {
+            // Filing is already the safest path in the tree — an unanswered slot is retried alone
+            // and then staged as Unsorted, so nothing is silently mis-filed. What it could not do
+            // was SAY why. A cut-off reply and a reply the model got wrong both surfaced as "the
+            // reply couldn't be read", which sends the user looking at their model instead of at
+            // their server's context window.
+            let reason = c.unusable_reason();
+            let proposals = match c.usable_text() {
+                Some(text) => parse_batch(text, docs.len()),
+                None => vec![None; docs.len()],
+            };
+            BatchOutcome {
+                proposals,
+                usage: Some((c.usage, c.model, meta)),
+                error: reason.map(|r| format!("Proposal request failed: {r}")),
+            }
+        }
         Err(e) => BatchOutcome {
             proposals: vec![None; docs.len()],
             usage: None,
