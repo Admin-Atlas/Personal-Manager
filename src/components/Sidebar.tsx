@@ -607,8 +607,23 @@ export function Sidebar({
             title="Models in use — click to change"
             className="mb-1 w-full rounded-[var(--radius-sm)] px-3 py-1.5 text-left hover:bg-surface"
           >
-            <ModelRow role="Chat" id={chatModel} fallbacks={chatFallbacks} />
-            <ModelRow role="Tasks" id={backgroundModel} fallbacks={backgroundFallbacks} />
+            {/* `id` is the OpenRouter list; `local` is what routing will really reach for. The
+                rows used to render `id` unconditionally with no access to routing at all, so a
+                machine answering every turn from its own GPU displayed a cloud model's name — and
+                read together with "Local connected" below, the footer stated the exact inverse of
+                what was happening. */}
+            <ModelRow
+              role="Chat"
+              id={chatModel}
+              local={localAi?.chat_local_model ?? null}
+              fallbacks={chatFallbacks}
+            />
+            <ModelRow
+              role="Tasks"
+              id={backgroundModel}
+              local={localAi?.background_local_model ?? null}
+              fallbacks={backgroundFallbacks}
+            />
             <LocalRow status={localAi} />
           </button>
         )}
@@ -637,12 +652,27 @@ export function Sidebar({
 }
 
 /** One line of the footer model tag: role label, active model, fallback count. */
-function ModelRow({ role, id, fallbacks }: { role: string; id: string | null; fallbacks: number }) {
+function ModelRow({
+  role,
+  id,
+  local,
+  fallbacks,
+}: {
+  role: string;
+  id: string | null;
+  /** The local model this role will really reach for, when routing sends it there. */
+  local: string | null;
+  fallbacks: number;
+}) {
+  const shown = local ?? id;
+  const title = local
+    ? `${local} — running on this machine${id ? `; ${id} is the cloud fallback` : ""}`
+    : (id ?? "Using the default model");
   return (
     <div className="flex items-center gap-1.5 text-xs leading-5">
       <span className="w-9 shrink-0 font-mono text-ink4">{role}</span>
-      <span className="min-w-0 flex-1 truncate text-ink3" title={id ?? "Using the default model"}>
-        {id ? shortModel(id) : "default"}
+      <span className="min-w-0 flex-1 truncate text-ink3" title={title}>
+        {shown ? shortModel(shown) : "default"}
       </span>
       {fallbacks > 0 && (
         <span

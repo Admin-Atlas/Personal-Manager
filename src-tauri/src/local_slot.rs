@@ -310,7 +310,13 @@ impl CallOutcome {
     /// fault"; nothing downstream re-decides this by inspecting a `LocalFailKind` again.
     pub fn for_failure(kind: &LocalFailKind) -> Self {
         match kind {
-            LocalFailKind::ModelLoading | LocalFailKind::ClientError(_) => CallOutcome::Alive,
+            // `UnrecognisedResponse` sits here for the same reason as `ClientError`: the host
+            // ANSWERED. A 200 settles liveness more firmly than a 404 does, and striking it would
+            // eject a working server for what is a config or compatibility problem — hiding the
+            // body PM could not read behind a cooldown instead of surfacing it.
+            LocalFailKind::ModelLoading
+            | LocalFailKind::ClientError(_)
+            | LocalFailKind::UnrecognisedResponse => CallOutcome::Alive,
             LocalFailKind::Refused
             | LocalFailKind::Timeout
             | LocalFailKind::MalformedStream
@@ -811,6 +817,17 @@ mod tests {
             CallOutcome::for_failure(&LocalFailKind::ClientError(404)),
             CallOutcome::Alive,
             "a 4xx means the host answered — config problem, not a dead host"
+        );
+        assert_eq!(
+            CallOutcome::for_failure(&LocalFailKind::UnrecognisedResponse),
+            CallOutcome::Alive,
+            "a 200 PM could not read settles liveness more firmly than a 404 does — striking it \
+             would eject a working server and hide the body behind a cooldown"
+        );
+        // The stream kinds keep their strike: those really are the host failing mid-flight.
+        assert_eq!(
+            CallOutcome::for_failure(&LocalFailKind::MalformedStream),
+            CallOutcome::Strike
         );
     }
 

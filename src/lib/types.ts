@@ -1933,6 +1933,11 @@ export interface LocalLlmStatus {
   in_cooldown: boolean;
   cooldown_remaining_s: number;
   probed_now: boolean;
+  /** The local model bound to Chat, but only when chat routing actually sends chat to it — null
+   *  means the role goes to cloud and the cloud model is the true answer for that row. */
+  chat_local_model: string | null;
+  /** The same for background work. */
+  background_local_model: string | null;
 }
 
 /** One progress tick from an Ollama model pull (openai_compat.rs PullProgress). */

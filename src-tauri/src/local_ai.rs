@@ -607,6 +607,29 @@ pub struct LocalLlmStatus {
     /// Whether the reachability figure came from a fresh probe this call, or is the last-known value
     /// (a probe was skipped by the debounce so a fast-polling UI can't spam the user's server).
     pub probed_now: bool,
+    /// The local model bound to Chat, but ONLY when chat routing actually sends chat to it. `None`
+    /// means the role goes to cloud, and the cloud model is the true answer for that row.
+    ///
+    /// Here because the model footer used to read the OpenRouter list for both rows and had no
+    /// access to routing at all — so a machine answering every turn from its own GPU displayed a
+    /// cloud model's name, and the local line underneath said only "connected". Read as a set, the
+    /// footer stated the exact inverse of what was happening.
+    pub chat_local_model: Option<String>,
+    /// The same for background work (filing, titles, summaries, learning).
+    pub background_local_model: Option<String>,
+}
+
+/// The local model a role will really use, or `None` when the role goes to cloud.
+///
+/// Pure over the two settings so the "what is actually answering" question has one answer, testable
+/// without a database. `"cloud"` (and an absent preference, which parses to it) means the local
+/// binding is irrelevant however it is set; both local preferences mean local is tried FIRST, which
+/// is what the footer is reporting.
+pub fn role_local_model(routing: Option<&str>, bound: Option<&str>) -> Option<String> {
+    match routing.unwrap_or("cloud") {
+        "local" | "local-then-cloud" => bound.filter(|m| !m.is_empty()).map(str::to_string),
+        _ => None,
+    }
 }
 
 /// A live status snapshot for the Local AI tab / the chat honesty surface (#297 PR5/PR6). Reads the
@@ -614,10 +637,20 @@ pub struct LocalLlmStatus {
 /// one `/v1/models` reachability probe so a fast UI poll can't hammer the user's server.
 #[tauri::command]
 pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
-    let configured = {
+    // One connection for every setting this needs, dropped before the first await.
+    let (configured, chat_local_model, background_local_model) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?.is_some()
+        let configured = db::get_setting(&conn, LOCAL_BASE_URL_KEY)?.is_some();
+        let chat = role_local_model(
+            db::get_setting(&conn, CHAT_ROUTING_KEY)?.as_deref(),
+            db::get_setting(&conn, LOCAL_CHAT_MODEL_KEY)?.as_deref(),
+        );
+        let background = role_local_model(
+            db::get_setting(&conn, BACKGROUND_ROUTING_KEY)?.as_deref(),
+            db::get_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?.as_deref(),
+        );
+        (configured, chat, background)
     };
     if !configured {
         return Ok(LocalLlmStatus {
@@ -626,6 +659,8 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             in_cooldown: false,
             cooldown_remaining_s: 0,
             probed_now: false,
+            chat_local_model: None,
+            background_local_model: None,
         });
     }
 
@@ -681,6 +716,8 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         in_cooldown,
         cooldown_remaining_s,
         probed_now: probe_now,
+        chat_local_model,
+        background_local_model,
     })
 }
 
@@ -1408,6 +1445,31 @@ mod tests {
             offered >= 60,
             "only {offered} quant rows are downloadable — the catalogue lost its pull tags"
         );
+    }
+
+    #[test]
+    fn the_footer_names_a_local_model_only_when_routing_actually_reaches_it() {
+        // The defect: the model footer read the OpenRouter list for both rows and had no access to
+        // routing at all, so a machine answering every turn from its own GPU displayed a cloud
+        // model's name — with "Local connected" underneath it, stating the exact inverse.
+        assert_eq!(
+            role_local_model(Some("local"), Some("qwen2.5:7b")),
+            Some("qwen2.5:7b".to_string())
+        );
+        assert_eq!(
+            role_local_model(Some("local-then-cloud"), Some("qwen2.5:7b")),
+            Some("qwen2.5:7b".to_string()),
+            "local is tried FIRST, so it is what answers"
+        );
+
+        // Cloud routing: the binding is irrelevant however it is set, and the cloud model is the
+        // honest answer for that row.
+        assert_eq!(role_local_model(Some("cloud"), Some("qwen2.5:7b")), None);
+        // An absent preference parses to cloud everywhere else; it must here too.
+        assert_eq!(role_local_model(None, Some("qwen2.5:7b")), None);
+        // A pointed-at-local role with nothing bound has no name to show.
+        assert_eq!(role_local_model(Some("local"), None), None);
+        assert_eq!(role_local_model(Some("local"), Some("")), None);
     }
 
     #[test]

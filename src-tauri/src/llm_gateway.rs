@@ -180,6 +180,7 @@ fn fail_kind_slug(kind: &LocalFailKind) -> &'static str {
         LocalFailKind::Refused => "refused",
         LocalFailKind::Timeout => "timeout",
         LocalFailKind::MalformedStream => "malformed_stream",
+        LocalFailKind::UnrecognisedResponse => "unrecognised_response",
         LocalFailKind::DegenerateStream => "degenerate_stream",
         LocalFailKind::ModelLoading => "model_loading",
         LocalFailKind::ServerError(_) => "server_error",
@@ -826,6 +827,9 @@ fn local_failure_to_error(failure: &LocalFailure) -> Error {
         }
         LocalFailKind::ServerError(_) => "the local model server returned an error",
         LocalFailKind::MalformedStream => "the local model stream ended unexpectedly",
+        LocalFailKind::UnrecognisedResponse => {
+            "the local endpoint answered, but not in a shape PM recognises"
+        }
         LocalFailKind::DegenerateStream => {
             "the local model got stuck repeating itself and was stopped"
         }
@@ -835,7 +839,13 @@ fn local_failure_to_error(failure: &LocalFailure) -> Error {
     // local server, so echoing its message is safe and the fastest way to diagnose a bad model id.
     let detail = failure.detail.trim();
     let msg = match failure.kind {
-        LocalFailKind::ClientError(_) | LocalFailKind::ServerError(_) if !detail.is_empty() => {
+        // The body is the whole diagnosis for an unrecognised answer, so it rides along like a
+        // server's own error text does — it is the user's own machine either way.
+        LocalFailKind::ClientError(_)
+        | LocalFailKind::ServerError(_)
+        | LocalFailKind::UnrecognisedResponse
+            if !detail.is_empty() =>
+        {
             format!("{base} ({})", crate::error::truncate_detail(detail))
         }
         _ => base.to_string(),
@@ -845,6 +855,28 @@ fn local_failure_to_error(failure: &LocalFailure) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unreadable_answer_is_not_reported_as_a_broken_stream() {
+        // `probe()` and the non-streaming completion path both used `MalformedStream`, so a user
+        // whose endpoint answered 200 with an unexpected body was told "the local model stream
+        // ended unexpectedly" about a call with no stream in it — and the one diagnosable part,
+        // the body, was dropped on the floor.
+        let err = local_failure_to_error(&LocalFailure {
+            kind: LocalFailKind::UnrecognisedResponse,
+            detail: "the endpoint answered but did not look like an OpenAI /v1/models list".into(),
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not in a shape PM recognises"),
+            "should not claim a stream broke: {msg}"
+        );
+        assert!(!msg.contains("stream ended"), "{msg}");
+        assert!(
+            msg.contains("/v1/models list"),
+            "the body is the whole diagnosis and must survive: {msg}"
+        );
+    }
+
     use super::*;
 
     /// The byte-identical invariant made mechanical: with an EMPTY runtime context, the resolver's
