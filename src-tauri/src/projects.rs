@@ -700,10 +700,21 @@ pub async fn propose(
         Ok(crate::llm_gateway::LlmOutcome {
             completion: c,
             meta,
-        }) => (
-            parse_proposal(&c.text, project),
-            Some((c.usage, c.model, meta)),
-        ),
+        }) => {
+            // A cut-off or blank 200 is not a proposal. Without this gate a truncated reply
+            // either fell into "unparseable model output" — sending the user to inspect output
+            // that was never finished — or, cut just after a closing `}`, was accepted as a real
+            // proposal from an unfinished answer. The call was made and billed either way, so the
+            // usage still rides.
+            let proposal = match c.usable_text() {
+                Some(text) => parse_proposal(text, project),
+                None => ProjectProposal::fallback(format!(
+                    "Proposal request failed: {}",
+                    c.unusable_reason().unwrap_or("the reply could not be used")
+                )),
+            };
+            (proposal, Some((c.usage, c.model, meta)))
+        }
         Err(e) => (
             ProjectProposal::fallback(format!("Proposal request failed: {e}")),
             None,

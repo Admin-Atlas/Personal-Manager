@@ -547,12 +547,14 @@ pub async fn distill_blob(
             c.unusable_reason().unwrap_or("the reply could not be used")
         )));
     };
-    if extract_json(text, '[', ']').is_none() {
-        return Err(crate::error::Error::Other(
+    // The parse itself gates too, and that is the door's real lock: a bracket-presence check let
+    // an array-SHAPED but unparseable reply (a trailing comma is a canonical small-model tic)
+    // degrade to zero records, and the flag was stamped over them anyway.
+    parse_pref_array(text).ok_or_else(|| {
+        crate::error::Error::Other(
             "couldn't read the imported profile — the model's reply held no readable list".into(),
-        ));
-    }
-    Ok(parse_pref_array(text))
+        )
+    })
 }
 
 /// Cap on the already-known list injected into the distil prompt. A user with hundreds of records
@@ -629,7 +631,15 @@ pub async fn parse_statement(
     let messages = parse_messages(text, project_names);
     let crate::llm_gateway::LlmOutcome { completion: c, .. } =
         crate::llm_gateway::complete(app, plan, &messages, false).await?;
-    parse_pref_object(&c.text)
+    // A cut-off or blank reply is the MODEL's failure — saying "try rephrasing" for it blames the
+    // user's sentence for something no rephrasing can fix.
+    let Some(reply) = c.usable_text() else {
+        return Err(Error::Other(format!(
+            "couldn't read a preference from that — {}",
+            c.unusable_reason().unwrap_or("the reply could not be used")
+        )));
+    };
+    parse_pref_object(reply)
         .ok_or_else(|| Error::Other("couldn't read a preference from that — try rephrasing".into()))
 }
 
@@ -729,16 +739,18 @@ pub fn render_chat_extract_request(
 /// and the caller writes both down the same way — as "there was nothing to learn in those turns" —
 /// then advances the extraction cursor past them, so they are never offered again.
 ///
-///   * `Some(records)` — a JSON array was found and yielded these records. An empty one is a real,
-///     common and correct answer: most conversations state no preference.
-///   * `None` — no JSON array was found. The reply was prose, an apology, or an array cut off before
-///     its closing bracket. `extract_json` is first-`[`-to-last-`]` and a record contains no nested
-///     array, so a truncated reply has no `]` anywhere and lands here.
+///   * `Some(records)` — a readable JSON array yielded these records. An empty one is a real,
+///     common and correct answer: most conversations state no preference — and the model states
+///     "nothing" as the literal `[]` its prompt asks for.
+///   * `None` — no readable list. The reply was prose, an apology, an array cut off before its
+///     closing bracket (`extract_json` is first-`[`-to-last-`]` and a record contains no nested
+///     array, so a truncated reply has no `]` anywhere), a bracketed span that is not valid JSON
+///     (a trailing comma — serde is strict RFC 8259 and a canonical small-model tic used to
+///     degrade to "nothing stated"), or a non-empty array in which NOT ONE element was readable.
 ///
 /// Only the first is a result.
 pub fn parse_chat_preferences(raw: &str) -> Option<Vec<DraftPreference>> {
-    extract_json(raw, '[', ']')?;
-    Some(parse_pref_array_inner(raw, true, MAX_CHAT_PREFS))
+    parse_pref_array_inner(raw, true, MAX_CHAT_PREFS)
 }
 
 // --- defensive parsing of untrusted model JSON ------------------------------
@@ -827,26 +839,42 @@ fn extract_json(s: &str, open: char, close: char) -> Option<&str> {
 }
 
 /// Parse a distillation reply into validated drafts (array form, project scope disallowed, capped).
-fn parse_pref_array(raw: &str) -> Vec<DraftPreference> {
+/// `None` = no readable list — the caller must treat that as failure, never as "zero preferences":
+/// its caller stamps the one-way `MIGRATED_FLAG_KEY` over whatever this returns.
+fn parse_pref_array(raw: &str) -> Option<Vec<DraftPreference>> {
     parse_pref_array_inner(raw, false, MAX_DISTILLED)
 }
 
 /// Shared array-form parser for the distillation and chat-extraction paths. `allow_project` gates
 /// whether a `project` scope survives (distillation has no entity to resolve against; chat does);
 /// `cap` bounds how many records one untrusted reply may yield.
-fn parse_pref_array_inner(raw: &str, allow_project: bool, cap: usize) -> Vec<DraftPreference> {
-    let Some(json) = extract_json(raw, '[', ']') else {
-        return Vec::new();
-    };
-    // Parse leniently into generic values first, so ONE non-object element (e.g. a stray string the
-    // model slipped in) can't sink the whole batch — then validate each object on its own.
-    let values: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
-    values
+///
+/// Defensive PER ELEMENT, strict about the whole: one junk element among readable ones is dropped
+/// (a stray string the model slipped in must not sink the batch), but a reply in which nothing at
+/// all was readable is `None`, not `Some(vec![])`. The distinction is the whole point — every
+/// caller advances a cursor or stamps a one-way flag on `Some`, and the old always-a-Vec shape let
+/// three kinds of garbage count as "nothing stated": a bracketed span that is not valid JSON (a
+/// trailing comma is enough — serde is strict RFC 8259), an array of non-record elements, and an
+/// array of record-shaped elements none of which carries a usable value. A model that genuinely
+/// found nothing says `[]`, which stays a real (empty) answer.
+fn parse_pref_array_inner(
+    raw: &str,
+    allow_project: bool,
+    cap: usize,
+) -> Option<Vec<DraftPreference>> {
+    let json = extract_json(raw, '[', ']')?;
+    let values: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let had_elements = !values.is_empty();
+    let drafts: Vec<DraftPreference> = values
         .into_iter()
         .filter_map(|v| serde_json::from_value::<RawPref>(v).ok())
         .filter_map(|r| validate_raw(r, allow_project))
         .take(cap)
-        .collect()
+        .collect();
+    if drafts.is_empty() && had_elements {
+        return None;
+    }
+    Some(drafts)
 }
 
 /// Parse a single-statement reply into one validated draft (object form, project scope allowed).
@@ -1198,7 +1226,7 @@ mod tests {
             {\"scope\":\"global\"},\
             \"garbage\"\
         ]\n```";
-        let drafts = parse_pref_array(raw);
+        let drafts = parse_pref_array(raw).expect("a batch with readable records is an answer");
         // The two valid + the coerced + the project-as-global = 4; the value-less and the string dropped.
         assert_eq!(drafts.len(), 4);
         assert!(drafts
@@ -1210,9 +1238,38 @@ mod tests {
         let ctx = drafts.iter().find(|d| d.scope == SCOPE_CONTEXT).unwrap();
         assert_eq!(ctx.condition.as_deref(), Some("during work hours"));
 
-        // Total nonsense → empty, not an error.
-        assert!(parse_pref_array("no json here at all").is_empty());
-        assert!(parse_pref_array("[ not valid json").is_empty());
+        // Total nonsense → None. `distill_blob` stamps the one-way migration flag over what this
+        // returns, so "unreadable" must never be spelled the same as "zero preferences".
+        assert_eq!(parse_pref_array("no json here at all"), None);
+        assert_eq!(parse_pref_array("[ not valid json"), None);
+        // A genuinely empty list is still a real (empty) answer.
+        assert_eq!(parse_pref_array("[]"), Some(vec![]));
+    }
+
+    /// The residue #798's first pass left on the one-way door: gates that checked a `[...]` span
+    /// EXISTS, not that it PARSES. Everything here sailed through the bracket check and degraded
+    /// to `vec![]` — which `migrate_preferences_once` then stamped `MIGRATED_FLAG_KEY` over,
+    /// permanently, and `persist_extraction` advanced the chat cursor over.
+    #[test]
+    fn an_array_shaped_but_unreadable_reply_is_not_an_empty_answer() {
+        // The canonical small-model tic: a trailing comma. serde_json is strict RFC 8259.
+        assert_eq!(
+            parse_pref_array("[{\"scope\":\"global\",\"value\":\"files invoices\"},]"),
+            None,
+            "a trailing comma is unreadable, not 'no preferences'"
+        );
+        assert_eq!(
+            parse_chat_preferences("[{\"scope\":\"global\",\"value\":\"terse replies\"},]"),
+            None
+        );
+        // A non-empty array in which nothing is readable: record-shaped junk with no usable value,
+        // or elements that are not records at all.
+        assert_eq!(parse_pref_array("[{\"scope\":\"global\"}]"), None);
+        assert_eq!(parse_chat_preferences("[\"garbage\", 42]"), None);
+        // But ONE readable record among junk keeps the defensive posture: the batch survives.
+        let mixed =
+            "[\"noise\", {\"scope\":\"global\",\"value\":\"file invoices under Finances\"}]";
+        assert_eq!(parse_pref_array(mixed).map(|d| d.len()), Some(1));
     }
 
     #[test]

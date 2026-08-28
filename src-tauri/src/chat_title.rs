@@ -17,8 +17,8 @@
 //!     to `custom`, and generation is guarded `WHERE title_state = 'pending'` — checked again inside the
 //!     write transaction — so a rename that lands during the async model call is never clobbered.
 //!   * **Keep the conversation model free.** Titling uses the **background** model role
-//!     ([`BACKGROUND_MODELS_KEY`]) through `openrouter::complete` (per-request zero-data-retention), exactly
-//!     like the rolling summary — not the model the user is actually talking to. The spend is logged to
+//!     ([`BACKGROUND_MODELS_KEY`]) through `llm_gateway::complete` (whose cloud arm is per-request
+//!     zero-data-retention), exactly like the rolling summary — not the model the user is actually talking to. The spend is logged to
 //!     `usage_log` under `chat_title`, and the prompt frames the conversation as untrusted data to label,
 //!     never instructions to obey.
 //!
@@ -182,8 +182,17 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
     let crate::llm_gateway::LlmOutcome { completion, meta } =
         crate::llm_gateway::complete(app, &route, &messages, false).await?;
     // `apply_title` is guarded on `pending`, so a title that lands is the one this conversation
-    // keeps — a name cut off mid-word would stick until the user renamed it by hand.
+    // keeps — a name cut off mid-word would stick until the user renamed it by hand. The rejected
+    // call was still billed, so its spend is logged before bailing (the success path logs inside
+    // the apply block below).
     let Some(title) = completion.usable_text().and_then(clamp_title) else {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let model = completion
+            .model
+            .as_deref()
+            .or(Some(route.primary_model_id()));
+        crate::commands::log_usage(&conn, "chat_title", model, &completion.usage, &meta);
         return Ok(false);
     };
 

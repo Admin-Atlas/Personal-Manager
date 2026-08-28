@@ -42,7 +42,17 @@ pub async fn diagnose(
     // prefix to reuse across calls.
     let crate::llm_gateway::LlmOutcome { completion, .. } =
         crate::llm_gateway::complete(app, plan, &messages, false).await?;
-    Ok(completion.text.trim().to_string())
+    // "Not best-effort" (above) applies to the reply too: a blank 200 used to return Ok("") — an
+    // empty diagnosis presented as success — and a cut-off one displayed mid-sentence, unmarked.
+    match completion.usable_text() {
+        Some(text) => Ok(text.to_string()),
+        None => Err(crate::error::Error::Other(format!(
+            "the diagnosis couldn't be used — {}",
+            completion
+                .unusable_reason()
+                .unwrap_or("the reply could not be used")
+        ))),
+    }
 }
 
 /// Build the system + user messages for one diagnostic. Pure (no network, no DB), so the framing

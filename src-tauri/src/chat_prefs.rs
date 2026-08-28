@@ -284,8 +284,21 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
     // turns regardless. The two outcomes it could not tell apart were "I read those forty turn-pairs
     // and there was nothing worth learning" and "I lost the thread", and only the first is a result.
     // Now both halves of that are real errors: a reply that was cut off or empty, and a reply with
-    // no JSON array in it at all.
+    // no readable list in it. Either way the call went out and was billed, so the spend is logged
+    // BEFORE bailing — the same rule the summary path documents: the spend happened whatever
+    // became of the answer.
+    let log_spend = || -> Result<()> {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let model = completion
+            .model
+            .as_deref()
+            .or(Some(route.primary_model_id()));
+        crate::commands::log_usage(&conn, "chat_prefs", model, &completion.usage, &meta);
+        Ok(())
+    };
     let Some(text) = completion.usable_text() else {
+        log_spend()?;
         return Err(Error::Other(format!(
             "couldn't extract preferences — {}",
             completion
@@ -294,6 +307,7 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
         )));
     };
     let Some(drafts) = preferences::parse_chat_preferences(text) else {
+        log_spend()?;
         return Err(Error::Other(
             "couldn't extract preferences — the model's reply held no readable list".into(),
         ));

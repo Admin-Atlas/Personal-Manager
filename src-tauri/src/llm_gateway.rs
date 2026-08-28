@@ -551,14 +551,16 @@ async fn run_local_complete(
         let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
         match rt.slot.run_background(attempt).await {
             SlotOutcome::Ran(Ok(completion)) => {
-                // A reply that stopped at the model's token ceiling is not a clean success.
-                // `Ok` clears the strike streak, the cooldown AND the ejection count, so a server
-                // that truncates every reply — an over-tight `num_predict`, a model that will not
-                // stop — looked perfectly healthy no matter how many times it had been ejected.
-                // `Alive` says what is actually known: it answered. It clears the streak, so this
-                // can never cause a cooldown on its own, and it leaves the escalation record of a
-                // host that keeps not finishing.
-                rt.record(if completion.truncated {
+                // A reply nothing can use is not a clean success. `Ok` clears the strike streak,
+                // the cooldown AND the ejection count, so a server that truncates every reply (an
+                // over-tight `num_predict`, a model that will not stop) — or returns a BLANK one
+                // every time (a broken chat template is a real Ollama failure mode) — looked
+                // perfectly healthy no matter how many times it had been ejected. The gate is the
+                // primitive's own definition (`usable_text`), not just `truncated`, so both kinds
+                // of useless 200 score `Alive`: it answered. That clears the streak, so this can
+                // never cause a cooldown on its own, and it leaves the escalation record of a host
+                // that keeps not delivering.
+                rt.record(if completion.usable_text().is_none() {
                     CallOutcome::Alive
                 } else {
                     CallOutcome::Ok
@@ -774,8 +776,9 @@ where
     };
     match local_result {
         Ok(completion) => {
-            // Same rule as the background arm: answered is not the same as finished.
-            rt.record(if completion.truncated {
+            // Same rule as the background arm: answered is not the same as delivered — a
+            // truncated OR blank reply keeps the host's escalation record.
+            rt.record(if completion.usable_text().is_none() {
                 CallOutcome::Alive
             } else {
                 CallOutcome::Ok
