@@ -306,6 +306,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Assign roles",
     body: "Choose which local model answers your chats and which runs background work, and how each falls back: Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server).",
   },
+  "settings-localai-downloaded": {
+    title: "Already downloaded",
+    body: "Model files PM found on this device — in Ollama, LM Studio, or Hugging Face folders, or a folder you point it at — that your endpoint isn't serving yet. PM can only use a model the server is actually serving, so load one in the app you downloaded it with and it becomes assignable above.",
+  },
   "settings-storage": {
     title: "On-device components",
     body: "Everything PM has downloaded to this device, with sizes. The document engine and the active search model are always needed. The enhanced map layout (t-SNE), photo text recognition and the speech model can be removed to free space — they re-download when you need them again, and photo text recognition installs from here too. Some rows are shared libraries a feature above them depends on: scikit-learn and scipy under the enhanced layout, OpenCV, shapely and pyclipper under photo text recognition. Those read 'Installed — in use' with a greyed Remove button and a pill pointing at what to remove first — they're already on your device, just still needed by something. numpy is never offered because the search model shares it.",

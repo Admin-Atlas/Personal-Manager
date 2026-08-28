@@ -1961,6 +1961,19 @@ export interface PullProgress {
   done: boolean;
 }
 
+/** The one in-flight (or last-terminal) model pull — the backend-owned job's snapshot, so a
+ *  remounted settings view can pick the download back up instead of re-arming the button
+ *  (local_slot.rs PullSnapshot). `running: false` is terminal: consult `error` and `status`
+ *  (`"cancelled"` after a cancel). */
+export interface PullSnapshot {
+  model: string;
+  status: string;
+  completed_bytes: number | null;
+  total_bytes: number | null;
+  running: boolean;
+  error: string | null;
+}
+
 /** Two documents PM believes are the same thing, and why; mirrors `duplicates::DuplicatePair`.
  *  Each side is a full `Document` so a duplicate renders with the same row and badges as the list. */
 export interface DuplicatePair {

@@ -466,30 +466,36 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
 }
 
 #[tauri::command]
-pub fn set_local_llm_role_model(
-    state: State<'_, AppState>,
-    role: String,
-    model: String,
-) -> Result<()> {
+pub fn set_local_llm_role_model(app: AppHandle, role: String, model: String) -> Result<()> {
     let key = role_model_key(&role)?;
+    let state = app.state::<AppState>();
     let conn = state.conn()?;
     if model.trim().is_empty() {
         db::delete_setting(&conn, key)?;
     } else {
         db::set_setting(&conn, key, model.trim())?;
     }
+    drop(conn);
+    // The sidebar's per-role model rows (#794) read the status snapshot; without a ping they named
+    // the OLD model until the next real call — for the background role, potentially hours. Same
+    // rule as the endpoint set/clear above: a settings change the sidebar reports must show at once.
+    crate::llm_gateway::ping_status(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_local_llm_routing(state: State<'_, AppState>, role: String, pref: String) -> Result<()> {
+pub fn set_local_llm_routing(app: AppHandle, role: String, pref: String) -> Result<()> {
     let key = role_routing_key(&role)?;
     // Validate the preference string so an unknown value can't silently read back as "cloud".
     if !matches!(pref.as_str(), "cloud" | "local" | "local-then-cloud") {
         return Err(Error::Other(format!("unknown routing preference '{pref}'")));
     }
+    let state = app.state::<AppState>();
     let conn = state.conn()?;
     db::set_setting(&conn, key, &pref)?;
+    drop(conn);
+    // Same as the role-model write: routing decides which model the sidebar names.
+    crate::llm_gateway::ping_status(&app);
     Ok(())
 }
 
@@ -567,30 +573,80 @@ pub async fn pull_local_model(
         }
         Endpoint::Refused => return Err(Error::Other(CALL_TIME_REFUSAL.into())),
     };
-    let outcome = openai_compat::pull_ollama_model(
+    // The job is BACKEND-owned from here: the settings view unmounts on every tab switch, and a
+    // pull that lived in component state came back as a re-armed Download button over a server
+    // still saturating the connection — one click away from a second concurrent `/api/pull` of the
+    // same tag. `begin_pull` is also the only-one-at-a-time guard, and the snapshot it maintains
+    // is what a remounted view re-reads (`active_local_pull`).
+    let Some(cancel) = app.state::<AppState>().local_ai.begin_pull(&model) else {
+        let running = app
+            .state::<AppState>()
+            .local_ai
+            .active_pull()
+            .map(|s| s.model)
+            .unwrap_or_default();
+        return Err(Error::Other(format!(
+            "a model download is already running ({running}) — wait for it or cancel it first"
+        )));
+    };
+    let progress_app = app.clone();
+    let pull = openai_compat::pull_ollama_model(
         &base_url,
         &model,
         token.as_ref().map(|s| s.expose()),
         |p| {
+            progress_app.state::<AppState>().local_ai.update_pull(&p);
             let _ = on_event.send(p);
         },
-    )
-    .await;
+    );
+    // Cancellation drops the pull future, which aborts the HTTP request — Ollama ties the download
+    // to the request context, so the server-side pull stops too (partial blobs are kept for a
+    // resume). A cancel is deliberate, so it lands as Ok with a "cancelled" snapshot, not an error.
+    let outcome = tokio::select! {
+        outcome = pull => Some(outcome),
+        _ = cancel.notified() => None,
+    };
     // The pull just changed what is on disk, so the cached crawl (#449) is now a lie — and it is
     // cached for the whole process, so without this PM answers its own download with its own
-    // pre-download picture until the app restarts. Cleared unconditionally: a pull that dies after
-    // Ollama has written the manifest would otherwise leave real weights invisible.
+    // pre-download picture until the app restarts. Cleared unconditionally: a pull that dies (or is
+    // cancelled) after Ollama has written the manifest would otherwise leave real weights invisible.
     //
     // Lock-safe: `clear_disk_models` takes only `LocalRuntime.disk_models` for one assignment and
     // never re-enters `state.conn()`, and `configured_endpoint` above dropped its connection before
     // its own await. Same shape as `set_local_model_scan_dir`.
     app.state::<AppState>().local_ai.clear_disk_models();
-    outcome.map_err(|f| {
-        Error::Other(format!(
-            "couldn't download the model ({})",
-            crate::error::truncate_detail(&f.detail)
-        ))
-    })
+    let state = app.state::<AppState>();
+    match outcome {
+        Some(Ok(())) => {
+            state.local_ai.finish_pull(None);
+            Ok(())
+        }
+        Some(Err(f)) => {
+            let msg = format!(
+                "couldn't download the model ({})",
+                crate::error::truncate_detail(&f.detail)
+            );
+            state.local_ai.finish_pull(Some(msg.clone()));
+            Err(Error::Other(msg))
+        }
+        None => {
+            state.local_ai.finish_pull_cancelled();
+            Ok(())
+        }
+    }
+}
+
+/// The one in-flight (or last-terminal) pull, for a settings view (re)mounting — the snapshot half
+/// of the backend-owned job `pull_local_model` runs.
+#[tauri::command]
+pub fn active_local_pull(state: State<'_, AppState>) -> Option<crate::local_slot::PullSnapshot> {
+    state.local_ai.active_pull()
+}
+
+/// Stop the running pull. Returns whether there was one to stop.
+#[tauri::command]
+pub fn cancel_local_pull(state: State<'_, AppState>) -> bool {
+    state.local_ai.cancel_pull()
 }
 
 #[derive(Serialize)]

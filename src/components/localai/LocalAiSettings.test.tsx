@@ -16,11 +16,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   LocalLlmConfig,
+  LocalLlmStatus,
   LocalRecommendation,
   LocalRecommendations,
   LocalServedModel,
 } from "../../lib/types";
 
+const activeLocalPull = vi.fn();
+const cancelLocalPull = vi.fn();
 const checkLocalLlmEndpoint = vi.fn();
 const clearLocalLlmEndpoint = vi.fn();
 const clearLocalLlmToken = vi.fn();
@@ -44,6 +47,8 @@ const setLocalModelScanDir = vi.fn();
 // A factory REPLACES the whole module, so every function the component imports must appear here or
 // it is `undefined` at module-eval. LocalAiSettings imports eighteen.
 vi.mock("../../lib/ipc", () => ({
+  activeLocalPull: () => activeLocalPull(),
+  cancelLocalPull: () => cancelLocalPull(),
   checkLocalLlmEndpoint: (...a: unknown[]) => checkLocalLlmEndpoint(...a),
   clearLocalLlmEndpoint: () => clearLocalLlmEndpoint(),
   clearLocalLlmToken: () => clearLocalLlmToken(),
@@ -142,19 +147,30 @@ const recs = (): LocalRecommendations => ({
 
 const served = (...models: LocalServedModel[]) => models;
 
+// TYPED, unlike the inline object it replaces: the untyped mock silently drifted a release behind
+// the Rust struct (four fields short), which is exactly the drift a fixture exists to catch.
+const statusFix = (over: Partial<LocalLlmStatus> = {}): LocalLlmStatus => ({
+  configured: true,
+  reachable: true,
+  in_cooldown: false,
+  cooldown_remaining_s: 0,
+  probed_now: false,
+  chat_local_model: null,
+  background_local_model: null,
+  served_window: null,
+  served_window_proven: false,
+  ...over,
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   getLocalLlmConfig.mockResolvedValue(cfg());
   listLocalLlmModels.mockResolvedValue(served({ id: "llama3.2:1b", embedding: false }));
   localModelRecommendations.mockResolvedValue(recs());
   localBetterFitNotice.mockResolvedValue(null);
-  localLlmStatus.mockResolvedValue({
-    configured: true,
-    reachable: true,
-    in_cooldown: false,
-    cooldown_remaining_s: 0,
-    probed_now: false,
-  });
+  localLlmStatus.mockResolvedValue(statusFix());
+  activeLocalPull.mockResolvedValue(null);
+  cancelLocalPull.mockResolvedValue(true);
   clearLocalLlmToken.mockResolvedValue(undefined);
 });
 
@@ -522,5 +538,93 @@ describe("model licence terms", () => {
       ),
     );
     expect(screen.queryByRole("button", { name: /accept and download/i })).toBeNull();
+  });
+});
+
+describe("the served-window honesty line", () => {
+  // The release's headline promise: a small served window is WARNED about, and an unproven number
+  // is never presented as a measurement. Nothing pinned either half until now.
+  it("warns on a small window and marks an unproven number as an estimate", async () => {
+    localLlmStatus.mockResolvedValue(
+      statusFix({ served_window: 4096, served_window_proven: false }),
+    );
+    await loaded();
+
+    expect(await screen.findByText(/Your server is serving/)).toBeTruthy();
+    expect(screen.getByText(/PM's estimate — it hasn't measured yet/)).toBeTruthy();
+  });
+
+  it("drops the estimate suffix once the number is measured", async () => {
+    localLlmStatus.mockResolvedValue(
+      statusFix({ served_window: 4096, served_window_proven: true }),
+    );
+    await loaded();
+
+    expect(await screen.findByText(/Your server is serving/)).toBeTruthy();
+    expect(screen.queryByText(/hasn't measured/)).toBeNull();
+  });
+
+  it("says nothing at a comfortable window — absence is the pass", async () => {
+    localLlmStatus.mockResolvedValue(
+      statusFix({ served_window: 32768, served_window_proven: true }),
+    );
+    await loaded();
+
+    expect(screen.queryByText(/Your server is serving/)).toBeNull();
+  });
+});
+
+describe("a download owned by the backend", () => {
+  // The pull is a backend job precisely so the settings view can unmount (the tab router unmounts
+  // on every switch) without the download losing its UI — the old component-owned state came back
+  // as a RE-ARMED Download button over a server still saturating the connection.
+  const pulled = (): LocalRecommendation => ({
+    repo: "bartowski/Phi-3.5-mini-instruct-GGUF",
+    display_name: "Phi 3.5 mini instruct",
+    architecture: "phi3",
+    role_hint: "background",
+    parameters_b: 3.8,
+    active_parameters_b: 3.8,
+    context_length: 8192,
+    multimodal: false,
+    reasoning: null,
+    // The shape the generator really emits, naming this fixture's own repo + fitted quant.
+    ollama_pull: "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
+    sharded_quant: false,
+    licence: {
+      id: "mit",
+      name: "MIT License",
+      url: "https://opensource.org/license/mit",
+      open: true,
+      summary: "A permissive open-source licence.",
+    },
+    fit: {
+      verdict: "comfortable",
+      quant: "Q4_K_M",
+      context: 8192,
+      kv: "f16",
+      est_memory_gb: 2.6,
+      est_tokens_per_sec: 35,
+      notes: [],
+    },
+    gpu: { kind: "single" },
+  });
+
+  it("is adopted on mount: the card shows Downloading with a Cancel, not a re-armed button", async () => {
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [pulled()] });
+    activeLocalPull.mockResolvedValue({
+      model: "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
+      status: "downloading",
+      completed_bytes: 1024,
+      total_bytes: 4096,
+      running: true,
+      error: null,
+    });
+    await loaded();
+
+    const downloading = await screen.findByRole("button", { name: /downloading/i });
+    expect((downloading as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: /cancel/i })).toBeTruthy();
+    expect(pullLocalModel).not.toHaveBeenCalled();
   });
 });

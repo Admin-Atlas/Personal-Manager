@@ -702,11 +702,21 @@ where
 
     // Ollama streams newline-delimited JSON objects. Buffer bytes and parse each complete line; a
     // stalled (open-but-idle) stream is bounded by a generous per-chunk deadline so a dead download
-    // can't hang the tab forever.
+    // can't hang the tab forever. The deadline is STATUS-AWARE: the verify/write phases emit one
+    // line per layer and then hash in silence — several minutes for the catalogue's largest rows —
+    // so only those named phases get `PULL_VERIFY_STALL_TIMEOUT`; a silent download is still a
+    // stall at the ordinary bound. (Sized against the catalogue's largest tagged artifact, 44 GiB,
+    // on a spinning disk — the miss that used to call an essentially-complete pull "stalled".)
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
+    let mut last_status = String::new();
     loop {
-        let next = match tokio::time::timeout(tunables::PULL_STALL_TIMEOUT, stream.next()).await {
+        let stall = if last_status.starts_with("verifying") || last_status.starts_with("writing") {
+            tunables::PULL_VERIFY_STALL_TIMEOUT
+        } else {
+            tunables::PULL_STALL_TIMEOUT
+        };
+        let next = match tokio::time::timeout(stall, stream.next()).await {
             Ok(next) => next,
             Err(_elapsed) => {
                 return Err(LocalFailure::new(
@@ -750,6 +760,7 @@ where
                 .and_then(|s| s.as_str())
                 .unwrap_or_default()
                 .to_string();
+            last_status = status.clone();
             let done = status == "success";
             on_progress(PullProgress {
                 status,

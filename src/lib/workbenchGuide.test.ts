@@ -9,9 +9,12 @@
 //
 // And `installCommand` must keep refusing to invent a command. Only llama-server documents taking a
 // Hugging Face repo id (`-hf <user>/<model>[:quant]`), which is exactly what the catalogue stores.
-// Ollama names models its own way and LM Studio's `lms get` documentation never says an HF repo id
-// is accepted — so PM prints neither. The temptation to "helpfully" add them is the thing being
-// guarded against: a copy box with a command that silently does nothing is the worst outcome here.
+// Ollama DOES accept `hf.co/<repo>:<quant>` — that is what the Download button pulls since #793 —
+// but only the catalogue's per-quant tag is byte-verified against the HF tree, so this DISPLAY
+// helper must never re-derive one (workbenchGuide.ts documents the rule; the verified tag arrives
+// as data). LM Studio's `lms get` documentation still never says an HF repo id is accepted, so LM
+// Studio gets no command at all. A copy box with a command that silently does nothing — or fetches
+// an unverified file — is the outcome being guarded against.
 
 import { describe, expect, it } from "vitest";
 

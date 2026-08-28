@@ -102,6 +102,13 @@ pub mod tunables {
     /// Per-request deadline for the `/slots` and `/v1/models` context-window probes.
     pub const WINDOW_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+    /// The quiet allowance while Ollama VERIFIES a finished download ("verifying sha256 digest" /
+    /// "writing manifest"). Hashing is one silent status line per layer and then nothing until it
+    /// is done — a 44 GiB catalogue row on a spinning disk is several minutes of silence — and the
+    /// general stall timeout below called that a failed download on a pull that was essentially
+    /// complete. Only these named phases get the long leash; a silent DOWNLOAD is still a stall.
+    pub const PULL_VERIFY_STALL_TIMEOUT: Duration = Duration::from_secs(900);
+
     /// How old a cached context window may grow before the next opportunity re-probes it. The cache
     /// used to be write-once per process, which made it blind in both directions: a user who
     /// followed PM's own refusal message — raise `OLLAMA_CONTEXT_LENGTH`, restart the server — kept
@@ -520,6 +527,33 @@ pub struct LocalRuntime {
     /// The last on-disk model crawl (#449), cached on the same terms as the hardware scan: it walks
     /// real directories, so it is not something to redo on every Workbench repaint.
     disk_models: Mutex<Option<crate::local_disk::DiskScan>>,
+    /// The one in-flight (or just-finished) model pull. Backend-owned so the job survives the
+    /// settings view unmounting (the tab router unmounts on every switch) and so a remounted view
+    /// can re-read where things stand instead of re-arming the Download button mid-download.
+    pull: Mutex<Option<PullState>>,
+}
+
+/// What a UI needs to render the one model pull: live progress while `running`, and the terminal
+/// outcome after (an `error`, the `"cancelled"` status, or a completed pull). Kept until the next
+/// pull replaces it, so a view that was unmounted when the download failed still gets to say so.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PullSnapshot {
+    /// The tag being pulled (`hf.co/<repo>:<QUANT>`).
+    pub model: String,
+    /// Ollama's latest status line ("pulling manifest", "downloading", "verifying sha256", …);
+    /// `"cancelled"` after a cancel.
+    pub status: String,
+    /// Bytes fetched / total for the layer currently downloading, when Ollama reports them.
+    pub completed_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    /// Still streaming. `false` is terminal: consult `error` and `status`.
+    pub running: bool,
+    pub error: Option<String>,
+}
+
+struct PullState {
+    snap: PullSnapshot,
+    cancel: Arc<Notify>,
 }
 
 impl LocalRuntime {
@@ -592,6 +626,81 @@ impl LocalRuntime {
         if let Ok(mut w) = self.windows.lock() {
             w.insert(Self::window_key(base_url, model), (info, Instant::now()));
         }
+    }
+
+    // ---- the one-pull-at-a-time registry (see `PullSnapshot`) ----
+
+    /// Claim the pull slot for `model`. `None` when a pull is already running — the caller refuses
+    /// rather than racing two `/api/pull`s at the same server. On success, returns the handle a
+    /// `cancel_pull` will notify (`notify_one`, so a cancel that lands before the puller awaits is
+    /// stored, not lost).
+    pub fn begin_pull(&self, model: &str) -> Option<Arc<Notify>> {
+        let mut p = self.pull.lock().ok()?;
+        if p.as_ref().is_some_and(|s| s.snap.running) {
+            return None;
+        }
+        let cancel = Arc::new(Notify::new());
+        *p = Some(PullState {
+            snap: PullSnapshot {
+                model: model.to_string(),
+                status: "starting".to_string(),
+                completed_bytes: None,
+                total_bytes: None,
+                running: true,
+                error: None,
+            },
+            cancel: cancel.clone(),
+        });
+        Some(cancel)
+    }
+
+    /// Record one progress tick against the running pull (poison-tolerant, like the caches).
+    pub fn update_pull(&self, progress: &crate::openai_compat::PullProgress) {
+        if let Ok(mut p) = self.pull.lock() {
+            if let Some(s) = p.as_mut().filter(|s| s.snap.running) {
+                s.snap.status = progress.status.clone();
+                s.snap.completed_bytes = progress.completed_bytes;
+                s.snap.total_bytes = progress.total_bytes;
+            }
+        }
+    }
+
+    /// Mark the running pull terminal. `error: None` with the status left as streamed = success;
+    /// the snapshot survives until the next `begin_pull` so an unmounted UI can still report it.
+    pub fn finish_pull(&self, error: Option<String>) {
+        if let Ok(mut p) = self.pull.lock() {
+            if let Some(s) = p.as_mut() {
+                s.snap.running = false;
+                s.snap.error = error;
+            }
+        }
+    }
+
+    /// Mark the running pull cancelled: terminal, deliberate, not an error.
+    pub fn finish_pull_cancelled(&self) {
+        if let Ok(mut p) = self.pull.lock() {
+            if let Some(s) = p.as_mut() {
+                s.snap.running = false;
+                s.snap.status = "cancelled".to_string();
+                s.snap.error = None;
+            }
+        }
+    }
+
+    /// The current pull snapshot (running or last-terminal), for a UI (re)mounting.
+    pub fn active_pull(&self) -> Option<PullSnapshot> {
+        self.pull.lock().ok()?.as_ref().map(|s| s.snap.clone())
+    }
+
+    /// Ask the running pull to stop. Returns whether there was one to ask.
+    pub fn cancel_pull(&self) -> bool {
+        if let Ok(p) = self.pull.lock() {
+            if let Some(s) = p.as_ref().filter(|s| s.snap.running) {
+                s.cancel.notify_one();
+                return true;
+            }
+        }
+        false
     }
 
     /// Test-only: age a cached window entry so staleness paths can be exercised without sleeping.
