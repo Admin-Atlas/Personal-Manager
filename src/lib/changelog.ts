@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.5-alpha",
+    date: "2026-08-28",
+    highlights: [
+      "A pre-release audit of the local AI work closed the gaps the last round left. The biggest: the size-to-fit protection quietly stood down in exactly the cases that needed it most. A server with a very small memory was handed the full-size work the protection exists to shrink, and on two of the three server kinds PM could mistake a model's advertised capacity for the memory actually in use and size its work up to eight times too large. Both now size honestly: small stays guarded, and an advertised capacity is never trusted over a measured one.",
+      "PM also now re-checks a server's memory instead of remembering the first answer forever. Before, if PM told you to raise the context length and you did — restarting the server exactly as instructed — PM kept refusing based on the dead server's number until you restarted PM too. Now it notices within a minute, in both directions: a server that came back bigger stops being refused, and one that came back smaller stops being overfed.",
+      "A single enormous chat message — a pasted document, say — could silently stop that conversation's summary and preference-learning forever, with everything after it stuck behind it. PM now reads as much of the oversized message as the server can hold and moves on, rather than wedging.",
+      'Smaller honesty fixes in the same area: the sidebar now shows a known context window even when one of the two roles hasn\'t answered yet; when a chat message is refused for size, the message mentions Compress — the fix you can do from inside PM — alongside the server setting; and the token figure in that message now says "up to about", because it is a deliberate overestimate.',
+    ],
+  },
+  {
     version: "3.130.4-alpha",
     date: "2026-08-27",
     highlights: [
