@@ -63,7 +63,7 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install Ollama — run `brew install ollama`, or download it from ollama.com/download.",
           "Start it (the menu-bar app, or `ollama serve` in a terminal). It listens on http://127.0.0.1:11434.",
           "Give it room to work — Ollama serves a 4,096-token context by default and cuts anything longer without saying so. Set `OLLAMA_CONTEXT_LENGTH=32768` in its environment (`launchctl setenv OLLAMA_CONTEXT_LENGTH 32768`, then restart it).",
-          "Come back here — PM detects it automatically, and you can download a recommended model in one click.",
+          "Come back here and press Auto-detect a local server — then you can download a recommended model in one click. (First-run onboarding looks for it by itself.)",
         ],
       };
     case "linux":
@@ -73,7 +73,7 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install Ollama — run `curl -fsSL https://ollama.com/install.sh | sh`.",
           "It runs as a service on http://127.0.0.1:11434 (or start it with `ollama serve`).",
           "Give it room to work — Ollama serves a 4,096-token context by default and cuts anything longer without saying so. Set `OLLAMA_CONTEXT_LENGTH=32768` in a systemd drop-in (`/etc/systemd/system/ollama.service.d/override.conf`), then `sudo systemctl restart ollama`.",
-          "Come back here — PM detects it automatically, and you can download a recommended model in one click.",
+          "Come back here and press Auto-detect a local server — then you can download a recommended model in one click. (First-run onboarding looks for it by itself.)",
         ],
       };
     default:
@@ -83,7 +83,7 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Download Ollama from ollama.com/download and run the installer — it doesn't need an administrator.",
           "Launch it. It keeps running in the background on http://127.0.0.1:11434.",
           "Give it room to work — Ollama serves a 4,096-token context by default and cuts anything longer without saying so. Set an `OLLAMA_CONTEXT_LENGTH` environment variable to 32768 and restart it.",
-          "Come back here — PM detects it automatically, and you can download a recommended model in one click.",
+          "Come back here and press Auto-detect a local server — then you can download a recommended model in one click. (First-run onboarding looks for it by itself.)",
         ],
       };
   }
@@ -121,7 +121,8 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
     case "linux":
       return {
         ...base,
-        caveat: "Ships as an AppImage. Needs Ubuntu 20.04 or newer (or an equivalent).",
+        caveat:
+          "Ships as an AppImage. Needs Ubuntu 20.04 or newer (or an equivalent); on an Intel or AMD PC the processor needs AVX2 support.",
         steps: [
           "Install LM Studio — run `curl -fsSL https://lmstudio.ai/install.sh | bash`, or download the AppImage from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (Ctrl+2).",

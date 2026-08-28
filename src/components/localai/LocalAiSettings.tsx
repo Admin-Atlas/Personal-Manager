@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
+  activeLocalPull,
+  cancelLocalPull,
   checkLocalLlmEndpoint,
   clearLocalLlmEndpoint,
   clearLocalLlmToken,
@@ -42,6 +44,7 @@ import type {
   PullProgress,
 } from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
+import { IngestProgress } from "../IngestProgress";
 import { installCommand, runnerGuides } from "../../lib/workbenchGuide";
 import {
   Button,
@@ -88,7 +91,9 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const urlField = useFieldA11y();
   const tokenField = useFieldA11y();
 
-  // Model pull (Ollama only).
+  // Model pull (Ollama only). `pulling` holds the pull TAG (`hf.co/<repo>:<QUANT>`), not the repo:
+  // the backend's job snapshot is keyed on the tag, so a view that mounts mid-download can adopt it
+  // and mark the right card.
   const [pulling, setPulling] = useState<string | null>(null);
   const [pullProg, setPullProg] = useState<PullProgress | null>(null);
   /** The model whose licence terms are being shown, or null when no dialog is open. */
@@ -104,8 +109,18 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     !!config?.background_model &&
     config.chat_model !== config.background_model;
   // Whether the connected endpoint is an Ollama server (the only runner with a one-click pull API).
-  // Heuristic: Ollama's default port. A non-Ollama endpoint gets a copy-paste command instead.
-  const isOllama = !!config?.base_url?.includes(":11434");
+  // Heuristic: Ollama's default port — parsed from the URL, not a substring test (":114341", or
+  // "11434" anywhere in a path, must not count). An Ollama on a custom port degrades honestly to
+  // the copy-paste command; anything else on 11434 gets a button whose pull fails with a clear
+  // error. A real flavour probe is the better gate if this ever grows a third consumer.
+  const isOllama = (() => {
+    if (!config?.base_url) return false;
+    try {
+      return new URL(config.base_url).port === "11434";
+    } catch {
+      return false;
+    }
+  })();
 
   async function reloadConfig() {
     const cfg = await getLocalLlmConfig();
@@ -173,17 +188,30 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   }, []);
 
   // Poll the live status while an endpoint is configured (the backend debounces the actual probe to
-  // once / 30s, so this can't hammer the user's server).
+  // once / 30s, so this can't hammer the user's server). The served-model list rides the same tick:
+  // the copy under Assign roles promises "download a model and it appears here", and before this the
+  // list only refreshed on save/pull — a user following the copy-paste path while sitting on the tab
+  // waited forever.
   useEffect(() => {
     if (!configured) {
       setStatus(null);
       return;
     }
     let cancelled = false;
-    const tick = () =>
+    const tick = () => {
       localLlmStatus()
         .then((s) => !cancelled && setStatus(s))
         .catch(() => {});
+      listLocalLlmModels()
+        .then((m) => {
+          if (cancelled) return;
+          setServed(m);
+          setServedLoaded(true);
+        })
+        .catch(() => {
+          /* transient listing failure: keep the last answer rather than flashing "serves nothing" */
+        });
+    };
     void tick();
     const id = setInterval(tick, 30000);
     return () => {
@@ -191,6 +219,62 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       clearInterval(id);
     };
   }, [configured]);
+
+  // A download owned by the BACKEND may be running while this view mounts (the tab router unmounts
+  // on every switch): adopt it, and while any pull is marked running keep re-reading the snapshot —
+  // it is the source of truth that survives the unmount, and its terminal state carries the error
+  // a channel nobody was listening to could not deliver.
+  useEffect(() => {
+    let cancelled = false;
+    void activeLocalPull()
+      .then((snap) => {
+        if (cancelled || !snap?.running) return;
+        setPulling(snap.model);
+        setPullProg({
+          status: snap.status,
+          completed_bytes: snap.completed_bytes,
+          total_bytes: snap.total_bytes,
+          done: false,
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  useEffect(() => {
+    if (pulling === null) return;
+    let cancelled = false;
+    const id = setInterval(() => {
+      void activeLocalPull()
+        .then((snap) => {
+          if (cancelled || !snap || snap.model !== pulling) return;
+          if (snap.running) {
+            setPullProg({
+              status: snap.status,
+              completed_bytes: snap.completed_bytes,
+              total_bytes: snap.total_bytes,
+              done: false,
+            });
+            return;
+          }
+          // Terminal. The locally-started path also lands here if its invoke handler is gone.
+          setPulling(null);
+          setPullProg(null);
+          if (snap.error) setError(snap.error);
+          void reloadConfig();
+          void localModelRecommendations()
+            .then((r) => !cancelled && setRecs(r))
+            .catch(() => {});
+        })
+        .catch(() => {});
+    }, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pulling]);
 
   /** Acknowledge the better-fit suggestion: it stays quiet until the cadence says to look again.
    *  Clears the dot here and, via the callback, in the sidebar and the settings nav. */
@@ -370,10 +454,12 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   async function pull(rec: LocalRecommendation) {
     const tag = rec.ollama_pull;
     if (!tag) return;
-    setPulling(rec.repo);
+    setPulling(tag);
     setPullProg(null);
     setError(null);
     try {
+      // The job itself is backend-owned (it survives this view unmounting); the channel is just
+      // the low-latency progress feed while we ARE mounted — the 1s snapshot poll is the fallback.
       await pullLocalModel(tag, setPullProg);
       await reloadConfig(); // the model now shows as served / installed
       setRecs(await localModelRecommendations());
@@ -482,9 +568,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 rec={rec}
                 installed={installedRepos.has(rec.repo)}
                 canPull={configured && isOllama && !!rec.ollama_pull}
-                pulling={pulling === rec.repo}
-                pullProg={pulling === rec.repo ? pullProg : null}
+                pulling={pulling !== null && pulling === rec.ollama_pull}
+                pullProg={pulling !== null && pulling === rec.ollama_pull ? pullProg : null}
                 onPull={() => requestPull(rec)}
+                onCancel={() => void cancelLocalPull().catch(() => {})}
                 busy={pulling !== null}
               />
             ))}
@@ -799,7 +886,8 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               // fresh runner failed to connect at all, so nothing here had to speak for it.
               <p className="text-xs text-ink4">
                 This server isn't serving any models yet, so there is nothing to assign and both
-                roles stay on cloud. Download a model into it and it will appear here.
+                roles stay on cloud. Download a model into it and it will appear here within about
+                half a minute.
               </p>
             )}
             {bothLocal && twoModels && (
@@ -912,7 +1000,7 @@ export function DownloadedModels({
         <>
           <p className="mb-2 text-xs text-ink4">
             {configured
-              ? "None of these can be assigned yet — PM can only use a model your endpoint is actually serving. Load one in the app you downloaded it with and it appears under Assign roles above."
+              ? "None of these can be assigned yet — PM can only use a model your endpoint is actually serving. Load one in the app you downloaded it with and it shows up under Assign roles above within about half a minute."
               : "This is what's on your device, not what PM can use yet. Connect an endpoint above, then load the model in the app you downloaded it with, and it appears under Assign roles."}
           </p>
           <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -1206,6 +1294,7 @@ function RecommendationCard({
   pulling,
   pullProg,
   onPull,
+  onCancel,
   busy,
 }: {
   rec: LocalRecommendation;
@@ -1214,6 +1303,7 @@ function RecommendationCard({
   pulling: boolean;
   pullProg: PullProgress | null;
   onPull: () => void;
+  onCancel: () => void;
   busy: boolean;
 }) {
   const f = rec.fit;
@@ -1268,9 +1358,12 @@ function RecommendationCard({
               <ConfigRow label="Highest quality" fit={f} />
               <ConfigRow label="Fastest on GPU" fit={rec.gpu.fit} />
               {canPull && (
+                // Since #793 the button pulls the exact quant the "Highest quality" row measured
+                // (`hf.co/<repo>:<QUANT>`), so say that — the old "runner's default quant" caption
+                // predates the verified-tag route and told this card's users the opposite.
                 <p className="text-[0.625rem] text-ink4">
-                  Download fetches the runner's default quant — set the quant &amp; context to
-                  match.
+                  Download fetches the Highest-quality file measured above. Fastest on GPU is a
+                  different file (its quant is on its row) — PM's button doesn't fetch that one.
                 </p>
               )}
             </div>
@@ -1308,18 +1401,26 @@ function RecommendationCard({
 
       {pulling && (
         <div className="mt-2">
-          <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface">
-            <div
-              className="h-full rounded-full bg-accent transition-[width] duration-300"
-              style={{ width: pct != null ? `${pct}%` : "100%" }}
-            />
+          {/* The shared per-depth progress surface: shimmer while the total is unknown (the
+              manifest/verify phases used to render a FULL bar, which reads as "done"), percent
+              once bytes flow. The status line stays — it is a status readout, never folded. */}
+          <IngestProgress
+            processed={pct ?? 0}
+            total={pct != null ? 100 : null}
+            label={`Downloading ${rec.display_name}`}
+            mode="percent"
+          />
+          <div className="mt-1 flex items-center justify-between gap-2">
+            <p className="min-w-0 truncate font-mono text-[0.625rem] text-ink4">
+              {pullProg?.status ?? "starting…"}
+              {pullProg?.total_bytes
+                ? ` · ${formatBytes(pullProg.completed_bytes)} / ${formatBytes(pullProg.total_bytes)}`
+                : ""}
+            </p>
+            <Button variant="tertiary" size="sm" onClick={onCancel}>
+              Cancel
+            </Button>
           </div>
-          <p className="mt-1 font-mono text-[0.625rem] text-ink4">
-            {pullProg?.status ?? "starting…"}
-            {pullProg?.total_bytes
-              ? ` · ${formatBytes(pullProg.completed_bytes)} / ${formatBytes(pullProg.total_bytes)}`
-              : ""}
-          </p>
         </div>
       )}
 
@@ -1347,11 +1448,29 @@ function RecommendationCard({
 }
 
 function StatusChip({ status }: { status: LocalLlmStatus | null }) {
+  // The cooldown seconds arrive up to 30s stale (the poll cadence) and then sat FROZEN until the
+  // next poll — a countdown that doesn't count. Anchor it to when this status landed and tick it
+  // down locally; each poll re-anchors. At zero the chip says what is actually happening (the next
+  // call retries) instead of holding a dead number.
+  const receivedAt = useRef(Date.now());
+  const lastStatus = useRef<LocalLlmStatus | null>(status);
+  if (lastStatus.current !== status) {
+    lastStatus.current = status;
+    receivedAt.current = Date.now();
+  }
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!status?.in_cooldown) return;
+    const id = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [status]);
   let label = "Checking…";
   let token = "--ink4";
   if (status) {
     if (status.in_cooldown) {
-      label = `Cooling down (${status.cooldown_remaining_s}s)`;
+      const elapsed = Math.floor((Date.now() - receivedAt.current) / 1000);
+      const remaining = Math.max(0, (status.cooldown_remaining_s ?? 0) - elapsed);
+      label = remaining > 0 ? `Cooling down (${remaining}s)` : "Ready to retry";
       token = "--st-look";
     } else if (status.reachable) {
       label = "Connected";

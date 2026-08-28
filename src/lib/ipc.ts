@@ -59,6 +59,7 @@ import type {
   LocalRescanCadence,
   LocalServedModel,
   PullProgress,
+  PullSnapshot,
   LanguageOptions,
   LayoutProgressEvent,
   LocalFolder,
@@ -1699,6 +1700,14 @@ export function pullLocalModel(
   channel.onmessage = onProgress;
   return invoke<void>("pull_local_model", { model, onEvent: channel });
 }
+
+/** The one in-flight (or last-terminal) pull — the backend-owned job's snapshot. A settings view
+ *  re-reads this on mount so a download survives tab switches instead of re-arming the button. */
+export const activeLocalPull = () => invoke<PullSnapshot | null>("active_local_pull");
+
+/** Stop the running pull (the backend aborts the request, which stops Ollama's download too).
+ *  Resolves to whether there was a pull to stop. */
+export const cancelLocalPull = () => invoke<boolean>("cancel_local_pull");
 
 /** Record that the user has read a restricted model licence's terms, and get back the full accepted
  *  set. Keyed on the LICENCE, not the model — reading the Gemma Terms once covers every Gemma. This

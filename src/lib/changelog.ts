@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.7-alpha",
+    date: "2026-08-28",
+    highlights: [
+      "A model download now survives you leaving the tab. It used to live inside the settings page itself, so switching tabs mid-download threw away the progress display and re-armed the Download button — one click away from starting the same multi-gigabyte fetch twice. The download is now owned by the app: come back and the progress bar is where you left it, a second copy of the same download is refused, and there is a Cancel button at last.",
+      'Big downloads stopped being called failures at the finish line. After fetching, Ollama checks the file in silence — several minutes for the largest models — and PM\'s patience ran out at two, so it reported "the download stalled" about a download that was essentially done. The checking phase now gets the time it needs; a genuinely silent download is still called out.',
+      'Honesty and polish around the edges: the two-configurations card no longer claims Download fetches "the runner\'s default" file (it fetches exactly the Highest-quality file measured — that claim predated the fix and said the opposite); the sidebar updates the moment you assign a model to a role instead of after the next call; the served-models list refreshes on its own, so "download a model and it appears here" is now true while you watch; the cooldown chip counts down instead of freezing; the progress bar no longer reads full while the download is only fetching its manifest; and the Already-downloaded section explains itself in help mode.',
+      "Guide corrections: LM Studio's Linux entry now mentions the processor requirement its Windows entry already had, and the Ollama guide now says to press Auto-detect when you come back rather than promising PM notices by itself (it only does during first-run onboarding). The release notes for the two versions above were also trimmed where they promised slightly more than shipped.",
+    ],
+  },
+  {
     version: "3.130.6-alpha",
     date: "2026-08-28",
     highlights: [
@@ -58,7 +68,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     date: "2026-08-27",
     highlights: [
       "PM was sending its background work — sorting proposals, summaries, the things it learns about how you file — in single lumps far larger than a local server can hold. What happens then is the part worth knowing: the server does not refuse. It quietly throws away the beginning of the message and answers anyway. The beginning is where PM's instructions are, so what arrives is a pile of your documents with nothing telling the model what to do with them, and nothing telling it that the documents are not instructions.",
-      "PM now knows how much room your server actually has and works within it. It sends fewer documents per batch on a small server and the full batch on a large one, and it decides that before it sends rather than finding out afterwards. Where it cannot make something fit, it stops and tells you the two numbers — what the job needed, and what your server is serving — along with the one setting that changes it. It never fails your server for this; the size of the message was PM's choice, not your machine's fault.",
+      "PM now sizes its work to the room your server actually has — measured when it can, assumed conservatively until then — and works within it. It sends fewer documents per batch on a small server and the full batch on a large one, and it decides that before it sends rather than finding out afterwards. Where it cannot make something fit, it stops and tells you the two numbers — what the job needed, and what your server is serving — along with the one setting that changes it. It never fails your server for this; the size of the message was PM's choice, not your machine's fault.",
       "It also stops advancing past work it did not really do. When a batch has to shrink, PM only marks off the part it actually sent, so the rest is picked up next time instead of being skipped forever.",
       "And the Local AI tab now tells you the number outright when it is small. Ollama gives 4,096 tokens unless you tell it otherwise, and never mentions it — so the setup instructions for all three servers now include the line that raises it.",
       "One thing found while measuring, and fixed here: a document title can contain a line break, and PM was putting titles straight into a list where each line means something. A file named to look like PM's own text could add a line to that list. Titles and folder names are now kept to one line, and shortened — which is also what stops four hundred long filenames from filling a small server on their own.",
@@ -85,7 +95,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "3.130.0-alpha",
     date: "2026-08-27",
     highlights: [
-      "Every recommended model now has a Download button that works. PM has been showing you a list of models it thought would suit your machine, with no way to get any of them — the button was there in the code and could never appear, because the list carried no name Ollama would recognise for a single one of them. All seventeen now do. Pick one, press Download, and your own Ollama fetches it.",
+      "Every recommended model now has a working way in. PM has been showing you a list of models it thought would suit your machine, with no way to get any of them — the Download button was there in the code and could never appear, because the list carried no name Ollama would recognise for a single one of them. All seventeen models now carry one. Pick one, press Download, and your own Ollama fetches it — the button appears once an Ollama endpoint is connected, and the few very largest size variants that come split into pieces (which Ollama refuses) say so on their card and point you elsewhere instead.",
       "It fetches exactly the file PM measured, too. The sizes and speeds on each card were worked out from a specific file, and the same model packaged elsewhere can be a third larger — enough to turn a model that fits into one that doesn't. PM now downloads from the same place it took its measurements, so what the card promised is what lands on your disk. Where it can't do that honestly it offers no button and says why instead.",
       'And the list stops contradicting itself after you use it. Downloading a model used to leave the "already downloaded" section showing the picture from before you pressed the button, until you restarted PM. It also told anyone with a model folder but nothing in it that everything they had was already loaded — which is what you see the moment you delete your last model, or the first time you install one of these apps.',
     ],

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { CHANGELOG } from "../lib/changelog";
+import { formatDateOnly } from "../lib/format";
 import { Dialog } from "./ui";
 
 /**
@@ -44,7 +45,9 @@ export function WhatsNew({
                 Release
               </span>
             )}
-            <span className="ml-auto font-mono text-xs text-ink4">{entry.date}</span>
+            <span className="ml-auto font-mono text-xs text-ink4">
+              {formatDateOnly(entry.date)}
+            </span>
           </div>
           <ul className="mt-2 space-y-1.5">
             {entry.highlights.map((h, i) => (
