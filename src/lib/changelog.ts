@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.6-alpha",
+    date: "2026-08-28",
+    highlights: [
+      'The last release taught PM to stop writing a broken reply down as an answer. The audit found the places that lesson missed. The most important: the one-time import of your old profile notes checked that the reply looked like a list, but not that the list could actually be read — so a reply with one stray comma in it still counted as "your notes contained nothing", and the import stamped itself finished over zero results, permanently. Reading the list properly is now part of the check, there and in the pass that learns preferences from your chats.',
+      "Three more readers got the same discipline: project auto-triage no longer accepts an unfinished reply as a real proposal (or blames its own output parsing for one), the retrieval diagnosis no longer presents a blank reply as an empty diagnosis, and the add-a-preference form no longer answers a cut-off model with “try rephrasing” — no rephrasing fixes a reply that never finished.",
+      "A local server that answers every call with a blank reply — a broken model setup, typically — used to have its failure record wiped by each of those “successful” answers, so PM never escalated. Blank now counts the same as cut-off: the server is noted as answering but not delivering.",
+      "And billed calls whose replies were rejected are now always in the usage log — three places dropped the spend record along with the bad reply.",
+    ],
+  },
+  {
     version: "3.130.5-alpha",
     date: "2026-08-28",
     highlights: [

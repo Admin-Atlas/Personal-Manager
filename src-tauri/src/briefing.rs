@@ -408,6 +408,20 @@ pub async fn generate(
     // replace it. Only a manual Refresh escapes. Erroring here leaves yesterday's briefing (or none)
     // and the next tick tries again.
     let Some(text) = c.usable_text() else {
+        // The success path's usage rides the Ok tuple and is logged by the caller — which this
+        // early return skips, so the billed call would vanish from the usage log. Log it here,
+        // under the same source label the caller uses.
+        {
+            let state = app.state::<crate::AppState>();
+            let conn = state.conn()?;
+            crate::commands::log_usage(
+                &conn,
+                "background",
+                c.model.as_deref().or(Some(plan.primary_model_id())),
+                &c.usage,
+                &meta,
+            );
+        }
         return Err(crate::error::Error::Other(format!(
             "couldn't write the briefing — {}",
             c.unusable_reason().unwrap_or("the reply could not be used")
