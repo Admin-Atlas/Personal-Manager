@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.8-alpha",
+    date: "2026-08-28",
+    highlights: [
+      "Under-the-hood tidying, with one thing worth naming: the Linux file confinement around PM's document processor is now actually tested. PM boxes that helper in so it can only read the handful of folders it needs and nothing else — but that boxing-in had never been exercised by a test, because it only exists on Linux and PM was built on Windows. There is now a test that runs the helper for real and checks it can read what it should and genuinely cannot read anything else.",
+      "Also: the contributor guide now covers licence headers and how a file records more than one author, ahead of a second developer joining.",
+    ],
+  },
+  {
     version: "3.130.7-alpha",
     date: "2026-08-28",
     highlights: [

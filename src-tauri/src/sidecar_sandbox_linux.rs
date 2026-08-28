@@ -327,3 +327,117 @@ fn confine_child(ruleset_fd: Option<RawFd>, filter: &[SockFilter]) -> std::io::R
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Stdio;
+
+    /// Build a sandbox over throwaway directories, with the BASE interpreter pointed at the real
+    /// `/usr/bin`.
+    ///
+    /// That last part is what makes an end-to-end test possible at all. The allow-set grants
+    /// read+execute on `base_python_home`, and `/usr/bin` appears nowhere else in it — so pointing
+    /// it there (the "system interpreter" shape `sidecar_allowset`'s own tests already model) is
+    /// what lets the confined child exec a real binary. Everything else is a temp dir, and `/tmp`
+    /// is granted by nothing, which is what leaves an honest denied path to aim at.
+    fn sandbox_over(root: &Path) -> Sandbox {
+        for sub in ["venv", "models", "script", "runtime"] {
+            fs::create_dir_all(root.join(sub)).expect("fixture dirs");
+        }
+        Sandbox::ensure(
+            &root.join("venv"),
+            Path::new("/usr/bin"),
+            &root.join("models"),
+            &root.join("script"),
+            &root.join("runtime"),
+        )
+        .expect("a kernel with OR without Landlock still yields a Sandbox")
+    }
+
+    /// `cat` a path inside a confined child. `/usr/bin/cat` by absolute path, not `cat`: the
+    /// ruleset grants that directory specifically, and PATH lookup is not what is under test.
+    fn confined_cat(sandbox: &Sandbox, path: &Path) -> std::process::Output {
+        let mut cmd = Command::new("/usr/bin/cat");
+        cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::piped());
+        sandbox.install_into(&mut cmd);
+        cmd.output().expect("the confined child spawns")
+    }
+
+    /// The property this whole file exists for, and the one no unit test can reach: a real child,
+    /// after a real `fork` + `landlock_restrict_self`, cannot open a file the ruleset does not
+    /// grant — and can still open one it does.
+    ///
+    /// Everything else here is parent-side bookkeeping that would pass just as happily with a
+    /// ruleset that enforced nothing. This is the assertion that would notice.
+    #[test]
+    fn a_confined_child_reads_inside_the_allow_set_and_not_outside_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = sandbox_over(root.path());
+
+        // Granted: `models_dir` is read-only in the allow-set.
+        let allowed = root.path().join("models").join("allowed.txt");
+        fs::write(&allowed, b"readable").expect("write the granted file");
+
+        // Not granted: a SEPARATE temp dir, so it sits under no granted path.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let denied = outside.path().join("secret.txt");
+        fs::write(&denied, b"must not be readable").expect("write the denied file");
+
+        if sandbox.ruleset_fd.is_none() {
+            // No active Landlock LSM. The sandbox is filesystem-degraded BY DESIGN here (seccomp
+            // still blocks the network), so there is no filesystem confinement to assert. Say so
+            // out loud rather than passing silently — a quiet pass is how this test would rot into
+            // one that never actually runs.
+            eprintln!(
+                "sandbox enforcement: SKIPPED the filesystem half — this kernel reports no \
+                 Landlock, so `Sandbox` is degraded to seccomp-only and grants nothing to test"
+            );
+            return;
+        }
+
+        let ok = confined_cat(&sandbox, &allowed);
+        assert!(
+            ok.status.success() && ok.stdout == b"readable",
+            "a GRANTED path must stay readable inside the sandbox — status {:?}, stderr {}",
+            ok.status,
+            String::from_utf8_lossy(&ok.stderr),
+        );
+
+        let blocked = confined_cat(&sandbox, &denied);
+        assert!(
+            !blocked.status.success(),
+            "an UNGRANTED path must not be readable inside the sandbox, but cat exited 0 with {:?}",
+            String::from_utf8_lossy(&blocked.stdout),
+        );
+        assert!(
+            blocked.stdout.is_empty(),
+            "a denied read must yield no content at all, got {:?}",
+            String::from_utf8_lossy(&blocked.stdout),
+        );
+    }
+
+    /// The control. Without it the deny assertion above passes for free the moment the fixture is
+    /// wrong — a mistyped path or an unwritable temp dir makes `cat` fail for reasons that have
+    /// nothing to do with Landlock, and the test would still go green. So: the same file, the same
+    /// binary, no sandbox, must be readable.
+    #[test]
+    fn the_denied_file_is_readable_when_the_sandbox_is_not_applied() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let denied = outside.path().join("secret.txt");
+        fs::write(&denied, b"must not be readable").expect("write the denied file");
+
+        let out = Command::new("/usr/bin/cat")
+            .arg(&denied)
+            .output()
+            .expect("unconfined cat runs");
+        assert!(
+            out.status.success() && out.stdout == b"must not be readable",
+            "the fixture itself must be readable unconfined, else the deny test proves nothing — \
+             status {:?}, stderr {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}
