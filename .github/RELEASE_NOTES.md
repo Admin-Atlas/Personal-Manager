@@ -1,4 +1,4 @@
-PM desktop release — **v3.129.1-alpha**.
+PM desktop release — **v3.130.10-alpha**.
 
 ## Install
 
@@ -47,40 +47,53 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.129.1-alpha
+## What's new in 3.130.10-alpha
 
-This one is about **running AI on your own machine** — setting it up, and PM being honest with
-you about what your machine can actually manage. Plus the fixes and housekeeping since v3.128.7.
+This one finishes the job the last release started: **running AI on your own machine** — getting
+a model onto it, and PM being straight with you about what it can hold and what it actually
+answered. Plus the fixes and housekeeping since v3.129.1.
 
-- **PM can now walk you through setting up local AI.** It works with three local servers —
-  Ollama, LM Studio and llama-server — but until now it had instructions for only one of them,
-  and a recommended model you hadn't downloaded yet gave you no way to get it. All three now
-  have proper instructions for your operating system, alongside what each one is good at, how
-  models get into it, and the thing most likely to rule it out for you. Every recommended model
-  shows a command that fetches and runs it. Every one of those commands was checked against the
-  makers' own documentation rather than written from memory. If you have ever wanted PM to keep
-  working without an internet connection, this is the release to try it on.
-- **The numbers PM showed about your machine are now true.** It worked out how much memory you
-  had free once, when you opened the tab, then judged every model against that one reading for
-  the rest of the session — so opening PM while your machine was busy could rule out a model
-  that fits perfectly well. On Linux it never recognised your graphics card at all. And laptop
-  graphics were borrowing the speed of the desktop card that shares their name, which overstated
-  some laptops by around double. All three are fixed, seventeen laptop chips now carry their own
-  verified figures, and a card PM has no real figure for says so rather than guessing. A model
-  that only just fits now tells you that it only just fits.
-- **Two things that made a perfectly good local model look broken.** If your machine has a proxy
-  set up — common behind a work network, or with a VPN client running — PM was sending requests
-  to your own computer through it, which cannot work; after three failures it concluded your
-  model was dead and stopped using it for minutes at a time. And the Local AI status light was
-  showing green from a guess rather than from anything it had actually seen, so it could sit
-  there reassuring you while chat was failing. Requests to your own machine now go straight
-  there, and the light reports what really happened.
-- **Elsewhere.** A document containing a single em dash or accented name no longer becomes
-  unreadable, and no longer holds up everything queued behind it. Transcribing a recording is
-  back to full speed on a laptop with four processor cores or fewer. Help mode stopped
-  explaining a project status PM removed a long time ago, and now checks itself against the
-  statuses PM really has. The libraries behind reading documents, on-device search and voice
-  notes all moved up to current versions, with every licence read again before it went in.
+- **Downloading a model works now, start to finish.** PM has been showing you a list of models
+  suited to your machine with no way to get any of them — the Download button existed and could
+  never appear, because not one of the seventeen carried a name your model server would
+  recognise. They all do now, and PM fetches the exact file it measured for the card rather than
+  a differently-packaged copy that can be a third larger. The download also became something you
+  can walk away from: it used to live inside the settings page, so switching tabs threw away the
+  progress bar and re-armed the button, one click from starting the same multi-gigabyte fetch
+  twice. It is now owned by the app — leave and come back and the progress is where you left it,
+  a second copy is refused, and there is a **Cancel** button at last. And a download is no longer
+  called a failure at the finish line: the silent minutes your server spends verifying a large
+  file now get the time they need.
+- **PM stopped guessing how much your model can hold — and the guess was hiding a real problem.**
+  Every model is trained for a certain amount of conversation, but the server running it decides
+  how much to really give, and those are different numbers. Ollama in particular hands over far
+  less than the model can take and never mentions it. PM read the model's number, so the warning
+  that a conversation is getting long, and the offer to compress it, both fire at 80% of a figure
+  the conversation could never reach — while your older messages were being quietly dropped by
+  the server. PM now asks the server what it is really serving, says plainly when a number has to
+  be assumed, and re-checks within a minute rather than remembering the first answer forever. If
+  PM told you to raise your context length and you did exactly that, it now notices.
+- **The same honesty went into the work PM does in the background.** It was sending its sorting
+  proposals and summaries in single lumps far larger than a local server can hold — and a server
+  does not refuse those, it silently throws away the beginning and answers anyway. The beginning
+  is where PM's instructions are. Work is now sized to the room your server really has before it
+  is sent, PM marks off only the part it actually managed, and where something cannot be made to
+  fit it stops and shows you the two numbers instead of pretending.
+- **A reply that failed is no longer written down as an answer.** A cut-off or blank reply from a
+  struggling local model was being recorded as a real result in several places, and in three of
+  them permanently: a truncated summary was folded into your conversation's running summary and
+  the messages behind it never read again; a cut-off pass over your history marked those messages
+  as scanned, so anything you had said about how you like things done was lost with them; and the
+  one-time import of your old profile notes could stamp itself complete having imported nothing.
+  None of those count as an answer now — PM leaves the work where it is, tries again next time,
+  and tells you which of the two happened. Billed calls whose replies were rejected also always
+  reach the usage log, which they did not before.
+- **Under the hood.** Two security boundaries that had never actually been run. PM boxes its
+  document processor in so it can only reach the handful of folders it needs — but that
+  confinement only exists on Linux and PM was built on Windows, so nothing had ever tested that
+  it confines anything, and it fails silently if it stops working. It has now been run for real
+  on a Linux machine, along with the on-device engine that reads text out of your photos, which
+  runs inside the same box. Both work, and both now have tests that will say so from now on.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
