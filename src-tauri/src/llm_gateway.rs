@@ -522,9 +522,14 @@ async fn run_local_complete(
     // why `run_local_complete` is also where the batchers get their ceiling from.
     if let Some(failure) = prompt_fit_failure(rt, local, messages) {
         rt.record(CallOutcome::for_failure(&failure.kind));
+        // A refused call never reaches the wire, so nothing downstream would ever re-check the
+        // evidence this refusal stands on — re-probe it here (no-op unless it has aged out). This
+        // is what lets "raise the context length and restart the server" actually work without
+        // also restarting PM.
+        ensure_local_window_cached(app, local);
         return match cloud {
             // Cloud windows are orders of magnitude larger, so the prompt that did not fit locally
-            // fits there — this is the one hard failure where the fallback is certain to help.
+            // all but certainly fits there.
             Some(cloud) => {
                 cloud_complete(
                     cloud,
@@ -722,10 +727,17 @@ where
     // retrieved document text being read as instructions. A front cut removes that paragraph and
     // leaves the untrusted Sources block behind it, which is the one shape this repo does not
     // tolerate (`AGENTS.md`: ingested content is DATA, never instructions). Nothing has streamed
-    // yet, so the fallback is clean; local-only surfaces it, and the context meter — now reading the
-    // served window rather than the trained one — is already offering Compress by this point.
-    if let Some(failure) = prompt_fit_failure(rt, local, messages) {
+    // yet, so the fallback is clean; local-only surfaces it. The refusal message itself must name
+    // Compress: the estimate here is pessimistic on purpose, so a refusal can fire well before the
+    // context meter's measured 80% alert would have surfaced the Compress affordance — and once
+    // refusals start, the measured numerator stops growing, so that alert may never come.
+    if let Some(mut failure) = prompt_fit_failure(rt, local, messages) {
         rt.record(CallOutcome::for_failure(&failure.kind));
+        // The evidence just mattered — make sure it is still true (no-op unless it has aged out).
+        ensure_local_window_cached(app, local);
+        failure
+            .detail
+            .push_str(" — or use Compress to shrink this conversation");
         return match cloud {
             Some(cloud) => {
                 cloud_stream(
@@ -843,10 +855,20 @@ pub fn no_provider_message() -> String {
 ///
 /// So an unknown window is treated as [`openai_compat::DEFAULT_CONTEXT`] — the same honest floor the
 /// ladder itself falls to — and flagged as unproven. Never probes; safe on the hot path.
+///
+/// An UNPROVEN cached number is clamped to that same floor rather than trusted upward. The unproven
+/// rung is `ModelsMeta` — llama-server's `n_ctx_train`, LM Studio's `max_context_length` — the
+/// model's TRAINED capacity, a property of the weights and not of this load. Sizing batches to it
+/// repeats the exact mistake that killed the Catalog rung (#792/#795): llama-server at its default
+/// `--ctx-size 4096` reports a 32768 `n_ctx_train`, and one cached probe would have every later
+/// batch built eight times too large, silently head-cut on a `--context-shift` server. A trained
+/// capacity BELOW the floor is kept — the load cannot exceed the weights, so smaller is evidence.
 fn sizing_window(rt: &crate::local_slot::LocalRuntime, local: &LocalArm) -> (i64, bool) {
+    let floor = i64::from(openai_compat::DEFAULT_CONTEXT);
     match rt.cached_window(&local.base_url, &local.model) {
-        Some(w) => (i64::from(w.tokens), w.source.is_proven()),
-        None => (i64::from(openai_compat::DEFAULT_CONTEXT), false),
+        Some(w) if w.source.is_proven() => (i64::from(w.tokens), true),
+        Some(w) => (i64::from(w.tokens).min(floor), false),
+        None => (floor, false),
     }
 }
 
@@ -905,32 +927,44 @@ fn prompt_fit_failure(
     messages: &[ChatMessage],
 ) -> Option<LocalFailure> {
     let ceiling = local_refusal_ceiling(rt, local)?;
+    // The window itself, for the message — not reconstructed from the ceiling, whose reserve now
+    // scales with the window size.
+    let (window, _) = sizing_window(rt, local);
     let est =
         context_budget::est_messages_tokens_upper(messages.iter().map(|m| m.content.as_str()));
     (est > ceiling).then(|| LocalFailure {
         kind: LocalFailKind::PromptTooLarge,
+        // "up to": the estimate is deliberately pessimistic (25-100% over truth, by content class),
+        // so stating it as the prompt's size would contradict the server's own counters.
         detail: format!(
-            "this one needs about {est} tokens and the server is serving {}; \
+            "this one needs up to about {est} tokens and the server is serving {window}; \
              raise the context length (Ollama: OLLAMA_CONTEXT_LENGTH, llama-server: --ctx-size, \
-             LM Studio: the model's context length)",
-            ceiling + context_budget::REPLY_RESERVE_TOKENS
+             LM Studio: the model's context length)"
         ),
     })
 }
 
 /// After a successful local call the model is loaded, so the server can be asked what it really
-/// loaded — `/slots` on llama-server, `/api/ps` on Ollama. Probe and cache it ONCE, in the
-/// background, so the context meter can show it on its next poll without ever blocking a reply on
-/// the network. A no-op once the window is cached.
+/// loaded — `/slots` on llama-server, `/api/ps` on Ollama. Probe and cache it in the background, so
+/// the context meter can show it on its next poll without ever blocking a reply on the network.
+///
+/// A no-op while the cached window is younger than `WINDOW_REPROBE_INTERVAL`; older entries are
+/// re-probed rather than trusted forever. Write-once was blind in both directions: the user follows
+/// PM's own refusal message (raise the context length, restart the server) and PM keeps refusing
+/// against the dead server's window; or the server comes back SMALLER and a stale proven ceiling
+/// lets oversized prompts through to be silently head-cut. The refusal paths call this too — a
+/// refused call is precisely the moment the cached evidence is worth re-checking, and the refusal
+/// itself never reaches the wire, so nothing else would. A re-probe that finds no resident model
+/// deliberately DOWNGRADES a proven entry to the unproven floor: the evidence expired with the
+/// load it described, and an unproven entry sizes conservatively and never refuses.
 ///
 /// Timing matters here: both proven rungs only answer while a model is RESIDENT, which is why this
-/// runs after a successful call rather than at configure time.
+/// runs after calls rather than at configure time.
 fn ensure_local_window_cached(app: &AppHandle, local: &LocalArm) {
     let state = app.state::<AppState>();
-    if state
+    if !state
         .local_ai
-        .cached_window(&local.base_url, &local.model)
-        .is_some()
+        .window_probe_due(&local.base_url, &local.model)
     {
         return;
     }
@@ -1123,6 +1157,76 @@ mod tests {
             },
         );
         assert!(prompt_fit_failure(&rt, &local, &msgs(10_000)).is_none());
+    }
+
+    #[test]
+    fn an_unproven_models_meta_window_never_sizes_upward() {
+        // `ModelsMeta` is the model's TRAINED capacity (`n_ctx_train` / `max_context_length`) — a
+        // property of the weights, not of this load. llama-server at its default `--ctx-size 4096`
+        // reports a 32768 n_ctx_train; trusting it for sizing would rebuild the exact #792 defect
+        // the Catalog rung was deleted for, one probe after the first successful call.
+        let rt = LocalRuntime::default();
+        let local = arm();
+        rt.cache_window(
+            &local.base_url,
+            &local.model,
+            WindowInfo {
+                tokens: 32_768,
+                source: WindowSource::ModelsMeta,
+            },
+        );
+        assert_eq!(
+            local_prompt_ceiling(&rt, &local),
+            Some(i64::from(openai_compat::DEFAULT_CONTEXT) - context_budget::REPLY_RESERVE_TOKENS),
+            "an unproven claim above the floor is clamped to the floor"
+        );
+        assert_eq!(local_refusal_ceiling(&rt, &local), None);
+        assert!(prompt_fit_failure(&rt, &local, &msgs(500_000)).is_none());
+
+        // BELOW the floor the claim is kept: the load cannot exceed the weights, so a small trained
+        // capacity is real evidence — for sizing, never for refusal.
+        rt.cache_window(
+            &local.base_url,
+            &local.model,
+            WindowInfo {
+                tokens: 2048,
+                source: WindowSource::ModelsMeta,
+            },
+        );
+        assert_eq!(local_prompt_ceiling(&rt, &local), Some(2048 - 512));
+        assert_eq!(local_refusal_ceiling(&rt, &local), None);
+    }
+
+    #[test]
+    fn a_proven_tiny_window_still_sizes_and_still_refuses() {
+        // A PROVEN window at or below the reply reserve used to yield ceiling `None`, which every
+        // consumer read as "no ceiling — send everything": the smallest servers, the ones a
+        // head-cut hurts most, got the largest unguarded prompts. Now the reserve scales down and
+        // both the sizing and the refusal stay armed.
+        let rt = LocalRuntime::default();
+        let local = arm();
+        rt.cache_window(
+            &local.base_url,
+            &local.model,
+            WindowInfo {
+                tokens: 1024,
+                source: WindowSource::LoadedModel,
+            },
+        );
+        assert_eq!(
+            local_prompt_ceiling(&rt, &local),
+            Some(768),
+            "a measured 1024-token window keeps three quarters for the prompt"
+        );
+        assert_eq!(local_refusal_ceiling(&rt, &local), Some(768));
+        let failure = prompt_fit_failure(&rt, &local, &msgs(10_000))
+            .expect("10k characters cannot fit a 1024-token window");
+        assert_eq!(failure.kind, LocalFailKind::PromptTooLarge);
+        assert!(
+            failure.detail.contains("1024"),
+            "the message names the real window, not one reconstructed from the ceiling: {}",
+            failure.detail
+        );
     }
 
     #[test]

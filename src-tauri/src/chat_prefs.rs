@@ -201,16 +201,15 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
     //     is the rule that breaks when the SERVER does the trimming instead of PM, because then the
     //     cursor still advances over all forty. The overflow is picked up next run, unchanged.
     let ceiling = crate::llm_gateway::prompt_ceiling_for(app, &route);
-    let keep = crate::context_budget::largest_fitting(pairs.len(), ceiling, |n| {
+    let span_cost = |span: &[chat::TurnPair]| {
         crate::context_budget::est_messages_tokens_upper(
-            preferences::render_chat_extract_request(
-                &extractable_user_turns(&pairs[..n]),
-                &project_names,
-            )
-            .iter()
-            .map(|m| m.content.as_str()),
+            preferences::render_chat_extract_request(&extractable_user_turns(span), &project_names)
+                .iter()
+                .map(|m| m.content.as_str()),
         )
-    });
+    };
+    let keep =
+        crate::context_budget::largest_fitting(pairs.len(), ceiling, |n| span_cost(&pairs[..n]));
     if keep < pairs.len() {
         let deferred = pairs.len() - keep;
         eprintln!(
@@ -218,12 +217,60 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
              these turn-pairs, deferring {deferred} to the next run"
         );
         pairs.truncate(keep);
-        user_turns = extractable_user_turns(&pairs);
         cursor_to = pairs
             .iter()
             .map(|p| p.turn_id)
             .max()
             .expect("largest_fitting never returns 0 for a non-empty span");
+    }
+
+    // 2c. Even the one remaining pair can exceed the whole window by itself (`MAX_MESSAGE_CHARS`
+    //     allows a ~100k-char paste). Refusing it would wedge THIS conversation's extraction
+    //     forever — the cursor could never pass it, and every newer turn would sit unscanned
+    //     behind it, invisibly (nothing on a background path reaches the user). So the turn is
+    //     clipped to what the window holds and scanned partially instead; the stored turn is
+    //     untouched, only the prompt's view of it shrinks. If even a fully-clipped pair cannot
+    //     fit (the scaffold — an unbounded project list — is over the ceiling on its own), the
+    //     clip is NOT committed and the refusal stays visible as the honest signal of the real
+    //     problem.
+    if let Some(ceiling) = ceiling {
+        if pairs.len() == 1 && span_cost(&pairs) > ceiling {
+            let full = pairs[0].user.chars().count();
+            let clip = |k: usize| chat::TurnPair {
+                user: pairs[0].user.chars().take(k).collect(),
+                assistant: pairs[0].assistant.clone(),
+                turn_id: pairs[0].turn_id,
+                at: pairs[0].at.clone(),
+            };
+            let keep_chars = crate::context_budget::largest_fitting(full, Some(ceiling), |k| {
+                span_cost(std::slice::from_ref(&clip(k)))
+            });
+            let clipped = clip(keep_chars);
+            if span_cost(std::slice::from_ref(&clipped)) <= ceiling {
+                eprintln!(
+                    "chat-prefs: session {conversation_id} — one turn is larger than the server's \
+                     whole context window; scanning its first {keep_chars} of {full} chars rather \
+                     than wedging extraction behind it"
+                );
+                pairs[0] = clipped;
+            }
+        }
+    }
+    user_turns = extractable_user_turns(&pairs);
+
+    // 2d. The fitted span can be all-trivial or near-empty even when the full span was not — the
+    //     prefix that fits may hold only greetings while the substance sits in the deferred tail.
+    //     Calling the model here would bill a prompt containing no turns at all. Mirror the
+    //     pre-trim gate: advance the cursor over the span and stop, no call.
+    let content_chars: usize = user_turns.iter().map(|t| t.chars().count()).sum();
+    if user_turns.is_empty() || content_chars < MIN_CONTENT_CHARS {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.execute(
+            "UPDATE chat_sessions SET prefs_covers_up_to_turn_id = ?1 WHERE conversation_id = ?2",
+            params![cursor_to, conversation_id],
+        )?;
+        return Ok(0);
     }
 
     // 3. Extract (async, no lock held). A model/parse failure propagates so the cursor is NOT advanced

@@ -302,9 +302,13 @@ pub async fn propose_metadata(
     //
     // The batch is sized DOWN when the answering server's window can't hold five documents plus the
     // run-wide system prefix; `review::BATCH_SIZE` is still the ceiling.
-    let filing_ceiling = llm_gateway::prompt_ceiling_for(&app, &plan);
     let mut cursor = 0usize;
     while cursor < pending.len() {
+        // Re-read the ceiling every batch, not once per run: the first successful call of a fresh
+        // process re-proves the window in the background, and a run sized once to the pre-proof
+        // floor would then refuse (or under-fill) every remaining batch against a number that is
+        // already known to be wrong.
+        let filing_ceiling = llm_gateway::prompt_ceiling_for(&app, &plan);
         let all: Vec<review::DocInput<'_>> = pending[cursor..]
             .iter()
             .take(review::BATCH_SIZE)
@@ -683,9 +687,11 @@ async fn retag_assign(
 
     let total = docs.len();
     let mut done = 0usize;
-    let ceiling = llm_gateway::prompt_ceiling_for(app, plan);
     let mut cursor = 0usize;
     while cursor < docs.len() {
+        // Per-batch, not per-run: the first success of a fresh process re-proves the window in the
+        // background, and every batch after it should be sized to the proven number.
+        let ceiling = llm_gateway::prompt_ceiling_for(app, plan);
         let all: Vec<retag::RetagInput<'_>> = docs[cursor..]
             .iter()
             .take(retag::ASSIGN_BATCH)

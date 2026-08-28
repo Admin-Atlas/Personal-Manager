@@ -21,8 +21,8 @@
 //!     a batch ([`RECENCY_WINDOW_PAIRS`] + [`SUMMARY_BATCH_PAIRS`]), summarising the oldest batch so the
 //!     window snaps back to ~`RECENCY_WINDOW_PAIRS`. A short chat never gets a summary at all.
 //!   * **Standard privacy posture.** Summary generation uses the **background** model role (separate from the
-//!     conversation model, [`BACKGROUND_MODELS_KEY`]) through `openrouter::complete`, which enforces
-//!     per-request zero-data-retention exactly like the review loop. It is not an untracked side channel:
+//!     conversation model, [`BACKGROUND_MODELS_KEY`]) through `llm_gateway::complete`, whose cloud arm
+//!     enforces per-request zero-data-retention exactly like the review loop. It is not an untracked side channel:
 //!     the spend is logged to `usage_log` under `chat_summary`, and the prompt frames the conversation as
 //!     untrusted data to summarise, never instructions to obey.
 //!
@@ -173,8 +173,15 @@ fn render_summary_request(existing: Option<&str>, segment: &[chat::TurnPair]) ->
 /// a prompt thirty times a 4096-token window. The [`crate::context_budget::SUMMARY_CAP_FRAC`] guard
 /// does not cover it: that one only decides whether the UI *offers* the button.
 ///
-/// Never returns an empty segment — a single pair too large for the window is sent and refused by
-/// name, which the user can act on, rather than skipped, which they cannot see.
+/// Never returns an empty segment — and never leaves a single pair that cannot fit alone. A pair
+/// bigger than the whole window (a pasted document, `MAX_MESSAGE_CHARS` allows ~100k chars) used to
+/// be sent as-is and refused by the gateway; since this runs on a background path where the refusal
+/// reaches nobody, that pair wedged the summary PERMANENTLY — the cursor could never advance past
+/// it, and every turn after it was never folded. So the pair is CLIPPED to fit instead: the summary
+/// records a truncated view of that one turn (logged), which is strictly more than the nothing-ever-
+/// again the wedge produced. The one case still sent over-size is a scaffold that alone exceeds the
+/// ceiling — an existing summary grown past a tiny window — where no amount of clipping this pair
+/// can help and the refusal names the real problem.
 fn fit_segment(
     existing: Option<&str>,
     segment: &mut Vec<chat::TurnPair>,
@@ -191,7 +198,55 @@ fn fit_segment(
         )
     });
     segment.truncate(n);
+    if let (Some(ceiling), [pair]) = (ceiling, segment.as_mut_slice()) {
+        clip_pair_to_fit(existing, pair, ceiling);
+    }
     segment.last().map(|p| p.turn_id)
+}
+
+/// The prompt cost of summarising exactly one pair (the shape `clip_pair_to_fit` sizes against).
+fn one_pair_cost(existing: Option<&str>, pair: &chat::TurnPair) -> i64 {
+    context_budget::est_messages_tokens_upper(
+        render_summary_request(existing, std::slice::from_ref(pair))
+            .iter()
+            .map(|m| m.content.as_str()),
+    )
+}
+
+/// Clip both texts of an oversized pair (in place) until its one-pair prompt fits `ceiling`.
+/// Char-budget found by the same halving search the batchers use, over the REAL rendered prompt.
+/// A no-op when the pair already fits, and when even a fully-clipped pair cannot fit (the scaffold
+/// itself is over the ceiling) — that case must stay visible as a refusal, not vanish here.
+fn clip_pair_to_fit(existing: Option<&str>, pair: &mut chat::TurnPair, ceiling: i64) {
+    if one_pair_cost(existing, pair) <= ceiling {
+        return;
+    }
+    let clip = |s: &str, max: usize| -> String { s.chars().take(max).collect() };
+    let probe = |k: usize| chat::TurnPair {
+        user: clip(&pair.user, k),
+        assistant: clip(&pair.assistant, k),
+        turn_id: pair.turn_id,
+        at: pair.at.clone(),
+    };
+    let max_chars = pair
+        .user
+        .chars()
+        .count()
+        .max(pair.assistant.chars().count());
+    let keep = context_budget::largest_fitting(max_chars, Some(ceiling), |k| {
+        one_pair_cost(existing, &probe(k))
+    });
+    // `largest_fitting` returns 1 untested — commit the clip only if it genuinely fits.
+    let clipped = probe(keep);
+    if one_pair_cost(existing, &clipped) <= ceiling {
+        eprintln!(
+            "chat-summary: one turn-pair (turn {}) is larger than the server's whole context \
+             window — folding a clipped view ({keep} of {max_chars} chars per side) rather than \
+             wedging the summary behind it forever",
+            pair.turn_id
+        );
+        *pair = clipped;
+    }
 }
 
 /// Land one extension atomically: append `new_segment` to the stored summary (re-reading it inside the
@@ -943,6 +998,49 @@ mod tests {
             turn_id,
             at: "2026-06-28T10:00:00.000Z".into(),
         }
+    }
+
+    #[test]
+    fn a_pair_bigger_than_the_window_is_clipped_rather_than_wedging_the_summary() {
+        // A pasted document: one pair whose user side alone dwarfs a small served window. Refusing
+        // it wedges the summary permanently (the refusal reaches nobody on a background path and
+        // the cursor can never pass the pair) — so fit_segment clips the pair to what fits.
+        let mut seg = vec![chat::TurnPair {
+            user: "word ".repeat(20_000),
+            assistant: "short reply".into(),
+            turn_id: 7,
+            at: "2026-08-28T10:00:00.000Z".into(),
+        }];
+        let ceiling = Some(768i64); // a proven 1024-token window's ceiling
+        let cursor = fit_segment(None, &mut seg, ceiling);
+        assert_eq!(cursor, Some(7), "the cursor still lands on the pair");
+        assert_eq!(seg.len(), 1);
+        let cost = one_pair_cost(None, &seg[0]);
+        assert!(
+            cost <= 768,
+            "the clipped pair's prompt fits the ceiling (got {cost})"
+        );
+        assert!(
+            !seg[0].user.is_empty(),
+            "clipped, not emptied — a truncated view beats no view"
+        );
+
+        // A pair that already fits is untouched, byte for byte.
+        let mut small = vec![pair(3)];
+        fit_segment(None, &mut small, ceiling);
+        assert_eq!(small[0].user, "u3");
+        assert_eq!(small[0].assistant, "a3");
+
+        // And when the SCAFFOLD alone is over the ceiling (an existing summary grown past a tiny
+        // window), no clip can help: the pair goes through unclipped so the gateway's refusal
+        // names the real problem instead of this code hiding it.
+        let huge_summary = "x".repeat(20_000);
+        let mut seg2 = vec![pair(9)];
+        fit_segment(Some(&huge_summary), &mut seg2, ceiling);
+        assert_eq!(
+            seg2[0].user, "u9",
+            "an unfixable overflow is left visible, not silently clipped to nothing"
+        );
     }
 
     #[test]

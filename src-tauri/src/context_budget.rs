@@ -143,28 +143,43 @@ pub fn est_messages_tokens_upper<'a, I: IntoIterator<Item = &'a str>>(contents: 
         .sum()
 }
 
-/// How many prompt tokens may be sent to a server serving `window` tokens. `None` when the window is
-/// unknown (nothing to size against) or so small that the reply reserve alone exhausts it — a caller
-/// that gets `None` sends what it would have sent anyway, which is the pre-existing behaviour.
+/// How many prompt tokens may be sent to a server serving `window` tokens. `None` ONLY when the
+/// window is unknown (nothing to size against) or nonsensical (zero or negative) — a caller that
+/// gets `None` sends what it would have sent anyway, which is the pre-existing behaviour.
+///
+/// A KNOWN window always yields a ceiling, however small. The reserve scales down to a quarter of a
+/// small window rather than swallowing it: the first shipped version returned `None` whenever
+/// `window <= REPLY_RESERVE_TOKENS`, which handed the SMALLEST servers — the ones a head-cut hurts
+/// most — the full unsized prompt, and flipped to "refuse nearly everything" at `window = reserve+1`.
+/// Both cliffs are gone: windows >= 4×reserve behave exactly as before (ceiling = window − 1024),
+/// smaller ones keep three quarters for the prompt and a quarter for the reply.
 pub fn prompt_ceiling(window: Option<i64>) -> Option<i64> {
     let w = window?;
-    let ceiling = w - REPLY_RESERVE_TOKENS;
+    let reserve = REPLY_RESERVE_TOKENS.min(w / 4);
+    let ceiling = w - reserve;
     (ceiling > 0).then_some(ceiling)
 }
 
 /// The largest batch size in `1..=max` whose prompt fits under `ceiling`, found by halving.
 ///
-/// `cost(n)` must return the token size of the prompt this caller would build for `n` items, and it
-/// must not shrink as `n` grows (every batcher here appends, so it doesn't). Callers pass a closure
-/// that BUILDS the real prompt and measures it with [`est_messages_tokens_upper`], rather than
-/// estimating its parts — a parallel estimate is a second copy of the prompt's shape and would drift
-/// away from the builder the first time anyone edits one. `cost` is called ~log2(max) times, and a
-/// prompt builder is a few string joins, so that is cheap next to the model call it precedes.
+/// `cost(n)` must return the token size of the prompt this caller would build for `n` items.
+/// Callers pass a closure that BUILDS the real prompt and measures it with
+/// [`est_messages_tokens_upper`], rather than estimating its parts — a parallel estimate is a
+/// second copy of the prompt's shape and would drift away from the builder the first time anyone
+/// edits one. `cost` is called ~log2(max) times, and a prompt builder is a few string joins, so
+/// that is cheap next to the model call it precedes.
 ///
-/// **Never returns zero.** `None` (no ceiling — a cloud route, or a local window PM has not learned
-/// yet) returns `max` unchanged, which is the pre-existing behaviour. A single item too large for
-/// any ceiling comes back as a batch of one, so the gateway refuses it by name instead of the caller
-/// reading an empty batch as "nothing to do" and skipping it forever.
+/// The search assumes `cost` does not shrink as `n` grows. Most batchers append, so it holds;
+/// `retag::sample_titles_within` resamples a DIFFERENT even spread per `n`, so its cost can dip.
+/// That cannot make the result overflow — every size the search settles on except `1` was
+/// MEASURED to fit, and the caller rebuilds the identical prompt — it can only under-fill.
+///
+/// **Never returns zero, and `1` is returned untested.** `None` (no ceiling — a cloud route, or a
+/// local window PM has not learned yet) returns `max` unchanged, which is the pre-existing
+/// behaviour. A single item too large for any ceiling comes back as a batch of one — `cost(1)` is
+/// never compared against the ceiling — so the gateway refuses it by name instead of the caller
+/// reading an empty batch as "nothing to do" and skipping it forever. A caller whose cursor would
+/// wedge on that refusal (chat_prefs, chat_summary) must clip the single item instead.
 pub fn largest_fitting(
     max: usize,
     ceiling: Option<i64>,
@@ -321,18 +336,39 @@ mod tests {
     }
 
     #[test]
-    fn prompt_ceiling_holds_back_the_reply_and_gives_up_on_a_tiny_window() {
+    fn prompt_ceiling_holds_back_the_reply_and_scales_it_down_for_a_tiny_window() {
         assert_eq!(
             prompt_ceiling(Some(4096)),
-            Some(4096 - REPLY_RESERVE_TOKENS)
+            Some(4096 - REPLY_RESERVE_TOKENS),
+            "at 4×reserve and above the full reserve is held back — unchanged behaviour"
+        );
+        assert_eq!(
+            prompt_ceiling(Some(16384)),
+            Some(16384 - REPLY_RESERVE_TOKENS)
         );
         assert_eq!(prompt_ceiling(None), None, "unknown window ⇒ no ceiling");
+
+        // Below 4×reserve the reserve scales to a quarter of the window instead of swallowing it.
+        // The first shipped version returned None here, which every consumer read as "no ceiling —
+        // send everything": a PROVEN 1024-token server got the full 400-title vocabulary prompt
+        // while a 4096 one got a sized batch. Known-small must never mean unguarded.
         assert_eq!(
             prompt_ceiling(Some(REPLY_RESERVE_TOKENS)),
-            None,
-            "a window the reply alone fills is not a budget"
+            Some(REPLY_RESERVE_TOKENS - REPLY_RESERVE_TOKENS / 4),
+            "a window the old rule gave up on now keeps 3/4 for the prompt"
         );
-        assert_eq!(prompt_ceiling(Some(REPLY_RESERVE_TOKENS + 1)), Some(1));
+        assert_eq!(prompt_ceiling(Some(2048)), Some(2048 - 512));
+
+        // And the cliff at reserve+1 (ceiling of 1 token — refuse effectively everything) is gone.
+        assert_eq!(
+            prompt_ceiling(Some(REPLY_RESERVE_TOKENS + 1)),
+            Some(769),
+            "reserve+1 is a usable budget, not a 1-token one"
+        );
+
+        // Nonsense windows are still not budgets.
+        assert_eq!(prompt_ceiling(Some(0)), None);
+        assert_eq!(prompt_ceiling(Some(-1)), None);
     }
 
     #[test]

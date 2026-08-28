@@ -102,6 +102,15 @@ pub mod tunables {
     /// Per-request deadline for the `/slots` and `/v1/models` context-window probes.
     pub const WINDOW_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+    /// How old a cached context window may grow before the next opportunity re-probes it. The cache
+    /// used to be write-once per process, which made it blind in both directions: a user who
+    /// followed PM's own refusal message — raise `OLLAMA_CONTEXT_LENGTH`, restart the server — kept
+    /// being refused against the dead server's window until they also restarted PM, and a server
+    /// restarted SMALLER left an oversized ceiling silently head-cutting every prompt. Sixty
+    /// seconds bounds both wrongs at one minute; the probe itself is two loopback GETs against a
+    /// server that just answered, so the steady-state cost is negligible.
+    pub const WINDOW_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
+
     /// Consecutive hard failures that trip the dead-host cooldown. A consecutive-count trip (not an
     /// error-rate window) is the right model for a low-volume single backend. Envoy's infra default
     /// is 5; 3 is deliberately more sensitive for an interactive desktop app — move toward 5 if
@@ -499,7 +508,7 @@ impl LocalSlot {
 pub struct LocalRuntime {
     pub slot: LocalSlot,
     health: Mutex<HealthState>,
-    windows: Mutex<std::collections::HashMap<String, WindowInfo>>,
+    windows: Mutex<std::collections::HashMap<String, (WindowInfo, Instant)>>,
     last_probe: Mutex<Option<Instant>>,
     /// The RESULT of the last reachability observation, so a debounced status read can report what
     /// was actually last seen. `None` means nothing has been observed yet, which is NOT the same as
@@ -562,12 +571,36 @@ impl LocalRuntime {
 
     pub fn cached_window(&self, base_url: &str, model: &str) -> Option<WindowInfo> {
         let key = Self::window_key(base_url, model);
-        self.windows.lock().ok()?.get(&key).copied()
+        self.windows.lock().ok()?.get(&key).map(|(info, _)| *info)
+    }
+
+    /// Whether the cached window for this key is due a re-probe: absent, or older than
+    /// [`tunables::WINDOW_REPROBE_INTERVAL`]. The cache used to be write-once per process, which
+    /// left it blind to the one change its own refusal message tells the user to make (restart the
+    /// server with a bigger window) — and to the quieter inverse, a server restarted smaller.
+    pub fn window_probe_due(&self, base_url: &str, model: &str) -> bool {
+        let key = Self::window_key(base_url, model);
+        match self.windows.lock() {
+            Ok(w) => w
+                .get(&key)
+                .is_none_or(|(_, at)| at.elapsed() >= tunables::WINDOW_REPROBE_INTERVAL),
+            Err(_) => false,
+        }
     }
 
     pub fn cache_window(&self, base_url: &str, model: &str, info: WindowInfo) {
         if let Ok(mut w) = self.windows.lock() {
-            w.insert(Self::window_key(base_url, model), info);
+            w.insert(Self::window_key(base_url, model), (info, Instant::now()));
+        }
+    }
+
+    /// Test-only: age a cached window entry so staleness paths can be exercised without sleeping.
+    #[cfg(test)]
+    pub fn backdate_window(&self, base_url: &str, model: &str, age: Duration) {
+        if let Ok(mut w) = self.windows.lock() {
+            if let Some((_, at)) = w.get_mut(&Self::window_key(base_url, model)) {
+                *at = Instant::now() - age;
+            }
         }
     }
 
@@ -924,6 +957,41 @@ mod tests {
         );
         // A different model on the same endpoint is a separate entry.
         assert_eq!(rt.cached_window("http://localhost:11434", "qwen2.5"), None);
+    }
+
+    #[test]
+    fn a_cached_window_ages_out_instead_of_living_forever() {
+        use crate::openai_compat::WindowSource;
+        // Write-once was blind in both directions: the user follows PM's own refusal message
+        // (raise the context length, restart the server) and PM keeps refusing against the dead
+        // server's window; or the server comes back SMALLER and a stale proven ceiling lets
+        // oversized prompts through to be silently head-cut.
+        let rt = LocalRuntime::default();
+        let (url, model) = ("http://127.0.0.1:11434", "llama3.2");
+        assert!(
+            rt.window_probe_due(url, model),
+            "no entry at all is exactly what a probe fixes"
+        );
+        rt.cache_window(
+            url,
+            model,
+            WindowInfo {
+                tokens: 4096,
+                source: WindowSource::LoadedModel,
+            },
+        );
+        assert!(
+            !rt.window_probe_due(url, model),
+            "a fresh entry is not re-probed — the hot path must stay probe-free"
+        );
+        rt.backdate_window(url, model, tunables::WINDOW_REPROBE_INTERVAL);
+        assert!(
+            rt.window_probe_due(url, model),
+            "an entry older than the interval is due — however proven it was when written"
+        );
+        // The entry itself is still served while the background re-probe runs: stale evidence is
+        // better than none for SIZING, and the refresh is what bounds how stale it can get.
+        assert_eq!(rt.cached_window(url, model).map(|w| w.tokens), Some(4096));
     }
 
     #[test]

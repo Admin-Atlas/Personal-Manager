@@ -639,7 +639,12 @@ pub struct LocalLlmStatus {
 /// is what the footer is reporting.
 pub fn role_local_model(routing: Option<&str>, bound: Option<&str>) -> Option<String> {
     match routing.unwrap_or("cloud") {
-        "local" | "local-then-cloud" => bound.filter(|m| !m.is_empty()).map(str::to_string),
+        // `trim`, matching the gateway's own emptiness test (`local_arm`) — a whitespace-only
+        // stored model must not make the sidebar name a model routing treats as unconfigured.
+        "local" | "local-then-cloud" => bound
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -727,19 +732,24 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
 
     // Background first: it is the demanding role — the one sending index-matched arrays over several
     // documents — so when the two roles run different models its window is the one worth reporting.
-    let (served_window, served_window_proven) = match (
-        base_url.as_deref(),
-        background_local_model
-            .as_deref()
-            .or(chat_local_model.as_deref()),
-    ) {
-        (Some(url), Some(model)) => {
-            match app.state::<AppState>().local_ai.cached_window(url, model) {
-                Some(w) => (Some(w.tokens), w.source.is_proven()),
-                None => (None, false),
+    // The fallback is on CACHE PRESENCE, not on which role is bound: a background model that has
+    // never answered has no cache entry, and reporting "unknown" for it while the CHAT model's
+    // window is proven-small hid the very warning the number exists to raise. Whichever role's
+    // window is actually known is more honest than none.
+    let (served_window, served_window_proven) = {
+        let state = app.state::<AppState>();
+        let window_for = |model: Option<&str>| -> Option<openai_compat::WindowInfo> {
+            match (base_url.as_deref(), model) {
+                (Some(url), Some(m)) => state.local_ai.cached_window(url, m),
+                _ => None,
             }
+        };
+        match window_for(background_local_model.as_deref())
+            .or_else(|| window_for(chat_local_model.as_deref()))
+        {
+            Some(w) => (Some(w.tokens), w.source.is_proven()),
+            None => (None, false),
         }
-        _ => (None, false),
     };
 
     Ok(LocalLlmStatus {
