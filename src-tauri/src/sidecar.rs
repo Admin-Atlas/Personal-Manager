@@ -3249,9 +3249,10 @@ mod tests {
 
     /// End-to-end smoke test of the Windows AppContainer confinement (issue #286 PR2b): spawn the REAL
     /// worker confined, `ping` it over the raw pipes, then convert a text file through the staging path,
-    /// and confirm it actually ran confined. `#[ignore]` + hardcoded dev paths because it needs the live
-    /// venv and runs the slow one-time ACL grant. Run manually:
-    ///   cargo test --manifest-path src-tauri/Cargo.toml --ignored confined_worker_smoke -- --nocapture
+    /// and confirm it actually ran confined. `#[ignore]` + a `PM_SANDBOX_SMOKE_VENV` env because it
+    /// needs the live venv and runs the slow one-time ACL grant. Run manually (PowerShell):
+    ///   $env:PM_SANDBOX_SMOKE_VENV = "$env:LOCALAPPDATA\Personal Manager\runtime\venv"
+    ///   cargo test --manifest-path src-tauri/Cargo.toml confined_worker_smoke -- --ignored --nocapture
     #[test]
     #[ignore = "windows-only, needs the live venv; validates the confined stdio protocol"]
     #[cfg(windows)]
@@ -3302,8 +3303,8 @@ mod tests {
     /// outside the allow-set. `#[ignore]` + a `PM_SANDBOX_SMOKE_VENV` env because it needs the live venv
     /// and a Landlock-capable kernel (≥ 5.13). This is the enforcement check the Windows dev box cannot
     /// run and CI (compile/lint/unit only) does not — run it on a real Linux box:
-    ///   PM_SANDBOX_SMOKE_VENV=~/.local/share/pm/runtime/venv \
-    ///     cargo test --manifest-path src-tauri/Cargo.toml --ignored confined_worker_smoke_linux -- --nocapture
+    ///   PM_SANDBOX_SMOKE_VENV="$HOME/.local/share/Personal Manager/runtime/venv" \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml confined_worker_smoke_linux -- --ignored --nocapture
     #[test]
     #[ignore = "linux-only, needs the live venv + a Landlock kernel; validates real enforcement"]
     #[cfg(all(
@@ -3403,6 +3404,126 @@ mod tests {
         }
     }
 
+    /// The photo-OCR half of the Linux confinement (issue #617 finding 1): prove the OPTIONAL OCR
+    /// component can actually run INSIDE the sandbox. Its own card could not be closed by a PR
+    /// because nothing headless could answer the question — the audit's claim was that rapidocr
+    /// fetches its models from its OWN host on first use, so the no-network worker could never
+    /// obtain them, the constructor would raise, and the F-56 guard would swallow it and commit the
+    /// photo with an empty body. A receipt would index as textless and look entirely normal.
+    ///
+    /// The fix routes rapidocr's weights under `PM_MODELS_DIR` (granted read-only in the allow-set)
+    /// and its loader through `_load_model`, so a cold cache raises `ModelNotCached` and rides the
+    /// same fetch-and-retry every other model gets. This is the check that says the fix holds on a
+    /// real kernel, and it is the ONLY one that can: the fall-open is silent by design, so a
+    /// regression here produces no error, no crash, and a green gate.
+    ///
+    /// Needs the live venv WITH the optional OCR component installed (Settings → the OCR download),
+    /// and a Landlock-capable kernel (≥ 5.13):
+    ///   PM_SANDBOX_SMOKE_VENV="$HOME/.local/share/Personal Manager/runtime/venv" \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml confined_worker_ocr_smoke_linux -- --ignored --nocapture
+    #[test]
+    #[ignore = "linux-only, needs the live venv + the OCR component + a Landlock kernel"]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn confined_worker_ocr_smoke_linux() {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("sidecar");
+        // PANIC, not `return`, for the same reason as every other smoke test here: an early return
+        // in a #[test] is a PASS, and a confinement check that passes without confining anything is
+        // worse than no check at all (H7).
+        let venv_dir = PathBuf::from(std::env::var("PM_SANDBOX_SMOKE_VENV").expect(
+            "set PM_SANDBOX_SMOKE_VENV to the installed venv dir (.../runtime/venv) to run this",
+        ));
+        let python = venv_dir.join("bin/python");
+        assert!(python.exists(), "no venv at {venv_dir:?}");
+        // OCR is an OPTIONAL component, so its absence is a legitimate state of a real install —
+        // but it is also this test's entire subject, so it is an error here rather than a skip.
+        let models = venv_dir.parent().unwrap().join("models/rapidocr");
+        assert!(
+            models.is_dir() && models.read_dir().is_ok_and(|mut d| d.next().is_some()),
+            "no rapidocr weights at {models:?} — install the photo-OCR component (Settings → \
+             Storage) before running this"
+        );
+
+        // Render the fixture with the venv's OWN Pillow rather than checking a binary into a public
+        // repo or adding an image crate to the build. Pillow is a pinned base requirement, so this
+        // needs nothing the worker does not already have. Big type on white: the point is to prove
+        // the engine RUNS under the sandbox, not to measure how good it is.
+        let image = std::env::temp_dir().join("pm_confined_ocr_smoke.png");
+        let render = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(
+                "import sys\n\
+                 from PIL import Image, ImageDraw, ImageFont\n\
+                 img = Image.new('RGB', (900, 220), 'white')\n\
+                 ImageDraw.Draw(img).text((30, 60), 'INVOICE 12345', fill='black',\n\
+                 font=ImageFont.load_default(size=72))\n\
+                 img.save(sys.argv[1])\n",
+            )
+            .arg(&image)
+            .output()
+            .expect("render the OCR fixture");
+        assert!(
+            render.status.success(),
+            "could not render the fixture: {}",
+            String::from_utf8_lossy(&render.stderr)
+        );
+
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir,
+            venv_dir,
+        });
+
+        // Like the convert smoke test, the FIRST request is the path-bearing one, so the input has
+        // to be staged after the confined spawn rather than before it.
+        let analysis = mgr
+            .analyze_image(&image, true)
+            .expect("confined analyze_image (first request)");
+        std::fs::remove_file(&image).ok();
+
+        assert!(
+            mgr.sandbox.lock().unwrap().is_some(),
+            "worker should be confined — the sandbox was not set up"
+        );
+        match mgr.sandbox_report() {
+            SandboxReport::Confined { ref layers, .. } => {
+                assert!(layers.iter().any(|l| l == "network"), "network: {layers:?}");
+                assert!(
+                    layers.iter().any(|l| l == "filesystem"),
+                    "filesystem layer should be enforced on a Landlock kernel: {layers:?}"
+                );
+            }
+            other => panic!(
+                "this test is only meaningful on a fully confined worker, got: {}",
+                serde_json::to_value(&other).unwrap()
+            ),
+        }
+
+        // The image was read at all — separates "the sandbox blocked the file" from "OCR failed".
+        assert_eq!(analysis.width, Some(900), "the worker never read the image");
+
+        // The two assertions below are deliberately separate, because they fail for different
+        // reasons and the difference is the whole finding:
+        //   ocr_ran == false          → the engine could not start (F-56 swallowed it) — the bug
+        //   ocr_ran == true, no text  → the engine ran and read nothing — a fixture problem
+        assert!(
+            analysis.ocr_ran,
+            "OCR did not run inside the confinement — the engine could not start, and the F-56 \
+             guard degraded the photo to EXIF-only with an empty body (issue #617 finding 1)"
+        );
+        let text = analysis.ocr_text.to_ascii_uppercase();
+        assert!(
+            text.contains("INVOICE") && text.contains("12345"),
+            "OCR ran under the confinement but read nothing usable — fixture problem, not a \
+             sandbox one. Got: {:?}",
+            analysis.ocr_text
+        );
+    }
+
     /// End-to-end smoke test of the macOS `sandbox-exec` confinement (issue #286 PR2c): spawn the REAL
     /// worker confined, convert a text file through the staging path, then PROVE enforcement on the live
     /// worker — the Seatbelt profile refuses BOTH a direct outbound socket AND out-of-process DNS
@@ -3410,8 +3531,8 @@ mod tests {
     /// outside the allow-set. `#[ignore]` + a `PM_SANDBOX_SMOKE_VENV` env because it needs the live venv
     /// on a real Mac. This is the enforcement check neither the Windows dev box nor any CI job can run
     /// (the macOS arm only compiles on `macos-latest` CI and only ENFORCES on a real Mac):
-    ///   PM_SANDBOX_SMOKE_VENV=~/Library/Application\ Support/pm/runtime/venv \
-    ///     cargo test --manifest-path src-tauri/Cargo.toml --ignored confined_worker_smoke_macos -- --nocapture
+    ///   PM_SANDBOX_SMOKE_VENV="$HOME/Library/Application Support/Personal Manager/runtime/venv" \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml confined_worker_smoke_macos -- --ignored --nocapture
     #[test]
     #[ignore = "macOS-only, needs the live venv; validates real sandbox-exec enforcement"]
     #[cfg(target_os = "macos")]

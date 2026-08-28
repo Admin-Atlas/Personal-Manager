@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.9-alpha",
+    date: "2026-08-28",
+    highlights: [
+      "More under-the-hood tidying on the same Linux thread as the last update. PM reads text out of your photos with an on-device engine, and that engine runs inside the same locked-down helper as everything else that opens a file you did not write. Whether it could still work in there had never actually been checked on a real Linux machine \u2014 and the way it fails is silent: a photo of a receipt would simply be filed as holding no text at all, looking completely normal. It has now been run for real, it works, and there is a test that will say so from now on.",
+      "Also fixed: the instructions for running those Linux and Mac checks were wrong in two ways \u2014 a mistyped flag and a folder name PM has never used \u2014 so anyone following them got an error instead of a result.",
+    ],
+  },
+  {
     version: "3.130.8-alpha",
     date: "2026-08-28",
     highlights: [
