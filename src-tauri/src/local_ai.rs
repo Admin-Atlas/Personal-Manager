@@ -132,8 +132,12 @@ pub async fn check_local_llm_endpoint(url: String, token: Option<String>) -> Res
         Err(f) => (
             false,
             Vec::new(),
+            // Lead with the diagnosis, not the symptom. "Couldn't reach the endpoint" plus a
+            // transport error tells someone what happened and nothing about what to do; the gateway
+            // has said "is the server running?" on this exact failure since #297, and the two
+            // surfaces disagreeing meant the one people meet FIRST was the less useful of them.
             Some(format!(
-                "Couldn't reach the endpoint ({}).",
+                "Couldn't reach it — is the server running? ({})",
                 crate::error::truncate_detail(&f.detail)
             )),
         ),

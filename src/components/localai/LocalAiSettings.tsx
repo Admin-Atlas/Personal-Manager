@@ -774,6 +774,23 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               Connected to <span className="break-all text-ink2">{config?.base_url}</span>
               {config?.has_token ? " (with a saved token)" : ""}.
             </p>
+            {/* Unfolded: the chip beside the section label says "Unreachable" or "Cooling down" and
+                then stops, which is a dead end — the two states have different causes and different
+                things to do about them, and neither was said anywhere. */}
+            {status != null && !status.reachable && !status.in_cooldown && (
+              <p className="mt-1 text-xs text-ink4">
+                PM can't reach it at the moment. The usual cause is that the server isn't running —
+                the guide below says, for each runner, whether it starts with your machine or you
+                start it each session. PM keeps checking, so this clears on its own once it's back.
+              </p>
+            )}
+            {status?.in_cooldown && (
+              <p className="mt-1 text-xs text-ink4">
+                PM is resting the connection after several failures in a row, so it isn't hammering
+                a server that's struggling. It retries by itself — nothing to do unless it keeps
+                coming back, in which case the server is the place to look.
+              </p>
+            )}
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <Button variant="tertiary" onClick={() => void disconnect()}>
                 Disconnect
@@ -814,7 +831,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               <div className="text-xs">
                 {detected.length === 0 ? (
                   <p className="text-ink4">
-                    No local server found. Install one below, then auto-detect again.
+                    Nothing answered on port 11434, 1234 or 8080. If you've already installed one,
+                    it's most likely not running — check the guide below for whether yours starts on
+                    its own. Otherwise install one and auto-detect again. You can also type an
+                    address yourself, if your server is on a different port or another machine.
                   </p>
                 ) : (
                   <ul className="space-y-1">
@@ -1854,9 +1874,14 @@ function RunnerInstall() {
             <p className="mt-1">
               <span className="text-ink3">Models:</span> {g.models}
             </p>
-            {/* Unfolded, never a caret: a hardware exclusion or a "it stops when you close the
-                window" is a gating fact, and the settings doctrine folds prose but not those. */}
+            {/* Unfolded, never a caret: a hardware exclusion and "does this stay running?" are
+                gating facts, and the settings doctrine folds prose but not those. Lifecycle sits
+                immediately before the steps because it is what decides whether the steps are a
+                one-time setup or something you redo every session. */}
             {g.caveat && <p className="mt-1 text-ink3">Worth knowing: {g.caveat}</p>}
+            <p className="mt-1 text-ink3">
+              <span className="text-ink3">Staying running:</span> {g.lifecycle}
+            </p>
             <ol className="ml-4 mt-1.5 list-decimal space-y-1">
               {g.steps.map((s, i) => (
                 <li key={i}>{s}</li>
