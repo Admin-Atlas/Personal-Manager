@@ -569,8 +569,15 @@ pub struct WindowInfo {
     pub source: WindowSource,
 }
 
-/// Ollama silently truncates at its default `num_ctx` (4096), so assuming any larger window when
-/// nothing is discoverable would make the context meter lie. 4096 is the honest floor.
+/// The window PM assumes when nothing is discoverable. A FLOOR, not a claim about any server's
+/// default — assuming anything larger would make the context meter lie in the one direction that
+/// costs a silently decapitated prompt.
+///
+/// It is deliberately not described as "Ollama's default" any more, because that was wrong.
+/// Ollama 0.33's own help reads `OLLAMA_CONTEXT_LENGTH ... (default: 4k/32k/256k based on VRAM)`,
+/// so 4096 is only its LOW tier — what a small card gets, and what this machine would have got
+/// before the variable was set. A server on a 24 GiB card defaults to 32768 and one on 48 GiB to
+/// 262144. The floor is still right; the reasoning behind it was not.
 pub const DEFAULT_CONTEXT: u32 = 4096;
 
 /// The ladder's preference order, as a pure choice over what each rung found: the two PROVEN rungs
@@ -989,6 +996,34 @@ pub async fn probe_window(base_url: &str, model: &str, token: Option<&str>) -> W
         None
     };
     pick_window(slots, loaded, models_meta)
+}
+
+/// The two PROVEN rungs only — `/slots`, then Ollama's `/api/ps` — or `None` when neither answered.
+///
+/// [`probe_window`] can never return `None`: it falls through to [`DEFAULT_CONTEXT`] by design,
+/// because a caller sizing a prompt always needs a number. A caller that is merely LOOKING needs the
+/// opposite guarantee — it must be able to learn nothing and write nothing, rather than record PM's
+/// own floor into a cache that other paths read as evidence about the user's server.
+///
+/// Neither rung cares who loaded the model, which is what makes a passive caller worth having: the
+/// answer is there whenever something is resident, whoever put it there.
+pub async fn probe_proven_window(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+) -> Option<WindowInfo> {
+    if let Some(tokens) = probe_slots_ctx(base_url, token).await {
+        return Some(WindowInfo {
+            tokens,
+            source: WindowSource::Slots,
+        });
+    }
+    probe_loaded_ctx(base_url, model, token)
+        .await
+        .map(|tokens| WindowInfo {
+            tokens,
+            source: WindowSource::LoadedModel,
+        })
 }
 
 /// Ollama `/api/ps` reports the RESIDENT models and, for each, the `context_length` it was actually

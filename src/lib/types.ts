@@ -1977,6 +1977,16 @@ export interface LocalLlmStatus {
   /** Whether `served_window` was measured or is PM's conservative floor. Never present a guess as a
    *  reading. */
   served_window_proven: boolean;
+  /** WHICH rung answered: "slots" | "loaded_model" | "models_meta" | "default", or null when nothing
+   *  has been measured yet. The same field the chat context meter already ships (`ContextStatus`),
+   *  spelled the same way, so there is one convention for this and not two.
+   *
+   *  The boolean above is not enough: the two unproven rungs are wrong in OPPOSITE directions.
+   *  "default" is PM's floor — an under-estimate. "models_meta" is the server's claim about the
+   *  MODEL's trained capacity — an over-estimate of this load, and `served_window` reports it RAW
+   *  while the gateway clamps it to the floor, so without the source the panel can show a reassuring
+   *  32,768 while PM is quietly compressing everything to fit 4,096. */
+  window_source: string | null;
 }
 
 /** One progress tick from an Ollama model pull (openai_compat.rs PullProgress). */

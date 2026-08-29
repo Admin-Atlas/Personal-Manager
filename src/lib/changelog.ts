@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.133.0-alpha",
+    date: "2026-08-30",
+    highlights: [
+      "PM now says when it hasn\u2019t been able to read your server\u2019s context window, instead of saying nothing at all. That number is the one that explains a symptom people usually blame on the model: a server running a small window can\u2019t hold one batch of PM\u2019s background work, so PM quietly sends less per call. PM could only ever read it while a model was loaded \u2014 and nothing loads one until your first local reply \u2014 so on a new setup the warning had nothing to show and showed nothing. It now says so plainly, and it also picks the number up on its own within about half a minute of a model being loaded, by anything: your own \u2018ollama run\u2019, another app, or a session of PM you closed. That last one mattered more than it sounds, because PM forgets the number every time it starts while your server keeps the model loaded.",
+      "And the number stopped being able to reassure you wrongly. Some servers report the model\u2019s own maximum rather than the window they actually loaded it with, and the two are often eight times apart. PM was showing that maximum as though it were the real setting \u2014 so a server genuinely running a small window could look comfortable and skip its own warning, while PM was quietly working to the small number anyway. Those are now told apart on screen. A figure PM had to guess is also no longer described as something your server is doing: it says PM is sizing its work that way because it couldn\u2019t read the real one.",
+    ],
+  },
+  {
     version: "3.132.0-alpha",
     date: "2026-08-29",
     highlights: [

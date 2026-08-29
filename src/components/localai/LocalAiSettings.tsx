@@ -113,6 +113,15 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   // case where the two choices interact, since one server holding one model costs what the Workbench
   // said it would. Guarded this narrowly so the warning never fires on the common setups.
   const bothLocal = config?.chat_routing !== "cloud" && config?.background_routing !== "cloud";
+  // A role that reaches the local server AND has a model bound. Both halves are load-bearing.
+  // Without the routing half the "not measured yet" line fires for someone entirely on cloud, who
+  // has no local model to measure. Without the model half it fires for someone who flipped routing
+  // to local and left the select on "— use cloud —": `role_local_model` returns null for an empty
+  // model, so the window would be null forever and the line would promise a reading that can never
+  // arrive, because the gateway treats an absent model as unconfigured.
+  const anyLocalRoleWithModel =
+    (config?.chat_routing !== "cloud" && !!config?.chat_model?.trim()) ||
+    (config?.background_routing !== "cloud" && !!config?.background_model?.trim());
   const twoModels =
     !!config?.chat_model &&
     !!config?.background_model &&
@@ -963,26 +972,73 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 one model on its own — two that each fit alone may not fit together.
               </p>
             )}
-            {status?.served_window != null && status.served_window < COMFORTABLE_WINDOW && (
-              // Unfolded: a loss warning, not prose. This is the number that explains the symptom
-              // people blame on model size. A server serving 4096 tokens (Ollama's default, applied
-              // silently) cannot hold one filing batch, so PM now sends fewer documents per call —
-              // and past a point it stops rather than let the server cut the instructions off the
-              // front of the prompt and answer anyway.
+            {/* Unfolded: a loss warning, not prose. This is the number that explains the symptom
+                people blame on model size — a server serving a small window cannot hold one filing
+                batch, so PM sends fewer documents per call, and past a point stops rather than let
+                the server cut the instructions off the front of the prompt and answer anyway.
+
+                Three branches, because this whole block used to be gated on `served_window != null`
+                and so rendered NOTHING on a fresh install — the one moment the warning exists for.
+                The number can only be read while a model is resident (`/api/ps` on Ollama, `/slots`
+                on llama-server) and nothing loads one until the first local call, so "not measured
+                yet" was the permanent state of every new setup and it said so nowhere. */}
+            {anyLocalRoleWithModel && status != null && status.served_window == null && (
               <p className="text-xs text-ink4">
-                Your server is serving{" "}
-                <span className="text-ink2">
-                  {status.served_window.toLocaleString()} tokens
-                  {status.served_window_proven ? "" : " (PM's estimate — it hasn't measured yet)"}
-                </span>{" "}
-                of context. PM's background work — sorting proposals, summaries, learning — sends
-                more than that in one go, so it will send smaller batches to fit. Raising it makes
-                that work better: Ollama uses{" "}
-                <span className="text-ink2">OLLAMA_CONTEXT_LENGTH</span>, llama-server uses{" "}
-                <span className="text-ink2">--ctx-size</span>, and LM Studio has a context-length
-                slider on the model.
+                PM hasn't read your server's context window yet — that number is only visible while
+                a model is loaded. Load one, or send a local message, and PM picks it up within
+                about half a minute. It's worth knowing before you rely on it: a small window makes
+                PM's background work send less per call.
               </p>
             )}
+            {status?.served_window != null && status.window_source === "models_meta" && (
+              // The two unproven rungs are NOT the same kind of uncertainty, and calling both "an
+              // estimate" hid that. This one is the server's claim about the MODEL — its trained
+              // capacity, an UPPER bound on this load — and it is the exact number that read 32768
+              // while a server served 4096 (#792). PM sizes to its own floor regardless, so showing
+              // it alone would have the panel contradict PM's behaviour without saying so.
+              <p className="text-xs text-ink4">
+                Your server says this model can go up to{" "}
+                <span className="text-ink2">{status.served_window.toLocaleString()} tokens</span> —
+                but that is the model's own limit, not what your server actually loaded it with, and
+                the two are often far apart. Until PM can confirm the real one it sizes its work
+                cautiously, so background work may be doing less than your server could take. One
+                local reply is enough for PM to read the real number.
+              </p>
+            )}
+            {status?.served_window != null &&
+              status.window_source !== "models_meta" &&
+              status.served_window < COMFORTABLE_WINDOW && (
+                <p className="text-xs text-ink4">
+                  {status.served_window_proven ? (
+                    <>
+                      Your server is serving{" "}
+                      <span className="text-ink2">
+                        {status.served_window.toLocaleString()} tokens
+                      </span>{" "}
+                      of context.
+                    </>
+                  ) : (
+                    // The SUBJECT matters. An unproven floor is PM's own number, and the old
+                    // sentence put it in the server's mouth — "your server is serving 4,096 (PM's
+                    // floor)" reads as a reading of the user's machine when it is an admission
+                    // about PM.
+                    <>
+                      PM is sizing its work for{" "}
+                      <span className="text-ink2">
+                        {status.served_window.toLocaleString()} tokens
+                      </span>{" "}
+                      because it hasn't been able to read your server's real window.
+                    </>
+                  )}{" "}
+                  PM's background work — sorting proposals, summaries, learning — sends more than
+                  that in one go, so it will send smaller batches to fit. Raising it makes that work
+                  better: Ollama uses <span className="text-ink2">OLLAMA_CONTEXT_LENGTH</span>,
+                  llama-server uses <span className="text-ink2">--ctx-size</span>, and LM Studio has
+                  a context-length slider on the model. Ollama picks its own default from your
+                  graphics card and doesn't publish where the steps are, so{" "}
+                  <span className="text-ink2">ollama ps</span> is the way to see what it chose.
+                </p>
+              )}
             {served.some((m) => m.embedding) && (
               // Unfolded on purpose. The settings doctrine folds prose but never gating hints, and
               // "this one is listed but you can't pick it" is exactly a gating hint (same call as
