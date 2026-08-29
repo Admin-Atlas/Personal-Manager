@@ -161,6 +161,7 @@ const statusFix = (over: Partial<LocalLlmStatus> = {}): LocalLlmStatus => ({
   background_local_model: null,
   served_window: null,
   served_window_proven: false,
+  window_source: null,
   ...over,
 });
 
@@ -547,19 +548,62 @@ describe("model licence terms", () => {
 describe("the served-window honesty line", () => {
   // The release's headline promise: a small served window is WARNED about, and an unproven number
   // is never presented as a measurement. Nothing pinned either half until now.
-  it("warns on a small window and marks an unproven number as an estimate", async () => {
+  it("attributes an unproven floor to PM rather than to the user's server", async () => {
     localLlmStatus.mockResolvedValue(
-      statusFix({ served_window: 4096, served_window_proven: false }),
+      statusFix({ served_window: 4096, served_window_proven: false, window_source: "default" }),
     );
     await loaded();
 
-    expect(await screen.findByText(/Your server is serving/)).toBeTruthy();
-    expect(screen.getByText(/PM's estimate — it hasn't measured yet/)).toBeTruthy();
+    // The SUBJECT is PM, not the user's server. An unproven floor is PM's own number, and the copy
+    // used to say "Your server is serving 4,096 (PM's floor)" — putting PM's guess in the server's
+    // mouth. It also must not read as an estimate: the two unproven rungs are wrong in opposite
+    // directions, and this one is the under-estimate.
+    expect(await screen.findByText(/PM is sizing its work for/)).toBeTruthy();
+    expect(screen.queryByText(/Your server is serving/)).toBeNull();
+  });
+
+  it("says it hasn't measured yet instead of rendering nothing at all", async () => {
+    // THE regression test for this card. The whole block was gated on `served_window != null`, so
+    // on a fresh install — the one moment the warning exists for — PM showed nothing. The number is
+    // only readable while a model is resident, and nothing loads one until the first local call, so
+    // this was the permanent state of every new setup.
+    localLlmStatus.mockResolvedValue(statusFix({ served_window: null }));
+    await loaded();
+
+    expect(await screen.findByText(/hasn't read your server's context window yet/)).toBeTruthy();
+  });
+
+  it("stays quiet about an unmeasured window when no role goes local", async () => {
+    // There is no local model to measure, so the line would be answering a question nobody asked.
+    getLocalLlmConfig.mockResolvedValue(
+      cfg({ chat_routing: "cloud", background_routing: "cloud" }),
+    );
+    localLlmStatus.mockResolvedValue(statusFix({ served_window: null }));
+    await loaded();
+
+    expect(screen.queryByText(/hasn't read your server's context window yet/)).toBeNull();
+  });
+
+  it("never presents the model's trained capacity as the window being served", async () => {
+    // #792 in miniature, shown to the user. `served_window` reports the cached number RAW while the
+    // gateway clamps an unproven one to its floor — so a 32,768 from `models_meta` rendered as a
+    // comfortable window, suppressing the warning entirely, while PM was internally sizing to 4,096.
+    localLlmStatus.mockResolvedValue(
+      statusFix({
+        served_window: 32768,
+        served_window_proven: false,
+        window_source: "models_meta",
+      }),
+    );
+    await loaded();
+
+    expect(await screen.findByText(/that is the model's own limit/)).toBeTruthy();
+    expect(screen.queryByText(/Your server is serving/)).toBeNull();
   });
 
   it("drops the estimate suffix once the number is measured", async () => {
     localLlmStatus.mockResolvedValue(
-      statusFix({ served_window: 4096, served_window_proven: true }),
+      statusFix({ served_window: 4096, served_window_proven: true, window_source: "slots" }),
     );
     await loaded();
 
@@ -569,7 +613,7 @@ describe("the served-window honesty line", () => {
 
   it("says nothing at a comfortable window — absence is the pass", async () => {
     localLlmStatus.mockResolvedValue(
-      statusFix({ served_window: 32768, served_window_proven: true }),
+      statusFix({ served_window: 32768, served_window_proven: true, window_source: "slots" }),
     );
     await loaded();
 

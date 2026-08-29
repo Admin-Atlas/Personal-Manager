@@ -685,6 +685,19 @@ pub struct LocalLlmStatus {
     /// Whether [`Self::served_window`] was measured (`/slots`, `/api/ps`) or is PM's conservative
     /// floor. The UI must not present a guess as a reading.
     pub served_window_proven: bool,
+    /// WHICH rung answered: `"slots"` | `"loaded_model"` | `"models_meta"` | `"default"`, or `None`
+    /// when nothing has been measured yet. The same field, spelled the same way, that the chat
+    /// context meter already ships (`conversations.rs` → `ContextMeter.tsx`), so there is one
+    /// convention for this and not two.
+    ///
+    /// The boolean above is not enough, because the two unproven rungs are wrong in OPPOSITE
+    /// directions and saying "estimate" for both hides that. `Default` is PM's floor, an
+    /// under-estimate. `ModelsMeta` is the server's claim about the MODEL — its trained capacity,
+    /// an over-estimate of this load, and the exact confusion that made PM read 32768 off a model
+    /// card while the server served 4096 (#792). `served_window` reports that number RAW while
+    /// `llm_gateway::sizing_window` clamps it to the floor, so without the source the panel can
+    /// show a reassuring 32768 while PM is quietly compressing everything to fit 4096.
+    pub window_source: Option<String>,
 }
 
 /// The local model a role will really use, or `None` when the role goes to cloud.
@@ -737,6 +750,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             background_local_model: None,
             served_window: None,
             served_window_proven: false,
+            window_source: None,
         });
     }
 
@@ -762,9 +776,43 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
     let reachable = if probe_now {
         let observed = match configured_endpoint(&app).await? {
             Endpoint::Ready(base_url, token) => {
-                openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
-                    .await
-                    .is_ok()
+                let tok = token.as_ref().map(|s| s.expose());
+                let ok = openai_compat::probe(&base_url, tok).await.is_ok();
+                // Learn the served window PASSIVELY, on a tick that is already happening.
+                //
+                // The proven rungs do not care WHO loaded the model, so this picks the number up
+                // whenever one is resident for any reason — the user's own `ollama run`, another
+                // app, or a previous PM session. That last case is not an edge: this cache lives on
+                // `LocalRuntime`, which is rebuilt on every launch, while the server keeps its model
+                // loaded across PM restarts. So "PM has never measured this" was the state of every
+                // app START, not only of a fresh install, and the only thing that could clear it was
+                // a completed local call.
+                //
+                // Written ONLY when a proven rung answers. Recording PM's own floor here would
+                // replace an honest "not measured yet" with a number the panel attributes to the
+                // user's server, and would start `window_probe_due` throttling the post-call probe
+                // that is this cache's only other writer.
+                if ok {
+                    let mut models: Vec<&str> = [
+                        background_local_model.as_deref(),
+                        chat_local_model.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    // One role usually, and very often the same model on both.
+                    models.dedup();
+                    for model in models {
+                        if let Some(info) =
+                            openai_compat::probe_proven_window(&base_url, model, tok).await
+                        {
+                            app.state::<AppState>()
+                                .local_ai
+                                .cache_window(&base_url, model, info);
+                        }
+                    }
+                }
+                ok
             }
             Endpoint::Refused | Endpoint::Unconfigured => false,
         };
@@ -792,7 +840,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
     // never answered has no cache entry, and reporting "unknown" for it while the CHAT model's
     // window is proven-small hid the very warning the number exists to raise. Whichever role's
     // window is actually known is more honest than none.
-    let (served_window, served_window_proven) = {
+    let (served_window, served_window_proven, window_source) = {
         let state = app.state::<AppState>();
         let window_for = |model: Option<&str>| -> Option<openai_compat::WindowInfo> {
             match (base_url.as_deref(), model) {
@@ -803,8 +851,12 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         match window_for(background_local_model.as_deref())
             .or_else(|| window_for(chat_local_model.as_deref()))
         {
-            Some(w) => (Some(w.tokens), w.source.is_proven()),
-            None => (None, false),
+            Some(w) => (
+                Some(w.tokens),
+                w.source.is_proven(),
+                Some(w.source.as_str().to_string()),
+            ),
+            None => (None, false, None),
         }
     };
 
@@ -818,6 +870,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         background_local_model,
         served_window,
         served_window_proven,
+        window_source,
     })
 }
 

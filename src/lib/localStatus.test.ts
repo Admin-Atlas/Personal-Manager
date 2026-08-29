@@ -19,6 +19,7 @@ const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   background_local_model: null,
   served_window: null,
   served_window_proven: false,
+  window_source: null,
   ...over,
 });
 
