@@ -545,6 +545,38 @@ describe("model licence terms", () => {
   });
 });
 
+describe("a configured endpoint that isn't answering", () => {
+  // The chip beside the section label said "Unreachable" or "Cooling down (42s)" and stopped. Two
+  // different causes, two different things to do, and neither was said anywhere on the page.
+  it("says what to check when PM can't reach the server", async () => {
+    localLlmStatus.mockResolvedValue(statusFix({ reachable: false, in_cooldown: false }));
+    await loaded();
+
+    expect(await screen.findByText(/PM can't reach it at the moment/)).toBeTruthy();
+    expect(screen.queryByText(/resting the connection/)).toBeNull();
+  });
+
+  it("explains a cooldown as PM backing off, not as something to fix", async () => {
+    localLlmStatus.mockResolvedValue(
+      statusFix({ reachable: false, in_cooldown: true, cooldown_remaining_s: 42 }),
+    );
+    await loaded();
+
+    expect(await screen.findByText(/resting the connection/)).toBeTruthy();
+    // The unreachable line would be wrong here: the server may be perfectly fine and PM is simply
+    // not asking it yet.
+    expect(screen.queryByText(/PM can't reach it at the moment/)).toBeNull();
+  });
+
+  it("says nothing extra while the endpoint is healthy", async () => {
+    localLlmStatus.mockResolvedValue(statusFix({ reachable: true }));
+    await loaded();
+
+    expect(screen.queryByText(/PM can't reach it at the moment/)).toBeNull();
+    expect(screen.queryByText(/resting the connection/)).toBeNull();
+  });
+});
+
 describe("the served-window honesty line", () => {
   // The release's headline promise: a small served window is WARNED about, and an unproven number
   // is never presented as a measurement. Nothing pinned either half until now.

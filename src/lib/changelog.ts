@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.133.1-alpha",
+    date: "2026-08-30",
+    highlights: [
+      "The setup instructions for local AI now answer the question they never did: does this thing keep running? Each of the three servers gets its own line saying whether it starts with your machine, whether it keeps going when you close the window, and what stops it \u2014 which decides whether the steps below it are a one-time setup or something you redo every session. It was previously written into whichever bit of copy happened to have room, so one platform\u2019s answer went out to all three and another\u2019s went out to nobody.",
+      "Several of the commands were also wrong, and are now checked against each vendor\u2019s own documentation. The Linux instructions for giving Ollama a bigger context named a file but not what to put in it or how to apply it, so following them exactly changed nothing; they now use the command Ollama documents. Linux no longer suggests starting Ollama by hand, which fails because the service it installs already holds the port. Windows now says to quit Ollama before setting the variable, without which the change does nothing. And PM stopped claiming Ollama serves 4,096 tokens by default \u2014 it picks that from your graphics card, and PM now says how, along with the warning nobody gives you: asking for more context than fits doesn\u2019t fail, it quietly spills into ordinary memory and runs many times slower.",
+      "A connection that isn\u2019t working also stopped being a dead end. \u201cUnreachable\u201d and \u201ccooling down\u201d now explain themselves \u2014 one usually means the server isn\u2019t running, the other means PM is deliberately backing off and will retry on its own. And when auto-detect finds nothing, it says which ports it tried and that an installed server is most likely just not started, rather than assuming you haven\u2019t installed one.",
+    ],
+  },
+  {
     version: "3.133.0-alpha",
     date: "2026-08-30",
     highlights: [
