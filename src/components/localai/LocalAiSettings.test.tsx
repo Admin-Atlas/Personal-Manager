@@ -627,4 +627,67 @@ describe("a download owned by the backend", () => {
     expect(screen.getByRole("button", { name: /cancel/i })).toBeTruthy();
     expect(pullLocalModel).not.toHaveBeenCalled();
   });
+
+  it("still clears its own marker when the download finishes", async () => {
+    // The per-tag guard below must not become a way for the marker to stick: write the happy path
+    // first, because a guard that never clears looks exactly like a download that never ends.
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [pulled()] });
+    pullLocalModel.mockResolvedValue(undefined);
+    await loaded();
+
+    fireEvent.click(screen.getByRole("button", { name: /^download$/i }));
+    await waitFor(() => expect(pullLocalModel).toHaveBeenCalled());
+
+    expect(await screen.findByRole("button", { name: /^download$/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /downloading/i })).toBeNull();
+  });
+
+  it("a refused second download leaves the running one on screen, not a blank card", async () => {
+    // Reachable through the licence dialog, whose Accept button is not gated on another pull being
+    // live: open it, let a backend-owned download get adopted underneath, then confirm. The backend
+    // refuses the second pull — and the refusal must not take the FIRST one's progress bar with it.
+    // It used to: `pull()` ended in an unconditional reset, and the 1s snapshot poller is keyed on
+    // that marker, so a live multi-gigabyte download went invisible until the view remounted.
+    const gemma: LocalRecommendation = {
+      ...pulled(),
+      repo: "bartowski/gemma-2-2b-it-GGUF",
+      display_name: "gemma 2 2b it",
+      ollama_pull: "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M",
+      licence: {
+        id: "gemma",
+        name: "Gemma Terms of Use",
+        url: "https://ai.google.dev/gemma/terms",
+        open: false,
+        summary: "Google's own terms, not an open-source licence.",
+      },
+    };
+    localModelRecommendations.mockResolvedValue({
+      ...recs(),
+      curated: [pulled(), gemma],
+      terms_accepted: [],
+    });
+    acceptLocalModelTerms.mockResolvedValue(["gemma"]);
+    await loaded();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /^download$/i })[1]);
+    // The dialog, not the card's own licence link — the licence NAME appears in both.
+    await screen.findByRole("button", { name: /accept and download/i });
+
+    // The Phi pull is adopted while the dialog sits open; the backend then refuses the second.
+    activeLocalPull.mockResolvedValue({
+      model: "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
+      status: "downloading",
+      completed_bytes: 2048,
+      total_bytes: 8192,
+      running: true,
+      error: null,
+    });
+    pullLocalModel.mockRejectedValue(new Error("a model download is already running"));
+
+    fireEvent.click(screen.getByRole("button", { name: /accept and download/i }));
+
+    expect(await screen.findByRole("button", { name: /downloading/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel/i })).toBeTruthy();
+    expect(await screen.findByText(/already running/)).toBeTruthy();
+  });
 });

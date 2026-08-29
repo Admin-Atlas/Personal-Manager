@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   activeLocalPull,
@@ -42,6 +42,7 @@ import type {
   LocalRescanCadence,
   LocalServedModel,
   PullProgress,
+  PullSnapshot,
 } from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
 import { IngestProgress } from "../IngestProgress";
@@ -96,8 +97,15 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   // and mark the right card.
   const [pulling, setPulling] = useState<string | null>(null);
   const [pullProg, setPullProg] = useState<PullProgress | null>(null);
-  /** The model whose licence terms are being shown, or null when no dialog is open. */
-  const [termsFor, setTermsFor] = useState<LocalRecommendation | null>(null);
+  /** The model whose licence terms are being shown, and the pull tag the user asked for, or null
+   *  when no dialog is open. The TAG rides along because a card can offer more than one way to run
+   *  the same model: resolving it again after the dialog would resolve the card's default, not the
+   *  row the user actually clicked. */
+  const [termsFor, setTermsFor] = useState<{ rec: LocalRecommendation; tag: string } | null>(null);
+  /** Mirrors `pulling` synchronously. `pull()` below is async, so the `pulling` it captured when it
+   *  started is stale by the time its `finally` runs — and that `finally` must be able to tell
+   *  whether the tag it started is still the one on screen. */
+  const pullingRef = useRef<string | null>(null);
 
   const configured = !!config?.base_url;
   // Both roles actually going to the local server, and going there with DIFFERENT models — the only
@@ -121,6 +129,32 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       return false;
     }
   })();
+
+  /** The single writer for the pull marker. Keeps `pullingRef` in step with the state so the two
+   *  can never disagree — a marker cleared in one and not the other silently kills the 1s snapshot
+   *  poller, whose effect dependency is `pulling`. */
+  const markPulling = useCallback((tag: string | null) => {
+    pullingRef.current = tag;
+    setPulling(tag);
+  }, []);
+
+  /** Mirror the backend's pull job into the view. The snapshot is the source of truth: it survives
+   *  this view unmounting, and it is the only thing that knows about a download this component did
+   *  not start. A snapshot with nothing running is deliberately NOT a reset — callers decide that. */
+  const applyPullSnapshot = useCallback(
+    (snap: PullSnapshot | null) => {
+      if (!snap?.running) return false;
+      markPulling(snap.model);
+      setPullProg({
+        status: snap.status,
+        completed_bytes: snap.completed_bytes,
+        total_bytes: snap.total_bytes,
+        done: false,
+      });
+      return true;
+    },
+    [markPulling],
+  );
 
   async function reloadConfig() {
     const cfg = await getLocalLlmConfig();
@@ -228,20 +262,14 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     let cancelled = false;
     void activeLocalPull()
       .then((snap) => {
-        if (cancelled || !snap?.running) return;
-        setPulling(snap.model);
-        setPullProg({
-          status: snap.status,
-          completed_bytes: snap.completed_bytes,
-          total_bytes: snap.total_bytes,
-          done: false,
-        });
+        if (cancelled) return;
+        applyPullSnapshot(snap);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyPullSnapshot]);
   useEffect(() => {
     if (pulling === null) return;
     let cancelled = false;
@@ -259,7 +287,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
             return;
           }
           // Terminal. The locally-started path also lands here if its invoke handler is gone.
-          setPulling(null);
+          markPulling(null);
           setPullProg(null);
           if (snap.error) setError(snap.error);
           void reloadConfig();
@@ -426,18 +454,19 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
    *
    *  This is disclosure, not enforcement: the download is the user's own Ollama fetching the weights
    *  from the publisher, and they could run `ollama pull` without PM at all. */
-  function requestPull(rec: LocalRecommendation) {
+  function requestPull(rec: LocalRecommendation, tag: string) {
     const needsTerms = !rec.licence.open && !(recs?.terms_accepted ?? []).includes(rec.licence.id);
     if (needsTerms) {
-      setTermsFor(rec);
+      setTermsFor({ rec, tag });
       return;
     }
-    void pull(rec);
+    void pull(tag);
   }
 
   async function acceptTermsAndPull() {
-    const rec = termsFor;
-    if (!rec) return;
+    const pending = termsFor;
+    if (!pending) return;
+    const { rec, tag } = pending;
     setTermsFor(null);
     try {
       const accepted = await acceptLocalModelTerms(rec.licence.id);
@@ -448,13 +477,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       setError(String(e));
       return;
     }
-    await pull(rec);
+    await pull(tag);
   }
 
-  async function pull(rec: LocalRecommendation) {
-    const tag = rec.ollama_pull;
-    if (!tag) return;
-    setPulling(tag);
+  async function pull(tag: string) {
+    markPulling(tag);
     setPullProg(null);
     setError(null);
     try {
@@ -465,9 +492,19 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       setRecs(await localModelRecommendations());
     } catch (e) {
       setError(String(e));
+      // The job is backend-owned and the backend refuses a second concurrent pull, so this is the
+      // ordinary outcome of clicking a second Download while one runs. The optimistic mark above has
+      // already displaced whatever was running; recover it from the snapshot rather than dropping to
+      // null, because null tears down the 1s poller (its dependency is `pulling`) and leaves a live
+      // download with no progress bar and no Cancel until the view happens to remount.
+      applyPullSnapshot(await activeLocalPull().catch(() => null));
     } finally {
-      setPulling(null);
-      setPullProg(null);
+      // Per-tag, never unconditional: the re-adoption above may have just put ANOTHER pull on
+      // screen, and this reset runs after it.
+      if (pullingRef.current === tag) {
+        markPulling(null);
+        setPullProg(null);
+      }
     }
   }
 
@@ -570,7 +607,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 canPull={configured && isOllama && !!rec.ollama_pull}
                 pulling={pulling !== null && pulling === rec.ollama_pull}
                 pullProg={pulling !== null && pulling === rec.ollama_pull ? pullProg : null}
-                onPull={() => requestPull(rec)}
+                onPull={() => rec.ollama_pull && requestPull(rec, rec.ollama_pull)}
                 onCancel={() => void cancelLocalPull().catch(() => {})}
                 busy={pulling !== null}
               />
@@ -581,17 +618,19 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         )}
         <ConfirmDialog
           open={termsFor !== null}
-          title={termsFor ? `${termsFor.display_name} is under the ${termsFor.licence.name}` : ""}
+          title={
+            termsFor ? `${termsFor.rec.display_name} is under the ${termsFor.rec.licence.name}` : ""
+          }
           confirmLabel="Accept and download"
           onConfirm={() => void acceptTermsAndPull()}
           onClose={() => setTermsFor(null)}
         >
           {termsFor && (
             <>
-              <p>{termsFor.licence.summary}</p>
+              <p>{termsFor.rec.licence.summary}</p>
               <p className="mt-2">
                 <a
-                  href={termsFor.licence.url}
+                  href={termsFor.rec.licence.url}
                   target="_blank"
                   rel="noreferrer noopener"
                   className="underline decoration-dotted underline-offset-2"
