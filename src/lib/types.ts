@@ -1780,6 +1780,16 @@ export interface LocalModelLicence {
 }
 
 /** One curated model scored against this machine (local_ai.rs Recommendation). */
+/** One rung's Ollama download, resolved from the quant that rung was measured at (local_ai.rs). */
+export interface LocalPullTarget {
+  /** `hf.co/<repo>:<QUANT>`, or null when Ollama cannot fetch this quant. */
+  tag: string | null;
+  /** Why `tag` is null: a split GGUF, which Ollama's registry route refuses by design. */
+  sharded: boolean;
+  /** This rung is the SAME file as the highest-quality one, run with different settings. */
+  same_file: boolean;
+}
+
 export interface LocalRecommendation {
   repo: string;
   display_name: string;
@@ -1794,6 +1804,9 @@ export interface LocalRecommendation {
    *  is none to offer — a sharded GGUF, or a quant whose registry manifest didn't match the bytes
    *  the catalogue measured. Null means "checked, not offerable": render no button, and say why. */
   ollama_pull: string | null;
+  /** The second rung's download (local_ai.rs `PullTarget`). `null` means the card shows only ONE
+   *  config — not that the second one can't be fetched, which is `{ tag: null, ... }`. */
+  gpu_pull: LocalPullTarget | null;
   /** The fitted quant ships as split GGUF shards, which Ollama's registry route refuses — the one
    *  reason a model PM would otherwise offer has no Download button. */
   sharded_quant: boolean;

@@ -425,6 +425,7 @@ describe("model licence terms", () => {
     reasoning: null,
     ollama_pull: "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M",
     sharded_quant: false,
+    gpu_pull: null,
     licence: {
       id: "gemma",
       name: "Gemma Terms of Use",
@@ -574,6 +575,130 @@ describe("the served-window honesty line", () => {
   });
 });
 
+describe("a split card, where the same model runs two ways", () => {
+  // The defect: `Recommendation` carried ONE pull target, resolved from the Highest-quality rung, so
+  // the "Fastest on GPU" row — the only config that runs at GPU speed on an 8 GB card — had no
+  // download at all. The card printed a caption admitting it. Connecting an Ollama endpoint then
+  // deleted the copyable commands too, removing the last route to it.
+  const split = (over: Partial<LocalRecommendation> = {}): LocalRecommendation => ({
+    repo: "bartowski/Qwen2.5-7B-Instruct-GGUF",
+    display_name: "Qwen2.5 7B Instruct",
+    architecture: "qwen2",
+    role_hint: "chat",
+    parameters_b: 7.62,
+    active_parameters_b: 7.62,
+    context_length: 32768,
+    multimodal: false,
+    reasoning: null,
+    ollama_pull: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0",
+    sharded_quant: false,
+    gpu_pull: {
+      tag: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M",
+      sharded: false,
+      same_file: false,
+    },
+    licence: {
+      id: "apache-2.0",
+      name: "Apache License 2.0",
+      url: "https://www.apache.org/licenses/LICENSE-2.0",
+      open: true,
+      summary: "A permissive open-source licence.",
+    },
+    fit: {
+      verdict: "comfortable",
+      quant: "Q8_0",
+      context: 32768,
+      kv: "f16",
+      est_memory_gb: 10.0,
+      est_tokens_per_sec: 5,
+      notes: [],
+    },
+    gpu: {
+      kind: "split",
+      fit: {
+        verdict: "comfortable",
+        quant: "Q5_K_M",
+        context: 32768,
+        kv: "q8_0",
+        est_memory_gb: 6.6,
+        est_tokens_per_sec: 71,
+        notes: [],
+      },
+    },
+    ...over,
+  });
+
+  it("offers BOTH rungs a download, not just the one that runs in system RAM", async () => {
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [split()] });
+    await loaded();
+
+    const buttons = await screen.findAllByRole("button", { name: /^download$/i });
+    expect(buttons).toHaveLength(2);
+  });
+
+  it("fetches the quant of the row it was clicked on", async () => {
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [split()] });
+    pullLocalModel.mockResolvedValue(undefined);
+    await loaded();
+
+    // The second row is "Fastest on GPU" — the rung that had no button at all before.
+    fireEvent.click((await screen.findAllByRole("button", { name: /^download$/i }))[1]);
+
+    await waitFor(() => expect(pullLocalModel).toHaveBeenCalled());
+    expect(pullLocalModel.mock.calls[0][0]).toBe("hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M");
+  });
+
+  it("says so plainly when both rows are one file, instead of sending you hunting", async () => {
+    // `gpu_fit` splits on context or KV precision alone, so a split whose rungs share a quant is
+    // legal and pinned by a Rust test. The old caption asserted the second row was "a different
+    // file" unconditionally, which was simply false here.
+    localModelRecommendations.mockResolvedValue({
+      ...recs(),
+      curated: [
+        split({
+          gpu_pull: {
+            tag: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0",
+            sharded: false,
+            same_file: true,
+          },
+        }),
+      ],
+    });
+    await loaded();
+
+    expect(await screen.findByText(/Both rows are the same file/)).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /^download$/i })).toHaveLength(1);
+    expect(screen.queryByText(/different file/)).toBeNull();
+  });
+
+  it("keeps the copyable commands reachable after an Ollama endpoint is connected", async () => {
+    // They used to be deleted outright at exactly this moment — including the llama-server line,
+    // which is for a different runner and has nothing to do with whether PM can drive Ollama.
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [split()] });
+    await loaded();
+
+    fireEvent.click(await screen.findByRole("button", { name: /install it another way/i }));
+
+    // The runner guide elsewhere on the page names llama-server too, so scope by count, not identity.
+    expect((await screen.findAllByText(/llama-server -hf/)).length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(/ollama pull hf\.co\/bartowski\/Qwen2\.5-7B-Instruct-GGUF:Q5_K_M/),
+    ).toBeTruthy();
+  });
+
+  it("marks a rung Installed only when that exact quant is being served", async () => {
+    listLocalLlmModels.mockResolvedValue(
+      served({ id: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M", embedding: false }),
+    );
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [split()] });
+    await loaded();
+
+    expect(await screen.findByText(/^Installed$/)).toBeTruthy();
+    // The other rung is a genuinely different file, so it keeps its own Download.
+    expect(screen.getAllByRole("button", { name: /^download$/i })).toHaveLength(1);
+  });
+});
+
 describe("a download owned by the backend", () => {
   // The pull is a backend job precisely so the settings view can unmount (the tab router unmounts
   // on every switch) without the download losing its UI — the old component-owned state came back
@@ -591,6 +716,7 @@ describe("a download owned by the backend", () => {
     // The shape the generator really emits, naming this fixture's own repo + fitted quant.
     ollama_pull: "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
     sharded_quant: false,
+    gpu_pull: null,
     licence: {
       id: "mit",
       name: "MIT License",

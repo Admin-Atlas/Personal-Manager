@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   activeLocalPull,
@@ -511,6 +511,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const installedRepos = new Set(
     (recs?.installed ?? []).map((m) => m.matched_repo).filter(Boolean),
   );
+  // The ids the endpoint actually serves, lower-cased. An `hf.co/<repo>:<QUANT>` pull is served
+  // under the very tag it was pulled with (measured against a live Ollama 0.33), so a card can match
+  // a RUNG exactly instead of matching the repo — which reported "Installed" for a quant that was
+  // neither of the two the card offers.
+  const servedTags = new Set(served.map((m) => m.id.toLowerCase()));
 
   return (
     <>
@@ -604,10 +609,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 key={rec.repo}
                 rec={rec}
                 installed={installedRepos.has(rec.repo)}
-                canPull={configured && isOllama && !!rec.ollama_pull}
-                pulling={pulling !== null && pulling === rec.ollama_pull}
-                pullProg={pulling !== null && pulling === rec.ollama_pull ? pullProg : null}
-                onPull={() => rec.ollama_pull && requestPull(rec, rec.ollama_pull)}
+                canPull={configured && isOllama}
+                pullingTag={pulling}
+                pullProg={pullProg}
+                onPull={(tag) => requestPull(rec, tag)}
+                servedTags={servedTags}
                 onCancel={() => void cancelLocalPull().catch(() => {})}
                 busy={pulling !== null}
               />
@@ -1139,12 +1145,14 @@ function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
 function ModelInstallHint({
   repo,
   quant,
-  ollamaPull,
+  rungs,
   shardedQuant,
 }: {
   repo: string;
   quant: string | null;
-  ollamaPull: string | null;
+  /** Every way to run this model that PM can name, one per rung the card shows. A split card offers
+   *  two genuinely different files; printing only one of them is what stranded the GPU rung. */
+  rungs: { label: string; tag: string }[];
   shardedQuant: boolean;
 }) {
   const cmd = installCommand("llama-server", repo, quant);
@@ -1164,20 +1172,23 @@ function ModelInstallHint({
           </Button>
         </div>
       )}
-      {ollamaPull && (
-        <div className="flex items-center gap-2">
+      {rungs.map((r) => (
+        <div key={r.tag} className="flex items-center gap-2">
+          {rungs.length > 1 && (
+            <span className="shrink-0 text-[0.625rem] text-ink4">{r.label}</span>
+          )}
           <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
-            {`ollama pull ${ollamaPull}`}
+            {`ollama pull ${r.tag}`}
           </code>
           <Button
             variant="tertiary"
             size="sm"
-            onClick={() => void navigator.clipboard?.writeText(`ollama pull ${ollamaPull}`)}
+            onClick={() => void navigator.clipboard?.writeText(`ollama pull ${r.tag}`)}
           >
             Copy
           </Button>
         </div>
-      )}
+      ))}
       <p className="text-[0.6875rem] text-ink4">
         That command downloads and serves it in one step. In LM Studio, paste{" "}
         <span className="font-mono text-ink3">{repo}</span> into the Discover tab's search.
@@ -1311,7 +1322,18 @@ function ConfigMetrics({ fit }: { fit: LocalFitResult }) {
 
 /** One labelled config row in a Split card: the mono metrics (with a “q8_0 KV” chip when the cache was
  *  compressed) plus this config's situational caveat (system-RAM vs GPU, halved/tight). */
-function ConfigRow({ label, fit }: { label: string; fit: LocalFitResult }) {
+function ConfigRow({
+  label,
+  fit,
+  action,
+}: {
+  label: string;
+  fit: LocalFitResult;
+  /** This rung's own way to get it — a Download, an Installed chip, or nothing. Rendered on the
+   *  label line so the action sits beside the config it fetches, never a card-level button the user
+   *  has to guess the meaning of. */
+  action?: ReactNode;
+}) {
   const caveat = fit.notes.join(" ");
   return (
     <div>
@@ -1320,6 +1342,7 @@ function ConfigRow({ label, fit }: { label: string; fit: LocalFitResult }) {
         <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[0.6875rem] text-ink4">
           <ConfigMetrics fit={fit} />
         </div>
+        {action && <div className="ml-auto shrink-0">{action}</div>}
       </div>
       {caveat && <p className="mt-0.5 text-[0.625rem] text-ink4">{caveat}</p>}
     </div>
@@ -1330,22 +1353,49 @@ function RecommendationCard({
   rec,
   installed,
   canPull,
-  pulling,
+  pullingTag,
   pullProg,
   onPull,
   onCancel,
   busy,
+  servedTags,
 }: {
   rec: LocalRecommendation;
   installed: boolean;
+  /** Whether PM can drive a download at all here — an Ollama endpoint is connected. Card-level;
+   *  whether a given RUNG has something to fetch is a separate question, answered per rung. */
   canPull: boolean;
-  pulling: boolean;
+  /** The tag downloading right now, anywhere in the list, or null. */
+  pullingTag: string | null;
   pullProg: PullProgress | null;
-  onPull: () => void;
+  onPull: (tag: string) => void;
   onCancel: () => void;
   busy: boolean;
+  /** Model ids the endpoint already serves, lower-cased. An `hf.co/...` pull is served under the
+   *  tag it was pulled with (measured against a live Ollama 0.33), so a rung can be matched exactly
+   *  rather than by repo — which said "Installed" for a quant that was neither rung.  */
+  servedTags: Set<string>;
 }) {
   const f = rec.fit;
+  const ramTarget = { tag: rec.ollama_pull, sharded: rec.sharded_quant };
+  const gpuTarget = rec.gpu_pull;
+  const isSplit = rec.gpu.kind === "split";
+  const pulling =
+    pullingTag !== null && (pullingTag === rec.ollama_pull || pullingTag === gpuTarget?.tag);
+
+  /** One rung's own action: it is already here, PM can fetch it, or neither (the commands below). */
+  const rungAction = (t: { tag: string | null } | null): ReactNode => {
+    const tag = t?.tag ?? null;
+    if (!tag) return null;
+    if (servedTags.has(tag.toLowerCase()))
+      return <span className="text-[0.625rem] font-medium text-st-quick">Installed</span>;
+    if (!canPull) return null;
+    return (
+      <Button variant="secondary" size="sm" onClick={() => onPull(tag)} disabled={busy}>
+        {pullingTag === tag ? "Downloading\u2026" : "Download"}
+      </Button>
+    );
+  };
   // MoE when fewer params are active per token than the model holds (matches the catalog's own rule).
   const isMoe = rec.active_parameters_b + 0.01 < rec.parameters_b;
   const pct =
@@ -1394,16 +1444,27 @@ function RecommendationCard({
               <p className="text-[0.625rem] text-ink4">
                 Two ways to run it here — same model, lighter settings for speed:
               </p>
-              <ConfigRow label="Highest quality" fit={f} />
-              <ConfigRow label="Fastest on GPU" fit={rec.gpu.fit} />
-              {canPull && (
-                // Since #793 the button pulls the exact quant the "Highest quality" row measured
-                // (`hf.co/<repo>:<QUANT>`), so say that — the old "runner's default quant" caption
-                // predates the verified-tag route and told this card's users the opposite.
+              {/* Each rung carries its OWN action, because each names its own file. The card held
+                  one button wired to the Highest-quality rung, plus a caption admitting the faster
+                  rung could not be fetched — which was also FALSE whenever the two rungs differ
+                  only in context or KV precision, a split `gpu_fit` produces by design. */}
+              <ConfigRow label="Highest quality" fit={f} action={rungAction(ramTarget)} />
+              <ConfigRow
+                label="Fastest on GPU"
+                fit={rec.gpu.fit}
+                action={gpuTarget?.same_file ? undefined : rungAction(gpuTarget)}
+              />
+              {gpuTarget?.same_file ? (
                 <p className="text-[0.625rem] text-ink4">
-                  Download fetches the Highest-quality file measured above. Fastest on GPU is a
-                  different file (its quant is on its row) — PM's button doesn't fetch that one.
+                  Both rows are the same file — the difference is the settings PM runs it with.
                 </p>
+              ) : (
+                gpuTarget?.sharded && (
+                  <p className="text-[0.625rem] text-ink4">
+                    PM can't fetch the Fastest-on-GPU file: that quant ships as split parts, which
+                    Ollama's download route refuses. The command below still works.
+                  </p>
+                )
               )}
             </div>
           ) : (
@@ -1423,16 +1484,17 @@ function RecommendationCard({
           )}
         </div>
         <div className="shrink-0">
-          {installed ? (
+          {/* A split card's actions live on its rows, beside the config each one fetches. */}
+          {isSplit ? null : installed ? (
             <span className="text-xs font-medium text-st-quick">Installed</span>
-          ) : canPull ? (
+          ) : canPull && rec.ollama_pull ? (
             <Button
               variant="secondary"
               size="sm"
-              onClick={onPull}
+              onClick={() => rec.ollama_pull && onPull(rec.ollama_pull)}
               disabled={busy || f.verdict === "stay_on_cloud"}
             >
-              {pulling ? "Downloading…" : "Download"}
+              {pulling ? "Downloading\u2026" : "Download"}
             </Button>
           ) : null}
         </div>
@@ -1463,18 +1525,35 @@ function RecommendationCard({
         </div>
       )}
 
-      {!installed && !canPull && (
-        // The row that offers a way to GET this model when PM can't fetch it for you — no endpoint
-        // connected, or the endpoint isn't Ollama. Both commands are real: llama-server takes the
-        // Hugging Face repo id directly, and Ollama takes the catalogue's verified `hf.co/…` tag.
-        // When the fitted quant is sharded there is no Ollama command to give, and it says why.
-        <ModelInstallHint
-          repo={rec.repo}
-          quant={f.quant}
-          ollamaPull={rec.ollama_pull}
-          shardedQuant={rec.sharded_quant}
-        />
-      )}
+      {!installed &&
+        (() => {
+          // Every way to get this model that PM can name. This block used to be DELETED the moment
+          // an Ollama endpoint connected — taking the `llama-server` line, which is for a
+          // different runner entirely, with it, and on a split card removing the only route to the
+          // second rung at exactly the moment the user had finished setting PM up. It now always
+          // exists; it just folds away once PM can do the work for you.
+          const rungs = [
+            { label: "Highest quality", tag: rec.ollama_pull },
+            ...(isSplit && !gpuTarget?.same_file
+              ? [{ label: "Fastest on GPU", tag: gpuTarget?.tag ?? null }]
+              : []),
+          ].filter((r): r is { label: string; tag: string } => !!r.tag);
+          const hint = (
+            <ModelInstallHint
+              repo={rec.repo}
+              quant={f.quant}
+              rungs={rungs}
+              shardedQuant={rec.sharded_quant}
+            />
+          );
+          return canPull ? (
+            <Collapsible title="Install it another way" defaultOpen={false} className="mt-2">
+              {hint}
+            </Collapsible>
+          ) : (
+            hint
+          );
+        })()}
 
       {rec.gpu.kind === "split"
         ? // Each Split row states its own caveat (and KV chip) via ConfigRow — nothing shared to add.
