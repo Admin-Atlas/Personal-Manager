@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.131.0-alpha",
+    date: "2026-08-29",
+    highlights: [
+      "Every way to run a model can now be downloaded, not just the slow one. Some models are offered two ways on the same card \u2014 the highest-quality settings, and the faster ones that fit your graphics card \u2014 and PM's Download button only ever fetched the first. On a laptop graphics card that is usually the version that runs in ordinary system memory at a few words a second, while the one you actually wanted sat on the row below with no way to get it. Both rows now have their own button, each fetching the exact file measured beside it. Where the two rows are really the same file run with different settings, PM says so instead of sending you looking for a second download that does not exist. And the copy-and-paste commands no longer vanish the moment you connect a server \u2014 they fold away, and they are still there when you want them, including the one for a different model server entirely.",
+    ],
+  },
+  {
     version: "3.130.11-alpha",
     date: "2026-08-29",
     highlights: [

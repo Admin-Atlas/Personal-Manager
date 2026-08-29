@@ -1037,6 +1037,12 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
                 }
             };
             let (ollama_pull, sharded_quant) = pull_target_for(e, fit.quant);
+            // The SECOND rung's download. `gpu_fit` was handed the same `entry_to_spec(e)` spec, so
+            // its quant is one of this entry's own rows by construction and `pull_target_for` maps it
+            // back exactly — the same round-trip the RAM rung relies on. Computed here rather than
+            // inside `fit::GpuFit` on purpose: `fit.rs` is a pure module with no catalogue concepts,
+            // and thirteen `gpu_fit` tests construct that enum.
+            let gpu_pull = gpu_pull_target(e, &gpu, fit.quant);
             Recommendation {
                 repo: e.repo.clone(),
                 display_name: e.display_name.clone(),
@@ -1054,6 +1060,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
                 // the candidate list — so the round-trip is exact by construction.
                 ollama_pull,
                 sharded_quant,
+                gpu_pull,
                 licence: e.licence.clone(),
                 fit,
                 gpu,
@@ -1385,6 +1392,46 @@ fn pull_target_for(
     (row.ollama.clone(), row.sharded)
 }
 
+/// The SECOND rung's download, or `None` when the card shows only one rung.
+///
+/// Pure, and separate from `fit::gpu_fit` on purpose: `fit.rs` carries no catalogue concepts and
+/// thirteen tests construct `GpuFit` directly. `gpu_fit` was handed the same `entry_to_spec(entry)`
+/// spec that produced the candidate list, so the GPU rung's quant is one of this entry's own rows by
+/// construction and `pull_target_for` maps it back exactly.
+fn gpu_pull_target(
+    entry: &local_catalog::CatalogEntry,
+    gpu: &fit::GpuFit,
+    ram_quant: Option<fit::Quant>,
+) -> Option<PullTarget> {
+    let fit::GpuFit::Split { fit: g } = gpu else {
+        return None;
+    };
+    let (tag, sharded) = pull_target_for(entry, g.quant);
+    Some(PullTarget {
+        tag,
+        sharded,
+        // `gpu_fit` splits when quant, context OR kv differ, so a rung that only drops the KV cache
+        // to q8_0 names the SAME file run with different settings. Saying otherwise sends the user
+        // hunting for a second download that does not exist.
+        same_file: g.quant.is_some() && g.quant == ram_quant,
+    })
+}
+
+/// One rung's Ollama download, resolved from the quant that rung was actually measured at.
+///
+/// `tag: None` is a real answer — a rung whose quant Ollama cannot fetch — and the UI must say why
+/// rather than render a button that fails or a silent gap.
+#[derive(Serialize)]
+pub struct PullTarget {
+    /// `hf.co/<repo>:<QUANT>`, or `None` when this quant has no fetchable tag.
+    pub tag: Option<String>,
+    /// The reason `tag` is `None`: a split GGUF, which Ollama's registry route refuses by design.
+    pub sharded: bool,
+    /// This rung names the SAME file as the highest-quality rung, differing only in the settings the
+    /// runner is given (context, or a q8_0 KV cache). One download, two ways to run it.
+    pub same_file: bool,
+}
+
 /// One curated model, scored against this machine.
 #[derive(Serialize)]
 pub struct Recommendation {
@@ -1405,6 +1452,10 @@ pub struct Recommendation {
     /// so this is the one reason a model PM would otherwise offer has no Download button — and the
     /// UI says so rather than leaving a silent gap.
     pub sharded_quant: bool,
+    /// The download for the "fastest on GPU" rung, when the card shows one. `None` means there is no
+    /// second rung at all — NOT that it can't be fetched; that is `Some(PullTarget { tag: None, .. })`.
+    /// Kept beside `ollama_pull` rather than replacing it: three files pin the flat pair.
+    pub gpu_pull: Option<PullTarget>,
     /// What the weights are licensed under. Rides with the row so the UI can label every model and
     /// show the terms before a restricted download without a second call.
     pub licence: local_catalog::EntryLicence,
@@ -1498,6 +1549,96 @@ pub struct Recommendations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_split_cards_second_rung_gets_its_own_download() {
+        // The defect this pins: `Recommendation` carried ONE pull target, resolved from the RAM rung,
+        // so the "fastest on GPU" row a user actually wants had no download at all — and the card
+        // printed a caption admitting it instead of closing the gap.
+        fn rung(q: Option<fit::Quant>) -> fit::FitResult {
+            fit::FitResult {
+                verdict: fit::Verdict::Comfortable,
+                quant: q,
+                context: Some(32768),
+                kv: fit::KvCache::Q8_0,
+                est_memory_gb: Some(6.6),
+                est_tokens_per_sec: Some(71.0),
+                notes: vec![],
+            }
+        }
+        let cat = local_catalog::catalog();
+        let e = cat
+            .entries
+            .iter()
+            .find(|e| e.repo == "bartowski/Qwen2.5-7B-Instruct-GGUF")
+            .expect("catalogue entry");
+
+        // A rung with its OWN quant resolves to that quant's tag, never the RAM rung's.
+        let split = fit::GpuFit::Split {
+            fit: rung(Some(fit::Quant::Q5_K_M)),
+        };
+        let t =
+            gpu_pull_target(e, &split, Some(fit::Quant::Q8_0)).expect("a split has a second rung");
+        assert_eq!(
+            t.tag.as_deref(),
+            Some("hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M")
+        );
+        assert!(!t.sharded);
+        assert!(!t.same_file, "different quants are different files");
+
+        // Same quant, different settings: `gpu_fit` splits on context or kv alone, so this is ONE
+        // file run two ways. Telling the user to find a second download would be false.
+        let same = fit::GpuFit::Split {
+            fit: rung(Some(fit::Quant::Q8_0)),
+        };
+        let t = gpu_pull_target(e, &same, Some(fit::Quant::Q8_0)).expect("still a split");
+        assert!(t.same_file, "one file, two ways to run it");
+        assert_eq!(
+            t.tag.as_deref(),
+            Some("hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0")
+        );
+
+        // No second rung is None — distinct from a second rung that exists but cannot be fetched.
+        assert!(gpu_pull_target(e, &fit::GpuFit::Single, Some(fit::Quant::Q8_0)).is_none());
+        assert!(gpu_pull_target(e, &fit::GpuFit::NoGpuResident, Some(fit::Quant::Q8_0)).is_none());
+    }
+
+    #[test]
+    fn a_fetchable_gpu_rung_survives_an_unfetchable_ram_rung() {
+        // Reachable in the committed catalogue on a large-RAM machine: the 72B's Q5_K_M/Q6_K/Q8_0 are
+        // sharded (no tag), while its Q4_K_M is tagged. PM used to offer nothing at all there,
+        // because the single pull target came from the RAM rung.
+        let cat = local_catalog::catalog();
+        let e = cat
+            .entries
+            .iter()
+            .find(|e| e.repo == "bartowski/Qwen2.5-72B-Instruct-GGUF")
+            .expect("catalogue entry");
+        let (ram_tag, ram_sharded) = pull_target_for(e, Some(fit::Quant::Q5_K_M));
+        assert!(
+            ram_tag.is_none() && ram_sharded,
+            "the RAM rung is the sharded one"
+        );
+
+        let split = fit::GpuFit::Split {
+            fit: fit::FitResult {
+                verdict: fit::Verdict::Comfortable,
+                quant: Some(fit::Quant::Q4_K_M),
+                context: Some(8192),
+                kv: fit::KvCache::Q8_0,
+                est_memory_gb: Some(40.0),
+                est_tokens_per_sec: Some(9.0),
+                notes: vec![],
+            },
+        };
+        let t = gpu_pull_target(e, &split, Some(fit::Quant::Q5_K_M)).expect("second rung");
+        assert_eq!(
+            t.tag.as_deref(),
+            Some("hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q4_K_M"),
+            "a fetchable rung must be offered even when the other one cannot be"
+        );
+        assert!(!t.sharded);
+    }
 
     #[test]
     fn the_download_button_always_names_the_quant_the_card_sized() {
