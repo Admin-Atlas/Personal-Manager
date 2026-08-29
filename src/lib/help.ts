@@ -308,7 +308,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-localai-downloaded": {
     title: "Already downloaded",
-    body: "Model files PM found on this device — in Ollama, LM Studio, or Hugging Face folders, or a folder you point it at — that your endpoint isn't serving yet. PM can only use a model the server is actually serving, so load one in the app you downloaded it with and it becomes assignable above.",
+    body: "What is on this machine. PM looks in the folders Ollama, LM Studio and Hugging Face keep models in, in a folder you point it at, and it asks your connected server what it holds — which on Linux is the only way to see a store the server owns as its own user. A folder PM finds but is not allowed to read is said so plainly, rather than reported as one that is not there. The list itself shows only models nothing is serving yet, since those are the ones PM cannot use: load one in the app you downloaded it with and it becomes assignable above.",
   },
   "settings-storage": {
     title: "On-device components",

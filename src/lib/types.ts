@@ -1848,6 +1848,13 @@ export interface LocalOnDiskModel {
   fit: LocalFitResult;
 }
 
+/** A model root PM can prove is there but is not allowed to read (local_disk.rs BlockedRoot) — a
+ *  packaged Linux Ollama's store, or a folder pointed at someone else's home. */
+export interface LocalBlockedRoot {
+  source: LocalDiskSource;
+  path: string;
+}
+
 /** The Workbench payload: the hardware scan + the fit-scored catalog + installed models + models
  *  found on disk (local_ai.rs Recommendations). */
 export interface LocalRecommendations {
@@ -1863,9 +1870,15 @@ export interface LocalRecommendations {
   installed: LocalInstalledModel[];
   /** Downloaded but not currently served (#449), de-duplicated against `installed`. */
   on_disk: LocalOnDiskModel[];
-  /** Which runners' model folders exist on this machine — so "Ollama is here with nothing
-   *  downloaded" can be said differently from "Ollama isn't installed". */
+  /** Which runners' model folders exist on this machine AND could be read — so "Ollama is here with
+   *  nothing downloaded" can be said differently from "Ollama isn't installed". */
   disk_sources_present: LocalDiskSource[];
+  /** Roots that are there and unreadable. Separate from `disk_sources_present` because it supports a
+   *  different sentence: PM names the cause instead of reporting an absence it never observed. */
+  disk_blocked: LocalBlockedRoot[];
+  /** How many models the endpoint answered with; null when nothing answered (not configured,
+   *  unreachable, or refused). `0` — a running server with nothing pulled — is a different state. */
+  endpoint_inventory: number | null;
   /** How many models the crawl found on disk BEFORE the already-served ones were removed. Separates
    *  "no model folder here" from "a folder, with nothing downloaded in it". */
   disk_found: number;

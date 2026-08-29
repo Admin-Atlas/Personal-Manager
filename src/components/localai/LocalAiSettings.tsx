@@ -47,6 +47,7 @@ import type {
 import { formatBytes, formatGib } from "../../lib/format";
 import { IngestProgress } from "../IngestProgress";
 import { installCommand, runnerGuides } from "../../lib/workbenchGuide";
+import { downloadedState, type DownloadedState } from "./downloadedState";
 import {
   Button,
   Callout,
@@ -690,9 +691,15 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
           action={
             !loading &&
             recs &&
-            recs.on_disk.length > 0 && (
+            recs.installed.length + recs.on_disk.length > 0 && (
+              // Both halves. `on_disk` is only the models NOTHING is serving, so counting it alone
+              // read "0 downloaded" to anyone whose server holds everything they have — which is
+              // every Ollama user, since `/v1/models` lists what has been pulled, not what is
+              // loaded. The two sets are disjoint by construction (`already_served` filters one out
+              // of the other), so this is a sum and not a union. No "on this device": the endpoint
+              // may not be one.
               <span className="shrink-0 text-[0.6875rem] text-ink4">
-                {recs.on_disk.length} on this device
+                {recs.installed.length + recs.on_disk.length} downloaded
               </span>
             )
           }
@@ -714,7 +721,14 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         <SectionInfo title="Where PM looks, and what it reads">
           <p>
             PM checks the folders {SUPPORTED_RUNTIMES} keep their models in, so a model you've
-            downloaded but aren't currently running still gets sized against your machine.
+            downloaded but aren't currently running still gets sized against your machine — and it
+            asks your connected server what it holds, which on Linux is the only way to see a store
+            the server owns as its own user.
+          </p>
+          <p>
+            A folder PM finds but isn't allowed to read is said so plainly, rather than reported as
+            a folder that isn't there. The two look identical to the operating system and they are
+            not the same thing.
           </p>
           <p>
             It reads <span className="text-ink2">file names and sizes only</span> — never the
@@ -1006,6 +1020,39 @@ const DISK_SOURCE_LABEL: Record<LocalDiskSource, string> = {
   folder: "Your folder",
 };
 
+/** The one sentence for each state that isn't a list. Split out so the copy sits beside the ladder's
+ *  reasoning instead of inside a nested ternary, and so each branch can be read against the machine
+ *  state it describes. */
+function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): string {
+  switch (state.kind) {
+    case "endpointHasAll": {
+      const one = state.count === 1;
+      return `Your server has ${state.count} model${one ? "" : "s"} downloaded, and PM can see ${
+        one ? "it" : "them all"
+      } — ${one ? "it's" : "they're"} listed under Assign roles above.`;
+    }
+    case "allServed":
+      return `Found ${listJoin(
+        state.runners,
+      )} on this device, with nothing downloaded that isn't already being served.`;
+    case "folderEmpty":
+      return `Found ${listJoin(state.runners)} on this device, but nothing downloaded into it yet.`;
+    case "endpointEmpty":
+      return "Your server is running, but nothing has been downloaded into it yet — pick one from Recommended models above.";
+    case "blocked":
+      // Never suggests changing the permissions. The store belongs to a service account, and telling
+      // someone to loosen one so a settings panel can count files would be a bad trade PM has no
+      // business proposing. Connecting the server gets the same answer and costs nothing.
+      return state.root.source === "folder"
+        ? `PM isn't allowed to read the folder you pointed it at (${state.root.path}), so it can't say what's in there.`
+        : `${DISK_SOURCE_LABEL[state.root.source]} keeps its models at ${
+            state.root.path
+          }, and PM isn't allowed to read that folder — the packaged Linux server owns its store as its own user, which is normal and nothing is wrong. Connect it below and PM will ask the server what it has instead.`;
+    case "noFolder":
+      return `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`;
+  }
+}
+
 /** Models found on disk that no endpoint is serving. Distinguishes "we looked and this runner has
  *  nothing" from "this runner isn't on this machine" — an empty list means different things.
  *
@@ -1026,21 +1073,20 @@ export function DownloadedModels({
   const found = recs.disk_sources_present
     .filter((s) => s !== "folder")
     .map((s) => DISK_SOURCE_LABEL[s]);
+  // Seven states, resolved in a pure module. The branch a stock Linux install lands in cannot be
+  // reached from a render test without a service account, so the ladder is tested on its own.
+  const state = downloadedState({
+    unservedCount: recs.on_disk.length,
+    endpointInventory: recs.endpoint_inventory,
+    foundRunners: found,
+    diskFound: recs.disk_found,
+    blocked: recs.disk_blocked,
+  });
 
   return (
     <div className="mt-2">
-      {recs.on_disk.length === 0 ? (
-        <p className="text-xs text-ink4">
-          {/* Three states, not two. `on_disk` has already had everything the endpoint serves
-              removed from it, so "empty" alone cannot tell a machine with no runner installed from
-              one whose runner is installed but empty — which is exactly what a user sees the moment
-              they remove their last model. `disk_found` is the pre-filter count. */}
-          {found.length === 0
-            ? `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`
-            : recs.disk_found === 0
-              ? `Found ${listJoin(found)} on this device, but nothing downloaded into it yet.`
-              : `Found ${listJoin(found)} on this device, with nothing downloaded that isn't already being served.`}
-        </p>
+      {state.kind !== "list" ? (
+        <p className="text-xs text-ink4">{emptyCopy(state)}</p>
       ) : (
         <>
           <p className="mb-2 text-xs text-ink4">
