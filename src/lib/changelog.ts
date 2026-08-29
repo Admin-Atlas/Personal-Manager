@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.130.11-alpha",
+    date: "2026-08-29",
+    highlights: [
+      "A second download no longer makes the first one vanish. PM refuses to run two model downloads at once, which is right \u2014 but the refusal was taking the running download's progress bar and its Cancel button down with it. The fetch itself carried on underneath a page showing no sign of it, and there was no way to watch it or stop it until you left the tab and came back. The progress now stays with the download that is actually running, and the message tells you which one that is.",
+    ],
+  },
+  {
     version: "3.130.10-alpha",
     date: "2026-08-29",
     release: true,
