@@ -139,6 +139,8 @@ const recs = (): LocalRecommendations => ({
   installed: [],
   on_disk: [],
   disk_sources_present: [],
+  disk_blocked: [],
+  endpoint_inventory: null,
   disk_found: 0,
   disk_truncated: false,
   scan_dir: null,

@@ -23,8 +23,15 @@
 //! | A folder you choose | the `local_model_scan_dir` setting | bounded walk for `*.gguf` |
 //!
 //! Everything is best-effort in the same way [`crate::hardware`] is: a missing directory, an
-//! unreadable file, a half-written manifest or a permission denial skips that one entry and the scan
-//! carries on. The scan is bounded by [`MAX_MODELS`] and [`MAX_WALK_DEPTH`] so it can't wander into a
+//! unreadable file or a half-written manifest skips that one entry and the scan carries on.
+//!
+//! A permission denial on a whole ROOT is the one thing that is not merely skipped, because silence
+//! there is a lie. The packaged Linux install runs Ollama as its own user with home
+//! `/usr/share/ollama` at mode 0700, so a PM process running as the desktop user cannot read the
+//! store at all — and the `is_dir()` probes this module used to open with report that identically to
+//! "not installed". A machine serving two models was told it had no model folder. [`probe_root`]
+//! separates the two, and an unreadable root is reported in [`DiskScan::blocked`] so the copy can
+//! name the cause instead of inventing an absence. The scan is bounded by [`MAX_MODELS`] and [`MAX_WALK_DEPTH`] so it can't wander into a
 //! junctioned media drive, and it reports when it hit those limits rather than implying it saw
 //! everything.
 
@@ -87,15 +94,35 @@ pub struct DiskModel {
     pub shards: u32,
 }
 
+/// A model root PM can prove is there but is not allowed to look inside.
+///
+/// Carried separately from [`DiskScan::sources_present`] because it supports a different sentence:
+/// a present source can be described ("Ollama is here with nothing in it"), while a blocked one can
+/// only be named ("Ollama's models are here, and they belong to the service account"). Collapsing
+/// the two would put PM back to guessing which it had.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockedRoot {
+    pub source: DiskSource,
+    /// The store's own path, so the copy can name it rather than gesturing at it.
+    pub path: String,
+}
+
 /// What a scan found, plus whether it was complete.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DiskScan {
     pub models: Vec<DiskModel>,
     /// The scan stopped at [`MAX_MODELS`], so the list is a prefix rather than everything on disk.
     pub truncated: bool,
-    /// Sources whose root exists on this machine — so the UI can distinguish "Ollama is here and has
+    /// Sources whose root PM found AND can read — so the UI can distinguish "Ollama is here and has
     /// nothing downloaded" from "Ollama isn't installed".
+    ///
+    /// Readable, not merely existing: a root PM can see but not list is [`DiskScan::blocked`], and
+    /// the two must never be merged. Conflating them is what let a machine actively serving models
+    /// be told it had no model folder at all.
     pub sources_present: Vec<DiskSource>,
+    /// Roots that exist and are unreadable. Never empty on a packaged Linux Ollama install unless
+    /// PM is running as root or as the service user.
+    pub blocked: Vec<BlockedRoot>,
 }
 
 /// Scan every known runner plus an optional user-chosen folder.
@@ -107,9 +134,15 @@ pub fn scan(home: &Path, extra_folder: Option<&Path>) -> DiskScan {
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for root in ollama_roots(home, env_path("OLLAMA_MODELS")) {
-        if root.join("manifests").is_dir() {
-            mark_present(&mut out, DiskSource::Ollama);
-            scan_ollama(&root, &mut out, &mut seen);
+        match probe_root(&root.join("manifests")) {
+            RootState::Readable => {
+                mark_present(&mut out, DiskSource::Ollama);
+                scan_ollama(&root, &mut out, &mut seen);
+            }
+            // Report the STORE, not the `manifests` child that happened to be probed: the store is
+            // the path a user recognises and the one the service account actually owns.
+            RootState::Blocked => mark_blocked(&mut out, DiskSource::Ollama, &root),
+            RootState::Missing => {}
         }
     }
     for root in huggingface_roots(
@@ -119,21 +152,35 @@ pub fn scan(home: &Path, extra_folder: Option<&Path>) -> DiskScan {
         env_path("HF_HOME"),
         env_path("XDG_CACHE_HOME"),
     ) {
-        if root.is_dir() {
-            mark_present(&mut out, DiskSource::HuggingFace);
-            scan_huggingface(&root, &mut out, &mut seen);
+        match probe_root(&root) {
+            RootState::Readable => {
+                mark_present(&mut out, DiskSource::HuggingFace);
+                scan_huggingface(&root, &mut out, &mut seen);
+            }
+            RootState::Blocked => mark_blocked(&mut out, DiskSource::HuggingFace, &root),
+            RootState::Missing => {}
         }
     }
     for root in lmstudio_roots(home) {
-        if root.is_dir() {
-            mark_present(&mut out, DiskSource::LmStudio);
-            scan_lmstudio(&root, &mut out, &mut seen);
+        match probe_root(&root) {
+            RootState::Readable => {
+                mark_present(&mut out, DiskSource::LmStudio);
+                scan_lmstudio(&root, &mut out, &mut seen);
+            }
+            RootState::Blocked => mark_blocked(&mut out, DiskSource::LmStudio, &root),
+            RootState::Missing => {}
         }
     }
     if let Some(folder) = extra_folder {
-        if folder.is_dir() {
-            mark_present(&mut out, DiskSource::Folder);
-            collect_gguf_models(folder, DiskSource::Folder, "", &mut out, &mut seen, 0);
+        match probe_root(folder) {
+            RootState::Readable => {
+                mark_present(&mut out, DiskSource::Folder);
+                collect_gguf_models(folder, DiskSource::Folder, "", &mut out, &mut seen, 0);
+            }
+            // A folder the USER chose is the one case where a denial is worth saying out loud even
+            // though they picked it themselves — they may have pointed PM at someone else's home.
+            RootState::Blocked => mark_blocked(&mut out, DiskSource::Folder, folder),
+            RootState::Missing => {}
         }
     }
 
@@ -149,6 +196,58 @@ pub fn scan(home: &Path, extra_folder: Option<&Path>) -> DiskScan {
 fn mark_present(out: &mut DiskScan, source: DiskSource) {
     if !out.sources_present.contains(&source) {
         out.sources_present.push(source);
+    }
+}
+
+fn mark_blocked(out: &mut DiskScan, source: DiskSource, root: &Path) {
+    let path = root.display().to_string();
+    if !out.blocked.iter().any(|b| b.path == path) {
+        out.blocked.push(BlockedRoot { source, path });
+    }
+}
+
+/// Whether a model root is absent, usable, or there-but-unreadable.
+enum RootState {
+    Missing,
+    Readable,
+    Blocked,
+}
+
+/// Probe a root three ways instead of two.
+///
+/// The distinction is the whole point of this function. `Path::is_dir()` — which every one of these
+/// probes used to be — is `metadata(..).map(..).unwrap_or(false)`, so it answers `false` both for a
+/// directory that does not exist and for one PM is not allowed to look inside, and the caller cannot
+/// tell which it got. On the packaged Linux install that is not a corner case: the service runs as
+/// its own `ollama` user whose home `/usr/share/ollama` is mode 0700, so the store is unreadable,
+/// the scan concluded Ollama was not installed, and the panel told a machine that was actively
+/// serving two models out of that store that it had no model folder at all.
+///
+/// Probed with `read_dir` rather than `metadata`, because listing is the capability the scan needs:
+/// a directory can be stat-able and still not listable (mode `0111`), and that must not read as an
+/// empty folder.
+fn probe_root(root: &Path) -> RootState {
+    match std::fs::read_dir(root) {
+        Ok(_) => RootState::Readable,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => RootState::Blocked,
+        Err(_) => {
+            // A denial on an ANCESTOR need not surface as `PermissionDenied` at the leaf: traversal
+            // stops before the leaf is consulted, and what a platform reports for that is not
+            // guaranteed. Linux gives EACCES even for a name that does not exist under an
+            // unsearchable directory (measured here against `/usr/share/ollama`), but treating that
+            // as the rule would make this silently wrong elsewhere. So when the leaf says "absent",
+            // ask the nearest ancestor that answers at all whether PM is allowed to list it.
+            root.ancestors()
+                .skip(1)
+                .find_map(|anc| match std::fs::read_dir(anc) {
+                    Ok(_) => Some(RootState::Missing),
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        Some(RootState::Blocked)
+                    }
+                    Err(_) => None,
+                })
+                .unwrap_or(RootState::Missing)
+        }
     }
 }
 
@@ -450,7 +549,15 @@ fn ollama_blob_path(root: &Path, digest: &str) -> Option<PathBuf> {
 fn ollama_quant_from_config(config_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(config_json).ok()?;
     let raw = value.get("file_type")?.as_str()?.trim();
-    (!raw.is_empty()).then(|| raw.to_string())
+    // Ollama writes the literal string "unknown" when it could not read a quantization out of the
+    // GGUF — measured 29-08-2026 against `hf.co/ggml-org/gemma-3-4b-it-GGUF`, while a bartowski
+    // build pulled the same day reported `Q5_K_M`, so this is repo-dependent and not rare. That
+    // sentinel is an ABSENCE. Letting it through as a label made PM print "PM doesn't have a size
+    // for the UNKNOWN quantization yet" — asserting it knew which quantization the file was, which
+    // is the exact opposite of what the server said. `local_ai::score_on_disk` keeps two branches
+    // apart for this ("couldn't tell" vs "know it, have no weight"), and the sentinel belongs in
+    // the first; stopping it here means no caller can land it in the second by accident.
+    (!raw.is_empty() && !raw.eq_ignore_ascii_case("unknown")).then(|| raw.to_string())
 }
 
 /// An Ollama model's name as `ollama list` prints it: the default registry and `library` namespace
@@ -1269,5 +1376,70 @@ mod tests {
         // resolving the default. PM must never do that.
         assert!(!home.join(".lmstudio-home-pointer").exists());
         assert!(!home.join(".lmstudio").exists());
+    }
+
+    #[test]
+    fn a_quantization_ollama_could_not_read_is_an_absence_not_a_label() {
+        // Ollama writes the literal string "unknown" into `file_type` when it could not read one out
+        // of the GGUF. Measured 29-08-2026: it does exactly that for `hf.co/ggml-org/gemma-3-4b-it-
+        // GGUF` while reporting `Q5_K_M` for a bartowski build pulled the same day.
+        //
+        // Letting it through as a label was a live defect on every platform, not a new risk from
+        // reading this store: `local_ai::score_on_disk` splits "PM couldn't tell which quantization
+        // this is" from "PM knows exactly which one and has no size for it", and the sentinel landed
+        // in the SECOND — so the card said "PM doesn't have a size for the UNKNOWN quantization
+        // yet", asserting knowledge PM had just been told the server did not have.
+        assert_eq!(
+            ollama_quant_from_config(r#"{"file_type":"Q5_K_M"}"#).as_deref(),
+            Some("Q5_K_M")
+        );
+        assert_eq!(ollama_quant_from_config(r#"{"file_type":"unknown"}"#), None);
+        assert_eq!(ollama_quant_from_config(r#"{"file_type":"UNKNOWN"}"#), None);
+        assert_eq!(ollama_quant_from_config(r#"{"file_type":"  "}"#), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_store_behind_an_unreadable_parent_is_blocked_rather_than_missing() {
+        // THE regression test for this card. A packaged Linux Ollama runs as its own user with home
+        // /usr/share/ollama at mode 0700, so PM gets EACCES on the store — and `Path::is_dir()`,
+        // which every root probe used to be, answers `false` for that exactly as it does for a
+        // directory that was never there. A machine serving two models was told it had no model
+        // folder for Ollama at all.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let service_home = tmp.path().join("service-home");
+        let store = service_home.join(".ollama").join("models");
+        std::fs::create_dir_all(store.join("manifests")).unwrap();
+        // Drop the search bit so traversal into it fails the way the packaged install's 0700 home
+        // does for anyone who is not the service user.
+        std::fs::set_permissions(&service_home, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root ignores the mode bits entirely, and so can an ACL. Check the PREMISE rather than
+        // asking who we are: if the denial did not actually happen, this test cannot say anything
+        // and must not pretend it did.
+        let denied = std::fs::read_dir(&service_home).is_err();
+        let blocked = probe_root(&store.join("manifests"));
+        let missing = probe_root(&tmp.path().join("never-existed"));
+        let readable = probe_root(tmp.path());
+        // Restored before the assertions so a failure still leaves a removable tempdir.
+        std::fs::set_permissions(&service_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        if !denied {
+            return;
+        }
+        assert!(
+            matches!(blocked, RootState::Blocked),
+            "an unreadable ancestor must not read as an absent store"
+        );
+        assert!(
+            matches!(missing, RootState::Missing),
+            "a genuinely absent root is still Missing"
+        );
+        assert!(
+            matches!(readable, RootState::Readable),
+            "an ordinary readable directory is still Readable"
+        );
     }
 }

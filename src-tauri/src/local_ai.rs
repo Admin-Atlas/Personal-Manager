@@ -907,12 +907,32 @@ pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit
     };
 
     // Which curated models are already downloaded (#449) — a suggestion the user can act on for free.
-    let on_disk: Vec<String> = disk_scan(&app)
+    //
+    // Both rungs, because the crawl alone is not enough to answer this: on a packaged Linux install
+    // it cannot read Ollama's store, so every model the user has pulled reads `on_disk: false` and
+    // this notice cheerfully recommends downloading something already sitting on the disk. What the
+    // endpoint serves is the second rung, and for Ollama it IS the store — `/v1/models` lists what
+    // has been pulled, not what is resident. Best-effort: the gate, the keychain or the server being
+    // unavailable degrades to the crawl's answer rather than failing a passive notice.
+    let mut on_disk: Vec<String> = disk_scan(&app)
         .await
         .models
         .iter()
         .filter_map(|m| local_catalog::match_installed(&m.name).map(|e| e.repo.clone()))
         .collect();
+    if let Endpoint::Ready(base_url, token) = configured_endpoint(&app)
+        .await
+        .unwrap_or(Endpoint::Unconfigured)
+    {
+        for id in openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
+            .await
+            .unwrap_or_default()
+        {
+            if let Some(entry) = local_catalog::match_installed(&id) {
+                on_disk.push(entry.repo.clone());
+            }
+        }
+    }
 
     let candidates: Vec<better_fit::Candidate> = cat
         .entries
@@ -1085,10 +1105,17 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     let endpoint = configured_endpoint(&app).await?;
     let endpoint_configured = !matches!(endpoint, Endpoint::Unconfigured);
     let mut installed = Vec::new();
+    // Whether the endpoint ANSWERED, which `installed` alone cannot say: an empty list is both "a
+    // server with nothing in it" and "no server answered", and the panel below has to tell a
+    // first-time installer apart from someone whose address is wrong. `probe` already separates
+    // them — a runner with an empty store returns `Ok(vec![])`, which #790 taught `is_models_list`
+    // to accept — so this needs no second request.
+    let mut endpoint_answered = false;
     if let Endpoint::Ready(base_url, token) = endpoint {
         if let Ok(models) =
             openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose())).await
         {
+            endpoint_answered = true;
             for id in models {
                 let (matched_repo, fit_result) = match local_catalog::match_installed(&id) {
                     Some(entry) => (
@@ -1171,6 +1198,9 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         accepted_terms(&conn)?
     };
 
+    // Bound before the payload moves `installed`.
+    let endpoint_inventory = endpoint_answered.then_some(installed.len());
+
     Ok(Recommendations {
         hardware,
         reserve_gb: fit::reserve_gb(),
@@ -1184,9 +1214,11 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         installed,
         on_disk,
         disk_sources_present: disk.sources_present.clone(),
+        disk_blocked: disk.blocked.clone(),
         // Pre-filter: `on_disk` has already had everything the endpoint serves removed from it, so
         // it cannot answer "is there anything downloaded here at all".
         disk_found: disk.models.len(),
+        endpoint_inventory,
         disk_truncated: disk.truncated,
         scan_dir: scan_dir_setting(&app),
         terms_accepted,
@@ -1265,8 +1297,15 @@ async fn disk_scan(app: &AppHandle) -> local_disk::DiskScan {
 }
 
 /// Whether an on-disk model is the same thing the endpoint already serves. Compared on the catalog
-/// repo when both matched, else on the runner's own name — an Ollama tag round-trips exactly, and a
-/// file-based runner's `owner/repo/file.gguf` contains what the endpoint reports.
+/// repo when both matched, else on the runner's own name.
+///
+/// The name fallback is strict EQUALITY, deliberately, and it carries the whole weight only for a
+/// model outside the catalogue. It round-trips exactly for Ollama — `ollama_display_name` rebuilds
+/// the same string `/v1/models` reports — and is unreliable for a file-based runner, whose
+/// `owner/repo/file.gguf` merely *contains* the served id rather than equalling it. Loosening it to
+/// a substring test would dedupe more, at the cost of silently merging two genuinely different
+/// files whose names nest; a missed dedupe shows the model twice and is self-correcting, a wrong one
+/// hides it. Left strict on purpose.
 fn already_served(model: &local_disk::DiskModel, served_keys: &[String]) -> bool {
     let matched = local_catalog::match_installed(&model.name).map(|e| e.repo.as_str());
     served_keys.iter().any(|key| {
@@ -1530,14 +1569,32 @@ pub struct Recommendations {
     pub installed: Vec<InstalledModel>,
     /// Downloaded but not currently served (#449) — de-duplicated against `installed`.
     pub on_disk: Vec<OnDiskModel>,
-    /// Which runners' model folders exist on this machine, so the UI can say "Ollama is here with
-    /// nothing downloaded" rather than implying it isn't installed.
+    /// Which runners' model folders exist on this machine AND could be read, so the UI can say
+    /// "Ollama is here with nothing downloaded" rather than implying it isn't installed.
     pub disk_sources_present: Vec<local_disk::DiskSource>,
+    /// Roots that are there and unreadable — a packaged Linux Ollama's store, or a folder the user
+    /// pointed PM at that belongs to someone else. Separate from `disk_sources_present` because it
+    /// supports a different and more useful sentence: PM can name the cause rather than reporting
+    /// an absence it did not observe.
+    pub disk_blocked: Vec<local_disk::BlockedRoot>,
     /// How many models the crawl found on disk, BEFORE `on_disk` removed the ones already served.
     /// Lets the UI separate "no model folder here" from "a folder, with nothing downloaded in it" —
     /// two different sentences, and the second is what a user sees the moment they remove their
     /// last model.
     pub disk_found: usize,
+    /// How many models the configured endpoint answered with — the length of `installed`, but only
+    /// when the probe actually succeeded.
+    ///
+    /// Three-valued on purpose, and a consumer must not flatten it. `None` = nothing answered: no
+    /// endpoint configured, unreachable, or refused by the cleartext gate. `Some(0)` = a server
+    /// that is running with nothing pulled into it yet — a first-time installer's exact state, and
+    /// a completely different sentence from "PM couldn't find a model folder".
+    ///
+    /// This is deliberately NOT a second HTTP call. Ollama's `/v1/models` lists what has been
+    /// PULLED, not what is loaded (`/api/ps` is the resident list), so the probe PM already makes
+    /// carries the whole store — and unlike Ollama's native `/api/tags` it also answers for
+    /// llama-server and LM Studio, and survives a proxy that only forwards `/v1`.
+    pub endpoint_inventory: Option<usize>,
     /// The crawl hit its bound, so `on_disk` is a prefix rather than everything on disk.
     pub disk_truncated: bool,
     /// The extra folder the crawl includes, when one is set.

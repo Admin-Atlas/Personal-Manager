@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.132.0-alpha",
+    date: "2026-08-29",
+    highlights: [
+      "PM stopped telling Linux users they had no models while their server was busy answering with them. On Linux, Ollama installs itself as a background service that owns its models under its own account \u2014 which means PM is not allowed to read that folder. PM asked the operating system whether the folder was there, got back the same answer it gets for a folder that does not exist, and concluded Ollama was not installed. So the \u201cAlready downloaded\u201d section announced \u201cNo model folder found\u201d on a machine holding two models and serving them. It now tells the difference between a folder that is not there and one it is not allowed to open, says which it found and where, and asks your connected server what it holds instead \u2014 which is the one place that answer definitely lives. It never suggests you change a system service\u2019s permissions to make a settings page count files.",
+      "The section also stopped counting the wrong thing. It only ever listed models that nothing was running, which is the right list to show \u2014 those are the ones you cannot use yet \u2014 but it also used that list as the headline count. With Ollama, everything you download is immediately available, so that number was permanently zero no matter how much you had. The count now covers everything PM can account for, a running server with nothing in it reads differently from a server that never answered, and a model whose quantization the server could not identify no longer produces a confident sentence about a quantization called \u201cunknown\u201d.",
+    ],
+  },
+  {
     version: "3.131.0-alpha",
     date: "2026-08-29",
     highlights: [

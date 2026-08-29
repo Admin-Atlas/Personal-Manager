@@ -7,6 +7,9 @@
 // prose, so the settings doctrine keeps it unfolded and visible. These pin that it is actually
 // rendered, that it says the right half depending on whether an endpoint exists, and that it stays
 // out of the way when there is nothing on disk to explain.
+//
+// The last suite covers what that framing MISSED: the list being empty is not the same as having
+// nothing downloaded, and a folder PM cannot read is not a folder that is absent.
 
 import { render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
@@ -85,6 +88,8 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     installed: [],
     on_disk: [MODEL],
     disk_sources_present: ["lm_studio"],
+    disk_blocked: [],
+    endpoint_inventory: null,
     disk_found: 1,
     disk_truncated: false,
     scan_dir: null,
@@ -163,5 +168,53 @@ describe("a runner that is installed but empty", () => {
   it("still says no folder at all when no runner is present", () => {
     const { container } = render3({ disk_sources_present: [], disk_found: 0 });
     expect(container.textContent).toContain("No model folder found");
+  });
+});
+
+describe("a store PM is not allowed to read", () => {
+  // The defect Bobby hit. A packaged Linux Ollama runs as its own user with home /usr/share/ollama
+  // at mode 0700, so the crawl gets EACCES — and `Path::is_dir()`, which every root probe used to
+  // be, reports that identically to "not there". The panel then told a machine that was serving two
+  // models out of that very store that it had no model folder for Ollama at all.
+  const render4 = (over: Partial<LocalRecommendations>) =>
+    render(
+      <DownloadedModels
+        recs={recs({ on_disk: [], disk_sources_present: [], disk_found: 0, ...over })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+
+  it("names the store and its path instead of reporting an absence", () => {
+    const { container } = render4({
+      disk_blocked: [{ source: "ollama", path: "/usr/share/ollama/.ollama/models" }],
+    });
+    expect(container.textContent).toContain("/usr/share/ollama/.ollama/models");
+    expect(container.textContent).not.toContain("No model folder found");
+  });
+
+  it("never tells anyone to loosen a service account's permissions", () => {
+    // Suggesting a chmod on a system service's home to make a settings panel count files would be a
+    // bad trade, and connecting the server gets the same answer for free.
+    const { container } = render4({
+      disk_blocked: [{ source: "ollama", path: "/usr/share/ollama/.ollama/models" }],
+    });
+    expect(container.textContent).not.toMatch(/chmod|chown|sudo|permissions to/i);
+  });
+
+  it("says what the endpoint holds rather than counting what nothing serves", () => {
+    // With an Ollama endpoint, `/v1/models` lists what has been PULLED, so everything downloaded is
+    // also served and the unserved list is structurally empty forever. Reading that as "you have
+    // nothing downloaded" is the same lie by a different route.
+    const { container } = render4({ endpoint_inventory: 2 });
+    expect(container.textContent).toContain("Your server has 2 models");
+    expect(container.textContent).not.toContain("No model folder found");
+  });
+
+  it("tells a first-time installer their server is simply empty", () => {
+    const { container } = render4({ endpoint_inventory: 0 });
+    expect(container.textContent).toContain("nothing has been downloaded into it yet");
+    expect(container.textContent).not.toContain("No model folder found");
   });
 });
