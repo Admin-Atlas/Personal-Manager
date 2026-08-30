@@ -34,7 +34,8 @@ import {
   writeBriefingInSidebar,
   type BriefingFloat,
 } from "../../lib/briefingPrefs";
-import { getTrayEnabled, setBriefingWindowVisible, setTrayEnabled } from "../../lib/ipc";
+import { setBriefingWindowVisible } from "../../lib/ipc";
+import { TrayIconRow } from "./TrayIconRow";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
 import {
   ACCENTS,
@@ -113,20 +114,6 @@ export function GeneralSettings() {
       }),
     [],
   );
-  // The tray icon is backend-owned (Rust reads it at boot), so it loads asynchronously rather than
-  // seeding from localStorage like its neighbours.
-  const [trayOn, setTrayOn] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    getTrayEnabled()
-      .then((on) => alive && setTrayOn(on))
-      .catch(() => {
-        /* leave it off — the tray is optional */
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
   function changeBriefingSidebar(on: boolean) {
     setBriefingSidebar(on);
     writeBriefingInSidebar(on);
@@ -140,10 +127,6 @@ export function GeneralSettings() {
     void setBriefingWindowVisible(mode === "onTop").catch(() => {
       /* best-effort: the in-app levels don't need it and a failure must not block the setting */
     });
-  }
-  function changeTray(on: boolean) {
-    setTrayOn(on);
-    void setTrayEnabled(on).catch(() => setTrayOn(!on));
   }
   // Memory map (the Map tab): the default grouping, cohesion blend, node cap, and the optional t-SNE
   // component's install/enable state.
@@ -639,9 +622,7 @@ export function GeneralSettings() {
             />
           )}
         </SettingRow>
-        <SettingRow label="Tray / menu bar icon" helpId="settings-tray-icon">
-          {(a11y) => <Toggle {...a11y} checked={trayOn} onChange={changeTray} />}
-        </SettingRow>
+        <TrayIconRow helpId="settings-tray-icon" />
         <SectionInfo helpId="settings-focus">
           <p>
             The Focus tab&rsquo;s own layout, Upcoming and panel controls live on the tab itself,

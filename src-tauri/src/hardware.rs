@@ -1405,6 +1405,74 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+// --- which displays are on the dedicated card (#786 item 8) --------------------------------------
+
+/// Connected display outputs wired to a DEDICATED graphics card, by connector name.
+///
+/// Empty everywhere except Linux, and that asymmetry is honest rather than a gap to apologise for:
+/// the attribution comes from the DRM sysfs tree, and neither Windows nor macOS exposes which chip
+/// drives a given output. Tauri can count monitors; it cannot say what is behind them.
+///
+/// **This is a readout and must stay one.** PM may say that an external display is sharing the card;
+/// it must never release a model because of it. Someone plugging in a monitor is quite likely sitting
+/// down to work, and having their model dropped at that exact moment would be maddening — a scheduler
+/// acting on a signal nobody consented to. The cost being surfaced is also small: a framebuffer plus
+/// compositor surfaces is typically a few hundred megabytes.
+///
+/// Internal panels (`eDP`) are excluded: a laptop's own screen is not news, and on a hybrid machine
+/// it is usually wired to the integrated chip anyway.
+pub fn dgpu_displays() -> Vec<String> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // `cardN-CONNECTOR`; anything without the dash is the card node itself.
+            let (card, connector) = name.split_once('-')?;
+            if !card.starts_with("card") || connector.starts_with("eDP") {
+                return None;
+            }
+            if std::fs::read_to_string(e.path().join("status"))
+                .ok()?
+                .trim()
+                != "connected"
+            {
+                return None;
+            }
+            discrete_driver(card).then_some(connector.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether a DRM card is driven by a discrete-GPU driver.
+///
+/// Matched on the driver rather than the PCI vendor id because vendor alone does not separate a
+/// discrete card from an integrated one — AMD ships both, and both report `0x1002`. `i915`/`xe` are
+/// Intel's integrated drivers; `nvidia`/`nouveau`/`amdgpu` drive the cards worth reporting. An
+/// unrecognised driver is treated as not-discrete: over-reporting would put a line in front of
+/// someone about hardware PM has not identified.
+fn discrete_driver(card: &str) -> bool {
+    let link = std::path::Path::new("/sys/class/drm")
+        .join(card)
+        .join("device")
+        .join("driver");
+    std::fs::read_link(&link)
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        })
+        .is_some_and(|d| matches!(d.as_str(), "nvidia" | "nouveau" | "amdgpu" | "radeon"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

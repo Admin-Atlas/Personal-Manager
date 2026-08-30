@@ -29,6 +29,12 @@ const checkLocalLlmEndpoint = vi.fn();
 const clearLocalLlmEndpoint = vi.fn();
 const clearLocalLlmToken = vi.fn();
 const dismissLocalBetterFit = vi.fn();
+const localGpuResidency = vi.fn();
+const releaseLocalGpu = vi.fn();
+const getLocalReleasePolicy = vi.fn();
+const setLocalReleasePolicy = vi.fn();
+const getTrayEnabled = vi.fn();
+const setTrayEnabled = vi.fn();
 const getLocalLlmConfig = vi.fn();
 const listLocalLlmModels = vi.fn();
 const localBetterFitNotice = vi.fn();
@@ -54,6 +60,15 @@ vi.mock("../../lib/ipc", () => ({
   clearLocalLlmEndpoint: () => clearLocalLlmEndpoint(),
   clearLocalLlmToken: () => clearLocalLlmToken(),
   dismissLocalBetterFit: () => dismissLocalBetterFit(),
+  // The lifecycle section's four, plus the tray row it shares with General. This factory replaces
+  // the WHOLE module, so anything the tab imports and this omits is `undefined` at module eval and
+  // takes every test in the file down with an unhelpful "is not a function".
+  localGpuResidency: () => localGpuResidency(),
+  releaseLocalGpu: () => releaseLocalGpu(),
+  getLocalReleasePolicy: () => getLocalReleasePolicy(),
+  setLocalReleasePolicy: (...a: unknown[]) => setLocalReleasePolicy(...a),
+  getTrayEnabled: () => getTrayEnabled(),
+  setTrayEnabled: (...a: unknown[]) => setTrayEnabled(...a),
   getLocalLlmConfig: () => getLocalLlmConfig(),
   listLocalLlmModels: () => listLocalLlmModels(),
   localBetterFitNotice: () => localBetterFitNotice(),
@@ -174,6 +189,19 @@ beforeEach(() => {
   localModelRecommendations.mockResolvedValue(recs());
   localBetterFitNotice.mockResolvedValue(null);
   localLlmStatus.mockResolvedValue(statusFix());
+  localGpuResidency.mockResolvedValue({
+    resident: [],
+    vram_gb: 8,
+    dgpu_displays: [],
+    policy: "server",
+    idle_minutes: 5,
+    no_unload_route: false,
+  });
+  releaseLocalGpu.mockResolvedValue(0);
+  getLocalReleasePolicy.mockResolvedValue({ policy: "server", idle_minutes: 5 });
+  setLocalReleasePolicy.mockResolvedValue(undefined);
+  getTrayEnabled.mockResolvedValue(false);
+  setTrayEnabled.mockResolvedValue(undefined);
   activeLocalPull.mockResolvedValue(null);
   cancelLocalPull.mockResolvedValue(true);
   clearLocalLlmToken.mockResolvedValue(undefined);

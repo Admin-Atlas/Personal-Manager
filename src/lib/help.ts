@@ -306,6 +306,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Assign roles",
     body: "Choose which local model answers your chats and which runs background work, and how each falls back: Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server).",
   },
+  "settings-localai-lifecycle": {
+    title: "Holding the graphics card",
+    body: "A local model sits in your graphics card's memory for as long as your server keeps it there, which on some setups is forever. This decides when PM hands that memory back: never (your server's business), when you quit PM, or after a quiet period. PM only ever unloads a model it loaded itself \u2014 one you started in a terminal is left alone \u2014 and it never changes how long your server keeps models by itself, because asking for that once would reprogram the server for every program that talks to it.",
+  },
   "settings-localai-downloaded": {
     title: "Already downloaded",
     body: "What is on this machine. PM looks in the folders Ollama, LM Studio and Hugging Face keep models in, in a folder you point it at, and it asks your connected server what it holds — which on Linux is the only way to see a store the server owns as its own user. A folder PM finds but is not allowed to read is said so plainly, rather than reported as one that is not there. The list itself shows only models nothing is serving yet, since those are the ones PM cannot use: load one in the app you downloaded it with and it becomes assignable above.",

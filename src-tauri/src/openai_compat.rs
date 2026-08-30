@@ -23,6 +23,8 @@
 //! [`crate::local_slot::tunables`], so tuning after live testing is a one-file edit there.
 
 use futures_util::StreamExt;
+use serde::Serialize;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::local_slot::tunables;
@@ -515,6 +517,208 @@ pub fn chat_body(model: &str, messages: &[ChatMessage], stream: bool) -> serde_j
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     body
+}
+
+// --- releasing the GPU (#786 item 8) ------------------------------------------------------------
+
+/// Build the body that asks Ollama to drop a model from memory, and nothing else.
+///
+/// `keep_alive: 0` on an EMPTY message list is the unload gesture: it takes the unload arm, loads
+/// nothing and generates nothing. Measured against 0.33.0 — 200 with `done_reason: "unload"`, in
+/// under a millisecond.
+///
+/// **Zero is the only value PM may ever send here**, and that is not fussiness. Measured on the same
+/// server: one request carrying a POSITIVE `keep_alive` reprograms that runner for the rest of its
+/// life. A later request that omits the field inherits the expiry and slides it forward — and so does
+/// one arriving on `/v1/chat/completions`, which has no such field at all. So a single PM request
+/// carrying `keep_alive: "5m"` would silently demote a user's own `OLLAMA_KEEP_ALIVE=-1`, for every
+/// client of that server, permanently. `0` leaves nothing behind: the model unloads, and the next
+/// load takes the server's own default again.
+///
+/// This is why PM's "release after a quiet period" policy is its OWN timer plus this call, rather
+/// than the obvious implementation of putting a TTL on each request.
+pub fn unload_body(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [],
+        "keep_alive": 0,
+    })
+}
+
+/// How long to wait for the runner to actually go away after a successful unload.
+///
+/// The 200 is NOT the teardown. Measured: the response came back in 0.82 ms while the runner stayed
+/// resident for a further ~850 ms, and a load issued inside that window returned a FALSE
+/// `done_reason: "load"` in 0.9 ms by re-attaching to the runner that was still there. So a caller
+/// that trusts the 200 will report memory freed that is still held.
+const UNLOAD_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+const UNLOAD_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// What happened when PM asked a server to drop a model.
+///
+/// Three states rather than a bool, because the two a bool collapses are the ones that matter.
+/// "I could not check" is not "it is gone", and "this server has no unload route" is not "there was
+/// nothing to free" — the first would have PM tell someone it freed memory it never confirmed, and
+/// the second would have PM ask a server that can never answer, every twenty seconds, forever.
+///
+/// There is deliberately no "was not loaded" arm: the caller establishes residency from `/api/ps`
+/// before asking, so a model that is not there is never asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadOutcome {
+    /// Confirmed gone.
+    Freed,
+    /// This server has no unload route at all (llama-server, LM Studio, a `/v1`-only proxy). A
+    /// permanent property of the endpoint, so a caller should latch it and stop asking.
+    NoRoute,
+    /// The request was accepted but PM could not confirm the memory came back. Deliberately NOT
+    /// counted as success: the caller must not tell anyone it freed something it never saw freed.
+    Unconfirmed,
+}
+
+/// Ask the server to drop `model` from memory.
+///
+/// With `confirm`, waits until `/api/ps` stops reporting it — because the 200 is not the teardown.
+/// Measured: the response came back in 0.82 ms while the runner stayed resident a further ~850 ms,
+/// and a load issued inside that window returned a FALSE `done_reason: "load"` by re-attaching to
+/// the runner that was still there.
+///
+/// Without `confirm`, sends and returns. That is for the exit path only, where the process is about
+/// to end and confirmation has no consumer — spending a shutdown budget proving something nobody
+/// will read is how the second model never gets its request sent at all.
+///
+/// Never an error the caller must handle: this is housekeeping, and it must not be evidence about
+/// the endpoint's health in either direction.
+pub async fn unload_model(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    confirm: bool,
+) -> UnloadOutcome {
+    let url = format!("{base_url}/api/chat");
+    let mut req = client_for(base_url)
+        .post(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT)
+        .json(&unload_body(model));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let Ok(response) = req.send().await else {
+        return UnloadOutcome::Unconfirmed;
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Either the route does not exist or the model id is unknown. Both mean "asking this again
+        // will not help", and the caller latches on it.
+        return UnloadOutcome::NoRoute;
+    }
+    if !response.status().is_success() {
+        return UnloadOutcome::Unconfirmed;
+    }
+    if !confirm {
+        return UnloadOutcome::Freed;
+    }
+    let deadline = Instant::now() + UNLOAD_SETTLE_TIMEOUT;
+    loop {
+        match model_is_resident(base_url, model, token).await {
+            // Answered, and it is gone.
+            Some(false) => return UnloadOutcome::Freed,
+            // Could not ask. NOT "it is gone" — that inversion is the whole reason this returns four
+            // states, since a `/v1`-only proxy answers the POST and fails `/api/ps`.
+            None => return UnloadOutcome::Unconfirmed,
+            Some(true) => {}
+        }
+        if Instant::now() >= deadline {
+            return UnloadOutcome::Unconfirmed;
+        }
+        tokio::time::sleep(UNLOAD_SETTLE_POLL).await;
+    }
+}
+
+/// What the server currently has loaded, per its own `/api/ps`.
+///
+/// `None` when the route did not answer — not an Ollama, unreachable, or refused. That is a
+/// different fact from `Some(vec![])`, "answering and holding nothing", and a caller that flattens
+/// the two will tell someone their card is free when PM simply could not ask.
+pub async fn ollama_ps(base_url: &str, token: Option<&str>) -> Option<Vec<ResidentModel>> {
+    let url = format!("{base_url}/api/ps");
+    let mut req = client_for(base_url)
+        .get(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    value.get("models")?.as_array()?;
+    Some(resident_from_ps(&value))
+}
+
+/// Whether `model` is currently resident, per the server's own `/api/ps`.
+///
+/// `None` means PM could not ask — unreachable, non-success, or a body it could not parse. That is a
+/// third state and it must stay one: reading "cannot check" as "not resident" is how a confirm loop
+/// turns into a rubber stamp.
+async fn model_is_resident(base_url: &str, model: &str, token: Option<&str>) -> Option<bool> {
+    let url = format!("{base_url}/api/ps");
+    let mut req = client_for(base_url)
+        .get(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    value.get("models")?.as_array()?;
+    Some(
+        resident_from_ps(&value)
+            .iter()
+            .any(|m| m.model.eq_ignore_ascii_case(model)),
+    )
+}
+
+/// One resident model, as `/api/ps` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResidentModel {
+    pub model: String,
+    /// Total bytes the server placed for it, in GB.
+    pub size_gb: f64,
+    /// The share of that it reports as being on the GPU, in GB.
+    ///
+    /// A FLOOR, not a measurement. It counts the weights the server placed and excludes the CUDA
+    /// context and compute buffers: measured on a laptop card, a model reporting 2.70 GiB here was
+    /// actually using 3.95 GiB of the card — a 1.25 GiB gap. Never present it as the GPU footprint,
+    /// and never let it prove that something fits.
+    pub size_vram_gb: f64,
+}
+
+/// The resident models in an `/api/ps` body. Pure, so the shapes are testable without a server.
+pub fn resident_from_ps(value: &serde_json::Value) -> Vec<ResidentModel> {
+    value
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let name = m
+                        .get("model")
+                        .or_else(|| m.get("name"))
+                        .and_then(|n| n.as_str())?;
+                    Some(ResidentModel {
+                        model: name.to_string(),
+                        size_gb: m.get("size").and_then(|s| s.as_u64()).unwrap_or(0) as f64 / 1e9,
+                        size_vram_gb: m.get("size_vram").and_then(|s| s.as_u64()).unwrap_or(0)
+                            as f64
+                            / 1e9,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1473,6 +1677,56 @@ mod tests {
             "the host is the diagnosable part and should survive: {}",
             err.detail
         );
+    }
+
+    #[test]
+    fn the_unload_body_carries_a_zero_keep_alive_and_absolutely_nothing_else() {
+        // Shape-pinned like `chat_body`, and for a sharper reason. Measured on a live server: ONE
+        // request carrying a POSITIVE `keep_alive` reprograms that runner for the rest of its life —
+        // a later request omitting the field inherits the expiry and slides it forward, and so does
+        // one arriving on `/v1/chat/completions`, which has no such field at all. So a single stray
+        // positive value here would silently demote a user's own `OLLAMA_KEEP_ALIVE=-1` for every
+        // client of their server, permanently. Zero leaves nothing behind.
+        let body = unload_body("gemma3:4b");
+        assert_eq!(body["model"], "gemma3:4b");
+        assert_eq!(body["keep_alive"], 0);
+        // Empty messages is what makes this the UNLOAD arm rather than a generation.
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            body.as_object().map(|o| o.len()),
+            Some(3),
+            "nothing else may ride along in this body"
+        );
+        // And the value must be the integer zero, not a duration string that happens to mean zero.
+        assert!(body["keep_alive"].is_number());
+    }
+
+    #[test]
+    fn residency_is_read_off_api_ps_without_trusting_its_vram_figure() {
+        // Byte-exact from a live server with one model loaded (30-08-2026).
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"models":[{"name":"hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+                "model":"hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+                "size":2896083024,"size_vram":2896083024,"context_length":32768}]}"#,
+        )
+        .unwrap();
+        let resident = resident_from_ps(&body);
+        assert_eq!(resident.len(), 1);
+        assert_eq!(
+            resident[0].model,
+            "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
+        );
+        assert!((resident[0].size_gb - 2.896).abs() < 0.001);
+        // `size_vram` is carried, but it is a FLOOR: on this measurement the card was actually
+        // holding 3.95 GiB against the 2.70 GiB reported, because the CUDA context and compute
+        // buffers sit outside it. Nothing may use this to prove something fits.
+        assert!((resident[0].size_vram_gb - 2.896).abs() < 0.001);
+
+        // Nothing loaded, and a body that is not a `/api/ps` answer at all, both read as "nothing".
+        let empty: serde_json::Value = serde_json::from_str(r#"{"models":[]}"#).unwrap();
+        assert!(resident_from_ps(&empty).is_empty());
+        let alien: serde_json::Value = serde_json::from_str(r#"{"object":"list"}"#).unwrap();
+        assert!(resident_from_ps(&alien).is_empty());
     }
 
     #[test]

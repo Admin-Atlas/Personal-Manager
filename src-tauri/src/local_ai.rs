@@ -24,8 +24,8 @@ use crate::llm_gateway::{
 };
 use crate::local_slot::{classify_ip, posture_for, EndpointClass, PostureVerdict};
 use crate::{
-    better_fit, db, fit, hardware, local_catalog, local_disk, openai_compat, paths, secrets,
-    AppState,
+    better_fit, db, fit, hardware, local_catalog, local_disk, openai_compat, paths, residency,
+    secrets, AppState,
 };
 
 /// The three servers PM knows how to auto-detect, by their default loopback port.
@@ -1079,6 +1079,418 @@ pub fn set_local_model_rescan_cadence(state: State<'_, AppState>, cadence: Strin
         local_catalog::RESCAN_CADENCE_KEY,
         parsed.as_setting(),
     )?;
+    Ok(())
+}
+
+/// One model the server currently has loaded.
+#[derive(serde::Serialize)]
+pub struct ResidentEntry {
+    pub model: String,
+    /// Total bytes the server placed for it, in GB.
+    pub size_gb: f64,
+    /// The share the server reports as being on the GPU, in GB. A FLOOR: it excludes the CUDA
+    /// context and compute buffers, and was measured 1.25 GB low on a real load. Never rendered as
+    /// "this is what your card is holding".
+    pub size_vram_gb: f64,
+    /// PM caused this load, so PM may release it. A model started from a terminal is never PM's.
+    pub pm_loaded: bool,
+}
+
+/// What is on the graphics card, and what PM is allowed to do about it.
+#[derive(serde::Serialize)]
+pub struct GpuResidency {
+    /// `None` when PM could not ask — no endpoint, unreachable, or a server with no such route.
+    /// Emphatically not the same as `Some([])`, which is a server answering that it holds nothing.
+    pub resident: Option<Vec<ResidentEntry>>,
+    pub vram_gb: Option<f64>,
+    /// Connected external displays PM can attribute to a dedicated card. Linux only — neither
+    /// Windows nor macOS will say which chip drives an output. Reported, never acted on.
+    pub dgpu_displays: Vec<String>,
+    pub policy: String,
+    pub idle_minutes: u64,
+    /// This endpoint answered an unload with "no such route", so the two active policies cannot do
+    /// anything here. llama-server holds a model for its whole process life and LM Studio has no
+    /// unload gesture; offering a picker that silently does nothing would be worse than saying so.
+    pub no_unload_route: bool,
+}
+
+/// What the graphics card is holding, for the Local AI tab's lifecycle section.
+#[tauri::command]
+pub async fn local_gpu_residency(app: AppHandle) -> Result<GpuResidency> {
+    let (policy, idle_minutes) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let policy = residency::ReleasePolicy::from_setting(
+            db::get_setting(&conn, residency::RELEASE_POLICY_KEY)?.as_deref(),
+        );
+        let idle = residency::idle_after(
+            db::get_setting(&conn, residency::RELEASE_IDLE_MINUTES_KEY)?.as_deref(),
+        );
+        (policy, idle.as_secs() / 60)
+    };
+    let resident = match configured_endpoint(&app).await? {
+        Endpoint::Ready(base_url, token) => {
+            openai_compat::ollama_ps(&base_url, token.as_ref().map(|s| s.expose()))
+                .await
+                .map(|models| {
+                    let state = app.state::<AppState>();
+                    models
+                        .into_iter()
+                        .map(|m| ResidentEntry {
+                            pm_loaded: state.local_ai.is_pm_loaded(&base_url, &m.model),
+                            model: m.model,
+                            size_gb: m.size_gb,
+                            size_vram_gb: m.size_vram_gb,
+                        })
+                        .collect()
+                })
+        }
+        Endpoint::Refused | Endpoint::Unconfigured => None,
+    };
+    let vram_gb = app
+        .state::<AppState>()
+        .local_ai
+        .cached_hardware()
+        .and_then(|h| h.vram_gb);
+    let no_unload_route = match configured_endpoint(&app).await? {
+        Endpoint::Ready(base_url, _) => app
+            .state::<AppState>()
+            .local_ai
+            .has_no_unload_route(&base_url),
+        _ => false,
+    };
+    Ok(GpuResidency {
+        resident,
+        vram_gb,
+        no_unload_route,
+        dgpu_displays: hardware::dgpu_displays(),
+        policy: policy.as_setting().to_string(),
+        idle_minutes,
+    })
+}
+
+/// Hand the graphics card back now, on the user's say-so.
+///
+/// Ignores the policy entirely — this is somebody asking, not a timer firing — but keeps every other
+/// rule, including proving PM still owns what it is about to free. Returns how many models were
+/// CONFIRMED gone, so the UI can say "nothing to release" rather than implying it did something. A
+/// request PM could not confirm deliberately does not count.
+#[tauri::command]
+pub async fn release_local_gpu(app: AppHandle) -> Result<usize> {
+    let Endpoint::Ready(base_url, token) = configured_endpoint(&app).await? else {
+        return Ok(0);
+    };
+    let state = app.state::<AppState>();
+    let summary = release_pm_models(&state, &base_url, token.as_ref().map(|s| s.expose())).await;
+    crate::llm_gateway::ping_status(&app);
+    Ok(summary.freed)
+}
+
+/// How often to look at whether the card can be handed back.
+///
+/// Must be comfortably shorter than the shortest quiet period a user can choose
+/// ([`residency::MIN_IDLE_MINUTES`] is one minute), or the setting would silently round up.
+const RELEASE_TICK: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Watch for the local slot going quiet, and give the graphics card back when the policy says to.
+///
+/// A tenth scheduler rather than a passenger on one of the nine that exist, and the reason is a real
+/// distinction rather than tidiness: every other loop gates on `state.idle_for()` — how long since
+/// the USER did something — while this one gates on how long the SLOT has been quiet. They are
+/// different clocks and conflating them is wrong in both directions. Someone reading a long document
+/// is "idle" while a background job is mid-generation, and someone typing quickly is "active" while
+/// the card has been untouched for an hour.
+///
+/// It also cannot gate on the vault being unlocked, the way the others do: a model stays resident
+/// after the user locks up and walks away, which is precisely when the card is worth handing back.
+/// The policy is read whenever it can be and remembered, so a locked vault keeps honouring the last
+/// one PM saw.
+pub fn spawn_release_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(RELEASE_TICK).await;
+            release_tick(&app).await;
+        }
+    });
+}
+
+/// One pass of the release scheduler. Split out so the ordering — read, decide, then act — is
+/// legible, and so the DB guard demonstrably closes before the first await (rule #4).
+async fn release_tick(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    // Refresh the policy if the vault is open; otherwise fall back to the last one PM could read.
+    let fresh = state.conn().ok().map(|conn| {
+        let policy = residency::ReleasePolicy::from_setting(
+            db::get_setting(&conn, residency::RELEASE_POLICY_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        let idle = residency::idle_after(
+            db::get_setting(&conn, residency::RELEASE_IDLE_MINUTES_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        let base_url = db::get_setting(&conn, LOCAL_BASE_URL_KEY).ok().flatten();
+        (policy, idle, base_url)
+    });
+    if let Some((policy, idle, _)) = fresh {
+        state.local_ai.cache_release_policy(policy, idle);
+    }
+    // `None` here means PM has never been able to read the policy, which is not the same as "the
+    // default policy" — it must not act on a setting it has never seen.
+    let Some((policy, idle_after)) = state.local_ai.cached_release_policy() else {
+        return;
+    };
+    // Every input handed over whole, and the decision made in one place. Nothing is pre-checked
+    // here: a caller that filters first and then asks makes the pure reducer's own gates unreachable,
+    // which leaves the real decision spread across two files with the tested one contributing
+    // nothing. `quiet_for` of `None` means no call has ever run, which zero expresses correctly —
+    // zero is never past a quiet period.
+    let inputs = residency::ReleaseInputs {
+        policy,
+        pm_loaded: !state.local_ai.pm_loaded_pairs().is_empty(),
+        in_flight: state.local_ai.slot.in_flight(),
+        holds: state.local_ai.slot.holds(),
+        quiet_for: state
+            .local_ai
+            .slot
+            .quiet_for(std::time::Instant::now())
+            .unwrap_or_default(),
+        idle_after,
+    };
+    if !residency::should_release(&inputs) {
+        return;
+    }
+    let Some(base_url) = fresh.and_then(|(_, _, b)| b) else {
+        return;
+    };
+    // An endpoint that has already told PM it has no unload route never gets asked again. llama-server
+    // and LM Studio have none, and neither does a proxy forwarding only `/v1` — without this latch the
+    // scheduler posts at one of them every twenty seconds for the life of the process.
+    if state.local_ai.has_no_unload_route(&base_url) {
+        return;
+    }
+    let token = secrets::get_local_llm_endpoint_token()
+        .ok()
+        .flatten()
+        .map(|s| s.expose().to_string());
+
+    release_pm_models(&state, &base_url, token.as_deref()).await;
+    crate::llm_gateway::ping_status(app);
+}
+
+/// What one release pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseSummary {
+    /// Models confirmed gone.
+    pub freed: usize,
+    /// Requests that were accepted but never seen to take effect.
+    pub unconfirmed: usize,
+    /// This endpoint has no unload route, so nothing was attempted after the first answer.
+    pub no_route: bool,
+}
+
+/// Release every model PM owns on this endpoint, proving ownership first.
+///
+/// Shared by the timer and the button so the rules live in one place, because two of them are easy
+/// to get subtly wrong in two directions:
+///
+///   * **Ownership is proved, not assumed.** A marker records that PM put a model on the wire, but
+///     the model can leave without PM — Ollama evicts under memory pressure, and a user can stop it.
+///     A marker left standing across that would have PM claim the NEXT load of that model, which
+///     might be the user's own, and unload it out from under their terminal. So a marked model that
+///     is no longer resident has its marker retired instead.
+///   * **The unload runs inside the lane.** Otherwise a chat call can start while a model is
+///     mid-teardown — measured at ~850 ms, during which a request re-attaches to the dying runner and
+///     comes back truncated or blank. Truncated scores as a strike, and three strikes cool the
+///     endpoint down for chat too.
+///
+/// Records no health outcome at any point. Housekeeping is not evidence about the endpoint in either
+/// direction: a success here would clear a failing host's strike streak, and a failure would eject a
+/// healthy one.
+async fn release_pm_models(
+    state: &State<'_, AppState>,
+    base_url: &str,
+    token: Option<&str>,
+) -> ReleaseSummary {
+    let mut summary = ReleaseSummary::default();
+    let loaded: Vec<(String, String)> = state
+        .local_ai
+        .pm_loaded_pairs()
+        .into_iter()
+        .filter(|(b, _)| b == base_url)
+        .collect();
+    if loaded.is_empty() {
+        return summary;
+    }
+    // One `/api/ps` read, doing both jobs. `None` means PM could not ask, so it knows nothing and
+    // does nothing — the opposite reading would have it unload on no evidence at all.
+    let Some(resident) = openai_compat::ollama_ps(base_url, token).await else {
+        return summary;
+    };
+    let is_resident = |model: &str| resident.iter().any(|r| r.model.eq_ignore_ascii_case(model));
+
+    let mut releasable: Vec<String> = Vec::new();
+    for (_, model) in &loaded {
+        if is_resident(model) {
+            releasable.push(model.clone());
+        } else {
+            state.local_ai.clear_pm_loaded(base_url, model);
+        }
+    }
+    if releasable.is_empty() {
+        return summary;
+    }
+
+    let outcomes = state
+        .local_ai
+        .slot
+        .run_exclusive(async {
+            let mut out = Vec::new();
+            for model in &releasable {
+                out.push((
+                    model.clone(),
+                    openai_compat::unload_model(base_url, model, token, true).await,
+                ));
+            }
+            out
+        })
+        .await;
+
+    for (model, outcome) in outcomes {
+        match outcome {
+            openai_compat::UnloadOutcome::Freed => {
+                state.local_ai.clear_pm_loaded(base_url, &model);
+                summary.freed += 1;
+            }
+            openai_compat::UnloadOutcome::NoRoute => {
+                state.local_ai.mark_no_unload_route(base_url);
+                summary.no_route = true;
+                break;
+            }
+            // Sent, never seen to take effect. The marker STAYS: PM has not been shown the memory
+            // came back, and saying otherwise is the inversion this outcome exists to prevent.
+            openai_compat::UnloadOutcome::Unconfirmed => summary.unconfirmed += 1,
+        }
+    }
+    summary
+}
+
+/// How long PM may spend giving the graphics card back on the way out.
+///
+/// `RunEvent::Exit` is a PRE-teardown hook: tao dispatches it and then ends the process with
+/// `process::exit`, so nothing after it runs and no destructor ever fires. That makes this the only
+/// place a release can happen at shutdown — and it makes it a place that must never hang, because a
+/// wedged unload here is an app that will not quit. Measured: the unload itself answers in under a
+/// millisecond, so two seconds is generous for a loopback server and short enough that a wrong one
+/// costs a blink.
+const EXIT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Give the graphics card back as PM shuts down, when the user asked for that.
+///
+/// Deliberately blocking. A spawned task is killed by `process::exit` before its first poll, so this
+/// is `block_on` — the first in production, on the main event-loop thread, which is not a runtime
+/// worker and so may block safely. Every step is written to give up rather than to fail: a locked
+/// vault, an absent state, an unreachable server and a slow one all end the same way, with PM
+/// quitting.
+///
+/// Never records a health outcome. Housekeeping must not be evidence about the endpoint in either
+/// direction, and at shutdown there is nobody left to tell anyway.
+pub fn release_gpu_on_exit(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    // Read every setting up front and drop the guard before the first await — the DB mutex is not
+    // reentrant, and this runs while the rest of the app is still alive.
+    let policy = {
+        let Ok(conn) = state.conn() else {
+            return; // a locked or already-torn-down vault is not an error at this point
+        };
+        let policy = residency::ReleasePolicy::from_setting(
+            db::get_setting(&conn, residency::RELEASE_POLICY_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        policy
+    };
+    // `pm_loaded` is PM's own bookkeeping, rebuilt every launch, so this is empty unless PM itself
+    // put a model on the wire during this run. A model the user loaded from a terminal is never in
+    // it and is never touched.
+    //
+    // Deliberately NOT filtered to the currently-configured endpoint. Someone who changes or clears
+    // the endpoint and then quits has still left PM's models resident on the old one, and gating the
+    // cleanup on the new configuration would leak exactly those.
+    let releasable = state.local_ai.pm_loaded_pairs();
+    if releasable.is_empty() || !residency::should_release_on_exit(policy, true) {
+        return;
+    }
+    let token = secrets::get_local_llm_endpoint_token()
+        .ok()
+        .flatten()
+        .map(|s| s.expose().to_string());
+    tauri::async_runtime::block_on(async move {
+        // Fired CONCURRENTLY and without waiting for confirmation, which is the opposite of what
+        // every other release path does — and both differences matter here. The process is about to
+        // end, so a confirmation has no consumer; and a serial loop that confirms would spend the
+        // whole budget on the first model and never send the second one's request at all.
+        let requests = releasable.iter().map(|(base_url, model)| {
+            openai_compat::unload_model(base_url, model, token.as_deref(), false)
+        });
+        let _ = tokio::time::timeout(
+            EXIT_RELEASE_BUDGET,
+            futures_util::future::join_all(requests),
+        )
+        .await;
+    });
+}
+
+/// The release policy and quiet period, for the Local AI tab's lifecycle section.
+#[derive(serde::Serialize)]
+pub struct ReleaseSettings {
+    /// `"server"` | `"on-exit"` | `"idle"`.
+    pub policy: String,
+    pub idle_minutes: u64,
+}
+
+#[tauri::command]
+pub fn get_local_release_policy(state: State<'_, AppState>) -> Result<ReleaseSettings> {
+    let conn = state.conn()?;
+    let policy = residency::ReleasePolicy::from_setting(
+        db::get_setting(&conn, residency::RELEASE_POLICY_KEY)?.as_deref(),
+    );
+    let idle = residency::idle_after(
+        db::get_setting(&conn, residency::RELEASE_IDLE_MINUTES_KEY)?.as_deref(),
+    );
+    Ok(ReleaseSettings {
+        policy: policy.as_setting().to_string(),
+        idle_minutes: idle.as_secs() / 60,
+    })
+}
+
+/// Store the release policy. Round-tripped through the enum and the clamp so an unrecognised policy
+/// or an out-of-range period cannot be persisted — both resolve to something PM can act on.
+#[tauri::command]
+pub fn set_local_release_policy(
+    state: State<'_, AppState>,
+    policy: String,
+    idle_minutes: Option<u64>,
+) -> Result<()> {
+    let parsed = residency::ReleasePolicy::from_setting(Some(policy.as_str()));
+    let conn = state.conn()?;
+    db::set_setting(&conn, residency::RELEASE_POLICY_KEY, parsed.as_setting())?;
+    if let Some(m) = idle_minutes {
+        let clamped = m.clamp(residency::MIN_IDLE_MINUTES, residency::MAX_IDLE_MINUTES);
+        db::set_setting(
+            &conn,
+            residency::RELEASE_IDLE_MINUTES_KEY,
+            &clamped.to_string(),
+        )?;
+    }
     Ok(())
 }
 

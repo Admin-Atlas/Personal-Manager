@@ -116,6 +116,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
           { id: "sec-localai-models", label: "Recommended models" },
           { id: "sec-localai-endpoint", label: "Connect endpoint" },
           { id: "sec-localai-roles", label: "Assign roles" },
+          { id: "sec-localai-lifecycle", label: "Graphics card" },
         ],
       },
       { id: "search", label: "Search", Icon: SearchIcon, sections: [] },

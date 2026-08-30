@@ -1848,6 +1848,42 @@ export interface LocalOnDiskModel {
   fit: LocalFitResult;
 }
 
+/** One model the local server currently has loaded (local_ai.rs ResidentEntry). */
+export interface LocalResidentEntry {
+  model: string;
+  /** Total bytes the server placed for it, in GB. */
+  size_gb: number;
+  /** The share the server calls GPU-resident, in GB. A FLOOR — it excludes the runtime's own context
+   *  and compute buffers, measured 1.25 GB low on a real load. Never render it as "your card is
+   *  holding this much". */
+  size_vram_gb: number;
+  /** PM caused this load, so PM may release it. A model started from a terminal is never PM's. */
+  pm_loaded: boolean;
+}
+
+/** What the graphics card is holding, and what PM may do about it (local_ai.rs GpuResidency). */
+export interface LocalGpuResidency {
+  /** null when PM could not ask — no endpoint, unreachable, or a server with no such route. That is
+   *  a different fact from `[]`, a server answering that it holds nothing. */
+  resident: LocalResidentEntry[] | null;
+  vram_gb: number | null;
+  /** Connected external displays PM can attribute to a dedicated card. Linux only — no other OS will
+   *  say which chip drives an output. Reported, never acted on. */
+  dgpu_displays: string[];
+  /** "server" | "on-exit" | "idle". */
+  policy: string;
+  idle_minutes: number;
+  /** This endpoint has no unload route, so the two active policies cannot do anything here —
+   *  llama-server holds a model for its whole process life, and LM Studio has no unload gesture. */
+  no_unload_route: boolean;
+}
+
+/** The stored release policy (local_ai.rs ReleaseSettings). */
+export interface LocalReleaseSettings {
+  policy: string;
+  idle_minutes: number;
+}
+
 /** How two models bound to the two roles behave sharing one server (fit.rs CoResidencyFit).
  *
  *  The question is not whether the machine will FAIL — Ollama queues and evicts rather than failing.

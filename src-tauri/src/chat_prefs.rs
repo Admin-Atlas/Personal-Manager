@@ -397,7 +397,16 @@ fn ready(app: &AppHandle) -> bool {
 /// Fire-and-forget and single-flight, so it never delays the streamed reply and never overlaps the
 /// launch catch-up.
 pub fn spawn_extract_after_reply(app: AppHandle, conversation_id: i64) {
+    // Hold the model for the life of this job. These three followers are spawned AFTER the reply
+    // has streamed and BEFORE the Done event, so the slot is genuinely quiet in the gap — and a
+    // release taken there unloads the model out from under all of them, each then paying a cold
+    // load. This is not a forecast that could be wrong: PM created the work it is holding for. The
+    // hold is taken on THIS thread, before the spawn, so the gap is closed from the first instant;
+    // it travels into the task and is dropped with it, including on an early return or a panic.
+    let hold = app.state::<AppState>().local_ai.slot.hold();
     tauri::async_runtime::spawn(async move {
+        // Moved in, and dropped when this task ends however it ends.
+        let _hold = hold;
         run_guarded(&app, |app| async move {
             if let Err(e) = extract_for_session(&app, conversation_id).await {
                 eprintln!("chat-prefs: eager extraction for {conversation_id} skipped ({e})");

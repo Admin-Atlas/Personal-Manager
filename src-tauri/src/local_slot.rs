@@ -13,7 +13,7 @@
 //! tests nor CI do. The epic's live-rig checklist owns that check and still owes it.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -445,6 +445,16 @@ pub struct LocalSlot {
     lane: tokio::sync::Mutex<()>,
     chat_waiting: AtomicBool,
     preempt: Mutex<Arc<Notify>>,
+    /// Calls occupying OR waiting for the lane. Counted from function entry rather than from lane
+    /// acquisition on purpose: a call queued behind another is still a reason to keep the model
+    /// resident, and releasing the memory it is about to need would be the worst possible timing.
+    in_flight: AtomicUsize,
+    /// When the last call finished. `None` until one has. Stamped on the way OUT of a call, so a
+    /// quiet period measures from the end of the last work rather than the start of it.
+    last_active: Mutex<Option<Instant>>,
+    /// Background jobs PM has spawned that have not reached the lane yet — see [`ReleaseHold`].
+    /// An `Arc` so a hold can outlive the borrow that minted it and travel into a spawned task.
+    holds: Arc<AtomicUsize>,
 }
 
 /// Resets `chat_waiting` to `false` on drop — including on an unwinding panic — so a chat call that
@@ -456,6 +466,41 @@ impl Drop for ChatWaitingGuard<'_> {
     }
 }
 
+/// Counts one call as occupying the slot, and stamps the finish time when it lets go.
+///
+/// A guard rather than a matched increment/decrement pair, for exactly the reason `ChatWaitingGuard`
+/// above is one — and here the need is sharper. `run_background` has THREE exits: the early
+/// `chat_waiting` bail before the `select!`, the preemption arm inside it, and normal completion.
+/// A decrement written after the select would be skipped by the first two, and a leaked count means
+/// PM decides it is permanently busy and silently never releases the card again — a bug whose only
+/// symptom is the absence of a thing happening.
+struct SlotBusyGuard<'a>(&'a LocalSlot);
+impl Drop for SlotBusyGuard<'_> {
+    fn drop(&mut self) {
+        // Stamp BEFORE decrementing, so a reader that observes zero in-flight also observes a fresh
+        // finish time rather than the previous call's.
+        if let Ok(mut t) = self.0.last_active.lock() {
+            *t = Some(Instant::now());
+        }
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A claim on the model held by work PM has SPAWNED but which has not reached the slot yet.
+///
+/// The gap this closes is real and narrow: `send_message` spawns its follow-up jobs after the reply
+/// has returned, so between the two the slot is genuinely quiet — and a release taken in that window
+/// makes every one of those jobs cold-load. This is not a forecast that could be wrong; PM created
+/// the work it is holding the model for. Released on drop, so a job that panics or returns early
+/// cannot leave the hold behind.
+pub struct ReleaseHold(Arc<AtomicUsize>);
+
+impl Drop for ReleaseHold {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl LocalSlot {
     /// Run a FOREGROUND (chat) call with priority: signal any in-flight background call to abort,
     /// take the lane, run to completion (chat is never itself preempted). The future is awaited
@@ -464,6 +509,8 @@ impl LocalSlot {
     where
         F: std::future::Future,
     {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _busy = SlotBusyGuard(self);
         self.chat_waiting.store(true, Ordering::SeqCst);
         let _waiting = ChatWaitingGuard(&self.chat_waiting);
         // Wake a background call that is already registered on the current notify. `notify_one`
@@ -484,6 +531,8 @@ impl LocalSlot {
     where
         F: std::future::Future,
     {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _busy = SlotBusyGuard(self);
         let _lane = self.lane.lock().await;
         let notify = Arc::new(Notify::new());
         if let Ok(mut slot) = self.preempt.lock() {
@@ -501,6 +550,59 @@ impl LocalSlot {
             out = fut => SlotOutcome::Ran(out),
         }
     }
+
+    /// Run housekeeping that must not overlap an inference call, and must not be interrupted once
+    /// begun.
+    ///
+    /// Neither `run_foreground` nor `run_background` is right for an unload. Background is
+    /// preemptible, and a preemption *after* the request has gone out drops the settle wait, letting
+    /// chat start streaming against a runner that is mid-teardown — measured at ~850 ms, during which
+    /// a request re-attaches to the dying runner and gets a truncated or blank answer. Foreground
+    /// would work but signals `chat_waiting`, which makes any queued background job bail and retry
+    /// for no reason.
+    ///
+    /// So this simply takes the lane and holds it. The cost is that a chat arriving during a release
+    /// waits for it — bounded by the settle timeout, and only reachable in the seconds after a quiet
+    /// period expires. The alternative is a torn stream scored as a strike, and three of those cool
+    /// the endpoint down for chat as well, for up to five minutes. A short wait is the better trade
+    /// and it is the reason this is not preemptible.
+    pub async fn run_exclusive<F>(&self, fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _busy = SlotBusyGuard(self);
+        let _lane = self.lane.lock().await;
+        fut.await
+    }
+
+    /// Claim the model for work PM has spawned but which has not reached the lane yet. Released on
+    /// drop, so a job that panics or returns early cannot strand the claim.
+    pub fn hold(&self) -> ReleaseHold {
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        ReleaseHold(self.holds.clone())
+    }
+
+    /// Calls occupying or waiting for the lane right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Background jobs spawned but not yet at the lane.
+    pub fn holds(&self) -> usize {
+        self.holds.load(Ordering::SeqCst)
+    }
+
+    /// How long since the last call finished. `None` when none ever has.
+    ///
+    /// Deliberately says nothing about whether the slot is busy right now — `in_flight` and `holds`
+    /// are separate inputs to [`crate::residency::should_release`], and folding them in here would
+    /// make that reducer's own gates unreachable, leaving the release decision spread across two
+    /// places with the pure, tested one contributing nothing.
+    pub fn quiet_for(&self, now: Instant) -> Option<Duration> {
+        let last = (*self.last_active.lock().ok()?)?;
+        Some(now.saturating_duration_since(last))
+    }
 }
 
 // =================================================================================================
@@ -516,6 +618,44 @@ pub struct LocalRuntime {
     pub slot: LocalSlot,
     health: Mutex<HealthState>,
     windows: Mutex<std::collections::HashMap<String, (WindowInfo, Instant)>>,
+    /// The (endpoint, model) pairs PM has itself caused to be loaded.
+    ///
+    /// The scope rule for releasing: **PM only ever unloads a model PM loaded.** A model someone
+    /// started from a terminal is theirs, and a settings pane that quietly frees it is a scheduler
+    /// acting on something nobody consented to.
+    ///
+    /// In-memory, and rebuilt on every launch — which is correct rather than a limitation. The
+    /// server keeps its models loaded across PM restarts, so on launch PM has caused zero loads and
+    /// everything resident belongs to the user until PM loads it itself. Residency seen through
+    /// `/api/ps` is deliberately NOT evidence here: that route does not care who loaded a model,
+    /// which is exactly what makes it useless as a proof of ownership.
+    ///
+    /// A set rather than one entry per role, because both roles can name the same model — chat
+    /// letting go must not free what background is about to use.
+    ///
+    /// Stored as a `(base_url, model)` TUPLE rather than a joined key. The obvious
+    /// `format!("{base}::{model}")` is unrecoverable for an IPv6 endpoint, which PM explicitly
+    /// supports (`classify_ip` has loopback, ULA and link-local arms): splitting
+    /// `http://[::1]:11434::gemma3:4b` on its first `::` lands inside the address literal and yields
+    /// a base URL of `http://[`. Every release path would then silently do nothing, and only for
+    /// IPv6 — invisible to any test that does not go through the accessor.
+    pm_loaded: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Endpoints that answered an unload with "no such route".
+    ///
+    /// llama-server and LM Studio have no unload gesture at all, and neither does a proxy that
+    /// forwards only `/v1`. Without a latch the scheduler asks such a server every twenty seconds
+    /// for the life of the process — over four thousand pointless requests a day at a server that
+    /// can never satisfy one. A permanent property of the endpoint, so learning it once is enough.
+    no_unload_route: Mutex<std::collections::HashSet<String>>,
+    /// The release policy as last read from settings, with its quiet period.
+    ///
+    /// Cached because a model can be resident while the vault is LOCKED — PM loaded it, the user
+    /// locked up and walked away, and the card stays occupied. Releasing has to keep working there,
+    /// but the policy lives in an encrypted settings row that cannot be read with the vault shut. So
+    /// PM remembers the last policy it could read and keeps honouring it. Without this the feature
+    /// would quietly stop at exactly the moment someone leaves the machine — which is the moment it
+    /// is most obviously supposed to work.
+    release_policy: Mutex<Option<(crate::residency::ReleasePolicy, Duration)>>,
     last_probe: Mutex<Option<Instant>>,
     /// The RESULT of the last reachability observation, so a debounced status read can report what
     /// was actually last seen. `None` means nothing has been observed yet, which is NOT the same as
@@ -601,6 +741,77 @@ impl LocalRuntime {
     /// either, and two models on one endpoint have different windows).
     fn window_key(base_url: &str, model: &str) -> String {
         format!("{base_url}::{model}")
+    }
+
+    /// Remember the release policy, so it survives the vault being locked.
+    pub fn cache_release_policy(&self, policy: crate::residency::ReleasePolicy, idle: Duration) {
+        if let Ok(mut p) = self.release_policy.lock() {
+            *p = Some((policy, idle));
+        }
+    }
+
+    /// The last policy PM was able to read. `None` before the first successful read — and `None` is
+    /// NOT "release nothing by default": it means PM has never known the policy, so it must not act.
+    pub fn cached_release_policy(&self) -> Option<(crate::residency::ReleasePolicy, Duration)> {
+        *self.release_policy.lock().ok()?
+    }
+
+    /// Record that PM is about to put this model on the wire.
+    ///
+    /// Called BEFORE the request, deliberately. A cold load that then times out has still left the
+    /// model resident on the server, and a marker written only on success would leave PM unable to
+    /// free the very memory its own failed call reserved. The same reasoning covers a preempted
+    /// call, whose load may still complete server-side after PM dropped the request.
+    pub fn mark_pm_loaded(&self, base_url: &str, model: &str) {
+        if let Ok(mut set) = self.pm_loaded.lock() {
+            set.insert((base_url.to_string(), model.to_string()));
+        }
+    }
+
+    /// Whether PM caused this model to be loaded, and may therefore release it.
+    pub fn is_pm_loaded(&self, base_url: &str, model: &str) -> bool {
+        self.pm_loaded
+            .lock()
+            .map(|s| s.contains(&(base_url.to_string(), model.to_string())))
+            .unwrap_or(false)
+    }
+
+    /// Forget a model PM no longer owns — released by PM, or observed to have gone away by itself.
+    ///
+    /// The second case is what makes the ownership rule true rather than merely stated. A marker is
+    /// written when PM puts a model on the wire, but the model can leave without PM: Ollama evicts
+    /// under memory pressure, and a user can `ollama stop` it. If the marker outlived that, then the
+    /// next time the USER loaded that same model themselves PM would still believe it owned it — and
+    /// would unload their model out from under their terminal. Which is exactly the
+    /// acting-without-consent the rule exists to prevent, and the one failure here a user could not
+    /// recover from by noticing.
+    pub fn clear_pm_loaded(&self, base_url: &str, model: &str) {
+        if let Ok(mut set) = self.pm_loaded.lock() {
+            set.remove(&(base_url.to_string(), model.to_string()));
+        }
+    }
+
+    /// Remember that this endpoint cannot unload, so PM stops asking.
+    pub fn mark_no_unload_route(&self, base_url: &str) {
+        if let Ok(mut set) = self.no_unload_route.lock() {
+            set.insert(base_url.to_string());
+        }
+    }
+
+    /// Whether PM has learned that this endpoint has no unload route.
+    pub fn has_no_unload_route(&self, base_url: &str) -> bool {
+        self.no_unload_route
+            .lock()
+            .map(|s| s.contains(base_url))
+            .unwrap_or(false)
+    }
+
+    /// Every (endpoint, model) PM currently believes it loaded, as `(base_url, model)` pairs.
+    pub fn pm_loaded_pairs(&self) -> Vec<(String, String)> {
+        self.pm_loaded
+            .lock()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn cached_window(&self, base_url: &str, model: &str) -> Option<WindowInfo> {
@@ -1190,5 +1401,122 @@ mod tests {
             matches!(bg.await.unwrap(), SlotOutcome::Preempted),
             "the in-flight background call was preempted, its future dropped"
         );
+        // THE test for the release feature. `run_background` has three exits and the preemption arm
+        // returns from inside a `select!`, dropping the call future — so a decrement written after
+        // the select would never run for this path. A leaked count means PM believes it is
+        // permanently busy and silently never releases the graphics card again, which is a bug whose
+        // only symptom is the absence of something happening.
+        assert_eq!(
+            slot.in_flight(),
+            0,
+            "a preempted background call must still let go of the slot"
+        );
+        assert!(slot.quiet_for(Instant::now()).is_some());
+    }
+
+    #[tokio::test]
+    async fn every_way_out_of_the_slot_lets_go_of_it() {
+        use std::sync::Arc;
+        let slot = Arc::new(LocalSlot::default());
+        assert_eq!(slot.in_flight(), 0);
+        // Nothing has run, so there is no quiet period running — which is NOT a quiet period of
+        // zero, and collapsing the two would release the card before PM had ever used it.
+        assert_eq!(slot.quiet_for(Instant::now()), None);
+
+        slot.run_foreground(async { 1u8 }).await;
+        assert_eq!(slot.in_flight(), 0, "after a completed foreground call");
+
+        assert!(matches!(
+            slot.run_background(async { 2u8 }).await,
+            SlotOutcome::Ran(2)
+        ));
+        assert_eq!(slot.in_flight(), 0, "after a completed background call");
+
+        // The early bail, before the `select!` is ever reached: chat is already waiting.
+        slot.chat_waiting.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            slot.run_background(async { 3u8 }).await,
+            SlotOutcome::Preempted
+        ));
+        slot.chat_waiting.store(false, Ordering::SeqCst);
+        assert_eq!(slot.in_flight(), 0, "after the early chat-waiting bail");
+
+        // And a panic inside the call, which unwinds past every decrement that is not a guard.
+        let panicking = {
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                slot.run_foreground(async { panic!("inside the slot") })
+                    .await
+            })
+        };
+        assert!(panicking.await.is_err(), "the panic propagated");
+        assert_eq!(slot.in_flight(), 0, "after a panic inside the call");
+    }
+
+    #[test]
+    fn model_ownership_survives_an_ipv6_endpoint() {
+        // The obvious `format!("{base}::{model}")` key is unrecoverable here: splitting
+        // `http://[::1]:11434::gemma3:4b` on its FIRST `::` lands inside the address literal and
+        // yields a base URL of `http://[`. Every release path would then post to an unresolvable
+        // host and silently do nothing — for IPv6 endpoints only, which PM explicitly supports
+        // (`classify_ip` has loopback, ULA and link-local arms). Invisible to any test that does not
+        // go through the pairs accessor, which is why this one does.
+        let rt = LocalRuntime::default();
+        let v6 = "http://[::1]:11434";
+        rt.mark_pm_loaded(v6, "gemma3:4b");
+        assert!(rt.is_pm_loaded(v6, "gemma3:4b"));
+        assert_eq!(
+            rt.pm_loaded_pairs(),
+            vec![(v6.to_string(), "gemma3:4b".to_string())],
+            "the endpoint must round-trip intact, colons and all"
+        );
+
+        rt.clear_pm_loaded(v6, "gemma3:4b");
+        assert!(rt.pm_loaded_pairs().is_empty());
+    }
+
+    #[test]
+    fn an_endpoint_that_cannot_unload_is_only_asked_once() {
+        // llama-server and LM Studio have no unload route, and neither does a proxy forwarding only
+        // `/v1`. Without this latch the release scheduler posts at one every 20 s for the life of
+        // the process — over four thousand requests a day at a server that can never satisfy one.
+        let rt = LocalRuntime::default();
+        assert!(!rt.has_no_unload_route("http://127.0.0.1:8080"));
+        rt.mark_no_unload_route("http://127.0.0.1:8080");
+        assert!(rt.has_no_unload_route("http://127.0.0.1:8080"));
+        // Learned per endpoint, not globally — pointing PM at an Ollama afterwards must still work.
+        assert!(!rt.has_no_unload_route("http://127.0.0.1:11434"));
+    }
+
+    #[test]
+    fn ownership_is_never_inherited_across_a_restart() {
+        // `LocalRuntime` is rebuilt on every launch while the server keeps its models loaded across
+        // PM restarts. So on launch PM has caused zero loads and everything resident belongs to the
+        // user until PM loads it itself. A fresh runtime claiming nothing is what makes that true.
+        let rt = LocalRuntime::default();
+        assert!(rt.pm_loaded_pairs().is_empty());
+        assert!(!rt.is_pm_loaded("http://127.0.0.1:11434", "gemma3:4b"));
+    }
+
+    #[tokio::test]
+    async fn a_hold_keeps_the_model_even_while_the_slot_is_empty() {
+        use std::sync::Arc;
+        let slot = Arc::new(LocalSlot::default());
+        slot.run_foreground(async { 1u8 }).await;
+        assert!(
+            slot.quiet_for(Instant::now()).is_some(),
+            "quiet after a call"
+        );
+
+        // `send_message` spawns its follow-up jobs AFTER the reply returns, so the slot is genuinely
+        // empty in between. Releasing in that window makes all of them cold-load.
+        let hold = slot.hold();
+        assert_eq!(
+            slot.holds(),
+            1,
+            "the hold is visible to the release decision"
+        );
+        drop(hold);
+        assert_eq!(slot.holds(), 0, "and released when the job ends");
     }
 }
