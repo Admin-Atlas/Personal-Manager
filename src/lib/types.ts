@@ -1848,6 +1848,21 @@ export interface LocalOnDiskModel {
   fit: LocalFitResult;
 }
 
+/** How two models bound to the two roles behave sharing one server (fit.rs CoResidencyFit).
+ *
+ *  The question is not whether the machine will FAIL — Ollama queues and evicts rather than failing.
+ *  It is whether both stay loaded, or the server swaps between them at a few seconds a switch. */
+export interface LocalCoResidency {
+  /** Against system RAM: "fits" | "too_close" | "exceeds" | "unknown". */
+  ram: string;
+  /** Against dedicated video memory; null when memory is unified or there is no discrete card. */
+  vram: string | null;
+  /** The two footprints summed, in GB; null when either could not be sized. */
+  combined_gb: number | null;
+  ram_budget_gb: number;
+  vram_budget_gb: number | null;
+}
+
 /** A model root PM can prove is there but is not allowed to read (local_disk.rs BlockedRoot) — a
  *  packaged Linux Ollama's store, or a folder pointed at someone else's home. */
 export interface LocalBlockedRoot {
@@ -1879,6 +1894,9 @@ export interface LocalRecommendations {
   /** How many models the endpoint answered with; null when nothing answered (not configured,
    *  unreachable, or refused). `0` — a running server with nothing pulled — is a different state. */
   endpoint_inventory: number | null;
+  /** The two role models weighed against this machine together; null when only one model is in play
+   *  (a role on cloud, a role unbound, or the same model on both). */
+  co_residency: LocalCoResidency | null;
   /** How many models the crawl found on disk BEFORE the already-served ones were removed. Separates
    *  "no model folder here" from "a folder, with nothing downloaded in it". */
   disk_found: number;

@@ -995,12 +995,19 @@ pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit
         .entries
         .iter()
         .filter(|e| e.fit == local_catalog::FitClass::Computed)
-        .map(|e| better_fit::Candidate {
-            repo: e.repo.clone(),
-            display_name: e.display_name.clone(),
-            parameters_b: e.parameters_b,
-            verdict: fit::fit(&local_catalog::entry_to_spec(e), &fit_hw).verdict,
-            on_disk: on_disk.iter().any(|r| r == &e.repo),
+        .map(|e| {
+            // The whole result now, not just its verdict: the joint check below needs the footprint,
+            // and throwing it away here is what made "does this still fit beside the other role's
+            // model?" unanswerable.
+            let f = fit::fit(&local_catalog::entry_to_spec(e), &fit_hw);
+            better_fit::Candidate {
+                repo: e.repo.clone(),
+                display_name: e.display_name.clone(),
+                parameters_b: e.parameters_b,
+                verdict: f.verdict,
+                footprint_gb: f.est_memory_gb,
+                on_disk: on_disk.iter().any(|r| r == &e.repo),
+            }
         })
         .collect();
 
@@ -1014,10 +1021,27 @@ pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit
         .filter_map(|repo| candidates.iter().find(|c| c.repo == repo).cloned())
         .collect();
 
-    Ok(better_fit::suggest(
-        better_fit::baseline(assigned.iter()),
-        &candidates,
-    ))
+    let current = better_fit::baseline(assigned.iter());
+    // What a suggestion has to share the machine with: the model on the role `baseline` did NOT
+    // pick, which it otherwise drops on the floor. Without this PM can talk someone into a model
+    // that fits only if the machine is holding nothing else — manufacturing the very swapping the
+    // co-residency line beside it was added to describe.
+    //
+    // Both sides come from the catalogue scoring, so they are compared like with like. That does
+    // over-state the model the user already has (the catalogue picks the best quant that fits, not
+    // the file they downloaded), which can suppress a suggestion that would in fact have fitted.
+    // That is the safe direction for something PM volunteers unprompted.
+    let beside = current.and_then(|cur| {
+        assigned
+            .iter()
+            .find(|c| c.repo != cur.repo)
+            .and_then(|other| other.footprint_gb)
+            .map(|footprint_gb| better_fit::Beside {
+                footprint_gb,
+                budget_gb: fit::ram_budget_gb(&fit_hw),
+            })
+    });
+    Ok(better_fit::suggest(current, &candidates, beside))
 }
 
 /// Acknowledge the better-fit notice: record that the user has seen this catalog's evaluation, which
@@ -1169,28 +1193,32 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     // to accept — so this needs no second request.
     let mut endpoint_answered = false;
     if let Endpoint::Ready(base_url, token) = endpoint {
-        if let Ok(models) =
-            openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose())).await
-        {
+        let tok = token.as_ref().map(|s| s.expose());
+        // The real byte size of every model in the store. `None` for anything that is not an Ollama;
+        // those fall back to the catalogue estimate, which is all PM ever had.
+        let tags = openai_compat::ollama_tags(&base_url, tok).await;
+        if let Ok(models) = openai_compat::probe(&base_url, tok).await {
             endpoint_answered = true;
             for id in models {
-                let (matched_repo, fit_result) = match local_catalog::match_installed(&id) {
-                    Some(entry) => (
-                        Some(entry.repo.clone()),
-                        fit::fit(&local_catalog::entry_to_spec(entry), &fit_hw),
-                    ),
-                    None => (
-                        None,
-                        fit::unknown(
-                            "This model isn't in PM's catalog, so its fit can't be estimated."
-                                .to_string(),
-                        ),
-                    ),
-                };
+                let entry = local_catalog::match_installed(&id);
+                // The window the server actually loaded it with, when it has been observed. Only a
+                // PROVEN reading is used: an unproven one is either PM's own floor or the model's
+                // trained capacity, and substituting either for the catalogue's figure would trade
+                // one guess for another while looking like a measurement.
+                let served_ctx = app
+                    .state::<AppState>()
+                    .local_ai
+                    .cached_window(&base_url, &id)
+                    .filter(|w| w.source.is_proven())
+                    .map(|w| w.tokens);
+                let tag = tags
+                    .iter()
+                    .flatten()
+                    .find(|t| t.name.eq_ignore_ascii_case(&id));
                 installed.push(InstalledModel {
                     id,
-                    matched_repo,
-                    fit: fit_result,
+                    matched_repo: entry.map(|e| e.repo.clone()),
+                    fit: score_served(entry, tag, served_ctx, &fit_hw),
                 });
             }
         }
@@ -1257,6 +1285,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
 
     // Bound before the payload moves `installed`.
     let endpoint_inventory = endpoint_answered.then_some(installed.len());
+    let co_residency = assigned_co_residency(&app, &installed, &fit_hw)?;
 
     Ok(Recommendations {
         hardware,
@@ -1276,10 +1305,71 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         // it cannot answer "is there anything downloaded here at all".
         disk_found: disk.models.len(),
         endpoint_inventory,
+        co_residency,
         disk_truncated: disk.truncated,
         scan_dir: scan_dir_setting(&app),
         terms_accepted,
     })
+}
+
+/// Weigh the two models the roles are actually bound to against this one machine (#786 item 6).
+///
+/// `None` — not a verdict, an absence of a question — whenever there is only one model in play: a
+/// role on cloud, a role with nothing picked, or the same model on both. One server holding one
+/// model costs exactly what the Workbench already said it would, and a co-residency line there would
+/// be noise on the commonest setup of all.
+///
+/// Scored from `installed`, so the sum is of the very numbers those cards displayed and cannot
+/// contradict them. A model the endpoint serves but PM could not size carries `Verdict::Unknown`
+/// through to an `Unknown` verdict rather than a sum with a hole in it.
+fn assigned_co_residency(
+    app: &AppHandle,
+    installed: &[InstalledModel],
+    fit_hw: &fit::FitHardware,
+) -> Result<Option<fit::CoResidencyFit>> {
+    let (chat, background) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        (
+            role_local_model(
+                db::get_setting(&conn, CHAT_ROUTING_KEY)?.as_deref(),
+                db::get_setting(&conn, LOCAL_CHAT_MODEL_KEY)?.as_deref(),
+            ),
+            role_local_model(
+                db::get_setting(&conn, BACKGROUND_ROUTING_KEY)?.as_deref(),
+                db::get_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?.as_deref(),
+            ),
+        )
+    };
+    Ok(co_residency_for_roles(
+        chat.as_deref(),
+        background.as_deref(),
+        installed,
+        fit_hw,
+    ))
+}
+
+/// The co-residency verdict for two role bindings, or `None` when there is no question to ask.
+///
+/// Pure, and split out from the settings read for exactly that reason: every "no question" case is a
+/// decision worth pinning, and each of them is a case where a warning would be actively wrong rather
+/// than merely unhelpful.
+fn co_residency_for_roles(
+    chat: Option<&str>,
+    background: Option<&str>,
+    installed: &[InstalledModel],
+    fit_hw: &fit::FitHardware,
+) -> Option<fit::CoResidencyFit> {
+    let (chat, background) = (chat?, background?);
+    if chat.eq_ignore_ascii_case(background) {
+        return None;
+    }
+    let find = |id: &str| installed.iter().find(|m| m.id.eq_ignore_ascii_case(id));
+    // A role bound to something the endpoint is not serving is already its own visible problem — the
+    // model cannot answer at all — and inventing a memory verdict about a model that is not there
+    // would be a second, quieter wrong answer on top of it.
+    let (a, b) = (find(chat)?, find(background)?);
+    Some(fit::co_residency(&a.fit, &b.fit, fit_hw))
 }
 
 /// The licence ids the user has accepted, as stored. Empty when the setting has never been written.
@@ -1398,6 +1488,77 @@ fn safe_quant_label(label: &str) -> Option<String> {
         .take(24)
         .collect();
     (!cleaned.is_empty()).then(|| cleaned.to_ascii_uppercase())
+}
+
+/// Score a model the endpoint is actually SERVING, using what the server will tell us about it.
+///
+/// The difference from `fit::fit` on the catalogue entry is the whole point, and it is not a
+/// refinement. `fit` picks the best quantization that FITS THE BUDGET — right advice for a model you
+/// have not downloaded, and fiction for one you already have. Measured 30-08-2026: PM scored a served
+/// Qwen2.5-7B as Q8_0 at 10.04 GB against the user's real Q5_K_M file of 5.44 GB, and a served
+/// gemma-3-4b at 9.21 GB against a real 3.34 GB. The error also moved the wrong way — a bigger budget
+/// lets `fit` reach a higher quant, so FREEING memory made PM's estimate of an unchanged file grow.
+///
+/// Two measurements replace two guesses whenever the server supplies them:
+///
+///   * **The file's real byte size**, from `/api/tags`. That figure is the manifest total — weights
+///     plus any projector — so it goes into the weight term with the projector explicitly zeroed,
+///     never added to a separate projector figure. Getting that backwards is the double-count #588
+///     fixed.
+///   * **The context the server actually loaded it with**, instead of the model's TRAINED capacity.
+///     Not a nicety: gemma-3-4b trains at 131072, so the catalogue's KV term for it is 4.07 GB —
+///     44% of the entire estimate — for a window the server was never serving. #792 already ruled
+///     that number unusable for the context meter, and it was still driving the memory estimate.
+///
+/// Falls back to the catalogue spec whenever either measurement is missing, which is exactly the
+/// behaviour that shipped before this — never worse, and better wherever the server answers.
+fn score_served(
+    entry: Option<&local_catalog::CatalogEntry>,
+    tag: Option<&openai_compat::OllamaTag>,
+    served_ctx: Option<u32>,
+    hw: &fit::FitHardware,
+) -> fit::FitResult {
+    let Some(entry) = entry else {
+        return fit::unknown(
+            "This model isn't in PM's catalog, so its fit can't be estimated.".to_string(),
+        );
+    };
+    let mut spec = local_catalog::entry_to_spec(entry);
+    if let Some(ctx) = served_ctx {
+        spec.target_context = ctx;
+    }
+    // Both, or neither. A measured size with no quantization label cannot be made into a candidate —
+    // `bytes_per_param` drives the throughput term — and pinning the weight while inventing a quant
+    // would put a made-up number beside a measured one.
+    if let (Some(tag), Some(quant)) = (tag, tag.and_then(served_quant)) {
+        if tag.size_bytes > 0 {
+            spec.candidates = vec![fit::QuantCandidate {
+                quant,
+                weight_gb: bytes_to_gb(tag.size_bytes),
+            }];
+            // The tag's size is the manifest TOTAL, so the projector is already inside the weight
+            // term. `Some(0.0)` is a measurement here ("nothing further to add"), not a gap.
+            spec.projector_gb = Some(0.0);
+        }
+    }
+    fit::fit(&spec, hw)
+}
+
+/// The quantization of a served model: what the server says, else what its own tag says.
+///
+/// Ollama reports `"unknown"` for some repos even when the tag it was pulled under names the quant
+/// outright (`hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M`), so the tag suffix is a real second source
+/// rather than a guess — it is the string the user typed to fetch that exact file.
+fn served_quant(tag: &openai_compat::OllamaTag) -> Option<fit::Quant> {
+    tag.quant
+        .as_deref()
+        .and_then(fit::Quant::from_label)
+        .or_else(|| tag.name.rsplit(':').next().and_then(fit::Quant::from_label))
+}
+
+/// Billions-of-bytes GB, matching every other size in this feature.
+fn bytes_to_gb(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
 }
 
 fn score_on_disk(
@@ -1652,6 +1813,12 @@ pub struct Recommendations {
     /// carries the whole store — and unlike Ollama's native `/api/tags` it also answers for
     /// llama-server and LM Studio, and survives a proxy that only forwards `/v1`.
     pub endpoint_inventory: Option<usize>,
+    /// The two role models weighed against this machine together, or `None` when only one model is
+    /// in play (a role on cloud, a role unbound, or the same model on both).
+    ///
+    /// Here rather than on a catalogue card because a card is about ONE model and has no idea what
+    /// the other role holds.
+    pub co_residency: Option<fit::CoResidencyFit>,
     /// The crawl hit its bound, so `on_disk` is a prefix rather than everything on disk.
     pub disk_truncated: bool,
     /// The extra folder the crawl includes, when one is set.
@@ -1843,6 +2010,129 @@ mod tests {
         assert_eq!(safe_quant_label("   "), None);
         assert_eq!(safe_quant_label(""), None);
         assert_eq!(safe_quant_label("//"), None);
+    }
+
+    fn installed_model(id: &str, gb: f64) -> InstalledModel {
+        InstalledModel {
+            id: id.to_string(),
+            matched_repo: None,
+            fit: fit::FitResult {
+                verdict: fit::Verdict::Comfortable,
+                quant: Some(fit::Quant::Q4_K_M),
+                context: Some(32768),
+                kv: fit::KvCache::F16,
+                est_memory_gb: Some(gb),
+                est_tokens_per_sec: Some(30.0),
+                notes: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn a_served_model_is_scored_on_the_file_the_user_actually_has() {
+        // The defect this closes, with the real numbers that exposed it. PM scored a model the
+        // endpoint was SERVING with `fit::fit`, which picks the best quantization that fits the
+        // budget — right advice for something you have not downloaded, fiction for something already
+        // on your disk. On a 17.3 GB / 8 GB-card laptop it believed a served Qwen2.5-7B was Q8_0 at
+        // 10.04 GB while the actual file was Q5_K_M at 5.44 GB, and a served gemma-3-4b was 9.21 GB
+        // against a real 3.34 GB. Summed for a co-residency warning that is 19.25 GB of fiction.
+        let hw = fit::FitHardware {
+            available_ram_gb: 17.3,
+            vram_gb: Some(8.0),
+            gpu_bandwidth_gbps: None,
+            unified_memory: false,
+        };
+        let cat = local_catalog::catalog();
+        let qwen = cat
+            .entries
+            .iter()
+            .find(|e| e.repo.contains("Qwen2.5-7B-Instruct"))
+            .expect("catalogue entry");
+
+        // What shipped: the catalogue's best-fitting quant, not the user's file.
+        let guessed = score_served(Some(qwen), None, None, &hw);
+        assert_eq!(guessed.quant, Some(fit::Quant::Q8_0));
+
+        // With the server's own answer — 5.44 GB of Q5_K_M, loaded at the 32768 it really serves.
+        let tag = openai_compat::OllamaTag {
+            name: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M".to_string(),
+            size_bytes: 5_444_833_987,
+            quant: Some("Q5_K_M".to_string()),
+        };
+        let real = score_served(Some(qwen), Some(&tag), Some(32768), &hw);
+        assert_eq!(real.quant, Some(fit::Quant::Q5_K_M));
+        let est = real.est_memory_gb.expect("a measured file has a footprint");
+        assert!(
+            est < guessed.est_memory_gb.unwrap(),
+            "the measured file must not cost more than the guess it replaces: {est}"
+        );
+        // Measured resident on that machine: 6.41 GB. The estimate must stay ABOVE it — the fit
+        // bar is "never under" — while being far closer than the 10.04 GB it replaces.
+        assert!(
+            (6.41..8.5).contains(&est),
+            "estimate should sit just above the 6.41 GB measured, got {est}"
+        );
+    }
+
+    #[test]
+    fn a_quantization_the_server_would_not_name_is_read_off_the_tag_it_was_pulled_under() {
+        // Ollama reports `"unknown"` for some repos while the tag names the quant outright. That is
+        // a real second source, not a guess: it is the string the user typed to fetch this exact
+        // file. Measured on a live server for `hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M`.
+        let tag = openai_compat::OllamaTag {
+            name: "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M".to_string(),
+            size_bytes: 3_341_010_115,
+            quant: None,
+        };
+        assert_eq!(served_quant(&tag), Some(fit::Quant::Q4_K_M));
+
+        // What the server says still wins when it says anything at all.
+        let named = openai_compat::OllamaTag {
+            quant: Some("Q5_K_M".to_string()),
+            ..tag.clone()
+        };
+        assert_eq!(served_quant(&named), Some(fit::Quant::Q5_K_M));
+
+        // And a tag that names nothing usable stays unknown rather than being invented.
+        let bare = openai_compat::OllamaTag {
+            name: "llama3.2:latest".to_string(),
+            quant: None,
+            ..tag
+        };
+        assert_eq!(served_quant(&bare), None);
+    }
+
+    #[test]
+    fn co_residency_is_asked_only_when_two_different_models_are_really_in_play() {
+        // Each of these is a case where a warning would be WRONG, not merely unhelpful — which is why
+        // the absence is `None` (no question) rather than a verdict meaning "fine".
+        let hw = fit::FitHardware {
+            available_ram_gb: 32.0,
+            vram_gb: None,
+            gpu_bandwidth_gbps: None,
+            unified_memory: false,
+        };
+        let served = [
+            installed_model("chat-model", 6.0),
+            installed_model("bg-model", 6.0),
+        ];
+
+        // A role on cloud: one model on this machine, costing exactly what its card said.
+        assert!(co_residency_for_roles(Some("chat-model"), None, &served, &hw).is_none());
+        assert!(co_residency_for_roles(None, Some("bg-model"), &served, &hw).is_none());
+        // The same model on both roles: one resident model, nothing to add up. The commonest setup
+        // of all, and the one a permanently-on warning trained people to ignore.
+        assert!(
+            co_residency_for_roles(Some("chat-model"), Some("CHAT-MODEL"), &served, &hw).is_none()
+        );
+        // A role bound to something the endpoint is not serving.
+        assert!(co_residency_for_roles(Some("chat-model"), Some("absent"), &served, &hw).is_none());
+
+        // Two different served models — the one case where the choices interact.
+        let out = co_residency_for_roles(Some("chat-model"), Some("bg-model"), &served, &hw)
+            .expect("two different served models is a real question");
+        assert_eq!(out.combined_gb, Some(12.0));
+        assert_eq!(out.ram, fit::CoResidency::Fits);
     }
 
     #[test]
