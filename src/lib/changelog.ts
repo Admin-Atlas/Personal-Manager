@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.134.0-alpha",
+    date: "2026-08-30",
+    highlights: [
+      "PM stopped guessing at the size of models you have already downloaded. When you point it at a local server, it now asks that server how big each model actually is, instead of working out which version of that model your machine could best run. Those are very different numbers: on one real setup PM believed a model on disk needed 10 GB when the file was 5.4 GB, and another needed 9.2 GB when it was 3.3 GB. The guess also drifted the wrong way \u2014 free up memory and PM would decide your unchanged file had somehow got bigger. It reads the context length your server really loaded a model with too, rather than the largest that model was ever trained for, which on some models was nearly half the estimate on its own.",
+      "And the warning about running two different models has been replaced with something true. It used to appear whenever Chat and Background were set to different models, in the same quiet grey as everything else, saying they might not fit together \u2014 which is not what happens. Your server keeps one model in memory at a time and swaps when the other is needed, so nothing breaks; you just wait a few seconds each time it switches. PM now works out whether both would actually fit, stays silent when they do, says plainly when they won\u2019t and what that costs you, and admits when the two are too close for it to call. It also stopped suggesting you upgrade to a model that would only fit if your other role were empty.",
+    ],
+  },
+  {
     version: "3.133.1-alpha",
     date: "2026-08-30",
     highlights: [

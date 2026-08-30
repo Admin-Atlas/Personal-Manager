@@ -379,8 +379,14 @@ fn context_ladder(target: u32) -> Vec<u32> {
 /// A thin wrapper over [`fit_within`] with the RAM budget; behaviour is unchanged from before the
 /// two-budget split (pinned by `fit_within_reproduces_fit_for_the_ram_budget`).
 pub fn fit(spec: &ModelSpec, hw: &FitHardware) -> FitResult {
-    let budget = (hw.available_ram_gb - PM_RESERVE_GB).max(0.0);
-    fit_within(spec, budget, hw)
+    fit_within(spec, ram_budget_gb(hw), hw)
+}
+
+/// The system-RAM a model is scored against: free RAM less the reserve, floored at zero. One
+/// definition, so a caller weighing two models against this budget cannot drift from the one a
+/// single model's verdict was computed with.
+pub fn ram_budget_gb(hw: &FitHardware) -> f64 {
+    (hw.available_ram_gb - PM_RESERVE_GB).max(0.0)
 }
 
 /// Score one model against an explicit memory `budget_gb`, reusing one degradation ladder. `fit()`
@@ -562,6 +568,115 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+// --- two models on one machine (#786 item 6) ----------------------------------------------------
+
+/// The memory estimate's own stated tolerance (DECISIONS.md ±15%), measured at +11.3% against a real
+/// load on real hardware. A combined figure that overshoots a budget by less than this is inside PM's
+/// own error bar, and PM has to say so rather than pick a side it cannot defend.
+///
+/// The asymmetry is deliberate and it is the whole reason this band exists. The estimate runs HIGH,
+/// so "these fit" is the safe verdict — if the over-estimate fits, the real thing fits. "These will
+/// not both stay loaded" is the one that can be wrong about a setup that works, and a confident wrong
+/// warning is worse than the vague prose it replaces.
+const ESTIMATE_TOLERANCE: f64 = 0.15;
+
+/// How two models bound to the two roles behave when they share one server.
+///
+/// The question is NOT whether the machine will fail. Ollama's own FAQ is explicit that it does not:
+/// when a new model will not fit beside a loaded one, "all new requests will be queued until the new
+/// model can be loaded. As prior models become idle, one or more will be unloaded to make room". So
+/// the outcome of exceeding the budget is eviction and reloading, not a crash — every alternation
+/// between the chat role and the background role paying an unload plus a cold load (measured at
+/// 2.6-4.2 s on a laptop GPU, 30-08-2026). That compounds against the flat 180 s background timeout
+/// whose third strike cools the endpoint down for chat as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoResidency {
+    /// Both stay loaded together, with the estimate on the safe side of the budget.
+    Fits,
+    /// The sum lands inside the estimate's own error band. PM cannot honestly call it either way.
+    TooClose,
+    /// They will not both stay loaded, so the server will swap between them.
+    Exceeds,
+    /// At least one of them could not be sized, so there is no sum to take. Never guessed.
+    Unknown,
+}
+
+/// Two models weighed against one machine, on both budgets that can bind.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CoResidencyFit {
+    /// Against system RAM.
+    pub ram: CoResidency,
+    /// Against dedicated video memory. `None` when memory is unified or there is no discrete card —
+    /// there is then no separate graphics-memory question, mirroring [`gpu_fit`]'s own guards.
+    pub vram: Option<CoResidency>,
+    /// The two footprints summed, in GB. `None` when either could not be sized.
+    pub combined_gb: Option<f64>,
+    pub ram_budget_gb: f64,
+    pub vram_budget_gb: Option<f64>,
+}
+
+/// Weigh two models against one machine.
+///
+/// The sum is of `est_memory_gb` — the very numbers the two cards displayed — so this can never
+/// contradict what the user was already shown. It composes exactly, which is not an accident of this
+/// function but a property of [`footprint_gb`]: `OVERHEAD_GB` is per-model runtime cost (compute
+/// buffers, the graph), so charging it twice for two models is correct rather than a double count,
+/// while both reserves are subtracted from the BUDGET and never added to a footprint — so summing two
+/// footprints against one budget charges each reserve exactly once.
+///
+/// A model PM could not size, or one it already told you to keep on the cloud, yields `Unknown`
+/// rather than a sum with a hole in it.
+pub fn co_residency(a: &FitResult, b: &FitResult, hw: &FitHardware) -> CoResidencyFit {
+    let ram_budget = ram_budget_gb(hw);
+    // No discrete-GPU question when the card shares the RAM pool, or when there is no card figure —
+    // the same two guards `gpu_fit` opens with, for the same reasons.
+    let vram_budget = (!hw.unified_memory)
+        .then_some(hw.vram_gb)
+        .flatten()
+        .map(|v| (v - GPU_RESERVE_GB).max(0.0));
+
+    let (Some(fa), Some(fb)) = (sizable_footprint(a), sizable_footprint(b)) else {
+        return CoResidencyFit {
+            ram: CoResidency::Unknown,
+            vram: vram_budget.map(|_| CoResidency::Unknown),
+            combined_gb: None,
+            ram_budget_gb: ram_budget,
+            vram_budget_gb: vram_budget,
+        };
+    };
+    let combined = fa + fb;
+    CoResidencyFit {
+        ram: classify_combined(combined, ram_budget),
+        vram: vram_budget.map(|b| classify_combined(combined, b)),
+        combined_gb: Some(combined),
+        ram_budget_gb: ram_budget,
+        vram_budget_gb: vram_budget,
+    }
+}
+
+/// The footprint to charge for one model, or `None` when there is no honest number.
+///
+/// `StayOnCloud` is excluded as well as `Unknown`: PM has already said not to run that one locally, so
+/// adding it into a co-residency sum would produce a second warning about a decision the user has
+/// been told not to make.
+fn sizable_footprint(f: &FitResult) -> Option<f64> {
+    match f.verdict {
+        Verdict::Unknown | Verdict::StayOnCloud => None,
+        _ => f.est_memory_gb,
+    }
+}
+
+fn classify_combined(combined_gb: f64, budget_gb: f64) -> CoResidency {
+    if combined_gb <= budget_gb {
+        CoResidency::Fits
+    } else if combined_gb <= budget_gb * (1.0 + ESTIMATE_TOLERANCE) {
+        CoResidency::TooClose
+    } else {
+        CoResidency::Exceeds
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +714,106 @@ mod tests {
             gpu_bandwidth_gbps: None,
             unified_memory: false,
         }
+    }
+
+    // --- two models on one machine (#786 item 6) -------------------------------------------------
+
+    /// A fit with a known footprint, for the co-residency sums. The verdict only has to be one the
+    /// sum is allowed to use.
+    fn sized(gb: f64) -> FitResult {
+        FitResult {
+            verdict: Verdict::Comfortable,
+            quant: Some(Quant::Q4_K_M),
+            context: Some(32768),
+            kv: KvCache::F16,
+            est_memory_gb: Some(gb),
+            est_tokens_per_sec: Some(30.0),
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn two_models_are_weighed_against_one_budget_with_the_reserve_charged_once() {
+        // The composition this whole feature rests on. 16 GB free, PM_RESERVE_GB=2 → a 14 GB budget.
+        // Two 6 GB models sum to 12 and fit; the reserve must not be subtracted twice, which would
+        // leave 12 and make the same pair look impossible.
+        let hw = ram(16.0);
+        let both = co_residency(&sized(6.0), &sized(6.0), &hw);
+        assert!(
+            (both.ram_budget_gb - 14.0).abs() < EPS,
+            "reserve charged once"
+        );
+        assert_eq!(both.combined_gb, Some(12.0));
+        assert_eq!(both.ram, CoResidency::Fits);
+    }
+
+    #[test]
+    fn a_pair_that_overshoots_by_more_than_the_estimates_own_error_is_called() {
+        // 14 GB budget. 16.2 GB is 15.7% over — outside the +-15% the memory estimate is allowed.
+        let hw = ram(16.0);
+        assert_eq!(
+            co_residency(&sized(8.1), &sized(8.1), &hw).ram,
+            CoResidency::Exceeds
+        );
+    }
+
+    #[test]
+    fn a_pair_inside_the_estimates_error_bar_is_not_called_either_way() {
+        // 14 GB budget, 15 GB combined: over, but only by 7%. PM's own memory estimate ran +11.3%
+        // against a real load, so a confident "these will not both stay loaded" here would be a
+        // claim the estimator cannot support. The band exists so PM says so instead of picking.
+        let hw = ram(16.0);
+        assert_eq!(
+            co_residency(&sized(7.5), &sized(7.5), &hw).ram,
+            CoResidency::TooClose
+        );
+    }
+
+    #[test]
+    fn a_model_that_could_not_be_sized_yields_no_sum_at_all() {
+        // Never a sum with a hole in it. `StayOnCloud` is excluded alongside `Unknown`: PM has
+        // already told the user not to run that one locally, and a second warning about a decision
+        // they were told not to make is noise.
+        let hw = ram(16.0);
+        for verdict in [Verdict::Unknown, Verdict::StayOnCloud] {
+            let mut bad = sized(6.0);
+            bad.verdict = verdict;
+            let out = co_residency(&sized(6.0), &bad, &hw);
+            assert_eq!(out.ram, CoResidency::Unknown, "{verdict:?}");
+            assert_eq!(out.combined_gb, None, "{verdict:?}");
+        }
+    }
+
+    #[test]
+    fn the_graphics_memory_question_is_asked_only_where_there_is_one() {
+        // Mirrors `gpu_fit`'s own two guards. Unified memory means VRAM is a slice of the same pool
+        // already counted in the RAM budget, and no card figure means nothing to size against —
+        // asking either way would invent a second budget that does not exist.
+        let mut unified = gpu(16.0, 8.0);
+        unified.unified_memory = true;
+        assert_eq!(co_residency(&sized(3.0), &sized(3.0), &unified).vram, None);
+        assert_eq!(
+            co_residency(&sized(3.0), &sized(3.0), &ram(16.0)).vram,
+            None
+        );
+
+        // 8 GB card, GPU_RESERVE_GB=1 → a 7 GB budget. Two 3 GB models fit on the card; two 5 GB
+        // ones do not, while both pairs still fit in system RAM. The two budgets must be able to
+        // disagree, because that disagreement IS the finding: they stay loaded, just not on the GPU.
+        let hw = gpu(32.0, 8.0);
+        let small = co_residency(&sized(3.0), &sized(3.0), &hw);
+        assert!((small.vram_budget_gb.unwrap() - 7.0).abs() < EPS);
+        assert_eq!(small.vram, Some(CoResidency::Fits));
+        let big = co_residency(&sized(5.0), &sized(5.0), &hw);
+        assert_eq!(big.ram, CoResidency::Fits);
+        assert_eq!(big.vram, Some(CoResidency::Exceeds));
+    }
+
+    #[test]
+    fn a_machine_with_less_memory_than_the_reserve_gets_a_zero_budget_not_a_negative_one() {
+        let out = co_residency(&sized(1.0), &sized(1.0), &ram(1.0));
+        assert_eq!(out.ram_budget_gb, 0.0);
+        assert_eq!(out.ram, CoResidency::Exceeds);
     }
 
     #[test]

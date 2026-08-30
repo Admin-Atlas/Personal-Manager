@@ -41,6 +41,25 @@ pub struct Candidate {
     /// Already downloaded to this machine (#449) — the strongest kind of suggestion, since acting on
     /// it costs nothing.
     pub on_disk: bool,
+    /// What it would occupy, from its own `FitResult`. `None` when it could not be sized — which
+    /// [`is_runnable`] already excludes, so in practice this is `Some` for anything that survives to
+    /// the joint check.
+    pub footprint_gb: Option<f64>,
+}
+
+/// What a suggestion has to share the machine with.
+///
+/// [`baseline`] picks the LARGER of the two assigned models and drops the other on the floor, so
+/// without this a candidate is scored against the whole budget as though it were alone — and PM's own
+/// nudge could talk someone into exactly the model-swapping the co-residency warning was added to
+/// tell them about. That is the bug this type exists to close, not a readout.
+#[derive(Debug, Clone, Copy)]
+pub struct Beside {
+    /// The footprint of the model on the role `baseline` did not pick.
+    pub footprint_gb: f64,
+    /// The budget the pair has to fit inside — [`fit::ram_budget_gb`], the same one the candidate's
+    /// own verdict was computed against.
+    pub budget_gb: f64,
 }
 
 /// The suggestion to surface, if there is one worth making.
@@ -68,7 +87,11 @@ pub fn baseline<'a>(assigned: impl IntoIterator<Item = &'a Candidate>) -> Option
 /// `candidates` is every scored curated model; the caller marks the ones already on disk. Ties break
 /// toward a model already downloaded, then toward the larger one, then by repo so the choice is
 /// stable across calls (a suggestion that flickers between two equals is its own kind of noise).
-pub fn suggest(current: Option<&Candidate>, candidates: &[Candidate]) -> Option<Suggestion> {
+pub fn suggest(
+    current: Option<&Candidate>,
+    candidates: &[Candidate],
+    beside: Option<Beside>,
+) -> Option<Suggestion> {
     let current = current?;
     // A baseline we couldn't score is not a baseline — no honest comparison exists.
     if !is_runnable(current.verdict) {
@@ -82,6 +105,7 @@ pub fn suggest(current: Option<&Candidate>, candidates: &[Candidate]) -> Option<
         // context is not an upgrade.
         .filter(|c| rank(c.verdict) <= rank(current.verdict))
         .filter(|c| c.parameters_b >= current.parameters_b * MIN_IMPROVEMENT)
+        .filter(|c| fits_beside(c, beside))
         .max_by(|a, b| {
             a.on_disk
                 .cmp(&b.on_disk)
@@ -94,6 +118,22 @@ pub fn suggest(current: Option<&Candidate>, candidates: &[Candidate]) -> Option<
             replaces: current.display_name.clone(),
             already_downloaded: best.on_disk,
         })
+}
+
+/// Whether a candidate still fits once the OTHER role's model is on the machine too.
+///
+/// `None` disables the check — one role on cloud, or both roles on the same model, so there is no
+/// second footprint to make room for. A candidate PM could not size is REJECTED rather than waved
+/// through: it cannot be shown to fit, and a suggestion is something PM volunteers unprompted, so
+/// silence is the safe default. Strict, with no tolerance band, for the same reason — the band in
+/// `fit::co_residency` exists so a WARNING is not over-confident, while here the conservative move is
+/// to keep quiet.
+fn fits_beside(c: &Candidate, beside: Option<Beside>) -> bool {
+    let Some(beside) = beside else {
+        return true;
+    };
+    c.footprint_gb
+        .is_some_and(|f| f + beside.footprint_gb <= beside.budget_gb)
 }
 
 /// Whether a verdict describes a model this machine can actually run well. `HalvedContext` is
@@ -124,6 +164,10 @@ mod tests {
             parameters_b: params,
             verdict,
             on_disk,
+            // Roughly a byte per param at Q8, which is only ever compared against a budget the test
+            // chooses — the joint check is what it exists for, and every other test disables that
+            // check by passing `None`.
+            footprint_gb: Some(params),
         }
     }
 
@@ -131,7 +175,7 @@ mod tests {
     fn nothing_is_suggested_without_a_model_to_improve_on() {
         let pool = vec![cand("big", 70.0, fit::Verdict::Comfortable, false)];
         // Pitching local AI at someone who hasn't set it up is a different feature.
-        assert_eq!(suggest(None, &pool), None);
+        assert_eq!(suggest(None, &pool, None), None);
     }
 
     #[test]
@@ -141,7 +185,7 @@ mod tests {
             cand("small", 7.0, fit::Verdict::Comfortable, false),
             cand("mid", 14.0, fit::Verdict::Comfortable, false),
         ];
-        let s = suggest(Some(&current), &pool).unwrap();
+        let s = suggest(Some(&current), &pool, None).unwrap();
         assert_eq!(s.repo, "mid");
         assert_eq!(s.replaces, "small");
         assert!(!s.already_downloaded);
@@ -153,10 +197,10 @@ mod tests {
         // ignore the notice entirely.
         let current = cand("seven", 7.0, fit::Verdict::Comfortable, false);
         let pool = vec![cand("eight", 8.0, fit::Verdict::Comfortable, false)];
-        assert_eq!(suggest(Some(&current), &pool), None);
+        assert_eq!(suggest(Some(&current), &pool, None), None);
         // 7B → 14B is a real step up.
         let pool = vec![cand("fourteen", 14.0, fit::Verdict::Comfortable, false)];
-        assert!(suggest(Some(&current), &pool).is_some());
+        assert!(suggest(Some(&current), &pool, None).is_some());
     }
 
     #[test]
@@ -168,13 +212,13 @@ mod tests {
             cand("cloud", 70.0, fit::Verdict::StayOnCloud, false),
             cand("unknown", 70.0, fit::Verdict::Unknown, false),
         ];
-        assert_eq!(suggest(Some(&current), &pool), None);
+        assert_eq!(suggest(Some(&current), &pool, None), None);
 
         // A tight fit is still a fit — but only when the current model isn't already comfortable.
         let tight_current = cand("small", 7.0, fit::Verdict::Tight, false);
         let pool = vec![cand("bigger", 14.0, fit::Verdict::Tight, false)];
-        assert!(suggest(Some(&tight_current), &pool).is_some());
-        assert_eq!(suggest(Some(&current), &pool), None);
+        assert!(suggest(Some(&tight_current), &pool, None).is_some());
+        assert_eq!(suggest(Some(&current), &pool, None), None);
     }
 
     #[test]
@@ -189,7 +233,7 @@ mod tests {
                 false,
             ),
         ];
-        let s = suggest(Some(&current), &pool).unwrap();
+        let s = suggest(Some(&current), &pool, None).unwrap();
         assert_eq!(s.repo, "downloaded");
         assert!(s.already_downloaded, "costs the user nothing to act on");
     }
@@ -198,7 +242,7 @@ mod tests {
     fn the_current_model_is_never_suggested_back_to_itself() {
         let current = cand("same", 14.0, fit::Verdict::Comfortable, false);
         let pool = vec![cand("same", 14.0, fit::Verdict::Comfortable, true)];
-        assert_eq!(suggest(Some(&current), &pool), None);
+        assert_eq!(suggest(Some(&current), &pool, None), None);
     }
 
     #[test]
@@ -206,7 +250,7 @@ mod tests {
         // If we can't say how well what they run fits, we can't honestly say something fits better.
         let current = cand("mystery", 7.0, fit::Verdict::Unknown, false);
         let pool = vec![cand("big", 70.0, fit::Verdict::Comfortable, false)];
-        assert_eq!(suggest(Some(&current), &pool), None);
+        assert_eq!(suggest(Some(&current), &pool, None), None);
     }
 
     #[test]
@@ -218,9 +262,63 @@ mod tests {
 
         // So a model that only beats the small background one is not suggested.
         let pool = vec![cand("mid", 8.0, fit::Verdict::Comfortable, false)];
-        assert_eq!(suggest(Some(base), &pool), None);
+        assert_eq!(suggest(Some(base), &pool, None), None);
 
         assert!(baseline(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn a_model_that_fits_alone_but_not_beside_the_other_role_is_not_suggested() {
+        // The live half of #786 item 6. `baseline` picks the LARGER of the two assigned models and
+        // drops the other, so a suggestion was scored against the whole budget as though the machine
+        // held nothing else — letting PM talk someone into exactly the model-swapping the warning
+        // beside it was added to describe.
+        let current = cand("small", 7.0, fit::Verdict::Comfortable, false);
+        let pool = vec![
+            current.clone(),
+            cand("mid", 14.0, fit::Verdict::Comfortable, false),
+        ];
+
+        // Alone, the 14 is a clear upgrade and is offered.
+        assert!(suggest(Some(&current), &pool, None).is_some());
+
+        // Beside a 6 GB model in a 16 GB budget it no longer fits (14 + 6 > 16), so it must not be.
+        let beside = Beside {
+            footprint_gb: 6.0,
+            budget_gb: 16.0,
+        };
+        assert_eq!(suggest(Some(&current), &pool, Some(beside)), None);
+
+        // Give the pair room and the same suggestion comes back — the filter has to be about the
+        // arithmetic, not about the presence of a second model.
+        let roomy = Beside {
+            footprint_gb: 6.0,
+            budget_gb: 32.0,
+        };
+        assert_eq!(
+            suggest(Some(&current), &pool, Some(roomy)).unwrap().repo,
+            "mid"
+        );
+    }
+
+    #[test]
+    fn a_candidate_with_no_footprint_is_kept_quiet_rather_than_waved_through() {
+        // A suggestion is volunteered, not asked for, so "cannot be shown to fit" must resolve to
+        // silence. Waving it through would make the joint check decorative.
+        let current = cand("small", 7.0, fit::Verdict::Comfortable, false);
+        let mut unsized_big = cand("mid", 14.0, fit::Verdict::Comfortable, false);
+        unsized_big.footprint_gb = None;
+        let pool = vec![current.clone(), unsized_big];
+
+        assert!(
+            suggest(Some(&current), &pool, None).is_some(),
+            "no check, no rejection"
+        );
+        let beside = Beside {
+            footprint_gb: 1.0,
+            budget_gb: 999.0,
+        };
+        assert_eq!(suggest(Some(&current), &pool, Some(beside)), None);
     }
 
     #[test]
@@ -232,8 +330,8 @@ mod tests {
             cand("alpha", 14.0, fit::Verdict::Comfortable, false),
             cand("beta", 14.0, fit::Verdict::Comfortable, false),
         ];
-        let first = suggest(Some(&current), &pool).unwrap();
+        let first = suggest(Some(&current), &pool, None).unwrap();
         let reversed: Vec<Candidate> = pool.into_iter().rev().collect();
-        assert_eq!(suggest(Some(&current), &reversed).unwrap(), first);
+        assert_eq!(suggest(Some(&current), &reversed, None).unwrap(), first);
     }
 }

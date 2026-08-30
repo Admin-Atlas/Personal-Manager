@@ -19,6 +19,7 @@ import type {
   LocalLlmStatus,
   LocalRecommendation,
   LocalRecommendations,
+  LocalCoResidency,
   LocalServedModel,
 } from "../../lib/types";
 
@@ -141,6 +142,7 @@ const recs = (): LocalRecommendations => ({
   disk_sources_present: [],
   disk_blocked: [],
   endpoint_inventory: null,
+  co_residency: null,
   disk_found: 0,
   disk_truncated: false,
   scan_dir: null,
@@ -274,32 +276,66 @@ describe("assigning a model to a role", () => {
     expect(screen.getByText(/can't be chosen/i)).toBeTruthy();
   });
 
-  it("warns that two local models share one machine, and only when they actually do", async () => {
-    // Nothing else in PM says this. Both roles hit ONE endpoint, so two different models are both
-    // resident and their memory adds up — while every Workbench verdict was worked out for a single
-    // model against the whole budget. The better-fit check compares against the LARGER of the two,
-    // never the sum, so it cannot warn about it either.
-    const both = /holds both at once/i;
+  describe("two different models on one server", () => {
+    // This used to be one unconditional paragraph fired at every pair of distinct local models,
+    // regardless of whether they collided — noise on a machine with room to spare, which is how you
+    // train someone to ignore the one line that matters. The sum is now done in Rust and the four
+    // outcomes read differently. The "there is no question to ask" cases (a role on cloud, the same
+    // model twice, a model the endpoint isn't serving) are pinned in local_ai.rs, where the decision
+    // now lives — `co_residency` simply arrives null.
+    const co = (over: Partial<LocalCoResidency>): LocalCoResidency => ({
+      ram: "fits",
+      vram: null,
+      combined_gb: 12,
+      ram_budget_gb: 14,
+      vram_budget_gb: null,
+      ...over,
+    });
+    const withCo = async (c: LocalCoResidency | null) => {
+      localModelRecommendations.mockResolvedValue({ ...recs(), co_residency: c });
+      await loaded();
+    };
 
-    // Default fixture: chat is local, background is on cloud — one model, nothing to warn about.
-    await loaded();
-    expect(screen.queryByText(both)).toBeNull();
+    it("says nothing at all when both models fit", async () => {
+      // Absence is the pass, the same call the served-window line makes.
+      await withCo(co({ ram: "fits" }));
+      expect(screen.queryByText(/won't both stay loaded/i)).toBeNull();
+      expect(screen.queryByText(/can't call it/i)).toBeNull();
+    });
 
-    // Both local, but the SAME model on each: one resident model, the verdict already covers it.
-    cleanup();
-    getLocalLlmConfig.mockResolvedValue(
-      cfg({ background_routing: "local", background_model: "llama3.2:1b" }),
-    );
-    await loaded();
-    expect(screen.queryByText(both)).toBeNull();
+    it("describes swapping, not breaking, when they don't both fit", async () => {
+      // Ollama's FAQ: it queues and unloads an idle model to make room. So the honest warning is
+      // about seconds lost per switch, and the words for a failure must not appear.
+      await withCo(co({ ram: "exceeds", combined_gb: 18, ram_budget_gb: 14 }));
+      const line = await screen.findByText(/won't both stay loaded/i);
+      expect(line).toBeTruthy();
+      expect(line.textContent).toMatch(/Nothing breaks/i);
+      expect(line.textContent).not.toMatch(/\b(fail|crash|error|out of memory)\b/i);
+    });
 
-    // Both local, two different models — the one case where the choices interact.
-    cleanup();
-    getLocalLlmConfig.mockResolvedValue(
-      cfg({ background_routing: "local", background_model: "qwen2.5:7b" }),
-    );
-    await loaded();
-    expect(screen.getByText(both)).toBeTruthy();
+    it("refuses to call a pair that lands inside its own margin of error", async () => {
+      // The memory estimate ran +11.3% against a real load and is only claimed to +-15%. Saying
+      // "these will not both stay loaded" from inside that band would be a confident wrong warning
+      // about a setup that works — worse than the vague prose this replaced.
+      await withCo(co({ ram: "too_close", combined_gb: 15, ram_budget_gb: 14 }));
+      expect(await screen.findByText(/can't call it/i)).toBeTruthy();
+      expect(screen.queryByText(/won't both stay loaded/i)).toBeNull();
+    });
+
+    it("says which memory it means, and prefers the graphics card when there is one", async () => {
+      // "it takes up all of their gpu twice" is the case people mean. The card is the tighter
+      // constraint whenever there is one, so it decides the verdict even when system RAM is fine.
+      await withCo(
+        co({ ram: "fits", vram: "exceeds", combined_gb: 10, vram_budget_gb: 7, ram_budget_gb: 30 }),
+      );
+      const line = await screen.findByText(/won't both stay loaded/i);
+      expect(line.textContent).toMatch(/on your graphics card/i);
+    });
+
+    it("admits when it couldn't size one of them", async () => {
+      await withCo(co({ ram: "unknown", combined_gb: null }));
+      expect(await screen.findByText(/couldn't size one of them/i)).toBeTruthy();
+    });
   });
 
   it("keeps a saved model selectable even when the endpoint stops serving it", async () => {

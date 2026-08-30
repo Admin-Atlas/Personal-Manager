@@ -90,6 +90,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     disk_sources_present: ["lm_studio"],
     disk_blocked: [],
     endpoint_inventory: null,
+    co_residency: null,
     disk_found: 1,
     disk_truncated: false,
     scan_dir: null,

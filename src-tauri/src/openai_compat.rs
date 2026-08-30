@@ -1072,6 +1072,91 @@ pub fn loaded_ctx_from_ps(value: &serde_json::Value, model: &str) -> Option<u32>
         .filter(|c| *c > 0)
 }
 
+/// One model in an Ollama server's own store, from `/api/tags` — whether or not it is loaded.
+///
+/// The point of this rung is the **byte size**. PM otherwise scores a model the endpoint serves with
+/// `fit::fit`, which picks the best quantization that fits the machine's budget — correct advice for
+/// something you have not downloaded yet, and fiction for something you already have. Measured on a
+/// real setup: PM believed a served Qwen2.5-7B was Q8_0 at 10.04 GB while the user's actual file was
+/// Q5_K_M at 5.44 GB, and a served gemma-3-4b was 9.21 GB against a real 3.34 GB.
+///
+/// Worse, that fiction moves the wrong way: a bigger budget lets `fit` pick a higher quant, so
+/// FREEING memory made PM's estimate of an already-downloaded model grow. This route is how PM stops
+/// guessing at a file that is sitting right there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OllamaTag {
+    /// The tag exactly as pulled. Byte-for-byte the id `/v1/models` reports and the one `/api/ps`
+    /// echoes, so the listings key against each other with no normalisation.
+    pub name: String,
+    /// The whole model's bytes on disk as the server measures them — weights AND any projector, so
+    /// a caller must put it in the weight term with the projector at zero rather than adding both.
+    pub size_bytes: u64,
+    /// `details.quantization_level`, or `None`. Ollama spells "I could not read one" as the literal
+    /// string `"unknown"` (measured: it does that for `hf.co/ggml-org/gemma-3-4b-it-GGUF` while
+    /// reporting `Q5_K_M` for a bartowski build pulled the same day), and that sentinel is folded
+    /// into `None` here so a caller cannot mistake it for a quantization it merely lacks a size for.
+    /// Untrusted content — the server read it out of a file — so bound it before display.
+    pub quant: Option<String>,
+}
+
+/// Ollama's own inventory: every model in its store, loaded or not, with the real byte size of each.
+///
+/// Best-effort exactly like `/slots` and `/api/ps`: a non-Ollama 404s and the caller falls through to
+/// the catalogue estimate. A 404 here is not evidence about the server's health and must never be
+/// scored as one.
+///
+/// `None` means "did not answer"; `Some(vec![])` means "an Ollama with nothing pulled". A caller that
+/// flattens the two will report an empty store for a server that is not an Ollama at all.
+pub async fn ollama_tags(base_url: &str, token: Option<&str>) -> Option<Vec<OllamaTag>> {
+    let url = format!("{base_url}/api/tags");
+    let mut req = client_for(base_url)
+        .get(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    tags_from_json(&value)
+}
+
+/// Parse an `/api/tags` body. Pure, so the three shapes that matter are testable without a server.
+///
+/// The check has to EARN `Some(vec![])`, since that value asserts "this is an Ollama and it is
+/// empty": `models` must be an array, and every entry in it must be an object carrying a string
+/// `name`. Deliberately cannot reuse [`is_models_list`], which is written for `/v1/models` — whose
+/// empty spelling is `{"object":"list","data":null}` — and would reject `{"models":[]}` outright.
+pub fn tags_from_json(value: &serde_json::Value) -> Option<Vec<OllamaTag>> {
+    let entries = value.get("models")?.as_array()?;
+    if !entries
+        .iter()
+        .all(|m| m.get("name").and_then(|n| n.as_str()).is_some())
+    {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .filter_map(|m| {
+                Some(OllamaTag {
+                    name: m.get("name")?.as_str()?.to_string(),
+                    size_bytes: m.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+                    quant: m
+                        .get("details")
+                        .and_then(|d| d.get("quantization_level"))
+                        .and_then(|q| q.as_str())
+                        .map(str::trim)
+                        .filter(|q| !q.is_empty() && !q.eq_ignore_ascii_case("unknown"))
+                        .map(str::to_string),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// llama-server `/slots` returns per-slot `n_ctx` for the loaded model. 404/501/timeout → None (not
 /// a llama-server, or slots disabled) — the ladder falls through, by design.
 async fn probe_slots_ctx(base_url: &str, token: Option<&str>) -> Option<u32> {
@@ -1388,6 +1473,52 @@ mod tests {
             "the host is the diagnosable part and should survive: {}",
             err.detail
         );
+    }
+
+    #[test]
+    fn a_tags_listing_carries_the_real_file_size_and_folds_ollamas_unknown_sentinel() {
+        // Byte-exact from a live server (Ollama 0.33.0, 30-08-2026). The two entries differ in
+        // exactly the way that matters: the same server reports a real quantization for one repo and
+        // the literal string "unknown" for another pulled the same day.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"models":[
+                {"name":"hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M","size":3341010115,
+                 "details":{"parameter_size":"3.88B","quantization_level":"unknown"}},
+                {"name":"hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M","size":5444833987,
+                 "details":{"parameter_size":"7.62B","quantization_level":"Q5_K_M"}}
+            ]}"#,
+        )
+        .unwrap();
+        let tags = tags_from_json(&body).expect("a tags listing");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].size_bytes, 3_341_010_115);
+        // "unknown" is an ABSENCE, not a label. Passed through it became "PM doesn't have a size for
+        // the UNKNOWN quantization yet" — asserting knowledge the server had just disclaimed.
+        assert_eq!(tags[0].quant, None);
+        assert_eq!(tags[1].quant.as_deref(), Some("Q5_K_M"));
+    }
+
+    #[test]
+    fn an_ollama_with_nothing_pulled_is_not_the_same_as_no_ollama_at_all() {
+        // `Some(vec![])` says "this IS an Ollama and it is empty" — a first-time installer's exact
+        // state. `None` says nothing answered. A caller that flattens the two reports an empty store
+        // for a server that is not an Ollama.
+        let empty: serde_json::Value = serde_json::from_str(r#"{"models":[]}"#).unwrap();
+        assert_eq!(tags_from_json(&empty), Some(Vec::new()));
+
+        // Not a tags listing: no `models`, or a `models` whose entries are not named models.
+        for body in [
+            r#"{"object":"list","data":[]}"#,
+            r#"{"models":[1,2,3]}"#,
+            r#"{}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(tags_from_json(&v), None, "{body}");
+        }
+
+        // And this shape must stay distinct from the `/v1/models` one, whose empty spelling is
+        // `{"object":"list","data":null}` — `is_models_list` would reject `{"models":[]}` outright.
+        assert!(!is_models_list(&empty));
     }
 
     #[test]

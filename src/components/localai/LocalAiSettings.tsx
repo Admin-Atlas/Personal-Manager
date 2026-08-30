@@ -28,6 +28,7 @@ import {
   setLocalModelScanDir,
 } from "../../lib/ipc";
 import type {
+  LocalCoResidency,
   DetectedEndpoint,
   EndpointCheck,
   LocalBetterFit,
@@ -109,10 +110,6 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const pullingRef = useRef<string | null>(null);
 
   const configured = !!config?.base_url;
-  // Both roles actually going to the local server, and going there with DIFFERENT models — the only
-  // case where the two choices interact, since one server holding one model costs what the Workbench
-  // said it would. Guarded this narrowly so the warning never fires on the common setups.
-  const bothLocal = config?.chat_routing !== "cloud" && config?.background_routing !== "cloud";
   // A role that reaches the local server AND has a model bound. Both halves are load-bearing.
   // Without the routing half the "not measured yet" line fires for someone entirely on cloud, who
   // has no local model to measure. Without the model half it fires for someone who flipped routing
@@ -122,10 +119,6 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const anyLocalRoleWithModel =
     (config?.chat_routing !== "cloud" && !!config?.chat_model?.trim()) ||
     (config?.background_routing !== "cloud" && !!config?.background_model?.trim());
-  const twoModels =
-    !!config?.chat_model &&
-    !!config?.background_model &&
-    config.chat_model !== config.background_model;
   // Whether the connected endpoint is an Ollama server (the only runner with a one-click pull API).
   // Heuristic: Ollama's default port — parsed from the URL, not a substring test (":114341", or
   // "11434" anywhere in a path, must not count). An Ollama on a custom port degrades honestly to
@@ -978,20 +971,18 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
                 half a minute.
               </p>
             )}
-            {bothLocal && twoModels && (
-              // Unfolded, for the same reason as the gating hint below: the doctrine folds prose but
-              // never a loss warning, and this is one. Chat and Background share ONE endpoint, so
-              // two different models are both resident on one machine and their memory adds up —
-              // while every verdict in the Workbench was worked out for a single model against the
-              // whole budget. Two independently "Comfortable" models can be jointly impossible, and
-              // nothing else in PM says so: the better-fit check compares against the LARGER of the
-              // two, never their sum, so it cannot warn about this either.
-              <p className="text-xs text-ink4">
-                Chat and Background go to the same server, so picking a different model for each
-                means your machine holds both at once. The fit shown in Local AI Workbench is for
-                one model on its own — two that each fit alone may not fit together.
-              </p>
-            )}
+            {/* Arithmetic, not a hedge. This used to be one unconditional paragraph fired at every
+                pair of distinct local models — noise on a setup with room to spare, which is how you
+                train someone to ignore the line that matters. The backend now sums the two
+                footprints the cards already showed against one budget, and `co_residency` is null
+                unless there really are two different models both being served.
+
+                It also used to describe a failure that does not happen. Ollama's FAQ is explicit:
+                when a model will not fit beside a loaded one, "all new requests will be queued until
+                the new model can be loaded. As prior models become idle, one or more will be
+                unloaded to make room". So the outcome is swapping, not breaking — and the cost is
+                seconds per switch, which is a thing to say plainly rather than a hazard to imply. */}
+            {recs?.co_residency && <CoResidencyLine fit={recs.co_residency} />}
             {/* Unfolded: a loss warning, not prose. This is the number that explains the symptom
                 people blame on model size — a server serving a small window cannot hold one filing
                 batch, so PM sends fewer documents per call, and past a point stops rather than let
@@ -1095,6 +1086,56 @@ const DISK_SOURCE_LABEL: Record<LocalDiskSource, string> = {
   lm_studio: "LM Studio",
   folder: "Your folder",
 };
+
+/**
+ * What two different models on one server actually mean for this machine.
+ *
+ * Silent when they fit, because absence is the pass — the same call the served-window line makes and
+ * for the same reason. Never says the machine will fail: it will not. It swaps, and swapping costs
+ * time, so time is what this talks about.
+ */
+function CoResidencyLine({ fit }: { fit: LocalCoResidency }) {
+  // The graphics card is the tighter constraint whenever there is one, and it is the one people mean
+  // by "it takes up all of my GPU twice" — so it decides the verdict, with system RAM as the fallback
+  // on a machine with no discrete card.
+  const verdict = fit.vram ?? fit.ram;
+  if (verdict === "fits") return null;
+
+  const budget = fit.vram ? fit.vram_budget_gb : fit.ram_budget_gb;
+  const where = fit.vram ? "on your graphics card" : "in memory";
+
+  if (verdict === "unknown") {
+    return (
+      <p className="text-xs text-ink4">
+        Chat and Background use different models, and PM couldn't size one of them — so it can't say
+        whether your server will keep both loaded or swap between them.
+      </p>
+    );
+  }
+  if (verdict === "too_close") {
+    return (
+      <p className="text-xs text-ink4">
+        Chat and Background use different models. Together they come to about{" "}
+        <span className="text-ink2">{formatGib(fit.combined_gb)}</span> against roughly{" "}
+        <span className="text-ink2">{formatGib(budget)}</span> {where} — close enough that PM can't
+        call it, since its memory estimate is only good to about 15%. If your server does start
+        swapping between them you'll see replies pause for a few seconds now and then.
+      </p>
+    );
+  }
+  return (
+    // `text-st-due` is the attention token, the same one a restricted licence gets. This is the one
+    // state worth pulling a user's eye to, which is exactly why the other three must not.
+    <p className="text-xs text-st-due">
+      Chat and Background use different models, and they won't both stay loaded — together they need
+      about <span className="font-medium">{formatGib(fit.combined_gb)}</span>, and there is about{" "}
+      <span className="font-medium">{formatGib(budget)}</span> {where}. Nothing breaks: your server
+      unloads one to make room for the other. But every switch between chatting and background work
+      then costs a few seconds while a model reloads, and background work runs often. Putting the
+      same model on both roles avoids it entirely.
+    </p>
+  );
+}
 
 /** The one sentence for each state that isn't a list. Split out so the copy sits beside the ladder's
  *  reasoning instead of inside a nested ternary, and so each branch can be read against the machine
