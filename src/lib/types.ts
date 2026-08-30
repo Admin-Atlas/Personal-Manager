@@ -2041,6 +2041,47 @@ export interface LocalLlmStatus {
    *  while the gateway clamps it to the floor, so without the source the panel can show a reassuring
    *  32,768 while PM is quietly compressing everything to fit 4,096. */
   window_source: string | null;
+  /** A local call for this role is in flight right now — answering, or queued behind something that
+   *  is. PM knows this from its own slot, so it needs no server and can never be stale. */
+  chat_answering: boolean;
+  background_answering: boolean;
+  /** Whether the role's model is on the graphics card. `null` is "PM cannot tell" — an endpoint with
+   *  no `/api/ps` (llama-server, LM Studio, a `/v1`-only proxy), or nothing seen recently enough to
+   *  still be worth saying. Never render it as "not loaded". */
+  chat_loaded: boolean | null;
+  background_loaded: boolean | null;
+  /** PM itself handed this model back, on the user's release policy — the difference between "your
+   *  server let it go" and "you asked PM to". Only meaningful while it is not loaded. */
+  chat_released: boolean;
+  background_released: boolean;
+}
+
+/** What one "does this actually work" test found (local_ai.rs LocalTestResult). */
+export interface LocalTestResult {
+  model: string;
+  /** It answered with something usable — not truncated, not blank. */
+  ok: boolean;
+  /** What it actually said, trimmed and capped. Evidence, not a claim. */
+  reply: string | null;
+  elapsed_ms: number;
+  /** The test had to load the model, so PM owns that load. `null` when PM could not tell. */
+  loaded_for_test: boolean | null;
+  /** Other models the server was holding when the test started — so a pass can say why the next
+   *  chat message might be slow. PM cannot stop a server making room; it can say what was there. */
+  was_holding: string[];
+  /** What went wrong, in the user's words. */
+  message: string | null;
+}
+
+/** The in-flight (or last-finished) test, owned by the backend so it survives the tab unmounting
+ *  (local_ai.rs TestSnapshot). */
+export interface LocalTestSnapshot {
+  role: string;
+  /** What it is asking. Compared against what the role is set to NOW, so a result is never shown
+   *  under a model the user changed to while it was running. */
+  model: string;
+  running: boolean;
+  result: LocalTestResult | null;
 }
 
 /** One progress tick from an Ollama model pull (openai_compat.rs PullProgress). */

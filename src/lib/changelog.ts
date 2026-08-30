@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.136.0-alpha",
+    date: "2026-08-30",
+    highlights: [
+      "The model list at the bottom of the sidebar now tells you what is actually happening, not just what is set up. Next to each role it says whether that model is answering something right now, sitting loaded on your graphics card, or not loaded at all \u2014 and when PM was the one that handed the memory back, it says so, so \u201cnot loaded\u201d doesn\u2019t send you hunting through your server\u2019s settings for something you asked PM to do. It appears the moment a reply starts and clears when it finishes. If your server can\u2019t answer the question \u2014 llama-server and LM Studio have no way to report what they are holding \u2014 PM says nothing rather than guessing, and the row looks exactly as it did before.",
+      "None of that costs your server anything. PM was already asking it a couple of questions every half-minute and throwing most of the answer away; it now keeps it, and asks no more often than it did.",
+      "There is also a new Test it button beside each role in Settings \u203a Local AI. Everything PM could check before was paperwork \u2014 the server answers, the model is in its list, the file is on disk \u2014 and setups tend to break at the one step none of that covers: actually producing an answer. This sends one short message and shows you what came back, in the model\u2019s own words. If your model is already loaded it reuses it rather than loading a second copy, it stands aside if you are mid-conversation, and it never counts for or against your server\u2019s reliability record \u2014 a test you ran to investigate a problem shouldn\u2019t be able to make PM stop trying.",
+      "Under the hood: a server with no way to unload a model on request \u2014 llama-server, LM Studio \u2014 is now recognised as such the first time PM asks it anything, so the note explaining that the release options can\u2019t do anything there actually appears, and PM stops re-asking a question that can only have one answer.",
+    ],
+  },
+  {
     version: "3.135.0-alpha",
     date: "2026-08-30",
     highlights: [

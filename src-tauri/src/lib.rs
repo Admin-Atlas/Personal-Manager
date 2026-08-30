@@ -1511,6 +1511,25 @@ pub fn run() {
             flags::spawn_flag_detection_scheduler(handle.clone());
             local_ai::spawn_release_scheduler(handle.clone());
 
+            // Tell the provider surfaces the moment a local call starts, not only when it ends.
+            //
+            // The status event has always fired after an outcome, which is enough to report health
+            // and useless for reporting activity: a reply takes seconds to arrive and the one thing
+            // the sidebar wanted to say during them was that the model was answering. The slot owns
+            // the count, and this is the wire from it to the same event every other status change
+            // already uses — installed here rather than reached for from `local_slot`, which
+            // deliberately knows nothing about Tauri.
+            {
+                let emit_to = handle.clone();
+                handle
+                    .state::<AppState>()
+                    .local_ai
+                    .slot
+                    .watch(std::sync::Arc::new(move || {
+                        llm_gateway::ping_status(&emit_to);
+                    }));
+            }
+
             // Keep the daily briefing current without the user clicking Refresh (#540): picks up an
             // inputs-changed nudge (calendar sync, milestone edit, flag resolved) within a minute
             // and otherwise checks hourly. A check that finds the facts unmoved costs one DB pass
@@ -1569,6 +1588,8 @@ pub fn run() {
             local_ai::cancel_local_pull,
             local_ai::accept_local_model_terms,
             local_ai::local_llm_status,
+            local_ai::test_local_llm,
+            local_ai::active_local_test,
             // Workbench (#296): hardware scan + per-machine model recommendations.
             local_ai::local_hardware_scan,
             local_ai::local_model_recommendations,

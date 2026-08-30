@@ -138,6 +138,26 @@ pub mod tunables {
     /// user's server with probes — the backend actually re-probes at most this often.
     pub const HEALTH_PROBE_DEBOUNCE: Duration = Duration::from_secs(30);
 
+    /// How long PM will wait for a test call the user is watching.
+    ///
+    /// Longer than the background budget, and for the opposite reason that one is short: a
+    /// background timeout is a strike, so it must give up before three of them cool the endpoint
+    /// down, while a test records nothing at all and exists precisely to sit through the slow case.
+    /// Long enough for a cold load of a large model on a machine that is swapping (measured cold
+    /// loads on the dev machine: 2.6-4.2s; a 30B model on a busy laptop is minutes), short enough
+    /// that a wedged server eventually says so instead of spinning forever.
+    pub const LOCAL_TEST_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// How long a `/api/ps` residency reading stays worth repeating.
+    ///
+    /// Residency is learned on the health probe above, so a reading is refreshed at best every
+    /// [`HEALTH_PROBE_DEBOUNCE`] and only while something is asking for status. This is deliberately
+    /// a small multiple of that rather than a tight bound: expiring at the probe interval would blank
+    /// the display on every ordinary skew between the two clocks, and the display's own claim is
+    /// "recently", not "this instant". Past it, PM says it does not know — which is the honest
+    /// reading of a server it has not heard from, and never "nothing is loaded".
+    pub const RESIDENCY_TTL: Duration = Duration::from_secs(150);
+
     /// Consecutive IDENTICAL streamed tokens that trip the degenerate-stream guard's fast path. 50
     /// in a row is almost certainly a broken small model; legitimate output effectively never does
     /// this, so the false-positive risk is negligible. Complements the period-based detector (which
@@ -449,6 +469,20 @@ pub struct LocalSlot {
     /// acquisition on purpose: a call queued behind another is still a reason to keep the model
     /// resident, and releasing the memory it is about to need would be the worst possible timing.
     in_flight: AtomicUsize,
+    /// The same count, split by which of PM's two AI roles the call belongs to, so a surface can say
+    /// WHICH model is answering rather than only that something is. [`Lane::Housekeeping`] is in
+    /// neither: an unload is not a role answering, and showing it as one would have PM report itself
+    /// as busy while it is handing the card back.
+    chat_in_flight: AtomicUsize,
+    background_in_flight: AtomicUsize,
+    /// Called whenever the in-flight counts change — on the way in and on the way out of every call.
+    ///
+    /// A callback rather than an `AppHandle` because this module deliberately has no `tauri`
+    /// dependency: the policy lives here, the emitting lives at the edge. It exists because the only
+    /// existing status event fires AFTER an outcome, so nothing could tell a surface that a model is
+    /// answering *right now* — the interesting half of the fact. Installed once at startup; absent
+    /// in every test, where the counters are read directly.
+    on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// When the last call finished. `None` until one has. Stamped on the way OUT of a call, so a
     /// quiet period measures from the end of the last work rather than the start of it.
     last_active: Mutex<Option<Instant>>,
@@ -474,7 +508,18 @@ impl Drop for ChatWaitingGuard<'_> {
 /// A decrement written after the select would be skipped by the first two, and a leaked count means
 /// PM decides it is permanently busy and silently never releases the card again — a bug whose only
 /// symptom is the absence of a thing happening.
-struct SlotBusyGuard<'a>(&'a LocalSlot);
+/// Which kind of work is holding the slot. Only the first two answer for a user-visible role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// An interactive chat turn.
+    Chat,
+    /// Unattended work — summaries, titles, briefings, proposals.
+    Background,
+    /// PM's own housekeeping (an unload). Counted in the total, in neither role.
+    Housekeeping,
+}
+
+struct SlotBusyGuard<'a>(&'a LocalSlot, Lane);
 impl Drop for SlotBusyGuard<'_> {
     fn drop(&mut self) {
         // Stamp BEFORE decrementing, so a reader that observes zero in-flight also observes a fresh
@@ -482,7 +527,13 @@ impl Drop for SlotBusyGuard<'_> {
         if let Ok(mut t) = self.0.last_active.lock() {
             *t = Some(Instant::now());
         }
+        if let Some(counter) = self.0.role_counter(self.1) {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // After the counters, never before: a listener that refetches on this must see the state it
+        // is being told about. Notifying first is how a surface ends up permanently "answering".
+        self.0.notify_change();
     }
 }
 
@@ -509,8 +560,7 @@ impl LocalSlot {
     where
         F: std::future::Future,
     {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let _busy = SlotBusyGuard(self);
+        let _busy = self.enter(Lane::Chat);
         self.chat_waiting.store(true, Ordering::SeqCst);
         let _waiting = ChatWaitingGuard(&self.chat_waiting);
         // Wake a background call that is already registered on the current notify. `notify_one`
@@ -527,12 +577,16 @@ impl LocalSlot {
     /// bails immediately if chat is already waiting, then races the call against a preemption; on
     /// preemption the call future is DROPPED (a real reqwest abort) and [`SlotOutcome::Preempted`]
     /// is returned for the caller to retry on its next scheduler tick.
-    pub async fn run_background<F>(&self, fut: F) -> SlotOutcome<F::Output>
+    ///
+    /// `lane` is what the call is counted AS, separately from how it behaves: PM's own diagnostic
+    /// wants a background call's manners — yield to chat, come back later — without being reported
+    /// as the Tasks model answering, which it is not. Passing the wrong one is invisible except on
+    /// the surface that names the role, which is exactly where it would be believed.
+    pub async fn run_background<F>(&self, lane: Lane, fut: F) -> SlotOutcome<F::Output>
     where
         F: std::future::Future,
     {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let _busy = SlotBusyGuard(self);
+        let _busy = self.enter(lane);
         let _lane = self.lane.lock().await;
         let notify = Arc::new(Notify::new());
         if let Ok(mut slot) = self.preempt.lock() {
@@ -570,8 +624,7 @@ impl LocalSlot {
     where
         F: std::future::Future,
     {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let _busy = SlotBusyGuard(self);
+        let _busy = self.enter(Lane::Housekeeping);
         let _lane = self.lane.lock().await;
         fut.await
     }
@@ -583,9 +636,54 @@ impl LocalSlot {
         ReleaseHold(self.holds.clone())
     }
 
+    /// Count one call as occupying the slot and announce it, returning the guard that undoes both.
+    ///
+    /// One entry point for all three lanes so a fourth can never be added that increments without
+    /// announcing — the failure mode being a surface stuck on "answering" with nothing to correct it.
+    fn enter(&self, lane: Lane) -> SlotBusyGuard<'_> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if let Some(counter) = self.role_counter(lane) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        let guard = SlotBusyGuard(self, lane);
+        self.notify_change();
+        guard
+    }
+
+    /// The counter a lane contributes to, or `None` for housekeeping, which answers for no role.
+    fn role_counter(&self, lane: Lane) -> Option<&AtomicUsize> {
+        match lane {
+            Lane::Chat => Some(&self.chat_in_flight),
+            Lane::Background => Some(&self.background_in_flight),
+            Lane::Housekeeping => None,
+        }
+    }
+
+    /// Install the "the counts changed" callback. Called once at startup; later calls replace it.
+    pub fn watch(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.on_change.lock() {
+            *slot = Some(notify);
+        }
+    }
+
+    /// Announce a change, holding no lock while the callback runs — it emits, and an emit that
+    /// re-entered this module behind a held lock would deadlock the very call it is announcing.
+    fn notify_change(&self) {
+        let cb = self.on_change.lock().ok().and_then(|c| c.clone());
+        if let Some(cb) = cb {
+            cb();
+        }
+    }
+
     /// Calls occupying or waiting for the lane right now.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Calls in flight for one role. Housekeeping counts towards neither.
+    pub fn role_in_flight(&self, lane: Lane) -> usize {
+        self.role_counter(lane)
+            .map_or(0, |c| c.load(Ordering::SeqCst))
     }
 
     /// Background jobs spawned but not yet at the lane.
@@ -647,6 +745,25 @@ pub struct LocalRuntime {
     /// for the life of the process — over four thousand pointless requests a day at a server that
     /// can never satisfy one. A permanent property of the endpoint, so learning it once is enough.
     no_unload_route: Mutex<std::collections::HashSet<String>>,
+    /// The last thing `/api/ps` said about a `(base_url, model)` pair, and when it said it.
+    ///
+    /// Cached rather than asked per read for one reason: the only surface that wants it is the
+    /// sidebar footer, which repaints far more often than a server changes its mind, and the answer
+    /// costs an HTTP round trip. It is learned on the health probe that is ALREADY happening (once
+    /// per [`tunables::HEALTH_PROBE_DEBOUNCE`]), so the live display adds no request of its own.
+    ///
+    /// An entry expires: a reading old enough to be wrong must read as "PM does not know", never as
+    /// the last thing it saw. The absence of an entry and an expired entry are the same fact, and
+    /// both are different from `Some(false)` — a server that answered and is holding nothing.
+    resident: Mutex<std::collections::HashMap<(String, String), (bool, Instant)>>,
+    /// Models PM itself handed back, so "not loaded" can name its cause.
+    ///
+    /// Kept separate from [`Self::pm_loaded`], which is retired the moment a model leaves for ANY
+    /// reason — the server evicting it, the user stopping it, PM releasing it. That set cannot
+    /// answer "why", and a footer that reported PM's own housekeeping as though the server had done
+    /// it would leave someone hunting a server setting for a thing PM did on their instruction.
+    /// Cleared when the model loads again, because it is then no longer true of anything.
+    released: Mutex<std::collections::HashSet<(String, String)>>,
     /// The release policy as last read from settings, with its quiet period.
     ///
     /// Cached because a model can be resident while the vault is LOCKED — PM loaded it, the user
@@ -671,6 +788,28 @@ pub struct LocalRuntime {
     /// settings view unmounting (the tab router unmounts on every switch) and so a remounted view
     /// can re-read where things stand instead of re-arming the Download button mid-download.
     pull: Mutex<Option<PullState>>,
+    /// The one user-run "does this actually work" test: in flight, or the last one's outcome.
+    ///
+    /// Backend-owned for the same reason the pull is. The settings view unmounts on every tab
+    /// switch, and this job can legitimately run for minutes (a cold load of a large model), so a
+    /// result held only in component state is a result the user loses by looking at another tab —
+    /// and a button that re-arms itself while the backend is still refusing a second one. It is also
+    /// the single-flight claim: two tests would queue behind each other in the slot, making someone
+    /// who clicked once pay for a second cold load.
+    test: Mutex<Option<crate::local_ai::TestSnapshot>>,
+}
+
+/// Marks the test finished on drop, including on a panic or an early `?`, so a job that dies cannot
+/// leave the claim standing and the button refusing for the rest of the session.
+pub struct TestGuard<'a>(&'a Mutex<Option<crate::local_ai::TestSnapshot>>);
+impl Drop for TestGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.0.lock() {
+            if let Some(snap) = slot.as_mut() {
+                snap.running = false;
+            }
+        }
+    }
 }
 
 /// What a UI needs to render the one model pull: live progress while `running`, and the terminal
@@ -766,6 +905,107 @@ impl LocalRuntime {
         if let Ok(mut set) = self.pm_loaded.lock() {
             set.insert((base_url.to_string(), model.to_string()));
         }
+        // Whatever PM released is about to be loaded again, so the reason stops being true here
+        // rather than at the next probe — otherwise the footer says "released" over a model that is
+        // at that moment answering.
+        if let Ok(mut set) = self.released.lock() {
+            set.remove(&(base_url.to_string(), model.to_string()));
+        }
+    }
+
+    /// Remember that PM released this model, so a surface can say who unloaded it.
+    pub fn mark_released(&self, base_url: &str, model: &str) {
+        if let Ok(mut set) = self.released.lock() {
+            set.insert((base_url.to_string(), model.to_string()));
+        }
+    }
+
+    /// Whether the last thing that happened to this model was PM handing it back.
+    pub fn was_released_by_pm(&self, base_url: &str, model: &str) -> bool {
+        self.released
+            .lock()
+            .map(|s| s.contains(&(base_url.to_string(), model.to_string())))
+            .unwrap_or(false)
+    }
+
+    /// Claim the one test slot, recording what is being tested. `None` if one is already running.
+    pub fn begin_test(&self, role: &str, model: &str) -> Option<TestGuard<'_>> {
+        let mut slot = self.test.lock().ok()?;
+        if slot.as_ref().is_some_and(|s| s.running) {
+            return None;
+        }
+        *slot = Some(crate::local_ai::TestSnapshot {
+            role: role.to_string(),
+            model: model.to_string(),
+            running: true,
+            result: None,
+        });
+        drop(slot);
+        Some(TestGuard(&self.test))
+    }
+
+    /// Record a finished test's outcome, so a view that was unmounted when it landed still gets it.
+    pub fn finish_test(&self, result: crate::local_ai::LocalTestResult) {
+        if let Ok(mut slot) = self.test.lock() {
+            if let Some(snap) = slot.as_mut() {
+                snap.result = Some(result);
+            }
+        }
+    }
+
+    /// The in-flight (or last-finished) test, for a view that has just mounted.
+    pub fn active_test(&self) -> Option<crate::local_ai::TestSnapshot> {
+        self.test.lock().ok()?.clone()
+    }
+
+    /// Forget the last test. A result proves a MODEL answered on a SERVER, so changing the server
+    /// makes it untrue — and because the snapshot is backend-owned, clearing the view alone would
+    /// let it come straight back on the next mount. A RUNNING test is left alone: it is still
+    /// running, and its claim must not be released by anything but its own guard.
+    pub fn clear_finished_test(&self) {
+        if let Ok(mut slot) = self.test.lock() {
+            if slot.as_ref().is_some_and(|s| !s.running) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Record what `/api/ps` said about one model, stamped with when it said it.
+    pub fn cache_resident(&self, base_url: &str, model: &str, resident: bool) {
+        if let Ok(mut map) = self.resident.lock() {
+            map.insert(
+                (base_url.to_string(), model.to_string()),
+                (resident, Instant::now()),
+            );
+        }
+        // A model observed back on the card is no longer one PM has released — true whoever loaded
+        // it, which is why this lives with the observation rather than only with PM's own load.
+        if resident {
+            if let Ok(mut set) = self.released.lock() {
+                set.remove(&(base_url.to_string(), model.to_string()));
+            }
+        }
+    }
+
+    /// Forget everything PM had observed about one endpoint's residency.
+    ///
+    /// For the case where the answer is not "no" but "PM can no longer tell": the endpoint changed,
+    /// or the server stopped answering the route. Keeping the last reading past that would have the
+    /// footer state a fact about a server it can no longer see.
+    pub fn clear_resident(&self, base_url: &str) {
+        if let Ok(mut map) = self.resident.lock() {
+            map.retain(|(base, _), _| base != base_url);
+        }
+    }
+
+    /// What PM last saw of this model, if that was recently enough to still mean anything.
+    pub fn cached_resident(&self, base_url: &str, model: &str) -> Option<bool> {
+        let (resident, at) = *self
+            .resident
+            .lock()
+            .ok()?
+            .get(&(base_url.to_string(), model.to_string()))?;
+        (at.elapsed() < tunables::RESIDENCY_TTL).then_some(resident)
     }
 
     /// Whether PM caused this model to be loaded, and may therefore release it.
@@ -1351,10 +1591,181 @@ mod tests {
     /// which sleep OUTSIDE `run_background`, between calls — do NOT hold the slot: a background job that
     /// is merely waiting out its LOADING/PREEMPTION budget cannot block foreground chat. If the lane
     /// leaked past `run_background`, the foreground call below would deadlock and the timeout would fire.
+    /// The role split. A footer that can say WHICH model is answering needs the lanes counted apart,
+    /// and housekeeping must answer for neither: PM handing the card back is not chat working.
+    #[tokio::test]
+    async fn each_lane_is_counted_against_its_own_role_and_housekeeping_against_none() {
+        let slot = Arc::new(LocalSlot::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            // Reading the counters from inside the callback is the point: it pins that the numbers
+            // are settled BEFORE anyone is told to look, which is the difference between a display
+            // that flickers back to "answering" after every reply and one that does not. A `Weak`
+            // rather than a clone, so the callback the slot holds cannot keep the slot alive.
+            let weak = Arc::downgrade(&slot);
+            slot.watch(Arc::new(move || {
+                let Some(s) = weak.upgrade() else { return };
+                seen.lock().unwrap().push((
+                    s.role_in_flight(Lane::Chat),
+                    s.role_in_flight(Lane::Background),
+                    s.in_flight(),
+                ));
+            }));
+        }
+
+        slot.run_foreground(async {}).await;
+        slot.run_background(Lane::Background, async {}).await;
+        slot.run_exclusive(async {}).await;
+        // Background MANNERS, housekeeping IDENTITY — PM's own test call. It yields to chat like
+        // background work, and it is counted as neither role, because it is not one answering.
+        slot.run_background(Lane::Housekeeping, async {}).await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (1, 0, 1), // chat in
+                (0, 0, 0), // chat out
+                (0, 1, 1), // background in
+                (0, 0, 0), // background out
+                (0, 0, 1), // an unload — counted in the total, in NEITHER role
+                (0, 0, 0),
+                (0, 0, 1), // a test, in the background lane and still neither role
+                (0, 0, 0),
+            ]
+        );
+    }
+
+    /// The guard, not a matched pair. A call that panics still lets go of its role counter and still
+    /// announces it — otherwise one panic pins a role on "answering" for the life of the process.
+    #[tokio::test]
+    async fn a_panicking_call_still_frees_its_role_and_announces_it() {
+        let slot = Arc::new(LocalSlot::default());
+        let announcements = Arc::new(AtomicUsize::new(0));
+        {
+            let announcements = announcements.clone();
+            slot.watch(Arc::new(move || {
+                announcements.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let s = slot.clone();
+        let joined = tokio::spawn(async move {
+            s.run_foreground(async { panic!("boom") as () }).await;
+        })
+        .await;
+        assert!(joined.is_err(), "the call panicked");
+        assert_eq!(slot.role_in_flight(Lane::Chat), 0);
+        assert_eq!(slot.in_flight(), 0);
+        assert_eq!(announcements.load(Ordering::SeqCst), 2, "in, then out");
+    }
+
+    /// A test the user clicked is single-flight, its claim is released however the command exits,
+    /// and the outcome outlives the view that asked for it.
+    #[test]
+    fn a_test_is_single_flight_and_its_result_outlives_the_view_that_asked() {
+        let rt = LocalRuntime::default();
+        assert!(rt.active_test().is_none(), "nothing has been tested yet");
+
+        let first = rt
+            .begin_test("chat", "gemma3:4b")
+            .expect("the first claim is granted");
+        assert!(
+            rt.begin_test("background", "qwen2.5:7b").is_none(),
+            "a second is refused while one runs"
+        );
+        let running = rt.active_test().expect("a snapshot while it runs");
+        assert!(running.running);
+        assert_eq!(running.role, "chat");
+        assert_eq!(running.model, "gemma3:4b");
+        assert!(running.result.is_none());
+
+        rt.finish_test(crate::local_ai::LocalTestResult {
+            model: "gemma3:4b".into(),
+            ok: true,
+            reply: Some("ready".into()),
+            elapsed_ms: 1200,
+            loaded_for_test: Some(false),
+            was_holding: Vec::new(),
+            message: None,
+        });
+        // The guard is what marks it finished, so a command that panics cannot leave the button
+        // refusing for the rest of the session.
+        drop(first);
+
+        let done = rt.active_test().expect("the outcome is kept");
+        assert!(!done.running);
+        assert_eq!(done.result.map(|r| r.ok), Some(true));
+        assert!(
+            rt.begin_test("chat", "gemma3:4b").is_some(),
+            "and another can start"
+        );
+    }
+
+    /// Residency is a CACHED OBSERVATION with three states, and the third one has to survive.
+    #[test]
+    fn a_residency_reading_expires_rather_than_becoming_a_claim() {
+        let rt = LocalRuntime::default();
+        let (base, model) = ("http://[::1]:11434", "gemma3:4b");
+        assert_eq!(
+            rt.cached_resident(base, model),
+            None,
+            "nothing observed yet"
+        );
+
+        rt.cache_resident(base, model, true);
+        assert_eq!(rt.cached_resident(base, model), Some(true));
+        // "Answered, and it is not there" is a real answer and must not read as "no idea".
+        rt.cache_resident(base, model, false);
+        assert_eq!(rt.cached_resident(base, model), Some(false));
+
+        // Aged past the TTL, it stops being worth repeating — PM says it does not know, never that
+        // the model is gone.
+        if let Some(old) =
+            Instant::now().checked_sub(tunables::RESIDENCY_TTL + Duration::from_secs(1))
+        {
+            rt.resident
+                .lock()
+                .unwrap()
+                .insert((base.to_string(), model.to_string()), (true, old));
+            assert_eq!(rt.cached_resident(base, model), None);
+        }
+
+        // And an endpoint PM can no longer ask is cleared rather than left to age out.
+        rt.cache_resident(base, model, true);
+        rt.clear_resident(base);
+        assert_eq!(rt.cached_resident(base, model), None);
+    }
+
+    /// "PM released it" is a different fact from "it is not there", and it stops being true the
+    /// moment the model is back — whoever put it back.
+    #[test]
+    fn released_by_pm_is_cleared_by_a_load_from_either_side() {
+        let rt = LocalRuntime::default();
+        let (base, model) = ("http://127.0.0.1:11434", "qwen2.5:7b");
+        assert!(!rt.was_released_by_pm(base, model));
+
+        rt.mark_released(base, model);
+        assert!(rt.was_released_by_pm(base, model));
+        // PM loading it again.
+        rt.mark_pm_loaded(base, model);
+        assert!(!rt.was_released_by_pm(base, model));
+
+        rt.mark_released(base, model);
+        // Someone else loading it — observed through `/api/ps`, which does not care who did it.
+        rt.cache_resident(base, model, true);
+        assert!(!rt.was_released_by_pm(base, model));
+
+        // An observation that it is STILL absent does not clear the reason.
+        rt.mark_released(base, model);
+        rt.cache_resident(base, model, false);
+        assert!(rt.was_released_by_pm(base, model));
+    }
+
     #[tokio::test]
     async fn a_returned_background_call_frees_the_slot_for_foreground() {
         let slot = LocalSlot::default();
-        let out = slot.run_background(async { 7u8 }).await;
+        let out = slot.run_background(Lane::Background, async { 7u8 }).await;
         assert!(
             matches!(out, SlotOutcome::Ran(7)),
             "the background call ran"
@@ -1380,7 +1791,7 @@ mod tests {
         let bg = {
             let slot = slot.clone();
             tokio::spawn(async move {
-                slot.run_background(async move {
+                slot.run_background(Lane::Background, async move {
                     // Signal that we are now running inside the slot (lane held), then never finish on
                     // our own — only a preemption can end this call.
                     let _ = started_tx.send(());
@@ -1427,7 +1838,7 @@ mod tests {
         assert_eq!(slot.in_flight(), 0, "after a completed foreground call");
 
         assert!(matches!(
-            slot.run_background(async { 2u8 }).await,
+            slot.run_background(Lane::Background, async { 2u8 }).await,
             SlotOutcome::Ran(2)
         ));
         assert_eq!(slot.in_flight(), 0, "after a completed background call");
@@ -1435,7 +1846,7 @@ mod tests {
         // The early bail, before the `select!` is ever reached: chat is already waiting.
         slot.chat_waiting.store(true, Ordering::SeqCst);
         assert!(matches!(
-            slot.run_background(async { 3u8 }).await,
+            slot.run_background(Lane::Background, async { 3u8 }).await,
             SlotOutcome::Preempted
         ));
         slot.chat_waiting.store(false, Ordering::SeqCst);

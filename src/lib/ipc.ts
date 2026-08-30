@@ -60,6 +60,8 @@ import type {
   LocalRecommendations,
   LocalRescanCadence,
   LocalServedModel,
+  LocalTestResult,
+  LocalTestSnapshot,
   PullProgress,
   PullSnapshot,
   LanguageOptions,
@@ -1697,6 +1699,12 @@ export const listLocalLlmModels = () => invoke<LocalServedModel[]>("list_local_l
 /** A live endpoint status snapshot (configured / reachable / cooldown). Self-debounced to at most
  *  one server probe per 30s, so a fast poll can't hammer the user's server. */
 export const localLlmStatus = () => invoke<LocalLlmStatus>("local_llm_status");
+
+/** Ask the model bound to a role to actually answer something, and report what happened. */
+export const testLocalLlm = (role: string) => invoke<LocalTestResult>("test_local_llm", { role });
+
+/** The in-flight or last-finished test, so a remounted view picks it back up. */
+export const activeLocalTest = () => invoke<LocalTestSnapshot | null>("active_local_test");
 
 /** Fires when the local endpoint's health may have changed — a chat/background call succeeded or
  *  failed (opening/closing a cooldown), or the endpoint was (re)configured or cleared. Payload-less:

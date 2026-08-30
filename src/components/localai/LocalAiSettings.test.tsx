@@ -21,6 +21,7 @@ import type {
   LocalRecommendations,
   LocalCoResidency,
   LocalServedModel,
+  LocalTestResult,
 } from "../../lib/types";
 
 const activeLocalPull = vi.fn();
@@ -41,6 +42,8 @@ const localBetterFitNotice = vi.fn();
 const localHardwareScan = vi.fn();
 const localLlmStatus = vi.fn();
 const localModelRecommendations = vi.fn();
+const testLocalLlm = vi.fn();
+const activeLocalTest = vi.fn();
 const probeLocalLlmPorts = vi.fn();
 const pullLocalModel = vi.fn();
 const acceptLocalModelTerms = vi.fn();
@@ -75,6 +78,13 @@ vi.mock("../../lib/ipc", () => ({
   localHardwareScan: (...a: unknown[]) => localHardwareScan(...a),
   localLlmStatus: () => localLlmStatus(),
   localModelRecommendations: () => localModelRecommendations(),
+  testLocalLlm: (...a: unknown[]) => testLocalLlm(...a),
+  activeLocalTest: () => activeLocalTest(),
+  // The push signal the tab now also listens on, so the "answering right now" hint beside each role
+  // is not a coin flip on a 30 s tick. A no-op subscription here — the tests drive `localLlmStatus`
+  // directly — but it must EXIST, or the factory hands the component `undefined` and every test in
+  // the file dies at module eval.
+  onLocalLlmStatus: () => Promise.resolve(() => {}),
   probeLocalLlmPorts: () => probeLocalLlmPorts(),
   pullLocalModel: (...a: unknown[]) => pullLocalModel(...a),
   acceptLocalModelTerms: (...a: unknown[]) => acceptLocalModelTerms(...a),
@@ -179,6 +189,12 @@ const statusFix = (over: Partial<LocalLlmStatus> = {}): LocalLlmStatus => ({
   served_window: null,
   served_window_proven: false,
   window_source: null,
+  chat_answering: false,
+  background_answering: false,
+  chat_loaded: null,
+  background_loaded: null,
+  chat_released: false,
+  background_released: false,
   ...over,
 });
 
@@ -203,6 +219,7 @@ beforeEach(() => {
   getTrayEnabled.mockResolvedValue(false);
   setTrayEnabled.mockResolvedValue(undefined);
   activeLocalPull.mockResolvedValue(null);
+  activeLocalTest.mockResolvedValue(null);
   cancelLocalPull.mockResolvedValue(true);
   clearLocalLlmToken.mockResolvedValue(undefined);
 });
@@ -957,5 +974,156 @@ describe("a download owned by the backend", () => {
     expect(await screen.findByRole("button", { name: /downloading/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /cancel/i })).toBeTruthy();
     expect(await screen.findByText(/already running/)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// "Test it" — the only thing in the tab that asks the model to actually produce a token. Every
+// other check is metadata (the server answers, the id is in the list, the weights are on disk),
+// and the setups that fail fail at the step none of those cover.
+// ---------------------------------------------------------------------------------------------
+
+const testPass = (over: Partial<LocalTestResult> = {}): LocalTestResult => ({
+  model: "llama3.2:1b",
+  ok: true,
+  reply: "ready",
+  elapsed_ms: 2400,
+  loaded_for_test: false,
+  was_holding: [],
+  message: null,
+  ...over,
+});
+
+describe("testing a role's model", () => {
+  it("offers the button only where there is a local pair to test", async () => {
+    // The fixture routes Chat local with a model, and Background to cloud with none.
+    await loaded();
+    expect(screen.getAllByRole("button", { name: /^test it$/i })).toHaveLength(1);
+  });
+
+  it("shows what the model actually said, not just that it worked", async () => {
+    testLocalLlm.mockResolvedValue(testPass());
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+
+    const outcome = await screen.findByText(/Answered in 2.4s/);
+    // The reply IS the evidence — a tick with nothing behind it is the reassurance this exists to
+    // stop giving. Asserted on the outcome line itself rather than the page, which says "ready"
+    // twice more in copy that has nothing to do with the test.
+    expect(outcome.textContent).toContain("ready");
+    expect(testLocalLlm).toHaveBeenCalledWith("chat");
+  });
+
+  it("says when the test itself loaded the model, because PM then owns that memory", async () => {
+    testLocalLlm.mockResolvedValue(testPass({ loaded_for_test: true }));
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+    expect(await screen.findByText(/release setting applies to it/)).toBeTruthy();
+  });
+
+  it("reports a server that answered without saying anything usable as a failure", async () => {
+    // A 200 the gateway would score as `Alive` for health. The question here is different — "does
+    // this work" — and the honest answer is no.
+    testLocalLlm.mockResolvedValue(
+      testPass({
+        ok: false,
+        reply: null,
+        message: "the server answered, but the model's reply was empty.",
+      }),
+    );
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+    expect(await screen.findByText(/reply was empty/)).toBeTruthy();
+    expect(screen.queryByText(/Answered in/)).toBeNull();
+  });
+
+  it("surfaces a refusal raised before anything was sent", async () => {
+    testLocalLlm.mockRejectedValue(new Error("a test is already running"));
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+    expect(await screen.findByText(/already running/)).toBeTruthy();
+  });
+
+  it("drops a result the settings above it have just made untrue", async () => {
+    testLocalLlm.mockResolvedValue(testPass());
+    setLocalLlmRoleModel.mockResolvedValue(undefined);
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+    await screen.findByText(/Answered in 2.4s/);
+
+    // A pass shown against a model you have since swapped is worse than no pass at all.
+    const modelSelect = screen
+      .getAllByRole("combobox")
+      .find((el) => (el as HTMLSelectElement).value === "llama3.2:1b");
+    fireEvent.change(modelSelect as HTMLSelectElement, { target: { value: "" } });
+    await waitFor(() => expect(screen.queryByText(/Answered in 2.4s/)).toBeNull());
+  });
+
+  it("picks a running test back up after the tab has been away", async () => {
+    // The tab router unmounts this view on every switch and a test can take minutes. Held only in
+    // component state, the answer would be lost by looking at another tab — and the button would
+    // come back enabled while the backend was still refusing a second one.
+    activeLocalTest.mockResolvedValue({
+      role: "chat",
+      model: "llama3.2:1b",
+      running: true,
+      result: null,
+    });
+    await loaded();
+    expect(await screen.findByRole("button", { name: /testing/i })).toBeTruthy();
+  });
+
+  it("adopts a result that landed while the tab was elsewhere", async () => {
+    activeLocalTest.mockResolvedValue({
+      role: "chat",
+      model: "llama3.2:1b",
+      running: false,
+      result: testPass(),
+    });
+    await loaded();
+    expect(await screen.findByText(/Answered in 2.4s/)).toBeTruthy();
+  });
+
+  it("never shows a result under a model it did not ask", async () => {
+    // The pickers stay live during a test, and the backend job outlives this view — so a result
+    // can land after the row has been pointed at something else.
+    activeLocalTest.mockResolvedValue({
+      role: "chat",
+      model: "some-other-model",
+      running: false,
+      result: testPass({ model: "some-other-model" }),
+    });
+    await loaded();
+    expect(screen.queryByText(/Answered in/)).toBeNull();
+  });
+
+  it("says what the server was already holding, because loading may have displaced it", async () => {
+    testLocalLlm.mockResolvedValue(
+      testPass({ loaded_for_test: true, was_holding: ["qwen2.5:14b"] }),
+    );
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+    expect(await screen.findByText(/may have unloaded that/)).toBeTruthy();
+    expect(screen.getByText(/qwen2.5:14b/)).toBeTruthy();
+  });
+
+  it("admits when it could not check what was loaded, and what that costs", async () => {
+    // PM only unloads what it can prove it loaded, so a load it could not observe is one it will
+    // never hand back. Saying so beats an invisible leak.
+    testLocalLlm.mockResolvedValue(testPass({ loaded_for_test: null }));
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: /^test it$/i }));
+    expect(await screen.findByText(/won.t hand that memory back/)).toBeTruthy();
+  });
+
+  it("explains the wait before the click when the model is mid-answer", async () => {
+    localLlmStatus.mockResolvedValue(statusFix({ chat_answering: true }));
+    await loaded();
+    // Not a refusal — the button still works. A test arriving during a reply waits for the lane,
+    // which can be the length of the whole reply, and that is worth saying in advance.
+    expect(await screen.findByText(/would wait its turn/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: /^test it$/i }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
   });
 });

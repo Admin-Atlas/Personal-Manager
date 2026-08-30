@@ -10,6 +10,7 @@ import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { ProviderChip } from "./ProviderChip";
 import type { LocalLlmStatus } from "../lib/types";
+import { LOCAL_STATE_LABEL } from "../lib/localStatus";
 
 const st = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   configured: true,
@@ -22,6 +23,12 @@ const st = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   served_window: null,
   served_window_proven: false,
   window_source: null,
+  chat_answering: false,
+  background_answering: false,
+  chat_loaded: null,
+  background_loaded: null,
+  chat_released: false,
+  background_released: false,
   ...over,
 });
 
@@ -46,5 +53,20 @@ describe("ProviderChip", () => {
     expect(
       render(<ProviderChip status={st({ reachable: false })} />).container.textContent,
     ).toContain("unreachable");
+  });
+
+  it("words each state exactly as the sidebar line does", () => {
+    // The substring assertions above are what let the two surfaces drift: the chip said
+    // "resting (using cloud)" and the sidebar "resting - using cloud" for a release and a half,
+    // and "using cloud" passed for both. A shared classifier does not make shared copy — the shared
+    // TABLE does, and this pins the chip to it exactly rather than approximately.
+    for (const [state, over] of [
+      ["connected", { reachable: true }],
+      ["resting", { in_cooldown: true }],
+      ["unreachable", { reachable: false }],
+    ] as const) {
+      const { container } = render(<ProviderChip status={st(over)} />);
+      expect(container.textContent).toContain(LOCAL_STATE_LABEL[state]);
+    }
   });
 });

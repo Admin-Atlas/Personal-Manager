@@ -6,7 +6,13 @@ import type { CalendarOverview, Conversation, LocalLlmStatus } from "../lib/type
 import { calendarOverview, listProjects } from "../lib/ipc";
 import { shortModel } from "../lib/format";
 import { readHidden, readRosterOpen, writeHidden, writeRosterOpen } from "../lib/calendarPrefs";
-import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
+import { localEndpointState, LOCAL_STATE_LABEL, LOCAL_STATE_TOKEN } from "../lib/localStatus";
+import {
+  ACTIVITY_DETAIL,
+  ACTIVITY_LABEL,
+  localModelActivity,
+  type LocalModelActivity,
+} from "../lib/localModelState";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme, sourceColors, sourceShapeIndex } from "../theme";
 import { CalendarSourceList } from "./calendar/CalendarSourceList";
@@ -616,12 +622,14 @@ export function Sidebar({
               role="Chat"
               id={chatModel}
               local={localAi?.chat_local_model ?? null}
+              activity={localModelActivity(localAi, "chat")}
               fallbacks={chatFallbacks}
             />
             <ModelRow
               role="Tasks"
               id={backgroundModel}
               local={localAi?.background_local_model ?? null}
+              activity={localModelActivity(localAi, "background")}
               fallbacks={backgroundFallbacks}
             />
             <LocalRow status={localAi} />
@@ -651,17 +659,20 @@ export function Sidebar({
   );
 }
 
-/** One line of the footer model tag: role label, active model, fallback count. */
+/** One line of the footer model tag: role label, active model, what it is doing, fallback count. */
 function ModelRow({
   role,
   id,
   local,
+  activity,
   fallbacks,
 }: {
   role: string;
   id: string | null;
   /** The local model this role will really reach for, when routing sends it there. */
   local: string | null;
+  /** What that model is doing right now, or `null` when there is nothing PM can honestly say. */
+  activity: LocalModelActivity | null;
   fallbacks: number;
 }) {
   const shown = local ?? id;
@@ -674,6 +685,23 @@ function ModelRow({
       <span className="min-w-0 flex-1 truncate text-ink3" title={title}>
         {shown ? shortModel(shown) : "default"}
       </span>
+      {/* The live half. It renders NOTHING at all when PM cannot honestly answer — a role using
+          cloud, an endpoint with no `/api/ps`, or nothing observed recently enough to repeat — so a
+          row that used to say only a model name still says only a model name. Answering gets the
+          same soft accent chip the fallback count wears; the three resting states stay quiet text,
+          because "not loaded" is ordinary and a permanently highlighted footer is noise. */}
+      {activity && (
+        <span
+          className={
+            activity === "answering"
+              ? "shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1 text-[0.625rem] text-accent-text"
+              : "shrink-0 text-[0.625rem] text-ink4"
+          }
+          title={ACTIVITY_DETAIL[activity]}
+        >
+          {ACTIVITY_LABEL[activity]}
+        </span>
+      )}
       {fallbacks > 0 && (
         <span
           className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1 font-mono text-[0.625rem] text-accent-text"
@@ -693,12 +721,7 @@ function ModelRow({
 function LocalRow({ status }: { status: LocalLlmStatus | null }) {
   const state = localEndpointState(status);
   if (state === null) return null;
-  const label =
-    state === "connected"
-      ? "connected"
-      : state === "resting"
-        ? "resting · using cloud"
-        : "unreachable";
+  const label = LOCAL_STATE_LABEL[state];
   return (
     <div className="flex items-center gap-1.5 text-xs leading-5">
       <span className="w-9 shrink-0 font-mono text-ink4">Local</span>

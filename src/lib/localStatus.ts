@@ -19,6 +19,20 @@ export function localEndpointState(status: LocalLlmStatus | null): LocalEndpoint
   return status.reachable ? "connected" : "unreachable";
 }
 
+/**
+ * The words each endpoint state gets.
+ *
+ * One table because the two surfaces reading it had already drifted: the composer chip said
+ * "resting (using cloud)" while the sidebar line said "resting - using cloud", and the test that
+ * exists to stop exactly that asserted only the substring both happened to share. A shared
+ * classifier does not make shared copy; this does.
+ */
+export const LOCAL_STATE_LABEL: Record<LocalEndpointState, string> = {
+  connected: "connected",
+  resting: "resting (using cloud)",
+  unreachable: "unreachable",
+};
+
 /** The design-system status token (colour var) for each state: quick=green, look=amber, due=red. */
 export const LOCAL_STATE_TOKEN: Record<LocalEndpointState, string> = {
   connected: "--st-quick",

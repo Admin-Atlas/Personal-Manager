@@ -633,12 +633,39 @@ pub async fn unload_model(
     }
 }
 
-/// What the server currently has loaded, per its own `/api/ps`.
+/// What `/api/ps` answered — three states, because two of them are routinely confused.
 ///
-/// `None` when the route did not answer — not an Ollama, unreachable, or refused. That is a
-/// different fact from `Some(vec![])`, "answering and holding nothing", and a caller that flattens
-/// the two will tell someone their card is free when PM simply could not ask.
-pub async fn ollama_ps(base_url: &str, token: Option<&str>) -> Option<Vec<ResidentModel>> {
+/// [`Self::Resident`] with an empty list is a real answer: the server is up and holding nothing.
+/// [`Self::Unknown`] is the absence of an answer. A caller that flattens the two will tell someone
+/// their card is free when PM simply could not ask.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PsAnswer {
+    /// The server answered with what it is holding. An empty list means "nothing", not "no idea".
+    Resident(Vec<ResidentModel>),
+    /// The server answered, and it has no such route.
+    ///
+    /// `/api/ps` is Ollama's own API, and so is the `/api/chat` unload. A server that 404s the first
+    /// does not have the second either, which is the fact the release path needs: llama-server and
+    /// LM Studio hold a model for their whole process life, and asking them to let go is a request
+    /// that can only ever fail. Kept distinct from [`Self::Unknown`] so it can be LATCHED — a
+    /// missing route is permanent for this endpoint, an unreachable host is not.
+    NoRoute,
+    /// PM could not ask: unreachable, a timeout, or a body it could not read. It knows nothing.
+    Unknown,
+}
+
+impl PsAnswer {
+    /// The resident list, or `None` for both of the not-an-answer states.
+    pub fn models(self) -> Option<Vec<ResidentModel>> {
+        match self {
+            Self::Resident(models) => Some(models),
+            Self::NoRoute | Self::Unknown => None,
+        }
+    }
+}
+
+/// What the server currently has loaded, per its own `/api/ps`.
+pub async fn ollama_ps(base_url: &str, token: Option<&str>) -> PsAnswer {
     let url = format!("{base_url}/api/ps");
     let mut req = client_for(base_url)
         .get(&url)
@@ -646,39 +673,40 @@ pub async fn ollama_ps(base_url: &str, token: Option<&str>) -> Option<Vec<Reside
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let response = req.send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
+    let Ok(response) = req.send().await else {
+        return PsAnswer::Unknown;
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return PsAnswer::NoRoute;
     }
-    let value: serde_json::Value = response.json().await.ok()?;
-    value.get("models")?.as_array()?;
-    Some(resident_from_ps(&value))
+    if !response.status().is_success() {
+        return PsAnswer::Unknown;
+    }
+    let Ok(value) = response.json::<serde_json::Value>().await else {
+        return PsAnswer::Unknown;
+    };
+    // A 200 whose body is not the shape `/api/ps` returns is not evidence of anything — including
+    // that the route is missing, since something answered. Unknown, not NoRoute.
+    if value.get("models").and_then(|m| m.as_array()).is_none() {
+        return PsAnswer::Unknown;
+    }
+    PsAnswer::Resident(resident_from_ps(&value))
 }
 
 /// Whether `model` is currently resident, per the server's own `/api/ps`.
 ///
-/// `None` means PM could not ask — unreachable, non-success, or a body it could not parse. That is a
-/// third state and it must stay one: reading "cannot check" as "not resident" is how a confirm loop
-/// turns into a rubber stamp.
-async fn model_is_resident(base_url: &str, model: &str, token: Option<&str>) -> Option<bool> {
-    let url = format!("{base_url}/api/ps");
-    let mut req = client_for(base_url)
-        .get(&url)
-        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let response = req.send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let value: serde_json::Value = response.json().await.ok()?;
-    value.get("models")?.as_array()?;
-    Some(
-        resident_from_ps(&value)
-            .iter()
-            .any(|m| m.model.eq_ignore_ascii_case(model)),
-    )
+/// `None` means PM could not ask — unreachable, no such route, or a body it could not parse. That is
+/// a third state and it must stay one: reading "cannot check" as "not resident" is how a confirm
+/// loop turns into a rubber stamp.
+pub async fn model_is_resident(base_url: &str, model: &str, token: Option<&str>) -> Option<bool> {
+    Some(model_in(&ollama_ps(base_url, token).await.models()?, model))
+}
+
+/// Whether a resident list names `model`. Ollama echoes the id as it was pulled, so the comparison
+/// is case-insensitive; it is otherwise exact, because a looser match would answer for a different
+/// load on a machine serving several.
+pub fn model_in(resident: &[ResidentModel], model: &str) -> bool {
+    resident.iter().any(|m| m.model.eq_ignore_ascii_case(model))
 }
 
 /// One resident model, as `/api/ps` reports it.
@@ -694,6 +722,9 @@ pub struct ResidentModel {
     /// actually using 3.95 GiB of the card — a 1.25 GiB gap. Never present it as the GPU footprint,
     /// and never let it prove that something fits.
     pub size_vram_gb: f64,
+    /// The context window this load was actually given, when the server reports one. A zero is a
+    /// missing value rather than a window of nothing.
+    pub context_length: Option<u32>,
 }
 
 /// The resident models in an `/api/ps` body. Pure, so the shapes are testable without a server.
@@ -714,6 +745,11 @@ pub fn resident_from_ps(value: &serde_json::Value) -> Vec<ResidentModel> {
                         size_vram_gb: m.get("size_vram").and_then(|s| s.as_u64()).unwrap_or(0)
                             as f64
                             / 1e9,
+                        context_length: m
+                            .get("context_length")
+                            .and_then(|c| c.as_u64())
+                            .filter(|c| *c > 0)
+                            .map(|c| c as u32),
                     })
                 })
                 .collect()
@@ -1140,11 +1176,35 @@ pub async fn complete(
     token: Option<&str>,
     messages: &[ChatMessage],
 ) -> LocalResult<Completion> {
+    complete_within(
+        base_url,
+        model,
+        token,
+        messages,
+        tunables::BACKGROUND_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+/// The same call with the deadline named by the caller.
+///
+/// Background work gets [`tunables::BACKGROUND_TOTAL_TIMEOUT`], which is a budget: three of them in
+/// a row are three strikes and a cooled-down endpoint, so it has to be short enough to fail fast. A
+/// test the user is watching is the opposite — it exists to find out whether the thing works at all,
+/// a cold load is the slow case it most needs to survive, and it records no health outcome either
+/// way. Two different questions, so two different deadlines, both named in `tunables`.
+pub async fn complete_within(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    messages: &[ChatMessage],
+    deadline: std::time::Duration,
+) -> LocalResult<Completion> {
     let body = chat_body(model, messages, false);
     let url = format!("{base_url}/v1/chat/completions");
     let mut req = client_for(base_url)
         .post(&url)
-        .timeout(tunables::BACKGROUND_TOTAL_TIMEOUT)
+        .timeout(deadline)
         .json(&body);
     if let Some(t) = token {
         req = req.bearer_auth(t);
@@ -1202,32 +1262,85 @@ pub async fn probe_window(base_url: &str, model: &str, token: Option<&str>) -> W
     pick_window(slots, loaded, models_meta)
 }
 
-/// The two PROVEN rungs only — `/slots`, then Ollama's `/api/ps` — or `None` when neither answered.
+/// One pass of the two PROVEN rungs — `/slots`, then Ollama's `/api/ps` — kept whole instead of
+/// reduced to a number.
 ///
-/// [`probe_window`] can never return `None`: it falls through to [`DEFAULT_CONTEXT`] by design,
+/// [`probe_window`] can never return nothing: it falls through to [`DEFAULT_CONTEXT`] by design,
 /// because a caller sizing a prompt always needs a number. A caller that is merely LOOKING needs the
 /// opposite guarantee — it must be able to learn nothing and write nothing, rather than record PM's
-/// own floor into a cache that other paths read as evidence about the user's server.
+/// own floor into a cache that other paths read as evidence about the user's server. Neither rung
+/// cares who loaded the model, which is what makes a passive caller worth having: the answer is
+/// there whenever something is resident, whoever put it there.
 ///
-/// Neither rung cares who loaded the model, which is what makes a passive caller worth having: the
-/// answer is there whenever something is resident, whoever put it there.
-pub async fn probe_proven_window(
-    base_url: &str,
-    model: &str,
-    token: Option<&str>,
-) -> Option<WindowInfo> {
+/// It is kept whole because the ladder asks the ENDPOINT, not the model — `/slots` describes the one
+/// thing llama-server is running, and a single `/api/ps` lists everything Ollama holds. Asking once
+/// and questioning the ANSWER per model is what lets a two-role setup learn both windows and both
+/// residencies in the two requests a one-role setup already costs.
+pub struct LiveProbe {
+    /// llama-server's `/slots`, which answers about its single load and names no model.
+    slots_ctx: Option<u32>,
+    /// Ollama's `/api/ps`, which answers per model. [`PsAnswer::Unknown`] when `/slots` answered
+    /// first and this was never asked.
+    ps: PsAnswer,
+}
+
+/// Ask both proven rungs, short-circuiting exactly as the ladder always has: `/slots` first, and
+/// `/api/ps` only if it was silent.
+pub async fn probe_live(base_url: &str, token: Option<&str>) -> LiveProbe {
     if let Some(tokens) = probe_slots_ctx(base_url, token).await {
-        return Some(WindowInfo {
-            tokens,
-            source: WindowSource::Slots,
-        });
+        return LiveProbe {
+            slots_ctx: Some(tokens),
+            ps: PsAnswer::Unknown,
+        };
     }
-    probe_loaded_ctx(base_url, model, token)
-        .await
-        .map(|tokens| WindowInfo {
-            tokens,
-            source: WindowSource::LoadedModel,
-        })
+    LiveProbe {
+        slots_ctx: None,
+        ps: ollama_ps(base_url, token).await,
+    }
+}
+
+impl LiveProbe {
+    /// The served window for one model, from whichever rung answered.
+    pub fn window_for(&self, model: &str) -> Option<WindowInfo> {
+        if let Some(tokens) = self.slots_ctx {
+            return Some(WindowInfo {
+                tokens,
+                source: WindowSource::Slots,
+            });
+        }
+        match &self.ps {
+            PsAnswer::Resident(models) => models
+                .iter()
+                .find(|m| m.model.eq_ignore_ascii_case(model))
+                .and_then(|m| m.context_length)
+                .map(|tokens| WindowInfo {
+                    tokens,
+                    source: WindowSource::LoadedModel,
+                }),
+            PsAnswer::NoRoute | PsAnswer::Unknown => None,
+        }
+    }
+
+    /// What the endpoint says it is holding, or `None` when it cannot answer that at all.
+    ///
+    /// Only `/api/ps` answers it, and it answers for the whole ENDPOINT — so a caller with two role
+    /// models asks this once and then questions the list, rather than getting an `Option` per model
+    /// that is always the same variant. `/slots` proves llama-server is holding SOMETHING, for the
+    /// whole life of its process, but never says what: a user who typed a model id that server never
+    /// heard of would be told their model was resident. So the runners without an `/api/ps` report
+    /// "PM cannot tell", which is true, and which the surfaces already render for an unreachable
+    /// endpoint anyway.
+    pub fn residency(&self) -> Option<&[ResidentModel]> {
+        match &self.ps {
+            PsAnswer::Resident(models) => Some(models),
+            PsAnswer::NoRoute | PsAnswer::Unknown => None,
+        }
+    }
+
+    /// Whether the endpoint answered that it has no `/api/ps` — and so no unload gesture either.
+    pub fn no_ollama_api(&self) -> bool {
+        self.ps == PsAnswer::NoRoute
+    }
 }
 
 /// Ollama `/api/ps` reports the RESIDENT models and, for each, the `context_length` it was actually
@@ -1259,21 +1372,18 @@ async fn probe_loaded_ctx(base_url: &str, model: &str, token: Option<&str>) -> O
 /// The `context_length` `/api/ps` reports for `model`, if it is resident. Pure, so the matching —
 /// including the "several models loaded, answer for the right one" case — is testable without a
 /// server.
+///
+/// Built on the same parse and the same matcher as the residency question, so the two cannot
+/// disagree about which row is `model`. They used to: this asked case-SENSITIVELY while the release
+/// path asked case-insensitively, which is a footer able to say "loaded" and "no window" about one
+/// load. Case-insensitive is not the looser test its predecessor's comment feared — Ollama
+/// lower-cases a tag when it pulls it, so two rows differing only in case cannot both exist.
 pub fn loaded_ctx_from_ps(value: &serde_json::Value, model: &str) -> Option<u32> {
-    value
-        .get("models")?
-        .as_array()?
-        .iter()
-        .find(|m| {
-            // Ollama echoes the name as pulled. `model` is what PM sends on the wire, so an exact
-            // match is the honest test; anything looser risks answering for a different load.
-            m.get("name").and_then(|n| n.as_str()) == Some(model)
-                || m.get("model").and_then(|n| n.as_str()) == Some(model)
-        })?
-        .get("context_length")?
-        .as_u64()
-        .and_then(|c| u32::try_from(c).ok())
-        .filter(|c| *c > 0)
+    value.get("models")?.as_array()?;
+    resident_from_ps(value)
+        .into_iter()
+        .find(|m| m.model.eq_ignore_ascii_case(model))?
+        .context_length
 }
 
 /// One model in an Ollama server's own store, from `/api/tags` — whether or not it is loaded.
@@ -1892,6 +2002,97 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The three answers `/api/ps` can give, and the two that are routinely confused.
+    #[test]
+    fn ps_answer_keeps_could_not_ask_apart_from_holding_nothing() {
+        assert_eq!(PsAnswer::Resident(vec![]).models(), Some(vec![]));
+        assert_eq!(PsAnswer::NoRoute.models(), None);
+        assert_eq!(PsAnswer::Unknown.models(), None);
+
+        // A server answering that it holds nothing is a REAL answer about residency.
+        let empty = LiveProbe {
+            slots_ctx: None,
+            ps: PsAnswer::Resident(vec![]),
+        };
+        assert_eq!(
+            empty.residency().map(|m| model_in(m, "gemma3:4b")),
+            Some(false)
+        );
+        // Neither of the other two is. Reading either as "not loaded" is the inversion that would
+        // tell an LM Studio user their model is unloaded for as long as they own it.
+        for ps in [PsAnswer::NoRoute, PsAnswer::Unknown] {
+            let probe = LiveProbe {
+                slots_ctx: None,
+                ps,
+            };
+            assert!(probe.residency().is_none());
+        }
+    }
+
+    /// The latch fix: only a 404 says "this endpoint has no Ollama API", and only that may be
+    /// remembered forever. An unreachable host must never be latched — it comes back.
+    #[test]
+    fn only_a_missing_route_is_a_permanent_fact_about_the_endpoint() {
+        let no_route = LiveProbe {
+            slots_ctx: None,
+            ps: PsAnswer::NoRoute,
+        };
+        assert!(no_route.no_ollama_api());
+        for ps in [PsAnswer::Unknown, PsAnswer::Resident(vec![])] {
+            let probe = LiveProbe {
+                slots_ctx: None,
+                ps,
+            };
+            assert!(!probe.no_ollama_api());
+        }
+    }
+
+    /// `/slots` proves llama-server is holding SOMETHING and names nothing, so it answers the window
+    /// question and must decline the residency one.
+    #[test]
+    fn slots_answers_the_window_and_says_nothing_about_which_model() {
+        let probe = LiveProbe {
+            slots_ctx: Some(8192),
+            ps: PsAnswer::Unknown,
+        };
+        let window = probe.window_for("anything-at-all").expect("a window");
+        assert_eq!(window.tokens, 8192);
+        assert_eq!(window.source, WindowSource::Slots);
+        // A user who typed a model id this server never heard of would otherwise be told it is
+        // resident, on the strength of a route that never looked at the id.
+        assert!(probe.residency().is_none());
+    }
+
+    /// One `/api/ps` body answers both questions, and the two answers agree about which row is the
+    /// model — including on case, which they used to disagree about.
+    #[test]
+    fn one_ps_read_answers_residency_and_window_about_the_same_row() {
+        let body = serde_json::json!({"models":[
+            {"model":"Qwen2.5:7B-Instruct-Q4_K_M","size":5000000000u64,
+             "size_vram":4748056984u64,"context_length":4096},
+            {"model":"gemma3:4b","size":3000000000u64,"size_vram":0,"context_length":0}
+        ]});
+        let probe = LiveProbe {
+            slots_ctx: None,
+            ps: PsAnswer::Resident(resident_from_ps(&body)),
+        };
+        // Ollama lower-cases a tag when it pulls it, so two rows differing only in case cannot both
+        // exist — and the two questions must not answer about different rows.
+        let here = |m: &str| probe.residency().map(|list| model_in(list, m));
+        assert_eq!(here("qwen2.5:7b-instruct-q4_K_M"), Some(true));
+        assert_eq!(
+            probe
+                .window_for("qwen2.5:7b-instruct-q4_K_M")
+                .map(|w| (w.tokens, w.source)),
+            Some((4096, WindowSource::LoadedModel))
+        );
+        // A zero context_length is a missing value, not a window of nothing — and it must not make
+        // the model look absent.
+        assert_eq!(here("gemma3:4b"), Some(true));
+        assert_eq!(probe.window_for("gemma3:4b"), None);
+        assert_eq!(here("mistral:7b"), Some(false));
     }
 
     #[test]
