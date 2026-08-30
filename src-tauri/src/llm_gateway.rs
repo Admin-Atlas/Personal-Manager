@@ -553,7 +553,11 @@ async fn run_local_complete(
         // memory its own failed call reserved.
         rt.mark_pm_loaded(&local.base_url, &local.model);
         let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
-        match rt.slot.run_background(attempt).await {
+        match rt
+            .slot
+            .run_background(crate::local_slot::Lane::Background, attempt)
+            .await
+        {
             SlotOutcome::Ran(Ok(completion)) => {
                 // A reply nothing can use is not a clean success. `Ok` clears the strike streak,
                 // the cooldown AND the ejection count, so a server that truncates every reply (an
@@ -569,6 +573,11 @@ async fn run_local_complete(
                 } else {
                     CallOutcome::Ok
                 });
+                // It answered, so it is on the card — whatever the last `/api/ps` said. Written
+                // BEFORE the ping, because the ping is what makes the sidebar re-read: without
+                // this the footer could report "not loaded" seconds after the model replied, and
+                // stay wrong until the next debounced probe half a minute later.
+                rt.cache_resident(&local.base_url, &local.model, true);
                 ping_status(app);
                 ensure_local_window_cached(app, local);
                 return Ok(LlmOutcome {
@@ -790,6 +799,9 @@ where
             } else {
                 CallOutcome::Ok
             });
+            // Same rule as the background arm: a reply is proof of residency, and the ping below
+            // is what makes the sidebar re-read.
+            rt.cache_resident(&local.base_url, &local.model, true);
             ping_status(app);
             ensure_local_window_cached(app, local);
             Ok(LlmOutcome {
@@ -1010,7 +1022,10 @@ fn cooldown_message(rt: &crate::local_slot::LocalRuntime) -> String {
 }
 
 /// Convert a wire failure into a friendly user-facing error for the local-only path (no fallback).
-fn local_failure_to_error(failure: &LocalFailure) -> Error {
+///
+/// Shared with the Local AI tab's test button so a failure gets ONE wording wherever it is met — the
+/// same sentence in a settings panel and in a chat error is what lets someone match the two.
+pub(crate) fn local_failure_to_error(failure: &LocalFailure) -> Error {
     let base = match failure.kind {
         LocalFailKind::Refused => {
             "couldn't reach the local model endpoint — is the server running?"

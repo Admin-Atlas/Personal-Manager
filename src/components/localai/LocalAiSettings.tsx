@@ -17,6 +17,9 @@ import {
   localHardwareScan,
   localLlmStatus,
   localModelRecommendations,
+  testLocalLlm,
+  activeLocalTest,
+  onLocalLlmStatus,
   probeLocalLlmPorts,
   acceptLocalModelTerms,
   pullLocalModel,
@@ -42,12 +45,14 @@ import type {
   LocalRecommendations,
   LocalRescanCadence,
   LocalServedModel,
+  LocalTestResult,
   PullProgress,
   PullSnapshot,
 } from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
 import { IngestProgress } from "../IngestProgress";
 import { installCommand, runnerGuides } from "../../lib/workbenchGuide";
+import { subscribeUntilCleanup } from "../../lib/subscribe";
 import { downloadedState, type DownloadedState } from "./downloadedState";
 import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import {
@@ -81,6 +86,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   // server serves nothing when PM simply doesn't know.
   const [servedLoaded, setServedLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Which role's test is in flight, and the last outcome per role. Shared rather than per-row so a
+  // running test disables BOTH buttons: the backend refuses a second one anyway, and a button that
+  // can only produce "a test is already running" is not a button worth offering.
+  const [testing, setTesting] = useState<string | null>(null);
+  const [tests, setTests] = useState<Record<string, RoleTest>>({});
 
   // Endpoint form.
   const [urlInput, setUrlInput] = useState("");
@@ -252,9 +262,21 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     };
     void tick();
     const id = setInterval(tick, 30000);
+    // Also on the push signal. The status now carries whether a role is answering RIGHT NOW, and a
+    // 30 s tick cannot report a thing that lasts six seconds: the "this model is answering, so a
+    // test would wait its turn" hint beside each role would be a coin flip. The event fires when a
+    // call starts and again when it ends, so the hint appears and clears with the call.
+    const offStatus = subscribeUntilCleanup(() =>
+      onLocalLlmStatus(() => {
+        localLlmStatus()
+          .then((s) => !cancelled && setStatus(s))
+          .catch(() => {});
+      }),
+    );
     return () => {
       cancelled = true;
       clearInterval(id);
+      offStatus();
     };
   }, [configured]);
 
@@ -404,6 +426,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       setUrlInput(normalized);
       setTokenInput("");
       setCheck(null);
+      // A pass proves a MODEL on a SERVER, and the server just changed. The role models are
+      // deliberately left in place by the backend, so without this a green result from the old
+      // endpoint would sit under a row now pointing at a different machine.
+      setTests({});
       await reloadConfig();
     } catch (e) {
       setError(String(e));
@@ -418,6 +444,8 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     setError(null);
     try {
       await clearLocalLlmToken();
+      // The token is part of what a pass proved: without it the same server may now refuse.
+      setTests({});
       // Nothing else refreshes `config`, so without this the "(with a saved token)" line stays on
       // screen after the token is gone.
       await reloadConfig();
@@ -432,6 +460,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       await clearLocalLlmEndpoint();
       setCheck(null);
       setDetected(null);
+      setTests({});
       await reloadConfig();
     } catch (e) {
       setError(String(e));
@@ -440,15 +469,82 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
 
   function changeRoleModel(role: "chat" | "background", model: string) {
     setConfig((c) => (c ? { ...c, [`${role}_model`]: model || null } : c));
+    clearTest(role);
     void setLocalLlmRoleModel(role, model).catch((e) => setError(String(e)));
   }
 
   function changeRouting(role: "chat" | "background", pref: string) {
     setConfig((c) => (c ? { ...c, [`${role}_routing`]: pref } : c));
+    clearTest(role);
     void setLocalLlmRouting(role, pref as "cloud" | "local" | "local-then-cloud").catch((e) =>
       setError(String(e)),
     );
   }
+
+  /** Drop a test result the settings above it have just made untrue — the same rule the endpoint
+   *  Check follows when the URL or token changes. A pass shown against a model you have since
+   *  swapped is worse than no pass at all. */
+  function clearTest(role: "chat" | "background") {
+    setTests((t) => ({ ...t, [role]: { result: null, error: null } }));
+  }
+
+  /** Ask the role's model to actually answer something.
+   *
+   *  Everything the tab could check before this was metadata: the server answers, the weights are on
+   *  disk, the id is in the list. The setups that fail fail at the step none of that covers — an id
+   *  the server does not recognise, a chat template that returns an empty string, a model that
+   *  starts loading and never finishes. The backend does the careful part (report what was already
+   *  loaded, yield to chat, own nothing it did not load, record no health verdict) and OWNS the job,
+   *  so this promise resolving is a convenience rather than the only way the answer arrives. */
+  async function runTest(role: "chat" | "background") {
+    setTesting(role);
+    setTests((t) => ({ ...t, [role]: { result: null, error: null } }));
+    try {
+      const result = await testLocalLlm(role);
+      setTests((t) => ({ ...t, [role]: { result, error: null } }));
+    } catch (e) {
+      setTests((t) => ({ ...t, [role]: { result: null, error: String(e) } }));
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  /** Adopt the backend's test job, on mount and while one is running.
+   *
+   *  The tab router unmounts this view on every switch and a test can legitimately take minutes, so
+   *  without this a user who looked at another tab came back to a re-armed button, no sign anything
+   *  was happening, and a backend still refusing a second test — with the answer they were waiting
+   *  for already thrown away. The snapshot is the source of truth, exactly as it is for the pull. */
+  useEffect(() => {
+    let cancelled = false;
+    const adopt = () => {
+      void activeLocalTest()
+        .then((snap) => {
+          if (cancelled || !snap) return;
+          setTesting(snap.running ? snap.role : null);
+          if (snap.result) {
+            setTests((t) => ({
+              ...t,
+              [snap.role]: { result: snap.result, error: null },
+            }));
+          }
+        })
+        .catch(() => {
+          /* a failed read leaves the view as it is; the next tick corrects it */
+        });
+    };
+    adopt();
+    // Only while something is running — a finished test needs no cadence at all.
+    if (testing === null)
+      return () => {
+        cancelled = true;
+      };
+    const id = setInterval(adopt, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [testing]);
 
   /** Download, once the terms behind this model have been shown and accepted (if they need to be).
    *
@@ -950,6 +1046,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               served={served}
               onModel={(m) => changeRoleModel("chat", m)}
               onRouting={(p) => changeRouting("chat", p)}
+              onTest={() => void runTest("chat")}
+              testing={testing === "chat"}
+              testsBlocked={testing !== null}
+              busy={status?.chat_answering ?? false}
+              test={tests.chat}
             />
             <RoleRow
               label="Background"
@@ -959,6 +1060,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               served={served}
               onModel={(m) => changeRoleModel("background", m)}
               onRouting={(p) => changeRouting("background", p)}
+              onTest={() => void runTest("background")}
+              testing={testing === "background"}
+              testsBlocked={testing !== null}
+              busy={status?.background_answering ?? false}
+              test={tests.background}
             />
             {servedLoaded && served.length === 0 && (
               // Unfolded, for the same reason as the two hints below: the settings doctrine folds
@@ -1832,6 +1938,9 @@ const ROUTING_OPTIONS = [
   { value: "local-then-cloud", label: "Local, fall back to cloud" },
 ];
 
+/** One role's last test: a result the backend returned, or a refusal it raised before running. */
+type RoleTest = { result: LocalTestResult | null; error: string | null };
+
 function RoleRow({
   label,
   hint,
@@ -1840,6 +1949,11 @@ function RoleRow({
   served,
   onModel,
   onRouting,
+  onTest,
+  testing,
+  testsBlocked,
+  busy,
+  test,
 }: {
   label: string;
   hint: string;
@@ -1848,6 +1962,14 @@ function RoleRow({
   served: LocalServedModel[];
   onModel: (m: string) => void;
   onRouting: (p: string) => void;
+  onTest: () => void;
+  /** This row's test is the one running. */
+  testing: boolean;
+  /** Some test is running — this row's or the other's. */
+  testsBlocked: boolean;
+  /** This role's model is answering something right now. */
+  busy: boolean;
+  test: RoleTest | undefined;
 }) {
   // Keep the currently-saved model selectable even if the endpoint isn't serving it right now.
   // The embedder gate is applied AFTER this line, not by filtering `served` before it — otherwise
@@ -1888,8 +2010,92 @@ function RoleRow({
             </option>
           ))}
         </Select>
+        {/* Only where there is something to test. A role set to cloud has no local pair, and the
+            backend refuses that case anyway — offering the button there would be a control whose
+            only outcome is an error message. */}
+        {routing !== "cloud" && model.trim() !== "" && (
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onTest}
+            disabled={testsBlocked}
+            title="Send one short message to this model and show you what comes back"
+          >
+            {testing ? "Testing…" : "Test it"}
+          </Button>
+        )}
       </div>
+      {/* Said before the click, not after it: a test arriving while the model is mid-answer waits
+          for the lane, which can be the length of a whole reply. The button still works — this is
+          an explanation of the wait, not a refusal. */}
+      {busy && !testing && (
+        <p className="mt-1 text-[0.6875rem] text-ink4">
+          This model is answering something right now, so a test would wait its turn.
+        </p>
+      )}
+      {testing && (
+        <p className="mt-1 text-[0.6875rem] text-ink4">
+          Waiting for a reply. If the model isn&rsquo;t loaded yet this includes loading it, which
+          can take a while the first time.
+        </p>
+      )}
+      {test?.error && <p className="mt-1 text-[0.6875rem] text-st-due">{test.error}</p>}
+      {/* Only against the model it actually asked. The model picker stays live during a test (there
+          is no reason to freeze the settings you may be testing), and the backend job outlives this
+          view — so without this a result can land under a model that was never asked anything. */}
+      {test?.result && test.result.model === model && <TestOutcome result={test.result} />}
     </div>
+  );
+}
+
+/** What the test found — shown as the model's own words rather than a tick, because the reply IS
+ *  the evidence and a green tick with nothing behind it is the reassurance this feature exists to
+ *  stop giving. */
+function TestOutcome({ result }: { result: LocalTestResult }) {
+  const seconds = (result.elapsed_ms / 1000).toFixed(1);
+  if (!result.ok) {
+    return (
+      <p className="mt-1 text-[0.6875rem] text-st-due">
+        {result.message ?? "The test didn't get a usable reply."}
+      </p>
+    );
+  }
+  return (
+    <>
+      <p className="mt-1 text-[0.6875rem] text-st-quick">
+        Answered in {seconds}s
+        {result.reply ? (
+          <>
+            {" — "}
+            <span className="text-ink3">&ldquo;{result.reply}&rdquo;</span>
+          </>
+        ) : null}
+      </p>
+      {result.loaded_for_test === true && (
+        <p className="mt-1 text-[0.6875rem] text-ink4">
+          PM loaded the model for this, so your release setting applies to it.
+          {result.was_holding.length > 0 && (
+            // PM cannot stop a server making room, and pretending otherwise would be worse than
+            // saying what was there: someone reading a pass deserves to know why their next message
+            // might take a few seconds.
+            <>
+              {" "}
+              Your server was already holding{" "}
+              <span className="text-ink3">{result.was_holding.join(", ")}</span> — if it needed the
+              room, it may have unloaded that to fit this in.
+            </>
+          )}
+        </p>
+      )}
+      {result.loaded_for_test === null && (
+        // The honest consequence of not being able to ask. PM only unloads what it can prove it
+        // loaded, so a load it could not observe is one it will never hand back.
+        <p className="mt-1 text-[0.6875rem] text-ink4">
+          PM couldn&rsquo;t check what your server already had loaded. If the test loaded this
+          model, PM won&rsquo;t hand that memory back on its own — your server decides.
+        </p>
+      )}
+    </>
   );
 }
 

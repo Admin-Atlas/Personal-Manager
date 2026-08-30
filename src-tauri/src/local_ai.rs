@@ -448,6 +448,9 @@ pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<Strin
     let conn = state.conn()?;
     db::set_setting(&conn, LOCAL_BASE_URL_KEY, &normalized)?;
     drop(conn);
+    // The last test proved a model answered on the OLD server. Cleared in the backend, not just in
+    // the view, because the view re-reads this snapshot every time it mounts.
+    state.local_ai.clear_finished_test();
     // A newly-configured endpoint should light up the chat sidebar / status chip at once.
     crate::llm_gateway::ping_status(&app);
     Ok(normalized)
@@ -464,6 +467,7 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     db::delete_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?;
     drop(conn);
     secrets::clear_local_llm_endpoint_token()?;
+    state.local_ai.clear_finished_test();
     // A forgotten endpoint should drop the chat sidebar's provider line to zero pixels at once.
     crate::llm_gateway::ping_status(&app);
     Ok(())
@@ -702,6 +706,24 @@ pub struct LocalLlmStatus {
     /// `llm_gateway::sizing_window` clamps it to the floor, so without the source the panel can
     /// show a reassuring 32768 while PM is quietly compressing everything to fit 4096.
     pub window_source: Option<String>,
+    /// A local call for this role is in flight RIGHT NOW — the model is answering, or is queued
+    /// behind something else that is.
+    ///
+    /// Counted from the moment the call enters the slot rather than from the moment it reaches the
+    /// server, because both mean the same thing to someone reading the footer: PM is asking, and the
+    /// answer is not back. Housekeeping (an unload) counts for neither role.
+    pub chat_answering: bool,
+    pub background_answering: bool,
+    /// Whether the role's model is on the graphics card. `None` is "PM cannot tell" — the endpoint
+    /// has no `/api/ps` (llama-server, LM Studio, a `/v1`-only proxy), or nothing has been observed
+    /// recently enough to still be worth saying. It must never be rendered as "not loaded": that
+    /// inversion is the whole reason this is three-valued.
+    pub chat_loaded: Option<bool>,
+    pub background_loaded: Option<bool>,
+    /// PM itself handed this model back, on the user's own release policy. Only meaningful while the
+    /// model is not loaded, and it is what separates "your server let it go" from "you asked PM to".
+    pub chat_released: bool,
+    pub background_released: bool,
 }
 
 /// The local model a role will really use, or `None` when the role goes to cloud.
@@ -755,6 +777,12 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             served_window: None,
             served_window_proven: false,
             window_source: None,
+            chat_answering: false,
+            background_answering: false,
+            chat_loaded: None,
+            background_loaded: None,
+            chat_released: false,
+            background_released: false,
         });
     }
 
@@ -796,6 +824,13 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
                 // replace an honest "not measured yet" with a number the panel attributes to the
                 // user's server, and would start `window_probe_due` throttling the post-call probe
                 // that is this cache's only other writer.
+                if !ok {
+                    // PM asked and got nothing back, so it no longer knows what this server holds.
+                    // Without this the last reading stands for its whole TTL — and stands in the
+                    // SAME footer as the "unreachable" line directly beneath it, which is a display
+                    // contradicting itself rather than admitting it cannot see.
+                    app.state::<AppState>().local_ai.clear_resident(&base_url);
+                }
                 if ok {
                     let mut models: Vec<&str> = [
                         background_local_model.as_deref(),
@@ -806,13 +841,48 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
                     .collect();
                     // One role usually, and very often the same model on both.
                     models.dedup();
-                    for model in models {
-                        if let Some(info) =
-                            openai_compat::probe_proven_window(&base_url, model, tok).await
-                        {
-                            app.state::<AppState>()
-                                .local_ai
-                                .cache_window(&base_url, model, info);
+                    // Nothing bound to either role means there is nothing to ask ABOUT, and both
+                    // rungs answer per model: an endpoint connected but not yet assigned — the state
+                    // every setup passes through — must not start paying for two requests a tick.
+                    //
+                    // One pass of the ladder for the ENDPOINT, questioned per model — `/slots`
+                    // describes llama-server's single load and `/api/ps` lists everything Ollama
+                    // holds, so neither gets more informative by being asked twice. Two roles on
+                    // two models used to cost four requests on this tick; they now cost the two a
+                    // single role already did.
+                    if !models.is_empty() {
+                        let probe = openai_compat::probe_live(&base_url, tok).await;
+                        let state = app.state::<AppState>();
+                        // A server that 404s `/api/ps` has no unload gesture either — the same fact
+                        // the release path latches, learned here on a tick that was happening
+                        // anyway rather than only after an unload has been attempted and failed.
+                        //
+                        // Latched HERE and not in the residency command, because here it is
+                        // corroborated: `ok` above means `/v1/models` answered, so a server that
+                        // then 404s `/api/ps` is genuinely not an Ollama, rather than an
+                        // intermediary answering 404 for everything while the real server is
+                        // momentarily unrouted. This latch is permanent for the session, so it must
+                        // only be set on evidence that cannot be a blip.
+                        if probe.no_ollama_api() {
+                            state.local_ai.mark_no_unload_route(&base_url);
+                        }
+                        for model in &models {
+                            if let Some(info) = probe.window_for(model) {
+                                state.local_ai.cache_window(&base_url, model, info);
+                            }
+                        }
+                        // Learned on the SAME two requests. `/api/ps` answers for the ENDPOINT, so
+                        // it answers for every role model or for none — and "for none" clears the
+                        // last reading rather than leaving it to age out, because a stale "loaded"
+                        // outliving PM's ability to check it is the one answer worse than none.
+                        match probe.residency() {
+                            Some(resident) => {
+                                for model in &models {
+                                    let here = openai_compat::model_in(resident, model);
+                                    state.local_ai.cache_resident(&base_url, model, here);
+                                }
+                            }
+                            None => state.local_ai.clear_resident(&base_url),
                         }
                     }
                 }
@@ -864,12 +934,52 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         }
     };
 
+    // The live half. Every one of these is an in-memory read — two atomic loads and two short-lived
+    // mutexes — so the footer's cadence costs the user's server nothing beyond the debounced probe
+    // above. Deliberately NOT routed through the slot: `LocalSlot`'s guards stamp the quiet clock on
+    // the way out, so a status read that took the lane would keep the idle-release timer permanently
+    // fresh and the graphics card would never come back.
+    let (chat_answering, background_answering, chat_loaded, background_loaded) = {
+        let state = app.state::<AppState>();
+        let loaded = |model: Option<&str>| -> Option<bool> {
+            match (base_url.as_deref(), model) {
+                (Some(url), Some(m)) => state.local_ai.cached_resident(url, m),
+                _ => None,
+            }
+        };
+        (
+            state
+                .local_ai
+                .slot
+                .role_in_flight(crate::local_slot::Lane::Chat)
+                > 0,
+            state
+                .local_ai
+                .slot
+                .role_in_flight(crate::local_slot::Lane::Background)
+                > 0,
+            loaded(chat_local_model.as_deref()),
+            loaded(background_local_model.as_deref()),
+        )
+    };
+    let released = |model: Option<&str>| -> bool {
+        match (base_url.as_deref(), model) {
+            (Some(url), Some(m)) => app.state::<AppState>().local_ai.was_released_by_pm(url, m),
+            _ => false,
+        }
+    };
     Ok(LocalLlmStatus {
         configured: true,
         reachable,
         in_cooldown,
         cooldown_remaining_s,
         probed_now: probe_now,
+        chat_answering,
+        background_answering,
+        chat_loaded,
+        background_loaded,
+        chat_released: released(chat_local_model.as_deref()),
+        background_released: released(background_local_model.as_deref()),
         chat_local_model,
         background_local_model,
         served_window,
@@ -1128,42 +1238,53 @@ pub async fn local_gpu_residency(app: AppHandle) -> Result<GpuResidency> {
         );
         (policy, idle.as_secs() / 60)
     };
-    let resident = match configured_endpoint(&app).await? {
+    // ONE endpoint resolution. It costs a DB read, the call-time posture gate (a DNS lookup for a
+    // hostname endpoint) and a keychain read, and this command used to do all of it twice — once for
+    // the residency read and again, further down, purely to ask which base URL to look the unload
+    // latch up under.
+    let endpoint = configured_endpoint(&app).await?;
+    let (resident, no_unload_route) = match &endpoint {
         Endpoint::Ready(base_url, token) => {
-            openai_compat::ollama_ps(&base_url, token.as_ref().map(|s| s.expose()))
-                .await
-                .map(|models| {
-                    let state = app.state::<AppState>();
-                    models
-                        .into_iter()
-                        .map(|m| ResidentEntry {
-                            pm_loaded: state.local_ai.is_pm_loaded(&base_url, &m.model),
-                            model: m.model,
-                            size_gb: m.size_gb,
-                            size_vram_gb: m.size_vram_gb,
-                        })
-                        .collect()
-                })
+            let answer =
+                openai_compat::ollama_ps(base_url, token.as_ref().map(|s| s.expose())).await;
+            let state = app.state::<AppState>();
+            // Deliberately does NOT latch `no_unload_route` on a 404 here, though it could: this
+            // command asks `/api/ps` cold, with nothing corroborating that the server is up at all,
+            // and an intermediary can answer 404 for everything while the real server is briefly
+            // unrouted (a dropped ngrok tunnel returns exactly that). The latch is permanent for the
+            // session, so it is set only where a successful `/v1/models` probe has just proved the
+            // server IS answering — in `local_llm_status`, which runs every 30 s while an endpoint
+            // is configured, so nothing is lost by waiting for it.
+            let rows = answer.models().map(|models| {
+                models
+                    .into_iter()
+                    .map(|m| ResidentEntry {
+                        pm_loaded: state.local_ai.is_pm_loaded(base_url, &m.model),
+                        model: m.model,
+                        size_gb: m.size_gb,
+                        size_vram_gb: m.size_vram_gb,
+                    })
+                    .collect()
+            });
+            (rows, state.local_ai.has_no_unload_route(base_url))
         }
-        Endpoint::Refused | Endpoint::Unconfigured => None,
+        Endpoint::Refused | Endpoint::Unconfigured => (None, false),
     };
     let vram_gb = app
         .state::<AppState>()
         .local_ai
         .cached_hardware()
         .and_then(|h| h.vram_gb);
-    let no_unload_route = match configured_endpoint(&app).await? {
-        Endpoint::Ready(base_url, _) => app
-            .state::<AppState>()
-            .local_ai
-            .has_no_unload_route(&base_url),
-        _ => false,
-    };
+    // Reads every DRM connector's `status` file. Blocking, so it goes where the rest of the blocking
+    // hardware probes go — off the async runtime — rather than stalling a worker on a sysfs walk.
+    let dgpu_displays = tokio::task::spawn_blocking(hardware::dgpu_displays)
+        .await
+        .unwrap_or_default();
     Ok(GpuResidency {
         resident,
         vram_gb,
         no_unload_route,
-        dgpu_displays: hardware::dgpu_displays(),
+        dgpu_displays,
         policy: policy.as_setting().to_string(),
         idle_minutes,
     })
@@ -1327,12 +1448,22 @@ async fn release_pm_models(
     if loaded.is_empty() {
         return summary;
     }
-    // One `/api/ps` read, doing both jobs. `None` means PM could not ask, so it knows nothing and
-    // does nothing — the opposite reading would have it unload on no evidence at all.
-    let Some(resident) = openai_compat::ollama_ps(base_url, token).await else {
-        return summary;
+    // One `/api/ps` read, doing both jobs — and answering in three states, because two of them lead
+    // somewhere different. A server with no such route has no `/api/chat` unload either, so PM
+    // latches that and stops asking; "could not ask" is not a fact about the server at all, so PM
+    // knows nothing and does nothing. Reading either as "nothing is loaded" would have PM act on no
+    // evidence, and reading NoRoute as "could not ask" is what left the latch unreachable on exactly
+    // the servers it was written for, at twenty seconds a try for the life of the process.
+    let resident = match openai_compat::ollama_ps(base_url, token).await {
+        openai_compat::PsAnswer::Resident(models) => models,
+        openai_compat::PsAnswer::NoRoute => {
+            state.local_ai.mark_no_unload_route(base_url);
+            summary.no_route = true;
+            return summary;
+        }
+        openai_compat::PsAnswer::Unknown => return summary,
     };
-    let is_resident = |model: &str| resident.iter().any(|r| r.model.eq_ignore_ascii_case(model));
+    let is_resident = |model: &str| openai_compat::model_in(&resident, model);
 
     let mut releasable: Vec<String> = Vec::new();
     for (_, model) in &loaded {
@@ -1365,6 +1496,11 @@ async fn release_pm_models(
         match outcome {
             openai_compat::UnloadOutcome::Freed => {
                 state.local_ai.clear_pm_loaded(base_url, &model);
+                // Confirmed gone, and gone because PM asked — the two facts the footer needs to say
+                // "released" rather than the bare "not loaded" it would otherwise show for a thing
+                // the user's own setting did.
+                state.local_ai.cache_resident(base_url, &model, false);
+                state.local_ai.mark_released(base_url, &model);
                 summary.freed += 1;
             }
             openai_compat::UnloadOutcome::NoRoute => {
@@ -1378,6 +1514,294 @@ async fn release_pm_models(
         }
     }
     summary
+}
+
+/// What one "does this actually work" test found.
+///
+/// A real completion, because everything PM could already check is metadata: `/v1/models` proves the
+/// server answers and lists ids, the disk crawl proves the weights are there, and neither of them
+/// has ever asked the pair to produce a token. The setups that fail do so at exactly that step — a
+/// model id the server does not recognise, a chat template that returns an empty string, a machine
+/// that starts loading and never finishes.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LocalTestResult {
+    /// The model that was asked, so a result cannot be read against the wrong row.
+    pub model: String,
+    /// It answered with something usable — not truncated, not blank.
+    pub ok: bool,
+    /// What it actually said, trimmed and capped. Evidence rather than a claim: a green tick that
+    /// shows nothing is exactly the reassurance this feature exists to stop giving.
+    pub reply: Option<String>,
+    /// Wall-clock for the whole thing, cold load included.
+    pub elapsed_ms: u64,
+    /// The test had to load the model, so PM owns that load and the release policy applies to it.
+    /// `None` when PM could not tell — the endpoint has no `/api/ps`, or did not answer it.
+    pub loaded_for_test: Option<bool>,
+    /// OTHER models the server was holding when the test started.
+    ///
+    /// PM cannot stop a server making room. Ollama's own FAQ says a model that will not fit beside
+    /// a loaded one causes the loaded one to be unloaded, and that decision is the server's. So the
+    /// honest thing is to say what was there before, and let someone reading a passed test know why
+    /// their next chat message might be slow.
+    pub was_holding: Vec<String>,
+    /// What went wrong, in the user's words. `None` when nothing did.
+    pub message: Option<String>,
+}
+
+/// The in-flight (or last-finished) test, for a settings view that has just mounted.
+///
+/// Backend-owned because the tab router unmounts this view on every switch and a test can take
+/// minutes. Held in component state alone, a result would be lost by looking at another tab while it
+/// ran — and worse, the button would come back enabled while the backend was still refusing a second
+/// test, so the only thing a second click could produce was an error.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TestSnapshot {
+    /// Which role is being tested: `"chat"` or `"background"`.
+    pub role: String,
+    /// The model it is asking. The view compares this against what the role is set to NOW, so a
+    /// result cannot be shown under a model the user changed to while it was running.
+    pub model: String,
+    pub running: bool,
+    /// The outcome, once there is one. Present with `running: false` is a finished test.
+    pub result: Option<LocalTestResult>,
+}
+
+/// The in-flight or last-finished test.
+#[tauri::command]
+pub fn active_local_test(state: State<'_, AppState>) -> Option<TestSnapshot> {
+    state.local_ai.active_test()
+}
+
+/// The one prompt every test sends. Short, so a cold load dominates the timing rather than the
+/// generation, and phrased as an instruction so a reply that ignores it is still a usable reply —
+/// this proves the pair can produce tokens, and is emphatically not a quality benchmark.
+const TEST_PROMPT: &str = "Reply with just the word: ready";
+
+/// The most reply PM will show back. A model that ignores the instruction and writes an essay is
+/// still a pass; it is not a reason to put an essay in a settings panel.
+const TEST_REPLY_CAP: usize = 240;
+
+/// Ask the configured model to actually answer something, and report what happened.
+///
+/// Four rules, each of which the release work (#820) had to learn the hard way:
+///
+///   * **`/api/ps` is read FIRST, and what it says is reported rather than acted on.** If the model
+///     is already resident the test costs nothing and PM says so; if it is not, PM says which other
+///     models were there, because loading this one may make the server unload one of them. PM
+///     deliberately does not "protect" anything by refusing to test: a server making room is the
+///     server's decision, and a diagnostic that declines to run is not a diagnostic.
+///   * **Ownership is only claimed for a load this test caused.** Marking a model PM found already
+///     resident would have the idle timer unload something the user started in a terminal — the
+///     precise consent violation the ownership rule exists to prevent. So the marker is written only
+///     when `/api/ps` positively said the model was NOT there.
+///   * **It yields to chat.** The lane is taken as background work, so a chat turn arriving mid-test
+///     is not made to wait behind it. A preemption is reported as "busy", never as a failure.
+///   * **It records no health outcome.** A diagnostic the user ran is not evidence about the server:
+///     scoring a pass would clear a real failure streak, and scoring a failure would cool down an
+///     endpoint the user is in the middle of debugging. That is what `Neutral` means, and it is why
+///     a test is allowed to run during a cooldown at all — it is the natural thing to click when the
+///     endpoint is resting, and it cannot make that better or worse.
+#[tauri::command]
+pub async fn test_local_llm(app: AppHandle, role: String) -> Result<LocalTestResult> {
+    let model = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let (routing_key, model_key) = match role.as_str() {
+            "chat" => (CHAT_ROUTING_KEY, LOCAL_CHAT_MODEL_KEY),
+            "background" => (BACKGROUND_ROUTING_KEY, LOCAL_BACKGROUND_MODEL_KEY),
+            other => return Err(Error::Other(format!("unknown role '{other}'"))),
+        };
+        role_local_model(
+            db::get_setting(&conn, routing_key)?.as_deref(),
+            db::get_setting(&conn, model_key)?.as_deref(),
+        )
+    };
+    let Some(model) = model else {
+        return Err(Error::Other(
+            "this role is set to use the cloud, so there is no local model to test".into(),
+        ));
+    };
+    let endpoint = configured_endpoint(&app).await?;
+    let (base_url, token) = match endpoint {
+        Endpoint::Ready(base_url, token) => (base_url, token),
+        Endpoint::Refused => return Err(Error::Other(CALL_TIME_REFUSAL.into())),
+        Endpoint::Unconfigured => {
+            return Err(Error::Other("no local endpoint is configured".into()))
+        }
+    };
+    let tok = token.as_ref().map(|s| s.expose());
+
+    // Held for the whole command, so a second click while this one is in flight is refused rather
+    // than queued behind it in the slot.
+    let state = app.state::<AppState>();
+    let Some(_test) = state.local_ai.begin_test(&role, &model) else {
+        return Err(Error::Other(
+            "a test is already running — give it a moment".into(),
+        ));
+    };
+
+    let answer = openai_compat::ollama_ps(&base_url, tok).await;
+    if answer == openai_compat::PsAnswer::NoRoute {
+        state.local_ai.mark_no_unload_route(&base_url);
+    }
+    // `Some(true)` = PM was told it is not there and is about to put it there. `None` = PM could not
+    // ask, and both possible answers are wrong to assume: claiming a load it did not cause takes
+    // ownership of the user's model, and claiming none leaks memory PM can never free. It says so.
+    let (loaded_for_test, was_holding) = match &answer {
+        openai_compat::PsAnswer::Resident(models) => {
+            // This read is fresher than anything the footer has; keep it, so the line above the
+            // button cannot contradict the result printed under it.
+            let here = openai_compat::model_in(models, &model);
+            state.local_ai.cache_resident(&base_url, &model, here);
+            let others = models
+                .iter()
+                .map(|m| m.model.clone())
+                .filter(|m| !m.eq_ignore_ascii_case(&model))
+                .collect();
+            (Some(!here), others)
+        }
+        openai_compat::PsAnswer::NoRoute | openai_compat::PsAnswer::Unknown => (None, Vec::new()),
+    };
+    if loaded_for_test == Some(true) {
+        // Before the wire, never on success: a load that then times out has still happened, and the
+        // memory it took is exactly what PM must be able to hand back.
+        state.local_ai.mark_pm_loaded(&base_url, &model);
+    }
+
+    let waiting_since = std::time::Instant::now();
+    let messages = vec![crate::openrouter::ChatMessage {
+        role: "user".to_string(),
+        content: TEST_PROMPT.to_string(),
+    }];
+    // Timed from INSIDE the lane. The wait for the lane is unbounded — a test clicked mid-reply
+    // queues behind the whole of it — and folding that into "answered in Xs" would present someone
+    // else's generation as this model's latency, which is the one number the line claims to be.
+    let attempt = async {
+        let sent = std::time::Instant::now();
+        let out = openai_compat::complete_within(
+            &base_url,
+            &model,
+            tok,
+            &messages,
+            crate::local_slot::tunables::LOCAL_TEST_TOTAL_TIMEOUT,
+        )
+        .await;
+        (sent.elapsed(), out)
+    };
+    // Background MANNERS, housekeeping IDENTITY. It must yield to chat like background work does —
+    // a diagnostic that made someone wait for their reply would be a poor trade — but it is not the
+    // Tasks model answering, and counting it as one would have the footer name the wrong role: click
+    // Test on the Chat row and the Tasks row would light up.
+    let outcome = state
+        .local_ai
+        .slot
+        .run_background(crate::local_slot::Lane::Housekeeping, attempt)
+        .await;
+    // Every arm, including the ones that never reached the server. A test is never evidence.
+    state
+        .local_ai
+        .record(crate::local_slot::CallOutcome::Neutral);
+    // A preemption never reached the wire, so the only honest number is how long PM waited.
+    let elapsed_ms = match &outcome {
+        crate::local_slot::SlotOutcome::Ran((took, _)) => took.as_millis() as u64,
+        crate::local_slot::SlotOutcome::Preempted => waiting_since.elapsed().as_millis() as u64,
+    };
+
+    let result = match outcome {
+        crate::local_slot::SlotOutcome::Preempted => LocalTestResult {
+            model: model.clone(),
+            ok: false,
+            reply: None,
+            elapsed_ms,
+            loaded_for_test,
+            was_holding: was_holding.clone(),
+            message: Some(
+                "your model was busy answering a chat message, so the test stood aside. Try it \
+                 again in a moment."
+                    .into(),
+            ),
+        },
+        crate::local_slot::SlotOutcome::Ran((_, Ok(completion))) => {
+            // It produced tokens, so it is on the card whatever `/api/ps` said a moment ago.
+            state.local_ai.cache_resident(&base_url, &model, true);
+            match completion.usable_text() {
+                Some(text) => LocalTestResult {
+                    model: model.clone(),
+                    ok: true,
+                    reply: Some(cap_reply(text)),
+                    elapsed_ms,
+                    loaded_for_test,
+                    was_holding: was_holding.clone(),
+                    message: None,
+                },
+                // A 200 that delivered nothing usable. The gateway demotes this to `Alive` for
+                // health; here it is simply a fail, because the question was "does this work".
+                None => LocalTestResult {
+                    model: model.clone(),
+                    ok: false,
+                    reply: None,
+                    elapsed_ms,
+                    loaded_for_test,
+                    was_holding: was_holding.clone(),
+                    message: Some(format!(
+                        "the server answered, but {}.",
+                        completion
+                            .unusable_reason()
+                            .unwrap_or("the reply was not usable")
+                    )),
+                },
+            }
+        }
+        crate::local_slot::SlotOutcome::Ran((_, Err(failure))) => LocalTestResult {
+            model: model.clone(),
+            ok: false,
+            reply: None,
+            elapsed_ms,
+            loaded_for_test,
+            was_holding: was_holding.clone(),
+            message: Some(crate::llm_gateway::local_failure_to_error(&failure).to_string()),
+        },
+    };
+    // A marker written before the wire has to be settled against what actually happened.
+    //
+    // PM claims ownership BEFORE sending, because a load that then fails has still taken the memory.
+    // But two of the arms above mean the model may never have loaded at all: a preemption can happen
+    // before the request leaves (the early `chat_waiting` bail sends nothing), and a refused or
+    // unreachable endpoint never loaded anything either. A marker left standing over a model that is
+    // not there is not merely untidy — the next thing to load that model might be the USER, in a
+    // terminal, and PM would then believe it owned their load and unload it under them. So on
+    // anything but a proven answer, PM asks once more and keeps the claim only if the model is
+    // really there.
+    if loaded_for_test == Some(true) && !result.ok {
+        match openai_compat::ollama_ps(&base_url, tok).await {
+            openai_compat::PsAnswer::Resident(models) => {
+                let here = openai_compat::model_in(&models, &model);
+                if !here {
+                    state.local_ai.clear_pm_loaded(&base_url, &model);
+                }
+                state.local_ai.cache_resident(&base_url, &model, here);
+            }
+            // Could not ask, so PM cannot prove it is NOT there. The claim stands: leaking a model
+            // PM can free is recoverable, and unloading someone else's is not.
+            openai_compat::PsAnswer::NoRoute | openai_compat::PsAnswer::Unknown => {}
+        }
+    }
+    // Recorded where a view that was unmounted when it landed can still find it. The guard marks the
+    // job finished on its way out, whatever happened.
+    state.local_ai.finish_test(result.clone());
+    // The residency and ownership this test may have changed are on the surfaces above the button.
+    // Re-read them rather than leave a status line contradicting the result underneath it.
+    crate::llm_gateway::ping_status(&app);
+    Ok(result)
+}
+
+/// Trim a reply to something a settings panel can hold, on a character boundary.
+fn cap_reply(text: &str) -> String {
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth(TEST_REPLY_CAP) {
+        Some((byte, _)) => format!("{}...", &trimmed[..byte]),
+        None => trimmed.to_string(),
+    }
 }
 
 /// How long PM may spend giving the graphics card back on the way out.
@@ -2639,5 +3063,27 @@ mod tests {
             // refusal. (Rejected locally by getaddrinfo, so this issues no DNS query.)
             assert!(!endpoint_refused_now("http://not a host:11434").await);
         });
+    }
+
+    /// The test result shows the model's own words back, so the cap has to hold a String that may be
+    /// any bytes the model produced — including multi-byte ones exactly on the boundary.
+    #[test]
+    fn a_test_reply_is_capped_on_a_character_boundary() {
+        assert_eq!(cap_reply("  ready  "), "ready");
+        assert_eq!(cap_reply("ready"), "ready");
+
+        // Exactly at the cap: nothing to trim, and nothing appended.
+        let exact: String = "a".repeat(TEST_REPLY_CAP);
+        assert_eq!(cap_reply(&exact), exact);
+
+        // Over it, in characters that are three bytes each — a byte-indexed slice here would panic.
+        let long: String = "\u{4f60}".repeat(TEST_REPLY_CAP + 50);
+        let capped = cap_reply(&long);
+        assert_eq!(
+            capped.chars().count(),
+            TEST_REPLY_CAP + 3,
+            "the cap plus the ellipsis"
+        );
+        assert!(capped.ends_with("..."));
     }
 }

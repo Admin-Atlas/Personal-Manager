@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { LocalLlmStatus } from "../lib/types";
-import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
+import { localEndpointState, LOCAL_STATE_LABEL, LOCAL_STATE_TOKEN } from "../lib/localStatus";
 
 /**
  * A compact "Local · <state>" pill for the chat composer, next to the context meter. Renders
@@ -13,12 +13,7 @@ export function ProviderChip({ status }: { status: LocalLlmStatus | null }) {
   const state = localEndpointState(status);
   if (state === null) return null;
 
-  const label =
-    state === "connected"
-      ? "connected"
-      : state === "resting"
-        ? "resting (using cloud)"
-        : "unreachable";
+  const label = LOCAL_STATE_LABEL[state];
   const token = LOCAL_STATE_TOKEN[state];
 
   return (

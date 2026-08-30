@@ -20,6 +20,12 @@ const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   served_window: null,
   served_window_proven: false,
   window_source: null,
+  chat_answering: false,
+  background_answering: false,
+  chat_loaded: null,
+  background_loaded: null,
+  chat_released: false,
+  background_released: false,
   ...over,
 });
 

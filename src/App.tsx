@@ -223,7 +223,7 @@ export default function App() {
   }
   // Live local-endpoint status for the chat provider surfaces (sidebar Local line, composer chip,
   // per-message provenance). One instance, shared down — the "subscribe once" rule (#297 PR6).
-  const localAi = useLocalLlmStatus();
+  const localAi = useLocalLlmStatus(aiReady);
   const update = useUpdater();
   const { teachVisible, mapVisible } = useTheme();
   const { devMode } = useDevMode();
