@@ -49,6 +49,7 @@ import { formatBytes, formatGib } from "../../lib/format";
 import { IngestProgress } from "../IngestProgress";
 import { installCommand, runnerGuides } from "../../lib/workbenchGuide";
 import { downloadedState, type DownloadedState } from "./downloadedState";
+import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import {
   Button,
   Callout,
@@ -1071,6 +1072,9 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
           </p>
         </SectionInfo>
       </div>
+
+      {/* ── Holding the graphics card ─────────────────────────────────────────────────────── */}
+      <LocalAiLifecycle configured={configured} />
     </>
   );
 }

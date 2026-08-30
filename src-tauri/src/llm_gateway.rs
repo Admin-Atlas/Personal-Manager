@@ -548,6 +548,10 @@ async fn run_local_complete(
     loop {
         let start = Instant::now();
         let token = local.token.as_ref().map(Secret::expose);
+        // Mark BEFORE the wire, not on success: a cold load that then times out has still left the
+        // model resident, and a marker written only on success would leave PM unable to free the
+        // memory its own failed call reserved.
+        rt.mark_pm_loaded(&local.base_url, &local.model);
         let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
         match rt.slot.run_background(attempt).await {
             SlotOutcome::Ran(Ok(completion)) => {
@@ -762,6 +766,9 @@ where
     let local_result = {
         let first = &mut first;
         let on_token = &mut on_token;
+        // Same rule as the background arm: marked before the request, so a load PM caused but never
+        // got an answer from is still PM's to release.
+        rt.mark_pm_loaded(&local.base_url, &local.model);
         let attempt = openai_compat::stream_chat(
             &local.base_url,
             &local.model,

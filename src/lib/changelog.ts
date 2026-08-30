@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.135.0-alpha",
+    date: "2026-08-30",
+    highlights: [
+      "PM can now give your graphics card back when you aren\u2019t using it. A local model sits in your card\u2019s memory for as long as your server keeps it there, which on some setups is until you restart. There\u2019s a new section in Settings \u203a Local AI that shows what is loaded and how much of your card it is using, and lets you choose what happens: leave it entirely to your server (the default, and nothing changes), hand the memory back when you quit PM, or hand it back after a quiet period you pick. There\u2019s also a Release now button for when you want the card this second.",
+      "Two rules it keeps, because getting either wrong would be worse than not having the feature. PM only ever unloads a model it loaded itself \u2014 one you started in a terminal is left alone, and if your model gets swapped out and you reload it yourself, PM notices and stops considering it PM\u2019s. And PM never changes how long your server keeps models by itself: asking for that even once would quietly reprogram the server for every other program talking to it, so PM runs its own timer and sends a plain unload instead.",
+      "The tray icon setting now also appears in Local AI, next to the release options, because it decides what \u201cquit\u201d means \u2014 with the tray on, closing the window leaves PM running and your model loaded. And if an external monitor is sharing your graphics card, PM says so and then does nothing about it: plugging in a screen usually means you are about to do more work, not less, and dropping your model at that moment would be the wrong call to make on your behalf.",
+    ],
+  },
+  {
     version: "3.134.0-alpha",
     date: "2026-08-30",
     highlights: [

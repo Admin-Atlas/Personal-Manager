@@ -7,6 +7,8 @@ import { announceSettingSaved, isSettingWrite } from "./settingsSaved";
 import { pushLanding } from "./documentFeed";
 import type { RepairOutcome, VaultFault } from "./types";
 import type {
+  LocalGpuResidency,
+  LocalReleaseSettings,
   AiProviderStatus,
   AppLockStatus,
   BackupEntry,
@@ -1620,6 +1622,20 @@ export const localHardwareScan = (force = false) =>
 
 /** The Workbench payload: the hardware scan + the curated catalog scored against this machine +
  *  any models the configured endpoint already serves + any found on disk, sorted best-fit first. */
+/** What the local server currently has loaded, and what PM may release (#786 item 8). */
+export const localGpuResidency = () => invoke<LocalGpuResidency>("local_gpu_residency");
+
+/** Hand the graphics card back now. Returns how many models were actually freed, so the UI can say
+ *  "nothing to free" rather than implying it did something. Only ever releases models PM loaded. */
+export const releaseLocalGpu = () => invoke<number>("release_local_gpu");
+
+export const getLocalReleasePolicy = () => invoke<LocalReleaseSettings>("get_local_release_policy");
+
+/** Store the release policy. `idleMinutes` is clamped in Rust, so an out-of-range value is corrected
+ *  rather than rejected. */
+export const setLocalReleasePolicy = (policy: string, idleMinutes?: number) =>
+  invoke<void>("set_local_release_policy", { policy, idleMinutes });
+
 export const localModelRecommendations = () =>
   invoke<LocalRecommendations>("local_model_recommendations");
 

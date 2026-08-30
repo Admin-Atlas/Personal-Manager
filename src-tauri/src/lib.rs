@@ -57,6 +57,7 @@ mod local_catalog;
 // On-disk installed-model crawl (#449): find GGUF models a runner has downloaded but isn't serving,
 // so the Workbench can size them without you loading them first. Read-only, metadata only.
 mod local_disk;
+
 mod local_slot;
 // Local-folder indexing (board card 6): a third index-only source on the shared foundation, reading
 // from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
@@ -83,6 +84,7 @@ mod project_activity;
 mod projects;
 mod python_fetch;
 mod registry;
+mod residency;
 mod retag;
 mod retrieval;
 mod retrieval_config;
@@ -1507,6 +1509,7 @@ pub fn run() {
             // also runs synchronously on every briefing refresh; gated on unlocked + idle + not
             // mid-sync, and a no-op until there are milestones/events in the near window.
             flags::spawn_flag_detection_scheduler(handle.clone());
+            local_ai::spawn_release_scheduler(handle.clone());
 
             // Keep the daily briefing current without the user clicking Refresh (#540): picks up an
             // inputs-changed nudge (calendar sync, milestone edit, flag resolved) within a minute
@@ -1572,6 +1575,10 @@ pub fn run() {
             local_ai::set_local_model_scan_dir,
             local_ai::local_better_fit_notice,
             local_ai::dismiss_local_better_fit,
+            local_ai::local_gpu_residency,
+            local_ai::release_local_gpu,
+            local_ai::get_local_release_policy,
+            local_ai::set_local_release_policy,
             local_ai::set_local_model_rescan_cadence,
             settings::get_settings,
             settings::settings_defaults,
@@ -1858,8 +1865,13 @@ pub fn run() {
             // still alive (see `wipe::final_sweep_after_purge` for the trace through tao). It
             // narrows the window rather than closing it, and it is deliberately the belt to the
             // braces of clearing the webview's own storage before the directory behind it goes.
-            if matches!(event, tauri::RunEvent::Exit) && paths::data_dir_is_purged() {
-                wipe::final_sweep_after_purge(app);
+            if matches!(event, tauri::RunEvent::Exit) {
+                if paths::data_dir_is_purged() {
+                    wipe::final_sweep_after_purge(app);
+                }
+                // Hand the graphics card back, if that is what the user asked for. Here and only
+                // here: `process::exit` follows this closure, so no destructor will ever run.
+                local_ai::release_gpu_on_exit(app);
             }
         });
 }
