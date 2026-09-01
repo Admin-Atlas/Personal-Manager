@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.136.1-alpha",
+    date: "2026-08-30",
+    highlights: [
+      "Under-the-hood tidying: the Local AI tab is now built from six pieces instead of one very long file. Nothing about it looks or behaves differently \u2014 it is the same screen \u2014 but each part of it (your machine, the model catalogue, what you have downloaded, the connection, the roles, and holding the graphics card) is now its own self-contained piece, which is what makes the redesign coming next something that can be done carefully rather than all at once.",
+    ],
+  },
+  {
     version: "3.136.0-alpha",
     date: "2026-08-30",
     highlights: [

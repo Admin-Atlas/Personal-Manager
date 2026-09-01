@@ -14,7 +14,7 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
-import { DownloadedModels } from "./LocalAiSettings";
+import { DownloadedModels } from "./LocalAiDownloaded";
 
 // `useTheme` is stubbed so the section's <Button>s don't need the full ThemeProvider, matching
 // ConnectorItemRow.test.tsx.
