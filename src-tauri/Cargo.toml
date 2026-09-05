@@ -92,7 +92,7 @@ base64 = "0.23"
 # pulled in beside sha2 0.11. XChaCha20-Poly1305 encrypts the Markdown at rest (its
 # 192-bit nonce is safe to pick at random under the many small metadata rewrites).
 # uuid mints the stable per-vault id that keys the per-profile keychain cache.
-argon2 = "0.5"
+argon2 = "0.6"
 blake3 = "1"
 # `stream` enables the aead::stream STREAM construction (EncryptorBE32/DecryptorBE32),
 # used by the encrypted-backup archive to seal the compressed payload in 1 MiB chunks
