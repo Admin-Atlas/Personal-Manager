@@ -70,7 +70,7 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 # Encrypted backup (Proton Drive / user cloud): the portable `.pmbackup` archive is
 # zstd-compressed at level 19 (cold storage — ratio over speed) before the passphrase
 # encryption layer. Streaming Encoder/Decoder keeps peak memory flat over a large DB.
-zstd = "0.13"
+zstd = "0.14"
 
 # Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
 # all in one bundled, vendored connection — no system SQLite needed.
