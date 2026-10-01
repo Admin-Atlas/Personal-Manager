@@ -1411,6 +1411,23 @@ pub struct OllamaTag {
     /// into `None` here so a caller cannot mistake it for a quantization it merely lacks a size for.
     /// Untrusted content — the server read it out of a file — so bound it before display.
     pub quant: Option<String>,
+    /// `details.parameter_size` in billions (`"7.62B"` → 7.62, `"494.03M"` → 0.494), or `None` when
+    /// absent or not a size. What lets a bare library tag like `qwen2.5:latest`, whose name carries
+    /// no size at all, be matched back to a catalogue entry (`local_catalog::match_served`).
+    pub parameter_size_b: Option<f64>,
+}
+
+/// Parse Ollama's `details.parameter_size` (`"7.62B"`, `"494.03M"`) into billions. A trailing `B`/`b`
+/// is billions and `M`/`m` millions; anything else — `"unknown"`, a bare number, a negative or
+/// non-finite one — is `None`, because a guessed size would match the wrong catalogue entry.
+pub fn parse_parameter_size(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    let (number, scale) = match s.strip_suffix(['B', 'b']) {
+        Some(n) => (n, 1.0),
+        None => (s.strip_suffix(['M', 'm'])?, 1e-3),
+    };
+    let value: f64 = number.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value * scale)
 }
 
 /// Ollama's own inventory: every model in its store, loaded or not, with the real byte size of each.
@@ -1465,6 +1482,11 @@ pub fn tags_from_json(value: &serde_json::Value) -> Option<Vec<OllamaTag>> {
                         .map(str::trim)
                         .filter(|q| !q.is_empty() && !q.eq_ignore_ascii_case("unknown"))
                         .map(str::to_string),
+                    parameter_size_b: m
+                        .get("details")
+                        .and_then(|d| d.get("parameter_size"))
+                        .and_then(|p| p.as_str())
+                        .and_then(parse_parameter_size),
                 })
             })
             .collect(),
@@ -1860,6 +1882,30 @@ mod tests {
         // the UNKNOWN quantization yet" — asserting knowledge the server had just disclaimed.
         assert_eq!(tags[0].quant, None);
         assert_eq!(tags[1].quant.as_deref(), Some("Q5_K_M"));
+        // The parameter count rides along — the one fact a bare library tag's name does not carry.
+        assert_eq!(tags[0].parameter_size_b, Some(3.88));
+        assert_eq!(tags[1].parameter_size_b, Some(7.62));
+    }
+
+    #[test]
+    fn a_parameter_size_is_read_in_billions_or_not_at_all() {
+        assert_eq!(parse_parameter_size("7.62B"), Some(7.62));
+        assert_eq!(parse_parameter_size(" 8.0b "), Some(8.0));
+        let small = parse_parameter_size("494.03M").unwrap();
+        assert!((small - 0.49403).abs() < 1e-9, "{small}");
+        // Ollama's own "I don't know", and the shapes a guess would hide behind.
+        for raw in ["unknown", "", "7.62", "B", "-7B", "NaNB", "infB", "7.6 GB"] {
+            assert_eq!(parse_parameter_size(raw), None, "{raw:?}");
+        }
+
+        // Missing from the listing entirely: no size, never a zero.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"models":[{"name":"llama3.2:latest","size":2019393189,"details":{}},
+                          {"name":"qwen2.5:latest","size":4683087332}]}"#,
+        )
+        .unwrap();
+        let tags = tags_from_json(&body).expect("a tags listing");
+        assert!(tags.iter().all(|t| t.parameter_size_b.is_none()));
     }
 
     #[test]

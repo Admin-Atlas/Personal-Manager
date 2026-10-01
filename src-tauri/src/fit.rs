@@ -273,6 +273,25 @@ pub enum Verdict {
     Unknown,
 }
 
+/// Where a speed estimate's bandwidth figure came from, so the UI can say how far to trust it. The
+/// arithmetic is the same on every path — bandwidth over the active weight bytes read per token — but
+/// the bandwidth is a published spec on one path, a typical figure on two, and on shared memory a
+/// number PM does not stand behind at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedBasis {
+    /// Resident on a discrete GPU PM recognised, at that card's published memory bandwidth.
+    GpuPublished,
+    /// Resident on a discrete GPU PM did not recognise, at [`GPU_BANDWIDTH_FALLBACK_GBPS`].
+    GpuTypical,
+    /// Resident in memory shared with the processor (Apple Silicon, an APU, an iGPU). Shared-memory
+    /// bandwidth varies too much from chip to chip for PM to put a number on it yet.
+    Shared,
+    /// Larger than the GPU (or there is none), so it runs from system RAM at
+    /// [`SYSTEM_BANDWIDTH_GBPS`].
+    System,
+}
+
 /// The full result of scoring one model against one machine.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FitResult {
@@ -286,6 +305,9 @@ pub struct FitResult {
     pub kv: KvCache,
     pub est_memory_gb: Option<f64>,
     pub est_tokens_per_sec: Option<f64>,
+    /// Which bandwidth [`Self::est_tokens_per_sec`] was worked out from, so the UI can word the
+    /// number as a ceiling, a typical figure or no figure at all. `None` when there is no estimate.
+    pub speed_basis: Option<SpeedBasis>,
     /// Honest, user-facing caveats (GPU-vs-RAM speed, halved context, thin headroom). The KV precision
     /// is carried structurally in `kv`, not here.
     pub notes: Vec<String>,
@@ -338,25 +360,48 @@ fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32, kv: KvCache) 
 
 /// Rough decode throughput: read bandwidth divided by the *active* weight bytes touched per token
 /// (MoE only reads its active experts). Uses GPU bandwidth when the footprint fits in VRAM, else
-/// system RAM. Returns `None` if the model has no active weight bytes (nonsensical input).
+/// system RAM, and says which. Returns `None` if the model has no active weight bytes (nonsensical
+/// input).
+///
+/// Speed is an upper bound, not a forecast. On a recognised discrete GPU with the config resident on
+/// the GPU, it must never be below real decode speed, and has measured +11% (Qwen2.5 7B Q5_K_M: est
+/// 71, ~64 real) to +55% (gemma 3 4b Q4_K_M: est 162, ~105 real) above it on an RTX 5060 Laptop GPU
+/// at 384 GB/s (n=2). PM claims no tolerance for an unrecognised card, shared memory or system RAM,
+/// and no ranking may order by its magnitude: the one comparison PM makes is the background floor
+/// (better_fit), computed at the deliberately low SYSTEM_BANDWIDTH_GBPS.
 fn tokens_per_sec(
     spec: &ModelSpec,
     cand: &QuantCandidate,
     footprint_gb: f64,
     hw: &FitHardware,
-) -> Option<f64> {
+) -> Option<(f64, SpeedBasis)> {
     let active_weight_gb = spec.active_params_b * cand.quant.bytes_per_param();
     if active_weight_gb <= 0.0 {
         return None;
     }
     let on_gpu = hw.vram_gb.is_some_and(|v| v >= footprint_gb);
-    let bandwidth = if on_gpu {
-        // A recognised card's real spec, else the flat fallback for an unlisted GPU.
-        hw.gpu_bandwidth_gbps.unwrap_or(GPU_BANDWIDTH_FALLBACK_GBPS)
+    if !on_gpu {
+        return Some((SYSTEM_BANDWIDTH_GBPS / active_weight_gb, SpeedBasis::System));
+    }
+    // A recognised card's real spec, else the flat fallback for an unlisted GPU. The basis changes
+    // only what PM is willing to claim about the number, never the number: shared memory keeps the
+    // figure it always had, and the UI declines to show it.
+    let bandwidth = hw.gpu_bandwidth_gbps.unwrap_or(GPU_BANDWIDTH_FALLBACK_GBPS);
+    let basis = if hw.unified_memory {
+        SpeedBasis::Shared
+    } else if hw.gpu_bandwidth_gbps.is_some() {
+        SpeedBasis::GpuPublished
     } else {
-        SYSTEM_BANDWIDTH_GBPS
+        SpeedBasis::GpuTypical
     };
-    Some(bandwidth / active_weight_gb)
+    Some((bandwidth / active_weight_gb, basis))
+}
+
+/// Decode speed from system RAM at [`SYSTEM_BANDWIDTH_GBPS`], whatever the machine has. The one speed
+/// figure PM compares against anything: the background floor in `better_fit`, which needs the
+/// pessimistic number on purpose — a model that clears it from system RAM clears it anywhere.
+pub fn system_tokens_per_sec(active_params_b: f64, q: Quant) -> f64 {
+    SYSTEM_BANDWIDTH_GBPS / (active_params_b * q.bytes_per_param())
 }
 
 /// The context ladder: the target, then repeated halving, never below the floor. Always includes at
@@ -443,7 +488,11 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
 
                 let mut notes: Vec<String> = Vec::new();
                 let on_gpu = hw.vram_gb.is_some_and(|v| v >= mem);
-                if on_gpu {
+                if on_gpu && hw.unified_memory {
+                    // Shared memory is not a faster pool than the RAM it is carved from, so the
+                    // discrete-card promise below would be a speed claim PM cannot make here.
+                    notes.push("Fits the memory this computer's graphics can use.".to_string());
+                } else if on_gpu {
                     notes.push("Fits your GPU's memory — expect GPU-class speed.".to_string());
                 } else if hw.vram_gb.is_some() {
                     notes.push(
@@ -468,13 +517,15 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
                     notes.push("Fits, but with little memory headroom.".to_string());
                 }
 
+                let speed = tokens_per_sec(spec, cand, mem, hw);
                 return FitResult {
                     verdict,
                     quant: Some(cand.quant),
                     context: Some(ctx),
                     kv,
                     est_memory_gb: Some(round2(mem)),
-                    est_tokens_per_sec: tokens_per_sec(spec, cand, mem, hw).map(round1),
+                    est_tokens_per_sec: speed.map(|(tps, _)| round1(tps)),
+                    speed_basis: speed.map(|(_, basis)| basis),
                     notes,
                 };
             }
@@ -489,6 +540,7 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
         kv: KvCache::F16,
         est_memory_gb: None,
         est_tokens_per_sec: None,
+        speed_basis: None,
         notes: vec!["Too large for this machine's memory — better run in the cloud.".to_string()],
     }
 }
@@ -537,6 +589,32 @@ pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFi
     GpuFit::Split { fit: gpu }
 }
 
+/// The best config that fits the card with its reserve AND free RAM.
+///
+/// What PM's pick (`better_fit::judge`) sizes against on a discrete card: a config that lives
+/// entirely on the GPU, with the [`GPU_RESERVE_GB`] PM keeps free there, that the machine can also
+/// hold in RAM right now. `None` on unified memory or with no card figure (the same two guards
+/// [`gpu_fit`] opens with), when the RAM verdict already refused (`Unknown` / `StayOnCloud`), or
+/// when nothing fits the card at all.
+///
+/// For every [`GpuFit::Split`] this is the very rung `gpu_fit` returned — the same call at the same
+/// budget, because a Split's RAM config is larger than the card, so the RAM budget never binds — and
+/// for [`GpuFit::NoGpuResident`] it is `None`. The one case it adds is the reserve band: a RAM config
+/// in `(vram − GPU_RESERVE_GB, vram]`, which `gpu_fit` calls `Single` because it already reports GPU
+/// speed, while it does not keep the reserve. There this returns the config that does.
+pub fn resident_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> Option<FitResult> {
+    if hw.unified_memory {
+        return None;
+    }
+    let vram = hw.vram_gb?;
+    if matches!(ram_fit.verdict, Verdict::Unknown | Verdict::StayOnCloud) {
+        return None;
+    }
+    let budget = (vram - GPU_RESERVE_GB).max(0.0).min(ram_budget_gb(hw));
+    let g = fit_within(spec, budget, hw);
+    (!matches!(g.verdict, Verdict::Unknown | Verdict::StayOnCloud)).then_some(g)
+}
+
 /// A fit result for a model we deliberately won't score — an unmodelled architecture, or (from the
 /// installed scan) a model not in the catalog. The verdict is `Unknown`; `reason` is the single
 /// user-facing note.
@@ -548,6 +626,7 @@ pub fn unknown(reason: String) -> FitResult {
         kv: KvCache::F16,
         est_memory_gb: None,
         est_tokens_per_sec: None,
+        speed_basis: None,
         notes: vec![reason],
     }
 }
@@ -728,6 +807,7 @@ mod tests {
             kv: KvCache::F16,
             est_memory_gb: Some(gb),
             est_tokens_per_sec: Some(30.0),
+            speed_basis: None,
             notes: vec![],
         }
     }
@@ -1305,5 +1385,182 @@ mod tests {
     fn gpu_reserve_is_smaller_than_the_system_reserve() {
         // VRAM holds only the display + compute buffers, not the whole OS + PM.
         assert!(gpu_reserve_gb() < reserve_gb());
+    }
+
+    // --- speed honesty and the resident config (the Local AI tab redesign) ---------------------
+
+    #[test]
+    fn every_speed_says_which_bandwidth_it_came_from() {
+        // One small model, four machines — one per path through `tokens_per_sec`. The number is
+        // the same arithmetic on all four; what differs is how far PM can stand behind it, and the
+        // UI words each one differently ("up to", "about", or no figure at all).
+        let spec = dense(7.0, 4096, vec![q(Quant::Q4_K_M, 4.3)]);
+        let published = FitHardware {
+            gpu_bandwidth_gbps: Some(384.0),
+            ..gpu(32.0, 24.0)
+        };
+        let shared = FitHardware {
+            unified_memory: true,
+            ..gpu(32.0, 24.0)
+        };
+        for (hw, want) in [
+            (published, SpeedBasis::GpuPublished),
+            (gpu(32.0, 24.0), SpeedBasis::GpuTypical),
+            (shared, SpeedBasis::Shared),
+            (ram(32.0), SpeedBasis::System),
+            // A card too small for the config runs it from system RAM, at system speed.
+            (gpu(32.0, 2.0), SpeedBasis::System),
+        ] {
+            let r = fit(&spec, &hw);
+            assert_eq!(r.speed_basis, Some(want), "{hw:?}");
+            assert!(r.est_tokens_per_sec.is_some(), "{hw:?}");
+        }
+
+        // The basis never moves the number: shared memory keeps the figure it always had.
+        let tps = |hw: &FitHardware| fit(&spec, hw).est_tokens_per_sec.unwrap();
+        assert_eq!(tps(&shared), tps(&gpu(32.0, 24.0)));
+
+        // No estimate, no basis.
+        let huge = dense(405.0, 8192, vec![q(Quant::IQ2_XS, 146.0)]);
+        let cloud = fit(&huge, &ram(16.0));
+        assert_eq!(cloud.verdict, Verdict::StayOnCloud);
+        assert_eq!(cloud.speed_basis, None);
+        assert_eq!(unknown("x".to_string()).speed_basis, None);
+    }
+
+    #[test]
+    fn a_shared_memory_fit_promises_no_gpu_class_speed() {
+        // Shared memory is carved out of the same RAM, so "expect GPU-class speed" would be a speed
+        // claim PM cannot make there. The discrete wording is untouched.
+        let spec = dense(7.0, 4096, vec![q(Quant::Q4_K_M, 4.3)]);
+        let shared = FitHardware {
+            unified_memory: true,
+            ..gpu(32.0, 24.0)
+        };
+        let r = fit(&spec, &shared);
+        assert!(
+            r.notes.iter().all(|n| !n.contains("GPU-class speed")),
+            "{:?}",
+            r.notes
+        );
+        assert!(r
+            .notes
+            .iter()
+            .any(|n| n == "Fits the memory this computer's graphics can use."));
+        assert!(fit(&spec, &gpu(32.0, 24.0))
+            .notes
+            .iter()
+            .any(|n| n.contains("GPU-class speed")));
+    }
+
+    #[test]
+    fn system_speed_is_the_pessimistic_ram_figure() {
+        // 40 GB/s over the active weight bytes: Qwen2.5 7B at Q8_0 is the figure §3 of the redesign
+        // spec quotes as failing the background floor (4.95 against 8.53).
+        assert!((system_tokens_per_sec(7.62, Quant::Q8_0) - 40.0 / (7.62 * 1.06)).abs() < EPS);
+        assert!((system_tokens_per_sec(7.62, Quant::Q8_0) - 4.95).abs() < 0.01);
+        // And it is the same number `fit` reports for a config that runs from RAM.
+        let spec = dense(7.62, 4096, vec![q(Quant::Q8_0, 7.54)]);
+        let r = fit(&spec, &ram(32.0));
+        assert_eq!(r.speed_basis, Some(SpeedBasis::System));
+        assert_eq!(
+            r.est_tokens_per_sec,
+            Some(round1(system_tokens_per_sec(7.62, Quant::Q8_0)))
+        );
+    }
+
+    #[test]
+    fn the_resident_config_is_the_split_rung_wherever_there_is_one() {
+        // Swept over the committed catalogue on a grid of cards and free RAM, so the claim in the
+        // doc comment — "byte-identical to gpu_fit's rung for every Split, None for NoGpuResident" —
+        // is a measurement rather than an argument.
+        let mut splits = 0usize;
+        let mut band = 0usize;
+        for e in &crate::local_catalog::catalog().entries {
+            let spec = crate::local_catalog::entry_to_spec(e);
+            for vram in [2.0, 4.0, 6.0, 7.96, 8.0, 10.0, 12.0, 16.0, 24.0] {
+                for free in [3.0, 6.0, 10.0, 13.4, 20.0, 24.0, 32.0, 48.0, 64.0] {
+                    let hw = FitHardware {
+                        gpu_bandwidth_gbps: Some(384.0),
+                        ..gpu(free, vram)
+                    };
+                    let rf = fit(&spec, &hw);
+                    let resident = resident_fit(&spec, &hw, &rf);
+                    match gpu_fit(&spec, &hw, &rf) {
+                        GpuFit::Split { fit: g } => {
+                            splits += 1;
+                            assert_eq!(resident.as_ref(), Some(&g), "{} {vram}/{free}", e.repo);
+                        }
+                        GpuFit::NoGpuResident => {
+                            assert_eq!(resident, None, "{} {vram}/{free}", e.repo);
+                        }
+                        GpuFit::Single => {}
+                    }
+                    // Wherever there is one, it keeps the reserve on the card and fits free RAM.
+                    if let Some(g) = &resident {
+                        let mem = g.est_memory_gb.unwrap();
+                        assert!(mem <= vram - gpu_reserve_gb() + 1e-6, "{} {vram}", e.repo);
+                        assert!(mem <= ram_budget_gb(&hw) + 1e-6, "{} {free}", e.repo);
+                        // The reserve band: `gpu_fit` says Single because the RAM config already
+                        // fits raw VRAM, but that config does not keep the reserve.
+                        if rf
+                            .est_memory_gb
+                            .is_some_and(|m| m > vram - gpu_reserve_gb() && m <= vram)
+                        {
+                            band += 1;
+                            assert_ne!(g, &rf, "{} {vram}/{free}", e.repo);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            splits > 50,
+            "the grid must actually exercise Split ({splits})"
+        );
+        assert!(band > 0, "the grid must reach the reserve band");
+    }
+
+    #[test]
+    fn the_resident_config_keeps_the_reserve_in_the_band_gpu_fit_calls_single() {
+        // The dev-laptop case from the redesign spec: 7.96 GB card, 10 GB free. The RAM config is
+        // Qwen2.5 7B Q6_K at 7.38 GB — under raw VRAM, so `gpu_fit` reports one config, but 0.58 GB
+        // short of the reserve. The resident config is the Q5_K_M that keeps it.
+        let e = crate::local_catalog::catalog()
+            .entries
+            .iter()
+            .find(|e| e.repo == "bartowski/Qwen2.5-7B-Instruct-GGUF")
+            .expect("catalogue entry");
+        let spec = crate::local_catalog::entry_to_spec(e);
+        let hw = FitHardware {
+            gpu_bandwidth_gbps: Some(384.0),
+            ..gpu(10.0, 7.96)
+        };
+        let rf = fit(&spec, &hw);
+        assert_eq!(rf.quant, Some(Quant::Q6_K));
+        assert_eq!(rf.est_memory_gb, Some(7.38));
+        assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::Single);
+
+        let g = resident_fit(&spec, &hw, &rf).expect("a config that keeps the reserve");
+        assert_eq!(g.quant, Some(Quant::Q5_K_M));
+        assert_eq!(g.kv, KvCache::Q8_0);
+        assert_eq!(g.context, Some(32768));
+        assert_eq!(g.est_memory_gb, Some(6.63));
+        assert_eq!(g.speed_basis, Some(SpeedBasis::GpuPublished));
+        assert_eq!(g.est_tokens_per_sec, Some(71.0));
+
+        // The two guards `gpu_fit` opens with, and a RAM verdict that already refused.
+        let shared = FitHardware {
+            unified_memory: true,
+            ..hw
+        };
+        assert_eq!(resident_fit(&spec, &shared, &fit(&spec, &shared)), None);
+        assert_eq!(
+            resident_fit(&spec, &ram(10.0), &fit(&spec, &ram(10.0))),
+            None
+        );
+        let cloud = fit(&spec, &gpu(2.0, 7.96));
+        assert_eq!(cloud.verdict, Verdict::StayOnCloud);
+        assert_eq!(resident_fit(&spec, &gpu(2.0, 7.96), &cloud), None);
     }
 }

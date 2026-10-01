@@ -147,6 +147,89 @@ pub fn match_installed(model_id: &str) -> Option<&'static CatalogEntry> {
         .map(|(_, e)| e)
 }
 
+/// Match a model the endpoint SERVES back to a catalog row, using its parameter count when the name
+/// alone is not enough.
+///
+/// [`match_installed`] first, unchanged. What it cannot match is Ollama's own library naming: a tag
+/// like `qwen2.5:latest` carries a family and no size, so it contains no catalogue key and none
+/// contains it — `qwen2.5:latest`, `llama3.2:latest`, `gemma3:latest`, `phi3.5:latest` and
+/// `llama3.1:latest` all matched nothing. Ollama does report the parameter count in `/api/tags`
+/// (`details.parameter_size`), so this falls back to family + size:
+///
+/// * the id's family is the part after its last `/` and before its first `:` (`qwen2.5`);
+/// * an entry's family is its repo name minus `-GGUF`, up to its first size token, with the
+///   separators dropped (`Meta-Llama-3.1-8B-Instruct` → `metallama3.1`);
+/// * an entry is a candidate when its family contains the id's at a boundary — so `qwen3` never
+///   matches `qwen3.5` — and its size is within 15% of the reported one;
+/// * the closest wins, and an exact tie matches nothing rather than one of the two at random.
+///
+/// `None` without a size: a family alone names several models, and PM would rather say "not in the
+/// catalog" than size the wrong one.
+pub fn match_served(id: &str, parameters_b: Option<f64>) -> Option<&'static CatalogEntry> {
+    if let Some(entry) = match_installed(id) {
+        return Some(entry);
+    }
+    let p = parameters_b.filter(|p| p.is_finite() && *p > 0.0)?;
+    let lower = id.to_ascii_lowercase();
+    let after_slash = lower.rsplit('/').next().unwrap_or(&lower);
+    let base = after_slash.split(':').next().unwrap_or(after_slash);
+    if base.is_empty() {
+        return None;
+    }
+
+    let mut scored: Vec<(f64, &'static CatalogEntry)> = catalog()
+        .entries
+        .iter()
+        .filter(|e| family_contains(&family(e), base))
+        .map(|e| ((e.parameters_b - p).abs(), e))
+        .filter(|(distance, _)| distance / p <= 0.15)
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    match scored.as_slice() {
+        [] => None,
+        [(d0, _), (d1, _), ..] if d0 == d1 => None,
+        [(_, best), ..] => Some(*best),
+    }
+}
+
+/// An entry's family for [`match_served`]: the repo name, lowercased, minus `-gguf`, split on `-` and
+/// `_`, kept up to the first size token (`7b`, `500m`, or an MoE's `a3b`), and joined with nothing.
+fn family(entry: &CatalogEntry) -> String {
+    let name = model_key(entry).to_ascii_lowercase();
+    let name = name.strip_suffix("-gguf").unwrap_or(&name);
+    name.split(['-', '_'])
+        .take_while(|token| !is_size_token(token))
+        .collect()
+}
+
+/// `^\d+(\.\d+)?[bm]$` or `^a\d+b$`: a parameter count, or an MoE's active count.
+fn is_size_token(token: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(n) = token.strip_prefix('a').and_then(|t| t.strip_suffix('b')) {
+        if digits(n) {
+            return true;
+        }
+    }
+    let Some(n) = token.strip_suffix(['b', 'm']) else {
+        return false;
+    };
+    match n.split_once('.') {
+        Some((whole, frac)) => digits(whole) && digits(frac),
+        None => digits(n),
+    }
+}
+
+/// Whether `family` contains `base` where the next character does not continue a version number:
+/// `qwen2.5` is in `qwen2.5`, and `phi3.5` in `phi3.5miniinstruct`, but `qwen3` is not in `qwen3.5`.
+fn family_contains(family: &str, base: &str) -> bool {
+    family.match_indices(base).any(|(at, _)| {
+        family[at + base.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_digit() || c == '.'))
+    })
+}
+
 /// Whether a model id names an embedding or reranking model rather than a chat model.
 ///
 /// Embedders and rerankers cannot answer a chat turn, but every discovery path PM has hands them
@@ -479,6 +562,83 @@ mod tests {
         // A name matching nothing returns None.
         assert!(match_installed("totally-unknown-model-xyz").is_none());
         assert!(match_installed("").is_none());
+    }
+
+    #[test]
+    fn ollamas_bare_library_tags_match_by_family_and_size() {
+        // Ollama's own library names carry a family and no size, so the name match found nothing
+        // for any of these. The sizes are the `details.parameter_size` Ollama reports for each.
+        let repo = |id: &str, size: f64| match_served(id, Some(size)).map(|e| e.repo.as_str());
+        for (id, size, want) in [
+            ("qwen2.5:latest", 7.6, "bartowski/Qwen2.5-7B-Instruct-GGUF"),
+            (
+                "llama3.2:latest",
+                3.2,
+                "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            ),
+            ("gemma3:latest", 4.3, "ggml-org/gemma-3-4b-it-GGUF"),
+            ("phi3.5:latest", 3.8, "bartowski/Phi-3.5-mini-instruct-GGUF"),
+            (
+                "llama3.1:latest",
+                8.0,
+                "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            ),
+        ] {
+            assert!(
+                match_installed(id).is_none(),
+                "{id}: the name alone matches nothing"
+            );
+            assert_eq!(repo(id, size), Some(want), "{id}");
+        }
+
+        // `qwen3` is its own family, not a prefix of `qwen3.5` / `qwen3.6`.
+        assert_eq!(repo("qwen3:latest", 8.2), None);
+        // The family is right but no curated size is within 15% of it.
+        assert_eq!(repo("gemma2:latest", 9.2), None);
+        // Without a size a family names several models, so PM matches none of them.
+        assert!(match_served("qwen2.5:latest", None).is_none());
+        assert!(match_served("", Some(7.6)).is_none());
+
+        // A name the catalogue already matches is untouched by the size.
+        assert_eq!(
+            match_served(
+                "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M",
+                Some(70.0)
+            )
+            .map(|e| e.repo.as_str()),
+            Some("bartowski/Qwen2.5-7B-Instruct-GGUF")
+        );
+    }
+
+    #[test]
+    fn a_catalogue_family_stops_at_its_first_size_token() {
+        let fam = |repo: &str| {
+            let e = catalog()
+                .entries
+                .iter()
+                .find(|e| e.repo == repo)
+                .unwrap_or_else(|| panic!("{repo} is in the catalogue"));
+            family(e)
+        };
+        assert_eq!(fam("bartowski/Qwen2.5-7B-Instruct-GGUF"), "qwen2.5");
+        assert_eq!(fam("bartowski/Llama-3.2-1B-Instruct-GGUF"), "llama3.2");
+        assert_eq!(fam("ggml-org/gemma-3-4b-it-GGUF"), "gemma3");
+        assert_eq!(
+            fam("bartowski/Phi-3.5-mini-instruct-GGUF"),
+            "phi3.5miniinstruct"
+        );
+        assert_eq!(
+            fam("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"),
+            "metallama3.1"
+        );
+        assert_eq!(fam("unsloth/Qwen3.5-4B-GGUF"), "qwen3.5");
+        assert_eq!(fam("unsloth/Qwen3.6-35B-A3B-GGUF"), "qwen3.6");
+        assert_eq!(fam("ggml-org/SmolVLM-500M-Instruct-GGUF"), "smolvlm");
+
+        assert!(is_size_token("7b") && is_size_token("0.5b") && is_size_token("500m"));
+        assert!(is_size_token("a3b"));
+        assert!(!is_size_token("3") && !is_size_token("b") && !is_size_token("it"));
+        assert!(!is_size_token("3.b") && !is_size_token(".5b"));
     }
 
     #[test]
