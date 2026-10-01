@@ -30,6 +30,7 @@ import { LocalAiDownloaded } from "./LocalAiDownloaded";
 import { LocalAiEndpoint } from "./LocalAiEndpoint";
 import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import { LocalAiMachine } from "./LocalAiMachine";
+import { LocalAiPower } from "./LocalAiPower";
 import { LocalAiRoles } from "./LocalAiRoles";
 import { Button, Callout } from "../ui";
 
@@ -41,7 +42,7 @@ import { Button, Callout } from "../ui";
  *  This file is the tab, not the sections. It owns exactly what more than one section reads — the
  *  stored config, the live status, the served-model list, the hardware/catalog scan — and the
  *  reloads that refresh them. Everything that belongs to one section lives with it: the endpoint
- *  form, the download, the role tests. Five section files rather than one screenful each of a
+ *  form, the download, the role tests. One file per section, rather than one screenful each of a
  *  1,100-line function, which is what this was. */
 export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () => void } = {}) {
   const [recs, setRecs] = useState<LocalRecommendations | null>(null);
@@ -343,7 +344,16 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         onError={setError}
       />
 
-      <LocalAiLifecycle configured={configured} />
+      {/* Between the two it depends on: it only ever moves a role Assign roles set to Local, fall
+          back to cloud, and what it can't save by moving, the graphics-card section below can. */}
+      <LocalAiPower
+        status={status}
+        configured={configured}
+        anyLocalRoleWithModel={anyLocalRoleWithModel}
+        onError={setError}
+      />
+
+      <LocalAiLifecycle configured={configured} power={status?.power ?? null} />
     </>
   );
 }

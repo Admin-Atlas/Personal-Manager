@@ -102,7 +102,7 @@ pub async fn propose_metadata(
     document_ids: Option<Vec<i64>>,
     on_event: Channel<ReviewEvent>,
 ) -> Result<()> {
-    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+    let Some(mut plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
@@ -266,8 +266,14 @@ pub async fn propose_metadata(
                         .usable_text()
                         .map(|t| retag::parse_vocabulary(t, max))
                         .unwrap_or_default();
+                    // Attributed NOW, not at the end of the run: a long job re-resolves between
+                    // batches, so the plan the run finishes on may not be the one that billed this.
                     usage_rows.push((
-                        outcome.completion.model.clone(),
+                        outcome
+                            .completion
+                            .model
+                            .clone()
+                            .or_else(|| Some(plan.primary_model_id().to_string())),
                         outcome.completion.usage,
                         outcome.meta,
                     ));
@@ -304,6 +310,12 @@ pub async fn propose_metadata(
     // run-wide system prefix; `review::BATCH_SIZE` is still the ceiling.
     let mut cursor = 0usize;
     while cursor < pending.len() {
+        // Re-resolve between batches (#432), so a big import that started on mains follows the
+        // user onto battery — or back — at the next batch rather than at the end of the run. Before
+        // the ceiling read, which sizes against whichever route this batch will actually take.
+        if cursor > 0 {
+            llm_gateway::refresh_plan(&app, Role::Background, &mut plan);
+        }
         // Re-read the ceiling every batch, not once per run: the first successful call of a fresh
         // process re-proves the window in the background, and a run sized once to the pre-proof
         // floor would then refuse (or under-fill) every remaining batch against a number that is
@@ -331,7 +343,11 @@ pub async fn propose_metadata(
         let batch_model = outcome.usage.as_ref().and_then(|(_, m, _)| m.clone());
         let mut served: Vec<Option<String>> = vec![batch_model; chunk.len()];
         if let Some((usage, model, meta)) = outcome.usage.take() {
-            usage_rows.push((model, usage, meta));
+            usage_rows.push((
+                model.or_else(|| Some(plan.primary_model_id().to_string())),
+                usage,
+                meta,
+            ));
         }
 
         // Any document the batch didn't answer for is retried on its own before we give up on it.
@@ -354,7 +370,11 @@ pub async fn propose_metadata(
             served[i] = retry.usage.as_ref().and_then(|(_, m, _)| m.clone());
             let retry_error = retry.error.clone();
             if let Some((usage, model, meta)) = retry.usage.take() {
-                usage_rows.push((model, usage, meta));
+                usage_rows.push((
+                    model.or_else(|| Some(plan.primary_model_id().to_string())),
+                    usage,
+                    meta,
+                ));
             }
             *slot = retry.proposals.into_iter().next().flatten().or_else(|| {
                 // Batch and retry both came back empty. Surface the call error if there was one,
@@ -617,7 +637,7 @@ async fn apply_vocabulary_inner(
     sink: &retag::RetagSink,
     vocabulary: Vec<String>,
 ) -> Result<()> {
-    let Some(plan) = llm_gateway::resolve(app, Role::Background)? else {
+    let Some(mut plan) = llm_gateway::resolve(app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
@@ -659,7 +679,7 @@ async fn apply_vocabulary_inner(
 
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
-    retag_assign(app, &plan, &docs, &vocabulary, sink, &mut usage_rows).await?;
+    retag_assign(app, &mut plan, &docs, &vocabulary, sink, &mut usage_rows).await?;
     log_background_usage(app, plan.models(), &usage_rows);
     Ok(())
 }
@@ -673,7 +693,7 @@ async fn apply_vocabulary_inner(
 /// the lock and drops it before the next call goes out.
 async fn retag_assign(
     app: &AppHandle,
-    plan: &llm_gateway::RoutePlan,
+    plan: &mut llm_gateway::RoutePlan,
     docs: &[RetagDoc],
     vocabulary: &[String],
     sink: &retag::RetagSink,
@@ -688,7 +708,13 @@ async fn retag_assign(
     let total = docs.len();
     let mut done = 0usize;
     let mut cursor = 0usize;
+    let mut first = true;
     while cursor < docs.len() {
+        // Re-resolve between batches (#432), before the ceiling read, as the filing pass does.
+        if !first {
+            llm_gateway::refresh_plan(app, Role::Background, plan);
+        }
+        first = false;
         // Per-batch, not per-run: the first success of a fresh process re-proves the window in the
         // background, and every batch after it should be sized to the proven number.
         let ceiling = llm_gateway::prompt_ceiling_for(app, plan);
@@ -710,7 +736,11 @@ async fn retag_assign(
         let assignments = match llm_gateway::complete(app, plan, &messages, true).await {
             Ok(outcome) => {
                 usage_rows.push((
-                    outcome.completion.model.clone(),
+                    outcome
+                        .completion
+                        .model
+                        .clone()
+                        .or_else(|| Some(plan.primary_model_id().to_string())),
                     outcome.completion.usage,
                     outcome.meta,
                 ));

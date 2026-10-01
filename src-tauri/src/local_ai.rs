@@ -19,13 +19,14 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
 use crate::llm_gateway::{
-    BACKGROUND_ROUTING_KEY, CHAT_ROUTING_KEY, LOCAL_BACKGROUND_MODEL_KEY, LOCAL_BASE_URL_KEY,
-    LOCAL_CHAT_MODEL_KEY,
+    self, KeyPresence, PowerRoute, Role, BACKGROUND_ROUTING_KEY, CHAT_ROUTING_KEY,
+    LOCAL_BACKGROUND_MODEL_KEY, LOCAL_BASE_URL_KEY, LOCAL_CHAT_MODEL_KEY,
 };
 use crate::local_slot::{classify_ip, posture_for, EndpointClass, PostureVerdict};
+use crate::power::{self, PowerReading, PowerSettings, PowerSnapshot};
 use crate::{
-    better_fit, db, fit, hardware, local_catalog, local_disk, openai_compat, paths, residency,
-    secrets, AppState,
+    better_fit, db, fit, hardware, local_catalog, local_disk, openai_compat, paths, power_source,
+    residency, secrets, AppState,
 };
 
 /// The three servers PM knows how to auto-detect, by their default loopback port.
@@ -448,6 +449,12 @@ pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<Strin
     let conn = state.conn()?;
     db::set_setting(&conn, LOCAL_BASE_URL_KEY, &normalized)?;
     drop(conn);
+    // The release passes decide who may be sent the saved token from this cache. Refreshed here, not
+    // only on the next release tick: the UI saves a new URL and its token in one click, and a store
+    // that closed inside that gap would otherwise pair the new token with the old server.
+    state
+        .local_ai
+        .cache_release_endpoint(Some(normalized.clone()));
     // The last test proved a model answered on the OLD server. Cleared in the backend, not just in
     // the view, because the view re-reads this snapshot every time it mounts.
     state.local_ai.clear_finished_test();
@@ -466,6 +473,8 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     db::delete_setting(&conn, LOCAL_CHAT_MODEL_KEY)?;
     db::delete_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?;
     drop(conn);
+    // No endpoint now owns a token — see `set_local_llm_endpoint`.
+    state.local_ai.cache_release_endpoint(None);
     secrets::clear_local_llm_endpoint_token()?;
     state.local_ai.clear_finished_test();
     // A forgotten endpoint should drop the chat sidebar's provider line to zero pixels at once.
@@ -672,7 +681,8 @@ pub struct LocalLlmStatus {
     /// (a probe was skipped by the debounce so a fast-polling UI can't spam the user's server).
     pub probed_now: bool,
     /// The local model bound to Chat, but ONLY when chat routing actually sends chat to it. `None`
-    /// means the role goes to cloud, and the cloud model is the true answer for that row.
+    /// while the role goes to cloud, including while the On battery policy has moved it — the cloud
+    /// model is then the true answer for that row.
     ///
     /// Here because the model footer used to read the OpenRouter list for both rows and had no
     /// access to routing at all — so a machine answering every turn from its own GPU displayed a
@@ -718,12 +728,125 @@ pub struct LocalLlmStatus {
     /// has no `/api/ps` (llama-server, LM Studio, a `/v1`-only proxy), or nothing has been observed
     /// recently enough to still be worth saying. It must never be rendered as "not loaded": that
     /// inversion is the whole reason this is three-valued.
+    ///
+    /// Describes the role's BOUND local model, also while it is parked by the On battery policy —
+    /// a parked model can still be holding the card, which is exactly what the section says.
     pub chat_loaded: Option<bool>,
     pub background_loaded: Option<bool>,
     /// PM itself handed this model back, on the user's own release policy. Only meaningful while the
     /// model is not loaded, and it is what separates "your server let it go" from "you asked PM to".
+    /// Like `*_loaded`, about the BOUND model, also while it is parked by the On battery policy.
     pub chat_released: bool,
     pub background_released: bool,
+    /// The On battery policy (#432): what the machine reads, what PM is acting on, and where each
+    /// role stands. Computed from the same functions `resolve` uses.
+    pub power: PowerView,
+}
+
+/// One role's standing under the On battery policy.
+#[derive(Serialize, Clone, Debug)]
+pub struct PowerRoleView {
+    pub route: PowerRoute,
+    /// Why the policy can never move this role, or `None` if it can.
+    pub blocked: Option<llm_gateway::PowerBlocked>,
+    /// The role's bound local model (parked while `route` is `Cloud`). `None` for a cloud-routed
+    /// role.
+    pub local_model: Option<String>,
+}
+
+/// The On battery policy's state, for the status snapshot. No getter of its own: the stored values
+/// and the live state ride `local_llm_status`, like the release policy rides `GpuResidency`.
+#[derive(Serialize, Clone, Debug)]
+pub struct PowerView {
+    /// The latest raw reading, before settling.
+    pub source: power::PowerSource,
+    pub percent: Option<u8>,
+    pub has_battery: bool,
+    /// What PM acts on — `Mains` while the latch is stale.
+    pub state: power::PowerState,
+    /// The open store's threshold; 0 = never.
+    pub threshold: u8,
+    /// threshold + 15, so the UI does no arithmetic.
+    pub return_at: u8,
+    pub roles: power::PowerScope,
+    /// The roles the user has said may go to the cloud on battery — a scope, or `None` for none.
+    pub consent: power::Consent,
+    /// Either role's route is `NeedsConsent`.
+    pub consent_needed: bool,
+    pub keep_local: bool,
+    /// Some OpenRouter key exists, for either role. A role's `NoKey` alone can't say this: chat uses
+    /// only the main key, so a background-key-only setup reads `NoKey` for chat while a cloud
+    /// provider is very much set up — and the keyless copy would then tell the user it isn't.
+    pub any_cloud_key: bool,
+    pub chat: PowerRoleView,
+    pub background: PowerRoleView,
+}
+
+/// The status's power answer, built from the SAME pure functions `resolve` uses, so the section can
+/// never describe a route the gateway would not take. Pure, so it is unit-tested.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn power_view(
+    snap: &PowerSnapshot,
+    settings: &PowerSettings,
+    keep_local: bool,
+    prefs: &llm_gateway::RoutingPrefs,
+    endpoint_set: bool,
+    chat_bound: Option<&str>,
+    background_bound: Option<&str>,
+    chat_key: KeyPresence,
+    background_key: KeyPresence,
+) -> PowerView {
+    let ctx = llm_gateway::RuntimeContext::from_parts(snap, settings, keep_local);
+    let role = |role: Role, bound: Option<&str>, key: KeyPresence| {
+        let blocked =
+            llm_gateway::power_blocked(prefs.for_role(role), endpoint_set && bound.is_some(), key);
+        let route = match llm_gateway::power_route(role, &ctx, blocked) {
+            // Plugged back in, with the latch still waiting out its minute: there is nothing left to
+            // ask about. The question says "you're on battery" and offers the cloud "until you plug
+            // in" — both false now — and an answer would only take effect after PM has gone back
+            // to local anyway. Routing is unaffected: without consent this role was local already.
+            // Only a positive AC reading: one unreadable sample on battery is not "plugged in", and
+            // hiding the question then would leave the readout claiming nothing can move.
+            PowerRoute::NeedsConsent if snap.reading.source == power::PowerSource::Ac => {
+                PowerRoute::Unchanged
+            }
+            route => route,
+        };
+        PowerRoleView {
+            route,
+            blocked,
+            local_model: bound.map(str::to_string),
+        }
+    };
+    let chat = role(Role::Chat, chat_bound, chat_key);
+    let background = role(Role::Background, background_bound, background_key);
+    PowerView {
+        source: snap.reading.source,
+        percent: snap.reading.percent,
+        has_battery: snap.reading.has_battery,
+        state: snap.state,
+        threshold: settings.threshold,
+        return_at: power::return_at(settings.threshold),
+        roles: settings.scope,
+        consent: settings.consent,
+        consent_needed: chat.route == PowerRoute::NeedsConsent
+            || background.route == PowerRoute::NeedsConsent,
+        keep_local,
+        // Background falls back to the main key, so its presence covers both.
+        any_cloud_key: chat_key == KeyPresence::Present || background_key == KeyPresence::Present,
+        chat,
+        background,
+    }
+}
+
+/// The local model the status REPORTS for a role: none while the On battery policy has it on the
+/// cloud, so the sidebar names the model actually answering.
+fn reported_local(bound: Option<String>, route: PowerRoute) -> Option<String> {
+    if route == PowerRoute::Cloud {
+        None
+    } else {
+        bound
+    }
 }
 
 /// The local model a role will really use, or `None` when the role goes to cloud.
@@ -749,8 +872,16 @@ pub fn role_local_model(routing: Option<&str>, bound: Option<&str>) -> Option<St
 /// one `/v1/models` reachability probe so a fast UI poll can't hammer the user's server.
 #[tauri::command]
 pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
+    // The power latch is in memory and read BEFORE the DB guard, as `resolve` does.
+    let (snap, keep_local) = {
+        let state = app.state::<AppState>();
+        (
+            state.local_ai.power_snapshot(std::time::Instant::now()),
+            state.local_ai.keep_local(),
+        )
+    };
     // One connection for every setting this needs, dropped before the first await.
-    let (base_url, configured, chat_local_model, background_local_model) = {
+    let (base_url, configured, chat_bound, background_bound, prefs, power_settings) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         let base_url = db::get_setting(&conn, LOCAL_BASE_URL_KEY)?;
@@ -763,7 +894,16 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             db::get_setting(&conn, BACKGROUND_ROUTING_KEY)?.as_deref(),
             db::get_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?.as_deref(),
         );
-        (base_url, configured, chat, background)
+        let prefs = llm_gateway::routing_prefs(&conn)?;
+        let power_settings = PowerSettings::read(&conn);
+        (
+            base_url,
+            configured,
+            chat,
+            background,
+            prefs,
+            power_settings,
+        )
     };
     if !configured {
         return Ok(LocalLlmStatus {
@@ -783,8 +923,35 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             background_loaded: None,
             chat_released: false,
             background_released: false,
+            // Keys are never read for an unconfigured install: with no endpoint nothing can move.
+            power: power_view(
+                &snap,
+                &power_settings,
+                keep_local,
+                &prefs,
+                false,
+                chat_bound.as_deref(),
+                background_bound.as_deref(),
+                KeyPresence::Absent,
+                KeyPresence::Absent,
+            ),
         });
     }
+
+    // In-memory reads of the secrets cache, after the guard has closed. Only the two REPORTED model
+    // fields below change with the route; every internal use keeps the BOUND models, because a
+    // parked model can still be loaded, released and probed.
+    let power = power_view(
+        &snap,
+        &power_settings,
+        keep_local,
+        &prefs,
+        base_url.as_deref().is_some_and(|b| !b.trim().is_empty()),
+        chat_bound.as_deref(),
+        background_bound.as_deref(),
+        llm_gateway::key_presence(Role::Chat),
+        llm_gateway::key_presence(Role::Background),
+    );
 
     let (in_cooldown, cooldown_remaining_s) = {
         let state = app.state::<AppState>();
@@ -832,13 +999,11 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
                     app.state::<AppState>().local_ai.clear_resident(&base_url);
                 }
                 if ok {
-                    let mut models: Vec<&str> = [
-                        background_local_model.as_deref(),
-                        chat_local_model.as_deref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                    let mut models: Vec<&str> =
+                        [background_bound.as_deref(), chat_bound.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .collect();
                     // One role usually, and very often the same model on both.
                     models.dedup();
                     // Nothing bound to either role means there is nothing to ask ABOUT, and both
@@ -922,8 +1087,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
                 _ => None,
             }
         };
-        match window_for(background_local_model.as_deref())
-            .or_else(|| window_for(chat_local_model.as_deref()))
+        match window_for(background_bound.as_deref()).or_else(|| window_for(chat_bound.as_deref()))
         {
             Some(w) => (
                 Some(w.tokens),
@@ -958,8 +1122,8 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
                 .slot
                 .role_in_flight(crate::local_slot::Lane::Background)
                 > 0,
-            loaded(chat_local_model.as_deref()),
-            loaded(background_local_model.as_deref()),
+            loaded(chat_bound.as_deref()),
+            loaded(background_bound.as_deref()),
         )
     };
     let released = |model: Option<&str>| -> bool {
@@ -978,13 +1142,14 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         background_answering,
         chat_loaded,
         background_loaded,
-        chat_released: released(chat_local_model.as_deref()),
-        background_released: released(background_local_model.as_deref()),
-        chat_local_model,
-        background_local_model,
+        chat_released: released(chat_bound.as_deref()),
+        background_released: released(background_bound.as_deref()),
+        chat_local_model: reported_local(chat_bound, power.chat.route),
+        background_local_model: reported_local(background_bound, power.background.route),
         served_window,
         served_window_proven,
         window_source,
+        power,
     })
 }
 
@@ -1343,65 +1508,134 @@ async fn release_tick(app: &AppHandle) {
     };
     // Refresh the policy if the vault is open; otherwise fall back to the last one PM could read.
     let fresh = state.conn().ok().map(|conn| {
-        let policy = residency::ReleasePolicy::from_setting(
-            db::get_setting(&conn, residency::RELEASE_POLICY_KEY)
-                .ok()
-                .flatten()
-                .as_deref(),
-        );
-        let idle = residency::idle_after(
-            db::get_setting(&conn, residency::RELEASE_IDLE_MINUTES_KEY)
-                .ok()
-                .flatten()
-                .as_deref(),
-        );
-        let base_url = db::get_setting(&conn, LOCAL_BASE_URL_KEY).ok().flatten();
-        (policy, idle, base_url)
+        let read = |key: &str| db::get_setting(&conn, key).ok().flatten();
+        let cfg = residency::ReleaseConfig {
+            policy: residency::ReleasePolicy::from_setting(
+                read(residency::RELEASE_POLICY_KEY).as_deref(),
+            ),
+            idle_after: residency::idle_after(read(residency::RELEASE_IDLE_MINUTES_KEY).as_deref()),
+            battery_idle_after: residency::battery_idle_after(
+                read(residency::BATTERY_IDLE_MINUTES_KEY).as_deref(),
+            ),
+        };
+        (cfg, read(LOCAL_BASE_URL_KEY))
     });
-    if let Some((policy, idle, _)) = fresh {
-        state.local_ai.cache_release_policy(policy, idle);
+    if let Some((cfg, base_url)) = &fresh {
+        state.local_ai.cache_release_policy(*cfg);
+        state.local_ai.cache_release_endpoint(base_url.clone());
     }
     // `None` here means PM has never been able to read the policy, which is not the same as "the
     // default policy" — it must not act on a setting it has never seen.
-    let Some((policy, idle_after)) = state.local_ai.cached_release_policy() else {
+    let Some(cfg) = state.local_ai.cached_release_policy() else {
         return;
     };
+    let now = std::time::Instant::now();
     // Every input handed over whole, and the decision made in one place. Nothing is pre-checked
     // here: a caller that filters first and then asks makes the pure reducer's own gates unreachable,
     // which leaves the real decision spread across two files with the tested one contributing
     // nothing. `quiet_for` of `None` means no call has ever run, which zero expresses correctly —
     // zero is never past a quiet period.
     let inputs = residency::ReleaseInputs {
-        policy,
+        policy: cfg.policy,
         pm_loaded: !state.local_ai.pm_loaded_pairs().is_empty(),
         in_flight: state.local_ai.slot.in_flight(),
         holds: state.local_ai.slot.holds(),
-        quiet_for: state
-            .local_ai
-            .slot
-            .quiet_for(std::time::Instant::now())
-            .unwrap_or_default(),
-        idle_after,
+        quiet_for: state.local_ai.slot.quiet_for(now).unwrap_or_default(),
+        idle_after: cfg.idle_after,
+        // The SETTLED latch, never a raw reading: a cable wiggle must not release a model.
+        on_battery_for: state.local_ai.power_on_battery_for(now),
+        battery_idle_after: cfg.battery_idle_after,
     };
     if !residency::should_release(&inputs) {
         return;
     }
-    let Some(base_url) = fresh.and_then(|(_, _, b)| b) else {
-        return;
-    };
-    // An endpoint that has already told PM it has no unload route never gets asked again. llama-server
-    // and LM Studio have none, and neither does a proxy forwarding only `/v1` — without this latch the
-    // scheduler posts at one of them every twenty seconds for the life of the process.
-    if state.local_ai.has_no_unload_route(&base_url) {
-        return;
-    }
+    // With the store closed the endpoint can't be read, so PM visits every endpoint it loaded
+    // something on. Before #432 this returned here instead, which left the cached policy — kept
+    // precisely so a locked vault would keep honouring it — unable to release anything at all.
+    let endpoints = residency::release_endpoints(
+        fresh.as_ref().map(|(_, b)| b.as_deref()),
+        &state.local_ai.pm_loaded_pairs(),
+    );
     let token = secrets::get_local_llm_endpoint_token()
         .ok()
         .flatten()
         .map(|s| s.expose().to_string());
+    // The token is the configured endpoint's alone. A closed store sends PM to every endpoint it
+    // loaded on, and an old one must not be handed the current one's credential.
+    let configured = state.local_ai.cached_release_endpoint();
+    let mut changed = false;
+    for base_url in endpoints {
+        // An endpoint that has already told PM it has no unload route never gets asked again.
+        // llama-server and LM Studio have none, and neither does a proxy forwarding only `/v1` —
+        // without this latch the scheduler posts at one of them every twenty seconds for the life of
+        // the process.
+        if state.local_ai.has_no_unload_route(&base_url) {
+            continue;
+        }
+        let token = residency::token_for(&base_url, configured.as_deref(), token.as_deref());
+        let pass = release_pm_models(&state, &base_url, token).await;
+        // Only a pass that changed something the status reports is worth a ping. A marker left on
+        // an endpoint the open-store path no longer visits keeps `should_release` true every tick,
+        // and pinging for a pass that found nothing to do there would refetch the status every
+        // twenty seconds for the rest of the session — on battery, of all times.
+        changed |= pass.freed > 0 || pass.unconfirmed > 0 || pass.no_route;
+    }
+    if changed {
+        crate::llm_gateway::ping_status(app);
+    }
+}
 
-    release_pm_models(&state, &base_url, token.as_deref()).await;
-    crate::llm_gateway::ping_status(app);
+/// The On battery watcher (#432). Its own loop on purpose: `release_tick` can wait on the slot's
+/// lane behind a minutes-long stream (`release_pm_models` unloads inside it), and the power poll
+/// must not stall with it. Reads FIRST, so an install unplugged at launch has a reading at once. No
+/// shutdown path: `process::exit` ends it, like every other scheduler.
+pub fn spawn_power_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            power_tick(&app).await;
+            tokio::time::sleep(power::POLL).await;
+        }
+    });
+}
+
+/// One watcher sample: read the machine (off the runtime, bounded), read the threshold if the store
+/// is open, feed the latch, and ping the status ONLY on a settled change — the Local AI tab refetches
+/// on every ping, uncoalesced, so a per-poll ping would be a status refetch every thirty seconds
+/// that told it nothing.
+async fn power_tick(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let reading = match state.local_ai.begin_power_read() {
+        // The previous read is still stuck: an Unknown sample, and no second thread.
+        None => PowerReading::default(),
+        Some(claim) => {
+            let read = tokio::task::spawn_blocking(move || {
+                let _claim = claim;
+                power_source::read()
+            });
+            match tokio::time::timeout(power::READ_TIMEOUT, read).await {
+                Ok(Ok(r)) => r,
+                // A timeout, or a JoinError (the read panicked): Unknown, which never spends money.
+                _ => PowerReading::default(),
+            }
+        }
+    };
+    // The guard drops at the end of the statement. An Err (the vault is shut, or the read failed)
+    // is `None`, which keeps the last threshold the latch knew.
+    let threshold = state
+        .conn()
+        .ok()
+        .and_then(|c| db::get_setting(&c, power::THRESHOLD_KEY).ok())
+        .map(|v| power::threshold_from(v.as_deref()));
+    let now = std::time::Instant::now();
+    // The wall clock first: it is the only one that saw a suspend (see `PowerTracker::observe_wall`).
+    let woke = state
+        .local_ai
+        .power_observe_wall(std::time::SystemTime::now(), now);
+    if state.local_ai.power_observe(reading, threshold, now) || woke {
+        crate::llm_gateway::ping_status(app);
+    }
 }
 
 /// What one release pass did.
@@ -1818,9 +2052,9 @@ const EXIT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// Deliberately blocking. A spawned task is killed by `process::exit` before its first poll, so this
 /// is `block_on` — the first in production, on the main event-loop thread, which is not a runtime
-/// worker and so may block safely. Every step is written to give up rather than to fail: a locked
-/// vault, an absent state, an unreachable server and a slow one all end the same way, with PM
-/// quitting.
+/// worker and so may block safely. Every step is written to give up rather than to fail: an absent
+/// state, an unreachable server and a slow one all end the same way, with PM quitting. A locked vault
+/// uses the policy the release timer last read, and gives up only if it never read one.
 ///
 /// Never records a health outcome. Housekeeping must not be evidence about the endpoint in either
 /// direction, and at shutdown there is nobody left to tell anyway.
@@ -1829,18 +2063,24 @@ pub fn release_gpu_on_exit(app: &AppHandle) {
         return;
     };
     // Read every setting up front and drop the guard before the first await — the DB mutex is not
-    // reentrant, and this runs while the rest of the app is still alive.
-    let policy = {
-        let Ok(conn) = state.conn() else {
-            return; // a locked or already-torn-down vault is not an error at this point
-        };
-        let policy = residency::ReleasePolicy::from_setting(
-            db::get_setting(&conn, residency::RELEASE_POLICY_KEY)
-                .ok()
-                .flatten()
-                .as_deref(),
-        );
-        policy
+    // reentrant, and this runs while the rest of the app is still alive. A locked vault falls back to
+    // what the release timer last read, for the reason that cache exists: quitting with the library
+    // locked is still quitting, and the model PM loaded is still on the card.
+    let (policy, configured) = match state.conn() {
+        Ok(conn) => (
+            residency::ReleasePolicy::from_setting(
+                db::get_setting(&conn, residency::RELEASE_POLICY_KEY)
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+            db::get_setting(&conn, LOCAL_BASE_URL_KEY).ok().flatten(),
+        ),
+        Err(_) => match state.local_ai.cached_release_policy() {
+            Some(cfg) => (cfg.policy, state.local_ai.cached_release_endpoint()),
+            // Never read at all: PM has no policy to honour, so it does nothing.
+            None => return,
+        },
     };
     // `pm_loaded` is PM's own bookkeeping, rebuilt every launch, so this is empty unless PM itself
     // put a model on the wire during this run. A model the user loaded from a terminal is never in
@@ -1862,8 +2102,10 @@ pub fn release_gpu_on_exit(app: &AppHandle) {
         // every other release path does — and both differences matter here. The process is about to
         // end, so a confirmation has no consumer; and a serial loop that confirms would spend the
         // whole budget on the first model and never send the second one's request at all.
+        // The token goes only to the endpoint it was saved for (see `residency::token_for`).
         let requests = releasable.iter().map(|(base_url, model)| {
-            openai_compat::unload_model(base_url, model, token.as_deref(), false)
+            let token = residency::token_for(base_url, configured.as_deref(), token.as_deref());
+            openai_compat::unload_model(base_url, model, token, false)
         });
         let _ = tokio::time::timeout(
             EXIT_RELEASE_BUDGET,
@@ -1879,6 +2121,8 @@ pub struct ReleaseSettings {
     /// `"server"` | `"on-exit"` | `"idle"`.
     pub policy: String,
     pub idle_minutes: u64,
+    /// The on-battery quiet period (#432), in minutes; 0 = off.
+    pub battery_idle_minutes: u64,
 }
 
 #[tauri::command]
@@ -1890,23 +2134,32 @@ pub fn get_local_release_policy(state: State<'_, AppState>) -> Result<ReleaseSet
     let idle = residency::idle_after(
         db::get_setting(&conn, residency::RELEASE_IDLE_MINUTES_KEY)?.as_deref(),
     );
+    let battery_idle = residency::battery_idle_after(
+        db::get_setting(&conn, residency::BATTERY_IDLE_MINUTES_KEY)?.as_deref(),
+    );
     Ok(ReleaseSettings {
         policy: policy.as_setting().to_string(),
         idle_minutes: idle.as_secs() / 60,
+        battery_idle_minutes: battery_idle.map(|d| d.as_secs() / 60).unwrap_or(0),
     })
 }
 
 /// Store the release policy. Round-tripped through the enum and the clamp so an unrecognised policy
-/// or an out-of-range period cannot be persisted — both resolve to something PM can act on.
+/// or an out-of-range period cannot be persisted — both resolve to something PM can act on. Each
+/// `None` leaves its stored value alone, so the on-battery row can save without re-sending the
+/// policy above it. The release scheduler's cache catches up on its next tick.
 #[tauri::command]
 pub fn set_local_release_policy(
     state: State<'_, AppState>,
-    policy: String,
+    policy: Option<String>,
     idle_minutes: Option<u64>,
+    battery_idle_minutes: Option<u64>,
 ) -> Result<()> {
-    let parsed = residency::ReleasePolicy::from_setting(Some(policy.as_str()));
     let conn = state.conn()?;
-    db::set_setting(&conn, residency::RELEASE_POLICY_KEY, parsed.as_setting())?;
+    if let Some(policy) = policy {
+        let parsed = residency::ReleasePolicy::from_setting(Some(policy.as_str()));
+        db::set_setting(&conn, residency::RELEASE_POLICY_KEY, parsed.as_setting())?;
+    }
     if let Some(m) = idle_minutes {
         let clamped = m.clamp(residency::MIN_IDLE_MINUTES, residency::MAX_IDLE_MINUTES);
         db::set_setting(
@@ -1915,7 +2168,88 @@ pub fn set_local_release_policy(
             &clamped.to_string(),
         )?;
     }
+    match battery_idle_minutes {
+        None => {}
+        // Zero is the off switch, so off leaves no row behind rather than a "0" to reinterpret.
+        Some(0) => db::delete_setting(&conn, residency::BATTERY_IDLE_MINUTES_KEY)?,
+        Some(m) => db::set_setting(
+            &conn,
+            residency::BATTERY_IDLE_MINUTES_KEY,
+            &residency::clamp_battery_idle(m).to_string(),
+        )?,
+    }
     Ok(())
+}
+
+/// Store the On battery policy (#432). Each `None` leaves its stored value alone.
+///
+/// A lowered threshold, or "never", takes effect at once — the latch may move PM back to local
+/// immediately. A raised one reaches the cloud only through the latch's minute-long settle, so a
+/// settings change can never send work off the machine by itself.
+#[tauri::command]
+pub fn set_local_power_policy(
+    app: AppHandle,
+    threshold: Option<u8>,
+    roles: Option<String>,
+    consent: Option<String>,
+) -> Result<()> {
+    let state = app.state::<AppState>();
+    let thr = {
+        let conn = state.conn()?;
+        if let Some(t) = threshold {
+            db::set_setting(
+                &conn,
+                power::THRESHOLD_KEY,
+                &t.min(power::MAX_THRESHOLD).to_string(),
+            )?;
+        }
+        if let Some(roles) = roles {
+            let scope = power::PowerScope::parse_strict(&roles)
+                .ok_or_else(|| Error::Other("unknown On battery role choice".into()))?;
+            db::set_setting(&conn, power::SCOPE_KEY, scope.as_setting())?;
+        }
+        if let Some(request) = consent.as_deref() {
+            let stored = db::get_setting(&conn, power::CONSENT_KEY)?;
+            match consent_write(stored.as_deref(), request)? {
+                Some(scope) => db::set_setting(&conn, power::CONSENT_KEY, scope.as_setting())?,
+                None => db::delete_setting(&conn, power::CONSENT_KEY)?,
+            }
+        }
+        power::threshold_from(db::get_setting(&conn, power::THRESHOLD_KEY)?.as_deref())
+    };
+    state
+        .local_ai
+        .power_apply_threshold(thr, std::time::Instant::now());
+    llm_gateway::ping_status(&app);
+    Ok(())
+}
+
+/// What a consent request leaves stored: `Some(scope)` to write, `None` to delete the row.
+///
+/// `"none"` withdraws every yes — "not asked" is the state PM returns to, so the question comes back
+/// the next time the battery is low, which is honest, because PM is local again. Anything else names
+/// the roles a yes is about (the ones the question named) and is ADDED to any earlier yes: it never
+/// covers a role the user wasn't asked about, and never quietly drops one they were. An unknown value
+/// is refused rather than read as either.
+fn consent_write(stored: Option<&str>, request: &str) -> Result<Option<power::PowerScope>> {
+    match request.trim() {
+        "none" => Ok(None),
+        roles => {
+            let scope = power::PowerScope::parse_strict(roles)
+                .ok_or_else(|| Error::Other("unknown On battery consent".into()))?;
+            Ok(power::Consent::from_setting(stored).with(scope).as_scope())
+        }
+    }
+}
+
+/// "Keep using local until I quit PM" — memory only, never saved. Deliberately not `set_*`: the
+/// Settings "Saved ✓" tick announces any `set_` command as persisted, and this must not claim
+/// something was saved.
+#[tauri::command]
+pub fn keep_local_on_battery(app: AppHandle, on: bool) {
+    if app.state::<AppState>().local_ai.set_keep_local(on) {
+        llm_gateway::ping_status(&app);
+    }
 }
 
 /// Point the on-disk crawl (#449) at an extra folder, or clear it with `None`. Persisted, and drops
@@ -3085,5 +3419,260 @@ mod tests {
             "the cap plus the ellipsis"
         );
         assert!(capped.ends_with("..."));
+    }
+
+    // ---- the On battery section's status (#432) ----
+
+    use crate::llm_gateway::{PowerBlocked, ProviderPref, RoutingPrefs};
+    use crate::power::{PowerScope, PowerSource, PowerState};
+
+    fn low_battery() -> PowerSnapshot {
+        PowerSnapshot {
+            reading: PowerReading {
+                source: PowerSource::Battery,
+                percent: Some(40),
+                has_battery: true,
+            },
+            state: PowerState::BatteryLow,
+            threshold: Some(60),
+        }
+    }
+
+    fn policy(consent: bool) -> PowerSettings {
+        PowerSettings {
+            threshold: 60,
+            scope: PowerScope::Both,
+            consent: if consent {
+                power::Consent::ALL
+            } else {
+                power::Consent::NONE
+            },
+        }
+    }
+
+    fn both(pref: ProviderPref) -> RoutingPrefs {
+        RoutingPrefs {
+            chat: pref,
+            background: pref,
+        }
+    }
+
+    #[test]
+    fn a_routed_role_names_the_model_it_parked() {
+        let view = power_view(
+            &low_battery(),
+            &policy(true),
+            false,
+            &both(ProviderPref::LocalThenCloud),
+            true,
+            Some("gemma3:4b"),
+            Some("qwen3:8b"),
+            KeyPresence::Present,
+            KeyPresence::Present,
+        );
+        assert_eq!(view.chat.route, PowerRoute::Cloud);
+        assert_eq!(view.chat.local_model.as_deref(), Some("gemma3:4b"));
+        assert_eq!(view.background.route, PowerRoute::Cloud);
+        assert_eq!(view.background.local_model.as_deref(), Some("qwen3:8b"));
+        assert!(!view.consent_needed);
+        assert_eq!(view.threshold, 60);
+        assert_eq!(view.return_at, 75);
+        assert_eq!(view.state, PowerState::BatteryLow);
+        assert_eq!(view.percent, Some(40));
+    }
+
+    #[test]
+    fn with_no_endpoint_nothing_can_move() {
+        for pref in [
+            ProviderPref::Cloud,
+            ProviderPref::Local,
+            ProviderPref::LocalThenCloud,
+        ] {
+            let view = power_view(
+                &low_battery(),
+                &policy(true),
+                false,
+                &both(pref),
+                false,
+                Some("gemma3:4b"),
+                Some("gemma3:4b"),
+                KeyPresence::Present,
+                KeyPresence::Present,
+            );
+            for role in [&view.chat, &view.background] {
+                assert_eq!(role.route, PowerRoute::Unchanged, "{pref:?}");
+                assert!(
+                    matches!(
+                        role.blocked,
+                        Some(PowerBlocked::NoLocalModel) | Some(PowerBlocked::CloudRouting)
+                    ),
+                    "{pref:?}: {:?}",
+                    role.blocked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consent_is_needed_only_while_a_role_waits_for_it() {
+        let asks = power_view(
+            &low_battery(),
+            &policy(false),
+            false,
+            &both(ProviderPref::LocalThenCloud),
+            true,
+            Some("gemma3:4b"),
+            None,
+            KeyPresence::Present,
+            KeyPresence::Present,
+        );
+        assert_eq!(asks.chat.route, PowerRoute::NeedsConsent);
+        assert_eq!(asks.background.blocked, Some(PowerBlocked::NoLocalModel));
+        assert!(asks.consent_needed);
+
+        // The override silences the ask, and plugging in ends it.
+        let kept = power_view(
+            &low_battery(),
+            &policy(false),
+            true,
+            &both(ProviderPref::LocalThenCloud),
+            true,
+            Some("gemma3:4b"),
+            None,
+            KeyPresence::Present,
+            KeyPresence::Present,
+        );
+        assert_eq!(kept.chat.route, PowerRoute::KeptLocal);
+        assert!(!kept.consent_needed);
+        let mains = power_view(
+            &PowerSnapshot::default(),
+            &policy(false),
+            false,
+            &both(ProviderPref::LocalThenCloud),
+            true,
+            Some("gemma3:4b"),
+            None,
+            KeyPresence::Present,
+            KeyPresence::Present,
+        );
+        assert!(!mains.consent_needed);
+
+        // Plugged in while the latch still waits out its minute: nothing to ask about any more.
+        let mut plugged = low_battery();
+        plugged.reading.source = PowerSource::Ac;
+        let settling = power_view(
+            &plugged,
+            &policy(false),
+            false,
+            &both(ProviderPref::LocalThenCloud),
+            true,
+            Some("gemma3:4b"),
+            None,
+            KeyPresence::Present,
+            KeyPresence::Present,
+        );
+        assert_eq!(settling.chat.route, PowerRoute::Unchanged);
+        assert!(!settling.consent_needed);
+    }
+
+    #[test]
+    fn a_consent_request_adds_the_roles_it_names_and_none_withdraws_them_all() {
+        use power::PowerScope::*;
+        assert_eq!(consent_write(None, "background").unwrap(), Some(Background));
+        // Added to the earlier yes, never replacing it.
+        assert_eq!(
+            consent_write(Some("background"), "chat").unwrap(),
+            Some(Both)
+        );
+        assert_eq!(consent_write(Some("both"), "chat").unwrap(), Some(Both));
+        assert_eq!(consent_write(Some("chat"), " chat ").unwrap(), Some(Chat));
+        assert_eq!(consent_write(Some("both"), "none").unwrap(), None);
+        // Junk is refused, whatever is stored, rather than read as a yes or a no.
+        assert!(consent_write(Some("both"), "true").is_err());
+        assert!(consent_write(None, "").is_err());
+    }
+
+    #[test]
+    fn a_background_key_alone_moves_background_and_not_chat() {
+        // Chat uses only the primary key; background falls back to it but has its own. With only a
+        // background key set up, chat has no cloud to move to and background does.
+        let view = power_view(
+            &low_battery(),
+            &policy(true),
+            false,
+            &both(ProviderPref::LocalThenCloud),
+            true,
+            Some("gemma3:4b"),
+            Some("gemma3:4b"),
+            KeyPresence::Absent,
+            KeyPresence::Present,
+        );
+        assert_eq!(view.chat.blocked, Some(PowerBlocked::NoKey));
+        assert_eq!(view.chat.route, PowerRoute::Unchanged);
+        assert_eq!(view.background.blocked, None);
+        assert_eq!(view.background.route, PowerRoute::Cloud);
+        assert!(view.any_cloud_key, "a background key is a cloud provider");
+    }
+
+    #[test]
+    fn the_reported_local_model_is_none_exactly_while_the_role_is_on_the_cloud() {
+        for route in [
+            PowerRoute::Unchanged,
+            PowerRoute::NeedsConsent,
+            PowerRoute::KeptLocal,
+            PowerRoute::Cloud,
+        ] {
+            assert_eq!(
+                reported_local(Some("gemma3:4b".into()), route).is_none(),
+                route == PowerRoute::Cloud,
+                "{route:?}"
+            );
+            assert_eq!(reported_local(None, route), None);
+        }
+    }
+
+    /// The JSON the TypeScript mirror reads — every field name and enum value spelled once, here.
+    #[test]
+    fn the_power_view_serializes_the_shape_the_frontend_mirrors() {
+        let view = power_view(
+            &low_battery(),
+            &policy(false),
+            false,
+            &RoutingPrefs {
+                chat: ProviderPref::LocalThenCloud,
+                background: ProviderPref::Cloud,
+            },
+            true,
+            Some("gemma3:4b"),
+            None,
+            KeyPresence::Present,
+            KeyPresence::Unreadable,
+        );
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["source"], "battery");
+        assert_eq!(v["percent"], 40);
+        assert_eq!(v["has_battery"], true);
+        assert_eq!(v["state"], "battery_low");
+        assert_eq!(v["threshold"], 60);
+        assert_eq!(v["return_at"], 75);
+        assert_eq!(v["roles"], "both");
+        assert_eq!(v["consent"], serde_json::Value::Null);
+        assert_eq!(v["consent_needed"], true);
+        assert_eq!(v["keep_local"], false);
+        assert_eq!(v["any_cloud_key"], true);
+        assert_eq!(v["chat"]["route"], "needs_consent");
+        assert_eq!(v["chat"]["blocked"], serde_json::Value::Null);
+        assert_eq!(v["chat"]["local_model"], "gemma3:4b");
+        assert_eq!(v["background"]["route"], "unchanged");
+        assert_eq!(v["background"]["blocked"], "cloud_routing");
+        assert_eq!(v["background"]["local_model"], serde_json::Value::Null);
+
+        let release = serde_json::to_value(ReleaseSettings {
+            policy: "server".into(),
+            idle_minutes: 5,
+            battery_idle_minutes: 0,
+        })
+        .unwrap();
+        assert_eq!(release["battery_idle_minutes"], 0);
     }
 }

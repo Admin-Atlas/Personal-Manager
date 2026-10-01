@@ -14,6 +14,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { INERT_POWER_VIEW } from "../../lib/powerRoute";
 import type {
   LocalLlmConfig,
   LocalLlmStatus,
@@ -53,9 +54,11 @@ const setLocalLlmRouting = vi.fn();
 const setLocalLlmToken = vi.fn();
 const setLocalModelRescanCadence = vi.fn();
 const setLocalModelScanDir = vi.fn();
+const setLocalPowerPolicy = vi.fn();
+const keepLocalOnBattery = vi.fn();
 
 // A factory REPLACES the whole module, so every function the component imports must appear here or
-// it is `undefined` at module-eval. LocalAiSettings imports eighteen.
+// it is `undefined` at module-eval. The tab and its sections import every one of these.
 vi.mock("../../lib/ipc", () => ({
   activeLocalPull: () => activeLocalPull(),
   cancelLocalPull: () => cancelLocalPull(),
@@ -94,6 +97,9 @@ vi.mock("../../lib/ipc", () => ({
   setLocalLlmToken: (...a: unknown[]) => setLocalLlmToken(...a),
   setLocalModelRescanCadence: (...a: unknown[]) => setLocalModelRescanCadence(...a),
   setLocalModelScanDir: (...a: unknown[]) => setLocalModelScanDir(...a),
+  // The On battery section's two (#432) — and its consent ask, which imports the same pair.
+  setLocalPowerPolicy: (...a: unknown[]) => setLocalPowerPolicy(...a),
+  keepLocalOnBattery: (...a: unknown[]) => keepLocalOnBattery(...a),
 }));
 
 // The folder picker is only reached by a click no test here makes, but the module is imported at
@@ -195,6 +201,7 @@ const statusFix = (over: Partial<LocalLlmStatus> = {}): LocalLlmStatus => ({
   background_loaded: null,
   chat_released: false,
   background_released: false,
+  power: INERT_POWER_VIEW,
   ...over,
 });
 
@@ -214,8 +221,14 @@ beforeEach(() => {
     no_unload_route: false,
   });
   releaseLocalGpu.mockResolvedValue(0);
-  getLocalReleasePolicy.mockResolvedValue({ policy: "server", idle_minutes: 5 });
+  getLocalReleasePolicy.mockResolvedValue({
+    policy: "server",
+    idle_minutes: 5,
+    battery_idle_minutes: 0,
+  });
   setLocalReleasePolicy.mockResolvedValue(undefined);
+  setLocalPowerPolicy.mockResolvedValue(undefined);
+  keepLocalOnBattery.mockResolvedValue(undefined);
   getTrayEnabled.mockResolvedValue(false);
   setTrayEnabled.mockResolvedValue(undefined);
   activeLocalPull.mockResolvedValue(null);
@@ -1125,5 +1138,21 @@ describe("testing a role's model", () => {
     expect((screen.getByRole("button", { name: /^test it$/i }) as HTMLButtonElement).disabled).toBe(
       false,
     );
+  });
+});
+
+describe("the On battery section (#432)", () => {
+  it("sits between Assign roles and the graphics card, in the order the rail lists them", async () => {
+    // It moves only what Assign roles set to Local, fall back to cloud, and what moving can't save
+    // the graphics-card section below can — so it reads between the two, and the settings rail
+    // (registry.ts) scrolls to it in that same order.
+    const { container } = await loaded();
+    const ids = Array.from(container.querySelectorAll("[data-settings-section]")).map(
+      (el) => el.id,
+    );
+    const at = (id: string) => ids.indexOf(id);
+    expect(at("sec-localai-power")).toBeGreaterThan(-1);
+    expect(at("sec-localai-power")).toBe(at("sec-localai-roles") + 1);
+    expect(at("sec-localai-lifecycle")).toBe(at("sec-localai-power") + 1);
   });
 });

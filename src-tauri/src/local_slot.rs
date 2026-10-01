@@ -764,15 +764,20 @@ pub struct LocalRuntime {
     /// it would leave someone hunting a server setting for a thing PM did on their instruction.
     /// Cleared when the model loads again, because it is then no longer true of anything.
     released: Mutex<std::collections::HashSet<(String, String)>>,
-    /// The release policy as last read from settings, with its quiet period.
+    /// The release policy as last read from settings, with its quiet period and the on-battery
+    /// quiet period (#432).
     ///
     /// Cached because a model can be resident while the vault is LOCKED — PM loaded it, the user
     /// locked up and walked away, and the card stays occupied. Releasing has to keep working there,
     /// but the policy lives in an encrypted settings row that cannot be read with the vault shut. So
     /// PM remembers the last policy it could read and keeps honouring it. Without this the feature
     /// would quietly stop at exactly the moment someone leaves the machine — which is the moment it
-    /// is most obviously supposed to work.
-    release_policy: Mutex<Option<(crate::residency::ReleasePolicy, Duration)>>,
+    /// is most obviously supposed to work. The battery time is cached for the same reason: a laptop
+    /// locked and unplugged is the case it was set for.
+    release_policy: Mutex<Option<crate::residency::ReleaseConfig>>,
+    /// The configured endpoint as last read with the policy, so a locked vault still knows which
+    /// endpoint the saved bearer token belongs to — and so which ones must not be sent it.
+    release_endpoint: Mutex<Option<String>>,
     last_probe: Mutex<Option<Instant>>,
     /// The RESULT of the last reachability observation, so a debounced status read can report what
     /// was actually last seen. `None` means nothing has been observed yet, which is NOT the same as
@@ -797,6 +802,28 @@ pub struct LocalRuntime {
     /// the single-flight claim: two tests would queue behind each other in the slot, making someone
     /// who clicked once pay for a second cold load.
     test: Mutex<Option<crate::local_ai::TestSnapshot>>,
+    /// The On battery latch (#432). A LEAF lock: nothing — not `state.conn()`, not the slot lane,
+    /// not the secrets cache — is ever acquired while it is held, and it is never held across an
+    /// await or an emit.
+    power: Mutex<crate::power::PowerTracker>,
+    /// Single-flight claim on the blocking power read, so a wedged EC read can't stack a thread
+    /// every poll.
+    power_read_busy: Arc<AtomicBool>,
+    /// "Keep using local until I quit PM" (#432 decision 5). Process-scoped by construction:
+    /// AppState is built once (lib.rs), a tray close only hides the window (tray.rs), and quitting
+    /// goes through app.exit → RunEvent::Exit → process::exit. NEVER persisted.
+    keep_local: AtomicBool,
+}
+
+/// The claim on the one in-flight power read. Released on drop, so a read that panics or is
+/// abandoned by its timeout still frees the claim once the blocking thread finally returns. `Send`,
+/// so it moves into the blocking closure and is held exactly as long as the read is.
+pub struct PowerReadClaim(Arc<AtomicBool>);
+
+impl Drop for PowerReadClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Marks the test finished on drop, including on a panic or an early `?`, so a job that dies cannot
@@ -883,16 +910,99 @@ impl LocalRuntime {
     }
 
     /// Remember the release policy, so it survives the vault being locked.
-    pub fn cache_release_policy(&self, policy: crate::residency::ReleasePolicy, idle: Duration) {
+    pub fn cache_release_policy(&self, cfg: crate::residency::ReleaseConfig) {
         if let Ok(mut p) = self.release_policy.lock() {
-            *p = Some((policy, idle));
+            *p = Some(cfg);
         }
     }
 
     /// The last policy PM was able to read. `None` before the first successful read — and `None` is
     /// NOT "release nothing by default": it means PM has never known the policy, so it must not act.
-    pub fn cached_release_policy(&self) -> Option<(crate::residency::ReleasePolicy, Duration)> {
+    pub fn cached_release_policy(&self) -> Option<crate::residency::ReleaseConfig> {
         *self.release_policy.lock().ok()?
+    }
+
+    /// Remember which endpoint is configured, read alongside the release policy and for the same
+    /// reason: with the vault locked it can't be read, and a release pass still needs to know which
+    /// endpoint the saved bearer token belongs to ([`crate::residency::token_for`]).
+    pub fn cache_release_endpoint(&self, base_url: Option<String>) {
+        if let Ok(mut e) = self.release_endpoint.lock() {
+            *e = base_url;
+        }
+    }
+
+    /// The configured endpoint as last read. `None` when there is none, or PM has never been able to
+    /// read it — either way no endpoint is known to own the token.
+    pub fn cached_release_endpoint(&self) -> Option<String> {
+        self.release_endpoint.lock().ok()?.clone()
+    }
+
+    // ---- the On battery latch (#432), poison-tolerant like the health accessors ----
+
+    /// Feed one watcher sample to the latch. Returns whether the settled state changed.
+    pub fn power_observe(
+        &self,
+        r: crate::power::PowerReading,
+        thr: Option<u8>,
+        now: Instant,
+    ) -> bool {
+        self.power
+            .lock()
+            .map(|mut t| t.observe(r, thr, now))
+            .unwrap_or(false)
+    }
+
+    /// Feed the latch the wall clock, which — unlike `Instant` — saw any suspend since the last
+    /// sample. Returns whether the state changed.
+    pub fn power_observe_wall(&self, wall: std::time::SystemTime, now: Instant) -> bool {
+        self.power
+            .lock()
+            .map(|mut t| t.observe_wall(wall, now))
+            .unwrap_or(false)
+    }
+
+    /// Tell the latch about a threshold the user has just set. Returns whether the state changed.
+    pub fn power_apply_threshold(&self, t: u8, now: Instant) -> bool {
+        self.power
+            .lock()
+            .map(|mut p| p.apply_threshold(t, now))
+            .unwrap_or(false)
+    }
+
+    /// What the latch says now. A poisoned lock reads as mains with nothing known — the answer
+    /// that sends nothing to the cloud.
+    pub fn power_snapshot(&self, now: Instant) -> crate::power::PowerSnapshot {
+        self.power
+            .lock()
+            .map(|t| t.snapshot_at(now, Some(std::time::SystemTime::now())))
+            .unwrap_or_default()
+    }
+
+    /// How long PM has been settled on battery, for the release scheduler.
+    pub fn power_on_battery_for(&self, now: Instant) -> Option<Duration> {
+        self.power
+            .lock()
+            .ok()?
+            .on_battery_for_at(now, Some(std::time::SystemTime::now()))
+    }
+
+    /// Claim the one power read. `None` while the previous read is still running.
+    pub fn begin_power_read(&self) -> Option<PowerReadClaim> {
+        self.power_read_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| PowerReadClaim(Arc::clone(&self.power_read_busy)))
+    }
+
+    /// "Keep using local until I quit PM" is on.
+    pub fn keep_local(&self) -> bool {
+        self.keep_local.load(Ordering::SeqCst)
+    }
+
+    /// Turn the override on or off. Returns whether the value changed, so the caller pings only on a
+    /// real change.
+    pub fn set_keep_local(&self, on: bool) -> bool {
+        self.keep_local.swap(on, Ordering::SeqCst) != on
     }
 
     /// Record that PM is about to put this model on the wire.
@@ -1929,5 +2039,42 @@ mod tests {
         );
         drop(hold);
         assert_eq!(slot.holds(), 0, "and released when the job ends");
+    }
+
+    #[test]
+    fn the_power_read_is_single_flight_and_its_claim_frees_on_drop() {
+        // A wedged EC read must not stack a blocking thread every poll: while one read holds the
+        // claim, the next tick gets nothing and records an Unknown sample instead.
+        let rt = LocalRuntime::default();
+        let claim = rt
+            .begin_power_read()
+            .expect("the first read gets the claim");
+        assert!(rt.begin_power_read().is_none(), "a second read is refused");
+        drop(claim);
+        assert!(
+            rt.begin_power_read().is_some(),
+            "and the claim frees on drop"
+        );
+    }
+
+    #[test]
+    fn keep_local_reports_only_a_real_change() {
+        // The command pings the status only on a change, so a repeated click must say "unchanged".
+        let rt = LocalRuntime::default();
+        assert!(!rt.keep_local(), "off by default, every launch");
+        assert!(rt.set_keep_local(true));
+        assert!(!rt.set_keep_local(true));
+        assert!(rt.keep_local());
+        assert!(rt.set_keep_local(false));
+        assert!(!rt.keep_local());
+    }
+
+    #[test]
+    fn a_fresh_runtime_reads_as_mains_with_no_threshold() {
+        let rt = LocalRuntime::default();
+        let snap = rt.power_snapshot(Instant::now());
+        assert_eq!(snap.state, crate::power::PowerState::Mains);
+        assert_eq!(snap.threshold, None);
+        assert_eq!(rt.power_on_battery_for(Instant::now()), None);
     }
 }

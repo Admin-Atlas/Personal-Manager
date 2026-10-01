@@ -9,7 +9,7 @@
 //! video controller, `nvidia-smi`, and a DXGI enumeration for a discrete card's true VRAM (the CIM
 //! `AdapterRAM` field saturates at 4 GB); on Apple Silicon the unified-memory fraction; on Linux
 //! `nvidia-smi`, the AMD sysfs node, and the Intel DRM memory-regions query for a discrete Arc
-//! (#461). **No battery/AC here** — that's the deferred power-aware routing card (#432).
+//! (#461). **No battery/AC here** — that lives in `power_source.rs` (#432).
 //!
 //! The contract every probe honours: **a failure nulls its field, it never errors.** A machine with
 //! no GPU, no `nvidia-smi`, or a driver that lies about VRAM still gets a complete, honest scan — the

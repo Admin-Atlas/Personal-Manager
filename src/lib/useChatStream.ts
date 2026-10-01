@@ -4,7 +4,7 @@
 import { useCallback, useRef, useState } from "react";
 import { sendMessage } from "./ipc";
 import { useDevMode } from "./capabilities";
-import type { ChatFallback, GroundingConfidence, Message, PromptMessage } from "./types";
+import type { ChatFallback, GroundingConfidence, Message, PromptMessage, ServedBy } from "./types";
 
 /**
  * Chat send + streaming state, shared by the global chat (App) and the
@@ -37,7 +37,9 @@ export function useChatStream(currentConvId: () => number | null) {
   // the `done` event) — the source for ChatView's per-message "via <model> - local/cloud" footer. Same
   // lifecycle as `prompts`/`confidences`: captured live, never persisted, kept across switches (it only
   // renders under its own turn, so a reloaded-from-history turn simply has no entry and shows model-only).
-  const [providers, setProviders] = useState<Record<number, "local" | "cloud">>({});
+  // A turn the On battery policy moved is stored as "cloud-on-battery" (#432): it is a choice the
+  // footer words, not a fallback, so it never sets the strip below.
+  const [providers, setProviders] = useState<Record<number, ServedBy>>({});
   // Transient like `error`: set when a turn fell back from the preferred local endpoint to cloud (the
   // `fallback` event, which arrives after the tokens and before `done`). Rendered as the dismissible
   // FallbackStrip and cleared on dismiss / next send / conversation switch — NOT on `done`.
@@ -118,8 +120,10 @@ export function useChatStream(currentConvId: () => number | null) {
             if (p && isCurrent()) setPrompts((prev) => ({ ...prev, [event.message_id]: p }));
             const c = capturedConfidence;
             if (c && isCurrent()) setConfidences((prev) => ({ ...prev, [event.message_id]: c }));
-            if (isCurrent())
-              setProviders((prev) => ({ ...prev, [event.message_id]: event.served_by }));
+            if (isCurrent()) {
+              const servedBy: ServedBy = event.on_battery ? "cloud-on-battery" : event.served_by;
+              setProviders((prev) => ({ ...prev, [event.message_id]: servedBy }));
+            }
           } else if (event.type === "fallback") {
             if (isCurrent())
               setFallback({

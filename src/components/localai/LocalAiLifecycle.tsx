@@ -10,9 +10,28 @@ import {
   releaseLocalGpu,
   setLocalReleasePolicy,
 } from "../../lib/ipc";
-import type { LocalGpuResidency } from "../../lib/types";
+import type { LocalGpuResidency, PowerView } from "../../lib/types";
 import { Button, SectionInfo, SectionLabel, Select, SettingRow } from "../ui";
 import { TrayIconRow } from "../settings/TrayIconRow";
+
+/** The quiet periods offered, shared by "Quiet period" and the on-battery release. */
+const QUIET_MINUTES = [1, 2, 5, 10, 15, 30, 60];
+
+/** "1 minute" / "5 minutes". */
+function minutes(n: number): string {
+  return n === 1 ? "1 minute" : `${n} minutes`;
+}
+
+/** The quiet periods plus a stored one that isn't among them (in order), so the Select shows what
+ *  is really stored rather than snapping to a neighbour. */
+function withStored(options: readonly number[], stored: number | null): number[] {
+  const out = [...options];
+  if (stored != null && !out.includes(stored)) {
+    out.push(stored);
+    out.sort((a, b) => a - b);
+  }
+  return out;
+}
 
 /** How the three policies are worded, and — the part users actually need — when each one suits. */
 const POLICIES: ReadonlyArray<{ value: string; label: string; when: string }> = [
@@ -42,9 +61,26 @@ const POLICIES: ReadonlyArray<{ value: string; label: string; when: string }> = 
  * silently overwrite a setting the user chose. PM runs its own timer instead and leaves the server's
  * configuration alone.
  */
-export function LocalAiLifecycle({ configured }: { configured: boolean }) {
-  const [policy, setPolicy] = useState("server");
+export function LocalAiLifecycle({
+  configured,
+  power,
+}: {
+  configured: boolean;
+  /** The On battery readout from the status, or null while it isn't known — which counts as "not
+   *  known to be a desktop", so the battery row stays usable. */
+  power: PowerView | null;
+}) {
+  // null until the stored policy is read, like the battery row below: a picker showing "Leave it to
+  // my server" before PM has looked would present a default as the user's choice, and would go on
+  // presenting it if the read failed.
+  const [policy, setPolicy] = useState<string | null>(null);
   const [idleMinutes, setIdleMinutes] = useState(5);
+  // null until the stored value is read, and left null if the read fails: the row is disabled then,
+  // rather than presenting "off" as though PM had said so.
+  const [batteryIdle, setBatteryIdle] = useState<number | null>(null);
+  // "restored": the write failed and the pickers show what is really stored. "unknown": the write
+  // failed and so did reading it back, so the pickers show nothing.
+  const [saveError, setSaveError] = useState<"restored" | "unknown" | null>(null);
   const [residency, setResidency] = useState<LocalGpuResidency | null>(null);
   const [releasing, setReleasing] = useState(false);
   const [freed, setFreed] = useState<number | null>(null);
@@ -55,26 +91,57 @@ export function LocalAiLifecycle({ configured }: { configured: boolean }) {
       .catch(() => setResidency(null));
   }, []);
 
-  useEffect(() => {
+  // `afterFailedSave`: this read is checking what a failed write left behind. If it fails too, PM
+  // knows neither what it tried to store nor what is stored, so both pickers go back to unknown —
+  // leaving the unsaved choice on screen beside "this shows what PM has stored" would be a lie.
+  const readStored = useCallback((afterFailedSave = false) => {
     void getLocalReleasePolicy()
       .then((s) => {
         setPolicy(s.policy);
         setIdleMinutes(s.idle_minutes);
+        setBatteryIdle(s.battery_idle_minutes ?? null);
+        if (afterFailedSave) setSaveError("restored");
       })
       .catch(() => {
-        /* leave the defaults — the section still renders */
+        if (afterFailedSave) {
+          setPolicy(null);
+          setBatteryIdle(null);
+          setSaveError("unknown");
+        }
+        /* otherwise the pickers simply stay unknown and disabled */
       });
+  }, []);
+
+  useEffect(() => {
+    readStored();
     refresh();
-  }, [refresh]);
+  }, [readStored, refresh]);
+
+  /** A write failed: show what PM really has stored, and say so. This used to be swallowed, which
+   *  left the picker showing a choice that was never saved — the setting would quietly not apply. */
+  function restore() {
+    readStored(true);
+  }
 
   function change(nextPolicy: string, nextMinutes: number) {
     setPolicy(nextPolicy);
     setIdleMinutes(nextMinutes);
     setFreed(null);
-    void setLocalReleasePolicy(nextPolicy, nextMinutes).catch(() => {
-      /* the next read corrects it; a failed write must not wedge the picker */
-    });
+    void setLocalReleasePolicy(nextPolicy, nextMinutes).then(() => setSaveError(null), restore);
   }
+
+  function changeBatteryIdle(nextMinutes: number) {
+    setBatteryIdle(nextMinutes);
+    void setLocalReleasePolicy(null, undefined, nextMinutes).then(
+      () => setSaveError(null),
+      restore,
+    );
+  }
+
+  // A machine PM found no battery on. Only a positive reading counts: no power readout yet is not
+  // evidence of a desktop.
+  const desktop = power != null && !power.has_battery && power.source === "ac";
+  const batteryOff = batteryIdle === null || !!residency?.no_unload_route || desktop;
 
   async function release() {
     setReleasing(true);
@@ -89,7 +156,7 @@ export function LocalAiLifecycle({ configured }: { configured: boolean }) {
     }
   }
 
-  const chosen = POLICIES.find((p) => p.value === policy) ?? POLICIES[0];
+  const chosen = policy == null ? null : (POLICIES.find((p) => p.value === policy) ?? POLICIES[0]);
   const resident = residency?.resident ?? null;
   const releasable = (resident ?? []).filter((m) => m.pm_loaded);
 
@@ -164,9 +231,12 @@ export function LocalAiLifecycle({ configured }: { configured: boolean }) {
               {(a11y) => (
                 <Select
                   {...a11y}
-                  value={policy}
+                  value={policy ?? ""}
+                  disabled={policy == null}
                   onChange={(e) => change(e.target.value, idleMinutes)}
                 >
+                  {/* Not a value: a placeholder until PM has read what is stored. */}
+                  {policy == null && <option value="">—</option>}
                   {POLICIES.map((p) => (
                     <option key={p.value} value={p.value}>
                       {p.label}
@@ -176,7 +246,15 @@ export function LocalAiLifecycle({ configured }: { configured: boolean }) {
               )}
             </SettingRow>
             {/* Unfolded: what the chosen option will actually do is a gating fact, not prose. */}
-            <p className="text-xs text-ink4">{chosen.when}</p>
+            {chosen && <p className="text-xs text-ink4">{chosen.when}</p>}
+            {/* So "Leave it to my server — PM changes nothing" is never contradicted by the row
+                below doing something on battery. */}
+            {batteryIdle != null && batteryIdle > 0 && !desktop && (
+              <p className="text-xs text-ink4">
+                Except on battery: there, PM also hands the memory back after {minutes(batteryIdle)}{" "}
+                without use, as set below.
+              </p>
+            )}
 
             {policy === "idle" && (
               <SettingRow label="Quiet period" helpId="settings-localai-lifecycle">
@@ -186,14 +264,63 @@ export function LocalAiLifecycle({ configured }: { configured: boolean }) {
                     value={String(idleMinutes)}
                     onChange={(e) => change(policy, Number(e.target.value))}
                   >
-                    {[1, 2, 5, 10, 15, 30, 60].map((m) => (
+                    {QUIET_MINUTES.map((m) => (
                       <option key={m} value={m}>
-                        {m === 1 ? "1 minute" : `${m} minutes`}
+                        {minutes(m)}
                       </option>
                     ))}
                   </Select>
                 )}
               </SettingRow>
+            )}
+
+            {/* The On battery policy's other half (#432): whether PM stays local or moves to the
+                cloud, a model left on the card keeps it drawing power. Enabled for keyless and
+                Local only setups too — they are exactly who stays local on battery. */}
+            <SettingRow
+              label="On battery, hand the memory back"
+              helpId="settings-localai-lifecycle"
+            >
+              {(a11y) => (
+                <Select
+                  {...a11y}
+                  value={batteryIdle == null ? "" : String(batteryIdle)}
+                  disabled={batteryOff}
+                  onChange={(e) => changeBatteryIdle(Number(e.target.value))}
+                >
+                  {/* Not a value: a placeholder until PM has read what is stored. */}
+                  {batteryIdle == null && <option value="">—</option>}
+                  {withStored([0, ...QUIET_MINUTES], batteryIdle).map((m) => (
+                    <option key={m} value={m}>
+                      {m === 0 ? "As set above" : `After ${minutes(m)} without use`}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </SettingRow>
+            {desktop ? (
+              <p className="text-xs text-ink4">
+                PM didn't find a battery on this machine, so this never applies.
+              </p>
+            ) : batteryIdle == null ? null : batteryIdle > 0 ? (
+              <p className="text-xs text-ink4">
+                On battery, PM also hands the memory back once nothing has used the model for{" "}
+                {minutes(batteryIdle)}, counting from no earlier than when you unplugged — so moving
+                to the sofa keeps a model you were just using. The next message loads it again,
+                which takes a few seconds. PM only releases models it loaded.
+              </p>
+            ) : (
+              <p className="text-xs text-ink4">
+                On battery, PM does whatever "Give the memory back" says. A graphics card holding a
+                model keeps drawing power even while nothing is asking it anything.
+              </p>
+            )}
+            {saveError && (
+              <p className="text-xs text-st-due">
+                {saveError === "restored"
+                  ? "Couldn't save that. This shows what PM has stored."
+                  : "Couldn't save that, and PM couldn't read back what is stored."}
+              </p>
             )}
 
             <TrayIconRow helpId="settings-tray-icon" />

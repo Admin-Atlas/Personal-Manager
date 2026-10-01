@@ -46,4 +46,13 @@ describe("help registry hygiene", () => {
       expect(entry.body.trim(), `${id} has no body`).not.toBe("");
     }
   });
+
+  it("has an entry for the On battery section", () => {
+    // HelpOverlay renders nothing at all for an id it can't find, so a section whose `data-help`
+    // points nowhere is silently unexplained — and nothing but this would notice.
+    const entry = HELP["settings-localai-power"];
+    expect(entry, "no help entry for settings-localai-power").toBeDefined();
+    expect(entry?.title).toBe("On battery");
+    expect(entry?.body).toMatch(/reduces power use by not running inference on your GPU/);
+  });
 });

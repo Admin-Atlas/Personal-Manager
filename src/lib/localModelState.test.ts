@@ -12,6 +12,7 @@ import {
   localModelActivity,
   type LocalModelActivity,
 } from "./localModelState";
+import { INERT_POWER_VIEW } from "./powerRoute";
 import type { LocalLlmStatus } from "./types";
 
 const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
@@ -31,6 +32,7 @@ const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   background_loaded: null,
   chat_released: false,
   background_released: false,
+  power: INERT_POWER_VIEW,
   ...over,
 });
 
@@ -84,5 +86,26 @@ describe("localModelActivity", () => {
     }
     // The one a passing glance is most likely to misread, so it is spelled out rather than implied.
     expect(ACTIVITY_LABEL.unloaded).toBe("not loaded");
+  });
+
+  it("puts no 'loaded' chip over a row the On battery policy has moved to the cloud", () => {
+    // The backend reports no local model for a moved role, so the row names the cloud model — and a
+    // "loaded" beside a cloud model's name would read as the cloud model being on the card. The
+    // loaded fields still describe the parked model; this classifier must not borrow them.
+    const moved = status({
+      chat_local_model: null,
+      chat_loaded: true,
+      power: {
+        ...INERT_POWER_VIEW,
+        state: "battery_low",
+        chat: { route: "cloud", blocked: null, local_model: "gemma3:4b" },
+      },
+    });
+    expect(localModelActivity(moved, "chat")).toBeNull();
+  });
+
+  it("words a release without claiming which setting caused it", () => {
+    // The on-battery release and the release policy mark a model released through the same path.
+    expect(ACTIVITY_DETAIL.released).toMatch(/Local AI settings/);
   });
 });

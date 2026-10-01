@@ -6,10 +6,11 @@
 // what these pin: "PM couldn't ask" is not "nothing is loaded", a model PM didn't load is not PM's to
 // free, and a server with no unload route must say so rather than offer options that do nothing.
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { LocalGpuResidency } from "../../lib/types";
+import { INERT_POWER_VIEW } from "../../lib/powerRoute";
+import type { LocalGpuResidency, PowerView } from "../../lib/types";
 
 const localGpuResidency = vi.fn();
 const releaseLocalGpu = vi.fn();
@@ -56,7 +57,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   localGpuResidency.mockResolvedValue(residency());
   releaseLocalGpu.mockResolvedValue(0);
-  getLocalReleasePolicy.mockResolvedValue({ policy: "server", idle_minutes: 5 });
+  getLocalReleasePolicy.mockResolvedValue({
+    policy: "server",
+    idle_minutes: 5,
+    battery_idle_minutes: 0,
+  });
   setLocalReleasePolicy.mockResolvedValue(undefined);
   getTrayEnabled.mockResolvedValue(false);
   setTrayEnabled.mockResolvedValue(undefined);
@@ -65,7 +70,7 @@ afterEach(cleanup);
 
 const loaded = async (over: Partial<LocalGpuResidency> = {}) => {
   localGpuResidency.mockResolvedValue(residency(over));
-  const view = render(<LocalAiLifecycle configured />);
+  const view = render(<LocalAiLifecycle configured power={null} />);
   await waitFor(() => expect(localGpuResidency).toHaveBeenCalled());
   return view;
 };
@@ -126,8 +131,172 @@ describe("LocalAiLifecycle", () => {
   });
 
   it("stays quiet about all of it until an endpoint is connected", async () => {
-    render(<LocalAiLifecycle configured={false} />);
+    render(<LocalAiLifecycle configured={false} power={null} />);
     expect(await screen.findByText(/Connect an endpoint above/i)).toBeTruthy();
     expect(screen.queryByText(/Release now/i)).toBeNull();
+  });
+});
+
+describe("On battery, hand the memory back (#432)", () => {
+  const batteryRow = () =>
+    screen.getByRole("combobox", { name: "On battery, hand the memory back" }) as HTMLSelectElement;
+
+  /** Wait for the stored value to land — the row is disabled until it has. */
+  const settled = async () => {
+    await waitFor(() => expect(batteryRow().disabled).toBe(false));
+  };
+
+  it("writes only its own field", async () => {
+    await loaded();
+    await settled();
+    fireEvent.change(batteryRow(), { target: { value: "5" } });
+    // Positional, with the policy left alone: a battery change must not restate (and so risk
+    // overwriting) the release policy it sits under.
+    expect(setLocalReleasePolicy).toHaveBeenCalledWith(null, undefined, 5);
+    expect(
+      await screen.findByText(/counting from no earlier than when you unplugged/),
+    ).toBeTruthy();
+  });
+
+  it("shows nothing as stored until PM has read it", async () => {
+    // A read that never answers: the row must not present "As set above" as the user's choice.
+    getLocalReleasePolicy.mockReturnValue(new Promise(() => {}));
+    await loaded();
+    expect(batteryRow().disabled).toBe(true);
+    expect(batteryRow().value).toBe("");
+  });
+
+  it("is off for a desktop, and says why", async () => {
+    const desktop: PowerView = { ...INERT_POWER_VIEW, source: "ac", has_battery: false };
+    localGpuResidency.mockResolvedValue(residency());
+    render(<LocalAiLifecycle configured power={desktop} />);
+    expect(
+      await screen.findByText("PM didn't find a battery on this machine, so this never applies."),
+    ).toBeTruthy();
+    expect(batteryRow().disabled).toBe(true);
+  });
+
+  it("stays usable while the power readout isn't known, and on a laptop", async () => {
+    // null is "not known to be a desktop", never "is a desktop".
+    await loaded();
+    await settled();
+    cleanup();
+    const laptop: PowerView = { ...INERT_POWER_VIEW, source: "ac", has_battery: true };
+    render(<LocalAiLifecycle configured power={laptop} />);
+    await settled();
+  });
+
+  it("is off when the server can't unload anything", async () => {
+    await loaded({ no_unload_route: true });
+    expect(await screen.findByText(/no way to unload a model on request/i)).toBeTruthy();
+    expect(batteryRow().disabled).toBe(true);
+  });
+
+  it("qualifies the chosen policy only when it is set", async () => {
+    // "Leave it to my server — PM changes nothing" must never be contradicted by a silent battery
+    // rule underneath it.
+    await loaded();
+    await settled();
+    expect(screen.queryByText(/Except on battery/)).toBeNull();
+
+    cleanup();
+    getLocalReleasePolicy.mockResolvedValue({
+      policy: "server",
+      idle_minutes: 5,
+      battery_idle_minutes: 10,
+    });
+    await loaded();
+    expect(
+      await screen.findByText(
+        "Except on battery: there, PM also hands the memory back after 10 minutes without use, as set below.",
+      ),
+    ).toBeTruthy();
+    expect(batteryRow().value).toBe("10");
+  });
+
+  it("shows a stored value that isn't on the list rather than snapping to a neighbour", async () => {
+    getLocalReleasePolicy.mockResolvedValue({
+      policy: "server",
+      idle_minutes: 5,
+      battery_idle_minutes: 7,
+    });
+    await loaded();
+    await settled();
+    expect(batteryRow().value).toBe("7");
+  });
+
+  it("puts a failed write back to what PM has stored, and says so", async () => {
+    // This used to be swallowed: the picker kept showing a choice that was never saved, so the
+    // setting quietly did not apply.
+    await loaded();
+    await settled();
+    setLocalReleasePolicy.mockRejectedValueOnce(new Error("vault locked"));
+    fireEvent.change(batteryRow(), { target: { value: "5" } });
+
+    expect(
+      await screen.findByText("Couldn't save that. This shows what PM has stored."),
+    ).toBeTruthy();
+    await waitFor(() => expect(batteryRow().value).toBe("0"));
+    // Re-read, not guessed: once on mount, once after the failure.
+    expect(getLocalReleasePolicy).toHaveBeenCalledTimes(2);
+
+    // And it clears on the next change that does save.
+    fireEvent.change(batteryRow(), { target: { value: "2" } });
+    await waitFor(() =>
+      expect(screen.queryByText("Couldn't save that. This shows what PM has stored.")).toBeNull(),
+    );
+  });
+
+  it("restores the release policy too when its write fails", async () => {
+    await loaded();
+    await settled();
+    setLocalReleasePolicy.mockRejectedValueOnce(new Error("nope"));
+    const policy = screen.getByRole("combobox", {
+      name: "Give the memory back",
+    }) as HTMLSelectElement;
+    fireEvent.change(policy, { target: { value: "idle" } });
+    expect(await screen.findByText(/Couldn't save that/)).toBeTruthy();
+    await waitFor(() => expect(policy.value).toBe("server"));
+  });
+
+  it("shows nothing as stored when neither the save nor reading it back worked", async () => {
+    // Leaving the unsaved choice on screen beside "this shows what PM has stored" would be a lie.
+    await loaded();
+    await settled();
+    setLocalReleasePolicy.mockRejectedValueOnce(new Error("vault locked"));
+    getLocalReleasePolicy.mockRejectedValueOnce(new Error("vault locked"));
+    fireEvent.change(batteryRow(), { target: { value: "5" } });
+    expect(
+      await screen.findByText("Couldn't save that, and PM couldn't read back what is stored."),
+    ).toBeTruthy();
+    expect(batteryRow().value).toBe("");
+    expect(batteryRow().disabled).toBe(true);
+    const policy = screen.getByRole("combobox", {
+      name: "Give the memory back",
+    }) as HTMLSelectElement;
+    expect(policy.value).toBe("");
+    expect(policy.disabled).toBe(true);
+  });
+
+  it("doesn't present a release policy before PM has read the stored one", async () => {
+    getLocalReleasePolicy.mockReturnValue(new Promise(() => {}));
+    await loaded();
+    const policy = screen.getByRole("combobox", {
+      name: "Give the memory back",
+    }) as HTMLSelectElement;
+    expect(policy.value).toBe("");
+    expect(policy.disabled).toBe(true);
+    expect(screen.queryByText(/PM changes nothing\. Your server decides/)).toBeNull();
+  });
+
+  it("counts only a positive AC reading as a desktop", async () => {
+    // A wedged read is an Unknown sample; it isn't evidence that the battery has gone.
+    const unread: PowerView = { ...INERT_POWER_VIEW, source: "unknown", has_battery: false };
+    localGpuResidency.mockResolvedValue(residency());
+    render(<LocalAiLifecycle configured power={unread} />);
+    await settled();
+    expect(
+      screen.queryByText("PM didn't find a battery on this machine, so this never applies."),
+    ).toBeNull();
   });
 });
