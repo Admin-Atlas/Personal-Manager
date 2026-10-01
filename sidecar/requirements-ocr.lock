@@ -18,7 +18,7 @@
 # pm-lock: 1
 # pm-python-floor: 3.10
 # pm-input: sidecar/requirements-optional.txt@sha256:746a8136534a8b8a4fb8169a65b4ba4515b89be460c94a97a5d537cc872ba2da
-# pm-constraint: sidecar/requirements.lock@sha256:ccdc89f8ee942bf508cfd0c9923794643cc7d7ccb515bc5edb6867fa79bb58b0
+# pm-constraint: sidecar/requirements.lock@sha256:1944df77225585d68c4e87098b812fec665f8b7fbf4839399779c50355b3f0e7
 # pm-pins: rapidocr==3.9.2 pi-heif==1.4.0
 antlr4-python3-runtime==4.9.3 \
     --hash=sha256:f224469b4168294902bb1efa80a8bf7855f24c99aef99cbefc1bcd3cce77881b
@@ -784,9 +784,9 @@ tqdm==4.70.0 \
     # via
     #   -c sidecar/requirements.lock
     #   rapidocr
-urllib3==2.7.0 \
-    --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
-    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
+    --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
     # via
     #   -c sidecar/requirements.lock
     #   requests
