@@ -15,6 +15,7 @@ import { render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
 import { DownloadedModels } from "./LocalAiDownloaded";
+import { sectionLabel } from "./sections";
 
 // `useTheme` is stubbed so the section's <Button>s don't need the full ThemeProvider, matching
 // ConnectorItemRow.test.tsx.
@@ -54,6 +55,7 @@ const MODEL: LocalOnDiskModel = {
     kv: "f16",
     est_memory_gb: 3.4,
     est_tokens_per_sec: 40,
+    speed_basis: "system",
     notes: [],
   },
 };
@@ -95,6 +97,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     disk_truncated: false,
     scan_dir: null,
     terms_accepted: [],
+    live_available_ram_gb: 20,
     ...over,
   };
 }
@@ -121,7 +124,9 @@ describe("DownloadedModels — the unserved gating hint", () => {
         onClearFolder={noop}
       />,
     );
-    expect(container.textContent).toContain("Connect an endpoint");
+    expect(container.textContent).toContain(
+      `Connect your server under ${sectionLabel("sec-localai-endpoint")}`,
+    );
     expect(container.textContent).not.toContain("None of these can be assigned yet");
   });
 
@@ -135,7 +140,7 @@ describe("DownloadedModels — the unserved gating hint", () => {
       />,
     );
     expect(container.textContent).not.toContain("can be assigned");
-    expect(container.textContent).not.toContain("Connect an endpoint");
+    expect(container.textContent).not.toContain("Connect your server under");
   });
 });
 

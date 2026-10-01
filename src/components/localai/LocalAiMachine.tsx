@@ -4,7 +4,7 @@
 import type { LocalRecommendations } from "../../lib/types";
 import { formatGib } from "../../lib/format";
 import { sectionLabel } from "./sections";
-import { Button, SectionInfo, SectionLabel } from "../ui";
+import { Button, Callout, SectionInfo, SectionLabel } from "../ui";
 
 /**
  * "Your machine" — what PM read about this device, and the button that re-reads it.
@@ -18,11 +18,15 @@ export function LocalAiMachine({
   loading,
   rescanning,
   onRescan,
+  error,
 }: {
   recs: LocalRecommendations | null;
   loading: boolean;
   rescanning: boolean;
   onRescan: () => void;
+  /** Reading the hardware or sizing the list against it failed, said here rather than at the top
+   *  of the tab. */
+  error?: string | null;
 }) {
   return (
     <div
@@ -40,6 +44,7 @@ export function LocalAiMachine({
       >
         {sectionLabel("sec-localai-machine")}
       </SectionLabel>
+      {error && <Callout className="mt-2">{error}</Callout>}
       {loading ? (
         <p className="mt-2 text-xs text-ink4">Scanning your hardware…</p>
       ) : recs ? (

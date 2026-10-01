@@ -15,6 +15,7 @@ import {
   consentText,
   powerGate,
   powerReadout,
+  powerSummary,
   powerTag,
   scopeNote,
   themPhrase,
@@ -26,6 +27,8 @@ const movable = (over: Partial<PowerRoleView> = {}): PowerRoleView => ({
   route: "unchanged",
   blocked: null,
   local_model: "gemma3:4b",
+  effective: "local_then_cloud",
+  cloud_key: "present",
   ...over,
 });
 
@@ -349,7 +352,7 @@ describe("powerReadout — one case per row, first match wins", () => {
       `On battery at 50%, so chat and background work are going to the cloud. That ${REDUCES_POWER}. PM moves back to your local model about a minute after you plug in, or if the battery climbs back to 75%.`,
     );
     expect(read({ ...routed, background: movable() }, true)).toBe(
-      `On battery at 50%, so chat is going to the cloud. That ${REDUCES_POWER}. PM moves back to your local model about a minute after you plug in, or if the battery climbs back to 75%. gemma3:4b is still loaded on your graphics card, and a loaded model keeps the card drawing power. To hand it back on battery, choose a time for "On battery, hand the memory back" under Holding the graphics card.`,
+      `On battery at 50%, so chat is going to the cloud. That ${REDUCES_POWER}. PM moves back to your local model about a minute after you plug in, or if the battery climbs back to 75%. gemma3:4b is still loaded on your graphics card, and a loaded model keeps the card drawing power. To hand it back on battery, choose a time for "On battery, hand the memory back" below.`,
     );
   });
 
@@ -378,5 +381,80 @@ describe("powerReadout — one case per row, first match wins", () => {
     expect(read({ source: "battery", state: "battery_low", percent: 30 })).toBe(
       "On battery at 30%. Nothing you've chosen to move can use the cloud with your current setup, so PM is staying on your local model.",
     );
+  });
+});
+
+describe("powerSummary — one case per branch, first match wins", () => {
+  // The one-sentence version, for a readout outside On battery. Like the readout it words what Rust
+  // decided and re-derives nothing — so each branch is pinned against the snapshot that selects it.
+
+  it("says nothing where there is nothing to move, or nothing read yet", () => {
+    expect(powerSummary("cloud_only", power())).toBeNull();
+    expect(powerSummary("loading", null)).toBeNull();
+    expect(powerSummary("ready", null)).toBeNull();
+  });
+
+  it("words each gate that keeps PM on the local model", () => {
+    expect(powerSummary("no_battery", power({ has_battery: false }))).toBe(
+      "No battery on this computer, so On battery never applies.",
+    );
+    expect(powerSummary("no_key", power())).toBe(
+      "On battery, PM stays on your local model — there's no cloud key to move to.",
+    );
+    expect(powerSummary("key_unreadable", power())).toBe(
+      "On battery, PM stays on your local model while it can't read your saved keys.",
+    );
+    expect(powerSummary("not_with_roles", power())).toBe(
+      "On battery, PM stays on your local model — your roles aren't set to Local, fall back to cloud.",
+    );
+  });
+
+  it("puts a waiting question first", () => {
+    expect(
+      powerSummary(
+        "ready",
+        power({ consent_needed: true, keep_local: true, chat: movable({ route: "cloud" }) }),
+      ),
+    ).toBe("PM is waiting for your answer about using the cloud on battery.");
+  });
+
+  it("names what is on the cloud now, with the right verb", () => {
+    expect(powerSummary("ready", power({ chat: movable({ route: "cloud" }) }))).toBe(
+      "On battery, so chat is on your cloud model until you plug in.",
+    );
+    expect(
+      powerSummary(
+        "ready",
+        power({ chat: movable({ route: "cloud" }), background: movable({ route: "cloud" }) }),
+      ),
+    ).toBe("On battery, so chat and background work are on your cloud model until you plug in.");
+  });
+
+  it("says the override, then switching off, then nothing movable", () => {
+    expect(powerSummary("ready", power({ keep_local: true, threshold: 0 }))).toBe(
+      "You've asked PM to keep using your local model until you quit.",
+    );
+    expect(powerSummary("ready", power({ threshold: 0 }))).toBe(
+      "On battery, PM stays on your local model — switching is off.",
+    );
+    expect(
+      powerSummary("ready", power({ roles: "chat", chat: movable({ blocked: "local_only" }) })),
+    ).toBe("On battery, nothing you've chosen would move to the cloud.");
+  });
+
+  it("otherwise says when PM would move, and whether it asks first", () => {
+    expect(powerSummary("ready", power())).toBe(
+      "On battery at 60% or below, PM moves chat and background work to your cloud model, after asking you once.",
+    );
+    expect(powerSummary("ready", power({ consent: "both", roles: "background" }))).toBe(
+      "On battery at 60% or below, PM moves background work to your cloud model.",
+    );
+  });
+
+  it("never says switching stops the battery draining", () => {
+    const gates = ["no_battery", "no_key", "key_unreadable", "not_with_roles", "ready"] as const;
+    for (const gate of gates) {
+      expect(powerSummary(gate, power()) ?? "").not.toMatch(/stops? draining/i);
+    }
   });
 });

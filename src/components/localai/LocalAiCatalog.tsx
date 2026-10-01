@@ -9,8 +9,9 @@ import { IngestProgress } from "../IngestProgress";
 import { installCommand } from "../../lib/workbenchGuide";
 import { ConfigRow, FitBadge } from "./fitDisplay";
 import { sectionLabel } from "./sections";
+import { SPEED_LIST_NOTE, speedShort } from "./speedWords";
 import type { ModelPull } from "./usePull";
-import { Button, Collapsible, SectionLabel, Select } from "../ui";
+import { Button, Callout, Collapsible, SectionLabel, Select } from "../ui";
 
 /**
  * "Recommended models" — the curated catalog sized against this machine, and the one-click pull.
@@ -29,6 +30,7 @@ export function LocalAiCatalog({
   installedRepos,
   pull,
   onCadence,
+  error,
 }: {
   recs: LocalRecommendations | null;
   loading: boolean;
@@ -40,6 +42,9 @@ export function LocalAiCatalog({
   /** The one model download, from the tab's `usePull`. */
   pull: ModelPull;
   onCadence: (cadence: string) => void;
+  /** Something in this section went wrong — a download it asked for, the cadence — said here
+   *  rather than at the top of the tab. */
+  error?: string | null;
 }) {
   const { pulling, pullProg } = pull;
 
@@ -64,6 +69,10 @@ export function LocalAiCatalog({
       >
         {sectionLabel("sec-localai-models")}
       </SectionLabel>
+      {error && <Callout className="mt-2">{error}</Callout>}
+      {/* Never folded: it is what every speed on the cards below it is, and a ceiling read as a
+          forecast is the misreading it exists to stop. */}
+      <p className="mt-1.5 text-xs text-ink4">{SPEED_LIST_NOTE}</p>
       <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
         <NumbersGuide />
       </Collapsible>
@@ -136,7 +145,7 @@ function NumbersGuide() {
     ],
     [
       "Speed",
-      "A rough tokens-per-second estimate for how fast replies stream on your machine — higher is snappier.",
+      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement: PM divides the memory speed of whatever the model runs from by how much of the model it reads for each token. On a graphics card PM recognises, that makes it a ceiling — in PM's own checks on one laptop graphics card, real replies came 10–35% slower. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
     ],
     [
       "Memory",
@@ -160,9 +169,12 @@ function NumbersGuide() {
         </div>
       ))}
       <p className="pt-1 text-ink4">
-        Numbers are estimates. Memory assumes an f16 KV cache by default; where a card shows “q8_0
-        KV”, PM sized it on a compressed (near-lossless) cache to keep a larger context or quant.
-        Your real speed and memory depend on your runner and settings.
+        Memory figures are designed to run a little high — about 11% above a real load when PM
+        measured one — so a model PM says fits should fit. Memory assumes an f16 cache unless a card
+        shows “q8_0 KV”, where PM sized it on a compressed (near-lossless) cache to keep a larger
+        context or quant — your server needs that setting too (
+        {sectionLabel("sec-localai-endpoint")}, “Settings PM's numbers assume”). Your real speed and
+        memory depend on your server and its settings.
       </p>
     </dl>
   );
@@ -359,9 +371,7 @@ function RecommendationCard({
               {f.quant && <span>{f.quant}</span>}
               {f.context != null && <span>{(f.context / 1024).toFixed(0)}k ctx</span>}
               {f.kv === "q8_0" && <span>q8_0 KV</span>}
-              {f.est_tokens_per_sec != null && (
-                <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>
-              )}
+              {speedShort(f) && <span>{speedShort(f)}</span>}
               {f.est_memory_gb != null && <span>{formatGib(f.est_memory_gb)}</span>}
             </div>
           )}

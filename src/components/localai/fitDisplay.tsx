@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 
 import type { LocalFitResult, LocalFitVerdict } from "../../lib/types";
 import { formatGib } from "../../lib/format";
+import { speedShort } from "./speedWords";
 
 /**
  * How a fit VERDICT is shown, wherever it is shown.
@@ -49,14 +50,16 @@ export function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
 }
 
 /** The per-config mono metric spans (quant · context · speed · memory), shared by the single- and
- *  two-config (Split) card layouts. */
+ *  two-config (Split) card layouts. The speed is worded from what it was worked out from
+ *  (`speedWords`): a ceiling says "up to", a guess says "about", shared memory gets no number. */
 function ConfigMetrics({ fit }: { fit: LocalFitResult }) {
+  const speed = speedShort(fit);
   return (
     <>
       {fit.quant && <span>{fit.quant}</span>}
       {fit.context != null && <span>{(fit.context / 1024).toFixed(0)}k ctx</span>}
       {fit.kv === "q8_0" && <span>q8_0 KV</span>}
-      {fit.est_tokens_per_sec != null && <span>~{fit.est_tokens_per_sec.toFixed(0)} tok/s</span>}
+      {speed && <span>{speed}</span>}
       {fit.est_memory_gb != null && <span>{formatGib(fit.est_memory_gb)}</span>}
     </>
   );

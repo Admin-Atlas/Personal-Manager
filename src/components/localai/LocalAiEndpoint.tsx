@@ -17,11 +17,15 @@ import type {
   LocalLlmConfig,
   LocalLlmStatus,
 } from "../../lib/types";
-import { runnerGuides } from "../../lib/workbenchGuide";
+import { runnerGuides, tuningFor } from "../../lib/workbenchGuide";
+import { withCode } from "../withCode";
 import { TokenChip } from "./fitDisplay";
+import { TUNING_ID } from "./locate";
+import { runnerOf } from "./readiness";
 import { RunnerGuideCard } from "./RunnerGuideCard";
 import {
   Button,
+  Callout,
   Collapsible,
   ConfirmDialog,
   Input,
@@ -46,6 +50,9 @@ export function LocalAiEndpoint({
   onReload,
   onError,
   onEndpointChanged,
+  error,
+  tuningOpen,
+  onTuningOpenChange,
 }: {
   config: LocalLlmConfig | null;
   status: LocalLlmStatus | null;
@@ -56,6 +63,12 @@ export function LocalAiEndpoint({
   onError: (message: string | null) => void;
   /** The stored endpoint or its token changed, so anything proved against the old one is stale. */
   onEndpointChanged: () => void;
+  /** Something in this section went wrong, said here rather than at the top of the tab. */
+  error?: string | null;
+  /** The "Settings PM's numbers assume" fold, held by the tab so a pointer elsewhere can open it.
+   *  Omitted, the fold keeps its own state. */
+  tuningOpen?: boolean;
+  onTuningOpenChange?: (open: boolean) => void;
 }) {
   const [urlInput, setUrlInput] = useState("");
   const [detected, setDetected] = useState<DetectedEndpoint[] | null>(null);
@@ -64,6 +77,7 @@ export function LocalAiEndpoint({
   const [tokenInput, setTokenInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [confirmForgetToken, setConfirmForgetToken] = useState(false);
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   // The endpoint form's two label/control pairs. Both labels sat above their Input naming nothing,
   // so the fields announced as the placeholder ("http://localhost:11434", "bearer token").
   const urlField = useFieldA11y();
@@ -76,6 +90,11 @@ export function LocalAiEndpoint({
   useEffect(() => {
     setUrlInput((u) => u || storedUrl || "");
   }, [storedUrl]);
+
+  // The two settings PM sized its numbers for, worded for the server this is — or nothing, for a
+  // server PM can't name by its port.
+  const runner = runnerOf(storedUrl);
+  const tuning = tuningFor(runner);
 
   async function autodetect() {
     onError(null);
@@ -172,6 +191,7 @@ export function LocalAiEndpoint({
         the OpenAI API, at whatever address you give it. PM connects to a server{" "}
         <span className="text-ink2">you</span> run; it never bundles, installs, or starts one.
       </p>
+      {error && <Callout className="mt-2">{error}</Callout>}
 
       {configured ? (
         <div className="mt-2">
@@ -185,7 +205,7 @@ export function LocalAiEndpoint({
           {status != null && !status.reachable && !status.in_cooldown && (
             <p className="mt-1 text-xs text-ink4">
               PM can't reach it at the moment. The usual cause is that the server isn't running —
-              the guide below says, for each runner, whether it starts with your machine or you
+              the comparison below says, for each runner, whether it starts with your machine or you
               start it each session. PM keeps checking, so this clears on its own once it's back.
             </p>
           )}
@@ -197,8 +217,10 @@ export function LocalAiEndpoint({
             </p>
           )}
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <Button variant="tertiary" onClick={() => void disconnect()}>
-              Disconnect
+            {/* Asks first: it forgets more than the address — the token and both jobs' models go
+                with it, and what each job does afterwards depends on its routing. */}
+            <Button variant="tertiary" onClick={() => setConfirmDisconnect(true)}>
+              Disconnect…
             </Button>
             {config?.has_token && (
               <Button variant="tertiary" onClick={() => setConfirmForgetToken(true)}>
@@ -220,6 +242,23 @@ export function LocalAiEndpoint({
             PM deletes the bearer token for this endpoint from your keychain. The address and your
             role assignments stay as they are. If the server requires a token, PM won't be able to
             reach it until you connect again with a new one.
+          </ConfirmDialog>
+          <ConfirmDialog
+            open={confirmDisconnect}
+            title="Disconnect from your model server?"
+            danger
+            confirmLabel="Disconnect"
+            onConfirm={() => {
+              setConfirmDisconnect(false);
+              void disconnect();
+            }}
+            onClose={() => setConfirmDisconnect(false)}
+          >
+            PM forgets this server's address, its saved token, and the models you gave chat and
+            background work. Your server and the models in it aren't touched. Afterwards, a job set
+            to Local only has nothing to answer with until you connect again, and one set to Local,
+            fall back to cloud uses your cloud model if you have one. To change the address or
+            token, disconnect and connect again.
           </ConfirmDialog>
         </div>
       ) : (
@@ -299,14 +338,43 @@ export function LocalAiEndpoint({
             >
               {checking ? "Checking…" : "Check"}
             </Button>
+            {/* Secondary: the tab's one primary is the step it is on, and connecting from this form
+                is the by-hand route to the same write. */}
             <Button
-              variant="primary"
+              variant="secondary"
               onClick={() => void saveEndpoint()}
               disabled={saving || !urlInput.trim()}
             >
               {saving ? "Connecting…" : "Connect"}
             </Button>
           </div>
+        </div>
+      )}
+
+      {/* The settings PM's numbers assume, for the server this is. PM sizes for a longer context than
+          most servers start with, and on most graphics-card setups for a compressed cache — a model
+          PM says fits only fits that way once the server is set the same way, and nothing said so
+          before this. Folded (it is instructions), and held by the tab so a pointer can open it. */}
+      {configured && runner && tuning && (
+        <div id={TUNING_ID} className="mt-3">
+          <Collapsible
+            title="Settings PM's numbers assume"
+            defaultOpen={false}
+            open={tuningOpen}
+            onOpenChange={onTuningOpenChange}
+          >
+            <div className="mt-1 text-xs text-ink4">
+              <p>
+                PM sizes models for a longer context than most servers start with, and on most
+                graphics-card setups for a compressed (q8_0) cache. These are the {runner} settings
+                for both:
+              </p>
+              <ul className="mt-1.5 list-disc space-y-1 pl-4">
+                <li>{withCode(tuning.context)}</li>
+                <li>{withCode(tuning.cache)}</li>
+              </ul>
+            </div>
+          </Collapsible>
         </div>
       )}
 
@@ -405,7 +473,7 @@ function EndpointCheckResult({ check }: { check: EndpointCheck }) {
       {empty && (
         <p className="mt-1">
           It's running, but there are no models in it yet — so there is nothing for PM to send work
-          to. Download one into it, then check again.
+          to. Connect it anyway: with Ollama, PM can then download one into it for you.
         </p>
       )}
       {check.posture !== "loopback" && check.scheme_verdict !== "refused_public_cleartext" && (

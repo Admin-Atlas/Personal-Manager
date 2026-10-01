@@ -19,7 +19,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SetupPlatform } from "./setupGuide";
-import { installCommand, runnerGuides } from "./workbenchGuide";
+import { installCommand, runnerGuides, tuningFor, type RunnerName } from "./workbenchGuide";
 
 const PLATFORMS: SetupPlatform[] = ["windows", "mac", "linux"];
 
@@ -124,6 +124,67 @@ describe("runnerGuides", () => {
     // must not be sent down a path that cannot work.
     const mac = runnerGuides("mac").find((g) => g.name === "LM Studio");
     expect(mac?.caveat).toMatch(/Apple Silicon/i);
+  });
+});
+
+describe("the settings PM's numbers assume", () => {
+  // PM sizes most graphics-card configs on a compressed (q8_0) K/V cache, and for a longer context
+  // than most servers start with. Until these steps existed nothing told anyone to turn either on,
+  // so a model PM said fits did not fit the way PM said it would.
+
+  it("tells every Ollama platform to turn on the compressed cache, right after the context step", () => {
+    for (const platform of PLATFORMS) {
+      const steps = runnerGuides(platform).find((g) => g.name === "Ollama")?.steps ?? [];
+      const ctx = steps.findIndex((step) => step.includes("OLLAMA_CONTEXT_LENGTH"));
+      const kv = steps.findIndex((step) => step.includes("OLLAMA_KV_CACHE_TYPE"));
+      expect(ctx, `Ollama on ${platform} has no context step`).toBeGreaterThan(-1);
+      expect(kv, `Ollama on ${platform}`).toBe(ctx + 1);
+      // Found by name everywhere else, so the cache step must never be mistaken for it.
+      expect(steps[kv]).not.toContain("OLLAMA_CONTEXT_LENGTH");
+      // The two facts the FAQ attaches to it: it is global, and it needs Flash Attention.
+      expect(steps[kv]).toMatch(/every model it runs/);
+      expect(steps[kv]).toMatch(/Flash Attention/);
+    }
+  });
+
+  it("points nowhere by direction", () => {
+    // These strings render wherever the guide is shown, so "below" and "above" were always a guess
+    // about a layout the guide cannot see — and several were wrong.
+    for (const platform of PLATFORMS) {
+      for (const g of runnerGuides(platform)) {
+        for (const text of [...g.steps, g.models]) {
+          expect(text, `${g.name} on ${platform}`).not.toMatch(/\b(above|below)\b/i);
+        }
+      }
+    }
+  });
+
+  it("no longer says llama-server's default context is small", () => {
+    // `-c` defaults to 0, "loaded from model": the model's whole trained context.
+    for (const platform of PLATFORMS) {
+      const llama = runnerGuides(platform).find((g) => g.name === "llama-server");
+      const ctx = llama?.steps.find((step) => step.includes("--ctx-size"));
+      expect(ctx).toMatch(/whole trained context/);
+      expect(ctx).not.toMatch(/far smaller/);
+    }
+  });
+
+  it("words both settings for each of the three servers, and nothing for any other", () => {
+    const runners: RunnerName[] = ["Ollama", "LM Studio", "llama-server"];
+    for (const platform of PLATFORMS) {
+      for (const runner of runners) {
+        const tuning = tuningFor(runner, platform);
+        expect(tuning?.context.trim(), `${runner} on ${platform}`).toBeTruthy();
+        expect(tuning?.cache.trim(), `${runner} on ${platform}`).toBeTruthy();
+      }
+      // Ollama's are its own guide's steps, word for word, so the two cannot disagree.
+      const steps = runnerGuides(platform).find((g) => g.name === "Ollama")?.steps ?? [];
+      const ollama = tuningFor("Ollama", platform);
+      expect(steps).toContain(ollama?.context);
+      expect(steps).toContain(ollama?.cache);
+    }
+    expect(tuningFor("llama-server", "linux")?.cache).toContain("-fa on -ctk q8_0 -ctv q8_0");
+    expect(tuningFor(null, "linux")).toBeNull();
   });
 });
 

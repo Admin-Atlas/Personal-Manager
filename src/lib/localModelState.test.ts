@@ -98,7 +98,13 @@ describe("localModelActivity", () => {
       power: {
         ...INERT_POWER_VIEW,
         state: "battery_low",
-        chat: { route: "cloud", blocked: null, local_model: "gemma3:4b" },
+        chat: {
+          route: "cloud",
+          blocked: null,
+          local_model: "gemma3:4b",
+          effective: "cloud_for_power",
+          cloud_key: "present",
+        },
       },
     });
     expect(localModelActivity(moved, "chat")).toBeNull();

@@ -11,6 +11,15 @@
 // 2026-08-26 (and the lifecycle/context claims re-checked on 2026-08-30) rather than written from
 // memory, because a wrong command in a settings pane is worse than no command.
 //
+// Re-checked 01-10-2026: Ollama FAQ K/V-cache and Flash Attention; llama.cpp server README
+// -fa/-ctk/-ctv/-c. Two things came of it:
+//   * PM sizes most graphics-card configs on a q8_0 K/V cache, and nothing told anyone to turn one
+//     on. Ollama's `OLLAMA_KV_CACHE_TYPE` is a GLOBAL setting (every model it runs), and it only
+//     compresses the cache where Flash Attention is on — which Ollama enables by itself when the
+//     backend supports it. Hence the step after the context one, and `tuningFor`.
+//   * llama-server's `-c/--ctx-size` defaults to 0, "loaded from model": the model's whole trained
+//     context, not a small one. The old step said the opposite.
+//
 // What the 30-08 pass corrected, recorded so none of it is "fixed" back:
 //   * The flat "4,096-token default" was wrong on every platform. Ollama picks its default from
 //     VRAM — under 24 GiB → 4k, 24-48 GiB → 32k, 48 GiB and up → 256k (docs.ollama.com/context-
@@ -42,6 +51,9 @@
 //     unverified command in a copy box is exactly what this comment exists to prevent.
 
 import { PLATFORM, type SetupPlatform } from "./setupGuide";
+
+/** The three servers PM knows by name — and auto-detects, on 11434, 1234 and 8080. */
+export type RunnerName = "Ollama" | "LM Studio" | "llama-server";
 
 export interface RunnerGuide {
   /** Runner name, e.g. "Ollama". */
@@ -85,12 +97,77 @@ export interface RunnerGuide {
  * actually hit and the opposite of a loud one.
  */
 const OLLAMA_CONTEXT_WHY =
-  "Give it room to work \u2014 Ollama picks its context size from your graphics card (4k under 24 GB of video memory, 32k up to 48, 256k above), so most machines get 4,096 tokens and anything longer is cut without a word. ";
+  "Give it room to work \u2014 Ollama picks its context size from your graphics card (4k under 24 GB of video memory, 32k up to 48, 256k beyond that), so most machines get 4,096 tokens and anything longer is cut without a word. ";
 const OLLAMA_CONTEXT_HAZARD =
   " Don't overshoot, though: Ollama will not shrink the context to make a model fit. If it doesn't fit in video memory it spills into ordinary system memory and runs many times slower, with no error to tell you.";
 
+/**
+ * The compressed-cache step's two halves, around the per-platform HOW — the same shape as the context
+ * step, for the same reason. The second half is what the FAQ says and a user needs before turning it
+ * on: it is global, and it does nothing without Flash Attention. It must never name
+ * OLLAMA_CONTEXT_LENGTH: the context step is found by that name.
+ */
+const OLLAMA_KV_WHEN =
+  "If PM's pick says it was sized with a compressed (q8_0) cache, turn that on too: ";
+const OLLAMA_KV_SCOPE =
+  " Ollama applies it to every model it runs, and only compresses the cache where Flash Attention is on — which it switches on by itself when your graphics card supports it.";
+
+/** Ollama's last step, the same on every platform: PM finds it by itself, and then it is the one
+ *  server PM can download its pick into. */
+const OLLAMA_LAST_STEP =
+  "Come back to PM. It finds Ollama by itself within about half a minute — or press Look now under Your local model — then connect it there, and PM can download its pick into it for you. (First-run onboarding looks for it by itself too.)";
+
+/** The two settings PM's numbers assume, worded for one server — the context it sized for, and the
+ *  compressed cache. */
+export interface RunnerTuning {
+  context: string;
+  cache: string;
+}
+
+/** Ollama's context and cache steps on this platform: the same strings its guide shows. */
+function ollamaTuning(platform: SetupPlatform): RunnerTuning {
+  switch (platform) {
+    case "mac":
+      return {
+        context:
+          OLLAMA_CONTEXT_WHY +
+          "To change it, run `launchctl setenv OLLAMA_CONTEXT_LENGTH 32768`, then restart Ollama." +
+          OLLAMA_CONTEXT_HAZARD,
+        cache:
+          OLLAMA_KV_WHEN +
+          "run `launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0`, then restart Ollama." +
+          OLLAMA_KV_SCOPE,
+      };
+    case "linux":
+      return {
+        context:
+          OLLAMA_CONTEXT_WHY +
+          'To change it, run `sudo systemctl edit ollama.service` and add `Environment="OLLAMA_CONTEXT_LENGTH=32768"` under `[Service]`, then `sudo systemctl daemon-reload && sudo systemctl restart ollama`.' +
+          OLLAMA_CONTEXT_HAZARD,
+        cache:
+          OLLAMA_KV_WHEN +
+          'add `Environment="OLLAMA_KV_CACHE_TYPE=q8_0"` under the same `[Service]` line, then `sudo systemctl daemon-reload && sudo systemctl restart ollama`.' +
+          OLLAMA_KV_SCOPE,
+      };
+    default:
+      return {
+        context:
+          OLLAMA_CONTEXT_WHY +
+          "To change it, quit Ollama from the task bar first — setting this while it is running does nothing — then search Settings for \u201cenvironment variables\u201d, open Edit environment variables for your account, add `OLLAMA_CONTEXT_LENGTH` as 32768, and start Ollama again from the Start menu." +
+          OLLAMA_CONTEXT_HAZARD,
+        cache:
+          OLLAMA_KV_WHEN +
+          "with Ollama quit from the task bar, add `OLLAMA_KV_CACHE_TYPE` as q8_0 to your account's environment variables the same way, then start Ollama again." +
+          OLLAMA_KV_SCOPE,
+      };
+  }
+}
+
 /** How to install Ollama on this platform — the runner PM can drive a one-click model pull for. */
 export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
+  // The context step, then the cache step straight after it — the two settings PM's numbers assume,
+  // shared word for word with `tuningFor`.
+  const tuning = ollamaTuning(platform);
   const base = {
     name: "Ollama",
     summary:
@@ -112,10 +189,9 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
         steps: [
           "Install Ollama — download it from ollama.com/download for the menu-bar app, or run `brew install ollama` for just the server.",
           "Start it. It listens on http://127.0.0.1:11434.",
-          OLLAMA_CONTEXT_WHY +
-            "To change it, run `launchctl setenv OLLAMA_CONTEXT_LENGTH 32768`, then restart Ollama." +
-            OLLAMA_CONTEXT_HAZARD,
-          "Come back here and press Auto-detect a local server — then you can download a recommended model in one click. (First-run onboarding looks for it by itself.)",
+          tuning.context,
+          tuning.cache,
+          OLLAMA_LAST_STEP,
         ],
       };
     case "linux":
@@ -125,10 +201,9 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "The install script sets Ollama up as a systemd service and enables it, so it starts with the machine and keeps running. That also means `ollama serve` will fail with a port clash — the service already holds 11434. Use `sudo systemctl stop ollama` if you want it out of the way.",
         steps: [
           "Install Ollama — run `curl -fsSL https://ollama.com/install.sh | sh`. It runs as a service on http://127.0.0.1:11434.",
-          OLLAMA_CONTEXT_WHY +
-            'To change it, run `sudo systemctl edit ollama.service` and add `Environment="OLLAMA_CONTEXT_LENGTH=32768"` under `[Service]`, then `sudo systemctl daemon-reload && sudo systemctl restart ollama`.' +
-            OLLAMA_CONTEXT_HAZARD,
-          "Come back here and press Auto-detect a local server — then you can download a recommended model in one click. (First-run onboarding looks for it by itself.)",
+          tuning.context,
+          tuning.cache,
+          OLLAMA_LAST_STEP,
         ],
       };
     default:
@@ -139,10 +214,9 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
         steps: [
           "Download Ollama from ollama.com/download and run the installer — it doesn't need an administrator.",
           "Launch it. It keeps running in the background on http://127.0.0.1:11434.",
-          OLLAMA_CONTEXT_WHY +
-            "To change it, quit Ollama from the task bar first — setting this while it is running does nothing — then search Settings for \u201cenvironment variables\u201d, open Edit environment variables for your account, add `OLLAMA_CONTEXT_LENGTH` as 32768, and start Ollama again from the Start menu." +
-            OLLAMA_CONTEXT_HAZARD,
-          "Come back here and press Auto-detect a local server — then you can download a recommended model in one click. (First-run onboarding looks for it by itself.)",
+          tuning.context,
+          tuning.cache,
+          OLLAMA_LAST_STEP,
         ],
       };
   }
@@ -158,6 +232,15 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
  * Checked 2026-08-30 against lmstudio.ai/docs — the "run the LLM server on login" setting, and that
  * with it on, exiting minimises to the tray and the server keeps serving.
  */
+/** LM Studio's context step, the same on every platform — and the context half of its tuning. */
+const LM_STUDIO_CONTEXT =
+  "Check the model's context-length slider before you rely on it — a short context is silently truncated, and PM's background work sends more than a few thousand tokens at a time.";
+
+/** LM Studio's last step, the same on every platform. PM can't download into it, so the model is
+ *  got in its own app first. */
+const LM_STUDIO_LAST_STEP =
+  "Come back to PM and connect to that address under Your local model or Model server. PM can't download into LM Studio, so get your model in its app first — Your local model says which one PM would pick.";
+
 const LM_STUDIO_LIFECYCLE =
   "The server runs only while LM Studio is running, and it is off until you switch it on. In app settings (Ctrl/Cmd + ,) you can turn on running the LLM server on login \u2014 with that on, closing the window minimises it to the tray and the server keeps answering. Whether the server was on is remembered between launches.";
 
@@ -187,8 +270,8 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install LM Studio — run `brew install --cask lm-studio`, or download it from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (⌘2).",
           "Turn the server on: the toggle at the top of the Developer tab, or `lms server start` in a terminal. It listens on http://127.0.0.1:1234.",
-          "Check the model's context-length slider before you rely on it — a short context is silently truncated, and PM's background work sends more than a few thousand tokens at a time.",
-          "Come back here and connect to that address. PM can't download into LM Studio, so pick your model in its app first.",
+          LM_STUDIO_CONTEXT,
+          LM_STUDIO_LAST_STEP,
         ],
       };
     case "linux":
@@ -201,8 +284,8 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install LM Studio — run `curl -fsSL https://lmstudio.ai/install.sh | bash`, or download the AppImage from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (Ctrl+2).",
           "Turn the server on: the toggle at the top of the Developer tab, or `lms server start` in a terminal. It listens on http://127.0.0.1:1234.",
-          "Check the model's context-length slider before you rely on it — a short context is silently truncated, and PM's background work sends more than a few thousand tokens at a time.",
-          "Come back here and connect to that address. PM can't download into LM Studio, so pick your model in its app first.",
+          LM_STUDIO_CONTEXT,
+          LM_STUDIO_LAST_STEP,
         ],
       };
     default:
@@ -215,8 +298,8 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install LM Studio — run `irm https://lmstudio.ai/install.ps1 | iex` in PowerShell, or download it from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (Ctrl+2).",
           "Turn the server on: the toggle at the top of the Developer tab, or `lms server start` in a terminal. It listens on http://127.0.0.1:1234.",
-          "Check the model's context-length slider before you rely on it — a short context is silently truncated, and PM's background work sends more than a few thousand tokens at a time.",
-          "Come back here and connect to that address. PM can't download into LM Studio, so pick your model in its app first.",
+          LM_STUDIO_CONTEXT,
+          LM_STUDIO_LAST_STEP,
         ],
       };
   }
@@ -233,7 +316,7 @@ export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuid
     bestFor:
       "Pick this if you're comfortable in a terminal and want the leanest option, or the newest models the moment they appear on Hugging Face.",
     models:
-      "Straight from Hugging Face, in the same command that starts it — PM gives you the exact line for each model below.",
+      "Straight from Hugging Face, in the same command that starts it — PM shows the exact line for its pick under Your local model, and for every model under All models.",
     // `caveat` means a hardware exclusion everywhere else in this file. llama-server has none — what
     // it had here was a LIFECYCLE fact wearing the wrong label, which is the drift `lifecycle` exists
     // to stop. Moved verbatim; nothing replaces it, because there is nothing to exclude on.
@@ -245,8 +328,11 @@ export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuid
     "It runs only while its terminal window is open, and doesn't start with your machine. You launch it each session.";
   const serve = [
     "Start it with a model — for example `llama-server -hf ggml-org/gemma-3-4b-it-GGUF:Q4_K_M`. It downloads the model the first time, then serves it on http://127.0.0.1:8080.",
-    "Add `--ctx-size 32768` — the default context is far smaller than most models support, and llama-server discards the oldest part of an over-long prompt rather than refusing it.",
-    "Come back here and connect to that address. Each model below shows the exact command to run.",
+    // `-c/--ctx-size` defaults to 0, "loaded from model" (the server README, 01-10-2026): without
+    // it a current build allocates the model's whole trained context. The old line said the
+    // default was small, which was the opposite.
+    "Add `--ctx-size 32768` — without it, current builds use the model's whole trained context, which for many models is far more memory than PM sized for; and llama-server discards the oldest part of an over-long prompt rather than refusing it.",
+    "Come back here and connect to that address. Your local model and All models show the exact command for each model.",
   ];
   switch (platform) {
     case "mac":
@@ -284,6 +370,38 @@ export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuid
  */
 export function runnerGuides(platform: SetupPlatform = PLATFORM): RunnerGuide[] {
   return [ollamaGuide(platform), lmStudioGuide(platform), llamaServerGuide(platform)];
+}
+
+/**
+ * The two settings PM's numbers assume — the context it sized for, and the compressed (q8_0) cache —
+ * worded for one server, or null for a server PM doesn't know by name.
+ *
+ * Ollama's are its own guide's steps for this platform, word for word, so the two can't disagree.
+ * LM Studio's cache line names the load setting by what its API calls it (the K and V cache
+ * quantization); the in-app label wording is unverified.
+ */
+export function tuningFor(
+  runner: RunnerName | null,
+  platform: SetupPlatform = PLATFORM,
+): RunnerTuning | null {
+  switch (runner) {
+    case "Ollama":
+      return ollamaTuning(platform);
+    case "LM Studio":
+      return {
+        context: LM_STUDIO_CONTEXT,
+        cache:
+          "In the same load settings, set the K and V cache quantization to Q8_0. The V cache needs Flash Attention switched on there too.",
+      };
+    case "llama-server":
+      return {
+        context:
+          "Add `--ctx-size <n>` with the context PM sized for — current builds otherwise use the model's whole trained context.",
+        cache: "For the compressed cache, also add `-fa on -ctk q8_0 -ctv q8_0`.",
+      };
+    default:
+      return null;
+  }
 }
 
 /**

@@ -3,28 +3,12 @@
 
 import { formatGib } from "../../lib/format";
 import type { PowerView } from "../../lib/types";
-import { Button, SectionInfo, SectionLabel, Select, SettingRow } from "../ui";
+import { Button, Callout, SectionInfo, SectionLabel, Select, SettingRow } from "../ui";
 import { TrayIconRow } from "../settings/TrayIconRow";
+import { minutes, QUIET_MINUTES } from "./quietPeriods";
+import { SectionLink } from "./SectionLink";
+import { sectionLabel } from "./sections";
 import { useReleaseSettings, type ReleaseSettings } from "./useReleaseSettings";
-
-/** The quiet periods offered, shared by "Quiet period" and the on-battery release. */
-const QUIET_MINUTES = [1, 2, 5, 10, 15, 30, 60];
-
-/** "1 minute" / "5 minutes". */
-function minutes(n: number): string {
-  return n === 1 ? "1 minute" : `${n} minutes`;
-}
-
-/** The quiet periods plus a stored one that isn't among them (in order), so the Select shows what
- *  is really stored rather than snapping to a neighbour. */
-function withStored(options: readonly number[], stored: number | null): number[] {
-  const out = [...options];
-  if (stored != null && !out.includes(stored)) {
-    out.push(stored);
-    out.sort((a, b) => a - b);
-  }
-  return out;
-}
 
 /** How the three policies are worded, and — the part users actually need — when each one suits. */
 const POLICIES: ReadonlyArray<{ value: string; label: string; when: string }> = [
@@ -53,19 +37,30 @@ const POLICIES: ReadonlyArray<{ value: string; label: string; when: string }> = 
  * life — every later request inherits it, including requests from other programs — which would
  * silently overwrite a setting the user chose. PM runs its own timer instead and leaves the server's
  * configuration alone.
+ *
+ * The on-battery release lives in On battery now, with every other battery decision; this section
+ * only says it exists, so "Leave it to my server — PM changes nothing" is never contradicted by a
+ * rule set somewhere else.
  */
 export function LocalAiLifecycle({
   configured,
   power,
   release: shared,
+  hasDiscreteGpu = true,
+  error,
 }: {
   configured: boolean;
   /** The On battery readout from the status, or null while it isn't known — which counts as "not
-   *  known to be a desktop", so the battery row stays usable. */
+   *  known to be a desktop". */
   power: PowerView | null;
   /** The tab's release settings (`useReleaseSettings`), so this section and any other that shows
    *  them agree. Without one — a standalone render — the section reads its own. */
   release?: ReleaseSettings;
+  /** The machine has a separate graphics card. Without one, what the server holds is in memory the
+   *  processor shares, and "the graphics card is free" would name hardware that isn't there. */
+  hasDiscreteGpu?: boolean;
+  /** Something in this section went wrong, said here rather than at the top of the tab. */
+  error?: string | null;
 }) {
   // Always called, because a hook can't be conditional; inert whenever the tab handed one down.
   const own = useReleaseSettings({ status: null, enabled: !shared });
@@ -78,14 +73,15 @@ export function LocalAiLifecycle({
     releasing,
     freed,
     change,
-    changeBatteryIdle,
     release,
   } = shared ?? own;
 
   // A machine PM found no battery on. Only a positive reading counts: no power readout yet is not
   // evidence of a desktop.
   const desktop = power != null && !power.has_battery && power.source === "ac";
-  const batteryOff = batteryIdle === null || !!residency?.no_unload_route || desktop;
+  // A server with no unload route can't act on any of these, so they are switched off rather than
+  // left offering a choice that silently does nothing.
+  const noUnloadRoute = !!residency?.no_unload_route;
 
   const chosen = policy == null ? null : (POLICIES.find((p) => p.value === policy) ?? POLICIES[0]);
   const resident = residency?.resident ?? null;
@@ -99,10 +95,11 @@ export function LocalAiLifecycle({
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel>Holding the graphics card</SectionLabel>
+      {error && <Callout className="mt-2">{error}</Callout>}
       {!configured ? (
         <p className="mt-2 text-xs text-ink4">
-          Connect an endpoint above and PM can tell you what is loaded, and hand the memory back
-          when you are not using it.
+          Once your model server is connected (under <SectionLink to="sec-localai-endpoint" />
+          ), PM can tell you what it's holding and hand the memory back when you're not using it.
         </p>
       ) : (
         <>
@@ -111,12 +108,17 @@ export function LocalAiLifecycle({
             {resident === null ? (
               "PM couldn't ask your server what it has loaded — either it isn't answering, or it doesn't report that."
             ) : resident.length === 0 ? (
-              "Nothing is loaded right now, so the graphics card is free."
+              hasDiscreteGpu ? (
+                "Nothing is loaded right now, so the graphics card is free."
+              ) : (
+                "Nothing is loaded right now, so its memory is free."
+              )
             ) : (
               <>
                 Your server is holding{" "}
                 <span className="text-ink2">{resident.map((m) => m.model).join(", ")}</span>
-                {residency?.vram_gb != null && (
+                {!hasDiscreteGpu && " in memory"}
+                {hasDiscreteGpu && residency?.vram_gb != null && (
                   <>
                     {" "}
                     — at least{" "}
@@ -139,10 +141,10 @@ export function LocalAiLifecycle({
             // Unfolded: a gating fact. Offering a picker that silently does nothing would be worse
             // than the absence of the feature.
             <p className="mt-1 text-xs text-st-due">
-              This server has no way to unload a model on request, so none of the options below can
-              do anything with it. llama-server keeps its model for as long as it is running, and LM
-              Studio has no unload command — stopping the server is the only way to get the memory
-              back. Ollama can do it.
+              This server has no way to unload a model on request, so the options below can't do
+              anything with it and are switched off. llama-server keeps its model for as long as it
+              is running, and LM Studio has no unload command — stopping the server is the only way
+              to get the memory back. Ollama can do it.
             </p>
           )}
 
@@ -163,7 +165,7 @@ export function LocalAiLifecycle({
                 <Select
                   {...a11y}
                   value={policy ?? ""}
-                  disabled={policy == null}
+                  disabled={policy == null || noUnloadRoute}
                   onChange={(e) => change(e.target.value, idleMinutes)}
                 >
                   {/* Not a value: a placeholder until PM has read what is stored. */}
@@ -178,12 +180,12 @@ export function LocalAiLifecycle({
             </SettingRow>
             {/* Unfolded: what the chosen option will actually do is a gating fact, not prose. */}
             {chosen && <p className="text-xs text-ink4">{chosen.when}</p>}
-            {/* So "Leave it to my server — PM changes nothing" is never contradicted by the row
-                below doing something on battery. */}
+            {/* So "Leave it to my server — PM changes nothing" is never contradicted by the On
+                battery row doing something on battery. */}
             {batteryIdle != null && batteryIdle > 0 && !desktop && (
               <p className="text-xs text-ink4">
                 Except on battery: there, PM also hands the memory back after {minutes(batteryIdle)}{" "}
-                without use, as set below.
+                without use, as set under {sectionLabel("sec-localai-power")}.
               </p>
             )}
 
@@ -193,6 +195,7 @@ export function LocalAiLifecycle({
                   <Select
                     {...a11y}
                     value={String(idleMinutes)}
+                    disabled={noUnloadRoute}
                     onChange={(e) => change(policy, Number(e.target.value))}
                   >
                     {QUIET_MINUTES.map((m) => (
@@ -205,48 +208,7 @@ export function LocalAiLifecycle({
               </SettingRow>
             )}
 
-            {/* The On battery policy's other half (#432): whether PM stays local or moves to the
-                cloud, a model left on the card keeps it drawing power. Enabled for keyless and
-                Local only setups too — they are exactly who stays local on battery. */}
-            <SettingRow
-              label="On battery, hand the memory back"
-              helpId="settings-localai-lifecycle"
-            >
-              {(a11y) => (
-                <Select
-                  {...a11y}
-                  value={batteryIdle == null ? "" : String(batteryIdle)}
-                  disabled={batteryOff}
-                  onChange={(e) => changeBatteryIdle(Number(e.target.value))}
-                >
-                  {/* Not a value: a placeholder until PM has read what is stored. */}
-                  {batteryIdle == null && <option value="">—</option>}
-                  {withStored([0, ...QUIET_MINUTES], batteryIdle).map((m) => (
-                    <option key={m} value={m}>
-                      {m === 0 ? "As set above" : `After ${minutes(m)} without use`}
-                    </option>
-                  ))}
-                </Select>
-              )}
-            </SettingRow>
-            {desktop ? (
-              <p className="text-xs text-ink4">
-                PM didn't find a battery on this machine, so this never applies.
-              </p>
-            ) : batteryIdle == null ? null : batteryIdle > 0 ? (
-              <p className="text-xs text-ink4">
-                On battery, PM also hands the memory back once nothing has used the model for{" "}
-                {minutes(batteryIdle)}, counting from no earlier than when you unplugged — so moving
-                to the sofa keeps a model you were just using. The next message loads it again,
-                which takes a few seconds. PM only releases models it loaded.
-              </p>
-            ) : (
-              <p className="text-xs text-ink4">
-                On battery, PM does whatever "Give the memory back" says. A graphics card holding a
-                model keeps drawing power even while nothing is asking it anything.
-              </p>
-            )}
-            {saveError && (
+            {saveError?.field === "policy" && (
               <p className="text-xs text-st-due">
                 {saveError.kind === "restored"
                   ? "Couldn't save that. This shows what PM has stored."

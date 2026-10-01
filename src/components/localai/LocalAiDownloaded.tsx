@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { ReactNode } from "react";
+
 import { formatGib } from "../../lib/format";
 import type { LocalDiskSource, LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
 import { downloadedState, type DownloadedState } from "./downloadedState";
 import { ConfigRow, FitBadge } from "./fitDisplay";
+import { SectionLink } from "./SectionLink";
 import { sectionLabel } from "./sections";
-import { Button, SectionInfo, SectionLabel } from "../ui";
+import { Button, Callout, SectionInfo, SectionLabel } from "../ui";
 
 /**
  * "Already downloaded" (#449) — the models this device has, whoever put them there.
@@ -22,12 +25,15 @@ export function LocalAiDownloaded({
   configured,
   onPickFolder,
   onClearFolder,
+  error,
 }: {
   recs: LocalRecommendations | null;
   loading: boolean;
   configured: boolean;
   onPickFolder: () => void;
   onClearFolder: () => void;
+  /** Something in this section went wrong, said here rather than at the top of the tab. */
+  error?: string | null;
 }) {
   return (
     <div
@@ -56,6 +62,7 @@ export function LocalAiDownloaded({
       >
         {sectionLabel("sec-localai-downloaded")}
       </SectionLabel>
+      {error && <Callout className="mt-2">{error}</Callout>}
       {loading ? (
         <p className="mt-2 text-xs text-ink4">Looking for downloaded models…</p>
       ) : recs ? (
@@ -102,14 +109,18 @@ const DISK_SOURCE_LABEL: Record<LocalDiskSource, string> = {
 
 /** The one sentence for each state that isn't a list. Split out so the copy sits beside the ladder's
  *  reasoning instead of inside a nested ternary, and so each branch can be read against the machine
- *  state it describes. */
-function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): string {
+ *  state it describes. Sections are named, never pointed at "above" or "below". */
+function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): ReactNode {
   switch (state.kind) {
     case "endpointHasAll": {
       const one = state.count === 1;
-      return `Your server has ${state.count} model${one ? "" : "s"} downloaded, and PM can see ${
-        one ? "it" : "them all"
-      } — ${one ? "it's" : "they're"} listed under Assign roles above.`;
+      return (
+        <>
+          Your server has {state.count} model{one ? "" : "s"} downloaded, and PM can see{" "}
+          {one ? "it" : "them all"} — you can give {one ? "it" : "them"} a job under{" "}
+          <SectionLink to="sec-localai-roles" />.
+        </>
+      );
     }
     case "allServed":
       return `Found ${listJoin(
@@ -118,16 +129,21 @@ function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): string {
     case "folderEmpty":
       return `Found ${listJoin(state.runners)} on this device, but nothing downloaded into it yet.`;
     case "endpointEmpty":
-      return "Your server is running, but nothing has been downloaded into it yet — pick one from Recommended models above.";
+      return "Your server is running, but nothing has been downloaded into it yet — Your local model suggests one for this computer.";
     case "blocked":
       // Never suggests changing the permissions. The store belongs to a service account, and telling
       // someone to loosen one so a settings panel can count files would be a bad trade PM has no
       // business proposing. Connecting the server gets the same answer and costs nothing.
-      return state.root.source === "folder"
-        ? `PM isn't allowed to read the folder you pointed it at (${state.root.path}), so it can't say what's in there.`
-        : `${DISK_SOURCE_LABEL[state.root.source]} keeps its models at ${
-            state.root.path
-          }, and PM isn't allowed to read that folder — the packaged Linux server owns its store as its own user, which is normal and nothing is wrong. Connect it below and PM will ask the server what it has instead.`;
+      return state.root.source === "folder" ? (
+        `PM isn't allowed to read the folder you pointed it at (${state.root.path}), so it can't say what's in there.`
+      ) : (
+        <>
+          {DISK_SOURCE_LABEL[state.root.source]} keeps its models at {state.root.path}, and PM isn't
+          allowed to read that folder — the packaged Linux server owns its store as its own user,
+          which is normal and nothing is wrong. Connect it under{" "}
+          <SectionLink to="sec-localai-endpoint" /> and PM will ask the server what it has instead.
+        </>
+      );
     case "noFolder":
       return `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`;
   }
@@ -170,9 +186,19 @@ export function DownloadedModels({
       ) : (
         <>
           <p className="mb-2 text-xs text-ink4">
-            {configured
-              ? "None of these can be assigned yet — PM can only use a model your endpoint is actually serving. Load one in the app you downloaded it with and it shows up under Assign roles above within about half a minute."
-              : "This is what's on your device, not what PM can use yet. Connect an endpoint above, then load the model in the app you downloaded it with, and it appears under Assign roles."}
+            {configured ? (
+              <>
+                None of these can be assigned yet — PM can only use a model your server is actually
+                serving. Each one says how to get it served; it then shows up under{" "}
+                <SectionLink to="sec-localai-roles" /> within about half a minute.
+              </>
+            ) : (
+              <>
+                This is what's on your device, not what PM can use yet. Connect your server under{" "}
+                <SectionLink to="sec-localai-endpoint" /> first; each model says how to get it
+                served, and it then appears under <SectionLink to="sec-localai-roles" />.
+              </>
+            )}
           </p>
           <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
             {recs.on_disk.map((m) => (

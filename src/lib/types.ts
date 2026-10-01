@@ -1740,8 +1740,19 @@ export interface LocalFitResult {
   kv: "f16" | "q8_0";
   est_memory_gb: number | null;
   est_tokens_per_sec: number | null;
+  /** Where `est_tokens_per_sec` comes from, which decides how much it can be trusted and how the UI
+   *  words it (fit.rs SpeedBasis). null exactly when there is no speed figure. */
+  speed_basis: LocalSpeedBasis | null;
   notes: string[];
 }
+
+/** What a speed estimate was worked out from (fit.rs SpeedBasis).
+ *  - `gpu_published`: resident on a discrete card PM recognised, at its published memory bandwidth —
+ *    an upper bound;
+ *  - `gpu_typical`: resident on a discrete card PM did not recognise, at a typical 400 GB/s;
+ *  - `shared`: resident in memory shared with the processor — PM doesn't estimate this yet;
+ *  - `system`: runs from system RAM, at a typical 40 GB/s. */
+export type LocalSpeedBasis = "gpu_published" | "gpu_typical" | "shared" | "system";
 
 /** This machine's hardware scan (hardware.rs Hardware). A null field = "couldn't read it", never 0. */
 export interface LocalHardware {
@@ -1951,7 +1962,73 @@ export interface LocalRecommendations {
   scan_dir: string | null;
   /** Licence ids the user has already read and accepted, so a second Gemma does not re-ask. */
   terms_accepted: string[];
+  /** PM's pick for this computer (better_fit.rs Pick). Optional on this side so a payload without it
+   *  — an older backend — renders the no-pick path rather than crashing. It writes nothing and never
+   *  reorders `curated`. */
+  pick?: LocalPick;
+  /** The free RAM every verdict in this payload was scored against, read live for this call.
+   *  `hardware.available_ram_gb` is the cached scan's figure, which can be minutes old. */
+  live_available_ram_gb: number;
 }
+
+/** What PM's pick was judged against (better_fit.rs PickBasis): a discrete graphics card, memory
+ *  shared between processor and graphics, or system RAM. */
+export type LocalPickBasis = "gpu" | "shared" | "system";
+
+/** Which of a curated card's rungs the pick is (better_fit.rs Rung): its highest-quality config, or
+ *  the smaller one that stays on the graphics card. */
+export type LocalPickRung = "quality" | "gpu";
+
+/** Why PM is not picking a model (better_fit.rs NoPick). */
+export type LocalNoPick = "nothing_on_gpu" | "too_slow" | "too_little_memory";
+
+/** A model the user already has, named beside a catalogue pick that is at least 15% larger
+ *  (better_fit.rs OwnedRef). */
+export interface LocalOwnedRef {
+  id: string;
+  display_name: string;
+  served: boolean;
+}
+
+/** PM's pick for this computer (better_fit.rs Pick, `#[serde(tag = "kind")]`). */
+export type LocalPick =
+  | {
+      kind: "catalogue";
+      repo: string;
+      display_name: string;
+      rung: LocalPickRung;
+      /** The Ollama tag for the picked rung (`hf.co/<repo>:<QUANT>`). */
+      tag: string;
+      fit: LocalFitResult;
+      /** Weights plus any vision projector, in GB — what Ollama pulls. */
+      download_gb: number;
+      basis: LocalPickBasis;
+      also_have: LocalOwnedRef | null;
+    }
+  | {
+      kind: "owned";
+      id: string;
+      repo: string;
+      display_name: string;
+      /** The endpoint serves it now; otherwise it is on disk. */
+      served: boolean;
+      /** Which runner's folder it is in; null for a served model. */
+      source: LocalDiskSource | null;
+      /** The file on disk; null for a served model. */
+      path: string | null;
+      shards: number;
+      /** The figures are for the file the user has, not the version PM would pick. */
+      measured: boolean;
+      fit: LocalFitResult;
+      basis: LocalPickBasis;
+    }
+  | {
+      kind: "nothing";
+      reason: LocalNoPick;
+      basis: LocalPickBasis;
+      /** `nothing_on_gpu` only: some model would run from system memory instead. */
+      system_fallback: boolean;
+    };
 
 /** A local model that would fit this machine better than the one in use (better_fit.rs Suggestion,
  *  #437). Passive information — a flag, never a gate. */
@@ -2043,7 +2120,24 @@ export interface PowerRoleView {
   /** The role's bound local model — parked, not gone, while `route` is "cloud". null for a role
    *  that goes to the cloud anyway. */
   local_model: string | null;
+  /** Where this role's requests really go right now, from its preference, the endpoint, the model
+   *  and the key together (llm_gateway.rs EffectiveRoute). Every route sentence is worded from this,
+   *  never guessed from the preference alone. */
+  effective: EffectiveRoute;
+  /** Whether this role's cloud key can be read (llm_gateway.rs KeyPresence). */
+  cloud_key: KeyPresence;
 }
+
+/** Where a role's requests really go (llm_gateway.rs EffectiveRoute). `cloud_for_power` is a
+ *  "Local, fall back to cloud" role the On battery policy has moved; `nothing` is a role with no key
+ *  for its cloud route or no local model for its local one; `unknown` is a role PM can't place
+ *  because it couldn't read the saved keys. */
+export type EffectiveRoute =
+  "cloud" | "local_only" | "local_then_cloud" | "cloud_for_power" | "nothing" | "unknown";
+
+/** Whether a role's cloud key can be read (llm_gateway.rs KeyPresence). `unreadable` is never "no
+ *  key": the store couldn't be read, so it may well be there. */
+export type KeyPresence = "present" | "absent" | "unreadable";
 
 /** The On battery policy's stored values and live state (#432, local_ai.rs PowerView). Computed in
  *  Rust by the same functions routing uses, so the UI only words it and never re-derives the

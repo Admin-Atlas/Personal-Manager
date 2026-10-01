@@ -32,6 +32,9 @@ import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import { LocalAiMachine } from "./LocalAiMachine";
 import { LocalAiPower } from "./LocalAiPower";
 import { LocalAiRoles } from "./LocalAiRoles";
+import { TUNING_ID, type LocalAiTarget } from "./locate";
+import { runnerOf } from "./readiness";
+import { LocateProvider } from "./SectionLink";
 import { usePull } from "./usePull";
 import { useReleaseSettings } from "./useReleaseSettings";
 import { useRoleTests } from "./useRoleTests";
@@ -48,8 +51,21 @@ import { Button, Callout, ConfirmDialog } from "../ui";
  *  one reads the same state: the download (`usePull`), the role tests (`useRoleTests`) and the
  *  release settings (`useReleaseSettings`). Everything that belongs to one section lives with it,
  *  like the endpoint form. One file per section, rather than one screenful each of a 1,100-line
- *  function, which is what this was. */
-export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () => void } = {}) {
+ *  function, which is what this was.
+ *
+ *  Errors are per section: each one is said in the section whose control failed, so a refused
+ *  connect reads under the form that sent it rather than at the top of a long tab. And pointers
+ *  between sections are names, not directions (`SectionLink`): `locate` opens whatever fold the
+ *  target is in and scrolls there, through `onLocate` when the host has its own way to. */
+export function LocalAiSettings({
+  onBetterFitChange,
+  onLocate,
+}: {
+  onBetterFitChange?: () => void;
+  /** Scroll the host to the element with this id (Settings' own section jump), or omitted to
+   *  scroll it into view directly. */
+  onLocate?: (id: string) => void;
+} = {}) {
   const [recs, setRecs] = useState<LocalRecommendations | null>(null);
   const [betterFit, setBetterFit] = useState<LocalBetterFit | null>(null);
   const [loading, setLoading] = useState(true);
@@ -63,35 +79,57 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   // Only a resolved listing sets this, so copy that speaks for the empty case can never claim a
   // server serves nothing when PM simply doesn't know.
   const [servedLoaded, setServedLoaded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Partial<Record<ErrorSection, string>>>({});
+  /** The "Settings PM's numbers assume" fold under Model server — held here so a pointer from
+   *  another section can open it. */
+  const [tuningOpen, setTuningOpen] = useState(false);
   /** Bumped whenever the stored endpoint or its token changes. The role tests reset on it, so
    *  anything proved about the OLD server — a passing test — goes with it rather than having to be
    *  remembered and invalidated piecemeal. */
   const [endpointEpoch, setEndpointEpoch] = useState(0);
 
+  /** Say `message` in `section`, or clear that section's error with `null`. */
+  function setError(section: ErrorSection, message: string | null) {
+    setErrors((prev) => {
+      if (message == null) {
+        if (!(section in prev)) return prev;
+        const next = { ...prev };
+        delete next[section];
+        return next;
+      }
+      return { ...prev, [section]: message };
+    });
+  }
+
+  /** Take the reader to `target`: open the fold it sits in, then scroll there once it has rendered
+   *  open. */
+  function locate(target: LocalAiTarget) {
+    let id: string = target;
+    if (target === "tuning") {
+      setTuningOpen(true);
+      id = TUNING_ID;
+    }
+    requestAnimationFrame(() => {
+      if (onLocate) onLocate(id);
+      else document.getElementById(id)?.scrollIntoView?.();
+    });
+  }
+
   const configured = !!config?.base_url;
   // A role that reaches the local server AND has a model bound. Both halves are load-bearing.
   // Without the routing half the "not measured yet" line fires for someone entirely on cloud, who
   // has no local model to measure. Without the model half it fires for someone who flipped routing
-  // to local and left the select on "— use cloud —": `role_local_model` returns null for an empty
-  // model, so the window would be null forever and the line would promise a reading that can never
-  // arrive, because the gateway treats an absent model as unconfigured.
+  // to local and left the select on "— no local model —": `role_local_model` returns null for an
+  // empty model, so the window would be null forever and the line would promise a reading that can
+  // never arrive, because the gateway treats an absent model as unconfigured.
   const anyLocalRoleWithModel =
     (config?.chat_routing !== "cloud" && !!config?.chat_model?.trim()) ||
     (config?.background_routing !== "cloud" && !!config?.background_model?.trim());
   // Whether the connected endpoint is an Ollama server (the only runner with a one-click pull API).
-  // Heuristic: Ollama's default port — parsed from the URL, not a substring test (":114341", or
-  // "11434" anywhere in a path, must not count). An Ollama on a custom port degrades honestly to
-  // the copy-paste command; anything else on 11434 gets a button whose pull fails with a clear
-  // error. A real flavour probe is the better gate if this ever grows a third consumer.
-  const isOllama = (() => {
-    if (!config?.base_url) return false;
-    try {
-      return new URL(config.base_url).port === "11434";
-    } catch {
-      return false;
-    }
-  })();
+  // By its port, parsed rather than matched (`runnerOf`). An Ollama on a custom port degrades
+  // honestly to the copy-paste command; anything else on 11434 gets a button whose pull fails with
+  // a clear error. A real flavour probe is the better gate if this ever grows another consumer.
+  const isOllama = runnerOf(config?.base_url) === "Ollama";
 
   async function reloadConfig() {
     const cfg = await getLocalLlmConfig();
@@ -116,7 +154,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     try {
       setRecs(await localModelRecommendations());
     } catch (e) {
-      setError(String(e));
+      setError("machine", String(e));
     }
   }
 
@@ -125,7 +163,9 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     onRecs: setRecs,
     onReload: reloadConfig,
     onRefreshRecs: refreshRecs,
-    onError: (message) => setError(message),
+    // Said where it was asked for. A download this view only adopted has no asker; it is shown on
+    // its catalogue card, so that is where its error goes too.
+    onError: (message, origin) => setError(origin === "start" ? "start" : "models", message),
   });
   const roleTests = useRoleTests(endpointEpoch);
   const release = useReleaseSettings({ status });
@@ -150,13 +190,13 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
             .catch(() => {});
         }
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) setError("endpoint", String(e));
       }
       try {
         const r = await localModelRecommendations();
         if (!cancelled) setRecs(r);
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) setError("machine", String(e));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -226,7 +266,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     try {
       await dismissLocalBetterFit();
     } catch (e) {
-      setError(String(e));
+      setError("start", String(e));
     }
     onBetterFitChange?.();
   }
@@ -238,7 +278,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       await setLocalModelRescanCadence(cadence as LocalRescanCadence);
       if (cadence === "manual") setBetterFit(null);
     } catch (e) {
-      setError(String(e));
+      setError("models", String(e));
     }
     onBetterFitChange?.();
   }
@@ -255,23 +295,23 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   }
 
   async function applyScanDir(dir: string | null) {
-    setError(null);
+    setError("downloaded", null);
     try {
       await setLocalModelScanDir(dir);
       setRecs(await localModelRecommendations());
     } catch (e) {
-      setError(String(e));
+      setError("downloaded", String(e));
     }
   }
 
   async function rescan() {
     setRescanning(true);
-    setError(null);
+    setError("machine", null);
     try {
       await localHardwareScan(true);
       setRecs(await localModelRecommendations());
     } catch (e) {
-      setError(String(e));
+      setError("machine", String(e));
     } finally {
       setRescanning(false);
     }
@@ -287,8 +327,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const servedTags = new Set(served.map((m) => m.id.toLowerCase()));
 
   return (
-    <>
-      {error && <Callout className="mt-4">{error}</Callout>}
+    <LocateProvider locate={locate}>
+      {/* The start section's own error (a dismiss that didn't save). It sits where that section
+          will. */}
+      {errors.start && <Callout className="mt-4">{errors.start}</Callout>}
 
       {/* A better-fitting model is available (#437). A passive strip at the top of the tab — the
           quiet counterpart to the dots on the sidebar and the settings nav, and the thing they
@@ -313,6 +355,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         loading={loading}
         rescanning={rescanning}
         onRescan={() => void rescan()}
+        error={errors.machine}
       />
 
       <LocalAiCatalog
@@ -324,6 +367,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         installedRepos={installedRepos}
         pull={pull}
         onCadence={(c) => void changeCadence(c)}
+        error={errors.models}
       />
 
       <LocalAiDownloaded
@@ -332,6 +376,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         configured={configured}
         onPickFolder={() => void pickScanFolder()}
         onClearFolder={() => void clearScanFolder()}
+        error={errors.downloaded}
       />
 
       <LocalAiEndpoint
@@ -339,8 +384,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         status={status}
         configured={configured}
         onReload={reloadConfig}
-        onError={setError}
+        onError={(m) => setError("endpoint", m)}
         onEndpointChanged={() => setEndpointEpoch((n) => n + 1)}
+        error={errors.endpoint}
+        tuningOpen={tuningOpen}
+        onTuningOpenChange={setTuningOpen}
       />
 
       <LocalAiRoles
@@ -353,19 +401,33 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         anyLocalRoleWithModel={anyLocalRoleWithModel}
         roleTests={roleTests}
         onConfigPatch={(patch) => setConfig((c) => (c ? { ...c, ...patch } : c))}
-        onError={setError}
+        onError={(m) => setError("roles", m)}
+        error={errors.roles}
       />
 
       {/* Between the two it depends on: it only ever moves a role Assign roles set to Local, fall
-          back to cloud, and what it can't save by moving, the graphics-card section below can. */}
+          back to cloud, and it hands the graphics card back on battery through the same release
+          settings the next section stores. */}
       <LocalAiPower
         status={status}
         configured={configured}
         anyLocalRoleWithModel={anyLocalRoleWithModel}
-        onError={setError}
+        onError={(m) => setError("power", m)}
+        release={release}
+        error={errors.power}
       />
 
-      <LocalAiLifecycle configured={configured} power={status?.power ?? null} release={release} />
+      <LocalAiLifecycle
+        configured={configured}
+        power={status?.power ?? null}
+        release={release}
+        // Until the scan has answered, assume the card: it is the wording every existing machine
+        // reading has, and the shared-memory one is only true once PM knows there is no card.
+        hasDiscreteGpu={
+          recs ? recs.hardware.vram_gb != null && !recs.hardware.unified_memory : true
+        }
+        error={errors.lifecycle}
+      />
 
       {/* The licence ask for a restricted model, answered before its download starts. Once, here,
           because the download it guards is the tab's: whichever control asked for it, there is
@@ -403,6 +465,10 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
           </>
         )}
       </ConfirmDialog>
-    </>
+    </LocateProvider>
   );
 }
+
+/** The sections an error can be said in. */
+type ErrorSection =
+  "start" | "endpoint" | "roles" | "power" | "lifecycle" | "models" | "downloaded" | "machine";

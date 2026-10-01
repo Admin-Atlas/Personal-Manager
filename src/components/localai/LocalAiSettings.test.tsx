@@ -129,6 +129,7 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
 }));
 
 import { LocalAiSettings } from "./LocalAiSettings";
+import { sectionLabel } from "./sections";
 
 afterEach(cleanup);
 
@@ -178,6 +179,7 @@ const recs = (): LocalRecommendations => ({
   disk_truncated: false,
   scan_dir: null,
   terms_accepted: [],
+  live_available_ram_gb: 9,
 });
 
 const served = (...models: LocalServedModel[]) => models;
@@ -235,6 +237,8 @@ beforeEach(() => {
   activeLocalTest.mockResolvedValue(null);
   cancelLocalPull.mockResolvedValue(true);
   clearLocalLlmToken.mockResolvedValue(undefined);
+  // Nothing found on this computer, unless a test says otherwise.
+  probeLocalLlmPorts.mockResolvedValue([]);
 });
 
 /** Render and wait for the initial config load to settle. */
@@ -537,6 +541,7 @@ describe("model licence terms", () => {
       kv: "f16",
       est_memory_gb: 2.4,
       est_tokens_per_sec: 40,
+      speed_basis: null,
       notes: [],
     },
     gpu: { kind: "single" },
@@ -783,6 +788,7 @@ describe("a split card, where the same model runs two ways", () => {
       kv: "f16",
       est_memory_gb: 10.0,
       est_tokens_per_sec: 5,
+      speed_basis: null,
       notes: [],
     },
     gpu: {
@@ -794,6 +800,7 @@ describe("a split card, where the same model runs two ways", () => {
         kv: "q8_0",
         est_memory_gb: 6.6,
         est_tokens_per_sec: 71,
+        speed_basis: null,
         notes: [],
       },
     },
@@ -903,6 +910,7 @@ describe("a download owned by the backend", () => {
       kv: "f16",
       est_memory_gb: 2.6,
       est_tokens_per_sec: 35,
+      speed_basis: null,
       notes: [],
     },
     gpu: { kind: "single" },
@@ -1156,5 +1164,146 @@ describe("the On battery section (#432)", () => {
     expect(at("sec-localai-power")).toBeGreaterThan(-1);
     expect(at("sec-localai-power")).toBe(at("sec-localai-roles") + 1);
     expect(at("sec-localai-lifecycle")).toBe(at("sec-localai-power") + 1);
+  });
+});
+
+describe("disconnecting", () => {
+  // It forgets more than the address — the token and both jobs' models go with it — so it asks.
+  it("asks first, and backing out calls nothing", async () => {
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect…" }));
+    expect(await screen.findByText("Disconnect from your model server?")).toBeTruthy();
+    expect(screen.getByText(/Your server and the models in it aren't touched\./)).toBeTruthy();
+    expect(clearLocalLlmEndpoint).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+    expect(clearLocalLlmEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("forgets the server once confirmed", async () => {
+    clearLocalLlmEndpoint.mockResolvedValue(undefined);
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect…" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Disconnect" }));
+    await waitFor(() => expect(clearLocalLlmEndpoint).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe("the settings PM's numbers assume", () => {
+  // PM sizes most graphics-card configs on a compressed cache and a longer context than servers
+  // start with; until this fold, nothing told anyone to set either.
+  it("gives the connected server's own steps for both, folded", async () => {
+    await loaded();
+    const fold = screen.getByRole("button", { name: "Settings PM's numbers assume" });
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.getByText(/These are the Ollama settings for both:/)).toBeTruthy();
+    expect(screen.getAllByText("OLLAMA_KV_CACHE_TYPE").length).toBeGreaterThan(0);
+    fireEvent.click(fold);
+    expect(fold.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("isn't offered for a server PM can't name", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: "http://127.0.0.1:9000" }));
+    await loaded();
+    expect(screen.queryByRole("button", { name: "Settings PM's numbers assume" })).toBeNull();
+  });
+});
+
+describe("errors are said where they happened", () => {
+  // One Callout at the top of a long tab read as a fault in whatever was nearest it. Each section
+  // now says its own.
+  it("puts a refused connect under the form that sent it", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    setLocalLlmEndpoint.mockRejectedValue(new Error("refusing a public cleartext address"));
+    const { container } = render(<LocalAiSettings />);
+    fireEvent.change(await screen.findByLabelText("Endpoint URL"), {
+      target: { value: "http://203.0.113.9:11434" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+    const error = await screen.findByText(/refusing a public cleartext address/);
+    expect(error.closest("[data-settings-section]")?.id).toBe("sec-localai-endpoint");
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+  });
+
+  it("puts a failed role write under Assign roles", async () => {
+    setLocalLlmRouting.mockRejectedValue(new Error("vault locked"));
+    await loaded();
+    fireEvent.change(screen.getByRole("combobox", { name: "Where chat runs" }), {
+      target: { value: "cloud" },
+    });
+    const error = await screen.findByText(/vault locked/);
+    expect(error.closest("[data-settings-section]")?.id).toBe("sec-localai-roles");
+  });
+
+  it("puts a failed hardware read under the machine readout", async () => {
+    localModelRecommendations.mockRejectedValue(new Error("couldn't read the GPU"));
+    await loaded();
+    const error = await screen.findByText(/couldn't read the GPU/);
+    expect(error.closest("[data-settings-section]")?.id).toBe("sec-localai-machine");
+  });
+});
+
+describe("pointers between sections", () => {
+  it("are section names that take you there, never directions", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    const onLocate = vi.fn();
+    const { container } = render(<LocalAiSettings onLocate={onLocate} />);
+    await screen.findByLabelText("Endpoint URL");
+    const roles = container.querySelector("#sec-localai-roles") as HTMLElement;
+    const link = Array.from(roles.querySelectorAll("button")).find(
+      (b) => b.textContent === sectionLabel("sec-localai-endpoint"),
+    );
+    expect(link).toBeTruthy();
+    fireEvent.click(link as HTMLButtonElement);
+    await waitFor(() => expect(onLocate).toHaveBeenCalledWith("sec-localai-endpoint"));
+  });
+});
+
+describe("speed on the model list", () => {
+  it("says where each figure comes from, and never writes a tilde", async () => {
+    const card: LocalRecommendation = {
+      repo: "bartowski/Qwen2.5-7B-Instruct-GGUF",
+      display_name: "Qwen2.5 7B Instruct",
+      architecture: "qwen2",
+      role_hint: null,
+      parameters_b: 7.62,
+      active_parameters_b: 7.62,
+      context_length: 32768,
+      multimodal: false,
+      reasoning: null,
+      ollama_pull: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M",
+      sharded_quant: false,
+      gpu_pull: null,
+      licence: {
+        id: "apache-2.0",
+        name: "Apache License 2.0",
+        url: "https://www.apache.org/licenses/LICENSE-2.0",
+        open: true,
+        summary: "A permissive open-source licence.",
+      },
+      fit: {
+        verdict: "tight",
+        quant: "Q5_K_M",
+        context: 32768,
+        kv: "q8_0",
+        est_memory_gb: 6.63,
+        est_tokens_per_sec: 71.0,
+        speed_basis: "gpu_published",
+        notes: [],
+      },
+      gpu: { kind: "single" },
+    };
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [card] });
+    const { container } = await loaded();
+    const models = container.querySelector("#sec-localai-models") as HTMLElement;
+    expect(models.textContent).toContain("up to 71 tok/s");
+    expect(models.textContent).toContain(
+      "Speeds are estimates from published or typical memory speeds, not measurements",
+    );
+    expect(models.textContent).not.toMatch(/~\s?\d/);
+    // The numbers guide names where the cache setting lives, by its section.
+    expect(models.textContent).toContain(
+      `your server needs that setting too (${sectionLabel("sec-localai-endpoint")}, “Settings PM's numbers assume”).`,
+    );
   });
 });
