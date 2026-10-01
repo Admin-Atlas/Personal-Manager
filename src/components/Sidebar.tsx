@@ -13,6 +13,14 @@ import {
   localModelActivity,
   type LocalModelActivity,
 } from "../lib/localModelState";
+import {
+  keptLocalTitle,
+  onBatteryRowTitle,
+  POWER_DETAIL,
+  powerOf,
+  powerTag,
+  type PowerTag,
+} from "../lib/powerRoute";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme, sourceColors, sourceShapeIndex } from "../theme";
 import { CalendarSourceList } from "./calendar/CalendarSourceList";
@@ -623,6 +631,8 @@ export function Sidebar({
               id={chatModel}
               local={localAi?.chat_local_model ?? null}
               activity={localModelActivity(localAi, "chat")}
+              power={powerTag(localAi, "chat")}
+              parked={localAi ? powerOf(localAi).chat.local_model : null}
               fallbacks={chatFallbacks}
             />
             <ModelRow
@@ -630,6 +640,8 @@ export function Sidebar({
               id={backgroundModel}
               local={localAi?.background_local_model ?? null}
               activity={localModelActivity(localAi, "background")}
+              power={powerTag(localAi, "background")}
+              parked={localAi ? powerOf(localAi).background.local_model : null}
               fallbacks={backgroundFallbacks}
             />
             <LocalRow status={localAi} />
@@ -665,6 +677,8 @@ function ModelRow({
   id,
   local,
   activity,
+  power,
+  parked,
   fallbacks,
 }: {
   role: string;
@@ -673,12 +687,21 @@ function ModelRow({
   local: string | null;
   /** What that model is doing right now, or `null` when there is nothing PM can honestly say. */
   activity: LocalModelActivity | null;
+  /** What the On battery policy is doing to this role, or `null` when nothing (#432). */
+  power: PowerTag | null;
+  /** The role's bound local model, which the policy has parked while `power` is "on_battery". */
+  parked: string | null;
   fallbacks: number;
 }) {
+  // On battery the backend already reports no local model for a moved role, so `shown` is the cloud
+  // model answering and `activity` is null — only the title and the chip need to say why.
   const shown = local ?? id;
-  const title = local
-    ? `${local} — running on this machine${id ? `; ${id} is the cloud fallback` : ""}`
-    : (id ?? "Using the default model");
+  const title =
+    power === "on_battery"
+      ? onBatteryRowTitle(id, parked)
+      : local
+        ? `${local} — running on this machine${id ? `; ${id} is the cloud fallback` : ""}`
+        : (id ?? "Using the default model");
   return (
     <div className="flex items-center gap-1.5 text-xs leading-5">
       <span className="w-9 shrink-0 font-mono text-ink4">{role}</span>
@@ -702,6 +725,18 @@ function ModelRow({
           {ACTIVITY_LABEL[activity]}
         </span>
       )}
+      {/* The On battery marks wear the RESTING style: a deliberate policy, never the accent
+          "answering" chip and never `--st-look`, which is the failure family's colour. */}
+      {power === "on_battery" && (
+        <span className="shrink-0 text-[0.625rem] text-ink4" title={POWER_DETAIL}>
+          on battery
+        </span>
+      )}
+      {power === "kept_local" && (
+        <span className="shrink-0 text-[0.625rem] text-ink4" title={keptLocalTitle(local)}>
+          kept local
+        </span>
+      )}
       {fallbacks > 0 && (
         <span
           className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1 font-mono text-[0.625rem] text-accent-text"
@@ -714,7 +749,6 @@ function ModelRow({
   );
 }
 
-/** Drop the provider prefix for a compact label ("anthropic/claude-x" → "claude-x"). */
 /** The local-endpoint status line in the model footer (#297). Renders NOTHING unless an endpoint is
  *  configured (the zero-pixel contract). "resting" is the dead-host cooldown, during which background
  *  work goes to cloud — the honest signal a user who chose local wants to see. */

@@ -50,8 +50,10 @@ export const ACTIVITY_LABEL: Record<LocalModelActivity, string> = {
 export const ACTIVITY_DETAIL: Record<LocalModelActivity, string> = {
   answering: "PM is asking this model right now.",
   loaded: "Loaded on your graphics card, so the next message starts answering straight away.",
+  // Cause-neutral on purpose: the on-battery release (#432) marks a model released through the same
+  // path as the release policy, so this sentence cannot say which of the two did it.
   released:
-    "PM handed the memory back, as your release setting asks. The next message loads it again, which takes a few seconds.",
+    "PM handed the memory back, as your Local AI settings ask. The next message loads it again, which takes a few seconds.",
   unloaded:
     "Your server isn't holding it at the moment. The next message loads it, which takes a few seconds.",
 };

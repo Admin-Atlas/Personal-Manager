@@ -12,6 +12,16 @@
 //! same two verbs, not a rewrite of the call sites' semantics — proven mechanically by
 //! `resolve_provider_with_an_empty_context_is_a_direct_preference_lookup` plus an untouched
 //! `openrouter.rs`.
+//!
+//! **The On battery policy (#432)** is the first real input to the seam. [`resolve`] snapshots the
+//! settled power latch (in memory, before any DB guard), and only while it says the battery is low
+//! does it read the policy's threshold, scope and consent from the open store — fresh, on the same
+//! connection as the routing preference. [`resolve_provider`] then turns a "Local, fall back to
+//! cloud" role into [`ProviderChoice::CloudForPower`] when every condition holds, and the plan
+//! carries no local arm at all: nothing tries local on a request the policy moved, and the spend is
+//! logged against the cloud model with `fallback_reason = "power_policy"`, a deliberate policy and
+//! never a failure. "Local only" never moves. A request decides its route once, at dispatch; the
+//! long multi-batch jobs re-resolve between batches through [`refresh_plan`].
 
 use std::time::Instant;
 
@@ -25,6 +35,7 @@ use crate::local_slot::{
 };
 use crate::openai_compat::{self, LocalFailKind, LocalFailure};
 use crate::openrouter::{self, ChatMessage, Completion};
+use crate::power::{Consent, PowerScope, PowerSettings, PowerSnapshot, PowerState};
 use crate::secret::Secret;
 use crate::settings::{
     effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY, CHAT_AUTO_SWITCH_KEY,
@@ -74,49 +85,188 @@ impl RoutingPrefs {
     }
 }
 
-/// Runtime signals that can influence routing at dispatch time. **Deliberately inert today** — it
-/// holds no fields. It is threaded through EVERY dispatch path (built inside [`resolve`], never by a
-/// caller) so the power-aware provider policy (#432) can add battery / AC state here and change
-/// routing in ONE place, without touching a single call site. Do NOT delete it or "simplify" it
-/// away because it is currently empty: the emptiness IS the banked seam, and constructing it inside
-/// `resolve` is precisely what keeps a future field from rippling out to the 13 dispatch sites.
+/// Runtime signals that influence routing at dispatch time — today, the On battery policy (#432).
+/// It is threaded through EVERY dispatch path and built only inside [`resolve`] (and, through
+/// [`Self::from_parts`], by `local_llm_status` from the same inputs, so the status can never
+/// describe a route resolve would not take). Do NOT delete it or move its construction out to the
+/// callers: this type is the ONE place routing reads runtime state, and building it inside
+/// `resolve` is what keeps a new field from rippling out to every dispatch site (15 today).
+///
+/// `Default` is inert — no field moves anything — which is what keeps
+/// `resolve_provider_with_an_empty_context_is_a_direct_preference_lookup` a mechanical proof.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct RuntimeContext {}
+pub struct RuntimeContext {
+    /// The settled latch says BatteryLow AND the open store's threshold is the one it was computed
+    /// on.
+    pub battery_low: bool,
+    pub scope: PowerScope,
+    /// The roles the user has agreed may go to the cloud on battery (per role: see
+    /// [`crate::power::Consent`]).
+    pub consent: Consent,
+    /// "Keep using local until I quit PM" is on.
+    pub keep_local: bool,
+}
 
 impl RuntimeContext {
-    /// Read the current runtime signals. Empty today; #432 populates it (battery / AC / power-saver
-    /// state) at the I/O edge, consistent with the fit-math vs hardware-scan split.
-    fn current() -> Self {
-        Self {}
+    /// Pure. Inert unless the latch is BatteryLow, the store's threshold is not "never", and the
+    /// latch was computed against THIS store's threshold — a vault switch or restore mid-tick reads
+    /// as inert until the next tick re-latches against the new store.
+    pub(crate) fn from_parts(
+        snap: &PowerSnapshot,
+        settings: &PowerSettings,
+        keep_local: bool,
+    ) -> Self {
+        let agrees = snap.state == PowerState::BatteryLow
+            && settings.threshold != 0
+            && Some(settings.threshold) == snap.threshold;
+        if !agrees {
+            return Self::default();
+        }
+        Self {
+            battery_low: true,
+            scope: settings.scope,
+            consent: settings.consent,
+            keep_local,
+        }
+    }
+
+    /// The one builder [`resolve`] uses. While the latch is not BatteryLow — which is nearly always
+    /// — it returns the inert context WITHOUT reading a single setting. Otherwise it reads the policy
+    /// on the caller's guard: never cached, so consent from one store can never route another's.
+    fn current(snap: &PowerSnapshot, keep_local: bool, conn: &Connection) -> Self {
+        if snap.state != PowerState::BatteryLow {
+            return Self::default();
+        }
+        Self::from_parts(snap, &PowerSettings::read(conn), keep_local)
+    }
+
+    /// Whether the policy moves this role to the cloud right now.
+    pub fn moves(&self, role: Role) -> bool {
+        self.battery_low && self.scope.covers(role) && self.consent.covers(role) && !self.keep_local
     }
 }
 
 /// The effective provider routing for a request, after [`resolve_provider`] applies runtime policy
-/// to the raw preference. Today it mirrors the preference 1:1; #432 is where an empty-context
-/// identity becomes a real policy (e.g. force `Cloud` on battery).
+/// to the raw preference. With an inert context it mirrors the preference 1:1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderChoice {
     Cloud,
     Local,
     LocalThenCloud,
+    /// A "Local, fall back to cloud" role the On battery policy (#432) has moved to the cloud.
+    CloudForPower,
 }
 
 /// Decide a role's effective provider from its preference and the current runtime context. **Pure**
 /// — no I/O — so it is exhaustively unit-tested and the byte-identical invariant is mechanical, not
-/// argued. `runtime` is intentionally unread TODAY: the power-aware policy (#432) will read
-/// battery / AC state from it HERE to override the preference, which is why it is a parameter of
-/// this one function rather than something the call sites compute. Keeping it in the signature is
-/// what makes that feature a change to this function alone. Do not remove it.
+/// argued. `runtime` is read HERE and nowhere else, which is what keeps the power policy a change to
+/// this one function rather than to the call sites.
 pub fn resolve_provider(
     role: Role,
     prefs: &RoutingPrefs,
     runtime: &RuntimeContext,
 ) -> ProviderChoice {
-    let _ = runtime; // reserved for #432 — see the doc comment; not a dead parameter.
     match prefs.for_role(role) {
         ProviderPref::Cloud => ProviderChoice::Cloud,
+        // "Local only" never moves: the Roles copy promises it uses the model you picked and fails
+        // if that is unreachable, and a one-time consent must not quietly cover a role switched to
+        // Local only afterwards (#432 decision 7).
         ProviderPref::Local => ProviderChoice::Local,
+        ProviderPref::LocalThenCloud if runtime.moves(role) => ProviderChoice::CloudForPower,
         ProviderPref::LocalThenCloud => ProviderChoice::LocalThenCloud,
+    }
+}
+
+/// Whether a role's cloud key can be read, for the status's "could the policy move this?" answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyPresence {
+    Present,
+    Absent,
+    /// The secret store could not be read. Never reported as "no key": it may well be there.
+    Unreadable,
+}
+
+/// Why the On battery policy can NEVER move a role, as the section words it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerBlocked {
+    CloudRouting,
+    NoLocalModel,
+    NoKey,
+    KeyUnreadable,
+    LocalOnly,
+}
+
+/// Why this role can never be moved by the policy, or `None` if it can. The order is the copy's
+/// priority: a keyless "Local only" user gets the keyless copy, because adding a key is the step
+/// that comes first for them.
+pub fn power_blocked(
+    pref: ProviderPref,
+    local_ready: bool,
+    key: KeyPresence,
+) -> Option<PowerBlocked> {
+    if pref == ProviderPref::Cloud {
+        return Some(PowerBlocked::CloudRouting);
+    }
+    if !local_ready {
+        return Some(PowerBlocked::NoLocalModel);
+    }
+    match key {
+        KeyPresence::Absent => return Some(PowerBlocked::NoKey),
+        KeyPresence::Unreadable => return Some(PowerBlocked::KeyUnreadable),
+        KeyPresence::Present => {}
+    }
+    if pref == ProviderPref::Local {
+        return Some(PowerBlocked::LocalOnly);
+    }
+    None
+}
+
+/// Where the policy has a role right now, for the status. Computed from the same context
+/// [`resolve_provider`] reads, so the two cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerRoute {
+    /// The policy is not acting on this role.
+    Unchanged,
+    /// It would move, but the user has not been asked yet — so it stays local.
+    NeedsConsent,
+    /// It would move, but "Keep using local until I quit PM" is on.
+    KeptLocal,
+    /// It has moved to the cloud.
+    Cloud,
+}
+
+pub fn power_route(role: Role, ctx: &RuntimeContext, blocked: Option<PowerBlocked>) -> PowerRoute {
+    if blocked.is_some() || !ctx.battery_low || !ctx.scope.covers(role) {
+        return PowerRoute::Unchanged;
+    }
+    if ctx.keep_local {
+        return PowerRoute::KeptLocal;
+    }
+    // Per role: a yes about background work is not a yes about chat.
+    if !ctx.consent.covers(role) {
+        return PowerRoute::NeedsConsent;
+    }
+    PowerRoute::Cloud
+}
+
+/// The one owner of the per-role key rule, shared by [`cloud_arm`] and the status: chat uses the
+/// primary key; background prefers the dedicated background key and falls back to the primary —
+/// exactly as the call sites did before this seam.
+fn role_key(role: Role) -> Result<Option<Secret>> {
+    match role {
+        Role::Chat => secrets::get_openrouter_key(),
+        Role::Background => secrets::get_background_or_primary_key(),
+    }
+}
+
+/// Whether this role has a cloud key — an in-memory read of the secrets cache.
+pub(crate) fn key_presence(role: Role) -> KeyPresence {
+    match role_key(role) {
+        Ok(Some(_)) => KeyPresence::Present,
+        Ok(None) => KeyPresence::Absent,
+        Err(_) => KeyPresence::Unreadable,
     }
 }
 
@@ -140,7 +290,7 @@ impl Provider {
 
 /// Why a request was served by cloud instead of the local endpoint the user preferred. A power-
 /// policy switch is kept a categorically distinct variant so it can NEVER be represented as — or
-/// collapsed into — a failure (Bobby, item 4). PR3 produces only the failure-family reasons.
+/// collapsed into — a failure (Bobby, item 4). Every reason but `PowerPolicy` is failure-family.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FallbackReason {
     /// The local leg was attempted and failed for a concrete wire reason; we fell back to cloud.
@@ -154,11 +304,10 @@ pub enum FallbackReason {
     /// name points. Kept distinct from [`FallbackReason::HardFailure`] precisely so it can never be
     /// read as evidence the host is dead.
     EndpointRefused,
-    /// BANKED for the power-aware provider policy (#432): a DELIBERATE user policy (local on AC /
-    /// cloud on battery), categorically NOT a failure. No producer exists in PR3 (the feature is a
-    /// deferred board card) — the variant is banked NOW so a later implementer physically cannot fold
-    /// a policy switch into a hard-failure value. Do not remove it or "clean up" the unused variant.
-    #[allow(dead_code)]
+    /// The On battery policy (#432) moved this request to the cloud: a DELIBERATE user policy,
+    /// categorically NOT a failure. Its one producer is [`RoutePlan::CloudForPower`]. Kept a variant
+    /// of its own so a policy switch can never be folded into a hard-failure value, and filtered out
+    /// of the failure strip by [`CallMeta::failure_fallback`].
     PowerPolicy,
 }
 
@@ -236,6 +385,19 @@ impl CallMeta {
             displaced_local_model: Some(displaced_local_model),
         }
     }
+
+    /// The fallback a UI may present as a failure-family notice. `None` for a power-policy route,
+    /// which is a deliberate user policy and must never share the failure strip (#432).
+    pub fn failure_fallback(&self) -> Option<&FallbackReason> {
+        self.fallback
+            .as_ref()
+            .filter(|r| !matches!(r, FallbackReason::PowerPolicy))
+    }
+
+    /// The On battery policy sent this request to the cloud.
+    pub fn power_routed(&self) -> bool {
+        matches!(self.fallback, Some(FallbackReason::PowerPolicy))
+    }
 }
 
 /// A [`Completion`] plus the normalized [`CallMeta`] about how it was served. The gateway verbs
@@ -253,6 +415,8 @@ pub struct LlmOutcome {
 /// ([`local_slot::tunables::HEALTH_PROBE_DEBOUNCE`]) so a burst of pings can't hammer the user's
 /// server. Fired only where health can transition (an Ok resets strikes; a failure may open a
 /// cooldown); cooldown EXPIRY is time-based, so the frontend also refetches once at the deadline.
+/// The On battery policy (#432) fires it too, but only on a SETTLED change — the watcher's latch
+/// moving, a policy write, the "keep using local" override — never once per poll.
 /// `pub(crate)` so the endpoint set/clear commands ([`local_ai`]) fire the same event through one
 /// owner of the name string.
 pub(crate) fn ping_status(app: &AppHandle) {
@@ -280,7 +444,17 @@ pub struct LocalArm {
 pub enum RoutePlan {
     Cloud(CloudArm),
     LocalOnly(LocalArm),
-    LocalThenCloud { local: LocalArm, cloud: CloudArm },
+    LocalThenCloud {
+        local: LocalArm,
+        cloud: CloudArm,
+    },
+    /// The On battery policy moved this request to the cloud. Carries NO LocalArm on purpose:
+    /// nothing may try local on a request the policy moved (no reverse fallback — "Keep using local"
+    /// is the escape, decision 5), and spend must be attributed to the cloud model.
+    CloudForPower {
+        cloud: CloudArm,
+        displaced_local_model: String,
+    },
 }
 
 impl RoutePlan {
@@ -289,7 +463,9 @@ impl RoutePlan {
     /// local model; a fallback records the actually-served (cloud) model via [`Completion::model`].
     pub fn primary_model_id(&self) -> &str {
         match self {
-            RoutePlan::Cloud(arm) => arm.models.first().map(String::as_str).unwrap_or_default(),
+            RoutePlan::Cloud(arm) | RoutePlan::CloudForPower { cloud: arm, .. } => {
+                arm.models.first().map(String::as_str).unwrap_or_default()
+            }
             RoutePlan::LocalOnly(local) | RoutePlan::LocalThenCloud { local, .. } => &local.model,
         }
     }
@@ -298,11 +474,16 @@ impl RoutePlan {
     /// local arm has exactly one model, borrowed as a one-element slice.
     pub fn models(&self) -> &[String] {
         match self {
-            RoutePlan::Cloud(arm) => &arm.models,
+            RoutePlan::Cloud(arm) | RoutePlan::CloudForPower { cloud: arm, .. } => &arm.models,
             RoutePlan::LocalOnly(local) | RoutePlan::LocalThenCloud { local, .. } => {
                 std::slice::from_ref(&local.model)
             }
         }
+    }
+
+    /// The On battery policy chose this route.
+    pub fn is_power_routed(&self) -> bool {
+        matches!(self, RoutePlan::CloudForPower { .. })
     }
 }
 
@@ -327,7 +508,7 @@ fn parse_pref(raw: Option<String>) -> ProviderPref {
     }
 }
 
-fn routing_prefs(conn: &rusqlite::Connection) -> Result<RoutingPrefs> {
+pub(crate) fn routing_prefs(conn: &rusqlite::Connection) -> Result<RoutingPrefs> {
     Ok(RoutingPrefs {
         chat: parse_pref(crate::db::get_setting(conn, CHAT_ROUTING_KEY)?),
         background: parse_pref(crate::db::get_setting(conn, BACKGROUND_ROUTING_KEY)?),
@@ -338,43 +519,95 @@ fn routing_prefs(conn: &rusqlite::Connection) -> Result<RoutingPrefs> {
 /// `None` when no provider is usable (no key AND no local endpoint), so each caller keeps its own
 /// no-provider behaviour (a background job skips; an interactive command returns
 /// [`no_provider_message`]). Takes only `role`; the [`RuntimeContext`] is built HERE, never by the
-/// caller, so adding a future input (#432's power state) never re-plumbs a single dispatch site.
+/// caller, so a new input never re-plumbs a single dispatch site.
 ///
 /// Every DB read below takes the lock briefly and drops it — the mutex is non-reentrant, so nothing
-/// holds a lock across `resolve`'s return or across the caller's later work.
+/// holds a lock across `resolve`'s return or across the caller's later work. The power latch is read
+/// BEFORE the DB guard is taken, so no lock is ever acquired while another is held.
 pub fn resolve(app: &AppHandle, role: Role) -> Result<Option<RoutePlan>> {
     let state = app.state::<AppState>();
+    // In-memory and read BEFORE the DB guard, so no lock is ever taken while another is held.
+    let snap = state.local_ai.power_snapshot(Instant::now());
+    let keep_local = state.local_ai.keep_local();
 
     let choice = {
         let conn = state.conn()?;
         let prefs = routing_prefs(&conn)?;
-        resolve_provider(role, &prefs, &RuntimeContext::current())
+        resolve_provider(
+            role,
+            &prefs,
+            &RuntimeContext::current(&snap, keep_local, &conn),
+        )
     };
 
     let plan = match choice {
         ProviderChoice::Cloud => cloud_arm(app, role)?.map(RoutePlan::Cloud),
         ProviderChoice::Local => local_arm(app, role)?.map(RoutePlan::LocalOnly),
-        ProviderChoice::LocalThenCloud => match (local_arm(app, role)?, cloud_arm(app, role)?) {
-            // Both configured: the real local-then-cloud route (the executor falls back in-arm).
-            (Some(local), Some(cloud)) => Some(RoutePlan::LocalThenCloud { local, cloud }),
-            // Local configured, no cloud key: honour the local preference with no fallback available.
-            (Some(local), None) => Some(RoutePlan::LocalOnly(local)),
-            // Local not configured: fall through to cloud, exactly as before local existed.
-            (None, Some(cloud)) => Some(RoutePlan::Cloud(cloud)),
-            (None, None) => None,
-        },
+        ProviderChoice::LocalThenCloud | ProviderChoice::CloudForPower => hydrate_local_then_cloud(
+            choice == ProviderChoice::CloudForPower,
+            local_arm(app, role)?,
+            cloud_arm(app, role)?,
+        ),
     };
     Ok(plan)
 }
 
+/// The "Local, fall back to cloud" ladder, with the power policy's one substitution. Pure. The
+/// policy only ever replaces a both-arms pair, so it adds no failure mode and can never route a
+/// request to nothing: without a key or without a local model, the plan is exactly the one the
+/// preference alone gives.
+fn hydrate_local_then_cloud(
+    power: bool,
+    local: Option<LocalArm>,
+    cloud: Option<CloudArm>,
+) -> Option<RoutePlan> {
+    match (local, cloud) {
+        // The On battery policy moved it: the cloud arm alone, naming the local model it displaced.
+        (Some(local), Some(cloud)) if power => Some(RoutePlan::CloudForPower {
+            displaced_local_model: local.model,
+            cloud,
+        }),
+        // Both configured: the real local-then-cloud route (the executor falls back in-arm).
+        (Some(local), Some(cloud)) => Some(RoutePlan::LocalThenCloud { local, cloud }),
+        // Local configured, no cloud key: honour the local preference with no fallback available.
+        (Some(local), None) => Some(RoutePlan::LocalOnly(local)),
+        // Local not configured: fall through to cloud, exactly as before local existed.
+        (None, Some(cloud)) => Some(RoutePlan::Cloud(cloud)),
+        (None, None) => None,
+    }
+}
+
+/// Re-resolve between batches of a long background job, so a filing run that started on mains
+/// follows the user onto battery (and back) at the next batch boundary rather than at the end of a
+/// big import. Keeps the running plan on `Ok(None)` or `Err` (logged), so a started run is never
+/// stranded by a vault that locked mid-run.
+///
+/// Deliberately NOT re-checked: the in-call retry loops in `run_local_complete` (the preemption and
+/// model-loading budgets). That request has already started on its arm and may already have caused a
+/// load; moving it mid-call would pay for the load and then not use it.
+pub fn refresh_plan(app: &AppHandle, role: Role, plan: &mut RoutePlan) {
+    match resolve(app, role) {
+        Ok(Some(fresh)) => *plan = fresh,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!(
+                "llm_gateway: kept the running route — re-resolving between batches failed ({e})"
+            )
+        }
+    }
+}
+
+/// Appended to a failed reply that the On battery policy sent to the cloud. The person most likely
+/// to meet it is offline on battery, and the override is the one thing that gets them an answer.
+pub(crate) const POWER_ROUTED_FAILED_HINT: &str = "you're on battery, so PM sent this to the cloud. To use your local model instead, turn on \"Keep using local until I quit PM\" in Settings → Local AI → On battery.";
+
+pub(crate) fn power_route_error(e: Error) -> Error {
+    Error::Other(format!("{e} — {POWER_ROUTED_FAILED_HINT}"))
+}
+
 /// Hydrate the cloud arm for a role: the role's key + effective model list, or `None` with no key.
 fn cloud_arm(app: &AppHandle, role: Role) -> Result<Option<CloudArm>> {
-    // The role's key: chat uses the primary key; background prefers the dedicated background key and
-    // falls back to the primary — exactly as the call sites did before this seam.
-    let key = match role {
-        Role::Chat => secrets::get_openrouter_key()?,
-        Role::Background => secrets::get_background_or_primary_key()?,
-    };
+    let key = role_key(role)?;
     let Some(key) = key else {
         return Ok(None);
     };
@@ -454,6 +687,26 @@ pub async fn complete(
         RoutePlan::LocalOnly(local) => run_local_complete(app, local, messages, None).await,
         RoutePlan::LocalThenCloud { local, cloud } => {
             run_local_complete(app, local, messages, Some(cloud)).await
+        }
+        // Straight to OpenRouter with the caller's own `cache_prefix`, NOT through `cloud_complete`,
+        // which hard-codes `false`: the review and retag batches ask for the cached prefix and a
+        // power route must not quietly cost them it.
+        RoutePlan::CloudForPower {
+            cloud,
+            displaced_local_model,
+        } => {
+            let start = Instant::now();
+            let completion =
+                openrouter::complete(cloud.key.expose(), &cloud.models, messages, cache_prefix)
+                    .await?;
+            Ok(LlmOutcome {
+                completion,
+                meta: CallMeta::cloud_fallback(
+                    start.elapsed(),
+                    FallbackReason::PowerPolicy,
+                    displaced_local_model.clone(),
+                ),
+            })
         }
     }
 }
@@ -680,6 +933,28 @@ where
         }
         RoutePlan::LocalThenCloud { local, cloud } => {
             run_local_stream(app, local, messages, cache_through, Some(cloud), on_token).await
+        }
+        RoutePlan::CloudForPower {
+            cloud,
+            displaced_local_model,
+        } => {
+            let start = Instant::now();
+            let completion = openrouter::stream_chat(
+                cloud.key.expose(),
+                &cloud.models,
+                messages,
+                cache_through,
+                on_token,
+            )
+            .await?;
+            Ok(LlmOutcome {
+                completion,
+                meta: CallMeta::cloud_fallback(
+                    start.elapsed(),
+                    FallbackReason::PowerPolicy,
+                    displaced_local_model.clone(),
+                ),
+            })
         }
     }
 }
@@ -927,12 +1202,18 @@ fn local_refusal_ceiling(rt: &crate::local_slot::LocalRuntime, local: &LocalArm)
 /// [`prompt_fit_failure`] is the backstop for everything they cannot size — an unbounded project
 /// list, one enormous document — and for the window changing under a running app.
 pub fn prompt_ceiling_for(app: &AppHandle, plan: &RoutePlan) -> Option<i64> {
-    let local = match plan {
-        RoutePlan::Cloud(_) => return None,
-        RoutePlan::LocalOnly(local) | RoutePlan::LocalThenCloud { local, .. } => local,
-    };
+    let local = sizing_arm(plan)?;
     let state = app.state::<AppState>();
     local_prompt_ceiling(&state.local_ai, local)
+}
+
+/// The local arm a batch should be sized against, or `None` for a cloud route — including one the
+/// On battery policy chose, which is sized like any other cloud route.
+fn sizing_arm(plan: &RoutePlan) -> Option<&LocalArm> {
+    match plan {
+        RoutePlan::Cloud(_) | RoutePlan::CloudForPower { .. } => None,
+        RoutePlan::LocalOnly(local) | RoutePlan::LocalThenCloud { local, .. } => Some(local),
+    }
 }
 
 /// Refuse a prompt that cannot fit the window the server is actually serving, rather than letting it
@@ -1295,9 +1576,10 @@ mod tests {
     }
 
     /// The byte-identical invariant made mechanical: with an EMPTY runtime context, the resolver's
-    /// output must equal the raw preference for every (role, preference) pair — there is no policy
-    /// override yet, so routing is exactly a direct preference lookup. The same reasoning as making
-    /// the IPC boundary enforced rather than merely documented (#432 items 1-3).
+    /// output must equal the raw preference for every (role, preference) pair — the power policy
+    /// acts only through a populated context, so on mains routing is exactly a direct preference
+    /// lookup. The same reasoning as making the IPC boundary enforced rather than merely documented
+    /// (#432 items 1-3).
     #[test]
     fn resolve_provider_with_an_empty_context_is_a_direct_preference_lookup() {
         let ctx = RuntimeContext::default();
@@ -1409,5 +1691,405 @@ mod tests {
             models: vec![],
         });
         assert_eq!(empty.primary_model_id(), "");
+    }
+
+    // ---- the On battery policy (#432) ----
+
+    use crate::power::PowerReading;
+
+    fn snap(state: PowerState, threshold: Option<u8>) -> PowerSnapshot {
+        PowerSnapshot {
+            reading: PowerReading::default(),
+            state,
+            threshold,
+        }
+    }
+
+    fn yes(consent: bool) -> Consent {
+        if consent {
+            Consent::ALL
+        } else {
+            Consent::NONE
+        }
+    }
+
+    fn settings(threshold: u8, scope: PowerScope, consent: bool) -> PowerSettings {
+        PowerSettings {
+            threshold,
+            scope,
+            consent: yes(consent),
+        }
+    }
+
+    fn low(scope: PowerScope, consent: bool, keep_local: bool) -> RuntimeContext {
+        RuntimeContext {
+            battery_low: true,
+            scope,
+            consent: yes(consent),
+            keep_local,
+        }
+    }
+
+    fn is_inert(ctx: &RuntimeContext) -> bool {
+        !ctx.battery_low
+            && ctx.scope == PowerScope::Both
+            && ctx.consent == Consent::NONE
+            && !ctx.keep_local
+    }
+
+    fn cloud(models: &[&str]) -> CloudArm {
+        CloudArm {
+            key: Secret::from("k".to_string()),
+            models: models.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn r2_the_context_is_inert_unless_the_latch_and_the_store_agree() {
+        let on = settings(60, PowerScope::Chat, true);
+        assert!(is_inert(&RuntimeContext::from_parts(
+            &snap(PowerState::Battery, Some(60)),
+            &on,
+            true
+        )));
+        assert!(is_inert(&RuntimeContext::from_parts(
+            &snap(PowerState::BatteryLow, Some(60)),
+            &settings(0, PowerScope::Chat, true),
+            true
+        )));
+        // A vault switched mid-tick: the latch was computed on another store's threshold.
+        assert!(is_inert(&RuntimeContext::from_parts(
+            &snap(PowerState::BatteryLow, Some(60)),
+            &settings(40, PowerScope::Chat, true),
+            true
+        )));
+        // A stale latch already reads as Mains.
+        assert!(is_inert(&RuntimeContext::from_parts(
+            &snap(PowerState::Mains, Some(60)),
+            &on,
+            false
+        )));
+        let ctx = RuntimeContext::from_parts(&snap(PowerState::BatteryLow, Some(60)), &on, true);
+        assert!(ctx.battery_low);
+        assert_eq!(ctx.scope, PowerScope::Chat);
+        assert_eq!(ctx.consent, Consent::ALL);
+        assert!(ctx.keep_local);
+    }
+
+    #[test]
+    fn r3_on_a_low_battery_only_local_then_cloud_moves() {
+        let ctx = low(PowerScope::Both, true, false);
+        for role in [Role::Chat, Role::Background] {
+            for (pref, expected) in [
+                (ProviderPref::Cloud, ProviderChoice::Cloud),
+                (ProviderPref::Local, ProviderChoice::Local),
+                (ProviderPref::LocalThenCloud, ProviderChoice::CloudForPower),
+            ] {
+                assert_eq!(
+                    resolve_provider(role, &RoutingPrefs::uniform(pref), &ctx),
+                    expected,
+                    "{role:?} {pref:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r4_r5_the_scope_picks_the_role() {
+        let prefs = RoutingPrefs::uniform(ProviderPref::LocalThenCloud);
+        let chat = low(PowerScope::Chat, true, false);
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &chat),
+            ProviderChoice::CloudForPower
+        );
+        assert_eq!(
+            resolve_provider(Role::Background, &prefs, &chat),
+            ProviderChoice::LocalThenCloud
+        );
+        let background = low(PowerScope::Background, true, false);
+        assert_eq!(
+            resolve_provider(Role::Background, &prefs, &background),
+            ProviderChoice::CloudForPower
+        );
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &background),
+            ProviderChoice::LocalThenCloud
+        );
+    }
+
+    #[test]
+    fn a_yes_about_one_role_never_moves_the_other() {
+        // Asked while only background could move, the user said yes to background work. Chat
+        // becoming movable later (a key added, its routing changed, the scope widened) must be asked
+        // about, not carried in on the earlier answer.
+        let prefs = RoutingPrefs::uniform(ProviderPref::LocalThenCloud);
+        let ctx = RuntimeContext {
+            battery_low: true,
+            scope: PowerScope::Both,
+            consent: Consent::NONE.with(PowerScope::Background),
+            keep_local: false,
+        };
+        assert_eq!(
+            resolve_provider(Role::Background, &prefs, &ctx),
+            ProviderChoice::CloudForPower
+        );
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &ctx),
+            ProviderChoice::LocalThenCloud
+        );
+        assert_eq!(
+            power_route(Role::Chat, &ctx, None),
+            PowerRoute::NeedsConsent
+        );
+        assert_eq!(power_route(Role::Background, &ctx, None), PowerRoute::Cloud);
+    }
+
+    #[test]
+    fn r6_r7_no_consent_or_the_override_keeps_it_local() {
+        let prefs = RoutingPrefs::uniform(ProviderPref::LocalThenCloud);
+        for ctx in [
+            low(PowerScope::Both, false, false),
+            low(PowerScope::Both, true, true),
+        ] {
+            for role in [Role::Chat, Role::Background] {
+                assert_eq!(
+                    resolve_provider(role, &prefs, &ctx),
+                    ProviderChoice::LocalThenCloud
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r8_power_blocked_reports_in_the_copys_order() {
+        use KeyPresence::*;
+        for local_ready in [true, false] {
+            for key in [Present, Absent, Unreadable] {
+                assert_eq!(
+                    power_blocked(ProviderPref::Cloud, local_ready, key),
+                    Some(PowerBlocked::CloudRouting)
+                );
+            }
+        }
+        assert_eq!(
+            power_blocked(ProviderPref::LocalThenCloud, false, Present),
+            Some(PowerBlocked::NoLocalModel)
+        );
+        assert_eq!(
+            power_blocked(ProviderPref::LocalThenCloud, true, Absent),
+            Some(PowerBlocked::NoKey)
+        );
+        assert_eq!(
+            power_blocked(ProviderPref::LocalThenCloud, true, Unreadable),
+            Some(PowerBlocked::KeyUnreadable)
+        );
+        assert_eq!(
+            power_blocked(ProviderPref::Local, true, Present),
+            Some(PowerBlocked::LocalOnly)
+        );
+        assert_eq!(
+            power_blocked(ProviderPref::Local, true, Absent),
+            Some(PowerBlocked::NoKey),
+            "a keyless Local only user gets the keyless copy"
+        );
+        assert_eq!(
+            power_blocked(ProviderPref::LocalThenCloud, true, Present),
+            None
+        );
+    }
+
+    #[test]
+    fn r9_power_route_rows() {
+        let r = Role::Chat;
+        assert_eq!(
+            power_route(
+                r,
+                &low(PowerScope::Both, true, false),
+                Some(PowerBlocked::NoKey)
+            ),
+            PowerRoute::Unchanged
+        );
+        assert_eq!(
+            power_route(r, &RuntimeContext::default(), None),
+            PowerRoute::Unchanged
+        );
+        assert_eq!(
+            power_route(r, &low(PowerScope::Background, true, false), None),
+            PowerRoute::Unchanged
+        );
+        assert_eq!(
+            power_route(r, &low(PowerScope::Both, false, true), None),
+            PowerRoute::KeptLocal
+        );
+        assert_eq!(
+            power_route(r, &low(PowerScope::Both, false, false), None),
+            PowerRoute::NeedsConsent
+        );
+        assert_eq!(
+            power_route(r, &low(PowerScope::Both, true, false), None),
+            PowerRoute::Cloud
+        );
+    }
+
+    /// The status and routing must never disagree: across every combination, the status says
+    /// "cloud" exactly when `resolve_provider` would move the role AND `resolve` would find both arms
+    /// to hydrate.
+    #[test]
+    fn r10_the_status_says_cloud_exactly_when_routing_moves_the_role() {
+        use KeyPresence::*;
+        for role in [Role::Chat, Role::Background] {
+            for pref in [
+                ProviderPref::Cloud,
+                ProviderPref::Local,
+                ProviderPref::LocalThenCloud,
+            ] {
+                for local_ready in [true, false] {
+                    for key in [Present, Absent, Unreadable] {
+                        for battery_low in [true, false] {
+                            for scope in
+                                [PowerScope::Chat, PowerScope::Background, PowerScope::Both]
+                            {
+                                for consent in [
+                                    Consent::ALL,
+                                    Consent::NONE,
+                                    Consent::NONE.with(PowerScope::Chat),
+                                    Consent::NONE.with(PowerScope::Background),
+                                ] {
+                                    for keep_local in [true, false] {
+                                        let ctx = RuntimeContext {
+                                            battery_low,
+                                            scope,
+                                            consent,
+                                            keep_local,
+                                        };
+                                        let status = power_route(
+                                            role,
+                                            &ctx,
+                                            power_blocked(pref, local_ready, key),
+                                        ) == PowerRoute::Cloud;
+                                        let routed = resolve_provider(
+                                            role,
+                                            &RoutingPrefs::uniform(pref),
+                                            &ctx,
+                                        ) == ProviderChoice::CloudForPower
+                                            && local_ready
+                                            && key == Present;
+                                        assert_eq!(
+                                            status, routed,
+                                            "{role:?} {pref:?} ready={local_ready} {key:?} {ctx:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r11_hydration_substitutes_only_a_both_arms_pair() {
+        match hydrate_local_then_cloud(
+            true,
+            Some(LocalArm {
+                model: "gemma".into(),
+                ..arm()
+            }),
+            Some(cloud(&["a", "b"])),
+        ) {
+            Some(RoutePlan::CloudForPower {
+                cloud,
+                displaced_local_model,
+            }) => {
+                assert_eq!(cloud.models, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(displaced_local_model, "gemma");
+            }
+            _ => panic!("a power route with both arms is CloudForPower"),
+        }
+        assert!(matches!(
+            hydrate_local_then_cloud(false, Some(arm()), Some(cloud(&["a"]))),
+            Some(RoutePlan::LocalThenCloud { .. })
+        ));
+        assert!(matches!(
+            hydrate_local_then_cloud(true, Some(arm()), None),
+            Some(RoutePlan::LocalOnly(_))
+        ));
+        assert!(matches!(
+            hydrate_local_then_cloud(true, None, Some(cloud(&["a"]))),
+            Some(RoutePlan::Cloud(_))
+        ));
+        assert!(hydrate_local_then_cloud(true, None, None).is_none());
+    }
+
+    #[test]
+    fn r12_a_power_plan_is_a_cloud_plan_for_attribution_and_sizing() {
+        let plan = RoutePlan::CloudForPower {
+            cloud: cloud(&["a", "b"]),
+            displaced_local_model: "gemma".into(),
+        };
+        assert_eq!(plan.primary_model_id(), "a");
+        assert_eq!(plan.models(), ["a".to_string(), "b".to_string()]);
+        assert!(plan.is_power_routed());
+        assert!(sizing_arm(&plan).is_none(), "sized like any cloud route");
+        assert!(!RoutePlan::LocalThenCloud {
+            local: arm(),
+            cloud: cloud(&["a"])
+        }
+        .is_power_routed());
+        assert!(sizing_arm(&RoutePlan::LocalOnly(arm())).is_some());
+    }
+
+    #[test]
+    fn r13_a_power_route_is_never_a_failure() {
+        let meta = CallMeta::cloud_fallback(
+            std::time::Duration::from_millis(5),
+            FallbackReason::PowerPolicy,
+            "gemma".into(),
+        );
+        assert!(meta.failure_fallback().is_none());
+        assert!(meta.power_routed());
+        let slug = meta.fallback.as_ref().unwrap().as_log_str();
+        assert_eq!(slug, "power_policy");
+        assert!(!slug.starts_with("hard_failure:"));
+
+        let failed = CallMeta::cloud_fallback(
+            std::time::Duration::from_millis(5),
+            FallbackReason::HardFailure(LocalFailKind::Timeout),
+            "gemma".into(),
+        );
+        assert!(failed.failure_fallback().is_some());
+        assert!(!failed.power_routed());
+    }
+
+    /// The wire spelling the TypeScript mirror (`types.ts`) is written against.
+    #[test]
+    fn the_power_enums_serialize_as_the_frontend_mirrors_them() {
+        let json = |v: serde_json::Value| v.as_str().unwrap().to_string();
+        for (route, wire) in [
+            (PowerRoute::Unchanged, "unchanged"),
+            (PowerRoute::NeedsConsent, "needs_consent"),
+            (PowerRoute::KeptLocal, "kept_local"),
+            (PowerRoute::Cloud, "cloud"),
+        ] {
+            assert_eq!(json(serde_json::to_value(route).unwrap()), wire);
+        }
+        for (blocked, wire) in [
+            (PowerBlocked::CloudRouting, "cloud_routing"),
+            (PowerBlocked::NoLocalModel, "no_local_model"),
+            (PowerBlocked::NoKey, "no_key"),
+            (PowerBlocked::KeyUnreadable, "key_unreadable"),
+            (PowerBlocked::LocalOnly, "local_only"),
+        ] {
+            assert_eq!(json(serde_json::to_value(blocked).unwrap()), wire);
+        }
+    }
+
+    #[test]
+    fn r14_a_failed_power_route_names_the_override() {
+        let msg = power_route_error(Error::Other("x".into())).to_string();
+        assert!(msg.contains('x'));
+        assert!(msg.contains(POWER_ROUTED_FAILED_HINT));
+        assert!(msg.contains("Keep using local until I quit PM"));
     }
 }

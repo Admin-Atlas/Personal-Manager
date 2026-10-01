@@ -25,6 +25,14 @@
 //! 2. **Releasing is never evidence about the endpoint.** It records no health outcome in either
 //!    direction: scoring a success would let housekeeping clear a failing host's strike streak, and
 //!    scoring a failure would eject a healthy one.
+//!
+//! **On battery** (#432) there is a second clock, set separately and off by default: hand the
+//! memory back once nothing has used the model for a while, whatever the policy says. A graphics
+//! card holding a model keeps drawing power with nothing asking it anything, which on a laptop is
+//! battery spent on nothing. It is fed by the On battery latch — the SETTLED state, never a raw
+//! reading — and it counts from no earlier than the unplug, so carrying a laptop to the sofa keeps a
+//! model that was in use a moment ago. It sits behind the same ownership, activity and intent gates
+//! as everything else here.
 
 use std::time::Duration;
 
@@ -33,6 +41,8 @@ use std::time::Duration;
 pub const RELEASE_POLICY_KEY: &str = "local_llm_release_policy";
 /// Settings key for the quiet period, in whole minutes. Absent → [`DEFAULT_IDLE_MINUTES`].
 pub const RELEASE_IDLE_MINUTES_KEY: &str = "local_llm_release_idle_minutes";
+/// Settings key for the on-battery quiet period (#432), in whole minutes. Absent or `"0"` = off.
+pub const BATTERY_IDLE_MINUTES_KEY: &str = "local_llm_battery_idle_minutes";
 
 /// The default quiet period. Five minutes because a chat exchange has gaps of a minute or two while
 /// you read a reply and type the next thing, and paying a three-second reload inside one conversation
@@ -49,7 +59,8 @@ pub const MAX_IDLE_MINUTES: u64 = 120;
 #[serde(rename_all = "snake_case")]
 pub enum ReleasePolicy {
     /// PM never unloads anything. The default, and deliberately so: whatever the server was going to
-    /// do with its own memory is what happens, and a machine that installs PM notices no change.
+    /// do with its own memory is what happens, and a machine that installs PM notices no change —
+    /// except on battery, when you have set an on-battery release time.
     Server,
     /// Release when PM's process ends. Not when the window closes — with the tray icon on, a closed
     /// window means PM is still working for you.
@@ -88,6 +99,38 @@ pub fn idle_after(stored: Option<&str>) -> Duration {
     Duration::from_secs(minutes * 60)
 }
 
+/// A stored on-battery quiet period (#432). Absent, empty, `"0"`, negative or unparseable is `None`
+/// — off — and anything else is clamped into the same range as the policy's own quiet period.
+///
+/// Deliberately not [`idle_after`]: that one turns `"0"` into a minute, because for the policy a
+/// zero is a mistake to be corrected into something usable. Here zero is the off switch, and
+/// reading it as "release after a minute on battery" would turn the feature on for everyone.
+pub fn battery_idle_after(stored: Option<&str>) -> Option<Duration> {
+    let minutes = stored?.trim().parse::<u64>().ok().filter(|m| *m > 0)?;
+    Some(Duration::from_secs(
+        minutes.clamp(MIN_IDLE_MINUTES, MAX_IDLE_MINUTES) * 60,
+    ))
+}
+
+/// The value to store for an on-battery quiet period: zero stays zero (off), anything else is
+/// clamped into range.
+pub fn clamp_battery_idle(m: u64) -> u64 {
+    if m == 0 {
+        0
+    } else {
+        m.clamp(MIN_IDLE_MINUTES, MAX_IDLE_MINUTES)
+    }
+}
+
+/// Everything the release scheduler reads from settings, cached together so a locked vault keeps
+/// honouring all of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReleaseConfig {
+    pub policy: ReleasePolicy,
+    pub idle_after: Duration,
+    pub battery_idle_after: Option<Duration>,
+}
+
 /// Everything the decision depends on. Assembled by the caller from live state so this stays pure.
 #[derive(Debug, Clone, Copy)]
 pub struct ReleaseInputs {
@@ -110,6 +153,11 @@ pub struct ReleaseInputs {
     pub quiet_for: Duration,
     /// The user's chosen quiet period.
     pub idle_after: Duration,
+    /// How long PM has been on battery by the SETTLED On battery latch (#432). `None` on mains, and
+    /// `None` while the latch is stale. Never a raw reading: a cable wiggle must not release a model.
+    pub on_battery_for: Option<Duration>,
+    /// The on-battery quiet period, or `None` when it is off.
+    pub battery_idle_after: Option<Duration>,
 }
 
 /// Whether to release now, on the idle path.
@@ -121,11 +169,55 @@ pub fn should_release(i: &ReleaseInputs) -> bool {
     if !i.pm_loaded || i.in_flight > 0 || i.holds > 0 {
         return false;
     }
-    match i.policy {
-        // `OnExit` is not "never" — it is "not on a timer". Its release happens in the exit hook.
-        ReleasePolicy::Server | ReleasePolicy::OnExit => false,
-        ReleasePolicy::Idle => i.quiet_for >= i.idle_after,
+    // `OnExit` is not "never" — it is "not on a timer". Its release happens in the exit hook.
+    let policy_due = matches!(i.policy, ReleasePolicy::Idle) && i.quiet_for >= i.idle_after;
+    // Counted from no earlier than the unplug, so carrying the laptop to the sofa keeps a model just used.
+    let battery_due = matches!(
+        (i.on_battery_for, i.battery_idle_after),
+        (Some(b), Some(d)) if i.quiet_for.min(b) >= d
+    );
+    policy_due || battery_due
+}
+
+/// Which endpoints a release pass should visit.
+///
+/// `fresh` is what the open store says the endpoint is: `Some(Some(url))` a configured one,
+/// `Some(None)` none at all. With the store CLOSED (`None`) PM cannot read the endpoint — and a model
+/// PM loaded is still sitting on the card, which is the case the cached policy exists for. So a
+/// closed store visits every endpoint PM itself loaded something on: the same unfiltered set the
+/// exit hook releases, sorted so the order is stable.
+pub fn release_endpoints(
+    fresh: Option<Option<&str>>,
+    pm_loaded: &[(String, String)],
+) -> Vec<String> {
+    match fresh {
+        Some(Some(base)) if !base.trim().is_empty() => vec![base.to_string()],
+        Some(_) => Vec::new(),
+        None => {
+            let mut bases: Vec<String> = pm_loaded.iter().map(|(b, _)| b.clone()).collect();
+            bases.sort();
+            bases.dedup();
+            bases
+        }
     }
+}
+
+/// The bearer token to send to one endpoint a release pass visits.
+///
+/// The stored token belongs to the endpoint the user configured, and to no other. A release pass can
+/// visit more than one — the exit hook releases everywhere PM loaded something, and with the store
+/// closed so does the timer — and someone who moved from a tokened remote server to another, or back
+/// to loopback, still has PM's models sitting on the old one. Sending the current token there would
+/// hand one server's credential to a different host. So an endpoint that is not the configured one
+/// gets no token: an unload it then refuses costs a model left loaded, which is recoverable, and a
+/// leaked credential is not. `configured` of `None` means PM does not know which endpoint the token
+/// is for, and the answer is then always no token.
+pub fn token_for<'a>(
+    base_url: &str,
+    configured: Option<&str>,
+    token: Option<&'a str>,
+) -> Option<&'a str> {
+    token.filter(|_| configured.is_some_and(|c| c == base_url))
 }
 
 /// Whether to release as PM shuts down.
@@ -149,6 +241,18 @@ mod tests {
             holds: 0,
             quiet_for: Duration::from_secs(quiet_secs),
             idle_after: Duration::from_secs(300),
+            on_battery_for: None,
+            battery_idle_after: None,
+        }
+    }
+
+    /// The policy that changes nothing, on battery with an on-battery quiet period set.
+    fn on_battery(quiet_secs: u64, on_battery_secs: u64, battery_idle_secs: u64) -> ReleaseInputs {
+        ReleaseInputs {
+            policy: ReleasePolicy::Server,
+            on_battery_for: Some(Duration::from_secs(on_battery_secs)),
+            battery_idle_after: Some(Duration::from_secs(battery_idle_secs)),
+            ..idle(quiet_secs)
         }
     }
 
@@ -249,5 +353,126 @@ mod tests {
         assert_eq!(idle_after(Some("banana")), Duration::from_secs(300));
         assert_eq!(idle_after(Some("0")), Duration::from_secs(60));
         assert_eq!(idle_after(Some("99999")), Duration::from_secs(120 * 60));
+    }
+
+    #[test]
+    fn b1_on_battery_the_server_policy_releases_after_the_battery_quiet_period() {
+        assert!(
+            !should_release(&on_battery(299, 600, 300)),
+            "4m59 is still busy"
+        );
+        assert!(should_release(&on_battery(300, 600, 300)));
+    }
+
+    #[test]
+    fn b2_the_battery_clock_starts_no_earlier_than_the_unplug() {
+        // Half an hour quiet on mains, then carried to the sofa: the model was just used, as far as
+        // the battery is concerned, so it is kept for the battery period from the unplug.
+        assert!(!should_release(&on_battery(1800, 299, 300)));
+        assert!(should_release(&on_battery(1800, 300, 300)));
+    }
+
+    #[test]
+    fn b3_on_mains_the_battery_period_never_applies() {
+        let mut i = on_battery(10_000, 0, 60);
+        i.on_battery_for = None;
+        assert!(!should_release(&i));
+    }
+
+    #[test]
+    fn b4_with_the_battery_period_off_server_still_changes_nothing() {
+        for b in [0, 60, 600, 100_000] {
+            let mut i = on_battery(100_000, b, 60);
+            i.battery_idle_after = None;
+            assert!(!should_release(&i), "on battery for {b}s");
+        }
+    }
+
+    #[test]
+    fn b5_the_battery_period_sits_behind_every_gate() {
+        let mut not_ours = on_battery(600, 600, 300);
+        not_ours.pm_loaded = false;
+        assert!(!should_release(&not_ours));
+        let mut busy = on_battery(600, 600, 300);
+        busy.in_flight = 1;
+        assert!(!should_release(&busy));
+        let mut held = on_battery(600, 600, 300);
+        held.holds = 1;
+        assert!(!should_release(&held));
+    }
+
+    #[test]
+    fn b6_b7_the_shorter_clock_wins() {
+        // Idle at 5 minutes, battery at 15: the policy fires first.
+        let mut a = on_battery(300, 1200, 900);
+        a.policy = ReleasePolicy::Idle;
+        a.idle_after = Duration::from_secs(300);
+        assert!(should_release(&a));
+        // Idle at 15 minutes, battery at 5: the battery period fires first.
+        let mut b = on_battery(300, 1200, 300);
+        b.policy = ReleasePolicy::Idle;
+        b.idle_after = Duration::from_secs(900);
+        assert!(should_release(&b));
+    }
+
+    #[test]
+    fn b8_on_exit_gets_the_battery_timer_too() {
+        let mut i = on_battery(300, 600, 300);
+        i.policy = ReleasePolicy::OnExit;
+        assert!(should_release(&i));
+        i.on_battery_for = None;
+        assert!(
+            !should_release(&i),
+            "off battery, OnExit is still not a timer"
+        );
+    }
+
+    #[test]
+    fn b9_a_stored_battery_period_is_off_unless_it_says_otherwise() {
+        for stored in [None, Some(""), Some("0"), Some("-3"), Some("abc")] {
+            assert_eq!(battery_idle_after(stored), None, "{stored:?}");
+        }
+        assert_eq!(battery_idle_after(Some("1")), Some(Duration::from_secs(60)));
+        assert_eq!(
+            battery_idle_after(Some(" 5 ")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            battery_idle_after(Some("500")),
+            Some(Duration::from_secs(7200))
+        );
+        assert_eq!(clamp_battery_idle(0), 0);
+        assert_eq!(clamp_battery_idle(500), 120);
+    }
+
+    #[test]
+    fn b10_a_closed_store_releases_on_every_endpoint_pm_loaded_on() {
+        assert_eq!(
+            release_endpoints(Some(Some("http://a")), &[]),
+            vec!["http://a".to_string()]
+        );
+        assert!(release_endpoints(Some(None), &[]).is_empty());
+        assert!(release_endpoints(Some(Some("  ")), &[]).is_empty());
+        let pairs = [
+            ("http://b".to_string(), "m1".to_string()),
+            ("http://a".to_string(), "m2".to_string()),
+            ("http://b".to_string(), "m3".to_string()),
+        ];
+        assert_eq!(
+            release_endpoints(None, &pairs),
+            vec!["http://a".to_string(), "http://b".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_token_only_ever_goes_to_the_endpoint_it_was_saved_for() {
+        // The exit hook and a closed-store pass both visit every endpoint PM loaded on. One of them
+        // may be a server the user has since moved away from, and the current token is not theirs.
+        let tok = Some("secret");
+        assert_eq!(token_for("http://a", Some("http://a"), tok), tok);
+        assert_eq!(token_for("http://b", Some("http://a"), tok), None);
+        // Not knowing which endpoint the token is for is never a reason to send it anywhere.
+        assert_eq!(token_for("http://a", None, tok), None);
+        assert_eq!(token_for("http://a", Some("http://a"), None), None);
     }
 }

@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 import { localEndpointState } from "./localStatus";
+import { INERT_POWER_VIEW } from "./powerRoute";
 import type { LocalLlmStatus } from "./types";
 
 const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
@@ -26,6 +27,7 @@ const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   background_loaded: null,
   chat_released: false,
   background_released: false,
+  power: INERT_POWER_VIEW,
   ...over,
 });
 

@@ -101,15 +101,19 @@ pub enum ChatEvent {
         /// `usage_log.provider` token). The per-message "via <model> - local/cloud" footer reads it
         /// live; it is NOT persisted with the message (a reloaded history turn shows the model only).
         served_by: String,
+        /// The On battery policy moved this turn to the cloud (#432). Rendered in the per-message
+        /// footer; never a failure. Not persisted, like `served_by`.
+        on_battery: bool,
     },
     Error {
         message: String,
     },
     /// The reply was served by cloud despite a local-endpoint preference (#297): the user asked for
     /// local, but it failed or was resting, so cloud answered. NOT an error (the reply is real) and
-    /// NOT a power-policy switch. `reason` is the normalized slug (`hard_failure:<kind>` / `cooldown`);
-    /// the honesty strip (#297 PR6) maps it to friendly text. Today's if/else consumer safely ignores
-    /// this unknown variant until PR6 mirrors it in TS.
+    /// NEVER a power-policy switch: an On battery route is filtered out by
+    /// `CallMeta::failure_fallback` and reported on `Done.on_battery` instead, so it can never
+    /// share the failure strip. `reason` is the normalized slug (`hard_failure:<kind>` /
+    /// `cooldown` / `endpoint_refused`); the honesty strip (#297 PR6) maps it to friendly text.
     Fallback {
         from_model: String,
         to_model: String,
@@ -531,6 +535,8 @@ pub async fn send_message(
     let Some(plan) = llm_gateway::resolve(&app, Role::Chat)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
+    // Decided once, here: a reply finishes where it started, whatever the battery does meanwhile.
+    let power_routed = plan.is_power_routed();
 
     // Save the user turn and gather history + the learned profile + the
     // conversation's project scope. Scope the lock so the guard is dropped before
@@ -743,6 +749,14 @@ pub async fn send_message(
     let llm_gateway::LlmOutcome { completion, meta } = match result {
         Ok(o) => o,
         Err(e) => {
+            // A power-routed turn that failed names the way back to the local model. Both the event
+            // and the returned rejection carry it, because the chat hook overwrites the event's
+            // message with the rejection's.
+            let e = if power_routed {
+                llm_gateway::power_route_error(e)
+            } else {
+                e
+            };
             let _ = on_event.send(ChatEvent::Error {
                 message: e.to_string(),
             });
@@ -751,8 +765,8 @@ pub async fn send_message(
     };
     // If the local endpoint the user preferred didn't serve this turn (it failed or was resting), tell
     // the UI so it can render the honesty strip (#297 PR6) — a fell-back reply is real, so this is
-    // NOT an Error. Today's chat consumer safely ignores the unknown variant until PR6 mirrors it.
-    if let Some(reason) = &meta.fallback {
+    // NOT an Error. A power-policy route is not a failure and never reaches this strip.
+    if let Some(reason) = meta.failure_fallback() {
         let _ = on_event.send(ChatEvent::Fallback {
             from_model: meta.displaced_local_model.clone().unwrap_or_default(),
             to_model: completion
@@ -855,6 +869,7 @@ pub async fn send_message(
         content: reply,
         citations,
         served_by: meta.provider.as_str().to_string(),
+        on_battery: meta.power_routed(),
     });
     Ok(())
 }
@@ -1261,10 +1276,12 @@ mod tests {
             content: "hi".into(),
             citations: vec![],
             served_by: "local".into(),
+            on_battery: false,
         })
         .unwrap();
         assert_eq!(done["type"], "done");
         assert_eq!(done["served_by"], "local");
+        assert_eq!(done["on_battery"], false);
 
         let fb = serde_json::to_value(ChatEvent::Fallback {
             from_model: "llama3".into(),

@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { ProviderChip } from "./ProviderChip";
 import type { LocalLlmStatus } from "../lib/types";
 import { LOCAL_STATE_LABEL } from "../lib/localStatus";
+import { INERT_POWER_VIEW } from "../lib/powerRoute";
 
 const st = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   configured: true,
@@ -29,6 +30,7 @@ const st = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   background_loaded: null,
   chat_released: false,
   background_released: false,
+  power: INERT_POWER_VIEW,
   ...over,
 });
 
@@ -67,6 +69,46 @@ describe("ProviderChip", () => {
     ] as const) {
       const { container } = render(<ProviderChip status={st(over)} />);
       expect(container.textContent).toContain(LOCAL_STATE_LABEL[state]);
+    }
+  });
+
+  it("says chat is on the cloud while the On battery policy has moved it, in neutral ink", () => {
+    // "Local · connected" would be true of the server and false of the reply. And the status
+    // colours are the health family: `--st-look` is what a FAILURE wears, and a policy the user
+    // chose must never borrow it.
+    const { container } = render(
+      <ProviderChip
+        status={st({
+          power: {
+            ...INERT_POWER_VIEW,
+            state: "battery_low",
+            chat: { route: "cloud", blocked: null, local_model: "gemma3:4b" },
+          },
+        })}
+      />,
+    );
+    const pill = container.firstElementChild as HTMLElement;
+    expect(pill.textContent).toBe("Cloud·on battery");
+    expect(pill.textContent).not.toContain("connected");
+    expect(pill.getAttribute("style")).toContain("--ink3");
+    expect(pill.getAttribute("style")).not.toContain("--st-look");
+    expect(pill.title).toMatch(/Settings → Local AI → On battery/);
+  });
+
+  it("keeps the endpoint pill for every route that isn't a move", () => {
+    for (const route of ["unchanged", "needs_consent", "kept_local"] as const) {
+      const { container } = render(
+        <ProviderChip
+          status={st({
+            power: {
+              ...INERT_POWER_VIEW,
+              chat: { route, blocked: null, local_model: "gemma3:4b" },
+            },
+          })}
+        />,
+      );
+      expect(container.textContent).toContain("Local");
+      expect(container.textContent).toContain("connected");
     }
   });
 });

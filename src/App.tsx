@@ -8,6 +8,7 @@ import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
 import { ProviderChip } from "./components/ProviderChip";
 import { FallbackStrip } from "./components/FallbackStrip";
+import { PowerConsentStrip } from "./components/PowerConsentStrip";
 import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
@@ -1058,6 +1059,9 @@ export default function App() {
                 </button>
               </Callout>
             )}
+            {/* The one-time On battery question (#432). App-wide, because the moment it matters is
+                whatever tab is open when the battery runs low; renders nothing until it is asked. */}
+            <PowerConsentStrip status={localAi} />
             <div
               className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
             >

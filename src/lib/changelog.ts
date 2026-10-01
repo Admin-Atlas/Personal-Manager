@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.137.0-alpha",
+    date: "2026-10-01",
+    highlights: [
+      "On battery, PM can now hand your work to the cloud. If you run a model on your own machine and have an OpenRouter key, PM can send new requests to your cloud model once your battery falls to a level you choose — 60% to start with — and come back to your local model when you plug in. You choose whether that’s your chats, background work, or both, and each choice says which kind of setup it suits. PM waits a minute before acting on any change, so unplugging to move the laptop changes nothing, and it asks you before it first moves anything to the cloud — until you answer, it stays on your local model. Your answer covers what PM asked about and nothing else: if something more could move later, it asks about that once too. Settings › Local AI › On battery.",
+      "While it’s switched, the sidebar says “on battery” beside the model that’s answering, and so do the chat box and each reply. Offline on battery and need your own model? “Keep using local until I quit PM” does exactly that, and is forgotten when you quit. And if you stay on your local model while on battery, PM can hand the graphics card’s memory back after a quiet spell, which you set under Holding the graphics card — a card holding a model keeps drawing power even when nothing is asking it anything.",
+      "Two fixes to handing the graphics card back. It now keeps to your schedule while your library is locked, and when you quit with it locked — both used to be skipped, which was exactly when someone had walked away. And if you have switched servers since PM loaded a model on the old one, PM no longer sends the old server your new server’s access key when it tidies up there.",
+    ],
+  },
+  {
     version: "3.136.2-alpha",
     date: "2026-10-01",
     highlights: [

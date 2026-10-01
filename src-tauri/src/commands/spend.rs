@@ -106,9 +106,10 @@ pub(super) fn cached_catalogue(conn: &Connection) -> Result<Vec<openrouter::Mode
 
 /// Append a `usage_log` row — best-effort: cost logging must never fail a model call,
 /// so errors are swallowed. `model = None` is allowed (an unreported served model). `meta` tags the
-/// row with how it was served (provider / latency / fallback reason, migration v37) so the Usage &
-/// cost table and the Local AI tab can tell local from cloud spend. `pub(crate)` so the chat
-/// housekeeping modules (summary / title / prefs) route their rows through it too.
+/// row with how it was served (provider / latency / fallback reason, migration v37) so a reader can
+/// tell local from cloud spend and a power-policy route from a failure. The dev inspector shows
+/// them; the Usage & cost table does not yet. `pub(crate)` so the chat housekeeping modules
+/// (summary / title / prefs) route their rows through it too.
 pub(crate) fn log_usage(
     conn: &Connection,
     kind: &str,

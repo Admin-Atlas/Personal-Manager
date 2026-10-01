@@ -288,7 +288,9 @@ export function LocalAiRoles({
           <span className="text-ink2">Local only</span> uses the model you picked and fails if it's
           unreachable. <span className="text-ink2">Local, fall back to cloud</span> tries local
           first and quietly hands off to your cloud model only on a hard failure (an unreachable or
-          broken server) — never to chase quality.
+          broken server) — never to chase quality. The On battery section below is separate from
+          fallback: it can move a role set to Local, fall back to cloud onto your cloud model while
+          your battery is low, and it asks you before it first does. Local only is never moved.
         </p>
       </SectionInfo>
     </div>
