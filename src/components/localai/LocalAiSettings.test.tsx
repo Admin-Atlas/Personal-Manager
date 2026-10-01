@@ -917,6 +917,7 @@ describe("a download owned by the backend", () => {
       total_bytes: 4096,
       running: true,
       error: null,
+      started_at_ms: 0,
     });
     await loaded();
 
@@ -979,6 +980,7 @@ describe("a download owned by the backend", () => {
       total_bytes: 8192,
       running: true,
       error: null,
+      started_at_ms: 0,
     });
     pullLocalModel.mockRejectedValue(new Error("a model download is already running"));
 

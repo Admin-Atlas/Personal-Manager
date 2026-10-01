@@ -21,19 +21,31 @@ const VERDICT: Record<LocalFitVerdict, { label: string; token: string }> = {
   unknown: { label: "Unknown", token: "--ink4" },
 };
 
-export function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
-  const v = VERDICT[verdict];
+/**
+ * The tab's one status chip: a token's own colour on a 15% wash of itself.
+ *
+ * One recipe rather than a copy per chip, because the fit verdict, the endpoint's state and every
+ * chip after them are the same kind of readout — and a second hand-typed copy is how two chips that
+ * mean the same thing end up looking different. `token` is a theme custom property (`--st-quick`),
+ * never a colour: the chip has to follow the theme and the contrast setting like everything else.
+ */
+export function TokenChip({ token, children }: { token: string; children: ReactNode }) {
   return (
     <span
       className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium"
       style={{
-        color: `var(${v.token})`,
-        background: `color-mix(in oklab, var(${v.token}) 15%, transparent)`,
+        color: `var(${token})`,
+        background: `color-mix(in oklab, var(${token}) 15%, transparent)`,
       }}
     >
-      {v.label}
+      {children}
     </span>
   );
+}
+
+export function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
+  const v = VERDICT[verdict];
+  return <TokenChip token={v.token}>{v.label}</TokenChip>;
 }
 
 /** The per-config mono metric spans (quant · context · speed · memory), shared by the single- and

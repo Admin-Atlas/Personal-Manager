@@ -17,6 +17,7 @@ import {
 import type { LocalLlmStatus, PowerScope, PowerView } from "../../lib/types";
 import { Button, RadioChoice, SectionInfo, SectionLabel, Select, SettingRow, Toggle } from "../ui";
 import { PowerConsentAsk } from "../PowerConsentStrip";
+import { sectionLabel } from "./sections";
 
 /** The three What moves options, in the order shown — each with who it suits, so the choice is
  *  made against a reason rather than a label. */
@@ -106,7 +107,7 @@ export function LocalAiPower({
       data-help="settings-localai-power"
       className="mt-5 border-t border-border pt-4"
     >
-      <SectionLabel>On battery</SectionLabel>
+      <SectionLabel>{sectionLabel("sec-localai-power")}</SectionLabel>
 
       {/* Unfolded: why the controls below are dead is a gating hint, and the doctrine never folds
           those. The controls themselves stay on screen, disabled, so what this section would do is

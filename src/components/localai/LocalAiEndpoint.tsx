@@ -18,6 +18,8 @@ import type {
   LocalLlmStatus,
 } from "../../lib/types";
 import { runnerGuides } from "../../lib/workbenchGuide";
+import { TokenChip } from "./fitDisplay";
+import { RunnerGuideCard } from "./RunnerGuideCard";
 import {
   Button,
   Collapsible,
@@ -372,17 +374,7 @@ function StatusChip({ status }: { status: LocalLlmStatus | null }) {
       token = "--st-due";
     }
   }
-  return (
-    <span
-      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium"
-      style={{
-        color: `var(${token})`,
-        background: `color-mix(in oklab, var(${token}) 15%, transparent)`,
-      }}
-    >
-      {label}
-    </span>
-  );
+  return <TokenChip token={token}>{label}</TokenChip>;
 }
 
 function EndpointCheckResult({ check }: { check: EndpointCheck }) {
@@ -443,30 +435,7 @@ function RunnerInstall() {
       </p>
       <div className="mt-3 space-y-3">
         {guides.map((g) => (
-          <div key={g.name} className="rounded-[var(--radius-sm)] border border-border p-2.5">
-            <div className="flex flex-wrap items-baseline gap-x-2">
-              <span className="text-sm text-ink2">{g.name}</span>
-              <span className="font-mono text-[0.625rem] text-ink4">port {g.port}</span>
-            </div>
-            <p className="mt-0.5">{g.summary}</p>
-            <p className="mt-1.5 text-ink3">{g.bestFor}</p>
-            <p className="mt-1">
-              <span className="text-ink3">Models:</span> {g.models}
-            </p>
-            {/* Unfolded, never a caret: a hardware exclusion and "does this stay running?" are
-                gating facts, and the settings doctrine folds prose but not those. Lifecycle sits
-                immediately before the steps because it is what decides whether the steps are a
-                one-time setup or something you redo every session. */}
-            {g.caveat && <p className="mt-1 text-ink3">Worth knowing: {g.caveat}</p>}
-            <p className="mt-1 text-ink3">
-              <span className="text-ink3">Staying running:</span> {g.lifecycle}
-            </p>
-            <ol className="ml-4 mt-1.5 list-decimal space-y-1">
-              {g.steps.map((s, i) => (
-                <li key={i}>{s}</li>
-              ))}
-            </ol>
-          </div>
+          <RunnerGuideCard key={g.name} guide={g} />
         ))}
       </div>
     </div>

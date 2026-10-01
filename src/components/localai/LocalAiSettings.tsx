@@ -32,7 +32,10 @@ import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import { LocalAiMachine } from "./LocalAiMachine";
 import { LocalAiPower } from "./LocalAiPower";
 import { LocalAiRoles } from "./LocalAiRoles";
-import { Button, Callout } from "../ui";
+import { usePull } from "./usePull";
+import { useReleaseSettings } from "./useReleaseSettings";
+import { useRoleTests } from "./useRoleTests";
+import { Button, Callout, ConfirmDialog } from "../ui";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
  *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
@@ -41,9 +44,11 @@ import { Button, Callout } from "../ui";
  *
  *  This file is the tab, not the sections. It owns exactly what more than one section reads — the
  *  stored config, the live status, the served-model list, the hardware/catalog scan — and the
- *  reloads that refresh them. Everything that belongs to one section lives with it: the endpoint
- *  form, the download, the role tests. One file per section, rather than one screenful each of a
- *  1,100-line function, which is what this was. */
+ *  reloads that refresh them — plus three jobs held here so that every control that starts or shows
+ *  one reads the same state: the download (`usePull`), the role tests (`useRoleTests`) and the
+ *  release settings (`useReleaseSettings`). Everything that belongs to one section lives with it,
+ *  like the endpoint form. One file per section, rather than one screenful each of a 1,100-line
+ *  function, which is what this was. */
 export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () => void } = {}) {
   const [recs, setRecs] = useState<LocalRecommendations | null>(null);
   const [betterFit, setBetterFit] = useState<LocalBetterFit | null>(null);
@@ -59,9 +64,9 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   // server serves nothing when PM simply doesn't know.
   const [servedLoaded, setServedLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  /** Bumped whenever the stored endpoint or its token changes. It is the `key` on the roles
-   *  section, so anything that section proved about the OLD server — a passing test — goes with the
-   *  mount rather than having to be remembered and invalidated from up here. */
+  /** Bumped whenever the stored endpoint or its token changes. The role tests reset on it, so
+   *  anything proved about the OLD server — a passing test — goes with it rather than having to be
+   *  remembered and invalidated piecemeal. */
   const [endpointEpoch, setEndpointEpoch] = useState(0);
 
   const configured = !!config?.base_url;
@@ -114,6 +119,16 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       setError(String(e));
     }
   }
+
+  const pull = usePull({
+    recs,
+    onRecs: setRecs,
+    onReload: reloadConfig,
+    onRefreshRecs: refreshRecs,
+    onError: (message) => setError(message),
+  });
+  const roleTests = useRoleTests(endpointEpoch);
+  const release = useReleaseSettings({ status });
 
   useEffect(() => {
     let cancelled = false;
@@ -307,11 +322,8 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         isOllama={isOllama}
         servedTags={servedTags}
         installedRepos={installedRepos}
-        onRecs={setRecs}
-        onReload={reloadConfig}
-        onRefreshRecs={refreshRecs}
+        pull={pull}
         onCadence={(c) => void changeCadence(c)}
-        onError={setError}
       />
 
       <LocalAiDownloaded
@@ -332,7 +344,6 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       />
 
       <LocalAiRoles
-        key={endpointEpoch}
         config={config}
         status={status}
         served={served}
@@ -340,6 +351,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         configured={configured}
         coResidency={recs?.co_residency ?? null}
         anyLocalRoleWithModel={anyLocalRoleWithModel}
+        roleTests={roleTests}
         onConfigPatch={(patch) => setConfig((c) => (c ? { ...c, ...patch } : c))}
         onError={setError}
       />
@@ -353,7 +365,44 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         onError={setError}
       />
 
-      <LocalAiLifecycle configured={configured} power={status?.power ?? null} />
+      <LocalAiLifecycle configured={configured} power={status?.power ?? null} release={release} />
+
+      {/* The licence ask for a restricted model, answered before its download starts. Once, here,
+          because the download it guards is the tab's: whichever control asked for it, there is
+          only ever one question open. */}
+      <ConfirmDialog
+        open={pull.termsFor !== null}
+        title={
+          pull.termsFor
+            ? `${pull.termsFor.rec.display_name} is under the ${pull.termsFor.rec.licence.name}`
+            : ""
+        }
+        confirmLabel="Accept and download"
+        onConfirm={() => void pull.acceptTermsAndPull()}
+        onClose={pull.closeTerms}
+      >
+        {pull.termsFor && (
+          <>
+            <p>{pull.termsFor.rec.licence.summary}</p>
+            <p className="mt-2">
+              <a
+                href={pull.termsFor.rec.licence.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="underline decoration-dotted underline-offset-2"
+              >
+                Read the full terms
+              </a>
+              .
+            </p>
+            <p className="mt-2 text-ink4">
+              PM doesn't download the weights — your own Ollama fetches them from the publisher, and
+              PM can't enforce these terms either way. Accepting here records that you've read them.
+              PM won't ask again for another model under the same licence.
+            </p>
+          </>
+        )}
+      </ConfirmDialog>
     </>
   );
 }

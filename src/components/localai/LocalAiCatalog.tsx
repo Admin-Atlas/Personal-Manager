@@ -1,33 +1,24 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
-import {
-  acceptLocalModelTerms,
-  activeLocalPull,
-  cancelLocalPull,
-  pullLocalModel,
-} from "../../lib/ipc";
-import type {
-  LocalRecommendation,
-  LocalRecommendations,
-  PullProgress,
-  PullSnapshot,
-} from "../../lib/types";
+import type { LocalRecommendation, LocalRecommendations, PullProgress } from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
 import { IngestProgress } from "../IngestProgress";
 import { installCommand } from "../../lib/workbenchGuide";
 import { ConfigRow, FitBadge } from "./fitDisplay";
-import { Button, Collapsible, ConfirmDialog, SectionLabel, Select } from "../ui";
+import { sectionLabel } from "./sections";
+import type { ModelPull } from "./usePull";
+import { Button, Collapsible, SectionLabel, Select } from "../ui";
 
 /**
  * "Recommended models" — the curated catalog sized against this machine, and the one-click pull.
  *
- * It owns the download, because the download is this section's: the job itself is backend-owned
- * (it survives the tab unmounting), and everything here is the view of it — which card is marked,
- * what the progress bar says, and the licence dialog that has to be answered before a restricted
- * model is fetched. The tab keeps only what other sections also read.
+ * The download itself is the tab's (`usePull`), handed down as `pull`: the job is backend-owned (it
+ * survives the tab unmounting), and what this section shows is the view of it — which card is
+ * marked, and what the progress bar says. The licence dialog that has to be answered before a
+ * restricted model is fetched is the hook's too, and renders once, at the tab.
  */
 export function LocalAiCatalog({
   recs,
@@ -36,11 +27,8 @@ export function LocalAiCatalog({
   isOllama,
   servedTags,
   installedRepos,
-  onRecs,
-  onReload,
-  onRefreshRecs,
+  pull,
   onCadence,
-  onError,
 }: {
   recs: LocalRecommendations | null;
   loading: boolean;
@@ -49,164 +37,11 @@ export function LocalAiCatalog({
   isOllama: boolean;
   servedTags: Set<string>;
   installedRepos: Set<string>;
-  /** Replace the tab's recommendations (a licence acceptance, a finished pull). */
-  onRecs: (recs: LocalRecommendations) => void;
-  /** Re-read the stored config and the served-model list. */
-  onReload: () => Promise<void>;
-  /** Re-read the recommendations from the backend. */
-  onRefreshRecs: () => Promise<void>;
+  /** The one model download, from the tab's `usePull`. */
+  pull: ModelPull;
   onCadence: (cadence: string) => void;
-  onError: (message: string | null) => void;
 }) {
-  // `pulling` holds the pull TAG (`hf.co/<repo>:<QUANT>`), not the repo: the backend's job snapshot
-  // is keyed on the tag, so a view that mounts mid-download can adopt it and mark the right card.
-  const [pulling, setPulling] = useState<string | null>(null);
-  const [pullProg, setPullProg] = useState<PullProgress | null>(null);
-  /** The model whose licence terms are being shown, and the pull tag the user asked for, or null
-   *  when no dialog is open. The TAG rides along because a card can offer more than one way to run
-   *  the same model: resolving it again after the dialog would resolve the card's default, not the
-   *  row the user actually clicked. */
-  const [termsFor, setTermsFor] = useState<{ rec: LocalRecommendation; tag: string } | null>(null);
-  /** Mirrors `pulling` synchronously. `pull()` below is async, so the `pulling` it captured when it
-   *  started is stale by the time its `finally` runs — and that `finally` must be able to tell
-   *  whether the tag it started is still the one on screen. */
-  const pullingRef = useRef<string | null>(null);
-
-  /** The single writer for the pull marker. Keeps `pullingRef` in step with the state so the two
-   *  can never disagree — a marker cleared in one and not the other silently kills the 1s snapshot
-   *  poller, whose effect dependency is `pulling`. */
-  const markPulling = useCallback((tag: string | null) => {
-    pullingRef.current = tag;
-    setPulling(tag);
-  }, []);
-
-  /** Mirror the backend's pull job into the view. The snapshot is the source of truth: it survives
-   *  this view unmounting, and it is the only thing that knows about a download this component did
-   *  not start. A snapshot with nothing running is deliberately NOT a reset — callers decide that. */
-  const applyPullSnapshot = useCallback(
-    (snap: PullSnapshot | null) => {
-      if (!snap?.running) return false;
-      markPulling(snap.model);
-      setPullProg({
-        status: snap.status,
-        completed_bytes: snap.completed_bytes,
-        total_bytes: snap.total_bytes,
-        done: false,
-      });
-      return true;
-    },
-    [markPulling],
-  );
-
-  // A download owned by the BACKEND may be running while this view mounts (the tab router unmounts
-  // on every switch): adopt it, and while any pull is marked running keep re-reading the snapshot —
-  // it is the source of truth that survives the unmount, and its terminal state carries the error
-  // a channel nobody was listening to could not deliver.
-  useEffect(() => {
-    let cancelled = false;
-    void activeLocalPull()
-      .then((snap) => {
-        if (cancelled) return;
-        applyPullSnapshot(snap);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [applyPullSnapshot]);
-  useEffect(() => {
-    if (pulling === null) return;
-    let cancelled = false;
-    const id = setInterval(() => {
-      void activeLocalPull()
-        .then((snap) => {
-          if (cancelled || !snap || snap.model !== pulling) return;
-          if (snap.running) {
-            setPullProg({
-              status: snap.status,
-              completed_bytes: snap.completed_bytes,
-              total_bytes: snap.total_bytes,
-              done: false,
-            });
-            return;
-          }
-          // Terminal. The locally-started path also lands here if its invoke handler is gone.
-          markPulling(null);
-          setPullProg(null);
-          if (snap.error) onError(snap.error);
-          void onReload();
-          void onRefreshRecs();
-        })
-        .catch(() => {});
-    }, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pulling]);
-
-  /** Download, once the terms behind this model have been shown and accepted (if they need to be).
-   *
-   *  Restricted-licence models — Gemma, Llama, the largest Qwen — carry publisher terms rather than
-   *  an open-source licence, so PM shows them first. Acceptance is remembered per LICENCE, so
-   *  reading the Gemma Terms once covers every Gemma. Open-licence models are never interrupted.
-   *
-   *  This is disclosure, not enforcement: the download is the user's own Ollama fetching the weights
-   *  from the publisher, and they could run `ollama pull` without PM at all. */
-  function requestPull(rec: LocalRecommendation, tag: string) {
-    const needsTerms = !rec.licence.open && !(recs?.terms_accepted ?? []).includes(rec.licence.id);
-    if (needsTerms) {
-      setTermsFor({ rec, tag });
-      return;
-    }
-    void pull(tag);
-  }
-
-  async function acceptTermsAndPull() {
-    const pending = termsFor;
-    if (!pending) return;
-    const { rec, tag } = pending;
-    setTermsFor(null);
-    try {
-      const accepted = await acceptLocalModelTerms(rec.licence.id);
-      if (recs) onRecs({ ...recs, terms_accepted: accepted });
-    } catch (e) {
-      // The acceptance failed to persist, so the next download of this licence asks again. That is
-      // the safe direction: never start the download on the back of a record that wasn't written.
-      onError(String(e));
-      return;
-    }
-    await pull(tag);
-  }
-
-  async function pull(tag: string) {
-    markPulling(tag);
-    setPullProg(null);
-    onError(null);
-    try {
-      // The job itself is backend-owned (it survives this view unmounting); the channel is just
-      // the low-latency progress feed while we ARE mounted — the 1s snapshot poll is the fallback.
-      await pullLocalModel(tag, setPullProg);
-      await onReload(); // the model now shows as served / installed
-      await onRefreshRecs();
-    } catch (e) {
-      onError(String(e));
-      // The job is backend-owned and the backend refuses a second concurrent pull, so this is the
-      // ordinary outcome of clicking a second Download while one runs. The optimistic mark above has
-      // already displaced whatever was running; recover it from the snapshot rather than dropping to
-      // null, because null tears down the 1s poller (its dependency is `pulling`) and leaves a live
-      // download with no progress bar and no Cancel until the view happens to remount.
-      applyPullSnapshot(await activeLocalPull().catch(() => null));
-    } finally {
-      // Per-tag, never unconditional: the re-adoption above may have just put ANOTHER pull on
-      // screen, and this reset runs after it.
-      if (pullingRef.current === tag) {
-        markPulling(null);
-        setPullProg(null);
-      }
-    }
-  }
+  const { pulling, pullProg } = pull;
 
   return (
     <div
@@ -227,7 +62,7 @@ export function LocalAiCatalog({
           )
         }
       >
-        Recommended models
+        {sectionLabel("sec-localai-models")}
       </SectionLabel>
       <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
         <NumbersGuide />
@@ -244,9 +79,9 @@ export function LocalAiCatalog({
               canPull={configured && isOllama}
               pullingTag={pulling}
               pullProg={pullProg}
-              onPull={(tag) => requestPull(rec, tag)}
+              onPull={(tag) => pull.requestPull(rec, tag, "models")}
               servedTags={servedTags}
-              onCancel={() => void cancelLocalPull().catch(() => {})}
+              onCancel={pull.cancel}
               busy={pulling !== null}
             />
           ))}
@@ -254,37 +89,6 @@ export function LocalAiCatalog({
       ) : (
         <p className="mt-3 text-xs text-ink4">No catalog models to show.</p>
       )}
-      <ConfirmDialog
-        open={termsFor !== null}
-        title={
-          termsFor ? `${termsFor.rec.display_name} is under the ${termsFor.rec.licence.name}` : ""
-        }
-        confirmLabel="Accept and download"
-        onConfirm={() => void acceptTermsAndPull()}
-        onClose={() => setTermsFor(null)}
-      >
-        {termsFor && (
-          <>
-            <p>{termsFor.rec.licence.summary}</p>
-            <p className="mt-2">
-              <a
-                href={termsFor.rec.licence.url}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="underline decoration-dotted underline-offset-2"
-              >
-                Read the full terms
-              </a>
-              .
-            </p>
-            <p className="mt-2 text-ink4">
-              PM doesn't download the weights — your own Ollama fetches them from the publisher, and
-              PM can't enforce these terms either way. Accepting here records that you've read them.
-              PM won't ask again for another model under the same licence.
-            </p>
-          </>
-        )}
-      </ConfirmDialog>
       <p className="mt-3 text-xs text-ink4">
         Local models don't appear in Settings → AI &amp; Models → Usage &amp; cost — that ledger
         tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no

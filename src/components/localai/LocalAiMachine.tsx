@@ -3,6 +3,7 @@
 
 import type { LocalRecommendations } from "../../lib/types";
 import { formatGib } from "../../lib/format";
+import { sectionLabel } from "./sections";
 import { Button, SectionInfo, SectionLabel } from "../ui";
 
 /**
@@ -37,7 +38,7 @@ export function LocalAiMachine({
           </Button>
         }
       >
-        Your machine
+        {sectionLabel("sec-localai-machine")}
       </SectionLabel>
       {loading ? (
         <p className="mt-2 text-xs text-ink4">Scanning your hardware…</p>

@@ -5,6 +5,7 @@ import { formatGib } from "../../lib/format";
 import type { LocalDiskSource, LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
 import { downloadedState, type DownloadedState } from "./downloadedState";
 import { ConfigRow, FitBadge } from "./fitDisplay";
+import { sectionLabel } from "./sections";
 import { Button, SectionInfo, SectionLabel } from "../ui";
 
 /**
@@ -53,7 +54,7 @@ export function LocalAiDownloaded({
           )
         }
       >
-        Already downloaded
+        {sectionLabel("sec-localai-downloaded")}
       </SectionLabel>
       {loading ? (
         <p className="mt-2 text-xs text-ink4">Looking for downloaded models…</p>

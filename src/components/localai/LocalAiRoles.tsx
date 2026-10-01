@@ -1,14 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
-
-import {
-  activeLocalTest,
-  setLocalLlmRoleModel,
-  setLocalLlmRouting,
-  testLocalLlm,
-} from "../../lib/ipc";
+import { setLocalLlmRoleModel, setLocalLlmRouting } from "../../lib/ipc";
 import type {
   LocalCoResidency,
   LocalLlmConfig,
@@ -17,16 +10,19 @@ import type {
   LocalTestResult,
 } from "../../lib/types";
 import { formatGib } from "../../lib/format";
+import { sectionLabel } from "./sections";
+import type { RoleTest, RoleTests } from "./useRoleTests";
 import { Button, SectionInfo, SectionLabel, Select } from "../ui";
 
 /**
  * "Assign roles" — which local model answers chat, which does the unattended work, and proof that
  * the pair actually works.
  *
- * It owns the test state, because a test result belongs to a row: it is about one role's model on
- * one server, and it stops being true the moment either changes. The tab remounts this section
- * when the endpoint moves (a `key` on the stored address), which is why nothing here has to
- * remember to invalidate itself from the outside.
+ * The proof — the test state — is the tab's (`useRoleTests`), handed down as `roleTests`. A test
+ * result belongs to a row: it is about one role's model on one server, and it stops being true the
+ * moment either changes. This section clears it when you change a row; the hook clears everything
+ * when the endpoint moves, which is why nothing here has to remember to invalidate itself from the
+ * outside.
  */
 export function LocalAiRoles({
   config,
@@ -36,6 +32,7 @@ export function LocalAiRoles({
   configured,
   coResidency,
   anyLocalRoleWithModel,
+  roleTests,
   onConfigPatch,
   onError,
 }: {
@@ -48,16 +45,13 @@ export function LocalAiRoles({
   /** The two-models-at-once arithmetic, or null when there is only one model in play. */
   coResidency: LocalCoResidency | null;
   anyLocalRoleWithModel: boolean;
+  /** Which test is running and the last outcome per role, from the tab's `useRoleTests`. */
+  roleTests: RoleTests;
   /** Write a role change back into the tab's copy of the config, optimistically. */
   onConfigPatch: (patch: Partial<LocalLlmConfig>) => void;
   onError: (message: string | null) => void;
 }) {
-  // Which role's test is in flight, and the last outcome per role. Shared across the two rows
-  // rather than held per row so a running test disables BOTH buttons: the backend refuses a second
-  // one anyway, and a button that can only produce "a test is already running" is not a button
-  // worth offering.
-  const [testing, setTesting] = useState<string | null>(null);
-  const [tests, setTests] = useState<Record<string, RoleTest>>({});
+  const { testing, tests, runTest, clearTest } = roleTests;
 
   function changeRoleModel(role: "chat" | "background", model: string) {
     onConfigPatch({ [`${role}_model`]: model || null });
@@ -73,71 +67,6 @@ export function LocalAiRoles({
     );
   }
 
-  /** Drop a test result the settings above it have just made untrue — the same rule the endpoint
-   *  Check follows when the URL or token changes. A pass shown against a model you have since
-   *  swapped is worse than no pass at all. */
-  function clearTest(role: "chat" | "background") {
-    setTests((t) => ({ ...t, [role]: { result: null, error: null } }));
-  }
-
-  /** Ask the role's model to actually answer something.
-   *
-   *  Everything the tab could check before this was metadata: the server answers, the weights are on
-   *  disk, the id is in the list. The setups that fail fail at the step none of that covers — an id
-   *  the server does not recognise, a chat template that returns an empty string, a model that
-   *  starts loading and never finishes. The backend does the careful part (report what was already
-   *  loaded, yield to chat, own nothing it did not load, record no health verdict) and OWNS the job,
-   *  so this promise resolving is a convenience rather than the only way the answer arrives. */
-  async function runTest(role: "chat" | "background") {
-    setTesting(role);
-    setTests((t) => ({ ...t, [role]: { result: null, error: null } }));
-    try {
-      const result = await testLocalLlm(role);
-      setTests((t) => ({ ...t, [role]: { result, error: null } }));
-    } catch (e) {
-      setTests((t) => ({ ...t, [role]: { result: null, error: String(e) } }));
-    } finally {
-      setTesting(null);
-    }
-  }
-
-  /** Adopt the backend's test job, on mount and while one is running.
-   *
-   *  The tab router unmounts this view on every switch and a test can legitimately take minutes, so
-   *  without this a user who looked at another tab came back to a re-armed button, no sign anything
-   *  was happening, and a backend still refusing a second test — with the answer they were waiting
-   *  for already thrown away. The snapshot is the source of truth, exactly as it is for the pull. */
-  useEffect(() => {
-    let cancelled = false;
-    const adopt = () => {
-      void activeLocalTest()
-        .then((snap) => {
-          if (cancelled || !snap) return;
-          setTesting(snap.running ? snap.role : null);
-          if (snap.result) {
-            setTests((t) => ({
-              ...t,
-              [snap.role]: { result: snap.result, error: null },
-            }));
-          }
-        })
-        .catch(() => {
-          /* a failed read leaves the view as it is; the next tick corrects it */
-        });
-    };
-    adopt();
-    // Only while something is running — a finished test needs no cadence at all.
-    if (testing === null)
-      return () => {
-        cancelled = true;
-      };
-    const id = setInterval(adopt, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [testing]);
-
   return (
     <div
       id="sec-localai-roles"
@@ -145,7 +74,7 @@ export function LocalAiRoles({
       data-help="settings-localai-roles"
       className="mt-5 border-t border-border pt-4"
     >
-      <SectionLabel>Assign roles</SectionLabel>
+      <SectionLabel>{sectionLabel("sec-localai-roles")}</SectionLabel>
       {!configured ? (
         <p className="mt-2 text-xs text-ink4">
           Connect an endpoint above to route PM's chat or background work to a local model.
@@ -308,9 +237,6 @@ const ROUTING_OPTIONS = [
   { value: "local", label: "Local only" },
   { value: "local-then-cloud", label: "Local, fall back to cloud" },
 ];
-
-/** One role's last test: a result the backend returned, or a refusal it raised before running. */
-type RoleTest = { result: LocalTestResult | null; error: string | null };
 
 function RoleRow({
   label,

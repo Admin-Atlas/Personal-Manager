@@ -2170,6 +2170,8 @@ export interface PullSnapshot {
   total_bytes: number | null;
   running: boolean;
   error: string | null;
+  /** When the backend began this pull (epoch ms), so an elapsed time survives the view remounting. */
+  started_at_ms: number;
 }
 
 /** Two documents PM believes are the same thing, and why; mirrors `duplicates::DuplicatePair`.

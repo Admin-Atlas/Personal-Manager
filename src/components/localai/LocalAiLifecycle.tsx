@@ -1,18 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
-
 import { formatGib } from "../../lib/format";
-import {
-  getLocalReleasePolicy,
-  localGpuResidency,
-  releaseLocalGpu,
-  setLocalReleasePolicy,
-} from "../../lib/ipc";
-import type { LocalGpuResidency, PowerView } from "../../lib/types";
+import type { PowerView } from "../../lib/types";
 import { Button, SectionInfo, SectionLabel, Select, SettingRow } from "../ui";
 import { TrayIconRow } from "../settings/TrayIconRow";
+import { useReleaseSettings, type ReleaseSettings } from "./useReleaseSettings";
 
 /** The quiet periods offered, shared by "Quiet period" and the on-battery release. */
 const QUIET_MINUTES = [1, 2, 5, 10, 15, 30, 60];
@@ -64,97 +57,35 @@ const POLICIES: ReadonlyArray<{ value: string; label: string; when: string }> = 
 export function LocalAiLifecycle({
   configured,
   power,
+  release: shared,
 }: {
   configured: boolean;
   /** The On battery readout from the status, or null while it isn't known — which counts as "not
    *  known to be a desktop", so the battery row stays usable. */
   power: PowerView | null;
+  /** The tab's release settings (`useReleaseSettings`), so this section and any other that shows
+   *  them agree. Without one — a standalone render — the section reads its own. */
+  release?: ReleaseSettings;
 }) {
-  // null until the stored policy is read, like the battery row below: a picker showing "Leave it to
-  // my server" before PM has looked would present a default as the user's choice, and would go on
-  // presenting it if the read failed.
-  const [policy, setPolicy] = useState<string | null>(null);
-  const [idleMinutes, setIdleMinutes] = useState(5);
-  // null until the stored value is read, and left null if the read fails: the row is disabled then,
-  // rather than presenting "off" as though PM had said so.
-  const [batteryIdle, setBatteryIdle] = useState<number | null>(null);
-  // "restored": the write failed and the pickers show what is really stored. "unknown": the write
-  // failed and so did reading it back, so the pickers show nothing.
-  const [saveError, setSaveError] = useState<"restored" | "unknown" | null>(null);
-  const [residency, setResidency] = useState<LocalGpuResidency | null>(null);
-  const [releasing, setReleasing] = useState(false);
-  const [freed, setFreed] = useState<number | null>(null);
-
-  const refresh = useCallback(() => {
-    void localGpuResidency()
-      .then(setResidency)
-      .catch(() => setResidency(null));
-  }, []);
-
-  // `afterFailedSave`: this read is checking what a failed write left behind. If it fails too, PM
-  // knows neither what it tried to store nor what is stored, so both pickers go back to unknown —
-  // leaving the unsaved choice on screen beside "this shows what PM has stored" would be a lie.
-  const readStored = useCallback((afterFailedSave = false) => {
-    void getLocalReleasePolicy()
-      .then((s) => {
-        setPolicy(s.policy);
-        setIdleMinutes(s.idle_minutes);
-        setBatteryIdle(s.battery_idle_minutes ?? null);
-        if (afterFailedSave) setSaveError("restored");
-      })
-      .catch(() => {
-        if (afterFailedSave) {
-          setPolicy(null);
-          setBatteryIdle(null);
-          setSaveError("unknown");
-        }
-        /* otherwise the pickers simply stay unknown and disabled */
-      });
-  }, []);
-
-  useEffect(() => {
-    readStored();
-    refresh();
-  }, [readStored, refresh]);
-
-  /** A write failed: show what PM really has stored, and say so. This used to be swallowed, which
-   *  left the picker showing a choice that was never saved — the setting would quietly not apply. */
-  function restore() {
-    readStored(true);
-  }
-
-  function change(nextPolicy: string, nextMinutes: number) {
-    setPolicy(nextPolicy);
-    setIdleMinutes(nextMinutes);
-    setFreed(null);
-    void setLocalReleasePolicy(nextPolicy, nextMinutes).then(() => setSaveError(null), restore);
-  }
-
-  function changeBatteryIdle(nextMinutes: number) {
-    setBatteryIdle(nextMinutes);
-    void setLocalReleasePolicy(null, undefined, nextMinutes).then(
-      () => setSaveError(null),
-      restore,
-    );
-  }
+  // Always called, because a hook can't be conditional; inert whenever the tab handed one down.
+  const own = useReleaseSettings({ status: null, enabled: !shared });
+  const {
+    policy,
+    idleMinutes,
+    batteryIdle,
+    saveError,
+    residency,
+    releasing,
+    freed,
+    change,
+    changeBatteryIdle,
+    release,
+  } = shared ?? own;
 
   // A machine PM found no battery on. Only a positive reading counts: no power readout yet is not
   // evidence of a desktop.
   const desktop = power != null && !power.has_battery && power.source === "ac";
   const batteryOff = batteryIdle === null || !!residency?.no_unload_route || desktop;
-
-  async function release() {
-    setReleasing(true);
-    setFreed(null);
-    try {
-      setFreed(await releaseLocalGpu());
-    } catch {
-      setFreed(null);
-    } finally {
-      setReleasing(false);
-      refresh();
-    }
-  }
 
   const chosen = policy == null ? null : (POLICIES.find((p) => p.value === policy) ?? POLICIES[0]);
   const resident = residency?.resident ?? null;
@@ -317,7 +248,7 @@ export function LocalAiLifecycle({
             )}
             {saveError && (
               <p className="text-xs text-st-due">
-                {saveError === "restored"
+                {saveError.kind === "restored"
                   ? "Couldn't save that. This shows what PM has stored."
                   : "Couldn't save that, and PM couldn't read back what is stored."}
               </p>
