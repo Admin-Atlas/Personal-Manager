@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.136.1-alpha"
+version = "3.136.2-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -70,7 +70,7 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 # Encrypted backup (Proton Drive / user cloud): the portable `.pmbackup` archive is
 # zstd-compressed at level 19 (cold storage — ratio over speed) before the passphrase
 # encryption layer. Streaming Encoder/Decoder keeps peak memory flat over a large DB.
-zstd = "0.13"
+zstd = "0.14"
 
 # Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
 # all in one bundled, vendored connection — no system SQLite needed.
@@ -92,7 +92,7 @@ base64 = "0.23"
 # pulled in beside sha2 0.11. XChaCha20-Poly1305 encrypts the Markdown at rest (its
 # 192-bit nonce is safe to pick at random under the many small metadata rewrites).
 # uuid mints the stable per-vault id that keys the per-profile keychain cache.
-argon2 = "0.5"
+argon2 = "0.6"
 blake3 = "1"
 # `stream` enables the aead::stream STREAM construction (EncryptorBE32/DecryptorBE32),
 # used by the encrypted-backup archive to seal the compressed payload in 1 MiB chunks

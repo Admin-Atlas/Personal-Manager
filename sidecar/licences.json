@@ -852,9 +852,9 @@
       }
     },
     "urllib3": {
-      "versions": ["2.7.0"],
+      "versions": ["2.8.0"],
       "licence": "MIT",
-      "stamp": "6b4e9799f17fadb64edb59cd7e755f50",
+      "stamp": "9c610dc5880dcd7a5ffb9056b7ad83e5",
       "evidence": {
         "expression": "MIT",
         "license": null,

@@ -251,21 +251,32 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: ./src-tauri/Cargo.toml
+      # Every step below runs even when an earlier audit has already failed (`!cancelled()`), so the
+      # job reports all three ecosystems at once. With the default (stop at the first failure), a
+      # RustSec advisory against rustls failed cargo-deny on 2026-09-19 and silently skipped pip-audit
+      # and npm audit for every PR after it — an urllib3 advisory in the shipped sidecar sat unseen
+      # behind it. The job still fails if any one of them does.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: ${{ !cancelled() }}
         with:
           python-version: "3.12"
       - name: Install pip-audit
+        if: ${{ !cancelled() }}
         run: pip install pip-audit==2.10.1
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        if: ${{ !cancelled() }}
       - name: Python — pip-audit (sidecar deps)
+        if: ${{ !cancelled() }}
         run: just pip-audit
       - name: JS — npm audit
+        if: ${{ !cancelled() }}
         run: just npm-audit
 
       # The Rust half of the same trap. cargo-about renders about.hbs at RELEASE time only, so a
       # broken template or a crate whose licence about.toml does not accept would have failed the
       # publish job after the binaries were already built. Same checksummed install as release.yml.
       - name: Install cargo-about
+        if: ${{ !cancelled() }}
         env:
           CARGO_ABOUT_VERSION: "0.9.0"
           CARGO_ABOUT_SHA256: "7a1a1bfb3ae3b6feabe9e1d6147a6b34b85bd0339bfd8b0ec11b312dee10d99a"
@@ -278,6 +289,7 @@ jobs:
           echo "$CARGO_ABOUT_SHA256  $RUNNER_TEMP/$asset.tar.gz" | sha256sum --check --strict
           tar -xz -C /usr/local/bin --strip-components=1 -f "$RUNNER_TEMP/$asset.tar.gz" "$asset/cargo-about"
       - name: Third-party NOTICE (Rust half) generates
+        if: ${{ !cancelled() }}
         run: cd src-tauri && cargo about generate about.hbs -o /dev/null
 
   # --- workflow security: zizmor over .github/workflows -------------------

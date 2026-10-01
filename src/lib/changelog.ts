@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.136.2-alpha",
+    date: "2026-10-01",
+    highlights: [
+      "Under-the-hood tidying: a month’s worth of library updates, all in one go. The framework PM runs on picked up a security fix for how its windows talk to the app underneath, and its pieces for picking files and keeping PM to a single window moved up with it. So did the code that turns your passphrase into the key for your library, the compression inside your backups, the code PM makes secure connections with (another security fix), the helper that downloads the on-device search model, and a handful of tools that only ever run while PM is being built or tested. Before the passphrase and backup libraries went in, PM checked that they produce exactly the same bytes as the ones they replace, so every library and every backup you already have opens just as it did — and a new check now stands guard over that for every future update. Nothing about how you use PM changes.",
+    ],
+  },
+  {
     version: "3.136.1-alpha",
     date: "2026-08-30",
     highlights: [

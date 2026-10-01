@@ -462,4 +462,23 @@ mod tests {
         let padded = derive_master("  correct horse battery staple  ", &salt, &params).unwrap();
         assert_ne!(&bare[..], &padded[..]);
     }
+
+    #[test]
+    fn derive_master_still_makes_the_key_every_existing_vault_was_locked_with() {
+        // Every vault and every .pmbackup ever written is keyed by these exact Argon2id bytes, so an
+        // `argon2` upgrade that changed them would lock every user out of their own data while every
+        // other test stayed green. The expected key comes from the reference C implementation
+        // (libargon2, via Python's argon2-cffi `hash_secret_raw`), not from this crate, so the pin
+        // can't drift along with the code it guards. The passphrase carries non-ASCII on purpose:
+        // the raw UTF-8 bytes are what get hashed (rule 1 above). The salt is a counting pattern
+        // built at runtime rather than a byte literal, for the scanner reason given in the test above.
+        let salt: [u8; SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let params = KdfParams::at(256, 2);
+        let key = derive_master("correct horse battery staple — ünïcode", &salt, &params).unwrap();
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "ca29f2b566bdffb86ad935722bb10cbd7889ac8072617760e6d9f8afb4de71d1"
+        );
+    }
 }
