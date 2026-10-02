@@ -691,6 +691,8 @@ pub fn reset_local_ai_settings(app: AppHandle) -> Result<()> {
     local.clear_disk_models();
     // A passing test proved a model answered on the server just forgotten.
     local.clear_finished_test();
+    // What PM learned about switching thinking off came from the server it is now disconnected from.
+    openai_compat::forget_thinking();
     // The sidebar's provider line and the status chip should drop the forgotten server at once.
     llm_gateway::ping_status(&app);
     Ok(())
