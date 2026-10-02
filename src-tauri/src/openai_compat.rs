@@ -7,7 +7,11 @@
 //! stays in [`crate::openrouter`]. The request body here is deliberately **minimal** — plain
 //! `model` + `messages` + `stream` — carrying NONE of OpenRouter's body fields (no `provider`
 //! ZDR pin, no `cache_control`, no `models` fallback array), because a local server understands
-//! none of them and rejecting or ignoring them varies by server.
+//! none of them and rejecting or ignoring them varies by server. The one addition is Ollama's own
+//! `reasoning_effort: "none"`, sent only to a server that has said it is an Ollama recent enough to
+//! take it (see [`Thinking`]), because a model that thinks before it answers otherwise spends most of every call
+//! PM makes on thinking nobody reads. The chat Thinking button is the one exception: it leaves the
+//! field out so the user can watch the thinking, and only [`stream_chat`] can carry it.
 //!
 //! Design: everything that can be wrong *without a socket* — SSE framing, failure classification,
 //! the degenerate-stream guard, URL normalisation, the `/v1/models` shape check, the request
@@ -169,6 +173,10 @@ pub enum LocalFailKind {
     /// problem. Never a strike: the host is healthy, and ejecting it would rest a working server for
     /// a prompt PM chose to build.
     PromptTooLarge,
+    /// The model thought and never answered. The thinking ran past its time, size or loop bound, or
+    /// the stream ended with thinking and no answer. The host answered and was generating, so this is
+    /// never a strike.
+    UnfinishedThought,
 }
 
 /// A local failure with its human-readable detail (server body, or a short description). The
@@ -249,6 +257,9 @@ fn classify_send_error(e: &reqwest::Error) -> LocalFailKind {
 pub enum SseEvent {
     /// A content delta (or, for a buffered pseudo-stream, the whole message content).
     Token(String),
+    /// A thinking delta. Never a `Token`: it is never part of the answer, and only a stream that
+    /// asked to show it forwards it at all.
+    Reasoning(String),
     /// The model that actually served this response (first one seen wins).
     Model(String),
     /// A `finish_reason` — `"stop"`, `"length"`, etc. `"length"` means the token ceiling was hit.
@@ -314,11 +325,36 @@ impl SseAssembler {
             if usage.prompt_tokens.is_some() || usage.completion_tokens.is_some() {
                 events.push(SseEvent::Usage(usage));
             }
+            // Thinking, before the content in the same frame — the order the model produced them.
+            // Ollama (and LM Studio for gpt-oss) stream it as `delta.reasoning`, llama-server (and LM
+            // Studio's split setting) as `delta.reasoning_content`, and a buffered server puts either
+            // under `message`. The FIRST non-empty one is the thinking, and two are never joined, so
+            // a thought sent under both names is never shown twice. An empty one is not thinking,
+            // the same rule as the content filter below.
+            let choice = &value["choices"][0];
+            let reasoning = [
+                &choice["delta"]["reasoning"],
+                &choice["delta"]["reasoning_content"],
+                &choice["message"]["reasoning"],
+                &choice["message"]["reasoning_content"],
+            ]
+            .into_iter()
+            .find_map(|v| v.as_str().filter(|r| !r.is_empty()));
+            if let Some(r) = reasoning {
+                events.push(SseEvent::Reasoning(r.to_string()));
+            }
             // Streaming servers put the delta under `delta.content`; a couple of "OpenAI-compatible"
             // servers stream a single buffered message under `message.content` — tolerate both.
-            if let Some(tok) = value["choices"][0]["delta"]["content"].as_str() {
-                events.push(SseEvent::Token(tok.to_string()));
-            } else if let Some(tok) = value["choices"][0]["message"]["content"].as_str() {
+            //
+            // An EMPTY content is not a token. Ollama sends `"content": ""` on every chunk a
+            // thinking model spends thinking (beside `reasoning`, read above as thinking), and on
+            // its first chunk. Passed on, fifty of those in a row read as a one-token loop and the
+            // guard killed the reply mid-thought; they also counted as the first token, which
+            // switched off the fallback to the cloud for a reply that had not started.
+            let tok = value["choices"][0]["delta"]["content"]
+                .as_str()
+                .or_else(|| value["choices"][0]["message"]["content"].as_str());
+            if let Some(tok) = tok.filter(|t| !t.is_empty()) {
                 events.push(SseEvent::Token(tok.to_string()));
             }
         }
@@ -435,6 +471,105 @@ fn tail_is_looping(tail: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Thinking — what a stream hands its caller, and the bounds on thinking that is shown. All pure.
+// ---------------------------------------------------------------------------------------------
+
+/// What a local chat stream hands its caller: a piece of the answer, or a piece of the thinking that
+/// came before it. Thinking arrives only from a stream that asked to show it.
+#[derive(Clone, Copy)]
+pub enum StreamDelta<'a> {
+    Answer(&'a str),
+    Thinking(&'a str),
+}
+
+/// Untrusted output (rule #6): the most shown thinking PM will forward before stopping the call.
+/// About 64k tokens; the measured gemma 4 thought is 1,353-1,580 tokens, so this is a memory and
+/// webview bound, and the time limit binds first in practice.
+const MAX_THOUGHT_BYTES: usize = 256 * 1024;
+
+/// Why shown thinking was stopped, or why a thinking reply has no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThoughtStop {
+    /// Thinking ran past [`tunables::THINKING_TIME_LIMIT`] without the answer starting.
+    TooLong,
+    /// Thinking ran past [`MAX_THOUGHT_BYTES`].
+    TooLarge,
+    /// Thinking's own loop guard tripped.
+    Looping,
+    /// The stream ended cleanly with thinking and no answer.
+    NoAnswer,
+    /// The stream hit the token ceiling (`finish_reason: "length"`) with thinking and no answer.
+    OutOfRoom,
+}
+
+impl ThoughtStop {
+    /// The failure detail: the reason, then one hint. `button_helps` = the user turned the chat
+    /// Thinking button on AND PM can switch thinking off for this model on this server
+    /// ([`Thinking::Switchable`]), so the way out is turning the button off again. Anywhere else the
+    /// server is thinking on its own — on LM Studio, llama-server, an older Ollama or a model that
+    /// refused the switch the button only shows or hides it, and turning it off would only hide the
+    /// same thought from every bound PM puts on shown thinking — so the way out is on the server.
+    pub fn detail(self, button_helps: bool) -> String {
+        let reason = match self {
+            ThoughtStop::TooLong => format!(
+                "it thought for {} minutes without starting its answer, so PM stopped it",
+                tunables::THINKING_TIME_LIMIT.as_secs() / 60
+            ),
+            ThoughtStop::TooLarge => "its thinking ran past PM's size limit".to_string(),
+            ThoughtStop::Looping => "its thinking got stuck repeating itself".to_string(),
+            ThoughtStop::NoAnswer => "it finished thinking without writing an answer".to_string(),
+            ThoughtStop::OutOfRoom => "it ran out of room while it was still thinking".to_string(),
+        };
+        let hint = if button_helps {
+            "turn off Thinking for a straight answer"
+        } else {
+            "your model server lets this model think; set it to skip thinking, or give the model a \
+             longer context"
+        };
+        format!("{reason} — {hint}")
+    }
+}
+
+/// Bounds on SHOWN thinking. Pure: `now` is a parameter, so the time limit tests need no sleep.
+///
+/// It keeps its own [`LoopGuard`], so the answer's guard still sees exactly the answer and nothing
+/// a thought left in its tail. A stream with no total deadline and no Stop button needs all three
+/// bounds: without them a model that keeps thinking holds the foreground slot until the server gives
+/// up. Hidden thinking never reaches this — it is liveness only.
+#[derive(Default)]
+pub(crate) struct ThoughtBudget {
+    bytes: usize,
+    started: Option<Instant>,
+    guard: LoopGuard,
+}
+
+impl ThoughtBudget {
+    /// Count one thinking chunk. `Some(stop)` once a bound is crossed.
+    /// The size check runs first, then time (from the first chunk), then the loop guard.
+    pub(crate) fn observe(&mut self, chunk: &str, now: Instant) -> Option<ThoughtStop> {
+        self.bytes += chunk.len();
+        if self.bytes > MAX_THOUGHT_BYTES {
+            return Some(ThoughtStop::TooLarge);
+        }
+        let started = *self.started.get_or_insert(now);
+        if now.saturating_duration_since(started) > tunables::THINKING_TIME_LIMIT {
+            return Some(ThoughtStop::TooLong);
+        }
+        self.guard.observe(chunk).then_some(ThoughtStop::Looping)
+    }
+}
+
+/// The silence allowed before the next chunk: the long first-token wait until the model is
+/// producing ANYTHING (thinking or answer), then the inter-token window.
+fn chunk_deadline(generating: bool) -> Duration {
+    if generating {
+        tunables::INTER_TOKEN_TIMEOUT
+    } else {
+        tunables::TIME_TO_FIRST_TOKEN_TIMEOUT
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // URL normalisation, /v1/models shape check, request body — all pure.
 // ---------------------------------------------------------------------------------------------
 
@@ -502,7 +637,15 @@ pub fn models_from_list(value: &serde_json::Value) -> Vec<String> {
 
 /// Build the minimal OpenAI-compatible chat body. Deliberately carries no cloud-only fields — this
 /// is the whole point of the separate local arm. Pure, so a test can prove the body stays clean.
-pub fn chat_body(model: &str, messages: &[ChatMessage], stream: bool) -> serde_json::Value {
+///
+/// `thinking_off` adds [`THINKING_OFF`] as `reasoning_effort`, and the caller sets it only for an
+/// endpoint [`Thinking::Switchable`] says takes it.
+pub fn chat_body(
+    model: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+    thinking_off: bool,
+) -> serde_json::Value {
     let msgs: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
@@ -516,7 +659,230 @@ pub fn chat_body(model: &str, messages: &[ChatMessage], stream: bool) -> serde_j
         // Ask for a final usage chunk so the context meter has real numbers when the server obliges.
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
+    if thinking_off {
+        body["reasoning_effort"] = serde_json::json!(THINKING_OFF);
+    }
     body
+}
+
+// --- switching thinking off -------------------------------------------------------------------------
+
+/// The one `reasoning_effort` PM sends, and only to an Ollama of [`THINKING_OFF_SINCE`] or later.
+///
+/// A model that thinks before it answers does it on every call unless told not to, and PM reads only
+/// the answer. Measured on Ollama 0.33.0 with gemma 4 12b Q3_K_M (an RTX 5060 Laptop GPU), filing one
+/// invoice title into one of four projects: **1353–1580 completion tokens and 48–61 s** with nothing
+/// sent, against **20 tokens and 0.9 s** with `"none"` — the same answer either way. At that cost a
+/// long background job runs into `BACKGROUND_TOTAL_TIMEOUT`, and three of those cool the endpoint
+/// down for chat too. Ollama thinks for that model even though its `/api/show` lists no "thinking"
+/// capability, so PM cannot ask the model first; it asks the server instead.
+///
+/// `"none"` is the only safe value, measured on the same server: Qwen2.5 7B and gemma 3 4b, which
+/// never think, answer normally with it; `"low"` is refused with a 400 "does not support thinking"
+/// for Qwen2.5 and for gemma 4 itself. Ollama ignores `chat_template_kwargs` and a top-level
+/// `think: false` on `/v1` (gemma 4 still thought for 655-789 tokens), so neither is an alternative.
+///
+/// Chat leaves it out when the user has turned on the chat Thinking button (`show_thinking`). That
+/// is the request PM sent before #852, so no server can refuse it. Background work never can.
+pub const THINKING_OFF: &str = "none";
+
+/// The first Ollama that takes [`THINKING_OFF`] from every model. Read from Ollama's source by tag:
+/// 0.11.5-0.12.3 pass `"none"` through as a think level and refuse it with a 400 ("invalid think
+/// value"), 0.11.4 and earlier have no such field, and 0.12.4 maps it to `think: false` but then
+/// demands the thinking capability for it, so a model that never thinks is refused there. 0.12.5 is
+/// the first that only asks for the capability when thinking is turned ON.
+pub const THINKING_OFF_SINCE: (u64, u64, u64) = (0, 12, 5);
+
+/// Whether an endpoint takes [`THINKING_OFF`]. Learned once per endpoint, from `/api/version`, and
+/// remembered in [`THINKING`] until the endpoint or its token is saved again ([`forget_thinking`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    /// An Ollama of [`THINKING_OFF_SINCE`] or later: PM switches thinking off.
+    Switchable,
+    /// Anything else: the body goes exactly as it did before.
+    ///
+    /// For llama-server, LM Studio and the rest this is the old behaviour, not a fix. Each has its
+    /// own switch (llama-server, for one, takes `chat_template_kwargs` for a template that reads
+    /// `enable_thinking`, or `--reasoning-budget 0` at launch), none of them has been measured here,
+    /// and a field sent to a server that has not said what it is risks a strict one refusing every
+    /// call PM makes. There, the chat Thinking button only shows or hides what the server already
+    /// does.
+    Leave,
+}
+
+/// What PM has learned per endpoint, and which models on it refused the switch anyway. Only a
+/// definite answer is recorded (see [`thinking_from_version`]), so an endpoint that could not answer
+/// is asked again on the next call.
+#[derive(Default)]
+struct KnownThinking {
+    endpoints: std::collections::HashMap<String, Thinking>,
+    refused: std::collections::HashSet<(String, String)>,
+}
+
+static THINKING: std::sync::LazyLock<std::sync::Mutex<KnownThinking>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Forget everything learned about switching thinking off. Called whenever the endpoint or its token
+/// is saved: a new address may be a different server, and a new token can turn a 401 into an answer.
+pub fn forget_thinking() {
+    if let Ok(mut known) = THINKING.lock() {
+        *known = KnownThinking::default();
+    }
+}
+
+/// An Ollama version string as `(major, minor, patch)`: `0.33.0`, or `0.12.5-rc1` with its
+/// pre-release tag dropped. `None` for anything else, including a development build's `0.0.0`
+/// stand-in, which says nothing about what the server takes.
+pub fn ollama_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let mut next = || parts.next()?.parse::<u64>().ok();
+    let version = (next()?, next()?, next()?);
+    (version != (0, 0, 0)).then_some(version)
+}
+
+/// What one `/api/version` answer says, or `None` when it says nothing either way.
+///
+/// - A 404 or 405 is a server without the route: llama-server, vLLM. Recorded as [`Thinking::Leave`].
+/// - A 2xx whose JSON carries a version of [`THINKING_OFF_SINCE`] or later is an Ollama that takes
+///   the switch. Any other 2xx JSON is a server that answered and is not one: LM Studio is reported
+///   (not measured here) to answer a route it doesn't have with a 200 and an `error` object, and
+///   LocalAI, KoboldCpp and llama-swap answer this route with versions or shapes that are not a
+///   recent Ollama's. Both recorded as `Leave`.
+/// - Anything else (401, 403, 407, 408, 429, a 5xx, or a 2xx whose body is not JSON) is a proxy or a
+///   server that could not answer right now, and is not recorded.
+pub fn thinking_from_version(status: u16, body: Option<&serde_json::Value>) -> Option<Thinking> {
+    match status {
+        404 | 405 => Some(Thinking::Leave),
+        200..=299 => {
+            let body = body?;
+            let recent = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .and_then(ollama_version)
+                .is_some_and(|v| v >= THINKING_OFF_SINCE);
+            Some(if recent {
+                Thinking::Switchable
+            } else {
+                Thinking::Leave
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether to switch thinking off for this model on this endpoint, asking the endpoint the first
+/// time.
+async fn thinking_for(base_url: &str, model: &str, token: Option<&str>) -> Thinking {
+    let key = (base_url.to_string(), model.to_string());
+    if let Some(known) = THINKING.lock().ok().and_then(|k| {
+        if k.refused.contains(&key) {
+            return Some(Thinking::Leave);
+        }
+        k.endpoints.get(base_url).copied()
+    }) {
+        return known;
+    }
+    let url = format!("{base_url}/api/version");
+    let mut req = client_for(base_url)
+        .get(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    // Unreachable or timed out: nothing learned, and the call that follows will most likely fail
+    // the same way. Leave, for this call only.
+    let Ok(response) = req.send().await else {
+        return Thinking::Leave;
+    };
+    let status = response.status().as_u16();
+    let body = if response.status().is_success() {
+        response.json::<serde_json::Value>().await.ok()
+    } else {
+        None
+    };
+    let Some(thinking) = thinking_from_version(status, body.as_ref()) else {
+        return Thinking::Leave;
+    };
+    if let Ok(mut known) = THINKING.lock() {
+        known.endpoints.insert(base_url.to_string(), thinking);
+    }
+    thinking
+}
+
+/// Whether PM can switch thinking off for this model on this endpoint — asked by the gateway when a
+/// chat that wants to think has no room to, so it can send the turn with thinking off instead.
+pub(crate) async fn takes_thinking_off(base_url: &str, model: &str, token: Option<&str>) -> bool {
+    thinking_for(base_url, model, token).await == Thinking::Switchable
+}
+
+/// Whether a refusal is one the thinking switch could have caused, so PM resends without it.
+fn may_refuse_the_switch(status: u16) -> bool {
+    status == 400 || status == 422
+}
+
+/// POST one chat request and return the response once the server has accepted it.
+///
+/// Switches thinking off where [`thinking_for`] says the server takes it. If the server refuses the
+/// request with a 400 or 422, PM resends it once without the switch, and only when THAT succeeds —
+/// proof it was the switch the server objected to — does it stop sending the switch for this model
+/// on this endpoint. A refusal that has nothing to do with the switch fails the same way twice and
+/// is reported as it always was, with nothing remembered.
+///
+/// `want_thinking` is the chat Thinking button, and only [`stream_chat`] can pass `true`.
+async fn post_chat(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    messages: &[ChatMessage],
+    stream: bool,
+    deadline: Option<Duration>,
+    want_thinking: bool,
+) -> LocalResult<reqwest::Response> {
+    // Thinking asked for: send the body PM sent before #852 — no field, no probe. Short-circuited so
+    // the on path never touches THINKING (it can't resend, so it can't record a refusal either).
+    let mut thinking_off =
+        !want_thinking && thinking_for(base_url, model, token).await == Thinking::Switchable;
+    let mut resent = false;
+    let url = format!("{base_url}/v1/chat/completions");
+    loop {
+        let body = chat_body(model, messages, stream, thinking_off);
+        let mut req = client_for(base_url).post(&url);
+        if stream {
+            req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        }
+        if let Some(d) = deadline {
+            req = req.timeout(d);
+        }
+        let mut req = req.json(&body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send().await.map_err(|e| {
+            LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e))
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            if resent {
+                if let Ok(mut known) = THINKING.lock() {
+                    known
+                        .refused
+                        .insert((base_url.to_string(), model.to_string()));
+                }
+            }
+            return Ok(response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        if thinking_off && may_refuse_the_switch(status.as_u16()) {
+            thinking_off = false;
+            resent = true;
+            continue;
+        }
+        return Err(LocalFailure::new(
+            classify_http(status.as_u16(), &body),
+            crate::error::truncate_detail(&body),
+        ));
+    }
 }
 
 // --- releasing the GPU (#786 item 8) ------------------------------------------------------------
@@ -1030,39 +1396,27 @@ where
     ))
 }
 
-/// Stream a chat completion from a local endpoint. `on_token` is called with each content delta.
-/// Classifies every failure structurally (`LocalFailKind`) and aborts an obvious token loop.
+/// Stream a chat completion from a local endpoint. `on_delta` gets each answer delta, plus each
+/// thinking delta only when `show_thinking`; thinking is never part of `Completion.text`. Classifies
+/// every failure structurally (`LocalFailKind`), aborts an obvious token loop, and bounds thinking
+/// that is shown ([`ThoughtBudget`]).
+///
+/// `show_thinking` is the chat Thinking button, and this is the one path that can carry it: on, the
+/// request goes without `reasoning_effort` (the body PM sent before #852); off, it is the #852
+/// request. In both modes a reply that thinks and never answers is
+/// [`LocalFailKind::UnfinishedThought`], never a blank turn.
 pub async fn stream_chat<F>(
     base_url: &str,
     model: &str,
     token: Option<&str>,
     messages: &[ChatMessage],
-    mut on_token: F,
+    show_thinking: bool,
+    mut on_delta: F,
 ) -> LocalResult<Completion>
 where
-    F: FnMut(&str),
+    F: FnMut(StreamDelta<'_>),
 {
-    let body = chat_body(model, messages, true);
-    let url = format!("{base_url}/v1/chat/completions");
-    let mut req = client_for(base_url)
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .json(&body);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LocalFailure::new(
-            classify_http(status.as_u16(), &body),
-            crate::error::truncate_detail(&body),
-        ));
-    }
+    let response = post_chat(base_url, model, token, messages, true, None, show_thinking).await?;
 
     let mut full = String::new();
     let mut served: Option<String> = None;
@@ -1073,23 +1427,24 @@ where
     let mut assembler = SseAssembler::default();
     let mut guard = LoopGuard::default();
     let mut stream = response.bytes_stream();
-    let mut got_first_token = false;
+    // The model is producing something — an answer token OR thinking. A thinking model is generating
+    // from its first thought, so a stall after it is a stall between tokens, not a cold load.
+    let mut generating = false;
+    let mut saw_reasoning = false;
+    let mut budget = ThoughtBudget::default();
 
-    loop {
-        // Two-phase timeout: a generous deadline for the FIRST token — absorbing a silent cold model
-        // load (Ollama / LM Studio JIT-load and stream nothing until the first token) — then a short
-        // inter-token deadline once streaming has started. Any received bytes, including an SSE
-        // keepalive ping, arrive as a chunk and reset the timer; the inter-token window is set above
-        // llama-server's 30 s ping cadence so a ping always resets it before it can fire.
-        let deadline = if got_first_token {
-            tunables::INTER_TOKEN_TIMEOUT
-        } else {
-            tunables::TIME_TO_FIRST_TOKEN_TIMEOUT
-        };
+    'read: loop {
+        // Two-phase timeout: a generous deadline until the model produces ANYTHING — absorbing a
+        // silent cold model load (Ollama / LM Studio JIT-load and stream nothing until the first
+        // token) — then a short inter-token deadline once it is generating. Any received bytes,
+        // including an SSE keepalive ping, arrive as a chunk and reset the timer; the inter-token
+        // window is set above llama-server's 30 s ping cadence so a ping always resets it before it
+        // can fire.
+        let deadline = chunk_deadline(generating);
         let next = match tokio::time::timeout(deadline, stream.next()).await {
             Ok(next) => next,
             Err(_elapsed) => {
-                let detail = if got_first_token {
+                let detail = if generating {
                     "the model stream stalled between tokens"
                 } else {
                     "the model produced no first token before the deadline"
@@ -1103,8 +1458,25 @@ where
         let bytes = chunk.map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
         for event in assembler.feed(&bytes) {
             match event {
+                SseEvent::Reasoning(r) => {
+                    generating = true;
+                    saw_reasoning = true;
+                    // Hidden thinking is liveness only: no guard, no cap, nothing forwarded,
+                    // nothing kept.
+                    if !show_thinking {
+                        continue;
+                    }
+                    if let Some(stop) = budget.observe(&r, Instant::now()) {
+                        // Hang up first, so the server stops thinking while PM words the way out.
+                        drop(stream);
+                        return Err(unfinished_thought(stop, true, base_url, model, token).await);
+                    }
+                    // Never pushed to `full`: the thinking is not the answer, so it can never be
+                    // stored, indexed or replayed as one.
+                    on_delta(StreamDelta::Thinking(&r));
+                }
                 SseEvent::Token(tok) => {
-                    got_first_token = true;
+                    generating = true;
                     full.push_str(&tok);
                     if full.len() > MAX_REPLY_BYTES {
                         return Err(LocalFailure::new(
@@ -1118,7 +1490,7 @@ where
                             "the model stream fell into an obvious token loop",
                         ));
                     }
-                    on_token(&tok);
+                    on_delta(StreamDelta::Answer(&tok));
                 }
                 SseEvent::Model(m) => {
                     if served.is_none() {
@@ -1138,14 +1510,7 @@ where
                 SseEvent::Error(msg) => {
                     return Err(LocalFailure::new(LocalFailKind::MalformedStream, msg));
                 }
-                SseEvent::Done => {
-                    return Ok(Completion {
-                        text: full,
-                        model: served,
-                        usage,
-                        truncated,
-                    });
-                }
+                SseEvent::Done => break 'read,
             }
         }
         if assembler.buffered_len() > MAX_SSE_LINE_BYTES {
@@ -1156,21 +1521,51 @@ where
         }
     }
 
-    // The byte stream ended without a `[DONE]`. Accept it only if the model gave some clean end
-    // signal (a finish_reason or a usage chunk); otherwise the connection was cut mid-flight.
-    if stream_ended_cleanly(assembler.saw_done(), saw_finish, saw_usage) {
-        Ok(Completion {
-            text: full,
-            model: served,
-            usage,
-            truncated,
-        })
-    } else {
-        Err(LocalFailure::new(
+    // The stream is over: by its `[DONE]`, or because the byte stream ended. Without a `[DONE]`,
+    // accept it only if the model gave some other clean end signal (a finish_reason or a usage
+    // chunk); otherwise the connection was cut mid-flight.
+    if !stream_ended_cleanly(assembler.saw_done(), saw_finish, saw_usage) {
+        return Err(LocalFailure::new(
             LocalFailKind::MalformedStream,
             "the model stream ended without a completion marker",
-        ))
+        ));
     }
+    if let Some(stop) = unanswered(&full, truncated, saw_reasoning) {
+        return Err(unfinished_thought(stop, show_thinking, base_url, model, token).await);
+    }
+    Ok(Completion {
+        text: full,
+        model: served,
+        usage,
+        truncated,
+    })
+}
+
+/// A thinking reply with no answer is a failure, not a turn — in both modes, because on a server
+/// that thinks regardless it would otherwise be stored as a blank (or cut-off-marker-only) turn.
+/// `None` when the reply has an answer, or never thought.
+fn unanswered(full: &str, truncated: bool, saw_reasoning: bool) -> Option<ThoughtStop> {
+    (saw_reasoning && full.trim().is_empty()).then_some(if truncated {
+        ThoughtStop::OutOfRoom
+    } else {
+        ThoughtStop::NoAnswer
+    })
+}
+
+/// The [`LocalFailKind::UnfinishedThought`] for a stopped or unanswered thought, with the way out
+/// that really is one ([`ThoughtStop::detail`]): the Thinking button only where it switches
+/// thinking off. Asked only once the stream has failed, so a shown thought that ends in an answer
+/// never asks `/api/version` (the on path in [`post_chat`] doesn't either), and the answer is
+/// usually already known from the background work that switches thinking off on this endpoint.
+async fn unfinished_thought(
+    stop: ThoughtStop,
+    shown: bool,
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+) -> LocalFailure {
+    let button_helps = shown && takes_thinking_off(base_url, model, token).await;
+    LocalFailure::new(LocalFailKind::UnfinishedThought, stop.detail(button_helps))
 }
 
 /// A single non-streaming chat completion — background work wants the whole answer at once.
@@ -1197,6 +1592,8 @@ pub async fn complete(
 /// test the user is watching is the opposite — it exists to find out whether the thing works at all,
 /// a cold load is the slow case it most needs to survive, and it records no health outcome either
 /// way. Two different questions, so two different deadlines, both named in `tunables`.
+///
+/// Never thinks: there is deliberately no parameter for it.
 pub async fn complete_within(
     base_url: &str,
     model: &str,
@@ -1204,27 +1601,16 @@ pub async fn complete_within(
     messages: &[ChatMessage],
     deadline: std::time::Duration,
 ) -> LocalResult<Completion> {
-    let body = chat_body(model, messages, false);
-    let url = format!("{base_url}/v1/chat/completions");
-    let mut req = client_for(base_url)
-        .post(&url)
-        .timeout(deadline)
-        .json(&body);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LocalFailure::new(
-            classify_http(status.as_u16(), &body),
-            crate::error::truncate_detail(&body),
-        ));
-    }
+    let response = post_chat(
+        base_url,
+        model,
+        token,
+        messages,
+        false,
+        Some(deadline),
+        false,
+    )
+    .await?;
     let value: serde_json::Value = response
         .json()
         .await
@@ -1577,7 +1963,7 @@ mod tests {
                 SseEvent::Usage(u) => usage = Some(*u),
                 SseEvent::Finish(_) => finished = true,
                 SseEvent::Done => done = true,
-                SseEvent::Error(_) => {}
+                SseEvent::Error(_) | SseEvent::Reasoning(_) => {}
             }
         }
         (text, model, usage, finished, done)
@@ -2148,7 +2534,7 @@ mod tests {
 
     #[test]
     fn request_body_carries_no_cloud_only_fields() {
-        let body = chat_body("llama3.2", &[msg("user", "hi")], true);
+        let body = chat_body("llama3.2", &[msg("user", "hi")], true, false);
         // The model is a plain string (never a `models` fallback array), messages are plain strings,
         // and NONE of OpenRouter's body fields appear.
         assert_eq!(body["model"], "llama3.2");
@@ -2164,8 +2550,796 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
 
         // The non-streaming body omits stream_options too.
-        let buffered = chat_body("m", &[msg("user", "x")], false);
+        let buffered = chat_body("m", &[msg("user", "x")], false, false);
         assert_eq!(buffered["stream"], false);
         assert!(buffered.get("stream_options").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(buffered.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn the_thinking_switch_is_one_field_and_only_ever_none() {
+        for stream in [true, false] {
+            let off = chat_body("gemma4", &[msg("user", "hi")], stream, true);
+            let plain = chat_body("gemma4", &[msg("user", "hi")], stream, false);
+            assert_eq!(off["reasoning_effort"], "none");
+            // Exactly one field more than the body PM always sent, and nothing else changed.
+            let mut off = off.as_object().unwrap().clone();
+            off.remove("reasoning_effort");
+            assert_eq!(serde_json::Value::Object(off), plain);
+        }
+        // "low" is refused for a model that never thinks, so "none" is the only value PM may send.
+        assert_eq!(THINKING_OFF, "none");
+    }
+
+    #[test]
+    fn only_a_recent_ollamas_version_answer_takes_the_switch() {
+        let answer = |v: serde_json::Value| thinking_from_version(200, Some(&v));
+        assert_eq!(
+            answer(serde_json::json!({"version": "0.33.0"})),
+            Some(Thinking::Switchable)
+        );
+        assert_eq!(
+            answer(serde_json::json!({"version": "0.12.5"})),
+            Some(Thinking::Switchable)
+        );
+        assert_eq!(
+            answer(serde_json::json!({"version": "0.12.5-rc1"})),
+            Some(Thinking::Switchable)
+        );
+        // 0.12.4 refuses "none" for a model that never thinks, and 0.11.5-0.12.3 refuse it outright.
+        for old in ["0.12.4", "0.12.3", "0.12.0", "0.11.5", "0.11.4", "0.1.32"] {
+            assert_eq!(
+                answer(serde_json::json!({ "version": old })),
+                Some(Thinking::Leave),
+                "{old}"
+            );
+        }
+        // A development build, LM Studio's 200 for a route it doesn't have, and servers that answer
+        // the route with something that is not a recent Ollama's version: all answered, none takes it.
+        for other in [
+            serde_json::json!({"version": "0.0.0"}),
+            serde_json::json!({"error": "Unexpected endpoint or method. (GET /api/version)"}),
+            serde_json::json!({"version": "0.9.0"}),
+            serde_json::json!({"version": "v2.26.0"}),
+            serde_json::json!({"version": "v150"}),
+            serde_json::json!({"version": ""}),
+            serde_json::json!({"version": 3}),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(answer(other.clone()), Some(Thinking::Leave), "{other}");
+        }
+        // No such route is an answer too.
+        assert_eq!(thinking_from_version(404, None), Some(Thinking::Leave));
+        assert_eq!(thinking_from_version(405, None), Some(Thinking::Leave));
+        // A proxy that wants a token, a server that is restarting or rate-limiting, or a 2xx whose
+        // body never arrived say nothing about what the server is, so nothing is recorded.
+        for status in [401, 403, 407, 408, 429, 500, 502, 503] {
+            assert_eq!(thinking_from_version(status, None), None, "{status}");
+        }
+        assert_eq!(thinking_from_version(200, None), None);
+    }
+
+    #[test]
+    fn only_a_plain_version_number_is_read_as_one() {
+        assert_eq!(ollama_version("0.33.0"), Some((0, 33, 0)));
+        assert_eq!(ollama_version(" 0.12.5-rc1 "), Some((0, 12, 5)));
+        assert_eq!(ollama_version("0.12.5+dirty"), Some((0, 12, 5)));
+        assert_eq!(ollama_version("0.0.0"), None);
+        assert_eq!(ollama_version("v0.33.0"), None);
+        assert_eq!(ollama_version("0.33"), None);
+        assert_eq!(ollama_version("0.33.x"), None);
+        assert_eq!(ollama_version(""), None);
+    }
+
+    #[test]
+    fn only_a_refusal_the_switch_could_cause_is_resent_without_it() {
+        assert!(may_refuse_the_switch(400));
+        assert!(may_refuse_the_switch(422));
+        for status in [401, 403, 404, 408, 429, 500, 503] {
+            assert!(!may_refuse_the_switch(status), "{status}");
+        }
+    }
+
+    /// Ollama 0.33.0's shape for a model that is thinking: content "" beside the reasoning, eighty
+    /// identical `"hm"` thoughts, then a one-word answer.
+    fn thinking_loop_wire() -> String {
+        let mut wire = String::from(
+            "data: {\"model\":\"gemma4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        );
+        for _ in 0..80 {
+            wire.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"hm\"}}]}\n\n");
+        }
+        wire.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Taxes\"}}]}\n\n");
+        wire.push_str(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        wire.push_str("data: [DONE]\n\n");
+        wire
+    }
+
+    #[test]
+    fn a_thinking_models_empty_chunks_are_not_tokens() {
+        let events = SseAssembler::default().feed(thinking_loop_wire().as_bytes());
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SseEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, ["Taxes"]);
+        // And so the loop guard never sees a run of them.
+        let mut guard = LoopGuard::default();
+        assert!(!tokens.iter().any(|t| guard.observe(t)));
+        // The thinking is read — as thinking, every one of the eighty.
+        let thoughts = events
+            .iter()
+            .filter(|e| matches!(e, SseEvent::Reasoning(r) if r == "hm"))
+            .count();
+        assert_eq!(thoughts, 80);
+    }
+
+    /// A one-thread HTTP server for the thinking switch: it answers `/api/version` with `version`
+    /// (or `version_status`), and a chat request with a 400 when it carries the switch and
+    /// `refuses_switch` says so, else with a one-word completion. Every request is logged as
+    /// `"<path> <model> switch|plain"`. Blocking std I/O on purpose: the crate's tokio has no `net`.
+    struct MockServer {
+        base_url: String,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn mock_server(
+        version_status: u16,
+        version: &'static str,
+        refuses_switch: fn(&str) -> bool,
+        refuses_everything: bool,
+    ) -> MockServer {
+        serve(
+            version_status,
+            version,
+            refuses_switch,
+            refuses_everything,
+            None,
+        )
+    }
+
+    /// The same server, and a `"stream": true` chat request gets `sse` back as `text/event-stream`
+    /// — a scripted transcript, sent whatever the request carried, exactly as a server that thinks
+    /// regardless would. A non-streaming request still gets the one-word completion.
+    fn mock_stream_server(
+        version_status: u16,
+        version: &'static str,
+        refuses_everything: bool,
+        sse: &'static str,
+    ) -> MockServer {
+        serve(
+            version_status,
+            version,
+            |_| false,
+            refuses_everything,
+            Some(sse),
+        )
+    }
+
+    /// The accept loop both servers share.
+    fn serve(
+        version_status: u16,
+        version: &'static str,
+        refuses_switch: fn(&str) -> bool,
+        refuses_everything: bool,
+        sse: Option<&'static str>,
+    ) -> MockServer {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let json_type = "application/json";
+                let (status, content_type, reply) = if path == "/api/version" {
+                    (
+                        version_status,
+                        json_type,
+                        format!(r#"{{"version":"{version}"}}"#),
+                    )
+                } else {
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let model = json["model"].as_str().unwrap_or("").to_string();
+                    let switch = json.get("reasoning_effort").is_some();
+                    let streaming = json["stream"].as_bool() == Some(true);
+                    seen.lock().unwrap().push(format!(
+                        "{path} {model} {}",
+                        if switch { "switch" } else { "plain" }
+                    ));
+                    if refuses_everything || (switch && refuses_switch(&model)) {
+                        (400, json_type, r#"{"error":{"message":"no"}}"#.to_string())
+                    } else if let (Some(sse), true) = (sse, streaming) {
+                        (200, "text/event-stream", sse.to_string())
+                    } else {
+                        (
+                            200,
+                            json_type,
+                            r#"{"model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#
+                                .to_string(),
+                        )
+                    }
+                };
+                if path == "/api/version" {
+                    seen.lock().unwrap().push(path);
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        MockServer { base_url, log }
+    }
+
+    impl MockServer {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+    }
+
+    async fn ask(server: &MockServer, model: &str) -> LocalResult<Completion> {
+        complete_within(
+            &server.base_url,
+            model,
+            None,
+            &[msg("user", "hi")],
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_recent_ollama_is_asked_once_and_gets_the_switch_on_every_call() {
+        let server = mock_server(200, "0.33.0", |_| false, false);
+        ask(&server, "gemma4").await.unwrap();
+        ask(&server, "gemma4").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions gemma4 switch",
+                "/v1/chat/completions gemma4 switch"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refuses_the_switch_loses_it_and_no_other_model_does() {
+        let server = mock_server(200, "0.12.5", |m| m == "picky", false);
+        ask(&server, "picky").await.unwrap();
+        ask(&server, "picky").await.unwrap();
+        ask(&server, "other").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions picky switch",
+                "/v1/chat/completions picky plain",
+                "/v1/chat/completions picky plain",
+                "/v1/chat/completions other switch"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_switch_did_not_cause_is_reported_and_forgets_nothing() {
+        let server = mock_server(200, "0.33.0", |_| false, true);
+        let Err(err) = ask(&server, "m").await else {
+            panic!("a refused request must fail");
+        };
+        assert_eq!(
+            err.kind,
+            classify_http(400, r#"{"error":{"message":"no"}}"#)
+        );
+        assert!(ask(&server, "m").await.is_err());
+        // Resent once without the switch each time, and the switch still goes first.
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions m switch",
+                "/v1/chat/completions m plain",
+                "/v1/chat/completions m switch",
+                "/v1/chat/completions m plain"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_ollama_or_another_server_never_sees_the_switch() {
+        for (status, version) in [(200, "0.12.3"), (200, "0.12.4"), (404, "")] {
+            let server = mock_server(status, version, |_| true, false);
+            ask(&server, "m").await.unwrap();
+            ask(&server, "m").await.unwrap();
+            assert_eq!(
+                server.take(),
+                [
+                    "/api/version",
+                    "/v1/chat/completions m plain",
+                    "/v1/chat/completions m plain"
+                ],
+                "{status} {version}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_that_could_not_answer_is_asked_again() {
+        let server = mock_server(401, "0.33.0", |_| false, false);
+        ask(&server, "m").await.unwrap();
+        ask(&server, "m").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions m plain",
+                "/api/version",
+                "/v1/chat/completions m plain"
+            ]
+        );
+    }
+
+    // --- showing thinking ---------------------------------------------------------------------
+
+    /// Every event one frame decodes to, as `kind:text`, for the thinking and answer kinds only.
+    fn thinking_and_tokens(frame: &str) -> Vec<String> {
+        SseAssembler::default()
+            .feed(format!("data: {frame}\n\n").as_bytes())
+            .into_iter()
+            .filter_map(|e| match e {
+                SseEvent::Reasoning(r) => Some(format!("reasoning:{r}")),
+                SseEvent::Token(t) => Some(format!("token:{t}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sse_reads_thinking_from_every_servers_field_and_never_as_a_token() {
+        // Ollama: `delta.reasoning` beside an empty content.
+        assert_eq!(
+            thinking_and_tokens(
+                r#"{"choices":[{"index":0,"delta":{"content":"","reasoning":"Let me check"}}]}"#
+            ),
+            ["reasoning:Let me check"]
+        );
+        // llama-server (and LM Studio's split setting): `delta.reasoning_content`.
+        assert_eq!(
+            thinking_and_tokens(r#"{"choices":[{"delta":{"reasoning_content":"the invoice"}}]}"#),
+            ["reasoning:the invoice"]
+        );
+        // A buffered server puts it under `message`, under either name.
+        assert_eq!(
+            thinking_and_tokens(r#"{"choices":[{"message":{"reasoning":"all at once"}}]}"#),
+            ["reasoning:all at once"]
+        );
+        assert_eq!(
+            thinking_and_tokens(r#"{"choices":[{"message":{"reasoning_content":"buffered"}}]}"#),
+            ["reasoning:buffered"]
+        );
+        // An empty thought is not thinking, any more than an empty content is a token.
+        assert!(
+            thinking_and_tokens(r#"{"choices":[{"delta":{"content":"","reasoning":""}}]}"#)
+                .is_empty()
+        );
+        // Both in one frame: the thinking first, then the answer — the order the model wrote them.
+        assert_eq!(
+            thinking_and_tokens(
+                r#"{"choices":[{"delta":{"reasoning":"so it is tax","content":"Taxes"}}]}"#
+            ),
+            ["reasoning:so it is tax", "token:Taxes"]
+        );
+        // Two thinking fields in one frame are one thought, never joined: the first wins.
+        assert_eq!(
+            thinking_and_tokens(
+                r#"{"choices":[{"delta":{"reasoning":"first","reasoning_content":"second"}}]}"#
+            ),
+            ["reasoning:first"]
+        );
+        // An empty first field does not hide a real second one.
+        assert_eq!(
+            thinking_and_tokens(
+                r#"{"choices":[{"delta":{"reasoning":"","reasoning_content":"second"}}]}"#
+            ),
+            ["reasoning:second"]
+        );
+    }
+
+    /// Which of the two ways out a stream picks, against which server, is pinned end to end in
+    /// `the_way_out_of_a_shown_thought_is_the_button_only_where_it_switches_thinking_off`.
+    #[test]
+    fn a_thought_stop_names_its_reason_and_the_way_out() {
+        let button = "turn off Thinking for a straight answer";
+        let server =
+            "your model server lets this model think; set it to skip thinking, or give the \
+                      model a longer context";
+        for (stop, reason) in [
+            (
+                ThoughtStop::TooLong,
+                "it thought for 5 minutes without starting its answer, so PM stopped it",
+            ),
+            (
+                ThoughtStop::TooLarge,
+                "its thinking ran past PM's size limit",
+            ),
+            (
+                ThoughtStop::Looping,
+                "its thinking got stuck repeating itself",
+            ),
+            (
+                ThoughtStop::NoAnswer,
+                "it finished thinking without writing an answer",
+            ),
+            (
+                ThoughtStop::OutOfRoom,
+                "it ran out of room while it was still thinking",
+            ),
+        ] {
+            assert_eq!(
+                stop.detail(true),
+                format!("{reason} — {button}"),
+                "{stop:?}"
+            );
+            assert_eq!(
+                stop.detail(false),
+                format!("{reason} — {server}"),
+                "{stop:?}"
+            );
+        }
+    }
+
+    /// `n` bytes of pseudo-random lowercase words — thinking that never repeats itself, so only the
+    /// bound under test can stop it.
+    fn varied(n: usize, mut seed: u64) -> String {
+        let mut out = String::with_capacity(n);
+        while out.len() < n {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let c = (seed >> 33) % 27;
+            out.push(if c == 26 {
+                ' '
+            } else {
+                (b'a' + c as u8) as char
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn thinking_that_is_shown_is_bounded_by_size_time_and_its_own_loop_guard() {
+        let t0 = Instant::now();
+
+        // Size: up to the cap is fine, one byte past it is not.
+        let mut b = ThoughtBudget::default();
+        assert_eq!(b.observe(&varied(MAX_THOUGHT_BYTES, 1), t0), None);
+        assert_eq!(b.observe("x", t0), Some(ThoughtStop::TooLarge));
+
+        // Loop: the same chunk over and over.
+        let mut b = ThoughtBudget::default();
+        let stops: Vec<_> = (0..60).filter_map(|_| b.observe("hm", t0)).collect();
+        assert_eq!(stops.first(), Some(&ThoughtStop::Looping));
+
+        // Time, counted from the FIRST thinking chunk.
+        let mut b = ThoughtBudget::default();
+        assert_eq!(b.observe("Let me see.", t0), None);
+        assert_eq!(
+            b.observe(" Still going.", t0 + tunables::THINKING_TIME_LIMIT),
+            None
+        );
+        assert_eq!(
+            b.observe(" And more.", t0 + Duration::from_secs(301)),
+            Some(ThoughtStop::TooLong)
+        );
+
+        // A real thought: 6 KB of varied text over 200 s trips nothing.
+        let mut b = ThoughtBudget::default();
+        let thought = varied(6 * 1024, 7);
+        let chunks: Vec<&str> = thought
+            .as_bytes()
+            .chunks(24)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let step = Duration::from_secs(200) / chunks.len() as u32;
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(b.observe(chunk, t0 + step * i as u32), None, "chunk {i}");
+        }
+    }
+
+    #[test]
+    fn the_stall_window_shortens_once_the_model_is_generating_anything() {
+        assert_eq!(chunk_deadline(false), Duration::from_secs(120));
+        assert_eq!(chunk_deadline(true), Duration::from_secs(45));
+    }
+
+    const SENTINEL: &str = "THOUGHT-SENTINEL-7f3";
+
+    /// gemma 4 on Ollama 0.33.0, thinking then answering. The middle thought carries [`SENTINEL`].
+    const THINKING_SSE: &str = concat!(
+        "data: {\"model\":\"gemma4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"The invoice \"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"names THOUGHT-SENTINEL-7f3, \"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"so it is tax.\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Taxes\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Thinking, then a clean stop with no answer at all.
+    const NO_ANSWER_SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"Hmm, which project\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Thinking, then the token ceiling, still with no answer.
+    const OUT_OF_ROOM_SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"Hmm, which project\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// One chat stream against `server`, collecting what it hands up.
+    async fn stream(
+        server: &MockServer,
+        model: &str,
+        show_thinking: bool,
+    ) -> (LocalResult<Completion>, Vec<String>, Vec<String>) {
+        let (mut answers, mut thoughts) = (Vec::new(), Vec::new());
+        let result = stream_chat(
+            &server.base_url,
+            model,
+            None,
+            &[msg("user", "file this invoice")],
+            show_thinking,
+            |delta| match delta {
+                StreamDelta::Answer(t) => answers.push(t.to_string()),
+                StreamDelta::Thinking(t) => thoughts.push(t.to_string()),
+            },
+        )
+        .await;
+        (result, answers, thoughts)
+    }
+
+    #[tokio::test]
+    async fn shown_thinking_sends_the_plain_body_and_never_asks_the_version() {
+        let server = mock_stream_server(200, "0.33.0", false, THINKING_SSE);
+        let (result, answers, thoughts) = stream(&server, "gemma4", true).await;
+        // The body PM sent before #852: no switch, and no `/api/version` question either.
+        assert_eq!(server.take(), ["/v1/chat/completions gemma4 plain"]);
+        assert_eq!(result.unwrap().text, "Taxes");
+        assert_eq!(answers, ["Taxes"]);
+        assert_eq!(
+            thoughts,
+            [
+                "The invoice ",
+                "names THOUGHT-SENTINEL-7f3, ",
+                "so it is tax."
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_thinking_is_the_852_request() {
+        let server = mock_stream_server(200, "0.33.0", false, THINKING_SSE);
+        let (result, answers, thoughts) = stream(&server, "gemma4", false).await;
+        assert_eq!(
+            server.take(),
+            ["/api/version", "/v1/chat/completions gemma4 switch"]
+        );
+        assert_eq!(result.unwrap().text, "Taxes");
+        assert_eq!(answers, ["Taxes"]);
+        // The transcript thinks regardless, and none of it is forwarded.
+        assert!(thoughts.is_empty(), "{thoughts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_shown_chat_changes_nothing_background_sends() {
+        let server = mock_stream_server(200, "0.33.0", false, THINKING_SSE);
+        stream(&server, "gemma4", true).await.0.unwrap();
+        ask(&server, "gemma4").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/v1/chat/completions gemma4 plain",
+                "/api/version",
+                "/v1/chat/completions gemma4 switch"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_thinking_request_is_not_resent_and_remembers_nothing() {
+        let server = mock_stream_server(200, "0.33.0", true, THINKING_SSE);
+        let (result, answers, thoughts) = stream(&server, "m", true).await;
+        let Err(err) = result else {
+            panic!("a refused request must fail");
+        };
+        assert_eq!(err.kind, LocalFailKind::ClientError(400));
+        assert!(answers.is_empty() && thoughts.is_empty());
+        // One request: it carried no switch, so there was nothing to resend without.
+        assert_eq!(server.take(), ["/v1/chat/completions m plain"]);
+        // And nothing was learned from it: background work still asks, and still switches first.
+        assert!(ask(&server, "m").await.is_err());
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions m switch",
+                "/v1/chat/completions m plain"
+            ]
+        );
+    }
+
+    /// The thought is never the answer: not in an answer delta, not in `Completion.text`, so nothing
+    /// downstream — `messages`, the vault, the index, a summary — can ever be handed it.
+    #[tokio::test]
+    async fn the_thought_never_reaches_the_answer() {
+        assert!(THINKING_SSE.contains(SENTINEL), "the transcript carries it");
+        let server = mock_stream_server(200, "0.33.0", false, THINKING_SSE);
+
+        let (result, answers, thoughts) = stream(&server, "gemma4", true).await;
+        assert!(thoughts.concat().contains(SENTINEL));
+        assert!(answers.iter().all(|a| !a.contains(SENTINEL)), "{answers:?}");
+        assert!(!result.unwrap().text.contains(SENTINEL));
+
+        let (result, answers, thoughts) = stream(&server, "gemma4", false).await;
+        assert!(thoughts.is_empty(), "{thoughts:?}");
+        assert!(answers.iter().all(|a| !a.contains(SENTINEL)), "{answers:?}");
+        assert!(!result.unwrap().text.contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn a_thought_with_no_answer_is_an_unfinished_thought() {
+        for show in [true, false] {
+            for (sse, stop) in [
+                (NO_ANSWER_SSE, ThoughtStop::NoAnswer),
+                (OUT_OF_ROOM_SSE, ThoughtStop::OutOfRoom),
+            ] {
+                let server = mock_stream_server(200, "0.33.0", false, sse);
+                let (result, answers, _) = stream(&server, "gemma4", show).await;
+                let Err(err) = result else {
+                    panic!("a reply with no answer is not a turn (show={show}, {stop:?})");
+                };
+                assert_eq!(err.kind, LocalFailKind::UnfinishedThought);
+                assert_eq!(err.detail, stop.detail(show), "show={show}");
+                assert!(answers.is_empty());
+            }
+        }
+        // The wording the stop arm promises, end to end.
+        let server = mock_stream_server(200, "0.33.0", false, NO_ANSWER_SSE);
+        let Err(LocalFailure { detail, .. }) = stream(&server, "gemma4", true).await.0 else {
+            panic!("a reply with no answer is not a turn");
+        };
+        assert!(
+            detail.starts_with("it finished thinking without writing an answer — "),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shown_thinking_that_loops_is_stopped_hidden_is_not() {
+        let wire: &'static str = Box::leak(thinking_loop_wire().into_boxed_str());
+        let server = mock_stream_server(200, "0.33.0", false, wire);
+
+        let (result, answers, thoughts) = stream(&server, "gemma4", true).await;
+        let Err(err) = result else {
+            panic!("eighty identical thoughts in a row is a loop when shown");
+        };
+        assert_eq!(err.kind, LocalFailKind::UnfinishedThought);
+        assert_eq!(err.detail, ThoughtStop::Looping.detail(true));
+        assert!(answers.is_empty());
+        assert!(thoughts.len() < 80, "stopped before the end");
+
+        // Hidden, the same thinking is liveness only — nothing guards what nothing shows.
+        let (result, answers, thoughts) = stream(&server, "gemma4", false).await;
+        assert_eq!(result.unwrap().text, "Taxes");
+        assert_eq!(answers, ["Taxes"]);
+        assert!(thoughts.is_empty());
+    }
+
+    /// "Turn off Thinking" is only advice where turning it off sends a different request. On a server
+    /// PM can't switch it sends the same one, the model thinks just the same, and the thought is
+    /// then hidden — past every bound PM puts on shown thinking — so the way out is on the server.
+    #[tokio::test]
+    async fn the_way_out_of_a_shown_thought_is_the_button_only_where_it_switches_thinking_off() {
+        let looping: &'static str = Box::leak(thinking_loop_wire().into_boxed_str());
+        let shown_stop = |server: &MockServer, model: &'static str| {
+            let base_url = server.base_url.clone();
+            async move {
+                let result = stream_chat(
+                    &base_url,
+                    model,
+                    None,
+                    &[msg("user", "file this invoice")],
+                    true,
+                    |_| {},
+                )
+                .await;
+                let Err(err) = result else {
+                    panic!("{model}: a shown thought with no answer is not a turn");
+                };
+                assert_eq!(err.kind, LocalFailKind::UnfinishedThought);
+                err.detail
+            }
+        };
+
+        // A recent Ollama: the button switches thinking off, so it is the way out. The version is
+        // asked only once the stream has failed — a shown thought that answers never asks it.
+        let ollama = mock_stream_server(200, "0.33.0", false, looping);
+        assert_eq!(
+            shown_stop(&ollama, "gemma4").await,
+            ThoughtStop::Looping.detail(true)
+        );
+        assert_eq!(
+            ollama.take(),
+            ["/v1/chat/completions gemma4 plain", "/api/version"]
+        );
+
+        // llama-server (no `/api/version` route) and an Ollama too old to take the switch: the
+        // server decides, so the server is the way out — for a stopped thought and an unanswered one.
+        for (status, version) in [(404, ""), (200, "0.11.4")] {
+            for (sse, stop) in [
+                (looping, ThoughtStop::Looping),
+                (NO_ANSWER_SSE, ThoughtStop::NoAnswer),
+            ] {
+                let server = mock_stream_server(status, version, false, sse);
+                let detail = shown_stop(&server, "gemma4").await;
+                assert_eq!(detail, stop.detail(false), "{status} {version} {stop:?}");
+                assert!(!detail.contains("turn off Thinking"), "{detail}");
+            }
+        }
+
+        // A recent Ollama, but a model that refused the switch: for that model the button can't
+        // switch anything off, while the next model on the same server still can.
+        let server = serve(200, "0.33.0", |m| m == "qwen3", false, Some(looping));
+        ask(&server, "qwen3").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions qwen3 switch",
+                "/v1/chat/completions qwen3 plain"
+            ]
+        );
+        assert_eq!(
+            shown_stop(&server, "qwen3").await,
+            ThoughtStop::Looping.detail(false)
+        );
+        assert_eq!(
+            shown_stop(&server, "gemma4").await,
+            ThoughtStop::Looping.detail(true)
+        );
     }
 }

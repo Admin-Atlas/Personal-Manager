@@ -6,12 +6,16 @@
 // "never chosen" so the caller keeps its density-derived seed, rather than collapsing to a boolean
 // default that would freeze Depth out on a fresh install.
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   chatSectionsAreDefault,
   readChatSectionOpen,
+  readShowThinking,
   resetChatSections,
+  resetShowThinking,
+  showThinkingIsDefault,
   writeChatSectionOpen,
+  writeShowThinking,
 } from "./chatPrefs";
 
 beforeEach(() => {
@@ -66,5 +70,64 @@ describe("chat section fold prefs", () => {
     resetChatSections();
     window.removeEventListener("pm:settings-changed", bump);
     expect(heard).toBe(2);
+  });
+});
+
+// The Thinking toggle. Off is #852's fast path (thinking switched off on Ollama), so the read must
+// land there on every doubt: absent, a value this code never writes, or storage that throws.
+describe("the chat Thinking toggle pref", () => {
+  const KEY = "pm.chat.showThinking";
+
+  it("is off until turned on", () => {
+    expect(readShowThinking()).toBe(false);
+    expect(showThinkingIsDefault()).toBe(true);
+  });
+
+  it('reads on only for the "1" it writes', () => {
+    localStorage.setItem(KEY, "1");
+    expect(readShowThinking()).toBe(true);
+    for (const other of ["true", "0", "x"]) {
+      localStorage.setItem(KEY, other);
+      expect(readShowThinking(), other).toBe(false);
+    }
+  });
+
+  it("reads off when storage throws", () => {
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    try {
+      expect(readShowThinking()).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('writes on as "1", off as no key at all, and announces each', () => {
+    let heard = 0;
+    const bump = () => void heard++;
+    window.addEventListener("pm:settings-changed", bump);
+    writeShowThinking(true);
+    expect(localStorage.getItem(KEY)).toBe("1");
+    expect(heard).toBe(1);
+    expect(showThinkingIsDefault()).toBe(false);
+    writeShowThinking(false);
+    // Removed, not "0": absent IS the default, so a reset and an off are the same state.
+    expect(localStorage.getItem(KEY)).toBeNull();
+    expect(heard).toBe(2);
+    expect(showThinkingIsDefault()).toBe(true);
+    window.removeEventListener("pm:settings-changed", bump);
+  });
+
+  it("resets by removing the key, and announces", () => {
+    writeShowThinking(true);
+    let heard = 0;
+    const bump = () => void heard++;
+    window.addEventListener("pm:settings-changed", bump);
+    resetShowThinking();
+    window.removeEventListener("pm:settings-changed", bump);
+    expect(localStorage.getItem(KEY)).toBeNull();
+    expect(readShowThinking()).toBe(false);
+    expect(heard).toBe(1);
   });
 });

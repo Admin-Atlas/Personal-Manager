@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.0-alpha",
+    date: "2026-10-02",
+    highlights: [
+      "Models that think before they answer, like gemma 4 and Qwen 3.5, now work properly with PM on Ollama. Background work used to wait through thinking PM never showed you — in PM's own check, filing one document took close to a minute, and now takes about a second with the same answer — and a chat reply could stop partway with a “token loop” error while the model was still thinking. PM now asks Ollama (0.12.5 or newer) to skip the thinking, and a reply that does think is no longer mistaken for a loop, on any server. Models that never think are unaffected, and LM Studio and llama-server still think as they're set up to.",
+      "If you'd like to see the thinking, chat now has a Thinking button beside the message box, shown while chat is going to your own model. Turn it on and the model thinks before it answers, and you can watch it happen above the reply; once the answer starts it folds away under “Thought for 48 s”, and you can open it again. It's slower — close to a minute a reply with gemma 4, against about a second with it off — so it starts off, and it only changes your chats: filing, titles and summaries still skip thinking wherever PM can switch it off. The thinking is never saved: it's gone when you restart PM, and it never reaches your vault, summaries or search. On Ollama, if a conversation is too long to leave the model room to think, PM answers without thinking and tells you, and it stops a model that thinks for five minutes without answering. On LM Studio and llama-server your server decides whether the model thinks, so the button only shows or hides it.",
+      "A reply with no answer in it is no longer saved as an empty message — PM tells you what happened so you can try again. And the Context button beside the message box now has an outline you can actually see.",
+    ],
+  },
+  {
     version: "3.138.0-alpha",
     date: "2026-10-02",
     highlights: [

@@ -91,6 +91,25 @@ describe("contrast axis — WCAG targets across every system × mode", () => {
         }
       });
 
+      // The chat Thinking toggle (ThinkingToggle.tsx) is a bordered text button that fills with the
+      // accent when on. Same choice as the switch above, for the same reason: its edge is `--ink4` in
+      // BOTH states, because an accent edge is drawn in the colour of a pale-accent light theme's
+      // row (1.36:1). The edge sits on the composer (`--bg` in the global chat, `--panel` beside a
+      // project), and the on state's label is `--accent-ink` on the `--accent` fill — text-xs, so
+      // the full 4.5:1. Measured minimums over this sweep: 4.89:1 for the edge (terminal/light,
+      // #7fe0b0, aa, on --panel) and 5.43:1 for the label (editorial/dark, #c96f4c, aa).
+      it(`${system}/${mode}: the chat Thinking toggle's edge and label clear their floors at every level`, () => {
+        for (const contrast of ["aa", "high"] as const) {
+          for (const anyAccent of ACCENTS[system]) {
+            const v = themeVars(system, mode, anyAccent, false, contrast);
+            for (const against of ["bg", "panel"] as const) {
+              expect(ratioOf(v, "ink4", against)).toBeGreaterThanOrEqual(3);
+            }
+            expect(ratioOf(v, "accent-ink", "accent")).toBeGreaterThanOrEqual(4.5);
+          }
+        }
+      });
+
       // The semantic status colours are TEXT: the error banner's message, Field's role="alert", the
       // "Due soon" chip, every connector failure string. They render at text-xs, so the 3:1
       // large-text exemption never applies. They also sit OUTSIDE the contrast axis — boost() only

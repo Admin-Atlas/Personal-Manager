@@ -7,6 +7,7 @@ import { CONNECTOR_POLL_MS, shouldIncludeSharedWithMe } from "./lib/connectorPol
 import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
 import { ProviderChip } from "./components/ProviderChip";
+import { ThinkingToggle } from "./components/ThinkingToggle";
 import { FallbackStrip } from "./components/FallbackStrip";
 import { PowerConsentStrip } from "./components/PowerConsentStrip";
 import { ConversationTitle } from "./components/ConversationTitle";
@@ -1212,6 +1213,11 @@ export default function App() {
                       providers={chat.providers}
                       showProvenance={!!localAi?.configured}
                       streaming={chat.streaming}
+                      streamingThought={chat.streamingThought}
+                      thoughts={chat.thoughts}
+                      onLiveFold={chat.noteLiveFold}
+                      onThoughtFold={chat.noteThoughtFold}
+                      thoughtFold={chat.thoughtFold}
                       onOpenChatCitation={openChatCitation}
                       focusTurn={focusTurn}
                     />
@@ -1240,6 +1246,7 @@ export default function App() {
                             onUpgrade={handleUpgrade}
                           />
                           <ProviderChip status={localAi} />
+                          <ThinkingToggle status={localAi} />
                         </div>
                       }
                       rightTools={

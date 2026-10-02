@@ -361,6 +361,9 @@ export interface GroundingConfidence {
   gated: boolean;
 }
 
+/** Mirrors `llm_gateway::ThinkingNote`. */
+export type ThinkingNote = "fell_back" | "no_room";
+
 export type ChatEvent =
   | { type: "token"; text: string }
   // Developer mode only: the exact assembled request + the confidence readout, once before streaming.
@@ -381,7 +384,37 @@ export type ChatEvent =
   // resting, so cloud answered. NOT an error — the reply is real. `reason` is the backend slug
   // (`hard_failure:<kind>` / `cooldown`); `FallbackStrip` maps it to friendly copy. Arrives after
   // the tokens, before `done`.
-  | { type: "fallback"; from_model: string; to_model: string; reason: string };
+  | { type: "fallback"; from_model: string; to_model: string; reason: string }
+  // The model's thinking, live, only when the send asked for it (showThinking). Never persisted,
+  // never part of `done.content`. Arrives before the answer's tokens.
+  | { type: "thinking"; text: string }
+  // `fell_back`: drop the live thinking, the cloud is answering instead. `no_room`: this turn was
+  // answered without thinking because the conversation leaves no room for it.
+  | { type: "thinking_note"; note: ThinkingNote };
+
+/** Frontend-only: where the user left the live thinking fold. The live fold and the settled one are
+ *  separate mounts with a gap between them, so this is how a fold opened to read mid-answer stays
+ *  open, at the same place, when the turn settles (and when the user comes back mid-reply). */
+export interface ThoughtFold {
+  open: boolean | null; // their own open/closed click; null = never clicked, the automatic fold rules
+  scrollTop: number | null; // how far down the box they scrolled; null = following its end
+}
+
+/** Frontend-only (not a Rust mirror): the live thinking while a reply streams. */
+export interface LiveThought {
+  text: string;
+  startedAt: number; // Date.now() at the first `thinking` event
+  answeredAt: number | null; // Date.now() at the first `token` after thinking began
+  fold?: ThoughtFold; // absent until the user touches the live fold
+}
+
+/** Frontend-only: a finished turn's thinking, kept for the session under its message id. */
+export interface ChatThought {
+  text: string; // "" when skipped
+  seconds: number | null; // whole seconds thinking, null when nothing was timed
+  skipped: boolean; // true after a `no_room` note
+  fold?: ThoughtFold; // the live fold as the user left it; absent when they never touched it
+}
 
 /** Who answered a turn, as the per-message footer words it: `served_by` plus the `on_battery` flag
  *  from the same `done` event, folded into one value so the footer has one table to read. */

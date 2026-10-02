@@ -57,6 +57,32 @@ describe("help registry hygiene", () => {
     expect(entry?.title).toBe("On battery");
     expect(entry?.body).toMatch(/reduces power use by not running inference on your GPU/);
   });
+
+  it("explains the chat Thinking button and the fold it fills", () => {
+    // Same silent-miss as above: ThinkingToggle and ThinkingBlock point their `data-help` here.
+    for (const [id, title] of [
+      ["chat-thinking-toggle", "Thinking"],
+      ["chat-thinking", "The model's thinking"],
+    ] as const) {
+      const entry = HELP[id];
+      expect(entry, `no help entry for ${id}`).toBeDefined();
+      expect(entry?.title).toBe(title);
+      expect(entry?.body.trim()).not.toBe("");
+    }
+    // The never-stored promise is the one a reader most needs to be able to find.
+    expect(HELP["chat-thinking-toggle"].body).toContain("The thinking isn't saved");
+  });
+
+  it("promises background work skips thinking only where PM can switch it off", () => {
+    // LM Studio and llama-server are sent no switch, so background work there thinks if the server
+    // is set up to. An unscoped "background work never thinks" told those users something PM can't
+    // make true — so the sentence about it has to name them.
+    const sentence = HELP["chat-thinking-toggle"].body
+      .split(/(?<=\.) /)
+      .find((s) => s.includes("background work"));
+    expect(sentence, "the toggle's help no longer says what background work does").toBeDefined();
+    expect(sentence).toContain("LM Studio and llama-server");
+  });
 });
 
 describe("the Local AI tab's help", () => {

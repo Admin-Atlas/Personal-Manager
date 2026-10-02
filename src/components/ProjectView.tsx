@@ -7,6 +7,7 @@ import { Composer } from "./Composer";
 import { QueuedMessages } from "./QueuedMessages";
 import { ContextMeter } from "./ContextMeter";
 import { ProviderChip } from "./ProviderChip";
+import { ThinkingToggle } from "./ThinkingToggle";
 import { FallbackStrip } from "./FallbackStrip";
 import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
 import { listDocuments, listMilestones, listProjects, setDocumentMetadata } from "../lib/ipc";
@@ -506,6 +507,11 @@ export function ProjectView({
             providers={chat.providers}
             showProvenance={!!localAi?.configured}
             streaming={chat.streaming}
+            streamingThought={chat.streamingThought}
+            thoughts={chat.thoughts}
+            onLiveFold={chat.noteLiveFold}
+            onThoughtFold={chat.noteThoughtFold}
+            thoughtFold={chat.thoughtFold}
             onOpenChatCitation={onOpenChatCitation}
           />
           {idleDate && (
@@ -553,6 +559,7 @@ export function ProjectView({
                   onUpgrade={onUpgrade}
                 />
                 <ProviderChip status={localAi} />
+                <ThinkingToggle status={localAi} />
               </div>
             }
             rightTools={

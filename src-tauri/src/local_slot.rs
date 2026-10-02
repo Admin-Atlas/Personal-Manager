@@ -69,20 +69,27 @@ pub mod tunables {
     /// client's 5s so slow LAN/DNS still connects; tighten toward 5s for faster failure if wanted.
     pub const CONNECT_TIMEOUT_REMOTE: Duration = Duration::from_secs(10);
 
-    /// How long to wait for the FIRST content token. This absorbs a silent cold model load —
+    /// How long to wait for the FIRST output — an answer token or, from a model that thinks first, a
+    /// thinking chunk (`openai_compat::chunk_deadline`). This absorbs a silent cold model load —
     /// Ollama and LM Studio JIT-load a model on the first request and stream NOTHING until the
     /// first token (5-30s typical, >60s for a large model on a slow disk) — plus prompt prefill.
     /// Generous by design: the OpenAI client's own whole-request default is 600s, so 120s is not
     /// aggressive. A cold load is surfaced to the UI as "loading model…", never a silent hang.
     pub const TIME_TO_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(120);
 
-    /// Silence allowed BETWEEN tokens once streaming has started — the short deadline that catches a
-    /// genuinely wedged stream. RAISED from the 30s baseline to 45s: llama.cpp emits an SSE keepalive
-    /// ping every 30s (`--sse-ping-interval` default), and a 30s inter-token deadline would race that
-    /// ping. 45s guarantees a ping (which arrives as bytes and resets this timer) lands first, while
-    /// still catching a dead stream fast. Ollama/LM Studio send no pings, so a real stall is still
-    /// caught inside the window.
+    /// Silence allowed BETWEEN chunks once the model is generating (thinking counts) — the short
+    /// deadline that catches a genuinely wedged stream. RAISED from the 30s baseline to 45s: llama.cpp
+    /// emits an SSE keepalive ping every 30s (`--sse-ping-interval` default), and a 30s inter-token
+    /// deadline would race that ping. 45s guarantees a ping (which arrives as bytes and resets this
+    /// timer) lands first, while still catching a dead stream fast. Ollama/LM Studio send no pings,
+    /// so a real stall is still caught inside the window.
     pub const INTER_TOKEN_TIMEOUT: Duration = Duration::from_secs(45);
+
+    /// The longest PM lets a model THINK, shown, before it starts its answer — counted from the first
+    /// thinking chunk. A chat stream has no total deadline and there is no Stop button, so without this
+    /// a model that keeps thinking holds the foreground slot until the server gives up. gemma 4 12b
+    /// thinks for 48-61 s on Ollama 0.33.0; five minutes leaves Qwen-class thinkers room.
+    pub const THINKING_TIME_LIMIT: Duration = Duration::from_secs(300);
 
     /// Silence allowed between progress ticks during an Ollama model pull. A pull streams frequent
     /// byte/manifest updates, so a long quiet gap means a wedged download (or a dropped connection the
@@ -362,9 +369,13 @@ impl CallOutcome {
             // it is `Neutral` rather than `Alive` for exactly that reason: an unsent request must
             // neither strike a healthy server nor clear the strikes of a failing one.
             LocalFailKind::PromptTooLarge => CallOutcome::Neutral,
+            // `UnfinishedThought`: the host answered and was generating; the failure is the mode the
+            // user switched on, or a model that thinks without answering. Striking it would cool the
+            // endpoint down for background work too.
             LocalFailKind::ModelLoading
             | LocalFailKind::ClientError(_)
-            | LocalFailKind::UnrecognisedResponse => CallOutcome::Alive,
+            | LocalFailKind::UnrecognisedResponse
+            | LocalFailKind::UnfinishedThought => CallOutcome::Alive,
             LocalFailKind::Refused
             | LocalFailKind::Timeout
             | LocalFailKind::MalformedStream
@@ -1549,6 +1560,12 @@ mod tests {
             CallOutcome::Alive,
             "a 200 PM could not read settles liveness more firmly than a 404 does — striking it \
              would eject a working server and hide the body behind a cooldown"
+        );
+        // A model that thought and never answered was generating the whole time: the host is alive,
+        // and a strike would cool the endpoint down for background work too.
+        assert_eq!(
+            CallOutcome::for_failure(&LocalFailKind::UnfinishedThought),
+            CallOutcome::Alive
         );
         // The stream kinds keep their strike: those really are the host failing mid-flight.
         assert_eq!(

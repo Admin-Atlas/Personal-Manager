@@ -164,7 +164,9 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
                 : `Context usage is unknown for ${status.model}`
             }
             data-help="context-meter"
-            className="flex shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] border border-border2 px-2 py-1 text-xs text-ink4 hover:text-ink2"
+            // The edge is `--ink4`, not `--border2`: that measures 1.42–1.84:1 against `--panel` at
+            // the default Contrast, under the 3:1 a control's boundary needs (contrast.test).
+            className="flex shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] border border-ink4 px-2 py-1 text-xs text-ink4 hover:text-ink2"
             style={
               alerting
                 ? {
