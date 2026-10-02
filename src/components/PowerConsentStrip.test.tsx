@@ -26,10 +26,22 @@ vi.mock("../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ depth: "standard" }),
 }));
 
-import { PowerConsentStrip } from "./PowerConsentStrip";
+import { PowerConsentAsk, PowerConsentStrip } from "./PowerConsentStrip";
 
-const asking: PowerRoleView = { route: "needs_consent", blocked: null, local_model: "gemma3:4b" };
-const still: PowerRoleView = { route: "unchanged", blocked: null, local_model: "gemma3:4b" };
+const asking: PowerRoleView = {
+  route: "needs_consent",
+  blocked: null,
+  local_model: "gemma3:4b",
+  effective: "local_then_cloud",
+  cloud_key: "present",
+};
+const still: PowerRoleView = {
+  route: "unchanged",
+  blocked: null,
+  local_model: "gemma3:4b",
+  effective: "local_then_cloud",
+  cloud_key: "present",
+};
 
 const power = (over: Partial<PowerView> = {}): PowerView => ({
   ...INERT_POWER_VIEW,
@@ -168,5 +180,36 @@ describe("PowerConsentStrip", () => {
     for (const name of ANSWERS) {
       expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false);
     }
+  });
+});
+
+describe("PowerConsentAsk inside On battery", () => {
+  // The Settings overlay covers the strip, so the section asks the same question inline. There the
+  // controls are just under it, and "in Settings → Local AI → On battery" would send someone to the
+  // section they are already reading.
+  const text = (inSettings: boolean) => {
+    const { container } = render(<PowerConsentAsk power={power()} inSettings={inSettings} />);
+    const words = container.textContent ?? "";
+    cleanup();
+    return words;
+  };
+
+  it("swaps only the last sentence", () => {
+    const strip = text(false);
+    const settings = text(true);
+    const OLD = "You can change any of this in Settings → Local AI → On battery.";
+    const NEW = "You can change any of this below.";
+    expect(strip).toContain(OLD);
+    expect(strip).not.toContain(NEW);
+    expect(settings).toContain(NEW);
+    expect(settings).not.toContain(OLD);
+    expect(settings.replace(NEW, OLD)).toBe(strip);
+  });
+
+  it("is the strip's wording when nothing says otherwise", () => {
+    render(<PowerConsentAsk power={power()} />);
+    expect(
+      screen.getByText(/You can change any of this in Settings → Local AI → On battery\./),
+    ).toBeTruthy();
   });
 });

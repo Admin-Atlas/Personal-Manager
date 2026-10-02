@@ -290,33 +290,38 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), the light/dark Mode (including System, which follows your device, and Auto, which follows sunrise and sunset), Depth (how much detail is shown — it reveals and hides, never rearranges), the accent colour, and the text size. Changes apply instantly and are remembered on this device.",
   },
-  "settings-localai-machine": {
-    title: "Your machine",
-    body: "PM reads your memory, processor, and graphics card entirely on this device to work out which local models would run well, and how fast. Nothing about your hardware leaves the machine.",
-  },
-  "settings-localai-models": {
-    title: "Recommended models",
-    body: "A curated list of on-device models, each sized against your machine — the best quality it could run, the context it would fit, and a rough speed. The numbers are conservative estimates. Local models have no per-use cost, so they don't appear in AI & Models → Usage & cost.",
+  // The Local AI tab's sections, in the tab's order, each titled with its rail label (sections.ts).
+  "settings-localai-start": {
+    title: "Your local model",
+    body: "Where your local AI stands, and what to do next. PM picks one model for this computer from its list: the largest that fits entirely on your graphics card with the room PM keeps free, at the context PM sizes it for (32k, or less for a model made for less), and that PM expects to be quick enough for chat — or, without a separate graphics card, the largest that fits your free memory in a build PM's cautious estimate says is quick enough for background work — or one you already have, when nothing in the list that fits is at least 15% larger. Under it are four steps, in order: get a model server, get the model, put it to work, and check it works. Nothing here downloads or changes anything until you press a button, and every button does something you can also do in the sections that follow. Speeds are PM's estimates, not measurements on this computer: on a graphics card, from its memory speed scaled by PM's own tests on one laptop graphics card, and anywhere else a rough guide in either direction.",
   },
   "settings-localai-endpoint": {
-    title: "Connect an endpoint",
-    body: "Point PM at a local model server (Ollama, LM Studio, or llama-server). A server on this machine keeps everything on your device — nothing leaves it. A remote or LAN server receives the chats you route to it; PM refuses to send a token and chats in the clear to a public address.",
+    title: "Model server",
+    body: "The program that runs models on your computer — Ollama, LM Studio or llama-server, or any server that speaks the OpenAI API. PM connects to one you run; it never installs or starts one. A server on this machine keeps everything on your device. A remote or LAN server receives the chats you route to it, and PM refuses to send a token and chats in the clear to a public address. Disconnecting forgets the address, the token and both models your jobs use, and PM asks first. “Settings PM's numbers assume” has the context and cache settings PM sized its picks for.",
   },
   "settings-localai-roles": {
     title: "Assign roles",
-    body: "Choose which local model answers your chats and which runs background work, and how each falls back: Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server). The On battery section below is separate: it can move a role set to Local, fall back to cloud onto your cloud model while the battery is low, and asks before it first does.",
+    body: "Choose where chat and background work run — Cloud, Local only, or Local with a fall-back to your cloud model when your server can't answer (it isn't reachable, a reply fails or times out before anything is shown, or a request is too long for the window the server gives the model) — and which local model each uses. Each line says what will really happen with your keys and server as they are. The On battery section is separate: it can move a job set to Local, fall back to cloud onto your cloud model while the battery is low, and asks before it first does.",
   },
   "settings-localai-power": {
     title: "On battery",
-    body: 'When your laptop is on battery and the charge falls to the level you choose, PM can send new requests from your local model to your cloud model instead. That reduces power use by not running inference on your GPU. You choose what moves — chat, background work, or both — and only roles set to Local, fall back to cloud ever move. PM waits a minute before acting on any change, comes back to your local model about a minute after you plug in, and asks you before it first moves anything — once for what it asks about, and once more only if something else could move later. A reply that has started always finishes where it began. "Keep using local until I quit PM" keeps your own model for the rest of the session and is never saved.',
+    body: 'When your laptop is on battery and the charge falls to the level you choose, PM can send new requests from your local model to your cloud model instead. That reduces power use by not running inference on your GPU. You choose what moves — chat, background work, or both — and only roles set to Local, fall back to cloud ever move. PM waits a minute before acting on any change, comes back to your local model about a minute after you plug in, and asks you before it first moves anything — once for what it asks about, and once more only if something else could move later. A reply that has started always finishes where it began. "Keep using local until I quit PM" keeps your own model for the rest of the session and is never saved. On battery PM can also hand your graphics card\'s memory back after a quiet spell — set in this section — which saves power even when nothing moves to the cloud.',
   },
   "settings-localai-lifecycle": {
-    title: "Holding the graphics card",
-    body: "A local model sits in your graphics card's memory for as long as your server keeps it there, which on some setups is forever. This decides when PM hands that memory back: never (your server's business), when you quit PM, or after a quiet period. PM only ever unloads a model it loaded itself \u2014 one you started in a terminal is left alone \u2014 and it never changes how long your server keeps models by itself, because asking for that once would reprogram the server for every program that talks to it. On battery it can also hand the memory back after a quiet spell, whatever the policy above says.",
+    title: "Model memory",
+    body: "A local model stays in memory — your graphics card's, if it has one — for as long as your server keeps it there, which on some setups is forever. This decides when PM hands that memory back: never (your server's business), when you quit PM, or after a quiet period. PM only ever unloads a model it loaded itself — one you started in a terminal is left alone — and it never changes how long your server keeps models by itself, because asking for that once would reprogram the server for every program that talks to it. PM can only ask Ollama to unload a model — in LM Studio you eject it yourself, and llama-server holds its model until it stops. The on-battery version of this is under On battery.",
+  },
+  "settings-localai-models": {
+    title: "All models",
+    body: "Every model in PM's list, each sized against your machine: whether it fits, the context it would get, how much memory it needs, and a speed estimate. Speeds are PM's estimates, not measurements — on a graphics card from its memory speed scaled by PM's own tests, and anywhere else a rough guide in either direction. PM can download straight into Ollama on its usual port; for LM Studio and llama-server, each model says how to get it. Local models have no per-use cost, so they don't appear in AI & Models → Usage & cost.",
   },
   "settings-localai-downloaded": {
-    title: "Already downloaded",
-    body: "What is on this machine. PM looks in the folders Ollama, LM Studio and Hugging Face keep models in, in a folder you point it at, and it asks your connected server what it holds — which on Linux is the only way to see a store the server owns as its own user. A folder PM finds but is not allowed to read is said so plainly, rather than reported as one that is not there. The list itself shows only models nothing is serving yet, since those are the ones PM cannot use: load one in the app you downloaded it with and it becomes assignable above.",
+    title: "Already on this device",
+    body: "What is on this machine. PM looks in the folders Ollama, LM Studio and Hugging Face keep models in, in a folder you point it at, and it asks your connected server what it holds — which on Linux is the only way to see a store the server owns as its own user. A folder PM finds but is not allowed to read is said so plainly, rather than reported as one that is not there. The list itself shows only models nothing is serving yet, since those are the ones PM cannot use: each one says how to get it served, and it then becomes assignable under Assign roles.",
+  },
+  "settings-localai-machine": {
+    title: "Your machine",
+    body: "PM reads your memory, processor, and graphics card entirely on this device to work out which local models would run well, and how fast. Nothing about your hardware leaves the machine. PM's pick and every fit are worked out from this, using the memory that was free when the list was last sized.",
   },
   "settings-storage": {
     title: "On-device components",

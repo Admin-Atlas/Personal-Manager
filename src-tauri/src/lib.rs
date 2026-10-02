@@ -1630,6 +1630,9 @@ pub fn run() {
             local_ai::set_local_power_policy,
             local_ai::keep_local_on_battery,
             local_ai::set_local_model_rescan_cadence,
+            // The tab's "Reset to defaults" footer (#445).
+            local_ai::local_ai_settings_are_default,
+            local_ai::reset_local_ai_settings,
             settings::get_settings,
             settings::settings_defaults,
             settings::set_indexing_speed,

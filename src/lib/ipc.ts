@@ -1717,6 +1717,21 @@ export const setLocalLlmRouting = (
 export const setLocalLlmToken = (token: string) => invoke<void>("set_local_llm_token", { token });
 export const clearLocalLlmToken = () => invoke<void>("clear_local_llm_token");
 
+/** Whether the Local AI tab is at its defaults: none of its settings stored and no endpoint token.
+ *  Drives the tab's "Reset to defaults" footer (#445). */
+export const localAiSettingsAreDefault = () => invoke<boolean>("local_ai_settings_are_default");
+
+/** Put the Local AI tab back to its defaults (#445): forget the server and its token, and every
+ *  role, On battery, Model memory, extra-folder, update-check and licence setting. Touches no model
+ *  on any server or on disk, and neither the cloud key nor any chat. */
+export async function resetLocalAiSettings(): Promise<void> {
+  await invoke<void>("reset_local_ai_settings");
+  // Not a `set_*` name, so `invoke` doesn't announce it, and settingsSaved.ts leaves a reset to be
+  // added deliberately: it is a settings write — a whole tab of them — and the footer's "Saved ✓"
+  // should confirm it the way every other tab's reset is confirmed.
+  announceSettingSaved();
+}
+
 /** The models the configured endpoint currently serves (for the pickers). Rejects if none is
  *  configured or it can't be reached. */
 export const listLocalLlmModels = () => invoke<LocalServedModel[]>("list_local_llm_models");

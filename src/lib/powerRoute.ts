@@ -36,8 +36,20 @@ export const INERT_POWER_VIEW: PowerView = {
   consent_needed: false,
   keep_local: false,
   any_cloud_key: false,
-  chat: { route: "unchanged", blocked: "no_local_model", local_model: null },
-  background: { route: "unchanged", blocked: "no_local_model", local_model: null },
+  chat: {
+    route: "unchanged",
+    blocked: "no_local_model",
+    local_model: null,
+    effective: "nothing",
+    cloud_key: "absent",
+  },
+  background: {
+    route: "unchanged",
+    blocked: "no_local_model",
+    local_model: null,
+    effective: "nothing",
+    cloud_key: "absent",
+  },
 };
 
 /** The two roles, in the order every sentence names them. */
@@ -290,7 +302,9 @@ export function powerReadout(
     }
     if (loaded.length > 0) {
       const many = loaded.length > 1;
-      text += ` ${loaded.join(" and ")} ${many ? "are" : "is"} still loaded on your graphics card, and a loaded model keeps the card drawing power. To hand ${many ? "them" : "it"} back on battery, choose a time for "On battery, hand the memory back" under Holding the graphics card.`;
+      // "Below": the readout is On battery's own, and the row it names sits further down the same
+      // section — never a pointer into another one.
+      text += ` ${loaded.join(" and ")} ${many ? "are" : "is"} still loaded on your graphics card, and a loaded model keeps the card drawing power. To hand ${many ? "them" : "it"} back on battery, choose a time for "On battery, hand the memory back" below.`;
     }
     return text;
   }
@@ -301,6 +315,42 @@ export function powerReadout(
     return `On battery${at}. You asked PM to keep using your local model until you quit, so nothing has moved.`;
   }
   return `On battery${at}. Nothing you've chosen to move can use the cloud with your current setup, so PM is staying on your local model.`;
+}
+
+/**
+ * On battery in one sentence, for a readout outside the section — or null where there is nothing to
+ * summarise (no local model to move, or the status not read yet). First match wins, and every branch
+ * is a reading of the gate and the snapshot, never a re-derivation of either.
+ */
+export function powerSummary(gate: PowerGate, power: PowerView | null): string | null {
+  switch (gate) {
+    case "cloud_only":
+    case "loading":
+      return null;
+    case "no_battery":
+      return "No battery on this computer, so On battery never applies.";
+    case "no_key":
+      return "On battery, PM stays on your local model — there's no cloud key to move to.";
+    case "key_unreadable":
+      return "On battery, PM stays on your local model while it can't read your saved keys.";
+    case "not_with_roles":
+      return "On battery, PM stays on your local model — your roles aren't set to Local, fall back to cloud.";
+    case "ready":
+      break;
+  }
+  if (!power) return null;
+  if (power.consent_needed) {
+    return "PM is waiting for your answer about using the cloud on battery.";
+  }
+  const cloud = ROLES.filter((r) => roleView(power, r).route === "cloud");
+  if (cloud.length > 0) {
+    return `On battery, so ${who(cloud)} ${cloud.length > 1 ? "are" : "is"} on your cloud model until you plug in.`;
+  }
+  if (power.keep_local) return "You've asked PM to keep using your local model until you quit.";
+  if (power.threshold === 0) return "On battery, PM stays on your local model — switching is off.";
+  const movable = movableNow(power);
+  if (movable.length === 0) return "On battery, nothing you've chosen would move to the cloud.";
+  return `On battery at ${power.threshold}% or below, PM moves ${who(movable)} to your cloud model${askingFirst(power, movable)}.`;
 }
 
 /** The consent question's first paragraph, naming only the roles that are actually waiting on it. */

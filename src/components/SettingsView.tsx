@@ -179,7 +179,12 @@ export function SettingsView({
   // removed and the layout flushed first, or the browser reuses the running animation.
   function scrollToSection(id: string) {
     const el = contentRef.current?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
-    if (!el) return;
+    if (!el) {
+      // A jump to an id nothing carries does nothing at all, which is invisible — say so while
+      // developing, where a renamed anchor would otherwise ship as a dead link.
+      if (import.meta.env.DEV) console.warn(`scrollToSection: no #${id}`);
+      return;
+    }
     el.scrollIntoView({ behavior: scrollBehavior(), block: "start" });
     el.classList.remove("pm-locate");
     void el.offsetWidth; // force a reflow so the re-added class restarts the animation
@@ -638,7 +643,9 @@ export function SettingsView({
             />
           )}
 
-          {tab === "localai" && <LocalAiSettings onBetterFitChange={onBetterFitChange} />}
+          {tab === "localai" && (
+            <LocalAiSettings onBetterFitChange={onBetterFitChange} onLocate={scrollToSection} />
+          )}
 
           {tab === "search" && <SearchSettings />}
 

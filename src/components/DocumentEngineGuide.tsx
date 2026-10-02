@@ -19,6 +19,7 @@ import type { SidecarStatus } from "../lib/types";
 import { onPythonInstall } from "../lib/ipc";
 import { CHANGELOG } from "../lib/changelog";
 import { guideFor, PLATFORM, type SetupGuideMode } from "../lib/setupGuide";
+import { withCode } from "./withCode";
 
 const REPO_URL = "https://github.com/Admin-Atlas/Personal-Manager";
 
@@ -31,22 +32,6 @@ interface Props {
   busy: boolean;
   /** Run (or retry) setup. */
   onRetry: () => void;
-}
-
-/** Render a step string, turning `backtick` spans into inline code chips. */
-function withCode(text: string) {
-  return text.split("`").map((part, i) =>
-    i % 2 === 1 ? (
-      <code
-        key={i}
-        className="rounded-[var(--radius-sm)] bg-bg px-1 py-0.5 font-mono text-[0.85em] text-ink"
-      >
-        {part}
-      </code>
-    ) : (
-      <span key={i}>{part}</span>
-    ),
-  );
 }
 
 /** Pre-fill a GitHub issue for a packaging bug: the app version and the captured

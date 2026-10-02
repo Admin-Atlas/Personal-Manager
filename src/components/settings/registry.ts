@@ -16,6 +16,7 @@
 
 import type { ComponentType, SVGProps } from "react";
 
+import { LOCALAI_SECTIONS } from "../localai/sections";
 import {
   AccessibilityIcon,
   AiIcon,
@@ -111,15 +112,9 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
         id: "localai",
         label: "Local AI",
         Icon: LocalAiIcon,
-        sections: [
-          { id: "sec-localai-machine", label: "Your machine" },
-          { id: "sec-localai-models", label: "Recommended models" },
-          { id: "sec-localai-downloaded", label: "Already downloaded" },
-          { id: "sec-localai-endpoint", label: "Connect endpoint" },
-          { id: "sec-localai-roles", label: "Assign roles" },
-          { id: "sec-localai-power", label: "On battery" },
-          { id: "sec-localai-lifecycle", label: "Graphics card" },
-        ],
+        // From the tab's own list, so the rail, the tab's order and the copy that names a section
+        // can't drift apart. Add or rename a Local AI section there, not here.
+        sections: LOCALAI_SECTIONS.map(({ id, label }) => ({ id, label })),
       },
       { id: "search", label: "Search", Icon: SearchIcon, sections: [] },
     ],

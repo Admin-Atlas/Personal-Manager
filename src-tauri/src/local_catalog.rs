@@ -53,6 +53,10 @@ pub struct CatalogEntry {
     /// entry always carries a projector size (it drops the flag otherwise), so this is `Some` iff
     /// `multimodal`.
     pub projector_gb: Option<f64>,
+    /// What a token costs this model's KV cache, read from its GGUF header's attention geometry.
+    /// `None` only when the generator could not read that header, and the fit then falls back to
+    /// its parameter-count proxy — the committed catalogue carries it on every entry (pinned below).
+    pub kv_cache: Option<CatalogKvCache>,
     pub fit: FitClass,
     pub quants: Vec<CatalogQuant>,
     /// What this model's weights are licensed under. Required, not optional: an entry with no
@@ -82,6 +86,21 @@ pub struct EntryLicence {
     pub summary: String,
 }
 
+/// A catalogue entry's KV-cache geometry, in bytes at f16 (`kvFromHeader` in the generator says
+/// where each figure comes from). Bridged into [`fit::KvGeometry`] by [`entry_to_spec`].
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogKvCache {
+    /// What one token adds across the layers whose cache spans the whole context.
+    pub bytes_per_token: f64,
+    /// What one token adds across the sliding-window layers, which hold only `window` tokens.
+    pub window_bytes_per_token: f64,
+    /// The sliding window in tokens, or `None` when the model has no sliding layers.
+    pub window: Option<u32>,
+    /// A hybrid model's fixed recurrent state, f32 (0 when it has none).
+    pub state_bytes: f64,
+}
+
 /// One downloadable quantization with its measured on-disk size.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +117,28 @@ pub struct CatalogQuant {
     /// quantization, so a single per-entry tag would download a different file from the one the card
     /// sized, and the memory figure it showed would be a lie.
     pub ollama: Option<String>,
+    /// The bytes one decode step reads from this quant's files, read from every shard's GGUF tensor
+    /// table by the generator (`decodeBytes`, which says which tensors count and how much). `None`
+    /// when it could not read them, and the speed estimate falls back to the parameter count for this
+    /// quant; the committed catalogue carries it on every row (pinned below).
+    pub decode_bytes: Option<u64>,
+    /// The part of `decode_bytes` in a tensor type slow to unpack (the generator's
+    /// `SLOW_TENSOR_TYPES`), which the speed estimate charges at its own cost.
+    pub decode_slow_bytes: Option<u64>,
+}
+
+impl CatalogQuant {
+    /// This row's decode bytes as the fit reads them: both figures present and the slow part no more
+    /// than the whole, else `None`.
+    fn decode(&self) -> Option<fit::DecodeBytes> {
+        match (self.decode_bytes, self.decode_slow_bytes) {
+            (Some(t), Some(s)) if s <= t => Some(fit::DecodeBytes {
+                fast: (t - s) as f64,
+                slow: s as f64,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the app can compute a trustworthy fit for this entry (`unknown` = an unmodelled arch we
@@ -147,6 +188,89 @@ pub fn match_installed(model_id: &str) -> Option<&'static CatalogEntry> {
         .map(|(_, e)| e)
 }
 
+/// Match a model the endpoint SERVES back to a catalog row, using its parameter count when the name
+/// alone is not enough.
+///
+/// [`match_installed`] first, unchanged. What it cannot match is Ollama's own library naming: a tag
+/// like `qwen2.5:latest` carries a family and no size, so it contains no catalogue key and none
+/// contains it — `qwen2.5:latest`, `llama3.2:latest`, `gemma3:latest`, `phi3.5:latest` and
+/// `llama3.1:latest` all matched nothing. Ollama does report the parameter count in `/api/tags`
+/// (`details.parameter_size`), so this falls back to family + size:
+///
+/// * the id's family is the part after its last `/` and before its first `:` (`qwen2.5`);
+/// * an entry's family is its repo name minus `-GGUF`, up to its first size token, with the
+///   separators dropped (`Meta-Llama-3.1-8B-Instruct` → `metallama3.1`);
+/// * an entry is a candidate when its family contains the id's at a boundary — so `qwen3` never
+///   matches `qwen3.5` — and its size is within 15% of the reported one;
+/// * the closest wins, and an exact tie matches nothing rather than one of the two at random.
+///
+/// `None` without a size: a family alone names several models, and PM would rather say "not in the
+/// catalog" than size the wrong one.
+pub fn match_served(id: &str, parameters_b: Option<f64>) -> Option<&'static CatalogEntry> {
+    if let Some(entry) = match_installed(id) {
+        return Some(entry);
+    }
+    let p = parameters_b.filter(|p| p.is_finite() && *p > 0.0)?;
+    let lower = id.to_ascii_lowercase();
+    let after_slash = lower.rsplit('/').next().unwrap_or(&lower);
+    let base = after_slash.split(':').next().unwrap_or(after_slash);
+    if base.is_empty() {
+        return None;
+    }
+
+    let mut scored: Vec<(f64, &'static CatalogEntry)> = catalog()
+        .entries
+        .iter()
+        .filter(|e| family_contains(&family(e), base))
+        .map(|e| ((e.parameters_b - p).abs(), e))
+        .filter(|(distance, _)| distance / p <= 0.15)
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    match scored.as_slice() {
+        [] => None,
+        [(d0, _), (d1, _), ..] if d0 == d1 => None,
+        [(_, best), ..] => Some(*best),
+    }
+}
+
+/// An entry's family for [`match_served`]: the repo name, lowercased, minus `-gguf`, split on `-` and
+/// `_`, kept up to the first size token (`7b`, `500m`, or an MoE's `a3b`), and joined with nothing.
+fn family(entry: &CatalogEntry) -> String {
+    let name = model_key(entry).to_ascii_lowercase();
+    let name = name.strip_suffix("-gguf").unwrap_or(&name);
+    name.split(['-', '_'])
+        .take_while(|token| !is_size_token(token))
+        .collect()
+}
+
+/// `^\d+(\.\d+)?[bm]$` or `^a\d+b$`: a parameter count, or an MoE's active count.
+fn is_size_token(token: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(n) = token.strip_prefix('a').and_then(|t| t.strip_suffix('b')) {
+        if digits(n) {
+            return true;
+        }
+    }
+    let Some(n) = token.strip_suffix(['b', 'm']) else {
+        return false;
+    };
+    match n.split_once('.') {
+        Some((whole, frac)) => digits(whole) && digits(frac),
+        None => digits(n),
+    }
+}
+
+/// Whether `family` contains `base` where the next character does not continue a version number:
+/// `qwen2.5` is in `qwen2.5`, and `phi3.5` in `phi3.5miniinstruct`, but `qwen3` is not in `qwen3.5`.
+fn family_contains(family: &str, base: &str) -> bool {
+    family.match_indices(base).any(|(at, _)| {
+        family[at + base.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_digit() || c == '.'))
+    })
+}
+
 /// Whether a model id names an embedding or reranking model rather than a chat model.
 ///
 /// Embedders and rerankers cannot answer a chat turn, but every discovery path PM has hands them
@@ -182,6 +306,7 @@ pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
             fit::Quant::from_label(&q.quant).map(|quant| fit::QuantCandidate {
                 quant,
                 weight_gb: q.file_gb,
+                decode: q.decode(),
             })
         })
         .collect();
@@ -195,7 +320,27 @@ pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
         target_context: entry.context_length,
         projector_gb: entry.projector_gb,
         candidates,
+        // Every spec PM builds for a model starts here — the card, a served copy, a file on disk —
+        // so all of them are sized from the entry's real attention geometry, not the proxy.
+        kv_geometry: entry.kv_cache.map(|kv| fit::KvGeometry {
+            bytes_per_token: kv.bytes_per_token,
+            window_bytes_per_token: kv.window_bytes_per_token,
+            window: kv.window.unwrap_or(0),
+            state_bytes: kv.state_bytes,
+        }),
     }
+}
+
+/// The decode bytes of `entry`'s row for `quant`, matched through [`fit::Quant::from_label`] as
+/// [`entry_to_spec`] matches it, or `None` when the entry lists no such quant or could not read it.
+/// What a served or on-disk copy of the model is estimated from: the catalogue's own file of that
+/// label, which a copy from another publisher only approximates.
+pub fn decode_for(entry: &CatalogEntry, quant: fit::Quant) -> Option<fit::DecodeBytes> {
+    entry
+        .quants
+        .iter()
+        .find(|q| fit::Quant::from_label(&q.quant) == Some(quant))
+        .and_then(CatalogQuant::decode)
 }
 
 // The catalog identity used for name matching: prefer the repo's last path segment (what tools echo).
@@ -314,7 +459,7 @@ mod tests {
         // Pinned, not `>=`: the version is decoration unless something compares it. Bumping it in
         // the generator without landing the matching Rust change fails here rather than at runtime.
         assert_eq!(
-            cat.schema_version, 3,
+            cat.schema_version, 4,
             "catalog schema version must match what this module parses"
         );
         assert!(
@@ -338,6 +483,27 @@ mod tests {
             );
             assert!(e.context_length >= 256, "{}: context", e.repo);
             assert!(!e.quants.is_empty(), "{}: needs at least one quant", e.repo);
+
+            // Every entry is sized from its own attention geometry. An entry without one falls back
+            // to the parameter-count proxy, which under-counted Phi 3.5 mini 13x and is exactly what
+            // made PM recommend configs that did not fit — so a regenerated catalogue that lost the
+            // figure for any entry fails here rather than quietly going back to it.
+            let kv = e
+                .kv_cache
+                .unwrap_or_else(|| panic!("{}: no KV geometry from its GGUF header", e.repo));
+            assert!(
+                kv.bytes_per_token > 0.0
+                    && kv.window_bytes_per_token >= 0.0
+                    && kv.state_bytes >= 0.0,
+                "{}: KV geometry {kv:?}",
+                e.repo
+            );
+            assert_eq!(
+                kv.window.is_some(),
+                kv.window_bytes_per_token > 0.0,
+                "{}: a sliding window comes with sliding layers, and only then",
+                e.repo
+            );
 
             // Generator invariant: multimodal iff a projector size is present.
             assert_eq!(
@@ -368,6 +534,38 @@ mod tests {
                     q.quant
                 );
                 assert!(q.file_gb > 0.0, "{}: quant {} size", e.repo, q.quant);
+
+                // Every row's decode bytes were read off its tensor table: a regenerated catalogue
+                // that lost them for any row would quietly put that quant's speed back on the
+                // parameter count. Never more than the file, which also holds the header and every
+                // tensor a token does not read (0.005 GiB is `file_gb`'s rounding).
+                let total = q
+                    .decode_bytes
+                    .unwrap_or_else(|| panic!("{}: quant {} has no decode bytes", e.repo, q.quant));
+                let slow = q.decode_slow_bytes.unwrap_or_else(|| {
+                    panic!("{}: quant {} has no slow decode bytes", e.repo, q.quant)
+                });
+                let gib = 1_073_741_824.0;
+                assert!(
+                    slow <= total && total as f64 <= q.file_gb * gib + 0.005 * gib,
+                    "{}: quant {} decode bytes {slow} / {total} against {} GiB",
+                    e.repo,
+                    q.quant,
+                    q.file_gb
+                );
+                // A mixture of experts reads only the experts a token reaches: 0.09-0.24 of the file
+                // as measured, so a figure near the whole file means the experts were not scaled.
+                if arch_from(&e.architecture, e.active_parameters_b, e.parameters_b)
+                    == fit::Architecture::Moe
+                {
+                    assert!(
+                        (total as f64) < 0.3 * q.file_gb * gib,
+                        "{}: quant {} reads {total} of a {} GiB MoE per token",
+                        e.repo,
+                        q.quant,
+                        q.file_gb
+                    );
+                }
 
                 // The Ollama pull target, if the generator wrote one. Derived from THIS row rather
                 // than pattern-matched: a `starts_with("hf.co/")` check would pass for free on a
@@ -428,6 +626,43 @@ mod tests {
     }
 
     #[test]
+    fn the_catalogue_carries_the_attention_geometry_the_fit_was_calibrated_against() {
+        // The two entries measured on a real card (fit.rs
+        // `the_estimate_brackets_the_loads_measured_on_a_real_card`), the one the proxy got most
+        // wrong, and a hybrid. Read off each GGUF header on 02-10-2026.
+        let geometry = |repo: &str| {
+            let e = catalog().entries.iter().find(|e| e.repo == repo).unwrap();
+            entry_to_spec(e).kv_geometry.unwrap()
+        };
+        let g = |full: f64, windowed: f64, window: u32, state: f64| fit::KvGeometry {
+            bytes_per_token: full,
+            window_bytes_per_token: windowed,
+            window,
+            state_bytes: state,
+        };
+        // 28 layers × 4 KV heads × 128 × K,V × 2 bytes.
+        assert_eq!(
+            geometry("bartowski/Qwen2.5-7B-Instruct-GGUF"),
+            g(57_344.0, 0.0, 0, 0.0)
+        );
+        // Five global layers and 29 sliding ones, window 1024.
+        assert_eq!(
+            geometry("ggml-org/gemma-3-4b-it-GGUF"),
+            g(20_480.0, 118_784.0, 1024, 0.0)
+        );
+        // No grouped-query attention: 32 layers × 32 KV heads × 96 × 2 × 2.
+        assert_eq!(
+            geometry("bartowski/Phi-3.5-mini-instruct-GGUF"),
+            g(393_216.0, 0.0, 0, 0.0)
+        );
+        // A hybrid: a cache on 8 of 32 layers, a fixed state on the other 24.
+        assert_eq!(
+            geometry("unsloth/Qwen3.5-4B-GGUF"),
+            g(32_768.0, 0.0, 0, 52_690_944.0)
+        );
+    }
+
+    #[test]
     fn entry_to_spec_yields_scorable_specs() {
         for e in &catalog().entries {
             let spec = entry_to_spec(e);
@@ -479,6 +714,83 @@ mod tests {
         // A name matching nothing returns None.
         assert!(match_installed("totally-unknown-model-xyz").is_none());
         assert!(match_installed("").is_none());
+    }
+
+    #[test]
+    fn ollamas_bare_library_tags_match_by_family_and_size() {
+        // Ollama's own library names carry a family and no size, so the name match found nothing
+        // for any of these. The sizes are the `details.parameter_size` Ollama reports for each.
+        let repo = |id: &str, size: f64| match_served(id, Some(size)).map(|e| e.repo.as_str());
+        for (id, size, want) in [
+            ("qwen2.5:latest", 7.6, "bartowski/Qwen2.5-7B-Instruct-GGUF"),
+            (
+                "llama3.2:latest",
+                3.2,
+                "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            ),
+            ("gemma3:latest", 4.3, "ggml-org/gemma-3-4b-it-GGUF"),
+            ("phi3.5:latest", 3.8, "bartowski/Phi-3.5-mini-instruct-GGUF"),
+            (
+                "llama3.1:latest",
+                8.0,
+                "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            ),
+        ] {
+            assert!(
+                match_installed(id).is_none(),
+                "{id}: the name alone matches nothing"
+            );
+            assert_eq!(repo(id, size), Some(want), "{id}");
+        }
+
+        // `qwen3` is its own family, not a prefix of `qwen3.5` / `qwen3.6`.
+        assert_eq!(repo("qwen3:latest", 8.2), None);
+        // The family is right but no curated size is within 15% of it.
+        assert_eq!(repo("gemma2:latest", 9.2), None);
+        // Without a size a family names several models, so PM matches none of them.
+        assert!(match_served("qwen2.5:latest", None).is_none());
+        assert!(match_served("", Some(7.6)).is_none());
+
+        // A name the catalogue already matches is untouched by the size.
+        assert_eq!(
+            match_served(
+                "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M",
+                Some(70.0)
+            )
+            .map(|e| e.repo.as_str()),
+            Some("bartowski/Qwen2.5-7B-Instruct-GGUF")
+        );
+    }
+
+    #[test]
+    fn a_catalogue_family_stops_at_its_first_size_token() {
+        let fam = |repo: &str| {
+            let e = catalog()
+                .entries
+                .iter()
+                .find(|e| e.repo == repo)
+                .unwrap_or_else(|| panic!("{repo} is in the catalogue"));
+            family(e)
+        };
+        assert_eq!(fam("bartowski/Qwen2.5-7B-Instruct-GGUF"), "qwen2.5");
+        assert_eq!(fam("bartowski/Llama-3.2-1B-Instruct-GGUF"), "llama3.2");
+        assert_eq!(fam("ggml-org/gemma-3-4b-it-GGUF"), "gemma3");
+        assert_eq!(
+            fam("bartowski/Phi-3.5-mini-instruct-GGUF"),
+            "phi3.5miniinstruct"
+        );
+        assert_eq!(
+            fam("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"),
+            "metallama3.1"
+        );
+        assert_eq!(fam("unsloth/Qwen3.5-4B-GGUF"), "qwen3.5");
+        assert_eq!(fam("unsloth/Qwen3.6-35B-A3B-GGUF"), "qwen3.6");
+        assert_eq!(fam("ggml-org/SmolVLM-500M-Instruct-GGUF"), "smolvlm");
+
+        assert!(is_size_token("7b") && is_size_token("0.5b") && is_size_token("500m"));
+        assert!(is_size_token("a3b"));
+        assert!(!is_size_token("3") && !is_size_token("b") && !is_size_token("it"));
+        assert!(!is_size_token("3.b") && !is_size_token(".5b"));
     }
 
     #[test]

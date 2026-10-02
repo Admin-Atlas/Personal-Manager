@@ -56,8 +56,11 @@ pub struct Hardware {
     pub vram_source: Option<String>,
     /// The GPU's peak memory bandwidth (GB/s), matched from its name against a curated table, when
     /// recognised. `None` = an unlisted card (or a probe that only reports a generic name, e.g. Linux
-    /// `nvidia-smi`): fit-scoring falls back to a flat default for the speed estimate. Sharpens the
-    /// display-only tok/s only — never the fit verdict.
+    /// `nvidia-smi`): fit-scoring falls back to a flat default for the speed estimate. It feeds that
+    /// estimate (`fit::gpu_tokens_per_sec`) and never what fits — the memory verdict and the builds
+    /// that fit the card are the same at any bandwidth — but the estimate is not display-only: on a
+    /// discrete card it decides PM's pick through the chat floor (`better_fit::chat_floor_tps`), and
+    /// whether `fit::gpu_fit` offers the card's build as the faster rung.
     pub gpu_bandwidth_gbps: Option<f64>,
     /// Apple-Silicon-style shared CPU/GPU memory (VRAM is a slice of system RAM, not separate).
     pub unified_memory: bool,
@@ -1170,9 +1173,13 @@ fn intel_drm_driver_from_link(link_target: &str) -> Option<IntelDrmDriver> {
 // --- GPU memory bandwidth: name (+ VRAM) → GB/s, for the tok/s speed estimate ------------------
 //
 // Peak theoretical VRAM bandwidth (GB/s) per discrete GPU, from manufacturer / TechPowerUp specs
-// (verified 2026-07). Decode of a memory-bound LLM runs at ~bandwidth / active-weight-bytes-per-token,
-// so a real per-card number turns fit.rs's flat 400-GB/s placeholder into a card-specific estimate (an
-// RTX 4090 ≈ 1008 vs an Arc A380 ≈ 186). Maintenance notes:
+// (verified 2026-07). Decode of a memory-bound LLM is bound by bandwidth over the bytes it reads per
+// token, so a real per-card number turns fit.rs's flat 400-GB/s placeholder into a card-specific
+// estimate (an RTX 4090 ≈ 1008 vs an Arc A380 ≈ 186) — `fit::gpu_tokens_per_sec`, which charges each
+// file's decode bytes at costs fitted on one laptop card. Not just a label: on a discrete card that
+// estimate gates PM's pick through the chat floor (`better_fit::chat_floor_tps`) and decides whether
+// `fit::gpu_fit` offers a Split, so changing a figure here, or the fallback, can change the pick.
+// Maintenance notes:
 //   * Keys are normalised (see `normalize_gpu_name`): lowercase, every non-alphanumeric run collapsed
 //     to one space. Match is substring containment, LONGEST key first, so "rtx 4080 super" beats the
 //     "rtx 4080" it contains, and "rx 7900 xtx" beats "rx 7900 xt". Add specific-before-generic; the
@@ -1840,6 +1847,50 @@ mod tests {
             gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080", Some(12.0)),
             Some(912.0)
         );
+    }
+
+    #[test]
+    fn every_listed_card_is_estimated_faster_than_system_memory_for_a_dense_model() {
+        // `fit::gpu_fit` offers a card config as the faster rung only where the card's estimate
+        // beats system memory's. For a dense model that must hold on every card PM lists, or a
+        // listed card could lose a rung it plainly has: the worst case is a build whose every byte
+        // is slow to unpack, on the slowest card — 124 / 2.647 = 46.8 against 40 a byte.
+        let cand = crate::fit::QuantCandidate {
+            quant: crate::fit::Quant::Q3_K_M,
+            weight_gb: 3.5,
+            decode: Some(crate::fit::DecodeBytes {
+                fast: 0.0,
+                slow: 3.5e9,
+            }),
+        };
+        let spec = crate::fit::ModelSpec {
+            arch: crate::fit::Architecture::Dense,
+            active_params_b: 7.0,
+            target_context: 4096,
+            projector_gb: None,
+            candidates: vec![cand],
+            kv_geometry: None,
+        };
+        let system = crate::fit::system_tokens_per_sec(&spec, &cand);
+        for (key, bandwidth) in GPU_BANDWIDTH_TABLE {
+            let figures = match *bandwidth {
+                Bandwidth::Fixed(gbps) => vec![gbps],
+                Bandwidth::ByVram { high, low, .. } => vec![high, low],
+            };
+            for gbps in figures {
+                let hw = crate::fit::FitHardware {
+                    available_ram_gb: 32.0,
+                    vram_gb: Some(24.0),
+                    gpu_bandwidth_gbps: Some(gbps),
+                    unified_memory: false,
+                };
+                let card = crate::fit::gpu_tokens_per_sec(&spec, &cand, &hw).unwrap();
+                assert!(
+                    card > system,
+                    "{key} at {gbps} GB/s: {card:.1} against {system:.1}"
+                );
+            }
+        }
     }
 
     // --- Intel DRM query (#461) ---------------------------------------------------------------

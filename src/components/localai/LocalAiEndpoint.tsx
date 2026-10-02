@@ -7,7 +7,6 @@ import {
   checkLocalLlmEndpoint,
   clearLocalLlmEndpoint,
   clearLocalLlmToken,
-  probeLocalLlmPorts,
   setLocalLlmEndpoint,
   setLocalLlmToken,
 } from "../../lib/ipc";
@@ -17,9 +16,17 @@ import type {
   LocalLlmConfig,
   LocalLlmStatus,
 } from "../../lib/types";
-import { runnerGuides } from "../../lib/workbenchGuide";
+import { runnerGuides, tuningFor } from "../../lib/workbenchGuide";
+import { withCode } from "../withCode";
+import { TokenChip } from "./fitDisplay";
+import { TUNING_ID, TUNING_TITLE } from "./locate";
+import { runnerOf } from "./readiness";
+import { RunnerGuideCard } from "./RunnerGuideCard";
+import { SectionLink } from "./SectionLink";
+import { sectionHelp, sectionLabel } from "./sections";
 import {
   Button,
+  Callout,
   Collapsible,
   ConfirmDialog,
   Input,
@@ -29,13 +36,18 @@ import {
 } from "../ui";
 
 /**
- * "Connect an endpoint" — the address, the token, and what PM will and won't send there.
+ * "Model server" — the address, the token, and what PM will and won't send there.
  *
  * It owns its own form state (the typed URL, the typed token, the last check, the in-flight flags)
  * because none of it means anything outside this section: a half-typed address is not a fact about
  * the tab. What it reports upward is only what other sections read — that the stored config
  * changed, and that something went wrong — plus `onEndpointChanged`, which exists because a test
  * result in the roles section proves a MODEL on a SERVER and the server has just moved.
+ *
+ * What the port probe found is the tab's (`useServerDetect`), so this list and the start card's step
+ * 1 are one answer. While step 1 is showing the install guide, this section points there rather than
+ * keeping a second copy; whenever it isn't — a server was found, or one is connected — the
+ * comparison here is the guide, so there is always one on the page.
  */
 export function LocalAiEndpoint({
   config,
@@ -44,6 +56,13 @@ export function LocalAiEndpoint({
   onReload,
   onError,
   onEndpointChanged,
+  error,
+  tuningOpen,
+  onTuningOpenChange,
+  detected,
+  onDetect,
+  guideInStart,
+  pickContext,
 }: {
   config: LocalLlmConfig | null;
   status: LocalLlmStatus | null;
@@ -54,14 +73,32 @@ export function LocalAiEndpoint({
   onError: (message: string | null) => void;
   /** The stored endpoint or its token changed, so anything proved against the old one is stale. */
   onEndpointChanged: () => void;
+  /** Something in this section went wrong, said here rather than at the top of the tab. */
+  error?: string | null;
+  /** The "Settings PM's numbers assume" fold, held by the tab so a pointer elsewhere can open it.
+   *  Omitted, the fold keeps its own state. */
+  tuningOpen?: boolean;
+  onTuningOpenChange?: (open: boolean) => void;
+  /** What the tab's port probe found while nothing is connected, or null before it has answered. */
+  detected: DetectedEndpoint[] | null;
+  /** Look again now, resolving to what was found. */
+  onDetect: () => Promise<DetectedEndpoint[]>;
+  /** The start card's step 1 is showing the install guide right now. */
+  guideInStart: boolean;
+  /** The context PM sized its pick for, so the steps here set that number — or null with no pick. */
+  pickContext: number | null;
 }) {
   const [urlInput, setUrlInput] = useState("");
-  const [detected, setDetected] = useState<DetectedEndpoint[] | null>(null);
+  // Whether this section's own Auto-detect has been pressed: the probe also runs by itself, and
+  // "nothing answered" is the answer to a question — said once someone has asked it here, rather
+  // than as a second copy of what the start card's first step already says.
+  const [asked, setAsked] = useState(false);
   const [checking, setChecking] = useState(false);
   const [check, setCheck] = useState<EndpointCheck | null>(null);
   const [tokenInput, setTokenInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [confirmForgetToken, setConfirmForgetToken] = useState(false);
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   // The endpoint form's two label/control pairs. Both labels sat above their Input naming nothing,
   // so the fields announced as the placeholder ("http://localhost:11434", "bearer token").
   const urlField = useFieldA11y();
@@ -75,15 +112,19 @@ export function LocalAiEndpoint({
     setUrlInput((u) => u || storedUrl || "");
   }, [storedUrl]);
 
+  // The two settings PM sized its numbers for, worded for the server this is — or nothing, for a
+  // server PM can't name by its port.
+  const runner = runnerOf(storedUrl);
+  const tuning = tuningFor(runner, undefined, pickContext);
+  // The comparison is the guide whenever step 1 isn't: once a server is found, step 1 is a Connect
+  // button, and someone with only LM Studio running who wants Ollama had no install steps anywhere.
+  const compare = configured || (detected?.length ?? 0) > 0;
+
   async function autodetect() {
     onError(null);
-    try {
-      const found = await probeLocalLlmPorts();
-      setDetected(found);
-      if (found.length === 1) setUrlInput(found[0].url);
-    } catch (e) {
-      onError(String(e));
-    }
+    setAsked(true);
+    const found = await onDetect();
+    if (found.length === 1) setUrlInput(found[0].url);
   }
 
   async function runCheck() {
@@ -143,7 +184,7 @@ export function LocalAiEndpoint({
     try {
       await clearLocalLlmEndpoint();
       setCheck(null);
-      setDetected(null);
+      setAsked(false);
       onEndpointChanged();
       await onReload();
     } catch (e) {
@@ -155,11 +196,11 @@ export function LocalAiEndpoint({
     <div
       id="sec-localai-endpoint"
       data-settings-section
-      data-help="settings-localai-endpoint"
+      data-help={sectionHelp("sec-localai-endpoint")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel action={configured && <StatusChip status={status} />}>
-        Connect an endpoint
+        {sectionLabel("sec-localai-endpoint")}
       </SectionLabel>
       {/* Which runners PM supports, stated up front and in BOTH states — this is a gating fact
           (what you need to have installed), not prose to fold away. */}
@@ -170,6 +211,7 @@ export function LocalAiEndpoint({
         the OpenAI API, at whatever address you give it. PM connects to a server{" "}
         <span className="text-ink2">you</span> run; it never bundles, installs, or starts one.
       </p>
+      {error && <Callout className="mt-2">{error}</Callout>}
 
       {configured ? (
         <div className="mt-2">
@@ -183,7 +225,7 @@ export function LocalAiEndpoint({
           {status != null && !status.reachable && !status.in_cooldown && (
             <p className="mt-1 text-xs text-ink4">
               PM can't reach it at the moment. The usual cause is that the server isn't running —
-              the guide below says, for each runner, whether it starts with your machine or you
+              the comparison below says, for each runner, whether it starts with your machine or you
               start it each session. PM keeps checking, so this clears on its own once it's back.
             </p>
           )}
@@ -195,8 +237,10 @@ export function LocalAiEndpoint({
             </p>
           )}
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <Button variant="tertiary" onClick={() => void disconnect()}>
-              Disconnect
+            {/* Asks first: it forgets more than the address — the token and both jobs' models go
+                with it, and what each job does afterwards depends on its routing. */}
+            <Button variant="tertiary" onClick={() => setConfirmDisconnect(true)}>
+              Disconnect…
             </Button>
             {config?.has_token && (
               <Button variant="tertiary" onClick={() => setConfirmForgetToken(true)}>
@@ -219,9 +263,52 @@ export function LocalAiEndpoint({
             role assignments stay as they are. If the server requires a token, PM won't be able to
             reach it until you connect again with a new one.
           </ConfirmDialog>
+          <ConfirmDialog
+            open={confirmDisconnect}
+            title="Disconnect from your model server?"
+            danger
+            confirmLabel="Disconnect"
+            onConfirm={() => {
+              setConfirmDisconnect(false);
+              void disconnect();
+            }}
+            onClose={() => setConfirmDisconnect(false)}
+          >
+            PM forgets this server's address, its saved token, and the models you gave chat and
+            background work. Your server and the models in it aren't touched. Afterwards, a job set
+            to Local only has nothing to answer with until you connect again, and one set to Local,
+            fall back to cloud uses your cloud model if you have one. To change the address or
+            token, disconnect and connect again.
+          </ConfirmDialog>
         </div>
       ) : (
         <div className="mt-2 space-y-3">
+          {detected && detected.length > 0 && (
+            <div className="text-xs">
+              <p className="text-ink4">Found on this computer:</p>
+              <ul className="mt-1 space-y-1">
+                {detected.map((d) => (
+                  <li key={d.url}>
+                    <button
+                      type="button"
+                      onClick={() => setUrlInput(d.url)}
+                      className="text-accent-text underline hover:brightness-110"
+                    >
+                      {d.label} — {d.url}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {/* Only while it's true: once a server is found, step 1 is a Connect button and the guide
+              is the comparison below this form. */}
+          {guideInStart && (
+            <p className="text-xs text-ink4">
+              Don't have one yet? Step 1 under <SectionLink to="sec-localai-start" /> has the
+              install steps for this computer.
+            </p>
+          )}
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="secondary" onClick={() => void autodetect()}>
               Auto-detect a local server
@@ -230,31 +317,13 @@ export function LocalAiEndpoint({
               Looks for Ollama, LM Studio, and llama-server on this machine.
             </span>
           </div>
-          {detected && (
-            <div className="text-xs">
-              {detected.length === 0 ? (
-                <p className="text-ink4">
-                  Nothing answered on port 11434, 1234 or 8080. If you've already installed one,
-                  it's most likely not running — check the guide below for whether yours starts on
-                  its own. Otherwise install one and auto-detect again. You can also type an address
-                  yourself, if your server is on a different port or another machine.
-                </p>
-              ) : (
-                <ul className="space-y-1">
-                  {detected.map((d) => (
-                    <li key={d.url}>
-                      <button
-                        type="button"
-                        onClick={() => setUrlInput(d.url)}
-                        className="text-accent-text underline hover:brightness-110"
-                      >
-                        {d.label} — {d.url}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+          {asked && detected && detected.length === 0 && (
+            <p className="text-xs text-ink4">
+              Nothing answered on port 11434, 1234 or 8080. If you've already installed one, it's
+              most likely not running — step 1 under <SectionLink to="sec-localai-start" /> says,
+              for each server, whether it starts on its own. You can also type an address yourself,
+              if your server is on a different port or another machine.
+            </p>
           )}
           <div>
             <label {...urlField.labelProps} className="block text-sm font-medium text-ink2">
@@ -297,8 +366,10 @@ export function LocalAiEndpoint({
             >
               {checking ? "Checking…" : "Check"}
             </Button>
+            {/* Secondary: the tab's one primary is the step it is on, and connecting from this form
+                is the by-hand route to the same write. */}
             <Button
-              variant="primary"
+              variant="secondary"
               onClick={() => void saveEndpoint()}
               disabled={saving || !urlInput.trim()}
             >
@@ -308,15 +379,42 @@ export function LocalAiEndpoint({
         </div>
       )}
 
-      {/* Outside the `configured` branch on purpose. It used to live inside the not-yet-connected
-          half, so the moment you connected anything the comparison vanished — and "was one of the
-          others a better choice for me?" is a question you mostly ask AFTER trying one. */}
-      <Collapsible
-        title={configured ? "Compare the three local servers" : "Don't have a local server yet?"}
-        defaultOpen={false}
-      >
-        <RunnerInstall />
-      </Collapsible>
+      {/* The settings PM's numbers assume, for the server this is. PM sizes for a longer context than
+          most servers start with, and on most graphics-card setups for a compressed cache — a model
+          PM says fits only fits that way once the server is set the same way, and nothing said so
+          before this. Folded (it is instructions), and held by the tab so a pointer can open it. */}
+      {configured && runner && tuning && (
+        <div id={TUNING_ID} className="mt-3">
+          <Collapsible
+            title={TUNING_TITLE}
+            defaultOpen={false}
+            open={tuningOpen}
+            onOpenChange={onTuningOpenChange}
+          >
+            <div className="mt-1 text-xs text-ink4">
+              <p>
+                PM sizes models for a longer context than most servers start with, and on most
+                graphics-card setups for a compressed (q8_0) cache. These are the {runner} settings
+                for both:
+              </p>
+              <ul className="mt-1.5 list-disc space-y-1 pl-4">
+                <li>{withCode(tuning.context)}</li>
+                <li>{withCode(tuning.cache)}</li>
+              </ul>
+            </div>
+          </Collapsible>
+        </div>
+      )}
+
+      {/* Whenever the start card's first step isn't the guide: once connected ("was one of the
+          others a better choice for me?" is a question you mostly ask AFTER trying one), and once a
+          server is found but not yet connected. Before that, step 1 is the guide — one guide on the
+          page, not two that could disagree. */}
+      {compare && (
+        <Collapsible title="Compare the three local servers" defaultOpen={false}>
+          <RunnerInstall connected={configured} pickContext={pickContext} />
+        </Collapsible>
+      )}
 
       <SectionInfo title="What leaves your device">
         <p>
@@ -372,17 +470,7 @@ function StatusChip({ status }: { status: LocalLlmStatus | null }) {
       token = "--st-due";
     }
   }
-  return (
-    <span
-      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium"
-      style={{
-        color: `var(${token})`,
-        background: `color-mix(in oklab, var(${token}) 15%, transparent)`,
-      }}
-    >
-      {label}
-    </span>
-  );
+  return <TokenChip token={token}>{label}</TokenChip>;
 }
 
 function EndpointCheckResult({ check }: { check: EndpointCheck }) {
@@ -413,7 +501,7 @@ function EndpointCheckResult({ check }: { check: EndpointCheck }) {
       {empty && (
         <p className="mt-1">
           It's running, but there are no models in it yet — so there is nothing for PM to send work
-          to. Download one into it, then check again.
+          to. Connect it anyway: with Ollama, PM can then download one into it for you.
         </p>
       )}
       {check.posture !== "loopback" && check.scheme_verdict !== "refused_public_cleartext" && (
@@ -431,9 +519,18 @@ function EndpointCheckResult({ check }: { check: EndpointCheck }) {
  *
  *  This used to be the Ollama guide plus one sentence conceding the other two exist, which left a
  *  user who had never installed any of them with no way to tell them apart — and PM auto-detects
- *  all three, so "which one?" is a question PM creates and ought to answer. */
-function RunnerInstall() {
-  const guides = runnerGuides();
+ *  all three, so "which one?" is a question PM creates and ought to answer.
+ *
+ *  `connected`: each guide ends with the step for someone who has to disconnect first, since PM
+ *  doesn't look for another server while one is connected. */
+function RunnerInstall({
+  connected,
+  pickContext,
+}: {
+  connected: boolean;
+  pickContext: number | null;
+}) {
+  const guides = runnerGuides(undefined, pickContext);
   return (
     <div className="mt-1 text-xs text-ink4">
       <p>
@@ -443,30 +540,7 @@ function RunnerInstall() {
       </p>
       <div className="mt-3 space-y-3">
         {guides.map((g) => (
-          <div key={g.name} className="rounded-[var(--radius-sm)] border border-border p-2.5">
-            <div className="flex flex-wrap items-baseline gap-x-2">
-              <span className="text-sm text-ink2">{g.name}</span>
-              <span className="font-mono text-[0.625rem] text-ink4">port {g.port}</span>
-            </div>
-            <p className="mt-0.5">{g.summary}</p>
-            <p className="mt-1.5 text-ink3">{g.bestFor}</p>
-            <p className="mt-1">
-              <span className="text-ink3">Models:</span> {g.models}
-            </p>
-            {/* Unfolded, never a caret: a hardware exclusion and "does this stay running?" are
-                gating facts, and the settings doctrine folds prose but not those. Lifecycle sits
-                immediately before the steps because it is what decides whether the steps are a
-                one-time setup or something you redo every session. */}
-            {g.caveat && <p className="mt-1 text-ink3">Worth knowing: {g.caveat}</p>}
-            <p className="mt-1 text-ink3">
-              <span className="text-ink3">Staying running:</span> {g.lifecycle}
-            </p>
-            <ol className="ml-4 mt-1.5 list-decimal space-y-1">
-              {g.steps.map((s, i) => (
-                <li key={i}>{s}</li>
-              ))}
-            </ol>
-          </div>
+          <RunnerGuideCard key={g.name} guide={g} connected={connected} />
         ))}
       </div>
     </div>

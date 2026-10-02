@@ -3,7 +3,9 @@
 
 import type { LocalRecommendations } from "../../lib/types";
 import { formatGib } from "../../lib/format";
-import { Button, SectionInfo, SectionLabel } from "../ui";
+import { useDepth } from "../../theme";
+import { sectionHelp, sectionLabel } from "./sections";
+import { Button, Callout, SectionInfo, SectionLabel } from "../ui";
 
 /**
  * "Your machine" — what PM read about this device, and the button that re-reads it.
@@ -17,17 +19,21 @@ export function LocalAiMachine({
   loading,
   rescanning,
   onRescan,
+  error,
 }: {
   recs: LocalRecommendations | null;
   loading: boolean;
   rescanning: boolean;
   onRescan: () => void;
+  /** Reading the hardware or sizing the list against it failed, said here rather than at the top
+   *  of the tab. */
+  error?: string | null;
 }) {
   return (
     <div
       id="sec-localai-machine"
       data-settings-section
-      data-help="settings-localai-machine"
+      data-help={sectionHelp("sec-localai-machine")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel
@@ -37,8 +43,9 @@ export function LocalAiMachine({
           </Button>
         }
       >
-        Your machine
+        {sectionLabel("sec-localai-machine")}
       </SectionLabel>
+      {error && <Callout className="mt-2">{error}</Callout>}
       {loading ? (
         <p className="mt-2 text-xs text-ink4">Scanning your hardware…</p>
       ) : recs ? (
@@ -57,10 +64,20 @@ export function LocalAiMachine({
   );
 }
 
+/** "22-07-2026" from the catalogue's `YYYY-MM-DD`, or the value as it came. */
+function ddmmyyyy(date: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(date);
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : date;
+}
+
 function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
+  const { showPower } = useDepth();
   const h = recs.hardware;
+  // The free memory every verdict in the list was scored against, read when it was sized — not the
+  // cached scan's figure, which can be minutes older than the fits beside it.
+  const free = recs.live_available_ram_gb ?? h.available_ram_gb;
   const rows: Array<[string, string]> = [
-    ["Memory", `${formatGib(h.available_ram_gb)} free of ${formatGib(h.total_ram_gb)}`],
+    ["Memory", `${formatGib(free)} free of ${formatGib(h.total_ram_gb)}`],
     [
       "Processor",
       `${h.cpu_brand ?? "—"}${h.cpu_cores ? ` · ${h.cpu_cores} cores` : ""}${h.cpu_threads ? ` / ${h.cpu_threads} threads` : ""}`,
@@ -68,7 +85,7 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
     [
       "Graphics",
       h.gpu_name
-        ? `${h.gpu_name}${h.vram_gb ? ` · ${formatGib(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}${h.gpu_bandwidth_gbps ? ` · ~${h.gpu_bandwidth_gbps.toFixed(0)} GB/s` : ""}`
+        ? `${h.gpu_name}${h.vram_gb ? ` · ${formatGib(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}${h.gpu_bandwidth_gbps ? ` · ${h.gpu_bandwidth_gbps.toFixed(0)} GB/s published` : ""}`
         : "No dedicated GPU detected",
     ],
     ["Free disk", formatGib(h.disk_free_gb)],
@@ -105,6 +122,18 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
         <p className="mt-1.5 text-xs text-ink4">
           Speed estimates use a default graphics-memory bandwidth — this card's exact model wasn't
           recognised.
+        </p>
+      )}
+      {h.unified_memory && (
+        <p className="mt-1.5 text-xs text-ink4">
+          PM doesn't estimate speed on chips that share memory with the processor yet — how fast
+          that memory is varies too much from chip to chip.
+        </p>
+      )}
+      {showPower && (
+        <p className="mt-1.5 text-xs text-ink4">
+          PM's model list: version {recs.catalog_version}, built{" "}
+          {ddmmyyyy(recs.catalog_generated_at)}.
         </p>
       )}
     </div>

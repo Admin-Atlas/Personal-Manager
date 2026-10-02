@@ -96,6 +96,14 @@ pub mod tunables {
     /// still caught fast by the connect timeout; this only bounds an accepted-then-wedged request.
     pub const BACKGROUND_TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
 
+    /// The ~60 s worst-case load BACKGROUND_TOTAL_TIMEOUT's 180 s already assumes (above).
+    ///
+    /// Named so the one other place that needs it says so rather than repeating a bare 60: PM's pick
+    /// (`better_fit::background_floor_tps`) asks whether a model could finish PM's largest background
+    /// reply inside what is left of that budget once the load has been paid for. Changing it moves
+    /// that floor; it changes no timeout.
+    pub const COLD_LOAD_ALLOWANCE: Duration = Duration::from_secs(60);
+
     /// Per-request deadline for the `/v1/models` reachability probe — a wrong URL must fail fast.
     pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -855,6 +863,9 @@ pub struct PullSnapshot {
     /// Still streaming. `false` is terminal: consult `error` and `status`.
     pub running: bool,
     pub error: Option<String>,
+    /// When the pull began, in Unix milliseconds ([`crate::epoch_ms`]). Carried so a view that mounts
+    /// mid-download can show how long it has been running instead of restarting the timer at zero.
+    pub started_at_ms: i64,
 }
 
 struct PullState {
@@ -1209,6 +1220,7 @@ impl LocalRuntime {
                 total_bytes: None,
                 running: true,
                 error: None,
+                started_at_ms: crate::epoch_ms(),
             },
             cancel: cancel.clone(),
         });
@@ -2067,6 +2079,26 @@ mod tests {
         assert!(rt.keep_local());
         assert!(rt.set_keep_local(false));
         assert!(!rt.keep_local());
+    }
+
+    #[test]
+    fn a_pull_is_stamped_with_when_it_began_and_keeps_it_to_the_end() {
+        // A view that mounts mid-download reads the start time from here; restarting its timer at
+        // zero on every remount is the bug this field exists to close.
+        let rt = LocalRuntime::default();
+        let before = crate::epoch_ms();
+        rt.begin_pull("hf.co/example/Model-GGUF:Q4_K_M")
+            .expect("the slot is free");
+        let after = crate::epoch_ms();
+        let started = rt.active_pull().expect("a running pull").started_at_ms;
+        assert!(
+            (before..=after).contains(&started),
+            "{before} <= {started} <= {after}"
+        );
+
+        // The terminal state leaves it alone: it is when the pull BEGAN.
+        rt.finish_pull(None);
+        assert_eq!(rt.active_pull().unwrap().started_at_ms, started);
     }
 
     #[test]

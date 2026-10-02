@@ -91,7 +91,7 @@ fn client_for(base_url: &str) -> &'static reqwest::Client {
 }
 
 /// Whether the URL's host is `localhost` or a loopback IP literal — a cheap string check (no DNS).
-fn host_is_loopback_literal(base_url: &str) -> bool {
+pub(crate) fn host_is_loopback_literal(base_url: &str) -> bool {
     let after_scheme = base_url
         .split_once("://")
         .map(|(_, rest)| rest)
@@ -713,9 +713,9 @@ pub fn model_in(resident: &[ResidentModel], model: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResidentModel {
     pub model: String,
-    /// Total bytes the server placed for it, in GB.
+    /// Total bytes the server placed for it, in GiB.
     pub size_gb: f64,
-    /// The share of that it reports as being on the GPU, in GB.
+    /// The share of that it reports as being on the GPU, in GiB.
     ///
     /// A FLOOR, not a measurement. It counts the weights the server placed and excludes the CUDA
     /// context and compute buffers: measured on a laptop card, a model reporting 2.70 GiB here was
@@ -739,12 +739,16 @@ pub fn resident_from_ps(value: &serde_json::Value) -> Vec<ResidentModel> {
                         .get("model")
                         .or_else(|| m.get("name"))
                         .and_then(|n| n.as_str())?;
+                    // GiB, like every other `*_gb` the Local AI tab shows and compares: these sit
+                    // beside the card's `vram_gb` and are rendered with `formatGib`. They were 1e9
+                    // bytes, which read a load 7.4% larger than the same load anywhere else.
+                    let gib = |key: &str| {
+                        m.get(key).and_then(|s| s.as_u64()).unwrap_or(0) as f64 / 1_073_741_824.0
+                    };
                     Some(ResidentModel {
                         model: name.to_string(),
-                        size_gb: m.get("size").and_then(|s| s.as_u64()).unwrap_or(0) as f64 / 1e9,
-                        size_vram_gb: m.get("size_vram").and_then(|s| s.as_u64()).unwrap_or(0)
-                            as f64
-                            / 1e9,
+                        size_gb: gib("size"),
+                        size_vram_gb: gib("size_vram"),
                         context_length: m
                             .get("context_length")
                             .and_then(|c| c.as_u64())
@@ -1411,6 +1415,23 @@ pub struct OllamaTag {
     /// into `None` here so a caller cannot mistake it for a quantization it merely lacks a size for.
     /// Untrusted content — the server read it out of a file — so bound it before display.
     pub quant: Option<String>,
+    /// `details.parameter_size` in billions (`"7.62B"` → 7.62, `"494.03M"` → 0.494), or `None` when
+    /// absent or not a size. What lets a bare library tag like `qwen2.5:latest`, whose name carries
+    /// no size at all, be matched back to a catalogue entry (`local_catalog::match_served`).
+    pub parameter_size_b: Option<f64>,
+}
+
+/// Parse Ollama's `details.parameter_size` (`"7.62B"`, `"494.03M"`) into billions. A trailing `B`/`b`
+/// is billions and `M`/`m` millions; anything else — `"unknown"`, a bare number, a negative or
+/// non-finite one — is `None`, because a guessed size would match the wrong catalogue entry.
+pub fn parse_parameter_size(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    let (number, scale) = match s.strip_suffix(['B', 'b']) {
+        Some(n) => (n, 1.0),
+        None => (s.strip_suffix(['M', 'm'])?, 1e-3),
+    };
+    let value: f64 = number.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value * scale)
 }
 
 /// Ollama's own inventory: every model in its store, loaded or not, with the real byte size of each.
@@ -1465,6 +1486,11 @@ pub fn tags_from_json(value: &serde_json::Value) -> Option<Vec<OllamaTag>> {
                         .map(str::trim)
                         .filter(|q| !q.is_empty() && !q.eq_ignore_ascii_case("unknown"))
                         .map(str::to_string),
+                    parameter_size_b: m
+                        .get("details")
+                        .and_then(|d| d.get("parameter_size"))
+                        .and_then(|p| p.as_str())
+                        .and_then(parse_parameter_size),
                 })
             })
             .collect(),
@@ -1826,11 +1852,12 @@ mod tests {
             resident[0].model,
             "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
         );
-        assert!((resident[0].size_gb - 2.896).abs() < 0.001);
+        // 2_896_083_024 bytes in GiB — the 2.70 the comment below quotes, not 2.90 in decimal GB.
+        assert!((resident[0].size_gb - 2.697).abs() < 0.001);
         // `size_vram` is carried, but it is a FLOOR: on this measurement the card was actually
         // holding 3.95 GiB against the 2.70 GiB reported, because the CUDA context and compute
         // buffers sit outside it. Nothing may use this to prove something fits.
-        assert!((resident[0].size_vram_gb - 2.896).abs() < 0.001);
+        assert!((resident[0].size_vram_gb - 2.697).abs() < 0.001);
 
         // Nothing loaded, and a body that is not a `/api/ps` answer at all, both read as "nothing".
         let empty: serde_json::Value = serde_json::from_str(r#"{"models":[]}"#).unwrap();
@@ -1860,6 +1887,30 @@ mod tests {
         // the UNKNOWN quantization yet" — asserting knowledge the server had just disclaimed.
         assert_eq!(tags[0].quant, None);
         assert_eq!(tags[1].quant.as_deref(), Some("Q5_K_M"));
+        // The parameter count rides along — the one fact a bare library tag's name does not carry.
+        assert_eq!(tags[0].parameter_size_b, Some(3.88));
+        assert_eq!(tags[1].parameter_size_b, Some(7.62));
+    }
+
+    #[test]
+    fn a_parameter_size_is_read_in_billions_or_not_at_all() {
+        assert_eq!(parse_parameter_size("7.62B"), Some(7.62));
+        assert_eq!(parse_parameter_size(" 8.0b "), Some(8.0));
+        let small = parse_parameter_size("494.03M").unwrap();
+        assert!((small - 0.49403).abs() < 1e-9, "{small}");
+        // Ollama's own "I don't know", and the shapes a guess would hide behind.
+        for raw in ["unknown", "", "7.62", "B", "-7B", "NaNB", "infB", "7.6 GB"] {
+            assert_eq!(parse_parameter_size(raw), None, "{raw:?}");
+        }
+
+        // Missing from the listing entirely: no size, never a zero.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"models":[{"name":"llama3.2:latest","size":2019393189,"details":{}},
+                          {"name":"qwen2.5:latest","size":4683087332}]}"#,
+        )
+        .unwrap();
+        let tags = tags_from_json(&body).expect("a tags listing");
+        assert!(tags.iter().all(|t| t.parameter_size_b.is_none()));
     }
 
     #[test]
