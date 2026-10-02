@@ -119,6 +119,58 @@ pub enum ChatEvent {
         to_model: String,
         reason: String,
     },
+    /// The model's thinking, live, only when the send opted in (`show_thinking`). **Never
+    /// persisted**: not in `messages`, the vault, the index, summaries or `Done.content`, and never
+    /// replayed to the model. Arrives before the answer's tokens.
+    Thinking {
+        text: String,
+    },
+    /// About the thinking being shown, and only for a send that opted in. `fell_back`: the local leg
+    /// failed after thinking was shown, before any answer, so the UI drops the shown thinking now and
+    /// the cloud answers instead. `no_room`: this turn was answered without thinking, because the
+    /// conversation leaves the model no room to think in the window the server proved.
+    ThinkingNote {
+        note: llm_gateway::ThinkingNote,
+    },
+}
+
+/// One stream delta → the Channel event it becomes, if any. Thinking and its notes cross to the
+/// webview only when this send asked for them: a second gate behind the stream client's own.
+fn chat_event_for(delta: llm_gateway::ChatDelta<'_>, show_thinking: bool) -> Option<ChatEvent> {
+    use llm_gateway::ChatDelta;
+    match delta {
+        ChatDelta::Answer(t) => Some(ChatEvent::Token {
+            text: t.to_string(),
+        }),
+        ChatDelta::Thinking(t) if show_thinking => Some(ChatEvent::Thinking {
+            text: t.to_string(),
+        }),
+        ChatDelta::Note(note) if show_thinking => Some(ChatEvent::ThinkingNote { note }),
+        _ => None,
+    }
+}
+
+/// A reply with no answer in it is not a turn: storing it puts a blank (or a cut-off marker and
+/// nothing else) into `messages`, the vault, the index and the summary. `None` when the reply has
+/// an answer. (Thinking with no answer never gets here on the local arm: it is UnfinishedThought.)
+///
+/// A turn the On battery policy sent to the cloud names the way back to the local model, like every
+/// other failure of that turn ([`llm_gateway::power_route_error`]). There it replaces "Try again":
+/// a cloud model that spent its whole budget reasoning is likely to come back empty again.
+fn empty_reply_error(c: &openrouter::Completion, power_routed: bool) -> Option<Error> {
+    if !c.text.trim().is_empty() {
+        return None;
+    }
+    let what = if c.truncated {
+        "The model stopped before it wrote an answer, so PM didn't save this reply"
+    } else {
+        "The model sent back an empty reply, so PM didn't save it"
+    };
+    Some(if power_routed {
+        llm_gateway::power_route_error(Error::Other(what.into()))
+    } else {
+        Error::Other(format!("{what}. Try again."))
+    })
 }
 
 // --- conversations & messages ---
@@ -518,8 +570,12 @@ pub async fn send_message(
     // before streaming so the UI can show exactly what was sent. The frontend sets this from the
     // Developer-mode toggle, so a normal chat leaves it false and ships no prompt to the webview.
     capture_prompt: bool,
+    // The chat Thinking toggle, read by the frontend at send time. `None` (an older caller that
+    // omits it) is off. Only this streaming path can carry it; background work never sees it.
+    show_thinking: Option<bool>,
     on_event: Channel<ChatEvent>,
 ) -> Result<()> {
+    let show_thinking = show_thinking.unwrap_or(false);
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err(Error::Other("message is empty".into()));
@@ -738,12 +794,20 @@ pub async fn send_message(
         });
     }
 
-    // Stream the reply, forwarding each token to the UI.
-    let result = llm_gateway::stream_chat(&app, &plan, &messages, cache_through, |token| {
-        let _ = on_event.send(ChatEvent::Token {
-            text: token.to_string(),
-        });
-    })
+    // Stream the reply, forwarding each token to the UI — and, only when this send asked for it, the
+    // model's thinking, which is never kept: nothing below this call can see it.
+    let result = llm_gateway::stream_chat(
+        &app,
+        &plan,
+        &messages,
+        cache_through,
+        show_thinking,
+        |delta| {
+            if let Some(ev) = chat_event_for(delta, show_thinking) {
+                let _ = on_event.send(ev);
+            }
+        },
+    )
     .await;
 
     let llm_gateway::LlmOutcome { completion, meta } = match result {
@@ -763,6 +827,23 @@ pub async fn send_message(
             return Err(e);
         }
     };
+    // A reply with no answer is reported, never saved — on every route, cloud included. Nothing is
+    // persisted: the user turn left behind is cleared by the unanswered-turn cleanup on the next send.
+    if let Some(e) = empty_reply_error(&completion, power_routed) {
+        // Spent tokens are real: log them in their own short scope (the DB mutex is non-reentrant),
+        // and never let a DB hiccup replace the user-facing reason.
+        let used = completion
+            .model
+            .clone()
+            .unwrap_or_else(|| plan.primary_model_id().to_string());
+        if let Ok(conn) = state.conn() {
+            log_usage(&conn, "chat", Some(&used), &completion.usage, &meta);
+        }
+        let _ = on_event.send(ChatEvent::Error {
+            message: e.to_string(),
+        });
+        return Err(e);
+    }
     // If the local endpoint the user preferred didn't serve this turn (it failed or was resting), tell
     // the UI so it can render the honesty strip (#297 PR6) — a fell-back reply is real, so this is
     // NOT an Error. A power-policy route is not a failure and never reaches this strip.
@@ -1292,6 +1373,107 @@ mod tests {
         assert_eq!(fb["type"], "fallback");
         assert_eq!(fb["from_model"], "llama3");
         assert_eq!(fb["reason"], "hard_failure:timeout");
+
+        // The two thinking arms the TS union mirrors as `thinking` / `thinking_note`.
+        let thinking = serde_json::to_value(ChatEvent::Thinking {
+            text: "Let me check the invoice…".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            thinking,
+            serde_json::json!({"type": "thinking", "text": "Let me check the invoice…"})
+        );
+        let fell_back = serde_json::to_value(ChatEvent::ThinkingNote {
+            note: llm_gateway::ThinkingNote::FellBack,
+        })
+        .unwrap();
+        assert_eq!(
+            fell_back,
+            serde_json::json!({"type": "thinking_note", "note": "fell_back"})
+        );
+        let no_room = serde_json::to_value(ChatEvent::ThinkingNote {
+            note: llm_gateway::ThinkingNote::NoRoom,
+        })
+        .unwrap();
+        assert_eq!(no_room["type"], "thinking_note");
+        assert_eq!(no_room["note"], "no_room");
+    }
+
+    /// The second gate on "never shown unless asked": whatever the stream client hands up, thinking
+    /// and its notes become Channel events only for a send that opted in. The answer always goes.
+    #[test]
+    fn thinking_crosses_to_the_webview_only_when_asked() {
+        use llm_gateway::{ChatDelta, ThinkingNote};
+        const SENTINEL: &str = "THOUGHT-SENTINEL-7f3";
+        let wire =
+            |delta, show| chat_event_for(delta, show).map(|ev| serde_json::to_value(ev).unwrap());
+
+        assert!(wire(ChatDelta::Thinking(SENTINEL), false).is_none());
+        assert_eq!(
+            wire(ChatDelta::Thinking(SENTINEL), true),
+            Some(serde_json::json!({"type": "thinking", "text": SENTINEL}))
+        );
+
+        for note in [ThinkingNote::FellBack, ThinkingNote::NoRoom] {
+            assert!(wire(ChatDelta::Note(note), false).is_none(), "{note:?}");
+            assert_eq!(
+                wire(ChatDelta::Note(note), true).unwrap()["type"],
+                "thinking_note",
+                "{note:?}"
+            );
+        }
+
+        for show in [false, true] {
+            assert_eq!(
+                wire(ChatDelta::Answer("Taxes"), show),
+                Some(serde_json::json!({"type": "token", "text": "Taxes"})),
+                "show={show}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_with_no_answer_is_not_a_turn() {
+        let reply = |text: &str, truncated: bool| openrouter::Completion {
+            text: text.into(),
+            model: None,
+            usage: openrouter::Usage::default(),
+            truncated,
+        };
+        let message = |text: &str, truncated: bool, power_routed: bool| {
+            empty_reply_error(&reply(text, truncated), power_routed).map(|e| e.to_string())
+        };
+        let empty = "The model sent back an empty reply, so PM didn't save it. Try again.";
+        let stopped =
+            "The model stopped before it wrote an answer, so PM didn't save this reply. Try again.";
+        assert_eq!(message("", false, false).as_deref(), Some(empty));
+        assert_eq!(message("  \n", false, false).as_deref(), Some(empty));
+        assert_eq!(message("", true, false).as_deref(), Some(stopped));
+        assert_eq!(message(" \n", true, false).as_deref(), Some(stopped));
+        assert_eq!(message("hi", false, false), None);
+        // A cut-off reply with real text in it is still a turn; the cut-off marker says so.
+        assert_eq!(message("hi", true, false), None);
+
+        // On battery the cloud answered with nothing, and the way out is the one every other failed
+        // battery-routed turn names: back to the local model, not the same cloud model again.
+        let hint = llm_gateway::POWER_ROUTED_FAILED_HINT;
+        assert_eq!(
+            message("", false, true),
+            Some(format!(
+                "The model sent back an empty reply, so PM didn't save it — {hint}"
+            ))
+        );
+        assert_eq!(
+            message(" \n", true, true),
+            Some(format!(
+                "The model stopped before it wrote an answer, so PM didn't save this reply — {hint}"
+            ))
+        );
+        assert!(
+            message("", true, true).is_some_and(|m| m.contains("Keep using local until I quit PM"))
+        );
+        assert_eq!(message("hi", false, true), None);
+        assert_eq!(message("hi", true, true), None);
     }
 
     /// A minimal retrieved chunk for the M-7 assembler tests: only the fields the grounding payload

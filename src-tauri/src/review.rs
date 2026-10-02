@@ -55,7 +55,17 @@ const EXCERPT_CHARS: usize = 2000;
 /// are LOGGED (a hand-filed row with no proposal stopped inventing a correction of nothing). A later
 /// per-source accuracy readout must therefore not read the 2 → 3 step as single-cause: v3 has both a
 /// different proposal pipeline and a smaller, truer correction population.
-pub const FILING_PIPELINE_VERSION: i64 = 3;
+///
+/// Version 4 (2026-10-02, #852) switched thinking off for background filing: on an Ollama of 0.12.5
+/// or later every filing request now carries `reasoning_effort: "none"`
+/// ([`crate::openai_compat::THINKING_OFF`]), so a model that thinks before it answers now answers
+/// straight away, where it used to spend 1,353-1,580 tokens thinking first. Measured on gemma 4
+/// 12b, one invoice into one of four projects came back the same either way, in 0.9 s instead of
+/// 48-61 s — but that is one document, and the rule is to bump on any change that can move filing
+/// accuracy. Every other server is sent exactly what it was sent under v3, and a model that never
+/// thinks takes the field and answers as before (measured on Qwen2.5 7B and gemma 3 4b), so a
+/// readout that spans the step can only plausibly move on a thinking model behind a recent Ollama.
+pub const FILING_PIPELINE_VERSION: i64 = 4;
 
 /// The AI's proposed organisation for a document, shown in the Review view.
 #[derive(Clone, Debug, Serialize, Deserialize)]

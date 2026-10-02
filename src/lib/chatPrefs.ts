@@ -1,9 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Per-device view prefs for the Chats tab's sidebar — currently just which of its two sections
-// ("Projects" and "Global chats") the user has folded away. Display-only with no backend consumer,
-// so localStorage, never a backend Setting (mirrors focusPrefs / mapPrefs).
+// Per-device view prefs for chat: which of the Chats tab sidebar's two sections ("Projects" and
+// "Global chats") the user has folded away, and the composer's Thinking toggle. The folds are
+// display-only with no backend consumer, so localStorage, never a backend Setting (mirrors
+// focusPrefs / mapPrefs).
+//
+// The chat Thinking toggle is the one pref here with a backend reader. Like Developer mode's
+// `capturePrompt`, it travels with each send (`sendMessage(..., showThinking)`). The backend never
+// stores it, so it stays per-device view state in localStorage, not a backend Setting.
 //
 // The stored value is deliberately TRI-STATE: absent means "never chosen", not "open". The two
 // sections seed their initial state from density (`!minimal` for Projects), so a plain boolean
@@ -75,6 +80,45 @@ export function chatSectionsAreDefault(): boolean {
 export function resetChatSections(): void {
   try {
     localStorage.removeItem(SECTIONS_KEY);
+  } catch {
+    /* best-effort */
+  }
+  announce();
+}
+
+// The Thinking toggle. Stored as "1" when on; turning it off REMOVES the key, so absent is the
+// default and a reset is a single remove. Any other value, or storage that throws, reads as off —
+// the off state is #852's fast path, so every doubt lands there.
+const SHOW_THINKING_KEY = "pm.chat.showThinking";
+
+/** Whether chat should ask the local model to think and stream its thinking. Off unless chosen. */
+export function readShowThinking(): boolean {
+  try {
+    return localStorage.getItem(SHOW_THINKING_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function writeShowThinking(on: boolean): void {
+  try {
+    if (on) localStorage.setItem(SHOW_THINKING_KEY, "1");
+    else localStorage.removeItem(SHOW_THINKING_KEY);
+  } catch {
+    /* best-effort */
+  }
+  announce();
+}
+
+/** True when the Thinking toggle is at its default (off). */
+export function showThinkingIsDefault(): boolean {
+  return !readShowThinking();
+}
+
+/** Back to off — the default is the absent key. */
+export function resetShowThinking(): void {
+  try {
+    localStorage.removeItem(SHOW_THINKING_KEY);
   } catch {
     /* best-effort */
   }

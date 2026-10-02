@@ -246,6 +246,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Where you left off",
     body: "Marks where an earlier conversation picks back up, with when it was last active — so a long-running chat you return to reads in order instead of looking brand-new.",
   },
+  "chat-thinking-toggle": {
+    title: "Thinking",
+    body: "Shows what your own model thinks before it answers, in a fold above the reply. On Ollama (0.12.5 or newer) PM normally asks the model to skip thinking, so replies come back in about a second. With this on, the model thinks first and replies take longer: close to a minute with gemma 4. On LM Studio and llama-server your server decides whether the model thinks, so this only shows or hides it. It only changes chat on this device: filing, titles, summaries and other background work skip thinking wherever PM can switch it off, and on LM Studio and llama-server they do what your server is set up to do. The thinking isn't saved: it's gone when you restart PM, and it never reaches your vault, summaries or search. The button only appears while chat is going to your own model.",
+  },
+  "chat-thinking": {
+    title: "The model's thinking",
+    body: "What the model worked through before it answered, and how long it took. It's the model's own working, not checked facts, and it can be wrong even when the answer is right. PM stops a model that thinks for more than five minutes without answering, or whose thinking gets stuck repeating itself. If a conversation is too long to leave room to think, PM answers without thinking and says so. None of it is kept: it's gone when you restart PM.",
+  },
 
   // Calendar (unified read-only view, card 8)
   "calendar-view": {

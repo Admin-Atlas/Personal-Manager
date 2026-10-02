@@ -4,7 +4,17 @@
 import { useCallback, useRef, useState } from "react";
 import { sendMessage } from "./ipc";
 import { useDevMode } from "./capabilities";
-import type { ChatFallback, GroundingConfidence, Message, PromptMessage, ServedBy } from "./types";
+import { readShowThinking } from "./chatPrefs";
+import type {
+  ChatFallback,
+  ChatThought,
+  GroundingConfidence,
+  LiveThought,
+  Message,
+  PromptMessage,
+  ServedBy,
+  ThoughtFold,
+} from "./types";
 
 /**
  * Chat send + streaming state, shared by the global chat (App) and the
@@ -44,6 +54,20 @@ export function useChatStream(currentConvId: () => number | null) {
   // `fallback` event, which arrives after the tokens and before `done`). Rendered as the dismissible
   // FallbackStrip and cleared on dismiss / next send / conversation switch — NOT on `done`.
   const [fallback, setFallback] = useState<ChatFallback | null>(null);
+  // The chat Thinking toggle's output. `streamingThought` is the live thinking while a reply streams,
+  // transient like `streaming`. `thoughts` has the same lifecycle as `prompts`: keyed by assistant
+  // message id, committed on `done`, never persisted, kept across switches. Thinking is model output
+  // and never saved, so a reloaded turn has none.
+  const [streamingThought, setStreamingThought] = useState<LiveThought | null>(null);
+  const [thoughts, setThoughts] = useState<Record<number, ChatThought>>({});
+  // Where the user left the live thinking fold, per conversation: one reply streams per conversation
+  // at a time, so the conversation names the turn until `done` gives it a message id. The live fold
+  // and the settled one are separate mounts, with a gap between them while the messages reload, so
+  // without this a fold opened to read mid-answer snapped shut and lost its place as the turn
+  // settled. A ref, not state: nothing renders from it until a fold mounts and seeds from it (through
+  // `streamingThought` and the committed thought). An entry is dropped when its conversation's next
+  // send starts, and nothing reads it in between.
+  const liveFolds = useRef(new Map<number, ThoughtFold>());
 
   // Keep the getter in a ref so `send` can stay stable across renders.
   const currentRef = useRef(currentConvId);
@@ -59,9 +83,11 @@ export function useChatStream(currentConvId: () => number | null) {
    *  send's streaming bubble and disabled composer don't linger. The dev-only
    *  `prompts`/`confidences` maps are deliberately NOT cleared here — they're keyed
    *  by assistant message id, so they only attach to their own turn, and keeping
-   *  them lets a captured readout survive a tab switch or conversation revisit. */
+   *  them lets a captured readout survive a tab switch or conversation revisit.
+   *  `thoughts` is kept for the same reason; only the live `streamingThought` goes. */
   const clearTransient = useCallback(() => {
     setStreaming(null);
+    setStreamingThought(null);
     setSending(false);
     setError(null);
     setFallback(null);
@@ -70,6 +96,13 @@ export function useChatStream(currentConvId: () => number | null) {
   /** Dismiss the fallback honesty strip (the user has seen it). Transient-only; a new send or a
    *  conversation switch also clears it. */
   const dismissFallback = useCallback(() => setFallback(null), []);
+
+  /** The live thinking fold reporting where the user left it (ChatView's `onLiveFold`). Only the
+   *  conversation on screen has a live fold, so that is the one it belongs to. */
+  const noteLiveFold = useCallback((fold: ThoughtFold) => {
+    const id = currentRef.current();
+    if (id !== null) liveFolds.current.set(id, fold);
+  }, []);
 
   /** Append the user's message optimistically and stream the assistant reply
    *  into `streaming`. Resolves once the exchange is persisted (whether or not
@@ -95,6 +128,7 @@ export function useChatStream(currentConvId: () => number | null) {
     };
     setMessages((prev) => [...prev, optimistic]);
     setStreaming("");
+    setStreamingThought(null);
     setSending(true);
 
     let acc = "";
@@ -102,6 +136,17 @@ export function useChatStream(currentConvId: () => number | null) {
     // under the assistant message id once `done` delivers it, so the dropdown attaches to its turn.
     let captured: PromptMessage[] | null = null;
     let capturedConfidence: GroundingConfidence | null = null;
+    // This turn's thinking, accumulated the same way as `acc` and committed to `thoughts` on `done`.
+    // `skipped` is a `no_room` note: the turn was answered without thinking, and the UI says so.
+    let live: LiveThought | null = null;
+    let skipped = false;
+    liveFolds.current.delete(convId);
+    // Publish the live thought with where the user left its fold, so a fold that mounts again (the
+    // user came back mid-reply) opens where they left it.
+    const showThought = () => {
+      if (live && isCurrent())
+        setStreamingThought({ ...live, fold: liveFolds.current.get(convId) });
+    };
     try {
       await sendMessage(
         convId,
@@ -112,6 +157,28 @@ export function useChatStream(currentConvId: () => number | null) {
           if (event.type === "token") {
             acc += event.text;
             if (isCurrent()) setStreaming(acc);
+            // The first answer token stops the thinking clock — once per turn. The thought is
+            // published on every token, not only that one: a view the user left and came back to
+            // mid-answer had it cleared, and would otherwise lose the fold until `done`.
+            if (live && live.answeredAt === null) live = { ...live, answeredAt: Date.now() };
+            showThought();
+          } else if (event.type === "thinking") {
+            live = live
+              ? { ...live, text: live.text + event.text }
+              : { text: event.text, startedAt: Date.now(), answeredAt: null };
+            // `streaming` too: ChatView draws the live block inside the streaming column, and a view
+            // the user left and came back to mid-thought had both cleared — without this it would
+            // stay blank until the first answer token, which can be minutes away.
+            if (isCurrent()) setStreaming(acc);
+            showThought();
+          } else if (event.type === "thinking_note") {
+            if (event.note === "fell_back") {
+              // The local model's thinking, under a reply the cloud is about to give: drop it.
+              live = null;
+              if (isCurrent()) setStreamingThought(null);
+            } else if (event.note === "no_room") {
+              skipped = true;
+            }
           } else if (event.type === "prompt") {
             captured = event.messages;
             capturedConfidence = event.confidence;
@@ -120,6 +187,23 @@ export function useChatStream(currentConvId: () => number | null) {
             if (p && isCurrent()) setPrompts((prev) => ({ ...prev, [event.message_id]: p }));
             const c = capturedConfidence;
             if (c && isCurrent()) setConfidences((prev) => ({ ...prev, [event.message_id]: c }));
+            const t: LiveThought | null = live;
+            // Only a reply the local model gave carries a thought. A cloud reply never sits under
+            // local thinking (`fell_back` already dropped any that was shown), nor under "Answered
+            // without thinking": a `no_room` turn whose local leg then failed before answering was
+            // answered by the cloud, which never thinks here, so neither that line's reason nor its
+            // fix applies to it.
+            if ((t || skipped) && event.served_by === "local" && isCurrent()) {
+              const thought: ChatThought = {
+                text: t?.text ?? "",
+                seconds: t
+                  ? Math.max(0, Math.floor(((t.answeredAt ?? Date.now()) - t.startedAt) / 1000))
+                  : null,
+                skipped,
+                fold: liveFolds.current.get(convId),
+              };
+              setThoughts((prev) => ({ ...prev, [event.message_id]: thought }));
+            }
             if (isCurrent()) {
               const servedBy: ServedBy = event.on_battery ? "cloud-on-battery" : event.served_by;
               setProviders((prev) => ({ ...prev, [event.message_id]: servedBy }));
@@ -137,6 +221,9 @@ export function useChatStream(currentConvId: () => number | null) {
           }
         },
         devModeRef.current,
+        // Read at send time, synchronously, so `send` needs no dep on it: a queued message goes with
+        // the toggle as it stands the moment it is sent, not as it stood when it was typed.
+        readShowThinking(),
       );
     } catch (e) {
       ok = false;
@@ -145,6 +232,7 @@ export function useChatStream(currentConvId: () => number | null) {
       if (isCurrent()) {
         setSending(false);
         setStreaming(null);
+        setStreamingThought(null);
       }
     }
     return ok;
@@ -164,5 +252,8 @@ export function useChatStream(currentConvId: () => number | null) {
     providers,
     fallback,
     dismissFallback,
+    streamingThought,
+    thoughts,
+    noteLiveFold,
   };
 }

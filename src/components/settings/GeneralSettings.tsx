@@ -23,7 +23,12 @@ import {
 } from "../../lib/mapPrefs";
 import { focusViewPrefsAreDefault, resetFocusViewPrefs } from "../../lib/focusPrefs";
 import { readOpenOn, writeOpenOn } from "../../lib/calendarPrefs";
-import { chatSectionsAreDefault, resetChatSections } from "../../lib/chatPrefs";
+import {
+  chatSectionsAreDefault,
+  resetChatSections,
+  resetShowThinking,
+  showThinkingIsDefault,
+} from "../../lib/chatPrefs";
 import {
   briefingPrefsAreDefault,
   readBriefingFloat,
@@ -267,10 +272,14 @@ export function GeneralSettings() {
   // The Chats-tab sidebar folds, same story as the Focus prefs above: the control lives beside what
   // it changes (one control, one home) and only the RESET lives here, so this needs the same live
   // subscription rather than a read at mount. There is no Chats section on this tab to hang a
-  // dedicated ResetLink off, so the tab-level "Reset General" is its only home.
-  const [chatSectionsDefault, setChatSectionsDefault] = useState(chatSectionsAreDefault);
+  // dedicated ResetLink off, so the tab-level "Reset General" is its only home. The chat composer's
+  // Thinking toggle rides the same flag: its only Settings presence is this tab-level reset.
+  const [chatSectionsDefault, setChatSectionsDefault] = useState(
+    () => chatSectionsAreDefault() && showThinkingIsDefault(),
+  );
   useEffect(() => {
-    const onChanged = () => setChatSectionsDefault(chatSectionsAreDefault());
+    const onChanged = () =>
+      setChatSectionsDefault(chatSectionsAreDefault() && showThinkingIsDefault());
     window.addEventListener("pm:settings-changed", onChanged);
     return () => window.removeEventListener("pm:settings-changed", onChanged);
   }, []);
@@ -310,6 +319,7 @@ export function GeneralSettings() {
     resetConfirmDelete();
     resetFocus();
     resetChatSections(); // the Chats-tab sidebar folds, back to density-derived
+    resetShowThinking(); // the chat Thinking toggle, back to off
     setChatSectionsDefault(true);
     help.setEnabled(false);
     // Time zone is intentionally left alone — it's derived from the device, not a taste preference.

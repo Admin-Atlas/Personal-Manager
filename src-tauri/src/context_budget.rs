@@ -160,6 +160,20 @@ pub fn prompt_ceiling(window: Option<i64>) -> Option<i64> {
     (ceiling > 0).then_some(ceiling)
 }
 
+/// Extra room held back for a model's thinking when the user has asked to see it. Measured thinking
+/// is 1,353-1,580 tokens (gemma 4 12b, Ollama 0.33.0), larger than the whole REPLY_RESERVE_TOKENS.
+pub const THINKING_RESERVE_TOKENS: i64 = 2048;
+
+/// The prompt ceiling when the model will think first: reply AND thinking reserves, capped at half
+/// the window so a small window keeps a usable prompt. Never above `prompt_ceiling`.
+/// 4096 → 2048, 8192 → 5120, 32768 → 29696, None → None.
+pub fn thinking_prompt_ceiling(window: Option<i64>) -> Option<i64> {
+    let w = window?;
+    let reserve = (REPLY_RESERVE_TOKENS + THINKING_RESERVE_TOKENS).min(w / 2);
+    let ceiling = w - reserve;
+    (ceiling > 0).then_some(ceiling)
+}
+
 /// The largest batch size in `1..=max` whose prompt fits under `ceiling`, found by halving.
 ///
 /// `cost(n)` must return the token size of the prompt this caller would build for `n` items.
@@ -369,6 +383,28 @@ mod tests {
         // Nonsense windows are still not budgets.
         assert_eq!(prompt_ceiling(Some(0)), None);
         assert_eq!(prompt_ceiling(Some(-1)), None);
+    }
+
+    #[test]
+    fn thinking_prompt_ceiling_holds_back_room_to_think() {
+        assert_eq!(thinking_prompt_ceiling(Some(4096)), Some(2048));
+        assert_eq!(thinking_prompt_ceiling(Some(8192)), Some(5120));
+        assert_eq!(thinking_prompt_ceiling(Some(32768)), Some(29696));
+        assert_eq!(
+            thinking_prompt_ceiling(None),
+            None,
+            "unknown window ⇒ no ceiling"
+        );
+        assert_eq!(thinking_prompt_ceiling(Some(0)), None);
+        assert_eq!(thinking_prompt_ceiling(Some(-1)), None);
+        // Thinking only ever takes room away: a prompt that fits the thinking ceiling always fits the
+        // normal one, so asking to think can never let through a prompt the fit gate would refuse.
+        for w in (1..=65536).step_by(7) {
+            assert!(
+                thinking_prompt_ceiling(Some(w)) <= prompt_ceiling(Some(w)),
+                "window {w}"
+            );
+        }
     }
 
     #[test]

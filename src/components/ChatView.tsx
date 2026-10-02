@@ -14,11 +14,14 @@ import {
 } from "react";
 import type {
   AnswerRating,
+  ChatThought,
   Citation,
   GroundingConfidence,
+  LiveThought,
   Message,
   PromptMessage,
   ServedBy,
+  ThoughtFold,
 } from "../lib/types";
 import { scrollBehavior, useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
@@ -37,11 +40,19 @@ import {
   setRetrievalConfidenceThreshold,
 } from "../lib/ipc";
 import { IconButton, VisuallyHidden } from "./ui";
+import { LiveThinkingBlock, ThinkingBlock } from "./ThinkingBlock";
 
 interface Props {
   messages: Message[];
   /** Live assistant text while a reply streams in; null when idle. */
   streaming: string | null;
+  /** Live thinking while a reply streams (Thinking toggle). Never persisted. */
+  streamingThought?: LiveThought | null;
+  /** Each turn's thinking this session, keyed by assistant message id. */
+  thoughts?: Record<number, ChatThought>;
+  /** Where the user leaves the live thinking fold (`useChatStream`'s `noteLiveFold`), so the settled
+   *  fold that replaces it opens as they left it. Absent: the settled fold always starts folded. */
+  onLiveFold?: (fold: ThoughtFold) => void;
   /** Developer mode only: the exact request PM sent for a turn, keyed by assistant message id, shown
    *  in a collapsed "prompt sent to the API" dropdown under that turn (card #395). Only turns sent this
    *  session carry one; reloaded history turns don't. */
@@ -538,10 +549,12 @@ const SERVED_LABEL: Record<ServedBy, string> = {
 // STABLE callbacks and `highlight` is a plain bool, so a settled turn's props don't change token-to-token
 // and React skips it. `message` is referentially stable (it comes from the unchanged `messages` array).
 // `prompt` is stable too — a functional `prompts` update keeps existing turns' arrays by reference — and
-// `showPrompt` is a plain bool, so the dev dropdown doesn't defeat the memo.
+// `showPrompt` is a plain bool, so the dev dropdown doesn't defeat the memo. `thought` holds the same
+// way: the functional `thoughts` update keeps every earlier turn's object by reference.
 const MessageBlock = memo(function MessageBlock({
   message,
   prompt,
+  thought,
   confidence,
   provider,
   showProvenance,
@@ -553,6 +566,7 @@ const MessageBlock = memo(function MessageBlock({
 }: {
   message: Message;
   prompt?: PromptMessage[];
+  thought?: ChatThought;
   confidence?: GroundingConfidence;
   provider?: ServedBy;
   showProvenance?: boolean;
@@ -584,6 +598,14 @@ const MessageBlock = memo(function MessageBlock({
         highlight ? "ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]" : ""
       }`}
     >
+      {message.role === "assistant" && thought && (
+        <ThinkingBlock
+          text={thought.text}
+          seconds={thought.seconds}
+          skipped={thought.skipped}
+          fold={thought.fold}
+        />
+      )}
       <Bubble
         role={message.role}
         content={message.content}
@@ -634,6 +656,9 @@ const MessageBlock = memo(function MessageBlock({
 export function ChatView({
   messages,
   streaming,
+  streamingThought,
+  thoughts,
+  onLiveFold,
   prompts,
   confidences,
   providers,
@@ -694,13 +719,15 @@ export function ChatView({
   }, [messages]);
   // While a reply streams, only stay pinned to the bottom if the user is ALREADY near it — so they can
   // scroll up to read earlier turns mid-stream without being dragged back down every token (F-50).
+  // `streamingThought` is a dependency too: while the model thinks, `streaming` stays "" and the
+  // transcript would otherwise stop following the thought as it grows.
   useEffect(() => {
     if (streaming === null) return;
     const el = scrollRef.current;
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
       endRef.current?.scrollIntoView({ behavior: "auto", block: "nearest" });
     }
-  }, [streaming]);
+  }, [streaming, streamingThought]);
 
   // Arrive on a cited turn: scroll it into view and flash it once (mirrors ProjectView's file focus).
   // Depends on `messages` too, so it still fires when the target conversation's turns load a tick after
@@ -745,6 +772,7 @@ export function ChatView({
             key={m.id}
             message={m}
             prompt={prompts?.[m.id]}
+            thought={thoughts?.[m.id]}
             confidence={confidences?.[m.id]}
             provider={providers?.[m.id]}
             showProvenance={showProvenance}
@@ -755,7 +783,20 @@ export function ChatView({
             knownTags={knownTags}
           />
         ))}
-        {streaming !== null && <Bubble role="assistant" content={streaming} markdown />}
+        {/* One column with the settled turn's spacing (MessageBlock's gap-1.5), so the reply does
+            not jump when the finished turn replaces the streaming one. */}
+        {streaming !== null && (
+          <div className="flex flex-col gap-1.5">
+            {streamingThought && (
+              <LiveThinkingBlock thought={streamingThought} onFold={onLiveFold} />
+            )}
+            {/* No second busy indicator: while the model is thinking and no answer has arrived, the
+                live block IS the progress, so the empty "…" bubble is not drawn. */}
+            {!(streamingThought && streaming === "") && (
+              <Bubble role="assistant" content={streaming} markdown />
+            )}
+          </div>
+        )}
         <StreamAnnouncer streaming={streaming} />
         <div ref={endRef} />
       </div>

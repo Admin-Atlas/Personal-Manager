@@ -30,6 +30,10 @@ export function fallbackCopy(reason: string): string {
         return "your local model's reply was unusable";
       case "reply_too_large":
         return "your local model's reply was too large";
+      // Thinking that ran past its time, size or loop bound, or ended with no answer. Only an answer
+      // token rules the cloud out, so a turn can think locally and still fall back.
+      case "unfinished_thought":
+        return "your local model thought without answering";
       default:
         return "your local model couldn't answer";
     }

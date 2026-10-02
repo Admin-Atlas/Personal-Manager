@@ -538,10 +538,18 @@ export function sendMessage(
   /** Developer mode only: ask the backend to emit a `prompt` event with the exact assembled request
    *  before streaming, so the UI can show what was sent. Defaults off — a normal chat sends no prompt. */
   capturePrompt = false,
+  /** The chat Thinking toggle (lib/chatPrefs `readShowThinking()`), read at send time. */
+  showThinking = false,
 ): Promise<void> {
   const channel = new Channel<ChatEvent>();
   channel.onmessage = onEvent;
-  return invoke<void>("send_message", { conversationId, content, capturePrompt, onEvent: channel });
+  return invoke<void>("send_message", {
+    conversationId,
+    content,
+    capturePrompt,
+    showThinking,
+    onEvent: channel,
+  });
 }
 
 /** How full the selected model's context window is for a conversation, plus the meter/alert state
