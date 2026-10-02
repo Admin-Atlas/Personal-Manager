@@ -7,7 +7,10 @@
 //! stays in [`crate::openrouter`]. The request body here is deliberately **minimal** — plain
 //! `model` + `messages` + `stream` — carrying NONE of OpenRouter's body fields (no `provider`
 //! ZDR pin, no `cache_control`, no `models` fallback array), because a local server understands
-//! none of them and rejecting or ignoring them varies by server.
+//! none of them and rejecting or ignoring them varies by server. The one addition is Ollama's own
+//! `reasoning_effort: "none"`, sent only to a server that has said it is an Ollama (see
+//! [`Thinking`]), because a model that thinks before it answers otherwise spends most of every call
+//! PM makes on thinking nobody reads.
 //!
 //! Design: everything that can be wrong *without a socket* — SSE framing, failure classification,
 //! the degenerate-stream guard, URL normalisation, the `/v1/models` shape check, the request
@@ -502,7 +505,15 @@ pub fn models_from_list(value: &serde_json::Value) -> Vec<String> {
 
 /// Build the minimal OpenAI-compatible chat body. Deliberately carries no cloud-only fields — this
 /// is the whole point of the separate local arm. Pure, so a test can prove the body stays clean.
-pub fn chat_body(model: &str, messages: &[ChatMessage], stream: bool) -> serde_json::Value {
+///
+/// `thinking_off` adds [`THINKING_OFF`] as `reasoning_effort`, and the caller sets it only for an
+/// endpoint [`Thinking::Switchable`] says takes it.
+pub fn chat_body(
+    model: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+    thinking_off: bool,
+) -> serde_json::Value {
     let msgs: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
@@ -516,7 +527,159 @@ pub fn chat_body(model: &str, messages: &[ChatMessage], stream: bool) -> serde_j
         // Ask for a final usage chunk so the context meter has real numbers when the server obliges.
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
+    if thinking_off {
+        body["reasoning_effort"] = serde_json::json!(THINKING_OFF);
+    }
     body
+}
+
+// --- switching thinking off -------------------------------------------------------------------------
+
+/// The one `reasoning_effort` PM sends, and only to an Ollama.
+///
+/// A model that thinks before it answers does it on every call unless told not to, and PM reads only
+/// the answer. Measured on Ollama 0.33.0 with gemma 4 12b Q3_K_M (an RTX 5060 Laptop GPU), filing one
+/// invoice title into one of four projects: **1353–1580 completion tokens and 48–61 s** with nothing
+/// sent, against **20 tokens and 0.9 s** with `"none"` — the same answer either way. At that cost a
+/// long background job runs into `BACKGROUND_TOTAL_TIMEOUT`, and three of those cool the endpoint
+/// down for chat too. Ollama thinks for that model even though its `/api/show` lists no "thinking"
+/// capability, so PM cannot ask the model first; it asks the server instead.
+///
+/// `"none"` is the only safe value, measured on the same server: Qwen2.5 7B and gemma 3 4b, which
+/// never think, answer normally with it; `"low"` is refused with a 400 "does not support thinking"
+/// for Qwen2.5 and for gemma 4 itself. Ollama ignores `chat_template_kwargs` and a top-level
+/// `think: false` on `/v1` (gemma 4 still thought for 655-789 tokens), so neither is an alternative.
+pub const THINKING_OFF: &str = "none";
+
+/// Whether an endpoint takes [`THINKING_OFF`]. Learned once per endpoint per session, from
+/// `/api/version`, and remembered in [`THINKING`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    /// An Ollama: PM switches thinking off.
+    Switchable,
+    /// Not an Ollama, or an Ollama that refused the switch: the body goes exactly as it did before.
+    ///
+    /// For llama-server, LM Studio and the rest this is the old behaviour, not a fix. Each has its
+    /// own switch (llama-server, for one, takes `chat_template_kwargs` for a template that reads
+    /// `enable_thinking`, or `--reasoning-budget 0` at launch), none of them has been measured here,
+    /// and a field sent to a server that has not said what it is risks a strict one refusing every
+    /// call PM makes.
+    Leave,
+}
+
+/// What PM has learned per endpoint. A failed probe is not recorded, so the next call asks again.
+static THINKING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Thinking>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn remember_thinking(base_url: &str, thinking: Thinking) {
+    if let Ok(mut known) = THINKING.lock() {
+        known.insert(base_url.to_string(), thinking);
+    }
+}
+
+/// Whether an `/api/version` body is Ollama's: `{"version": "<non-empty string>"}`.
+///
+/// llama-server 404s the route. LM Studio is reported (not measured here) to answer a route it
+/// doesn't have with a 200 whose body is an `error` object, so a status alone is not enough.
+pub fn is_ollama_version(value: &serde_json::Value) -> bool {
+    value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Whether a refused request was refused for the thinking switch, so PM can drop it and resend.
+///
+/// The two refusals Ollama 0.33.0 has for the field, both 400s: `invalid reasoning value: …` and
+/// `"<model>" does not support thinking`. Neither happens with `"none"` on that version, so this is
+/// insurance for one that validates the field differently. 422 is the usual validation status for a
+/// server that is not Ollama but answers `/api/version` like one.
+pub fn refuses_thinking_switch(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("reasoning") || body.contains("thinking")
+}
+
+/// Whether to switch thinking off for this endpoint, asking it the first time.
+async fn thinking_for(base_url: &str, token: Option<&str>) -> Thinking {
+    if let Some(known) = THINKING.lock().ok().and_then(|k| k.get(base_url).copied()) {
+        return known;
+    }
+    let url = format!("{base_url}/api/version");
+    let mut req = client_for(base_url)
+        .get(&url)
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    // Unreachable or timed out: nothing learned, so nothing recorded, and the call that follows will
+    // most likely fail the same way. Leave, for this call only.
+    let Ok(response) = req.send().await else {
+        return Thinking::Leave;
+    };
+    let ollama = response.status().is_success()
+        && response
+            .json::<serde_json::Value>()
+            .await
+            .is_ok_and(|v| is_ollama_version(&v));
+    let thinking = if ollama {
+        Thinking::Switchable
+    } else {
+        Thinking::Leave
+    };
+    remember_thinking(base_url, thinking);
+    thinking
+}
+
+/// POST one chat request and return the response once the server has accepted it.
+///
+/// Switches thinking off where [`thinking_for`] says the server takes it. If the server refuses the
+/// switch ([`refuses_thinking_switch`]), PM remembers that, resends once without it, and from then on
+/// sends this endpoint the body it always did.
+async fn post_chat(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    messages: &[ChatMessage],
+    stream: bool,
+    deadline: Option<Duration>,
+) -> LocalResult<reqwest::Response> {
+    let mut thinking_off = thinking_for(base_url, token).await == Thinking::Switchable;
+    let url = format!("{base_url}/v1/chat/completions");
+    loop {
+        let body = chat_body(model, messages, stream, thinking_off);
+        let mut req = client_for(base_url).post(&url);
+        if stream {
+            req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        }
+        if let Some(d) = deadline {
+            req = req.timeout(d);
+        }
+        let mut req = req.json(&body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send().await.map_err(|e| {
+            LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e))
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        if thinking_off && refuses_thinking_switch(status.as_u16(), &body) {
+            remember_thinking(base_url, Thinking::Leave);
+            thinking_off = false;
+            continue;
+        }
+        return Err(LocalFailure::new(
+            classify_http(status.as_u16(), &body),
+            crate::error::truncate_detail(&body),
+        ));
+    }
 }
 
 // --- releasing the GPU (#786 item 8) ------------------------------------------------------------
@@ -1042,27 +1205,7 @@ pub async fn stream_chat<F>(
 where
     F: FnMut(&str),
 {
-    let body = chat_body(model, messages, true);
-    let url = format!("{base_url}/v1/chat/completions");
-    let mut req = client_for(base_url)
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .json(&body);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LocalFailure::new(
-            classify_http(status.as_u16(), &body),
-            crate::error::truncate_detail(&body),
-        ));
-    }
+    let response = post_chat(base_url, model, token, messages, true, None).await?;
 
     let mut full = String::new();
     let mut served: Option<String> = None;
@@ -1204,27 +1347,7 @@ pub async fn complete_within(
     messages: &[ChatMessage],
     deadline: std::time::Duration,
 ) -> LocalResult<Completion> {
-    let body = chat_body(model, messages, false);
-    let url = format!("{base_url}/v1/chat/completions");
-    let mut req = client_for(base_url)
-        .post(&url)
-        .timeout(deadline)
-        .json(&body);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LocalFailure::new(classify_send_error(&e), redacted_transport_detail(e)))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LocalFailure::new(
-            classify_http(status.as_u16(), &body),
-            crate::error::truncate_detail(&body),
-        ));
-    }
+    let response = post_chat(base_url, model, token, messages, false, Some(deadline)).await?;
     let value: serde_json::Value = response
         .json()
         .await
@@ -2148,7 +2271,7 @@ mod tests {
 
     #[test]
     fn request_body_carries_no_cloud_only_fields() {
-        let body = chat_body("llama3.2", &[msg("user", "hi")], true);
+        let body = chat_body("llama3.2", &[msg("user", "hi")], true, false);
         // The model is a plain string (never a `models` fallback array), messages are plain strings,
         // and NONE of OpenRouter's body fields appear.
         assert_eq!(body["model"], "llama3.2");
@@ -2164,8 +2287,65 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
 
         // The non-streaming body omits stream_options too.
-        let buffered = chat_body("m", &[msg("user", "x")], false);
+        let buffered = chat_body("m", &[msg("user", "x")], false, false);
         assert_eq!(buffered["stream"], false);
         assert!(buffered.get("stream_options").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(buffered.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn the_thinking_switch_is_one_field_and_only_ever_none() {
+        for stream in [true, false] {
+            let off = chat_body("gemma4", &[msg("user", "hi")], stream, true);
+            let plain = chat_body("gemma4", &[msg("user", "hi")], stream, false);
+            assert_eq!(off["reasoning_effort"], "none");
+            // Exactly one field more than the body PM always sent, and nothing else changed.
+            let mut off = off.as_object().unwrap().clone();
+            off.remove("reasoning_effort");
+            assert_eq!(serde_json::Value::Object(off), plain);
+        }
+        // "low" is refused for a model that never thinks, so "none" is the only value PM may send.
+        assert_eq!(THINKING_OFF, "none");
+    }
+
+    #[test]
+    fn only_ollamas_version_answer_says_ollama() {
+        assert!(is_ollama_version(&serde_json::json!({"version": "0.33.0"})));
+        // LM Studio's 200 for a route it doesn't have.
+        assert!(!is_ollama_version(&serde_json::json!({
+            "error": "Unexpected endpoint or method. (GET /api/version)"
+        })));
+        assert!(!is_ollama_version(&serde_json::json!({"version": ""})));
+        assert!(!is_ollama_version(&serde_json::json!({"version": 3})));
+        assert!(!is_ollama_version(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn a_refused_switch_is_told_apart_from_every_other_refusal() {
+        // The two refusals Ollama 0.33.0 has for the field, verbatim.
+        assert!(refuses_thinking_switch(
+            400,
+            r#"{"error":{"message":"invalid reasoning value: \"bogus\" (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")","type":"invalid_request_error"}}"#
+        ));
+        assert!(refuses_thinking_switch(
+            400,
+            r#"{"error":{"message":"\"hf.co/unsloth/gemma-4-12b-it-GGUF:Q3_K_M\" does not support thinking","type":"invalid_request_error"}}"#
+        ));
+        assert!(refuses_thinking_switch(
+            422,
+            "unknown field `reasoning_effort`"
+        ));
+        // A missing model, a full context or a server error is not about the switch, so it is never
+        // retried without it.
+        assert!(!refuses_thinking_switch(
+            404,
+            r#"{"error":"model \"x\" not found"}"#
+        ));
+        assert!(!refuses_thinking_switch(
+            400,
+            "the request exceeds the available context size"
+        ));
+        assert!(!refuses_thinking_switch(500, "reasoning parser crashed"));
     }
 }
