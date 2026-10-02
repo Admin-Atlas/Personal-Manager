@@ -163,6 +163,7 @@ const recs = (): LocalRecommendations => ({
   },
   reserve_gb: 2,
   gpu_reserve_gb: 1,
+  chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
   catalog_version: 1,
   catalog_generated_at: "2026-07-22",
   endpoint_configured: true,
@@ -1410,15 +1411,68 @@ describe("speed on the model list", () => {
     localModelRecommendations.mockResolvedValue({ ...recs(), curated: [card] });
     const { container } = await loaded();
     const models = container.querySelector("#sec-localai-models") as HTMLElement;
-    expect(models.textContent).toContain("up to 71 tok/s");
+    expect(models.textContent).toContain("about 71 tok/s");
     expect(models.textContent).toContain(
-      "Speeds are estimates from published or typical memory speeds, not measurements",
+      "Speeds are PM's estimates, not measurements on this computer: from published or typical memory speeds",
     );
+    expect(models.textContent).not.toMatch(/up to \d/);
     expect(models.textContent).not.toMatch(/~\s?\d/);
     // The numbers guide names where the settings live, by its section — and only as somewhere they
     // are once a server is connected, which is the only time that fold exists.
     expect(models.textContent).toContain(
       `your server needs that setting too, and the context the card shows. Each model's commands say what to set, and once your server is connected, ${sectionLabel("sec-localai-endpoint")}'s “Settings PM's numbers assume” has the steps.`,
     );
+  });
+
+  it("explains a mixture of experts' figure the way PM works it out on a card", async () => {
+    // fit.rs halves a MoE's card figure (`MOE_GPU_FACTOR`), so gemma 4 26B A4B (3.82B active) shows
+    // about 32 at 384 GB/s where a dense 4B shows about 80. A guide saying a MoE "runs at the speed of
+    // that small active part" would be contradicted by the card right beside it.
+    const card: LocalRecommendation = {
+      repo: "unsloth/gemma-4-26B-A4B-it-GGUF",
+      display_name: "gemma 4 26B A4B it",
+      architecture: "gemma4",
+      role_hint: null,
+      parameters_b: 25.23,
+      active_parameters_b: 3.82,
+      context_length: 262144,
+      multimodal: false,
+      reasoning: null,
+      ollama_pull: "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q3_K_M",
+      sharded_quant: false,
+      gpu_pull: null,
+      licence: {
+        id: "apache-2.0",
+        name: "Apache License 2.0",
+        url: "https://www.apache.org/licenses/LICENSE-2.0",
+        open: true,
+        summary: "A permissive open-source licence.",
+      },
+      fit: {
+        verdict: "tight",
+        quant: "Q3_K_M",
+        context: 32768,
+        kv: "f16",
+        est_memory_gb: 13.2,
+        est_tokens_per_sec: 32.1,
+        speed_basis: "gpu_published",
+        notes: [],
+      },
+      gpu: { kind: "single" },
+    };
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [card] });
+    const { container } = await loaded();
+    const models = container.querySelector("#sec-localai-models") as HTMLElement;
+    expect(models.textContent).toContain("about 32 tok/s");
+    expect(models.textContent).toContain("3.82B active");
+    const term = Array.from(models.querySelectorAll("dt")).find((dt) =>
+      dt.textContent?.startsWith("MoE (mixture of experts)"),
+    );
+    const entry = term?.nextElementSibling?.textContent ?? "";
+    expect(entry).toContain(
+      "On a graphics card it isn't as quick as an ordinary model the size of its active part: going by published reports, PM halves its estimate for a MoE there, since PM hasn't timed one itself",
+    );
+    expect(entry).toContain("quicker than an ordinary model of its full size");
+    expect(entry).not.toMatch(/runs at the speed of/);
   });
 });

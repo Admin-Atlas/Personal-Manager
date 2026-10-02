@@ -60,6 +60,7 @@ const recs = (hw: Partial<LocalRecommendations["hardware"]> = {}): LocalRecommen
   },
   reserve_gb: 2,
   gpu_reserve_gb: 1,
+  chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
   catalog_version: 4,
   catalog_generated_at: "2026-09-30",
   endpoint_configured: false,

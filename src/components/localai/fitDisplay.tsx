@@ -51,7 +51,7 @@ export function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
 
 /** The per-config mono metric spans (quant · context · speed · memory), shared by the single- and
  *  two-config (Split) card layouts. The speed is worded from what it was worked out from
- *  (`speedWords`): a ceiling says "up to", a guess says "about", shared memory gets no number. */
+ *  (`speedWords`): an estimate says "about", shared memory gets no number. */
 function ConfigMetrics({ fit }: { fit: LocalFitResult }) {
   const speed = speedShort(fit);
   return (

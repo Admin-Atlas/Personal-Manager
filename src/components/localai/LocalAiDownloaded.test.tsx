@@ -81,6 +81,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     },
     reserve_gb: 2,
     gpu_reserve_gb: 1,
+    chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
     catalog_version: 1,
     catalog_generated_at: "2026-07-26",
     endpoint_configured: true,

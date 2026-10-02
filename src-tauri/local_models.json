@@ -1,7 +1,7 @@
 {
   "schema_version": 4,
-  "catalog_version": 5,
-  "content_hash": "sha256:ba96679a950f361b5fb803737bb216eaaefc0b9becd592780c5431db3efc7588",
+  "catalog_version": 6,
+  "content_hash": "sha256:4eb3d37e5120f0910301b07f4b7cdea9eeb350570b618b5933fb5f2a0600aced",
   "generated_at": "2026-10-02",
   "source": "huggingface-gguf",
   "entries": [
@@ -28,7 +28,9 @@
           "quant": "Q8_0",
           "file_gb": 0.41,
           "sharded": false,
-          "ollama": "hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0"
+          "ollama": "hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0",
+          "decode_bytes": 384748800,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -62,13 +64,17 @@
           "quant": "Q4_K_M",
           "file_gb": 0.75,
           "sharded": false,
-          "ollama": "hf.co/ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
+          "ollama": "hf.co/ggml-org/gemma-3-1b-it-GGUF:Q4_K_M",
+          "decode_bytes": 799525120,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 1,
           "sharded": false,
-          "ollama": "hf.co/ggml-org/gemma-3-1b-it-GGUF:Q8_0"
+          "ollama": "hf.co/ggml-org/gemma-3-1b-it-GGUF:Q8_0",
+          "decode_bytes": 1062773248,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -102,25 +108,33 @@
           "quant": "Q4_K_M",
           "file_gb": 0.75,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M",
+          "decode_bytes": 799862912,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 0.85,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q5_K_M",
+          "decode_bytes": 903671936,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 0.95,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K",
+          "decode_bytes": 1013969024,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 1.23,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0",
+          "decode_bytes": 1313251456,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -154,25 +168,33 @@
           "quant": "Q4_K_M",
           "file_gb": 1.59,
           "sharded": false,
-          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M",
+          "decode_bytes": 1702536192,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 1.79,
           "sharded": false,
-          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q5_K_M",
+          "decode_bytes": 1917232128,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 2,
           "sharded": false,
-          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q6_K",
+          "decode_bytes": 2145346560,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 2.59,
           "sharded": false,
-          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/gemma-2-2b-it-GGUF:Q8_0",
+          "decode_bytes": 2778448896,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -206,25 +228,33 @@
           "quant": "Q4_K_M",
           "file_gb": 1.88,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",
+          "decode_bytes": 2011539712,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 2.16,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M",
+          "decode_bytes": 2314316032,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 2.46,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q6_K",
+          "decode_bytes": 2636015872,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 3.19,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0",
+          "decode_bytes": 3414061312,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -258,31 +288,41 @@
           "quant": "Q3_K_M",
           "file_gb": 1.82,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q3_K_M"
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q3_K_M",
+          "decode_bytes": 1912414080,
+          "decode_slow_bytes": 692060160
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 2.23,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
+          "decode_bytes": 2337087360,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 2.62,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q5_K_M",
+          "decode_bytes": 2746818432,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 2.92,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q6_K",
+          "decode_bytes": 3054313344,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 3.78,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q8_0",
+          "decode_bytes": 3955827072,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -316,13 +356,17 @@
           "quant": "Q4_K_M",
           "file_gb": 2.32,
           "sharded": false,
-          "ollama": "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
+          "ollama": "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+          "decode_bytes": 2483218432,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 3.85,
           "sharded": false,
-          "ollama": "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q8_0"
+          "ollama": "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q8_0",
+          "decode_bytes": 4123686912,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -356,31 +400,41 @@
           "quant": "Q3_K_M",
           "file_gb": 2.14,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q3_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q3_K_M",
+          "decode_bytes": 2282420224,
+          "decode_slow_bytes": 838041600
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 2.55,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M",
+          "decode_bytes": 2729969664,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 2.93,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q5_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q5_K_M",
+          "decode_bytes": 3132688384,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 3.28,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q6_K"
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q6_K",
+          "decode_bytes": 3514988544,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 4.17,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q8_0"
+          "ollama": "hf.co/unsloth/Qwen3.5-4B-GGUF:Q8_0",
+          "decode_bytes": 4471435264,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -414,31 +468,41 @@
           "quant": "Q3_K_M",
           "file_gb": 3.55,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q3_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q3_K_M",
+          "decode_bytes": 3568259072,
+          "decode_slow_bytes": 1810350080
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 4.36,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M",
+          "decode_bytes": 4370558976,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 5.07,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M",
+          "decode_bytes": 5064192000,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 5.82,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q6_K",
+          "decode_bytes": 5801177088,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 7.54,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0",
+          "decode_bytes": 7513511936,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -472,31 +536,41 @@
           "quant": "Q3_K_M",
           "file_gb": 3.74,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q3_K_M"
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q3_K_M",
+          "decode_bytes": 3785351424,
+          "decode_slow_bytes": 1903165440
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 4.58,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M",
+          "decode_bytes": 4617396480,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 5.34,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q5_K_M",
+          "decode_bytes": 5363982592,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 6.14,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q6_K",
+          "decode_bytes": 6157230336,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 7.95,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q8_0",
+          "decode_bytes": 7974764800,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -530,31 +604,41 @@
           "quant": "Q3_K_M",
           "file_gb": 4.35,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q3_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q3_K_M",
+          "decode_bytes": 4225632256,
+          "decode_slow_bytes": 1686896640
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 5.29,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
+          "decode_bytes": 5097424896,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 6.13,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q5_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q5_K_M",
+          "decode_bytes": 5867603968,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 6.95,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q6_K"
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q6_K",
+          "decode_bytes": 6612977664,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 8.87,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q8_0"
+          "ollama": "hf.co/unsloth/Qwen3.5-9B-GGUF:Q8_0",
+          "decode_bytes": 8435845120,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -588,31 +672,41 @@
           "quant": "Q3_K_M",
           "file_gb": 5.3,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q3_K_M"
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q3_K_M",
+          "decode_bytes": 5678047424,
+          "decode_slow_bytes": 3385958400
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 6.63,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M"
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M",
+          "decode_bytes": 7106035904,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 7.84,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q5_K_M"
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q5_K_M",
+          "decode_bytes": 8397750464,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 9.11,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q6_K"
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q6_K",
+          "decode_bytes": 9770197184,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 11.8,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q8_0"
+          "ollama": "hf.co/unsloth/gemma-4-12b-it-GGUF:Q8_0",
+          "decode_bytes": 12653822144,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -646,31 +740,41 @@
           "quant": "Q3_K_M",
           "file_gb": 6.84,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q3_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q3_K_M",
+          "decode_bytes": 6998695936,
+          "decode_slow_bytes": 3568435200
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 8.37,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q4_K_M",
+          "decode_bytes": 8544198656,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 9.79,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q5_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q5_K_M",
+          "decode_bytes": 9967640576,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 11.29,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q6_K"
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q6_K",
+          "decode_bytes": 11480047616,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 14.62,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q8_0"
+          "ollama": "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q8_0",
+          "decode_bytes": 14868402176,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -704,31 +808,41 @@
           "quant": "Q3_K_M",
           "file_gb": 11.85,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q3_K_M"
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q3_K_M",
+          "decode_bytes": 3044428856,
+          "decode_slow_bytes": 627697664
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 15.78,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M"
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+          "decode_bytes": 3475727416,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 19.7,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q5_K_M"
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q5_K_M",
+          "decode_bytes": 3738403896,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 21.58,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q6_K"
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q6_K",
+          "decode_bytes": 3864785976,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 25.02,
           "sharded": false,
-          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0"
+          "ollama": "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0",
+          "decode_bytes": 4095247416,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -762,31 +876,41 @@
           "quant": "Q3_K_M",
           "file_gb": 12.65,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q3_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q3_K_M",
+          "decode_bytes": 13028919296,
+          "decode_slow_bytes": 6019481600
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 15.66,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q4_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q4_K_M",
+          "decode_bytes": 16091088896,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 18.17,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q5_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q5_K_M",
+          "decode_bytes": 18624710656,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 20.98,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q6_K"
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q6_K",
+          "decode_bytes": 21469300736,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 26.63,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q8_0"
+          "ollama": "hf.co/unsloth/Qwen3.6-27B-GGUF:Q8_0",
+          "decode_bytes": 27233908736,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -820,31 +944,41 @@
           "quant": "Q3_K_M",
           "file_gb": 15.46,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q3_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q3_K_M",
+          "decode_bytes": 2457102848,
+          "decode_slow_bytes": 421789696
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 20.61,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
+          "decode_bytes": 2626185728,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 24.64,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M"
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M",
+          "decode_bytes": 2880555520,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 27.3,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q6_K"
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q6_K",
+          "decode_bytes": 2969684480,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 34.37,
           "sharded": false,
-          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q8_0"
+          "ollama": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q8_0",
+          "decode_bytes": 3195832832,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {
@@ -878,31 +1012,41 @@
           "quant": "Q3_K_M",
           "file_gb": 35.11,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q3_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q3_K_M",
+          "decode_bytes": 37157470208,
+          "decode_slow_bytes": 19247923200
         },
         {
           "quant": "Q4_K_M",
           "file_gb": 44.16,
           "sharded": false,
-          "ollama": "hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q4_K_M"
+          "ollama": "hf.co/bartowski/Qwen2.5-72B-Instruct-GGUF:Q4_K_M",
+          "decode_bytes": 46709014528,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q5_K_M",
           "file_gb": 50.71,
           "sharded": true,
-          "ollama": null
+          "ollama": null,
+          "decode_bytes": 53585051648,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q6_K",
           "file_gb": 59.93,
           "sharded": true,
-          "ollama": null
+          "ollama": null,
+          "decode_bytes": 63319769088,
+          "decode_slow_bytes": 0
         },
         {
           "quant": "Q8_0",
           "file_gb": 71.96,
           "sharded": true,
-          "ollama": null
+          "ollama": null,
+          "decode_bytes": 75933057024,
+          "decode_slow_bytes": 0
         }
       ],
       "licence": {

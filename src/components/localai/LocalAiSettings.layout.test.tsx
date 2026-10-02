@@ -198,6 +198,7 @@ const PICK: LocalPick = {
   download_gb: 5.07,
   basis: "gpu",
   also_have: null,
+  passed_over: null,
 };
 
 const recs = (over: Partial<LocalRecommendations> = {}): LocalRecommendations => ({
@@ -220,6 +221,7 @@ const recs = (over: Partial<LocalRecommendations> = {}): LocalRecommendations =>
   },
   reserve_gb: 2,
   gpu_reserve_gb: 1,
+  chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
   catalog_version: 4,
   catalog_generated_at: "2026-09-30",
   endpoint_configured: true,
@@ -586,6 +588,7 @@ describe("All models", () => {
             measured: false,
             spills_gpu: false,
             card_unused: false,
+            under_chat_floor_tps: null,
           },
         ],
       }),
@@ -634,9 +637,10 @@ describe("All models", () => {
   describe("PM's pick is matched to a row by its config, not its tag", () => {
     // The pick is judged at the context PM sizes it for (32k at most) and the cards at the model's
     // trained one, so the pick's own file is often on a row here run another way. The dev laptop
-    // (7.96 GB card, 20 GB free, an empty Ollama): the pick is gemma 4 12b as Q3_K_M at 32768 on f16,
-    // 6.93 GB; the card's "Fastest on GPU" row is the same Q3_K_M file at 65536 on q8_0, 6.74 GB,
-    // its context halved from 262144 — the same tag, a different config.
+    // (7.96 GB card, 20 GB free, an empty Ollama) as it was judged before speed counted on a card:
+    // the pick was gemma 4 12b as Q3_K_M at 32768 on f16, 6.93 GB; the card's "Fastest on GPU" row
+    // is the same Q3_K_M file at 65536 on q8_0, 6.74 GB, its context halved from 262144 — the same
+    // tag, a different config. The payload's shape is what these pin, not which model wins.
     const GEMMA4 = "unsloth/gemma-4-12b-it-GGUF";
     const Q3 = `hf.co/${GEMMA4}:Q3_K_M`;
     const gemma4 = (over: Partial<LocalRecommendation> = {}) =>
@@ -681,6 +685,7 @@ describe("All models", () => {
       download_gb: 5.5,
       basis: "gpu",
       also_have: null,
+      passed_over: null,
     };
     const card = () =>
       document.getElementById("localai-rec-unsloth-gemma-4-12b-it-gguf") as HTMLElement;
@@ -857,6 +862,32 @@ describe("All models", () => {
           pick: gemma4Pick,
         },
         "PM's pick is this model as Q3_K_M at a 32k context on an f16 cache, so it fits your graphics card with the room PM keeps free — this card sizes the model for as much of its 256k context as fits. It's under Your local model.",
+      ],
+      [
+        "a build stepped down to be quick enough for chat on the card (chat)",
+        {
+          curated: [
+            gemma4({
+              gpu: {
+                kind: "split",
+                fit: fit({
+                  quant: "Q5_K_M",
+                  context: 65536,
+                  kv: "q8_0",
+                  verdict: "halved_context",
+                }),
+              },
+              gpu_pull: { tag: `hf.co/${GEMMA4}:Q5_K_M`, sharded: false, same_file: false },
+            }),
+          ],
+          pick: {
+            ...gemma4Pick,
+            tag: `hf.co/${GEMMA4}:Q4_K_M`,
+            rung: "chat",
+            fit: fit({ quant: "Q4_K_M", context: 32768, kv: "f16" }),
+          },
+        },
+        "PM's pick is this model as Q4_K_M at a 32k context on an f16 cache, the build quick enough for chat on your graphics card — this card sizes the model for as much of its 256k context as fits. It's under Your local model.",
       ],
     ];
     for (const [name, over, band] of REASONS) {

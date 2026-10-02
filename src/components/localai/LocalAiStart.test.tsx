@@ -180,6 +180,7 @@ const PICK: LocalPick = {
   download_gb: 5.07,
   basis: "gpu",
   also_have: null,
+  passed_over: null,
 };
 
 const recs = (over: Partial<LocalRecommendations> = {}): LocalRecommendations => ({
@@ -202,6 +203,7 @@ const recs = (over: Partial<LocalRecommendations> = {}): LocalRecommendations =>
   },
   reserve_gb: 2,
   gpu_reserve_gb: 1,
+  chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
   catalog_version: 4,
   catalog_generated_at: "2026-09-30",
   endpoint_configured: false,
@@ -529,6 +531,7 @@ describe("step 2 — the pick's download", () => {
           measured: true,
           fit: fit({ quant: "Q4_K_M" }),
           basis: "gpu",
+          passed_over: null,
         },
       }),
     );
@@ -579,6 +582,7 @@ describe("step 3 — one model for both jobs", () => {
       measured: true,
       fit: fit(),
       basis: "gpu",
+      passed_over: null,
     },
   });
   /** The calls the two role wrappers saw, in order. */
@@ -791,9 +795,9 @@ describe("Depth never hides what justifies the pick", () => {
     expect(text).toContain("Q5_K_M");
     expect(text).toContain("32k context");
     expect(text).toContain("compressed cache (q8_0)");
-    expect(text).toContain("up to 71 tok/s");
+    expect(text).toContain("about 71 tok/s");
     expect(text).toContain(
-      "Worked out from your graphics card's published memory speed (384 GB/s)",
+      "PM's estimate, not a measurement on this computer: your graphics card's published memory speed (384 GB/s)",
     );
     expect(text).toContain("5.1 GB download");
     // The parameter count is detail, and only that.
@@ -810,11 +814,50 @@ describe("the pick's reason says at which context it fits", () => {
     await within(start()).findByText("PM's pick for this computer");
     const text = start().textContent ?? "";
     expect(text).toContain(
-      "The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for",
+      "The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for — with only a little room to spare, and that PM expects to reply at 30 tok/s or more.",
     );
     expect(text).toContain(
       "runs entirely on your graphics card with the room PM keeps free, at the context PM sizes it for — 32k tokens, less for a model made for less, and more for one your server already runs with more — because",
     );
+    // How PM picks states the chat floor, from the payload.
+    expect(text).toContain("PM wants at least 30 tok/s");
+  });
+});
+
+describe("the pick names the larger model it passed over for speed", () => {
+  const GEMMA4 = "unsloth/gemma-4-12b-it-GGUF";
+  const LINE =
+    "gemma 4 12b it is larger and also fits your graphics card, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat. It's under All models if you'd rather have the larger model.";
+
+  it("right under the reason, at every Depth", async () => {
+    theme.depth = "min";
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    localModelRecommendations.mockResolvedValue(
+      recs({
+        pick: {
+          ...PICK,
+          passed_over: {
+            repo: GEMMA4,
+            display_name: "gemma 4 12b it",
+            quant: "Q3_K_M",
+            est_tokens_per_sec: 29.4,
+            have: null,
+          },
+        },
+      }),
+    );
+    await mount();
+    const reason = await within(start()).findByText(/^The largest model in PM's list/);
+    const line = within(start()).getByText(LINE);
+    expect(reason.nextElementSibling).toBe(line);
+    expect(shown(line)).toBe(true);
+  });
+
+  it("and says nothing when nothing was passed over", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    await mount();
+    await within(start()).findByText("PM's pick for this computer");
+    expect(start().textContent).not.toContain("is larger and also fits your graphics card");
   });
 });
 
@@ -858,6 +901,7 @@ describe("every start-card action makes the write its section control makes", ()
         measured: true,
         fit: fit(),
         basis: "gpu",
+        passed_over: null,
       },
     });
   const working = () => {

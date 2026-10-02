@@ -16,6 +16,8 @@ import { describe, expect, it } from "vitest";
 import {
   activeFromHeader,
   contentHash,
+  decodeBytes,
+  GGML_BLOCK,
   gib,
   isDraftHead,
   ollamaTagFor,
@@ -26,7 +28,9 @@ import {
   matchesQuant,
   pickProjector,
   prettyName,
+  quantShardPaths,
   round2,
+  SLOW_TENSOR_TYPES,
   sumQuantShards,
 } from "./generate-local-catalog.mjs";
 
@@ -100,6 +104,132 @@ describe("sumQuantShards", () => {
   it("returns null when nothing matches or the sizes are all zero", () => {
     expect(sumQuantShards([f("m-Q8_0.gguf", 500)], "Q4_K_M")).toBeNull();
     expect(sumQuantShards([f("m-Q4_K_M.gguf", 0)], "Q4_K_M")).toBeNull();
+  });
+});
+
+describe("quantShardPaths", () => {
+  const f = (path, size = 1) => ({ path, size });
+
+  it("lists one quant's shards in order, and nothing else that carries its label", () => {
+    // The headers PM reads for a quant's decode bytes must be the very files its size sums: the
+    // shards in order (the first carries the metadata), never a projector, a draft head or a
+    // longer label that starts the same way.
+    const files = [
+      f("Q6_K/m-00002-of-00002.gguf"),
+      f("mmproj-m-Q6_K.gguf"),
+      f("MTP/mtp-m-Q6_K.gguf"),
+      f("m-Q6_K_L.gguf"),
+      f("Q6_K/m-00001-of-00002.gguf"),
+      f("m-Q8_0.gguf"),
+    ];
+    expect(quantShardPaths(files, "Q6_K")).toEqual([
+      "Q6_K/m-00001-of-00002.gguf",
+      "Q6_K/m-00002-of-00002.gguf",
+    ]);
+    expect(sumQuantShards(files, "Q6_K")).toEqual({ bytes: 2, sharded: true });
+    expect(quantShardPaths(files, "Q4_K_M")).toEqual([]);
+  });
+});
+
+describe("decodeBytes", () => {
+  // What a decode step reads, from the tensor table alone. Shapes are bigints, as @huggingface/gguf
+  // returns them; the dtype is the numeric GGML type id the table stores.
+  const F32 = 0;
+  const Q8_0 = 8;
+  const Q3_K = 11;
+  const Q4_K = 12;
+  const Q6_K = 14;
+  const IQ4_XS = 23;
+  const t = (name, dtype, ...shape) => ({ name, dtype, shape: shape.map(BigInt) });
+  const llama = { "general.architecture": "llama" };
+  // 256 × 1000 at Q8_0: 8000 blocks of 34 bytes.
+  const embd = t("token_embd.weight", Q8_0, 256, 1000);
+  const body = [t("blk.0.attn_q.weight", Q4_K, 256, 256), t("blk.0.attn_norm.weight", F32, 256)];
+  const bodyBytes = 256 * 144 + 256 * 4;
+
+  it("counts a tied embedding, because it is the output head read whole every token", () => {
+    expect(decodeBytes([embd, ...body], llama)).toEqual({
+      decode_bytes: 8000 * 34 + bodyBytes,
+      decode_slow_bytes: 0,
+    });
+  });
+
+  it("leaves out an untied embedding, which a token reads one row of", () => {
+    const output = t("output.weight", Q6_K, 256, 1000);
+    expect(decodeBytes([embd, ...body, output], llama).decode_bytes).toBe(bodyBytes + 1000 * 210);
+  });
+
+  it("leaves out a per-layer embedding table, which is looked up a row at a time", () => {
+    const gemma4 = { "general.architecture": "gemma4" };
+    const perLayer = t("per_layer_token_embd.weight", Q8_0, 8192, 1000);
+    expect(decodeBytes([embd, ...body, perLayer], gemma4).decode_bytes).toBe(8000 * 34 + bodyBytes);
+  });
+
+  it("charges routed experts at the share a token reaches, and a shared expert in full", () => {
+    const moe = {
+      "general.architecture": "qwen35moe",
+      "qwen35moe.expert_count": 128,
+      "qwen35moe.expert_used_count": 8,
+    };
+    // 128 experts of 256 × 64 at Q4_K: 1179648 bytes, of which a token reads 8/128.
+    const experts = t("blk.0.ffn_gate_exps.weight", Q4_K, 256, 64, 128);
+    const shared = t("blk.0.ffn_up_shexp.weight", Q4_K, 256, 64);
+    expect(decodeBytes([...body, experts, shared], moe).decode_bytes).toBe(
+      bodyBytes + (1_179_648 * 8) / 128 + 64 * 144,
+    );
+    // Routed experts with no counts to scale them by are not guessed at.
+    expect(() => decodeBytes([...body, experts], llama)).toThrow(/expert_\* counts/);
+  });
+
+  it("splits out the bytes in a slow-to-unpack type, scaled the same way", () => {
+    const moe = {
+      "general.architecture": "qwen35moe",
+      "qwen35moe.expert_count": 4,
+      "qwen35moe.expert_used_count": 1,
+    };
+    const tensors = [
+      t("blk.0.attn_q.weight", Q3_K, 256, 256), // 256 blocks of 110: slow
+      t("blk.0.attn_k.weight", IQ4_XS, 256, 256), // 256 of 136: slow
+      t("blk.0.attn_v.weight", Q6_K, 256, 256), // 256 of 210
+      t("blk.0.ffn_down_exps.weight", Q3_K, 256, 4, 4), // 16 of 110, a quarter read: slow
+    ];
+    const slow = 256 * 110 + 256 * 136 + (16 * 110) / 4;
+    expect(decodeBytes(tensors, moe)).toEqual({
+      decode_bytes: slow + 256 * 210,
+      decode_slow_bytes: slow,
+    });
+  });
+
+  it("rounds each sum once, at the end", () => {
+    // Three routed tensors of 40 bytes, a third of each read: 40 in all. Rounding each tensor's
+    // 13.33 first would write 39.
+    const moe = {
+      "general.architecture": "qwen35moe",
+      "qwen35moe.expert_count": 3,
+      "qwen35moe.expert_used_count": 1,
+    };
+    const tensors = ["gate", "up", "down"].map((m) => t(`blk.0.ffn_${m}_exps.weight`, F32, 10));
+    expect(decodeBytes(tensors, moe)).toEqual({ decode_bytes: 40, decode_slow_bytes: 0 });
+  });
+
+  it("throws on a tensor type it has no block size for, rather than guessing one", () => {
+    // TQ1_0 (34): a real ggml type no catalogue file carries yet.
+    expect(() => decodeBytes([...body, t("blk.0.attn_out.weight", 34, 256, 256)], llama)).toThrow(
+      /unknown GGML tensor type 34/,
+    );
+  });
+
+  it("knows the block of every type id it claims, and only Q2_K, Q3_K and the i-quants are slow", () => {
+    // The numeric ids a tensor table stores, pinned against the library enum the table is keyed by.
+    const ids = Object.keys(GGML_BLOCK).map(Number);
+    expect(ids.sort((a, b) => a - b)).toEqual([
+      0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+      27, 28, 29, 30, 39,
+    ]);
+    expect([...SLOW_TENSOR_TYPES].sort((a, b) => a - b)).toEqual([
+      10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 29,
+    ]);
+    expect(GGML_BLOCK[Q3_K]).toEqual([256, 110]);
   });
 });
 

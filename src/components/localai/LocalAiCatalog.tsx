@@ -138,8 +138,8 @@ export function LocalAiCatalog({
       </SectionLabel>
       {error && <Callout className="mt-2">{error}</Callout>}
       {gating && <p className="mt-1.5 text-xs text-ink4">{gating}</p>}
-      {/* Never folded: it is what every speed on the cards is, and a ceiling read as a forecast is
-          the misreading it exists to stop. */}
+      {/* Never folded: it is what every speed on the cards is, and an estimate read as a measurement
+          on this computer is the misreading it exists to stop. */}
       <p className="mt-1.5 text-xs text-ink4">{SPEED_LIST_NOTE}</p>
       <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
         <NumbersGuide />
@@ -277,14 +277,15 @@ function kTokens(n: number): string {
  * Matched on the config, never the tag: the pick is judged at the context PM sizes it for (32k, or
  * less for a model made for less, better_fit.rs `pick_context`) and the cards at the model's trained
  * one, so the pick's own file is often on a rung here at a longer context and a compressed cache —
- * the dev laptop's gemma 4 12b is Q3_K_M at 32k on f16 as the pick, and Q3_K_M at 64k on q8_0 as the
- * card's GPU rung.
+ * the dev laptop's gemma 4 12b, its pick before speed counted on a card, was Q3_K_M at 32k on f16 as
+ * the pick, and Q3_K_M at 64k on q8_0 as the card's GPU rung.
  *
  * The reason is the one that really separates them. When a rung has the pick's file, or the pick is
  * the highest-quality build at its own context (`rung: "quality"`), it is the context; otherwise it
- * is the step down `pick.rung` says PM took — to keep the room it leaves free on the card ("gpu"), or
- * to be quick enough from memory ("speed"). A pick that matches no rung at the model's full context
- * differs only in being a build Ollama can fetch, which the card's best file need not be.
+ * is the step down `pick.rung` says PM took — to keep the room it leaves free on the card ("gpu"), to
+ * be quick enough for chat on the card ("chat"), or to be quick enough from memory ("speed"). A pick
+ * that matches no rung at the model's full context differs only in being a build Ollama can fetch,
+ * which the card's best file need not be.
  */
 function bandLine(rec: LocalRecommendation, pick: LocalPick | undefined): string | null {
   if (pick?.kind !== "catalogue" || pick.repo !== rec.repo) return null;
@@ -305,9 +306,11 @@ function bandLine(rec: LocalRecommendation, pick: LocalPick | undefined): string
       ? `the build that fits ${fitsWhat} at the context PM sizes it for`
       : pick.rung === "gpu"
         ? "so it fits your graphics card with the room PM keeps free"
-        : pick.rung === "speed"
-          ? "the build quick enough for PM's background work from memory"
-          : "the best build of it that fits and that Ollama can download";
+        : pick.rung === "chat"
+          ? "the build quick enough for chat on your graphics card"
+          : pick.rung === "speed"
+            ? "the build quick enough for PM's background work from memory"
+            : "the best build of it that fits and that Ollama can download";
   // What the card itself shows, so the comparison names a figure the reader can see: the row with
   // the pick's file, or else how the card sizes the model as a whole.
   // With both rows on the same file, the one that runs where the pick does: on a card, its row.
@@ -342,7 +345,7 @@ function NumbersGuide() {
     ],
     [
       "Speed",
-      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement: PM divides the memory speed of whatever the model runs from by how much of the model it reads for each token. On a graphics card PM recognises, that makes it a ceiling — in PM's own checks on one laptop graphics card, real replies came 10–60% slower, and the same model varied from day to day. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
+      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement on this computer. On a graphics card PM divides the card's memory speed by how much of the model it reads for each token, worked out from the model file, and scales that by how fast eight models really ran on one laptop graphics card PM tested: there it came within 20% of each, though that card was held back by its power settings at the time, so yours may well be faster. A long conversation replies slower than a fresh one. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
     ],
     [
       "Memory",
@@ -350,7 +353,7 @@ function NumbersGuide() {
     ],
     [
       "MoE (mixture of experts)",
-      "A large model where only a few billion parameters fire per word. It runs at the speed of that small active part, but its whole weight still has to fit in memory — so a MoE is fast for its size, not lighter to load. Cards show both the total and the active size.",
+      "A large model where only a few billion parameters fire per word. That makes it quicker than an ordinary model of its full size, but its whole weight still has to fit in memory — so a MoE is fast for its size, not lighter to load. On a graphics card it isn't as quick as an ordinary model the size of its active part: going by published reports, PM halves its estimate for a MoE there, since PM hasn't timed one itself — so take that figure with a pinch of salt. Cards show both the total and the active size.",
     ],
     [
       "Two ways to run (with a graphics card)",

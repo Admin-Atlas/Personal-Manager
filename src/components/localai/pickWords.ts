@@ -4,13 +4,18 @@
 // The words for PM's pick, as pure readings of the payload: why this model, what it costs this
 // machine, and what to set on the server so it runs the way PM sized it.
 //
-// The pick ranks on memory and size, never on speed (better_fit.rs), so nothing here gives speed as
-// a reason — "why" never mentions it, and the speed figure sits among the facts with its own
-// qualifier beside it. "Room to spare" is said only of a Comfortable fit: a Tight one is a fit, but
-// saying it has room would be the one reassurance the verdict exists to withhold.
+// The pick ranks on memory and size, never on speed (better_fit.rs). On a discrete graphics card
+// speed is a gate as well: a build counts only if PM expects it to reply at the chat floor or more
+// (`chat_speed`, which the backend owns — copy prints its figure, never a literal). So "why" states
+// the floor there and never mentions speed off the card, the figure itself sits among the facts with
+// its own qualifier beside it, and a larger model passed over for being too slow is named — by
+// `passedOverLine`, or by `inUseLine` when it is the one a job runs on. "Room to spare" is said only
+// of a Comfortable fit: a Tight one is a fit, but saying it has room would be the one reassurance
+// the verdict exists to withhold.
 
 import { formatGib } from "../../lib/format";
 import type {
+  LocalChatSpeed,
   LocalDiskSource,
   LocalFitResult,
   LocalLlmConfig,
@@ -85,19 +90,26 @@ export function eyebrow(pick: ShownPick, inUse: boolean): string {
   return "PM's pick for this computer";
 }
 
-/** Why this model, from its verdict and what it was judged against. Never speed.
+/** "30", the chat floor as the copy prints it. */
+function floorOf(speed: LocalChatSpeed): string {
+  return speed.floor_tps.toFixed(0);
+}
+
+/** Why this model, from its verdict and what it was judged against. Speed only on the graphics
+ *  card, where it is part of the rule: the floor, never the pick's own figure.
  *
  *  "Fits entirely on your graphics card" is a claim about one context: every model is judged at
  *  the context PM sizes it for (better_fit.rs `pick_context`: 32k tokens, less for a model made for
  *  less, more for one the server is proven to run with more), and a larger one that only fits with
  *  less than that is passed over — so the sentence says which context. */
-export function why(pick: ShownPick): string {
+export function why(pick: ShownPick, speed: LocalChatSpeed): string {
   const r = room(pick.fit);
+  const floor = floorOf(speed);
   let text: string;
   if (pick.kind === "catalogue") {
     switch (pick.basis) {
       case "gpu":
-        text = `The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for${r}.`;
+        text = `The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for${r}, and that PM expects to reply at ${floor} tok/s or more.`;
         break;
       case "shared":
         text = `The largest model in PM's list that fits the memory this computer shares between its processor and graphics${r}, and that PM's cautious estimate says is quick enough for its background work.`;
@@ -105,10 +117,14 @@ export function why(pick: ShownPick): string {
       default:
         text = `Without a separate graphics card, models run from system memory. This is the largest in PM's list that fits what you have free${r}, and that PM's cautious estimate says is quick enough for its background work.`;
     }
-  } else if (pick.served) {
-    text = `It's on your server, it fits ${FITS_IN[pick.basis]}${r}, and nothing in PM's list that fits is at least 15% larger.`;
   } else {
-    text = `It's already on this computer, in ${FOLDER[pick.source ?? "folder"]}, it fits ${FITS_IN[pick.basis]}${r}, and nothing in PM's list that fits is at least 15% larger.`;
+    const where = pick.served
+      ? "It's on your server"
+      : `It's already on this computer, in ${FOLDER[pick.source ?? "folder"]}`;
+    text =
+      pick.basis === "gpu"
+        ? `${where}, it fits entirely on your graphics card${r}, PM expects it to reply at ${floor} tok/s or more, and nothing in PM's list that does both is at least 15% larger.`
+        : `${where}, it fits ${FITS_IN[pick.basis]}${r}, and nothing in PM's list that fits is at least 15% larger.`;
   }
   if (pick.kind === "owned" && !pick.measured)
     text +=
@@ -223,7 +239,9 @@ export function diskLine(
 }
 
 /** Why PM isn't picking a model — a full sentence, with what the reader can still do. `hasCloud`:
- *  some cloud key exists, so "keep using your cloud model" is advice and not a fiction. */
+ *  some cloud key exists, so "keep using your cloud model" is advice and not a fiction.
+ *  `too_slow_for_chat` is a card that holds models but, by PM's estimate, runs none at the chat
+ *  floor — only on a card far slower than any PM lists. */
 export function nothingSentence(
   pick: NothingPick,
   recs: LocalRecommendations,
@@ -235,6 +253,8 @@ export function nothingSentence(
     : `You can still choose one yourself under ${allModels}`;
   const vram = formatGib(recs.hardware.vram_gb);
   switch (pick.reason) {
+    case "too_slow_for_chat":
+      return `Every model in PM's list that fits your ${vram} graphics card would reply at under ${floorOf(recs.chat_speed)} tok/s by PM's estimate, too slow for PM to pick one for chat. ${meanwhile}, where each says how fast PM expects it to be.`;
     case "nothing_on_gpu":
       return pick.system_fallback
         ? `Nothing in PM's list fits your ${vram} graphics card with the room PM keeps free. Some would run from system memory instead, several times slower, and PM doesn't pick one of those on a computer with a graphics card. You can still choose one yourself under ${allModels}, where each says how it would run.`
@@ -270,6 +290,27 @@ export function alsoHaveLine(pick: CataloguePick, recs: LocalRecommendations): s
 }
 
 /**
+ * The larger model PM passed over because it expects it to reply under the chat floor on this card
+ * (better_fit.rs `passed_over`) — the user's own copy of it when they have one. null when nothing
+ * was, or when that copy is the model a job runs on (`bound`): `inUseLine` says it then, as the
+ * model in use.
+ */
+export function passedOverLine(
+  pick: ShownPick,
+  recs: LocalRecommendations,
+  bound: string | null,
+): string | null {
+  const po = pick.passed_over;
+  if (!po) return null;
+  const have = po.have;
+  if (have && bound && have.id.toLowerCase() === bound.toLowerCase()) return null;
+  const slow = `PM expects it to reply at about ${po.est_tokens_per_sec.toFixed(0)} tok/s here — under the ${floorOf(recs.chat_speed)} tok/s it wants for chat`;
+  if (have)
+    return `You already have ${have.display_name}, which is larger and also fits your graphics card, but ${slow}.`;
+  return `${po.display_name} is larger and also fits your graphics card, but ${slow}. It's under ${sectionLabel("sec-localai-models")} if you'd rather have the larger model.`;
+}
+
+/**
  * When a job already runs on a different local model than the pick: what the difference is. null
  * when the bound model is the pick, or when PM can't say something true about the pair.
  */
@@ -290,6 +331,30 @@ export function inUseLine(
   // from the row's sizing, which is f16 first and high by design.
   if (pick.basis === "gpu" && spillsOffCard(recs, bound))
     return `You're using ${bound}, which runs at least partly from system memory rather than your graphics card, so it replies slowly. PM's pick is sized to fit on the card.`;
+  // The model in use is the larger one PM passed over for speed: it fits the card, so the reason it
+  // isn't the pick is the chat floor, and the line says that rather than comparing sizes.
+  const po = pick.passed_over;
+  if (po?.have && po.have.id.toLowerCase() === b) {
+    const m = pick.fit.est_tokens_per_sec?.toFixed(0);
+    return `You're using ${bound}, which is larger, but PM expects it to reply at about ${po.est_tokens_per_sec.toFixed(0)} tok/s here — under the ${floorOf(recs.chat_speed)} tok/s it wants for chat.${
+      m != null ? ` PM's pick should reply at about ${m}.` : ""
+    }`;
+  }
+  // A build PM can show fits the card but is too slow for chat there, which `passed_over` never names
+  // when it isn't larger than the pick — most often a heavier build of the pick's own model.
+  if (pick.basis === "gpu" && row?.under_chat_floor_tps != null) {
+    const n = row.under_chat_floor_tps.toFixed(0);
+    const floor = floorOf(recs.chat_speed);
+    const m = pick.fit.est_tokens_per_sec?.toFixed(0);
+    if (row.matched_repo === pick.repo)
+      return `You're using ${bound}, but PM expects that build to reply at about ${n} tok/s here — under the ${floor} tok/s it wants for chat. PM's pick is a quicker build of the same model${m != null ? `, at about ${m}` : ""}.`;
+    const p = recs.curated.find((r) => r.repo === pick.repo)?.parameters_b ?? null;
+    const q = row.matched_repo
+      ? (recs.curated.find((r) => r.repo === row.matched_repo)?.parameters_b ?? null)
+      : null;
+    const larger = p != null && q != null && q > p ? ", which is larger," : ",";
+    return `You're using ${bound}${larger} but PM expects it to reply at about ${n} tok/s here — under the ${floor} tok/s it wants for chat.${m != null ? ` PM's pick should reply at about ${m}.` : ""}`;
+  }
   if (row && row.matched_repo === null)
     return `You're using ${bound}, which isn't in PM's list, so PM can't compare the two.`;
   const p = recs.curated.find((r) => r.repo === pick.repo)?.parameters_b ?? null;
@@ -299,4 +364,13 @@ export function inUseLine(
   if (p != null && q != null && p >= q * 1.15)
     return `You're using ${bound}. PM's pick is at least 15% larger and also fits.`;
   return null;
+}
+
+/** "How PM picks", the folded explainer under the start card. The chat-floor sentence needs the
+ *  backend's figure, so with no payload (`speed` null) it is left out rather than guessed. */
+export function howPmPicks(speed: LocalChatSpeed | null): string {
+  const chat = speed
+    ? `On a graphics card it must also be quick enough for chat: PM wants at least ${floorOf(speed)} tok/s, enough to write an answer of a few paragraphs in about ${speed.reply_secs.toFixed(0)} seconds, and when a model's best build is slower than that, PM tries its smaller builds before passing it over. Those speeds are PM's own estimates, from your card's published memory speed (or a typical one when PM doesn't recognise the card) and tests on one laptop graphics card, not measurements on this computer. `
+    : "";
+  return `PM looks for the largest model in its list that runs entirely on your graphics card with the room PM keeps free, at the context PM sizes it for — 32k tokens, less for a model made for less, and more for one your server already runs with more — because a model that spills into system memory replies many times slower. ${chat}On a computer without a separate graphics card, it only considers models its cautious estimate says are quick enough for PM's background work. If you already have a model that passes the same tests and nothing in the list is at least 15% larger, PM points at the one you have. It never downloads or switches anything for you.`;
 }

@@ -39,6 +39,7 @@ import type {
 import type { RunnerName } from "../../lib/workbenchGuide";
 import type { LocalAiTarget } from "./locate";
 import { sectionLabel } from "./sections";
+import { replySecs } from "./speedWords";
 import type { RoleTest } from "./useRoleTests";
 
 /** The served context below which PM says so, under Assign roles. One filing batch is ~3.5k tokens
@@ -794,6 +795,26 @@ function serverStep(i: ReadinessInput): Step {
   };
 }
 
+/**
+ * Step 2's sentence on how fast the pick should reply, and so how long an answer of a few paragraphs
+ * (`chat_speed.reply_tokens`) takes — or null when there is no figure, or on shared memory, where PM
+ * puts no number on it (speedWords.ts). The same whole number the pick card's facts row prints,
+ * worded as what it is: on the graphics card PM's estimate, from system memory its rough guide.
+ */
+export function speedSentence(
+  shown: Exclude<LocalPick, { kind: "nothing" }>,
+  recs: LocalRecommendations,
+): string | null {
+  const est = shown.fit.est_tokens_per_sec;
+  const basis = shown.fit.speed_basis;
+  if (est == null || basis == null || basis === "shared") return null;
+  const n = est.toFixed(0);
+  const secs = replySecs(est, recs.chat_speed);
+  return basis === "system"
+    ? `From system memory, PM's rough guide puts it at about ${n} tok/s, so an answer of a few paragraphs takes about ${secs}.`
+    : `PM expects it to reply at about ${n} tok/s on your graphics card, so an answer of a few paragraphs takes about ${secs}.`;
+}
+
 function toAllModels(): StepAction {
   return { kind: "locate", to: "catalog", label: `Go to ${sectionLabel("sec-localai-models")}` };
 }
@@ -854,6 +875,10 @@ function modelStep(i: ReadinessInput): Step {
     const runner = runnerOf(i.config.base_url);
     const size = formatGib(shown.download_gb);
     const quant = shown.fit.quant ?? "";
+    // How fast it should reply: in the Ollama line, before where it comes from; first among the
+    // notes for every server PM can't download into, whose lines are about getting the file.
+    const speed = i.recs ? speedSentence(shown, i.recs) : null;
+    const withSpeed = speed ? [speed, ...others] : others;
     if (runner === "Ollama") {
       const rec = i.recs?.curated.find((r) => r.repo === shown.repo);
       const asks =
@@ -863,7 +888,7 @@ function modelStep(i: ReadinessInput): Step {
       return {
         ...step,
         state: "next",
-        line: `A ${size} download. Your Ollama fetches it from Hugging Face — PM doesn't download anything itself.${
+        line: `A ${size} download.${speed ? ` ${speed}` : ""} Your Ollama fetches it from Hugging Face — PM doesn't download anything itself.${
           asks
             ? " Its licence has its own terms, which PM shows you before the download starts."
             : ""
@@ -879,7 +904,7 @@ function modelStep(i: ReadinessInput): Step {
         state: "next",
         line: `PM can't download into LM Studio. In LM Studio's Discover tab, search for the name below, download its ${quant} file, then load it.`,
         command: shown.repo,
-        notes: others,
+        notes: withSpeed,
       };
     }
     const command = hfServeCommand(shown.repo, shown.fit);
@@ -889,7 +914,7 @@ function modelStep(i: ReadinessInput): Step {
         state: "next",
         line: "llama-server serves one model at a time. Stop it, then start it again with:",
         command,
-        notes: others,
+        notes: withSpeed,
       };
     }
     return {
@@ -897,7 +922,7 @@ function modelStep(i: ReadinessInput): Step {
       state: "next",
       line: `PM can only download into an Ollama on its usual port (11434). Get ${shown.repo} at ${quant} into your server — with llama-server, that's:`,
       command,
-      notes: others,
+      notes: withSpeed,
     };
   }
 
@@ -922,11 +947,13 @@ function modelStep(i: ReadinessInput): Step {
       i.config.base_url,
     );
     // LM Studio's own route is the one to give for a model in LM Studio: no llama-server line.
+    const speed = i.recs ? speedSentence(shown, i.recs) : null;
     return {
       ...step,
       state: "next",
       line: how.line,
       command: shown.source === "lm_studio" ? null : how.command,
+      notes: speed ? [speed] : [],
     };
   }
 

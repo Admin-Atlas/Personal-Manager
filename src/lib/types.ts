@@ -1747,9 +1747,10 @@ export interface LocalFitResult {
 }
 
 /** What a speed estimate was worked out from (fit.rs SpeedBasis).
- *  - `gpu_published`: resident on a discrete card PM recognised, at its published memory bandwidth —
- *    an upper bound;
- *  - `gpu_typical`: resident on a discrete card PM did not recognise, at a typical 400 GB/s;
+ *  - `gpu_published`: resident on a discrete card PM recognised — an estimate from the card's
+ *    published memory speed, scaled by PM's own tests;
+ *  - `gpu_typical`: resident on a discrete card PM did not recognise, at a typical 400 GB/s, scaled
+ *    the same way;
  *  - `shared`: resident in memory shared with the processor — PM doesn't estimate this yet;
  *  - `system`: runs from system RAM, at a typical 40 GB/s. */
 export type LocalSpeedBasis = "gpu_published" | "gpu_typical" | "shared" | "system";
@@ -1770,7 +1771,9 @@ export interface LocalHardware {
    *  how VRAM was read. */
   vram_source: string | null;
   /** The GPU's peak memory bandwidth (GB/s) when its model is recognised, else null (the speed
-   *  estimate then uses a flat default). Sharpens the tok/s figure only, never the fit verdict. */
+   *  estimate then uses a flat default). It never changes what fits, but on a discrete card the
+   *  speed estimate built from it decides the pick through the chat floor, and whether the faster
+   *  card-resident option is offered. */
   gpu_bandwidth_gbps: number | null;
   unified_memory: boolean;
   is_wsl: boolean;
@@ -1858,6 +1861,11 @@ export interface LocalInstalledModel {
    *  container started without it, an unsupported card, a CPU-only build), so every model it runs is
    *  in system memory and switching models won't help (local_ai.rs InstalledModel.card_unused). */
   card_unused: boolean;
+  /** PM's estimate for it on the graphics card, one decimal, when PM can show it fits the card but
+   *  is too slow for chat there; null otherwise, including when PM can't tell which build it is
+   *  (local_ai.rs InstalledModel.under_chat_floor_tps). Most often a heavier build of the pick's
+   *  own model, which `passed_over` never names because it isn't larger. */
+  under_chat_floor_tps: number | null;
 }
 
 /** Which runner a model found on disk belongs to (local_disk.rs DiskSource). */
@@ -1949,6 +1957,9 @@ export interface LocalRecommendations {
   hardware: LocalHardware;
   reserve_gb: number;
   gpu_reserve_gb: number;
+  /** The speed PM's pick must reach on a discrete graphics card to count as quick enough for chat
+   *  (better_fit.rs ChatSpeed). The backend owns the figure; copy prints it, never a literal. */
+  chat_speed: LocalChatSpeed;
   catalog_version: number;
   catalog_generated_at: string;
   endpoint_configured: boolean;
@@ -1994,15 +2005,36 @@ export type LocalPickBasis = "gpu" | "shared" | "system";
 
 /** How the pick's config relates to the highest-quality one that fits free memory at the pick's
  *  context (better_fit.rs Rung): the same ("quality"), a smaller quant stepped down to stay on the
- *  graphics card ("gpu"), or one stepped down to be quick enough for background work from shared or
- *  system memory ("speed"). */
-export type LocalPickRung = "quality" | "gpu" | "speed";
+ *  graphics card ("gpu"), a build stepped down to be quick enough for chat on the graphics card
+ *  ("chat"), or one stepped down to be quick enough for background work from shared or system memory
+ *  ("speed"). */
+export type LocalPickRung = "quality" | "gpu" | "chat" | "speed";
 
 /** Why PM is not picking a model (better_fit.rs NoPick). */
-export type LocalNoPick = "nothing_on_gpu" | "too_slow" | "too_little_memory";
+export type LocalNoPick = "nothing_on_gpu" | "too_slow_for_chat" | "too_slow" | "too_little_memory";
 
-/** A model the user already has, named beside a catalogue pick that is at least 15% larger
- *  (better_fit.rs OwnedRef). */
+/** A larger model that also fits the graphics card, passed over because PM expects it to reply under
+ *  the chat floor there (better_fit.rs PassedOver). Only on the gpu basis. */
+export interface LocalPassedOver {
+  repo: string;
+  display_name: string;
+  quant: string;
+  /** One decimal; print with toFixed(0), as speedShort does. */
+  est_tokens_per_sec: number;
+  /** The user's own copy of it; null when PM's list is the only source. */
+  have: LocalOwnedRef | null;
+}
+
+/** The chat floor (better_fit.rs ChatSpeed): `floor_tps` = `reply_tokens` / `reply_secs` — an
+ *  answer of a few paragraphs (`reply_tokens`) streamed in `reply_secs`. */
+export interface LocalChatSpeed {
+  floor_tps: number;
+  reply_tokens: number;
+  reply_secs: number;
+}
+
+/** A model the user already has, named beside a catalogue pick that is at least 15% larger, or as
+ *  the larger model PM passed over for speed (better_fit.rs OwnedRef). */
 export interface LocalOwnedRef {
   id: string;
   display_name: string;
@@ -2023,6 +2055,7 @@ export type LocalPick =
       download_gb: number;
       basis: LocalPickBasis;
       also_have: LocalOwnedRef | null;
+      passed_over: LocalPassedOver | null;
     }
   | {
       kind: "owned";
@@ -2040,6 +2073,7 @@ export type LocalPick =
       measured: boolean;
       fit: LocalFitResult;
       basis: LocalPickBasis;
+      passed_over: LocalPassedOver | null;
     }
   | {
       kind: "nothing";

@@ -10,8 +10,10 @@
 //! tool. Three deliberate choices keep it honest:
 //!   * The **weight** term uses the catalog's *measured* per-quant `file_gb` (real bytes on disk),
 //!     which is more accurate than reconstructing size from `params × bytes_per_param` — especially
-//!     for K-quants, IQ-quants, and sharded/MoE files. `bytes_per_param` survives only for the
-//!     throughput term (active weight bytes read per token) and to order quants by quality.
+//!     for K-quants, IQ-quants, and sharded/MoE files. The **speed** term likewise reads the bytes a
+//!     decode step streams from each file's own tensor table ([`DecodeBytes`]). `bytes_per_param`
+//!     survives only to order quants by quality and as the speed fallback for a quant the catalogue
+//!     has no tensor table for ([`decode_bytes`]).
 //!   * The **KV** term is sized at **f16** (2 bytes/element) by default — the conservative choice —
 //!     but the ladder will compress it to **q8_0** (~half the size, near-lossless) *before* halving
 //!     the context, so a KV-dominated model keeps its window and quant instead of degrading harder.
@@ -67,11 +69,39 @@ const CONTEXT_FLOOR: u32 = 4096;
 /// a real rig before raising it — nobody has yet.
 const SYSTEM_BANDWIDTH_GBPS: f64 = 40.0;
 
-/// Fallback dedicated-GPU read bandwidth, used only when the footprint fits in VRAM *and* the card
-/// wasn't recognised by the per-model bandwidth table (`hardware::gpu_bandwidth_gbps`). CALIBRATE:
+/// Fallback dedicated-GPU read bandwidth, for the on-card estimate ([`gpu_tokens_per_sec`]) when the
+/// card wasn't recognised by the per-model bandwidth table (`hardware::gpu_bandwidth_gbps`). CALIBRATE:
 /// mid-range discrete GPUs land ~300-500 GB/s; 400 is a deliberately mid, non-flattering pick for the
-/// unknown case. A recognised card overrides this with its real spec via `FitHardware`.
+/// unknown case. A recognised card overrides this with its real spec via `FitHardware`. It feeds the
+/// chat floor as a recognised card's figure does, so it decides an unrecognised card's pick.
 const GPU_BANDWIDTH_FALLBACK_GBPS: f64 = 400.0;
+
+/// What an ordinary decode byte costs on a discrete card, in bytes of its published bandwidth: those
+/// bytes streamed at 1 / 1.787 = 56.0% of it. One half of a two-parameter fit, with
+/// [`GPU_SLOW_BYTE_COST`], on the eight models timed on the dev laptop ([`tokens_per_sec`] has the
+/// table), whose card was software power-capped throughout — so a healthy card beats it, which is the
+/// safe direction.
+///
+/// Written as the fitted costs, never as rounded efficiencies: 0.56 and 0.38 put gemma 4 12b Q3_K_M
+/// at 29.5 on that laptop, which prints as 30 and clears the chat floor its measured 28.3 does not.
+/// CALIBRATE: re-fit both on an uncapped run.
+const GPU_BYTE_COST: f64 = 1.787;
+
+/// What a byte in a type slow to unpack costs on a discrete card (the generator's
+/// `SLOW_TENSOR_TYPES`, [`Quant::unpacks_slowly`]): 1 / 2.647 = 37.8% of the published bandwidth.
+/// Fitted on the three Q3_K_M points, so it is Q3_K's cost; the other slow types are assumed to
+/// share it, unmeasured. CALIBRATE with [`GPU_BYTE_COST`].
+const GPU_SLOW_BYTE_COST: f64 = 2.647;
+
+/// A mixture of experts on a card is estimated at half what its decode bytes alone say. From one
+/// published report, not a PM measurement: Qwen3.6 35B A3B at about 120 tok/s on an RTX 4090, where
+/// the bytes alone say 215 and this 107. On the card only — [`system_tokens_per_sec`] has no factor.
+/// CALIBRATE: PM has timed no MoE.
+const MOE_GPU_FACTOR: f64 = 0.5;
+
+/// The share of a slow quant's bytes charged as slow where the catalogue has no tensor table to split
+/// them by ([`decode_bytes`]): the median slow share of the dense Q3_K_M files (36-60%).
+const FALLBACK_SLOW_SHARE: f64 = 0.5;
 
 /// f16 KV-cache proxy: GB of cache per (billion active params × token), used ONLY for a spec that
 /// carries no [`KvGeometry`] — every catalogue entry carries one, so in practice that is a test or
@@ -124,7 +154,8 @@ pub enum Architecture {
 
 /// A GGUF quantization, ordered here best (largest, highest quality) to worst. The `bytes_per_param`
 /// values approximate bits-per-weight / 8 for each scheme; they order quants by quality and feed the
-/// throughput estimate, but the *memory* footprint always uses the catalog's measured `file_gb`.
+/// throughput estimate where the catalogue has no decode bytes, but the *memory* footprint always uses
+/// the catalog's measured `file_gb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[allow(non_camel_case_types)] // GGUF quant labels are the canonical names (Q4_K_M, IQ4_XS, …); serde emits them verbatim.
 pub enum Quant {
@@ -177,6 +208,25 @@ impl Quant {
             Quant::IQ2_M => 0.33,
             Quant::IQ2_XS => 0.30,
         }
+    }
+
+    /// The label-level mirror of the generator's `SLOW_TENSOR_TYPES`: a quant whose bulk is in a
+    /// type slow to unpack ([`GPU_SLOW_BYTE_COST`]). Read only where there are no decode bytes to
+    /// split ([`decode_bytes`]). Only Q3_K is measured; the rest are assumed by kinship.
+    pub fn unpacks_slowly(self) -> bool {
+        matches!(
+            self,
+            Quant::Q3_K_L
+                | Quant::Q3_K_M
+                | Quant::Q3_K_S
+                | Quant::Q2_K
+                | Quant::IQ4_NL
+                | Quant::IQ4_XS
+                | Quant::IQ3_M
+                | Quant::IQ3_XS
+                | Quant::IQ2_M
+                | Quant::IQ2_XS
+        )
     }
 
     /// Parse a GGUF quant label (e.g. `"Q4_K_M"`) into a known scheme, case-insensitively. Unknown
@@ -250,6 +300,20 @@ pub struct QuantCandidate {
     pub quant: Quant,
     /// Measured file size in GiB (2^30 bytes, the unit of every size here) — the weight-memory term.
     pub weight_gb: f64,
+    /// The bytes a decode step reads, from the catalogue row for this quant
+    /// (`local_catalog::decode_for`). `None` — a quant the catalogue does not list, a row whose header
+    /// the generator could not read, a test — and [`decode_bytes`] falls back to the parameter count.
+    pub decode: Option<DecodeBytes>,
+}
+
+/// The bytes one decode step reads for one quant, in bytes (not GiB), read from the file's GGUF
+/// tensor table by the generator (`decodeBytes` in `scripts/generate-local-catalog.mjs`, which says
+/// which tensors count and how much): `slow` in the types slow to unpack ([`GPU_SLOW_BYTE_COST`]),
+/// `fast` in every other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeBytes {
+    pub fast: f64,
+    pub slow: f64,
 }
 
 /// What a model's KV cache costs, from its own attention geometry rather than its parameter count.
@@ -283,8 +347,13 @@ pub struct FitHardware {
     /// drives the separate GPU-resident config (`gpu_fit`).
     pub vram_gb: Option<f64>,
     /// The GPU's real peak memory bandwidth (GB/s) when its model was recognised
-    /// (`hardware::gpu_bandwidth_gbps`), else `None` → the flat [`GPU_BANDWIDTH_FALLBACK_GBPS`]. Only
-    /// sharpens the on-GPU tok/s estimate; never affects which config fits.
+    /// (`hardware::gpu_bandwidth_gbps`), else `None` → the flat [`GPU_BANDWIDTH_FALLBACK_GBPS`]. Feeds
+    /// the on-GPU tok/s estimate ([`gpu_tokens_per_sec`]) and the [`SpeedBasis`] it is worded on, and
+    /// nothing else, so it never changes what fits: every budget sizes the same config at any
+    /// bandwidth. That estimate is not display-only,
+    /// though: [`gpu_fit`] offers a `Split` only where it beats system memory, and on a discrete card
+    /// `better_fit::judge` keeps only the builds it puts at the chat floor or more — so the bandwidth
+    /// can change PM's pick.
     pub gpu_bandwidth_gbps: Option<f64>,
     /// Shared-memory GPU — Apple Silicon, OR a non-Apple integrated GPU / APU: VRAM is a slice of
     /// system RAM at the same bandwidth, so there is no distinct faster "GPU" config to offer
@@ -328,10 +397,12 @@ pub enum Verdict {
     Unknown,
 }
 
-/// Where a speed estimate's bandwidth figure came from, so the UI can say how far to trust it. The
-/// arithmetic is the same on every path — bandwidth over the active weight bytes read per token — but
-/// the bandwidth is a published spec on one path, a typical figure on two, and on shared memory a
-/// number PM does not stand behind at all.
+/// Where a speed estimate's bandwidth figure came from, so the UI can say how far to trust it. Every
+/// path divides a bandwidth by the bytes a decode step reads, and on a card charges those bytes at
+/// costs fitted on eight models timed on one power-capped laptop card ([`tokens_per_sec`]): an
+/// estimate on every path, never a bound. The bandwidth is a published spec on one path, a typical
+/// figure on two, and on shared memory a number PM does not stand behind at all. On the card the
+/// figure is compared against the chat floor, off it against the background floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeedBasis {
@@ -361,7 +432,8 @@ pub struct FitResult {
     pub est_memory_gb: Option<f64>,
     pub est_tokens_per_sec: Option<f64>,
     /// Which bandwidth [`Self::est_tokens_per_sec`] was worked out from, so the UI can word the
-    /// number as a ceiling, a typical figure or no figure at all. `None` when there is no estimate.
+    /// number as an estimate from a published or typical speed, or no figure. `None` when there is
+    /// no estimate.
     pub speed_basis: Option<SpeedBasis>,
     /// Honest, user-facing caveats (GPU-vs-RAM speed, halved context, thin headroom). The KV precision
     /// is carried structurally in `kv`, not here.
@@ -426,38 +498,46 @@ fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32, kv: KvCache) 
     cand.weight_gb + kv_cache_gb(spec, ctx, kv) + OVERHEAD_GB + spec.projector_gb.unwrap_or(0.0)
 }
 
-/// Rough decode throughput: read bandwidth divided by the *active* weight bytes touched per token
-/// (MoE only reads its active experts). Uses GPU bandwidth when the footprint fits in VRAM, else
-/// system RAM, and says which. Returns `None` if the model has no active weight bytes (nonsensical
-/// input).
+/// Decode throughput for a config of `footprint_gb`: on the card when it fits VRAM
+/// ([`gpu_tokens_per_sec`]), else from system RAM ([`system_tokens_per_sec`]), and which bandwidth
+/// it came from. `None` when there are no decode bytes (a spec with no active parameters).
 ///
-/// Speed is an upper bound, not a forecast. On a recognised discrete GPU with the config resident on
-/// the GPU, it must never be below real decode speed. On an RTX 5060 Laptop GPU at 384 GB/s, real
-/// decode has come in 10–57% below it: Qwen2.5 7B Q5_K_M est 71, ~64 real one day and 44–47 another;
-/// gemma 3 4b Q4_K_M est 162, ~105 then ~75; gemma 4 12b Q3_K_M est 65.8, 28.5 (n=5, Ollama, full
-/// residency). On the slower day the card generated in P4 at 9001 of 12001 MHz memory clock, on mains
-/// with the performance profile, so a laptop's own power management moves the real figure by more
-/// than the model does. PM claims no tolerance for an unrecognised card, shared memory or system RAM,
-/// and no ranking may order by its magnitude: the one comparison PM makes is the background floor
-/// (better_fit), computed at the deliberately low SYSTEM_BANDWIDTH_GBPS.
+/// An estimate, not a bound. On a discrete card it is a two-parameter fit ([`GPU_BYTE_COST`],
+/// [`GPU_SLOW_BYTE_COST`]) on eight models timed on the dev laptop — RTX 5060 Laptop GPU, 384 GB/s,
+/// Ollama 0.33, q8_0 cache, 32k context, fully on the card, thinking off, 02-10-2026 — where it came
+/// within −11% to +15% of each (leave-one-out 8.2% mean, 18.6% worst):
+///
+/// | Model, quant         | Estimate | Measured |
+/// |----------------------|----------|----------|
+/// | Llama 3.2 1B Q8_0    | 163.6    | 184.8    |
+/// | Llama 3.2 3B Q6_K    | 81.5     | 78.5     |
+/// | Qwen3.5 4B Q6_K      | 61.1     | 56.8     |
+/// | gemma 3 4b Q4_K_M    | 86.5     | 75.0     |
+/// | Qwen2.5 7B Q5_K_M    | 42.4     | 45.1     |
+/// | Llama 3.1 8B Q3_K_M  | 45.7     | 47.0     |
+/// | Qwen3.5 9B Q3_K_M    | 42.7     | 42.9     |
+/// | gemma 4 12b Q3_K_M   | 29.4     | 28.3     |
+///
+/// All eight points are capped ones: the card was software power-capped throughout
+/// (`clocks_event_reasons` 0x4, 47-53 W of 115 W), and uncapped on 29-08 it ran Qwen2.5 7B and gemma
+/// 3 4b about 1.4x faster. So a healthy card beats the estimate, the safe direction. On the card it
+/// is compared against the chat floor (`better_fit::quick_enough_for_chat`); off it, the system figure
+/// is compared against the background floor. PM claims no tolerance for an unrecognised card, shared
+/// memory or system RAM.
 fn tokens_per_sec(
     spec: &ModelSpec,
     cand: &QuantCandidate,
     footprint_gb: f64,
     hw: &FitHardware,
 ) -> Option<(f64, SpeedBasis)> {
-    let active_weight_gb = spec.active_params_b * cand.quant.bytes_per_param();
-    if active_weight_gb <= 0.0 {
-        return None;
-    }
+    decode_bytes(spec, cand)?;
     let on_gpu = hw.vram_gb.is_some_and(|v| v >= footprint_gb);
     if !on_gpu {
-        return Some((SYSTEM_BANDWIDTH_GBPS / active_weight_gb, SpeedBasis::System));
+        return Some((system_tokens_per_sec(spec, cand), SpeedBasis::System));
     }
     // A recognised card's real spec, else the flat fallback for an unlisted GPU. The basis changes
     // only what PM is willing to claim about the number, never the number: shared memory keeps the
-    // figure it always had, and the UI declines to show it.
-    let bandwidth = hw.gpu_bandwidth_gbps.unwrap_or(GPU_BANDWIDTH_FALLBACK_GBPS);
+    // figure a card would have, and the UI declines to show it.
     let basis = if hw.unified_memory {
         SpeedBasis::Shared
     } else if hw.gpu_bandwidth_gbps.is_some() {
@@ -465,14 +545,77 @@ fn tokens_per_sec(
     } else {
         SpeedBasis::GpuTypical
     };
-    Some((bandwidth / active_weight_gb, basis))
+    gpu_tokens_per_sec(spec, cand, hw).map(|tps| (tps, basis))
 }
 
-/// Decode speed from system RAM at [`SYSTEM_BANDWIDTH_GBPS`], whatever the machine has. The one speed
-/// figure PM compares against anything: the background floor in `better_fit`, which needs the
-/// pessimistic number on purpose — a model that clears it from system RAM clears it anywhere.
-pub fn system_tokens_per_sec(active_params_b: f64, q: Quant) -> f64 {
-    SYSTEM_BANDWIDTH_GBPS / (active_params_b * q.bytes_per_param())
+/// The bytes one decode step reads for `cand`: the catalogue's figure from the file's own tensor
+/// table when the candidate carries one, else the active parameters × [`Quant::bytes_per_param`],
+/// with [`FALLBACK_SLOW_SHARE`] of a slow quant's ([`Quant::unpacks_slowly`]) charged as slow.
+/// `None` for a spec with no active parameters, which is nonsensical input.
+///
+/// The fallback is the figure every estimate used before the catalogue carried decode bytes, and it
+/// read 1.25-1.63x too few bytes for both catalogue MoEs, so a catalogue row always wins over it.
+pub fn decode_bytes(spec: &ModelSpec, cand: &QuantCandidate) -> Option<DecodeBytes> {
+    if spec.active_params_b <= 0.0 {
+        return None;
+    }
+    if let Some(decode) = cand.decode {
+        return Some(decode);
+    }
+    let bytes = spec.active_params_b * 1e9 * cand.quant.bytes_per_param();
+    let slow = if cand.quant.unpacks_slowly() {
+        FALLBACK_SLOW_SHARE * bytes
+    } else {
+        0.0
+    };
+    Some(DecodeBytes {
+        fast: bytes - slow,
+        slow,
+    })
+}
+
+/// Decode speed resident on a discrete card: its bandwidth (the recognised card's, else
+/// [`GPU_BANDWIDTH_FALLBACK_GBPS`]) over the decode bytes, each charged at its fitted cost, and
+/// halved for a mixture of experts ([`MOE_GPU_FACTOR`]). `None` when there are no decode bytes.
+///
+/// A function of the quant and the card alone, never of memory, so freeing memory, adding VRAM or
+/// adding bandwidth can only ever widen what clears the chat floor.
+pub fn gpu_tokens_per_sec(
+    spec: &ModelSpec,
+    cand: &QuantCandidate,
+    hw: &FitHardware,
+) -> Option<f64> {
+    let decode = decode_bytes(spec, cand)?;
+    let cost = decode.fast * GPU_BYTE_COST + decode.slow * GPU_SLOW_BYTE_COST;
+    if cost <= 0.0 {
+        return None;
+    }
+    let bandwidth = hw.gpu_bandwidth_gbps.unwrap_or(GPU_BANDWIDTH_FALLBACK_GBPS);
+    let moe = if spec.arch == Architecture::Moe {
+        MOE_GPU_FACTOR
+    } else {
+        1.0
+    };
+    Some(bandwidth * 1e9 / cost * moe)
+}
+
+/// Decode speed from system RAM at [`SYSTEM_BANDWIDTH_GBPS`], whatever the machine has: that
+/// bandwidth over the decode bytes, with no cost factors and no MoE factor — both were fitted or
+/// reported on a card. The figure PM compares against the background floor in `better_fit`, which
+/// needs the pessimistic number on purpose: a model that clears it from system RAM clears it
+/// anywhere. 0.0 when there are no decode bytes.
+pub fn system_tokens_per_sec(spec: &ModelSpec, cand: &QuantCandidate) -> f64 {
+    match decode_bytes(spec, cand) {
+        Some(d) if d.fast + d.slow > 0.0 => SYSTEM_BANDWIDTH_GBPS * 1e9 / (d.fast + d.slow),
+        _ => 0.0,
+    }
+}
+
+/// The whole number the UI prints for an estimate: `speedShort` shows `toFixed(0)` of the
+/// one-decimal figure a [`FitResult`] carries, so this rounds the same two times. What the chat
+/// floor is compared on, so a card can never say "about 30" beside "under 30".
+pub fn shown_tps(tps: f64) -> f64 {
+    round1(tps).round()
 }
 
 /// The context ladder: the target, then repeated halving, never below the floor. Always includes at
@@ -657,7 +800,14 @@ pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFi
     if gpu.quant == ram_fit.quant && gpu.context == ram_fit.context && gpu.kv == ram_fit.kv {
         return GpuFit::Single; // Defensive: identical pick — nothing distinct to show.
     }
-    GpuFit::Split { fit: gpu }
+    // The invariant `Split` states, enforced rather than assumed: a card config PM estimates no
+    // faster than the RAM one is nothing faster to offer. The MoE factor applies on the card only, so
+    // a MoE's card figure could fall under its RAM one below about 150 GB/s; no listed card that slow
+    // can hold a catalogue MoE, and this keeps one from ever being offered as the faster rung.
+    match (gpu.est_tokens_per_sec, ram_fit.est_tokens_per_sec) {
+        (Some(on_card), Some(off_card)) if on_card > off_card => GpuFit::Split { fit: gpu },
+        _ => GpuFit::Single,
+    }
 }
 
 /// The best config that fits the card with its reserve AND free RAM.
@@ -670,9 +820,11 @@ pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFi
 ///
 /// For every [`GpuFit::Split`] this is the very rung `gpu_fit` returned — the same call at the same
 /// budget, because a Split's RAM config is larger than the card, so the RAM budget never binds — and
-/// for [`GpuFit::NoGpuResident`] it is `None`. The one case it adds is the reserve band: a RAM config
-/// in `(vram − GPU_RESERVE_GB, vram]`, which `gpu_fit` calls `Single` because it already reports GPU
-/// speed, while it does not keep the reserve. There this returns the config that does.
+/// for [`GpuFit::NoGpuResident`] it is `None`. The case it adds is the reserve band: a RAM config in
+/// `(vram − GPU_RESERVE_GB, vram]`, which `gpu_fit` calls `Single` because it already reports GPU
+/// speed, while it does not keep the reserve. There this returns the config that does. It also
+/// returns the rung `gpu_fit` declines to offer as a Split where the card is estimated no faster than
+/// system memory.
 pub fn resident_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> Option<FitResult> {
     if hw.unified_memory {
         return None;
@@ -868,7 +1020,11 @@ mod tests {
     }
 
     fn q(quant: Quant, weight_gb: f64) -> QuantCandidate {
-        QuantCandidate { quant, weight_gb }
+        QuantCandidate {
+            quant,
+            weight_gb,
+            decode: None,
+        }
     }
 
     fn ram(gb: f64) -> FitHardware {
@@ -1591,9 +1747,9 @@ mod tests {
 
     #[test]
     fn every_speed_says_which_bandwidth_it_came_from() {
-        // One small model, four machines — one per path through `tokens_per_sec`. The number is
-        // the same arithmetic on all four; what differs is how far PM can stand behind it, and the
-        // UI words each one differently ("up to", "about", or no figure at all).
+        // One small model, four machines — one per path through `tokens_per_sec`. What differs is
+        // how far PM can stand behind the number, and the UI words each one differently ("about" a
+        // published or a typical speed, or no figure at all).
         let spec = dense(7.0, 4096, vec![q(Quant::Q4_K_M, 4.3)]);
         let published = FitHardware {
             gpu_bandwidth_gbps: Some(384.0),
@@ -1655,18 +1811,269 @@ mod tests {
 
     #[test]
     fn system_speed_is_the_pessimistic_ram_figure() {
-        // 40 GB/s over the active weight bytes: Qwen2.5 7B at Q8_0 is the figure §3 of the redesign
-        // spec quotes as failing the background floor (4.95 against 8.53).
-        assert!((system_tokens_per_sec(7.62, Quant::Q8_0) - 40.0 / (7.62 * 1.06)).abs() < EPS);
-        assert!((system_tokens_per_sec(7.62, Quant::Q8_0) - 4.95).abs() < 0.01);
-        // And it is the same number `fit` reports for a config that runs from RAM.
+        // 40 GB/s over the decode bytes, here the active weight bytes: Qwen2.5 7B at Q8_0 is the
+        // figure §3 of the redesign spec quotes as failing the background floor (4.95 against 8.53).
         let spec = dense(7.62, 4096, vec![q(Quant::Q8_0, 7.54)]);
+        let cand = spec.candidates[0];
+        assert!((system_tokens_per_sec(&spec, &cand) - 40.0 / (7.62 * 1.06)).abs() < EPS);
+        assert!((system_tokens_per_sec(&spec, &cand) - 4.95).abs() < 0.01);
+        // And it is the same number `fit` reports for a config that runs from RAM.
         let r = fit(&spec, &ram(32.0));
         assert_eq!(r.speed_basis, Some(SpeedBasis::System));
         assert_eq!(
             r.est_tokens_per_sec,
-            Some(round1(system_tokens_per_sec(7.62, Quant::Q8_0)))
+            Some(round1(system_tokens_per_sec(&spec, &cand)))
         );
+    }
+
+    // --- the speed estimate: decode bytes and the fitted costs ------------------------------------
+
+    /// The committed catalogue's spec for `repo` and its candidate for `quant`.
+    fn catalogue_build(repo: &str, quant: Quant) -> (ModelSpec, QuantCandidate) {
+        let e = crate::local_catalog::catalog()
+            .entries
+            .iter()
+            .find(|e| e.repo == repo)
+            .unwrap_or_else(|| panic!("{repo} is in the catalogue"));
+        let spec = crate::local_catalog::entry_to_spec(e);
+        let cand = *spec
+            .candidates
+            .iter()
+            .find(|c| c.quant == quant)
+            .unwrap_or_else(|| panic!("{repo} lists {quant:?}"));
+        (spec, cand)
+    }
+
+    #[test]
+    fn the_gpu_estimate_comes_within_twenty_percent_of_the_eight_models_timed_on_the_dev_laptop() {
+        // RTX 5060 Laptop GPU at 384 GB/s, Ollama 0.33, q8_0 cache, 32k, fully on the card, thinking
+        // off, 02-10-2026, with the card software power-capped throughout. Each estimate is pinned
+        // to the decimal `tokens_per_sec`'s table prints, from the catalogue's own decode bytes.
+        let card = FitHardware {
+            gpu_bandwidth_gbps: Some(384.0),
+            ..gpu(20.0, 7.96)
+        };
+        for (repo, quant, estimate, measured) in [
+            (
+                "bartowski/Llama-3.2-1B-Instruct-GGUF",
+                Quant::Q8_0,
+                163.6,
+                184.8,
+            ),
+            (
+                "bartowski/Llama-3.2-3B-Instruct-GGUF",
+                Quant::Q6_K,
+                81.5,
+                78.5,
+            ),
+            ("unsloth/Qwen3.5-4B-GGUF", Quant::Q6_K, 61.1, 56.8),
+            ("ggml-org/gemma-3-4b-it-GGUF", Quant::Q4_K_M, 86.5, 75.0),
+            (
+                "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                Quant::Q5_K_M,
+                42.4,
+                45.1,
+            ),
+            (
+                "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                Quant::Q3_K_M,
+                45.7,
+                47.0,
+            ),
+            ("unsloth/Qwen3.5-9B-GGUF", Quant::Q3_K_M, 42.7, 42.9),
+            ("unsloth/gemma-4-12b-it-GGUF", Quant::Q3_K_M, 29.4, 28.3),
+        ] {
+            let (spec, cand) = catalogue_build(repo, quant);
+            assert!(
+                cand.decode.is_some(),
+                "{repo}: read off its own tensor table"
+            );
+            let tps = gpu_tokens_per_sec(&spec, &cand, &card).unwrap();
+            assert_eq!(round1(tps), estimate, "{repo} {quant:?}");
+            assert!(
+                (tps / measured - 1.0).abs() <= 0.20,
+                "{repo} {quant:?}: {tps:.1} against a measured {measured}"
+            );
+        }
+
+        // The pair that decides the dev laptop's pick: gemma 4 12b shows 29, under the chat floor's
+        // 30, and Qwen3.5 9B 43. The costs are the fitted 1.787 and 2.647 on purpose — rounded to
+        // 56% and 38% efficiencies, gemma 4 12b comes out at 29.5, which shows as 30 and passes.
+        let (gemma, gemma_q3) = catalogue_build("unsloth/gemma-4-12b-it-GGUF", Quant::Q3_K_M);
+        let (qwen, qwen_q3) = catalogue_build("unsloth/Qwen3.5-9B-GGUF", Quant::Q3_K_M);
+        let gemma_tps = gpu_tokens_per_sec(&gemma, &gemma_q3, &card).unwrap();
+        assert_eq!(shown_tps(gemma_tps), 29.0);
+        assert_eq!(
+            shown_tps(gpu_tokens_per_sec(&qwen, &qwen_q3, &card).unwrap()),
+            43.0
+        );
+        let d = gemma_q3.decode.unwrap();
+        let rounded = 384e9 / (d.fast / 0.56 + d.slow / 0.38);
+        assert_eq!(
+            round1(rounded),
+            29.5,
+            "the rounding trap the constants avoid"
+        );
+    }
+
+    /// One build of a dense 7B whose decode bytes are given outright.
+    fn decoded(arch: Architecture, fast: f64, slow: f64) -> (ModelSpec, QuantCandidate) {
+        let cand = QuantCandidate {
+            quant: Quant::Q4_K_M,
+            weight_gb: 4.0,
+            decode: Some(DecodeBytes { fast, slow }),
+        };
+        let spec = ModelSpec {
+            arch,
+            ..dense(7.0, 4096, vec![cand])
+        };
+        (spec, cand)
+    }
+
+    #[test]
+    fn a_slow_to_unpack_byte_costs_more_than_an_ordinary_one() {
+        let card = FitHardware {
+            gpu_bandwidth_gbps: Some(384.0),
+            ..gpu(20.0, 8.0)
+        };
+        let (fast_spec, fast) = decoded(Architecture::Dense, 4e9, 0.0);
+        let (slow_spec, slow) = decoded(Architecture::Dense, 0.0, 4e9);
+        let on_card = |spec, cand| gpu_tokens_per_sec(spec, cand, &card).unwrap();
+        assert!(
+            (on_card(&fast_spec, &fast) / on_card(&slow_spec, &slow) - 2.647 / 1.787).abs() < EPS
+        );
+        // From system memory a byte is a byte: the costs were fitted on a card.
+        assert_eq!(
+            system_tokens_per_sec(&fast_spec, &fast),
+            system_tokens_per_sec(&slow_spec, &slow)
+        );
+        // The label-level mirror, read only where there is no tensor table to split.
+        for quant in [Quant::Q3_K_M, Quant::Q3_K_S, Quant::Q2_K, Quant::IQ4_XS] {
+            assert!(quant.unpacks_slowly(), "{quant:?}");
+        }
+        for quant in [
+            Quant::F16,
+            Quant::Q8_0,
+            Quant::Q6_K,
+            Quant::Q4_K_M,
+            Quant::Q4_0,
+        ] {
+            assert!(!quant.unpacks_slowly(), "{quant:?}");
+        }
+    }
+
+    #[test]
+    fn a_mixture_of_experts_is_halved_on_a_card_and_not_from_system_memory() {
+        // The same decode bytes, dense and MoE. One published report (Qwen3.6 35B A3B about 120 on a
+        // 4090) halves the MoE on a card; nothing has been measured from system memory to halve.
+        let card = FitHardware {
+            gpu_bandwidth_gbps: Some(1008.0),
+            ..gpu(48.0, 24.0)
+        };
+        let (dense_spec, dense_build) = decoded(Architecture::Dense, 2e9, 1e9);
+        let (moe_spec, moe_build) = decoded(Architecture::Moe, 2e9, 1e9);
+        let on_card = |spec, cand| gpu_tokens_per_sec(spec, cand, &card).unwrap();
+        assert!(
+            (on_card(&moe_spec, &moe_build) / on_card(&dense_spec, &dense_build) - 0.5).abs() < EPS
+        );
+        assert_eq!(
+            system_tokens_per_sec(&moe_spec, &moe_build),
+            system_tokens_per_sec(&dense_spec, &dense_build)
+        );
+    }
+
+    #[test]
+    fn without_decode_bytes_the_estimate_falls_back_to_the_parameter_count() {
+        // Qwen2.5 7B with no tensor table: active params × bytes per param, half of a slow quant's
+        // charged as slow.
+        let spec = dense(
+            7.62,
+            4096,
+            vec![
+                q(Quant::Q8_0, 7.54),
+                q(Quant::Q4_K_M, 4.36),
+                q(Quant::Q3_K_M, 3.55),
+            ],
+        );
+        let build = |quant| *spec.candidates.iter().find(|c| c.quant == quant).unwrap();
+        let card = FitHardware {
+            gpu_bandwidth_gbps: Some(384.0),
+            ..gpu(32.0, 24.0)
+        };
+        // From system memory, exactly the figure it always was.
+        let system = system_tokens_per_sec(&spec, &build(Quant::Q8_0));
+        assert!((system - 40.0 / (7.62 * 1.06)).abs() < EPS);
+        assert!((system - 4.95).abs() < 0.01);
+        // On the card, at the fitted costs.
+        let q4 = gpu_tokens_per_sec(&spec, &build(Quant::Q4_K_M), &card).unwrap();
+        assert!((q4 - 384.0 / (7.62 * 0.61 * 1.787)).abs() < EPS, "{q4}");
+        let q3 = gpu_tokens_per_sec(&spec, &build(Quant::Q3_K_M), &card).unwrap();
+        assert!(
+            (q3 - 384.0 / (7.62 * 0.49 * (0.5 * 1.787 + 0.5 * 2.647))).abs() < EPS,
+            "{q3}"
+        );
+        // A spec with no active parameters has no bytes, so no figure at all.
+        let empty = dense(0.0, 4096, vec![q(Quant::Q4_K_M, 4.0)]);
+        assert_eq!(decode_bytes(&empty, &empty.candidates[0]), None);
+        assert_eq!(
+            gpu_tokens_per_sec(&empty, &empty.candidates[0], &card),
+            None
+        );
+        assert_eq!(system_tokens_per_sec(&empty, &empty.candidates[0]), 0.0);
+        assert_eq!(fit(&empty, &ram(32.0)).est_tokens_per_sec, None);
+    }
+
+    #[test]
+    fn shown_tps_is_the_whole_number_the_ui_prints() {
+        // `speedShort` prints `toFixed(0)` of the one-decimal figure, so it rounds twice. 29.45 is
+        // left out on purpose: in floating point it sits a hair under, and rounds to 29.4.
+        assert_eq!(shown_tps(29.44), 29.0);
+        assert_eq!(shown_tps(29.46), 30.0);
+        assert_eq!(shown_tps(29.5), 30.0);
+    }
+
+    #[test]
+    fn a_split_is_offered_only_where_the_card_is_estimated_faster() {
+        // A MoE whose Q8_0 lives off a 16 GB card and whose Q4_K_M fits on it. The halving applies
+        // on the card only, so on a slow enough card the build on it is estimated slower than the
+        // larger one from system memory, and is no faster rung to offer.
+        let moe = ModelSpec {
+            arch: Architecture::Moe,
+            active_params_b: 3.82,
+            ..dense(
+                3.82,
+                8192,
+                vec![q(Quant::Q8_0, 25.0), q(Quant::Q4_K_M, 13.0)],
+            )
+        };
+        let at = |bandwidth: f64| FitHardware {
+            gpu_bandwidth_gbps: Some(bandwidth),
+            ..gpu(64.0, 16.0)
+        };
+
+        let slow_card = at(60.0);
+        let rf = fit(&moe, &slow_card);
+        assert_eq!(rf.quant, Some(Quant::Q8_0));
+        assert_eq!(rf.speed_basis, Some(SpeedBasis::System));
+        let resident = resident_fit(&moe, &slow_card, &rf).expect("the Q4_K_M fits the card");
+        assert!(
+            resident.est_tokens_per_sec.unwrap() < rf.est_tokens_per_sec.unwrap(),
+            "{resident:?}"
+        );
+        assert_eq!(gpu_fit(&moe, &slow_card, &rf), GpuFit::Single);
+
+        let fast_card = at(288.0);
+        let rf = fit(&moe, &fast_card);
+        match gpu_fit(&moe, &fast_card, &rf) {
+            GpuFit::Split { fit: g } => {
+                assert_eq!(g.quant, Some(Quant::Q4_K_M));
+                assert!(
+                    g.est_tokens_per_sec.unwrap() > rf.est_tokens_per_sec.unwrap(),
+                    "{g:?} vs {rf:?}"
+                );
+            }
+            other => panic!("expected a Split, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1749,8 +2156,9 @@ mod tests {
         // over the 5.93 GiB this very config was measured holding on that card.
         assert_eq!(g.est_memory_gb, Some(6.5));
         assert_eq!(g.speed_basis, Some(SpeedBasis::GpuPublished));
-        // The estimate Bobby's measurement (about 64 real) was taken against.
-        assert_eq!(g.est_tokens_per_sec, Some(71.0));
+        // Measured at 45.1 on that card, capped, on 02-10 (and about 64 uncapped on 29-08). The old
+        // "up to" figure was 71.0.
+        assert_eq!(g.est_tokens_per_sec, Some(42.4));
 
         // The two guards `gpu_fit` opens with, and a RAM verdict that already refused.
         let shared = FitHardware {

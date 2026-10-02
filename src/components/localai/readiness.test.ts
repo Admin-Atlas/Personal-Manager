@@ -159,7 +159,8 @@ const fit = (over: Partial<LocalFitResult> = {}): LocalFitResult => ({
 const QWEN = "bartowski/Qwen2.5-7B-Instruct-GGUF";
 const QWEN_TAG = `hf.co/${QWEN}:Q5_K_M`;
 
-/** The dev laptop's pick (spec §3): Qwen2.5 7B at Q5_K_M on the card, 5.1 GB to download. */
+/** A pick on a card like the dev laptop's (7.96 GB at 384 GB/s): Qwen2.5 7B at Q5_K_M on the card,
+ *  5.1 GB to download. */
 const catalogue = (over: Partial<Extract<LocalPick, { kind: "catalogue" }>> = {}): LocalPick => ({
   kind: "catalogue",
   repo: QWEN,
@@ -170,6 +171,7 @@ const catalogue = (over: Partial<Extract<LocalPick, { kind: "catalogue" }>> = {}
   download_gb: 5.07,
   basis: "gpu",
   also_have: null,
+  passed_over: null,
   ...over,
 });
 
@@ -218,6 +220,7 @@ const recs = (over: Partial<LocalRecommendations> = {}): LocalRecommendations =>
   },
   reserve_gb: 2,
   gpu_reserve_gb: 1,
+  chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
   catalog_version: 4,
   catalog_generated_at: "2026-09-30",
   endpoint_configured: true,
@@ -280,6 +283,7 @@ const installed = (
   measured,
   spills_gpu,
   card_unused,
+  under_chat_floor_tps: null,
 });
 
 /** PM's pick as a model the user already has. */
@@ -297,6 +301,7 @@ const ownedPick = (
   measured: true,
   fit: fit(),
   basis: "gpu",
+  passed_over: null,
   ...over,
 });
 
@@ -756,7 +761,7 @@ describe("steps — four, in order, with at most one next", () => {
       label: "Download (5.1 GB)",
     });
     expect(model.line).toBe(
-      "A 5.1 GB download. Your Ollama fetches it from Hugging Face — PM doesn't download anything itself.",
+      "A 5.1 GB download. PM expects it to reply at about 71 tok/s on your graphics card, so an answer of a few paragraphs takes about 4 seconds. Your Ollama fetches it from Hugging Face — PM doesn't download anything itself.",
     );
     expect(model.tag).toBe(QWEN_TAG);
     const restricted = recs({
@@ -792,6 +797,69 @@ describe("steps — four, in order, with at most one next", () => {
     );
     expect(other.command).toBe(llama.command);
     expect(other.action).toBeNull();
+  });
+
+  it("step 2 says how fast PM expects the pick to reply, and how long an answer takes", () => {
+    const withFit = (over: Partial<LocalFitResult>, base_url = "http://127.0.0.1:11434") =>
+      steps(
+        input({
+          served: [],
+          config: cfg({ base_url }),
+          recs: recs({ pick: catalogue({ fit: fit(over) }) }),
+        }),
+      )[1];
+    // From system memory: PM's rough guide, not a claim about a card.
+    expect(withFit({ speed_basis: "system", est_tokens_per_sec: 12.4 }).line).toBe(
+      "A 5.1 GB download. From system memory, PM's rough guide puts it at about 12 tok/s, so an answer of a few paragraphs takes about 24 seconds. Your Ollama fetches it from Hugging Face — PM doesn't download anything itself.",
+    );
+    // Shared memory gets no number, so no sentence: exactly the line without one.
+    const plain =
+      "A 5.1 GB download. Your Ollama fetches it from Hugging Face — PM doesn't download anything itself.";
+    expect(withFit({ speed_basis: "shared" }).line).toBe(plain);
+    expect(withFit({ speed_basis: null, est_tokens_per_sec: null }).line).toBe(plain);
+    // An unrecognised card is still a card.
+    expect(withFit({ speed_basis: "gpu_typical" }).line).toContain(
+      "PM expects it to reply at about 71 tok/s on your graphics card",
+    );
+    // Never under one second, and singular when it is one.
+    expect(withFit({ est_tokens_per_sec: 300 }).line).toContain(
+      "so an answer of a few paragraphs takes about 1 second.",
+    );
+    // The button stays the size alone.
+    expect(withFit({}).action).toMatchObject({ label: "Download (5.1 GB)" });
+
+    // The servers PM can't download into: the speed comes first among the notes, and the line and
+    // command are the ones about getting the file.
+    const speed =
+      "PM expects it to reply at about 71 tok/s on your graphics card, so an answer of a few paragraphs takes about 4 seconds.";
+    for (const url of ["http://127.0.0.1:1234", "http://127.0.0.1:8080", "http://127.0.0.1:9000"]) {
+      const step = steps(input({ served: served("gemma3:4b"), config: cfg({ base_url: url }) }))[1];
+      expect(step.notes, url).toEqual([
+        speed,
+        `Your server already has 1 other model — you can give one a job under ${sectionLabel("sec-localai-roles")} instead.`,
+      ]);
+      expect(step.line, url).not.toContain("tok/s");
+      expect(withFit({ speed_basis: "shared" }, url).notes, url).toEqual([]);
+    }
+
+    // A pick that is a file on this computer, not yet served: the speed is its one note.
+    const onDisk = steps(
+      input({
+        served: [],
+        config: cfg({ base_url: "http://127.0.0.1:8080" }),
+        recs: recs({ pick: ownedPick() }),
+      }),
+    )[1];
+    expect(onDisk.notes).toEqual([speed]);
+    expect(
+      steps(
+        input({
+          served: [],
+          config: cfg({ base_url: "http://127.0.0.1:8080" }),
+          recs: recs({ pick: ownedPick({ fit: fit({ speed_basis: "shared" }) }) }),
+        }),
+      )[1].notes,
+    ).toEqual([]);
   });
 
   it("step 2 says when the server already has something else to use", () => {
@@ -900,6 +968,7 @@ describe("steps — four, in order, with at most one next", () => {
         measured: true,
         fit: fit(),
         basis: "gpu",
+        passed_over: null,
       },
     });
     expect(steps(input({ recs: owned, served: served("qwen2.5:latest") }))[1].state).toBe("done");
@@ -933,6 +1002,7 @@ describe("steps — four, in order, with at most one next", () => {
               measured: true,
               fit: fit(),
               basis: "gpu",
+              passed_over: null,
             },
           }),
         }),

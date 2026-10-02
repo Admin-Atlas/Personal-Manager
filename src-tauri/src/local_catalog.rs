@@ -117,6 +117,28 @@ pub struct CatalogQuant {
     /// quantization, so a single per-entry tag would download a different file from the one the card
     /// sized, and the memory figure it showed would be a lie.
     pub ollama: Option<String>,
+    /// The bytes one decode step reads from this quant's files, read from every shard's GGUF tensor
+    /// table by the generator (`decodeBytes`, which says which tensors count and how much). `None`
+    /// when it could not read them, and the speed estimate falls back to the parameter count for this
+    /// quant; the committed catalogue carries it on every row (pinned below).
+    pub decode_bytes: Option<u64>,
+    /// The part of `decode_bytes` in a tensor type slow to unpack (the generator's
+    /// `SLOW_TENSOR_TYPES`), which the speed estimate charges at its own cost.
+    pub decode_slow_bytes: Option<u64>,
+}
+
+impl CatalogQuant {
+    /// This row's decode bytes as the fit reads them: both figures present and the slow part no more
+    /// than the whole, else `None`.
+    fn decode(&self) -> Option<fit::DecodeBytes> {
+        match (self.decode_bytes, self.decode_slow_bytes) {
+            (Some(t), Some(s)) if s <= t => Some(fit::DecodeBytes {
+                fast: (t - s) as f64,
+                slow: s as f64,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the app can compute a trustworthy fit for this entry (`unknown` = an unmodelled arch we
@@ -284,6 +306,7 @@ pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
             fit::Quant::from_label(&q.quant).map(|quant| fit::QuantCandidate {
                 quant,
                 weight_gb: q.file_gb,
+                decode: q.decode(),
             })
         })
         .collect();
@@ -306,6 +329,18 @@ pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
             state_bytes: kv.state_bytes,
         }),
     }
+}
+
+/// The decode bytes of `entry`'s row for `quant`, matched through [`fit::Quant::from_label`] as
+/// [`entry_to_spec`] matches it, or `None` when the entry lists no such quant or could not read it.
+/// What a served or on-disk copy of the model is estimated from: the catalogue's own file of that
+/// label, which a copy from another publisher only approximates.
+pub fn decode_for(entry: &CatalogEntry, quant: fit::Quant) -> Option<fit::DecodeBytes> {
+    entry
+        .quants
+        .iter()
+        .find(|q| fit::Quant::from_label(&q.quant) == Some(quant))
+        .and_then(CatalogQuant::decode)
 }
 
 // The catalog identity used for name matching: prefer the repo's last path segment (what tools echo).
@@ -499,6 +534,38 @@ mod tests {
                     q.quant
                 );
                 assert!(q.file_gb > 0.0, "{}: quant {} size", e.repo, q.quant);
+
+                // Every row's decode bytes were read off its tensor table: a regenerated catalogue
+                // that lost them for any row would quietly put that quant's speed back on the
+                // parameter count. Never more than the file, which also holds the header and every
+                // tensor a token does not read (0.005 GiB is `file_gb`'s rounding).
+                let total = q
+                    .decode_bytes
+                    .unwrap_or_else(|| panic!("{}: quant {} has no decode bytes", e.repo, q.quant));
+                let slow = q.decode_slow_bytes.unwrap_or_else(|| {
+                    panic!("{}: quant {} has no slow decode bytes", e.repo, q.quant)
+                });
+                let gib = 1_073_741_824.0;
+                assert!(
+                    slow <= total && total as f64 <= q.file_gb * gib + 0.005 * gib,
+                    "{}: quant {} decode bytes {slow} / {total} against {} GiB",
+                    e.repo,
+                    q.quant,
+                    q.file_gb
+                );
+                // A mixture of experts reads only the experts a token reaches: 0.09-0.24 of the file
+                // as measured, so a figure near the whole file means the experts were not scaled.
+                if arch_from(&e.architecture, e.active_parameters_b, e.parameters_b)
+                    == fit::Architecture::Moe
+                {
+                    assert!(
+                        (total as f64) < 0.3 * q.file_gb * gib,
+                        "{}: quant {} reads {total} of a {} GiB MoE per token",
+                        e.repo,
+                        q.quant,
+                        q.file_gb
+                    );
+                }
 
                 // The Ollama pull target, if the generator wrote one. Derived from THIS row rather
                 // than pattern-matched: a `starts_with("hf.co/")` check would pass for free on a

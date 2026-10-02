@@ -18,8 +18,10 @@ import {
   diskLine,
   eyebrow,
   facts,
+  howPmPicks,
   inUseLine,
   nothingSentence,
+  passedOverLine,
   pickInUse,
   settingsLine,
   why,
@@ -193,16 +195,7 @@ export function LocalAiStart({
       )}
 
       <SectionInfo title="How PM picks">
-        <p>
-          PM looks for the largest model in its list that runs entirely on your graphics card with
-          the room PM keeps free, at the context PM sizes it for — 32k tokens, less for a model made
-          for less, and more for one your server already runs with more — because a model that
-          spills into system memory replies many times slower. On a computer without a separate
-          graphics card, it only considers models its cautious estimate says are quick enough for
-          PM's background work. If you already have a model that fits that way and nothing in the
-          list is at least 15% larger, PM points at the one you have. It never downloads or switches
-          anything for you.
-        </p>
+        <p>{howPmPicks(input.recs?.chat_speed ?? null)}</p>
       </SectionInfo>
     </div>
   );
@@ -314,6 +307,8 @@ function ShownPickCard({
     (input.config?.background_routing !== "cloud" ? input.config?.background_model : null) ??
     null;
   const differs = betterFit?.repo === pick.repo ? null : inUseLine(pick, bound || null, recs);
+  // The larger model PM passed over for speed — not when it is the one in use, which `differs` says.
+  const passedOver = passedOverLine(pick, recs, bound || null);
 
   return (
     <div>
@@ -340,7 +335,10 @@ function ShownPickCard({
           as <span className="break-all font-mono">{pick.id}</span>
         </p>
       )}
-      <p className="mt-2 text-xs text-ink3">{why(pick)}</p>
+      <p className="mt-2 text-xs text-ink3">{why(pick, recs.chat_speed)}</p>
+      {/* Right under the reason, never folded and never Depth-gated: the pick is the smaller model
+          because of the speed rule, and this says which larger one lost to it and by how much. */}
+      {passedOver && <p className="mt-1 text-xs text-ink3">{passedOver}</p>}
       {/* Every figure the pick is justified by, at every Depth. Only the parameter count is extra. */}
       <p className="mt-1.5 text-xs text-ink3">
         {[...row, ...(showMeta && params ? [params] : [])].join(" · ")}

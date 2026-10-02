@@ -71,7 +71,7 @@ describe("the Local AI tab's help", () => {
 
   it("says nothing the redesign made untrue", () => {
     const bodies = LOCALAI_SECTIONS.map((s) => HELP[s.help].body).join(" ");
-    // The speeds are ceilings or rough guides now, never "conservative".
+    // The speeds are estimates or rough guides now, never "conservative".
     expect(bodies).not.toContain("The numbers are conservative estimates.");
     // Sections are named, never pointed at by direction.
     expect(bodies).not.toMatch(/\b(above|below)\b/);
@@ -79,18 +79,20 @@ describe("the Local AI tab's help", () => {
     expect(HELP["settings-localai-endpoint"].body).toContain(`“${TUNING_TITLE}”`);
   });
 
-  it("calls a speed a ceiling only on a graphics card PM recognises", () => {
-    // On a card it doesn't recognise PM uses a typical 400 GB/s, and the tab says the real figure
-    // "could be half that, or double" — so an unscoped "on a graphics card they're ceilings" told
-    // the reader the opposite of the line beside the number. System-memory speeds are a typical
-    // 40 GB/s, not a published one, so they get no ceiling either.
+  it("no Local AI help calls a speed a ceiling", () => {
+    // A card's figure is an estimate scaled by PM's own tests, worded "about" wherever it is shown,
+    // and it can be under or over the real speed — so a "ceiling" anywhere would tell the reader the
+    // opposite of the line beside the number.
     for (const { help } of LOCALAI_SECTIONS) {
-      const body = HELP[help].body;
-      for (const m of body.matchAll(/[^.]*\bceilings?\b[^.]*\./g)) {
-        expect(m[0], help).toMatch(/graphics card PM recognises/);
-        expect(m[0], help).toMatch(/rough guide/);
-      }
+      expect(HELP[help].body, help).not.toMatch(/\bceilings?\b/);
+      expect(HELP[help].body, help).not.toMatch(/up to \d/);
     }
+  });
+
+  it("never names the chat floor's figure", () => {
+    // Help is static and the backend owns the floor (better_fit.rs `chat_floor_tps`), so a number
+    // here could go on teaching one the pick no longer uses.
+    for (const { help } of LOCALAI_SECTIONS) expect(HELP[help].body, help).not.toMatch(/tok\/s/);
   });
 
   it("says the limit on unloading is PM's, not the servers'", () => {
