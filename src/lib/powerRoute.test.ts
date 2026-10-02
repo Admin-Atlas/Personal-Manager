@@ -22,6 +22,7 @@ import {
   whoPhrase,
 } from "./powerRoute";
 import type { LocalLlmStatus, PowerRoleView, PowerView } from "./types";
+import { sectionLabel } from "../components/localai/sections";
 
 const movable = (over: Partial<PowerRoleView> = {}): PowerRoleView => ({
   route: "unchanged",
@@ -397,6 +398,10 @@ describe("powerSummary — one case per branch, first match wins", () => {
   it("words each gate that keeps PM on the local model", () => {
     expect(powerSummary("no_battery", power({ has_battery: false }))).toBe(
       "No battery on this computer, so On battery never applies.",
+    );
+    // A section named in a plain string: it has to be the section's own name.
+    expect(powerSummary("no_battery", power({ has_battery: false }))).toContain(
+      sectionLabel("sec-localai-power"),
     );
     expect(powerSummary("no_key", power())).toBe(
       "On battery, PM stays on your local model — there's no cloud key to move to.",

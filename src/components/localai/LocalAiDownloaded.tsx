@@ -4,15 +4,27 @@
 import type { ReactNode } from "react";
 
 import { formatGib } from "../../lib/format";
-import type { LocalDiskSource, LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
+import type {
+  LocalDiskSource,
+  LocalFitResult,
+  LocalOnDiskModel,
+  LocalRecommendations,
+} from "../../lib/types";
+import { useDepth } from "../../theme";
+import { CommandLine } from "./CommandLine";
 import { downloadedState, type DownloadedState } from "./downloadedState";
 import { ConfigRow, FitBadge } from "./fitDisplay";
+import { onDiskHow } from "./readiness";
 import { SectionLink } from "./SectionLink";
-import { sectionLabel } from "./sections";
-import { Button, Callout, SectionInfo, SectionLabel } from "../ui";
+import { sectionHelp, sectionLabel } from "./sections";
+import { Button, Callout, Collapsible, SectionInfo, SectionLabel } from "../ui";
+
+/** How many models the list shows before the rest fold away. */
+const FIRST = 4;
 
 /**
- * "Already downloaded" (#449) — the models this device has, whoever put them there.
+ * "Already on this device" (#449) — the models this device has, whoever put them there, and for each
+ * one how to get it served.
  *
  * The whole section, because its copy and its empty states are one argument: an empty list means
  * four different things (nothing downloaded, a runner installed but empty, a folder PM is not
@@ -35,16 +47,18 @@ export function LocalAiDownloaded({
   /** Something in this section went wrong, said here rather than at the top of the tab. */
   error?: string | null;
 }) {
+  const { showMeta } = useDepth();
   return (
     <div
       id="sec-localai-downloaded"
       data-settings-section
-      data-help="settings-localai-downloaded"
+      data-help={sectionHelp("sec-localai-downloaded")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel
         align="baseline"
         action={
+          showMeta &&
           !loading &&
           recs &&
           recs.installed.length + recs.on_disk.length > 0 && (
@@ -129,7 +143,12 @@ function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): ReactNode
     case "folderEmpty":
       return `Found ${listJoin(state.runners)} on this device, but nothing downloaded into it yet.`;
     case "endpointEmpty":
-      return "Your server is running, but nothing has been downloaded into it yet — Your local model suggests one for this computer.";
+      return (
+        <>
+          Your server is running, but nothing has been downloaded into it yet —{" "}
+          <SectionLink to="sec-localai-start" /> suggests one for this computer.
+        </>
+      );
     case "blocked":
       // Never suggests changing the permissions. The store belongs to a service account, and telling
       // someone to loosen one so a settings panel can count files would be a bad trade PM has no
@@ -166,6 +185,7 @@ export function DownloadedModels({
   onPickFolder: () => void;
   onClearFolder: () => void;
 }) {
+  const { showMeta } = useDepth();
   const found = recs.disk_sources_present
     .filter((s) => s !== "folder")
     .map((s) => DISK_SOURCE_LABEL[s]);
@@ -200,12 +220,26 @@ export function DownloadedModels({
               </>
             )}
           </p>
-          <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
-            {recs.on_disk.map((m) => (
+          {/* The first few, then the rest folded — no inner scroller, so the wheel moves the tab. */}
+          <div className="space-y-2">
+            {recs.on_disk.slice(0, FIRST).map((m) => (
               <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
             ))}
           </div>
-          {found.length > 0 && (
+          {recs.on_disk.length > FIRST && (
+            <Collapsible
+              title={`Show the other ${recs.on_disk.length - FIRST}`}
+              defaultOpen={false}
+              className="mt-2"
+            >
+              <div className="mt-2 space-y-2">
+                {recs.on_disk.slice(FIRST).map((m) => (
+                  <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
+                ))}
+              </div>
+            </Collapsible>
+          )}
+          {showMeta && found.length > 0 && (
             <p className="mt-2 text-xs text-ink4">Found via {listJoin(found)}.</p>
           )}
         </>
@@ -235,7 +269,24 @@ export function DownloadedModels({
   );
 }
 
+/** Where a fit runs, from what its speed was worked out from — the card's config row says it rather
+ *  than assuming system memory for a model that sits on the graphics card. */
+function runsIn(fit: LocalFitResult): string {
+  switch (fit.speed_basis) {
+    case "gpu_published":
+    case "gpu_typical":
+      return "On your graphics card";
+    case "shared":
+      return "In shared memory";
+    default:
+      return "In system memory";
+  }
+}
+
 function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
+  const { showMeta } = useDepth();
+  // The same words the start card uses for PM's pick when it is a file on this computer.
+  const how = onDiskHow(model.source, model.shards, model.path, model.fit);
   return (
     <div className="rounded-[var(--radius-sm)] border border-border px-3 py-2">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -244,15 +295,17 @@ function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
       </div>
       <p className="mt-0.5 text-xs text-ink4">
         {DISK_SOURCE_LABEL[model.source]} · {formatGib(model.size_gb)}
-        {model.quant ? ` · ${model.quant}` : ""}
-        {model.shards > 1 ? ` · ${model.shards} files` : ""}
+        {showMeta && model.quant ? ` · ${model.quant}` : ""}
+        {showMeta && model.shards > 1 ? ` · ${model.shards} files` : ""}
       </p>
-      <ConfigRow label="In system memory" fit={model.fit} />
+      <ConfigRow label={runsIn(model.fit)} fit={model.fit} />
       {model.fit.notes.map((n, i) => (
         <p key={i} className="mt-1 text-xs text-ink4">
           {n}
         </p>
       ))}
+      <p className="mt-1 text-xs text-ink3">To use it here: {how.line}</p>
+      {how.command && <CommandLine command={how.command} />}
     </div>
   );
 }

@@ -146,13 +146,13 @@ afterEach(cleanup);
 
 describe("when the section can't act", () => {
   it("says so plainly for a cloud-only setup, with the controls shown and disabled", () => {
-    show(null, { configured: false, anyLocal: false });
+    const { container } = show(null, { configured: false, anyLocal: false });
     expect(screen.getByText("Switch to the cloud on battery — not available yet")).toBeTruthy();
-    expect(
-      screen.getByText(
-        "This moves work from a local model to your cloud model while a laptop's battery is low. Nothing runs on a local model yet, so there's nothing to move — Your local model walks you through setting one up.",
-      ),
-    ).toBeTruthy();
+    // The pointer to the start card is a section name (a link inside the tab, plain text here), so
+    // the sentence spans an element: read it as the reader does, whole.
+    expect(container.textContent).toContain(
+      `This moves work from a local model to your cloud model while a laptop's battery is low. Nothing runs on a local model yet, so there's nothing to move — ${sectionLabel("sec-localai-start")} walks you through setting one up.`,
+    );
     // Not "you're using OpenRouter for everything": a keyless user uses nothing at all.
     expect(screen.queryByText(/OpenRouter for everything/)).toBeNull();
     expectAllDisabled();

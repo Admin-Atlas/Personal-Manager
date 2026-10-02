@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import {
@@ -13,9 +13,13 @@ import {
   localLlmStatus,
   localModelRecommendations,
   onLocalLlmStatus,
+  setLocalLlmEndpoint,
+  setLocalLlmRoleModel,
+  setLocalLlmRouting,
   setLocalModelRescanCadence,
   setLocalModelScanDir,
 } from "../../lib/ipc";
+import type { LocalRole } from "../../lib/localModelState";
 import type {
   LocalBetterFit,
   LocalLlmConfig,
@@ -32,13 +36,15 @@ import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import { LocalAiMachine } from "./LocalAiMachine";
 import { LocalAiPower } from "./LocalAiPower";
 import { LocalAiRoles } from "./LocalAiRoles";
-import { TUNING_ID, type LocalAiTarget } from "./locate";
-import { runnerOf } from "./readiness";
+import { LocalAiStart } from "./LocalAiStart";
+import { recCardId, TUNING_ID, type LocalAiTarget } from "./locate";
+import { runnerOf, shownPick, steps, type AssignPlan, type ReadinessInput } from "./readiness";
 import { LocateProvider } from "./SectionLink";
 import { usePull } from "./usePull";
 import { useReleaseSettings } from "./useReleaseSettings";
 import { useRoleTests } from "./useRoleTests";
-import { Button, Callout, ConfirmDialog } from "../ui";
+import { useServerDetect } from "./useServerDetect";
+import { ConfirmDialog } from "../ui";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
  *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
@@ -56,7 +62,12 @@ import { Button, Callout, ConfirmDialog } from "../ui";
  *  Errors are per section: each one is said in the section whose control failed, so a refused
  *  connect reads under the form that sent it rather than at the top of a long tab. And pointers
  *  between sections are names, not directions (`SectionLink`): `locate` opens whatever fold the
- *  target is in and scrolls there, through `onLocate` when the host has its own way to. */
+ *  target is in and scrolls there, through `onLocate` when the host has its own way to.
+ *
+ *  The first section, "Your local model", is a way through the rest: where the user stands, PM's
+ *  pick, and four steps (`readiness.ts`). Its buttons make the same writes the sections do — they are
+ *  wired here, beside the section controls that make them, so the two can't drift into two
+ *  different things. */
 export function LocalAiSettings({
   onBetterFitChange,
   onLocate,
@@ -83,13 +94,21 @@ export function LocalAiSettings({
   /** The "Settings PM's numbers assume" fold under Model server — held here so a pointer from
    *  another section can open it. */
   const [tuningOpen, setTuningOpen] = useState(false);
+  /** The "Show all … models" fold under All models, held here for the same reason. */
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  /** A role was written in this mount, and the endpoint hasn't changed since — what makes "send a
+   *  test message" the next step rather than an optional one. */
+  const [justAssigned, setJustAssigned] = useState(false);
+  /** The start card's two writes in flight: the address a Connect is for, and a "Use … for both". */
+  const [connecting, setConnecting] = useState<string | null>(null);
+  const [assigning, setAssigning] = useState(false);
   /** Bumped whenever the stored endpoint or its token changes. The role tests reset on it, so
    *  anything proved about the OLD server — a passing test — goes with it rather than having to be
    *  remembered and invalidated piecemeal. */
   const [endpointEpoch, setEndpointEpoch] = useState(0);
 
   /** Say `message` in `section`, or clear that section's error with `null`. */
-  function setError(section: ErrorSection, message: string | null) {
+  const setError = useCallback((section: ErrorSection, message: string | null) => {
     setErrors((prev) => {
       if (message == null) {
         if (!(section in prev)) return prev;
@@ -99,6 +118,13 @@ export function LocalAiSettings({
       }
       return { ...prev, [section]: message };
     });
+  }, []);
+
+  /** The stored endpoint or its token changed: what was proved or chosen against the old one is
+   *  stale. */
+  function bumpEpoch() {
+    setEndpointEpoch((n) => n + 1);
+    setJustAssigned(false);
   }
 
   /** Take the reader to `target`: open the fold it sits in, then scroll there once it has rendered
@@ -108,6 +134,12 @@ export function LocalAiSettings({
     if (target === "tuning") {
       setTuningOpen(true);
       id = TUNING_ID;
+    } else if (target === "catalog") {
+      setCatalogOpen(true);
+      id = "sec-localai-models";
+    } else if (target.startsWith("rec:")) {
+      setCatalogOpen(true);
+      id = recCardId(target.slice("rec:".length));
     }
     requestAnimationFrame(() => {
       if (onLocate) onLocate(id);
@@ -150,25 +182,28 @@ export function LocalAiSettings({
     }
   }
 
-  async function refreshRecs() {
+  const refreshRecs = useCallback(async () => {
     try {
       setRecs(await localModelRecommendations());
     } catch (e) {
       setError("machine", String(e));
     }
-  }
+  }, [setError]);
 
+  const pick = shownPick(recs);
   const pull = usePull({
     recs,
     onRecs: setRecs,
     onReload: reloadConfig,
     onRefreshRecs: refreshRecs,
-    // Said where it was asked for. A download this view only adopted has no asker; it is shown on
-    // its catalogue card, so that is where its error goes too.
+    // Said where it was asked for. A download this view only adopted has no asker: PM's pick's own
+    // download is the start card's (its progress is shown there), and any other is its card's.
     onError: (message, origin) => setError(origin === "start" ? "start" : "models", message),
+    adoptedOrigin: (tag) => (pick?.kind === "catalogue" && pick.tag === tag ? "start" : "models"),
   });
   const roleTests = useRoleTests(endpointEpoch);
   const release = useReleaseSettings({ status });
+  const detect = useServerDetect(configured);
 
   useEffect(() => {
     let cancelled = false;
@@ -212,23 +247,29 @@ export function LocalAiSettings({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setError]);
 
-  // Poll the live status while an endpoint is configured (the backend debounces the actual probe to
-  // once / 30s, so this can't hammer the user's server). The served-model list rides the same tick:
-  // the copy under Assign roles promises "download a model and it appears here", and before this the
-  // list only refreshed on save/pull — a user following the copy-paste path while sitting on the tab
-  // waited forever.
+  // Poll the live status (the backend debounces the actual probe to once / 30s, so this can't hammer
+  // the user's server). Always, not only once connected: where each job's requests really go is in
+  // the status even with no server — a keyed user's jobs go to the cloud, a keyless one's nowhere —
+  // and the start card says which. The served-model list rides the same tick once there is a server
+  // to ask: the copy under Assign roles promises "download a model and it appears here", and before
+  // this the list only refreshed on save/pull — a user following the copy-paste path while sitting on
+  // the tab waited forever.
+  //
+  // Keyed on whether a server is stored, and not run before the stored config has been read: an
+  // answer about "no server" must never stand in for one about the server just connected.
+  const pollKey = config === null ? null : configured;
   useEffect(() => {
-    if (!configured) {
-      setStatus(null);
-      return;
-    }
+    if (pollKey === null) return;
+    const withServer = pollKey;
     let cancelled = false;
+    setStatus(null);
     const tick = () => {
       localLlmStatus()
         .then((s) => !cancelled && setStatus(s))
         .catch(() => {});
+      if (!withServer) return;
       listLocalLlmModels()
         .then((m) => {
           if (cancelled) return;
@@ -257,7 +298,27 @@ export function LocalAiSettings({
       clearInterval(id);
       offStatus();
     };
-  }, [configured]);
+  }, [pollKey]);
+
+  // The pick and the "installed" rows are worked out against what the server serves, so when that
+  // changes — connecting, a download landing, a model removed by hand — they are read again. The
+  // first answer after mount is the baseline the initial read already matches.
+  const servedKey = served
+    .map((m) => m.id)
+    .sort()
+    .join("\n");
+  const servedBaseline = useRef<string | null>(null);
+  const servedKnown = config !== null && (!configured || servedLoaded);
+  useEffect(() => {
+    if (!servedKnown) return;
+    if (servedBaseline.current === null) {
+      servedBaseline.current = servedKey;
+      return;
+    }
+    if (servedBaseline.current === servedKey) return;
+    servedBaseline.current = servedKey;
+    void refreshRecs();
+  }, [servedKey, servedKnown, refreshRecs]);
 
   /** Acknowledge the better-fit suggestion: it stays quiet until the cadence says to look again.
    *  Clears the dot here and, via the callback, in the sidebar and the settings nav. */
@@ -317,6 +378,52 @@ export function LocalAiSettings({
     }
   }
 
+  /** Connect to an address the probe found — the same write Model server's form makes. */
+  async function connectTo(url: string) {
+    setConnecting(url);
+    setError("start", null);
+    try {
+      await setLocalLlmEndpoint(url);
+      bumpEpoch();
+      await reloadConfig();
+    } catch (e) {
+      setError("start", String(e));
+    } finally {
+      setConnecting(null);
+    }
+  }
+
+  /** Put one model on both jobs — the writes Assign roles' selects make, model first, then the
+   *  routing of each job the plan switches. Optimistic, like those selects. */
+  async function assignBoth(plan: AssignPlan) {
+    setAssigning(true);
+    setError("start", null);
+    const patch: Partial<LocalLlmConfig> = {};
+    if (plan.models.chat != null) patch.chat_model = plan.models.chat;
+    if (plan.models.background != null) patch.background_model = plan.models.background;
+    if (plan.routing.chat) patch.chat_routing = plan.routing.chat;
+    if (plan.routing.background) patch.background_routing = plan.routing.background;
+    setConfig((c) => (c ? { ...c, ...patch } : c));
+    roleTests.clearTest("chat");
+    roleTests.clearTest("background");
+    try {
+      if (plan.models.chat != null) await setLocalLlmRoleModel("chat", plan.models.chat);
+      if (plan.models.background != null)
+        await setLocalLlmRoleModel("background", plan.models.background);
+      for (const role of ["chat", "background"] as const) {
+        const pref = plan.routing[role];
+        if (pref) await setLocalLlmRouting(role, pref);
+      }
+      setJustAssigned(true);
+    } catch (e) {
+      setError("start", String(e));
+      // Some of it may have been written: show what is really stored.
+      await reloadConfig().catch(() => {});
+    } finally {
+      setAssigning(false);
+    }
+  }
+
   const installedRepos = new Set(
     (recs?.installed ?? []).map((m) => m.matched_repo).filter((r): r is string => r !== null),
   );
@@ -326,57 +433,60 @@ export function LocalAiSettings({
   // neither of the two the card offers.
   const servedTags = new Set(served.map((m) => m.id.toLowerCase()));
 
+  const prog = pull.pullProg;
+  const input: ReadinessInput = {
+    config,
+    status,
+    served,
+    servedLoaded,
+    recs,
+    recsLoading: loading,
+    detected: detect.detected,
+    detecting: detect.detecting,
+    pull: {
+      tag: pull.pulling,
+      pct:
+        prog && prog.total_bytes
+          ? Math.min(100, Math.round((100 * (prog.completed_bytes ?? 0)) / prog.total_bytes))
+          : null,
+    },
+    lastPulledTag: pull.lastPulledTag,
+    tests: {
+      running: roleTests.testing as LocalRole | null,
+      chat: roleTests.tests.chat,
+      background: roleTests.tests.background,
+    },
+    justAssigned,
+    residency: release.residency,
+  };
+  const stepList = steps(input);
+  // All models gives the pick's rung to the start card only while step 2 is offering exactly that
+  // download — one Download per tag, so there is never a second button for the same file.
+  const stepTwo = stepList[1];
+  const pickDownloadTag = stepTwo.action?.kind === "download" ? stepTwo.action.tag : null;
+
   return (
     <LocateProvider locate={locate}>
-      {/* The start section's own error (a dismiss that didn't save). It sits where that section
-          will. */}
-      {errors.start && <Callout className="mt-4">{errors.start}</Callout>}
-
-      {/* A better-fitting model is available (#437). A passive strip at the top of the tab — the
-          quiet counterpart to the dots on the sidebar and the settings nav, and the thing they
-          lead to. Never a modal, never a gate: dismissing it is always enough. */}
-      {betterFit && (
-        <Callout tone="info" body="ink" live className="mt-4 flex flex-wrap items-center gap-2">
-          <span className="min-w-0 flex-1 text-ink2">
-            <span className="text-ink">{betterFit.display_name}</span>{" "}
-            {betterFit.already_downloaded
-              ? "is already on this device and fits your machine better than"
-              : "would fit your machine better than"}{" "}
-            {betterFit.replaces}.
-          </span>
-          <Button variant="tertiary" size="sm" onClick={() => void dismissBetterFit()}>
-            Dismiss
-          </Button>
-        </Callout>
-      )}
-
-      <LocalAiMachine
-        recs={recs}
-        loading={loading}
-        rescanning={rescanning}
-        onRescan={() => void rescan()}
-        error={errors.machine}
-      />
-
-      <LocalAiCatalog
-        recs={recs}
-        loading={loading}
-        configured={configured}
-        isOllama={isOllama}
-        servedTags={servedTags}
-        installedRepos={installedRepos}
+      <LocalAiStart
+        input={input}
+        steps={stepList}
+        betterFit={betterFit}
+        onDismissBetterFit={() => void dismissBetterFit()}
+        error={errors.start}
         pull={pull}
-        onCadence={(c) => void changeCadence(c)}
-        error={errors.models}
-      />
-
-      <LocalAiDownloaded
-        recs={recs}
-        loading={loading}
-        configured={configured}
-        onPickFolder={() => void pickScanFolder()}
-        onClearFolder={() => void clearScanFolder()}
-        error={errors.downloaded}
+        actions={{
+          connect: (url) => void connectTo(url),
+          connecting,
+          assign: (plan) => void assignBoth(plan),
+          assigning,
+          test: (role) => void roleTests.runTest(role),
+          detect: () => void detect.detect(),
+          detecting: detect.detecting,
+          release: () => void release.release(),
+          releasing: release.releasing,
+          rescan: () => void rescan(),
+          rescanning,
+        }}
       />
 
       <LocalAiEndpoint
@@ -385,10 +495,12 @@ export function LocalAiSettings({
         configured={configured}
         onReload={reloadConfig}
         onError={(m) => setError("endpoint", m)}
-        onEndpointChanged={() => setEndpointEpoch((n) => n + 1)}
+        onEndpointChanged={bumpEpoch}
         error={errors.endpoint}
         tuningOpen={tuningOpen}
         onTuningOpenChange={setTuningOpen}
+        detected={detect.detected}
+        onDetect={detect.detect}
       />
 
       <LocalAiRoles
@@ -400,7 +512,10 @@ export function LocalAiSettings({
         coResidency={recs?.co_residency ?? null}
         anyLocalRoleWithModel={anyLocalRoleWithModel}
         roleTests={roleTests}
-        onConfigPatch={(patch) => setConfig((c) => (c ? { ...c, ...patch } : c))}
+        onConfigPatch={(patch) => {
+          setConfig((c) => (c ? { ...c, ...patch } : c));
+          setJustAssigned(true);
+        }}
         onError={(m) => setError("roles", m)}
         error={errors.roles}
       />
@@ -427,6 +542,40 @@ export function LocalAiSettings({
           recs ? recs.hardware.vram_gb != null && !recs.hardware.unified_memory : true
         }
         error={errors.lifecycle}
+      />
+
+      <LocalAiCatalog
+        recs={recs}
+        loading={loading}
+        configured={configured}
+        isOllama={isOllama}
+        runner={runnerOf(config?.base_url)}
+        servedTags={servedTags}
+        installedRepos={installedRepos}
+        pull={pull}
+        pickDownloadTag={pickDownloadTag}
+        pickProgressShown={stepTwo.progress}
+        open={catalogOpen}
+        onOpenChange={setCatalogOpen}
+        onCadence={(c) => void changeCadence(c)}
+        error={errors.models}
+      />
+
+      <LocalAiDownloaded
+        recs={recs}
+        loading={loading}
+        configured={configured}
+        onPickFolder={() => void pickScanFolder()}
+        onClearFolder={() => void clearScanFolder()}
+        error={errors.downloaded}
+      />
+
+      <LocalAiMachine
+        recs={recs}
+        loading={loading}
+        rescanning={rescanning}
+        onRescan={() => void rescan()}
+        error={errors.machine}
       />
 
       {/* The licence ask for a restricted model, answered before its download starts. Once, here,

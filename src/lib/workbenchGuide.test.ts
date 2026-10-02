@@ -18,6 +18,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { LOCALAI_SECTIONS } from "../components/localai/sections";
 import type { SetupPlatform } from "./setupGuide";
 import { installCommand, runnerGuides, tuningFor, type RunnerName } from "./workbenchGuide";
 
@@ -157,6 +158,27 @@ describe("the settings PM's numbers assume", () => {
         }
       }
     }
+  });
+
+  it("names sections of the Local AI tab that exist, by the names the tab gives them", () => {
+    // These are plain strings (a guide can't hold a link), so a renamed section would leave them
+    // naming a heading that's gone. Every section-shaped name they use must be one in the list.
+    const labels = new Set<string>(LOCALAI_SECTIONS.map((s) => s.label));
+    const named = new Set<string>();
+    for (const platform of PLATFORMS) {
+      for (const g of runnerGuides(platform)) {
+        for (const text of [...g.steps, g.models]) {
+          for (const name of ["Your local model", "Model server", "All models"]) {
+            if (text.includes(name)) named.add(name);
+          }
+          // The retired names, which must not come back.
+          expect(text).not.toMatch(/Recommended models|Connect an endpoint|Connect endpoint/);
+        }
+      }
+    }
+    // The start card is named by every runner's last step, and the list by llama-server's.
+    expect([...named].sort()).toEqual(["All models", "Model server", "Your local model"]);
+    for (const name of named) expect(labels.has(name), name).toBe(true);
   });
 
   it("no longer says llama-server's default context is small", () => {

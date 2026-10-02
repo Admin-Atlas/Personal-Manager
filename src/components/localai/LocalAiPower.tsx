@@ -30,7 +30,7 @@ import {
 import { PowerConsentAsk } from "../PowerConsentStrip";
 import { BatteryReleaseRow } from "./BatteryReleaseRow";
 import { SectionLink } from "./SectionLink";
-import { sectionLabel } from "./sections";
+import { sectionHelp, sectionLabel } from "./sections";
 import { useReleaseSettings, type ReleaseSettings } from "./useReleaseSettings";
 
 /** The three What moves options, in the order shown — each with who it suits, so the choice is
@@ -234,7 +234,7 @@ export function LocalAiPower({
     <div
       id="sec-localai-power"
       data-settings-section
-      data-help="settings-localai-power"
+      data-help={sectionHelp("sec-localai-power")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel>{sectionLabel("sec-localai-power")}</SectionLabel>
@@ -340,7 +340,11 @@ function GateBlock({
         <>
           {title("Switch to the cloud on battery — not available yet")}
           {body(
-            "This moves work from a local model to your cloud model while a laptop's battery is low. Nothing runs on a local model yet, so there's nothing to move — Your local model walks you through setting one up.",
+            <>
+              This moves work from a local model to your cloud model while a laptop's battery is
+              low. Nothing runs on a local model yet, so there's nothing to move —{" "}
+              <SectionLink to="sec-localai-start" /> walks you through setting one up.
+            </>,
           )}
         </>
       );

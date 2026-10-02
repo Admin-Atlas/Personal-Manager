@@ -13,9 +13,10 @@ import type {
 } from "../../lib/types";
 import { formatGib } from "../../lib/format";
 import { powerOf } from "../../lib/powerRoute";
+import { TUNING_TITLE } from "./locate";
 import { COMFORTABLE_WINDOW, whereOf } from "./readiness";
 import { SectionLink } from "./SectionLink";
-import { sectionLabel } from "./sections";
+import { sectionHelp, sectionLabel } from "./sections";
 import type { RoleTest, RoleTests } from "./useRoleTests";
 import { Button, Callout, SectionInfo, SectionLabel, Select } from "../ui";
 
@@ -88,7 +89,7 @@ export function LocalAiRoles({
     <div
       id="sec-localai-roles"
       data-settings-section
-      data-help="settings-localai-roles"
+      data-help={sectionHelp("sec-localai-roles")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel>{sectionLabel("sec-localai-roles")}</SectionLabel>
@@ -232,8 +233,8 @@ export function LocalAiRoles({
                 better: Ollama uses <span className="text-ink2">OLLAMA_CONTEXT_LENGTH</span>,
                 llama-server uses <span className="text-ink2">--ctx-size</span>, and LM Studio has a
                 context-length slider on the model — the steps for your server are under{" "}
-                <SectionLink to="sec-localai-endpoint" />, in “Settings PM's numbers assume”. Ollama
-                picks its default from your graphics card's memory, so{" "}
+                <SectionLink to="sec-localai-endpoint" />, in “{TUNING_TITLE}”. Ollama picks its
+                default from your graphics card's memory, so{" "}
                 <span className="text-ink2">ollama ps</span> is the way to see what it chose.
               </p>
             )}
@@ -269,14 +270,13 @@ const ROUTING_OPTIONS = [
   { value: "local-then-cloud", label: "Local, fall back to cloud" },
 ];
 
-/** Who each routing suits — said for the one chosen, so the choice is made against a reason. */
+/** Who each routing suits — said for the one chosen, so the choice is made against a reason. The
+ *  section it names is read from the list, so a rename can't leave it naming a heading that's gone. */
 const GOOD_IF: Record<string, string> = {
   cloud:
     "Good if this computer is slow, or you'd rather not keep a model loaded. What you send goes to OpenRouter.",
-  local:
-    "Good if nothing should ever go to the cloud. If your server is down, this job doesn't answer, and On battery never moves it.",
-  "local-then-cloud":
-    "Good for most setups with a cloud key: your own model when it can, your cloud model when your server is down. It's the only setting On battery can move.",
+  local: `Good if nothing should ever go to the cloud. If your server is down, this job doesn't answer, and ${sectionLabel("sec-localai-power")} never moves it.`,
+  "local-then-cloud": `Good for most setups with a cloud key: your own model when it can, your cloud model when your server is down. It's the only setting ${sectionLabel("sec-localai-power")} can move.`,
 };
 
 /** The routing Select's and the model Select's names, per role. */

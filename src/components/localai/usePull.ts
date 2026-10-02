@@ -48,7 +48,8 @@ export interface ModelPull {
  * can read it, and the licence dialog it drives renders once, at the tab.
  *
  * `onError` is told which section asked (`origin`). A download this view only adopted — one the
- * backend was already running when the tab mounted — has no asker, and arrives as `null`.
+ * backend was already running when the tab mounted — has no asker: `adoptedOrigin` says where its
+ * error belongs (the start card owns PM's pick's download), and without one it arrives as `null`.
  */
 export function usePull({
   recs,
@@ -56,6 +57,7 @@ export function usePull({
   onReload,
   onRefreshRecs,
   onError,
+  adoptedOrigin,
 }: {
   recs: LocalRecommendations | null;
   /** Replace the tab's recommendations (a licence acceptance, a finished pull). */
@@ -66,6 +68,9 @@ export function usePull({
   onRefreshRecs: () => Promise<void>;
   /** Show an error, or clear it with `null`, in the section the download belongs to. */
   onError: (message: string | null, origin: PullOrigin | null) => void;
+  /** Which section an adopted download (one nobody here asked for) belongs to, by its tag. Read
+   *  when its error lands, so it answers for the pick as it is then. */
+  adoptedOrigin?: (tag: string) => PullOrigin | null;
 }): ModelPull {
   // `pulling` holds the pull TAG (`hf.co/<repo>:<QUANT>`), not the repo: the backend's job snapshot
   // is keyed on the tag, so a view that mounts mid-download can adopt it and mark the right card.
@@ -88,6 +93,12 @@ export function usePull({
   /** The tag a Cancel was pressed for. A cancelled pull resolves like a finished one (the backend
    *  treats a cancel as deliberate, not an error), and only this tells the two apart. */
   const cancelledRef = useRef<string | null>(null);
+  /** The latest `adoptedOrigin`: the snapshot poll is set up once per download, and the pick it
+   *  should answer for is the one on screen when the error arrives, not when the download began. */
+  const adoptedRef = useRef(adoptedOrigin);
+  useEffect(() => {
+    adoptedRef.current = adoptedOrigin;
+  });
 
   /** The single writer for the pull marker. Keeps `pullingRef` in step with the state so the two
    *  can never disagree — a marker cleared in one and not the other silently kills the 1s snapshot
@@ -167,9 +178,11 @@ export function usePull({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pulling]);
 
-  /** The section that asked for `tag`, or null for a download this view only adopted. */
+  /** The section that asked for `tag` — or, for a download this view only adopted, the section
+   *  `adoptedOrigin` gives it, else null. */
   function originOf(tag: string): PullOrigin | null {
-    return askedRef.current?.tag === tag ? askedRef.current.origin : null;
+    if (askedRef.current?.tag === tag) return askedRef.current.origin;
+    return adoptedRef.current?.(tag) ?? null;
   }
 
   /** Download, once the terms behind this model have been shown and accepted (if they need to be).

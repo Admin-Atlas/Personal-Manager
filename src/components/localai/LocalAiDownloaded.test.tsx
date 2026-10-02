@@ -224,3 +224,71 @@ describe("a store PM is not allowed to read", () => {
     expect(container.textContent).not.toContain("No model folder found");
   });
 });
+
+describe("each model says how to get it served", () => {
+  // The hint above the list promises "each one says how to get it served"; this is that promise.
+  it("gives a single file the llama-server line that serves it as PM sized it", () => {
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [{ ...MODEL, source: "hugging_face" }] })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain(
+      "To use it here: It's a file on this computer. llama-server can serve it as it is:",
+    );
+    expect(container.querySelector("code")?.textContent).toBe(
+      'llama-server -m "/models/gemma-3-4b-it-Q4_K_M.gguf" --ctx-size 8192',
+    );
+  });
+
+  it("says where a model runs from what its speed was worked out from", () => {
+    const onCard = { ...MODEL, fit: { ...MODEL.fit, speed_basis: "gpu_published" as const } };
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [onCard] })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain("On your graphics card");
+    expect(container.textContent).not.toContain("In system memory");
+  });
+
+  it("shows four, and folds the rest rather than scrolling them", () => {
+    const many = Array.from({ length: 6 }, (_, k) => ({
+      ...MODEL,
+      name: `model-${k}`,
+      path: `/m/${k}.gguf`,
+    }));
+    const { container, getByRole } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: many })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    const fold = getByRole("button", { name: "Show the other 2" });
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".overflow-y-auto")).toBeNull();
+    expect(container.textContent).toContain("model-5");
+  });
+
+  it("points an empty server at the start card's pick", () => {
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [], disk_sources_present: [], disk_found: 0, endpoint_inventory: 0 })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain(
+      `Your server is running, but nothing has been downloaded into it yet — ${sectionLabel("sec-localai-start")} suggests one for this computer.`,
+    );
+  });
+});

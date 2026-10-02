@@ -3,32 +3,53 @@
 
 import type { ReactNode } from "react";
 
-import type { LocalRecommendation, LocalRecommendations, PullProgress } from "../../lib/types";
+import type {
+  LocalPick,
+  LocalRecommendation,
+  LocalRecommendations,
+  PullProgress,
+} from "../../lib/types";
 import { formatBytes, formatGib } from "../../lib/format";
+import { useDepth } from "../../theme";
 import { IngestProgress } from "../IngestProgress";
-import { installCommand } from "../../lib/workbenchGuide";
-import { ConfigRow, FitBadge } from "./fitDisplay";
-import { sectionLabel } from "./sections";
+import { installCommand, type RunnerName } from "../../lib/workbenchGuide";
+import { ConfigRow, FitBadge, TokenChip } from "./fitDisplay";
+import { recCardId, TUNING_TITLE, useLocate } from "./locate";
+import { sectionHelp, sectionLabel } from "./sections";
 import { SPEED_LIST_NOTE, speedShort } from "./speedWords";
 import type { ModelPull } from "./usePull";
-import { Button, Callout, Collapsible, SectionLabel, Select } from "../ui";
+import { Button, Callout, Collapsible, SectionInfo, SectionLabel, Select } from "../ui";
 
 /**
- * "Recommended models" — the curated catalog sized against this machine, and the one-click pull.
+ * "All models" — every model in PM's list sized against this machine, in the backend's order, and the
+ * one-click pull.
+ *
+ * Folded behind "Show all … models": the start card carries PM's pick, and this is the list to choose
+ * from yourself. What is never folded is what decides how to read it — why there is no Download here
+ * (the gating hint), and what every speed figure is.
  *
  * The download itself is the tab's (`usePull`), handed down as `pull`: the job is backend-owned (it
  * survives the tab unmounting), and what this section shows is the view of it — which card is
  * marked, and what the progress bar says. The licence dialog that has to be answered before a
  * restricted model is fetched is the hook's too, and renders once, at the tab.
+ *
+ * One Download per tag: while the start card's step 2 offers PM's pick, that rung here says "PM's
+ * pick" and points there instead of offering a second button for the same file — and a download's
+ * progress shows once, on the start card for the pick, on its card otherwise.
  */
 export function LocalAiCatalog({
   recs,
   loading,
   configured,
   isOllama,
+  runner = null,
   servedTags,
   installedRepos,
   pull,
+  pickDownloadTag = null,
+  pickProgressShown = false,
+  open,
+  onOpenChange,
   onCadence,
   error,
 }: {
@@ -37,32 +58,57 @@ export function LocalAiCatalog({
   configured: boolean;
   /** Whether the connected server is an Ollama — the only runner PM can pull into. */
   isOllama: boolean;
+  /** Which server is connected, by its port, for the gating hint. */
+  runner?: RunnerName | null;
   servedTags: Set<string>;
   installedRepos: Set<string>;
   /** The one model download, from the tab's `usePull`. */
   pull: ModelPull;
+  /** The tag the start card's step 2 is offering to download right now, or null. */
+  pickDownloadTag?: string | null;
+  /** The start card is showing the pick's download progress, so its card doesn't too. */
+  pickProgressShown?: boolean;
+  /** The "Show all … models" fold, held by the tab so a pointer can open it. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   onCadence: (cadence: string) => void;
   /** Something in this section went wrong — a download it asked for, the cadence — said here
    *  rather than at the top of the tab. */
   error?: string | null;
 }) {
   const { pulling, pullProg } = pull;
+  const { showMeta } = useDepth();
+  const pick = recs?.pick;
+  const count = recs?.curated.length ?? 0;
+  // Never folded: why the list offers no Download is a gating hint, and the doctrine never folds
+  // those.
+  const gating = !configured
+    ? "PM can download these straight into Ollama once it's connected. Until then, each model's “How to get it” has the commands for your own server."
+    : !isOllama
+      ? `PM can only download into an Ollama on its usual port (11434), and your server ${
+          runner === "LM Studio"
+            ? "is LM Studio"
+            : runner === "llama-server"
+              ? "is llama-server"
+              : "isn't one"
+        }, so each model's “How to get it” has the steps instead.`
+      : null;
 
   return (
     <div
       id="sec-localai-models"
       data-settings-section
-      data-help="settings-localai-models"
+      data-help={sectionHelp("sec-localai-models")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel
         align="baseline"
         action={
+          showMeta &&
           !loading &&
-          recs &&
-          recs.curated.length > 0 && (
+          count > 0 && (
             <span className="shrink-0 text-[0.6875rem] text-ink4">
-              {recs.curated.length} in the catalog
+              {count} sized for this machine
             </span>
           )
         }
@@ -70,39 +116,57 @@ export function LocalAiCatalog({
         {sectionLabel("sec-localai-models")}
       </SectionLabel>
       {error && <Callout className="mt-2">{error}</Callout>}
-      {/* Never folded: it is what every speed on the cards below it is, and a ceiling read as a
-          forecast is the misreading it exists to stop. */}
+      {gating && <p className="mt-1.5 text-xs text-ink4">{gating}</p>}
+      {/* Never folded: it is what every speed on the cards is, and a ceiling read as a forecast is
+          the misreading it exists to stop. */}
       <p className="mt-1.5 text-xs text-ink4">{SPEED_LIST_NOTE}</p>
       <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
         <NumbersGuide />
       </Collapsible>
       {loading ? (
         <p className="mt-3 text-xs text-ink4">Sizing models against your machine…</p>
-      ) : recs && recs.curated.length > 0 ? (
-        <div className="mt-3 max-h-80 space-y-2 overflow-y-auto pr-1">
-          {recs.curated.map((rec) => (
-            <RecommendationCard
-              key={rec.repo}
-              rec={rec}
-              installed={installedRepos.has(rec.repo)}
-              canPull={configured && isOllama}
-              pullingTag={pulling}
-              pullProg={pullProg}
-              onPull={(tag) => pull.requestPull(rec, tag, "models")}
-              servedTags={servedTags}
-              onCancel={pull.cancel}
-              busy={pulling !== null}
-            />
-          ))}
-        </div>
+      ) : recs && count > 0 ? (
+        <Collapsible
+          title={
+            // "Show all 1 models" would read like a typo; one model is just "Show the model".
+            (count === 1 ? "Show the model" : `Show all ${count} models`) +
+            (pick?.kind === "nothing" ? " anyway" : "")
+          }
+          defaultOpen={false}
+          open={open}
+          onOpenChange={onOpenChange}
+          className="mt-3"
+        >
+          {/* No inner scroller: one scrolling pane, so the wheel and the rail's scroll-spy both
+              move the whole tab. */}
+          <div className="mt-2 space-y-2">
+            {recs.curated.map((rec) => (
+              <RecommendationCard
+                key={rec.repo}
+                rec={rec}
+                installed={rec.ollama_pull != null && servedTags.has(rec.ollama_pull.toLowerCase())}
+                otherBuild={otherBuild(rec, recs, servedTags, installedRepos)}
+                canPull={configured && isOllama}
+                pullingTag={pulling}
+                pullProg={pullProg}
+                startedAt={pull.startedAt}
+                progressHere={
+                  pulling !== null &&
+                  !(pickProgressShown && pick?.kind === "catalogue" && pick.tag === pulling)
+                }
+                onPull={(tag) => pull.requestPull(rec, tag, "models")}
+                servedTags={servedTags}
+                onCancel={pull.cancel}
+                busy={pulling !== null}
+                pickTag={pickDownloadTag}
+                band={bandLine(rec, pick)}
+              />
+            ))}
+          </div>
+        </Collapsible>
       ) : (
         <p className="mt-3 text-xs text-ink4">No catalog models to show.</p>
       )}
-      <p className="mt-3 text-xs text-ink4">
-        Local models don't appear in Settings → AI &amp; Models → Usage &amp; cost — that ledger
-        tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no
-        per-use cost to count.
-      </p>
       {recs && (
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <label className="text-xs text-ink3" htmlFor="localai-cadence">
@@ -121,8 +185,43 @@ export function LocalAiCatalog({
           </Select>
         </div>
       )}
+      <SectionInfo title="Does a local model cost anything?">
+        <p>
+          Local models don't appear in Settings → AI &amp; Models → Usage &amp; cost — that ledger
+          tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no
+          per-use cost to count.
+        </p>
+      </SectionInfo>
     </div>
   );
+}
+
+/** "Your server has X, another build of this model": the server serves this repo, but neither of
+ *  the files this card offers — so it keeps its Download, and says what is there instead. */
+function otherBuild(
+  rec: LocalRecommendation,
+  recs: LocalRecommendations,
+  servedTags: Set<string>,
+  installedRepos: Set<string>,
+): string | null {
+  if (!installedRepos.has(rec.repo)) return null;
+  const tags = [rec.ollama_pull, rec.gpu_pull?.tag]
+    .filter((t): t is string => !!t)
+    .map((t) => t.toLowerCase());
+  if (tags.some((t) => servedTags.has(t))) return null;
+  const id = recs.installed.find((m) => m.matched_repo === rec.repo)?.id;
+  return id ? `Your server has ${id}, another build of this model.` : null;
+}
+
+/** PM's pick runs this model at a config neither rung shows — it keeps the room PM leaves free on
+ *  the card, which the cards' own rung does not — so the card says what the pick is, and where. */
+function bandLine(rec: LocalRecommendation, pick: LocalPick | undefined): string | null {
+  if (pick?.kind !== "catalogue" || pick.repo !== rec.repo) return null;
+  if (pick.tag === rec.ollama_pull || pick.tag === rec.gpu_pull?.tag) return null;
+  const k = `${((pick.fit.context ?? 0) / 1024).toFixed(0)}k`;
+  return `PM's pick runs this model as ${pick.fit.quant ?? "a smaller file"} with a ${k} context${
+    pick.fit.kv === "q8_0" ? " and a compressed cache" : ""
+  }, so it fits your graphics card with the room PM keeps free — it's under ${sectionLabel("sec-localai-start")}.`;
 }
 
 function NumbersGuide() {
@@ -173,8 +272,8 @@ function NumbersGuide() {
         measured one — so a model PM says fits should fit. Memory assumes an f16 cache unless a card
         shows “q8_0 KV”, where PM sized it on a compressed (near-lossless) cache to keep a larger
         context or quant — your server needs that setting too (
-        {sectionLabel("sec-localai-endpoint")}, “Settings PM's numbers assume”). Your real speed and
-        memory depend on your server and its settings.
+        {sectionLabel("sec-localai-endpoint")}, “{TUNING_TITLE}”). Your real speed and memory depend
+        on your server and its settings.
       </p>
     </dl>
   );
@@ -247,22 +346,33 @@ function ModelInstallHint({
 function RecommendationCard({
   rec,
   installed,
+  otherBuild,
   canPull,
   pullingTag,
   pullProg,
+  startedAt,
+  progressHere,
   onPull,
   onCancel,
   busy,
   servedTags,
+  pickTag,
+  band,
 }: {
   rec: LocalRecommendation;
+  /** The card's own file is being served — the exact tag, not just the model. */
   installed: boolean;
+  /** The server has this model, but as a build neither rung offers. */
+  otherBuild: string | null;
   /** Whether PM can drive a download at all here — an Ollama endpoint is connected. Card-level;
    *  whether a given RUNG has something to fetch is a separate question, answered per rung. */
   canPull: boolean;
   /** The tag downloading right now, anywhere in the list, or null. */
   pullingTag: string | null;
   pullProg: PullProgress | null;
+  startedAt: number | null;
+  /** This card shows the running download's progress (the start card shows the pick's). */
+  progressHere: boolean;
   onPull: (tag: string) => void;
   onCancel: () => void;
   busy: boolean;
@@ -270,20 +380,41 @@ function RecommendationCard({
    *  tag it was pulled with (measured against a live Ollama 0.33), so a rung can be matched exactly
    *  rather than by repo — which said "Installed" for a quant that was neither rung.  */
   servedTags: Set<string>;
+  /** The tag the start card is offering to download as PM's pick, or null. */
+  pickTag: string | null;
+  /** The reserve-band line, when PM's pick is this model at a config no rung shows. */
+  band: string | null;
 }) {
+  const { showMeta } = useDepth();
+  const locate = useLocate();
   const f = rec.fit;
   const ramTarget = { tag: rec.ollama_pull, sharded: rec.sharded_quant };
   const gpuTarget = rec.gpu_pull;
   const isSplit = rec.gpu.kind === "split";
   const pulling =
-    pullingTag !== null && (pullingTag === rec.ollama_pull || pullingTag === gpuTarget?.tag);
+    progressHere &&
+    pullingTag !== null &&
+    (pullingTag === rec.ollama_pull || pullingTag === gpuTarget?.tag);
+  const showIt = (
+    <Button variant="tertiary" size="sm" onClick={() => locate?.("sec-localai-start")}>
+      Show it
+    </Button>
+  );
 
-  /** One rung's own action: it is already here, PM can fetch it, or neither (the commands below). */
+  /** One rung's own action: it is already here, it is PM's pick (whose Download is on the start
+   *  card), PM can fetch it, or neither (the commands below). */
   const rungAction = (t: { tag: string | null } | null): ReactNode => {
     const tag = t?.tag ?? null;
     if (!tag) return null;
     if (servedTags.has(tag.toLowerCase()))
       return <span className="text-[0.625rem] font-medium text-st-quick">Installed</span>;
+    if (tag === pickTag)
+      return (
+        <span className="flex items-center gap-1.5">
+          <TokenChip token="--accent">PM's pick</TokenChip>
+          {showIt}
+        </span>
+      );
     if (!canPull) return null;
     return (
       <Button variant="secondary" size="sm" onClick={() => onPull(tag)} disabled={busy}>
@@ -298,35 +429,38 @@ function RecommendationCard({
       ? Math.min(100, Math.round((100 * (pullProg.completed_bytes ?? 0)) / pullProg.total_bytes))
       : null;
   return (
-    <div className="rounded-[var(--radius-sm)] border border-border p-3">
+    <div id={recCardId(rec.repo)} className="rounded-[var(--radius-sm)] border border-border p-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="text-sm font-medium text-ink">{rec.display_name}</span>
             <FitBadge verdict={f.verdict} />
-            {isMoe && <span className="text-[0.625rem] text-ink4">MoE</span>}
+            {showMeta && isMoe && <span className="text-[0.625rem] text-ink4">MoE</span>}
             {/* No "vision" chip, though `rec.multimodal` still says so. This row is what PM will do
                 with the model, and PM cannot send it an image: chat messages carry a plain string,
                 so no picture reaches any model, cloud or local. PM reads images through the sidecar
                 instead. Advertising it here made a heavier model look more capable for PM's purposes
                 than a lighter one, which is the opposite of true. A chip has no room for the caveat,
                 which is itself the argument for leaving it out. */}
-            {rec.reasoning && <span className="text-[0.625rem] text-ink4">reasoning</span>}
-            {rec.role_hint && (
+            {showMeta && rec.reasoning && (
+              <span className="text-[0.625rem] text-ink4">reasoning</span>
+            )}
+            {showMeta && rec.role_hint && (
               <span className="text-[0.625rem] text-ink4">suits {rec.role_hint}</span>
             )}
-            {/* Every row says what its weights are under. A restricted licence is the one worth
-                catching the eye, so it takes the attention colour the rest of the chips don't. */}
-            <a
-              href={rec.licence.url}
-              target="_blank"
-              rel="noreferrer noopener"
-              className={`text-[0.625rem] underline decoration-dotted underline-offset-2 ${
-                rec.licence.open ? "text-ink4" : "text-st-due"
-              }`}
-            >
-              {rec.licence.name}
-            </a>
+            {/* Every row says what its weights are under, in the same quiet ink: a restricted
+                licence is said in words beside the link, not by colouring the link like an error. */}
+            <span className="text-[0.625rem] text-ink4">
+              <a
+                href={rec.licence.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="text-ink4 underline decoration-dotted underline-offset-2"
+              >
+                {rec.licence.name}
+              </a>
+              {!rec.licence.open && " · its own terms"}
+            </span>
           </div>
           {rec.gpu.kind === "split" ? (
             <div className="mt-1 space-y-1">
@@ -380,6 +514,11 @@ function RecommendationCard({
           {/* A split card's actions live on its rows, beside the config each one fetches. */}
           {isSplit ? null : installed ? (
             <span className="text-xs font-medium text-st-quick">Installed</span>
+          ) : rec.ollama_pull && rec.ollama_pull === pickTag ? (
+            <span className="flex items-center gap-1.5">
+              <TokenChip token="--accent">PM's pick</TokenChip>
+              {showIt}
+            </span>
           ) : canPull && rec.ollama_pull ? (
             <Button
               variant="secondary"
@@ -393,21 +532,31 @@ function RecommendationCard({
         </div>
       </div>
 
+      {otherBuild && <p className="mt-1.5 text-[0.6875rem] text-ink4">{otherBuild}</p>}
+      {band && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          <p className="min-w-0 flex-1 text-[0.6875rem] text-ink4">{band}</p>
+          {showIt}
+        </div>
+      )}
+
       {pulling && (
         <div className="mt-2">
           {/* The shared per-depth progress surface: shimmer while the total is unknown (the
               manifest/verify phases used to render a FULL bar, which reads as "done"), percent
-              once bytes flow. The status line stays — it is a status readout, never folded. */}
+              once bytes flow. The status word stays at every Depth — it is a status readout, never
+              folded; the byte counts are detail. */}
           <IngestProgress
             processed={pct ?? 0}
             total={pct != null ? 100 : null}
             label={`Downloading ${rec.display_name}`}
             mode="percent"
+            startedAt={startedAt ?? undefined}
           />
           <div className="mt-1 flex items-center justify-between gap-2">
             <p className="min-w-0 truncate font-mono text-[0.625rem] text-ink4">
               {pullProg?.status ?? "starting…"}
-              {pullProg?.total_bytes
+              {showMeta && pullProg?.total_bytes
                 ? ` · ${formatBytes(pullProg.completed_bytes)} / ${formatBytes(pullProg.total_bytes)}`
                 : ""}
             </p>
@@ -420,31 +569,28 @@ function RecommendationCard({
 
       {!installed &&
         (() => {
-          // Every way to get this model that PM can name. This block used to be DELETED the moment
-          // an Ollama endpoint connected — taking the `llama-server` line, which is for a
-          // different runner entirely, with it, and on a split card removing the only route to the
-          // second rung at exactly the moment the user had finished setting PM up. It now always
-          // exists; it just folds away once PM can do the work for you.
+          // Every way to get this model that PM can name. Always folded: the card is the summary,
+          // and the commands are for the reader who has decided. "Install it another way" when PM
+          // can download it for you, "How to get it" when it can't.
           const rungs = [
             { label: "Highest quality", tag: rec.ollama_pull },
             ...(isSplit && !gpuTarget?.same_file
               ? [{ label: "Fastest on GPU", tag: gpuTarget?.tag ?? null }]
               : []),
           ].filter((r): r is { label: string; tag: string } => !!r.tag);
-          const hint = (
-            <ModelInstallHint
-              repo={rec.repo}
-              quant={f.quant}
-              rungs={rungs}
-              shardedQuant={rec.sharded_quant}
-            />
-          );
-          return canPull ? (
-            <Collapsible title="Install it another way" defaultOpen={false} className="mt-2">
-              {hint}
+          return (
+            <Collapsible
+              title={canPull ? "Install it another way" : "How to get it"}
+              defaultOpen={false}
+              className="mt-2"
+            >
+              <ModelInstallHint
+                repo={rec.repo}
+                quant={f.quant}
+                rungs={rungs}
+                shardedQuant={rec.sharded_quant}
+              />
             </Collapsible>
-          ) : (
-            hint
           );
         })()}
 

@@ -13,6 +13,8 @@
 
 import { describe, expect, it } from "vitest";
 
+import { TUNING_TITLE } from "../components/localai/locate";
+import { LOCALAI_SECTIONS } from "../components/localai/sections";
 import { STATUS_LABEL } from "../components/ui/StatusBadge";
 import { HELP } from "./help";
 
@@ -54,5 +56,26 @@ describe("help registry hygiene", () => {
     expect(entry, "no help entry for settings-localai-power").toBeDefined();
     expect(entry?.title).toBe("On battery");
     expect(entry?.body).toMatch(/reduces power use by not running inference on your GPU/);
+  });
+});
+
+describe("the Local AI tab's help", () => {
+  it("has an entry for every section, titled with the section's own name", () => {
+    // Each section's wrapper points its `data-help` at its row's id; an entry titled with an old name
+    // would explain a heading the reader can't find.
+    for (const { id, label, help } of LOCALAI_SECTIONS) {
+      expect(HELP[help], `${id} → ${help}`).toBeDefined();
+      expect(HELP[help].title).toBe(label);
+    }
+  });
+
+  it("says nothing the redesign made untrue", () => {
+    const bodies = LOCALAI_SECTIONS.map((s) => HELP[s.help].body).join(" ");
+    // The speeds are ceilings or rough guides now, never "conservative".
+    expect(bodies).not.toContain("The numbers are conservative estimates.");
+    // Sections are named, never pointed at by direction.
+    expect(bodies).not.toMatch(/\b(above|below)\b/);
+    // The fold it names is the one Model server shows.
+    expect(HELP["settings-localai-endpoint"].body).toContain(`“${TUNING_TITLE}”`);
   });
 });

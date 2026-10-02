@@ -7,7 +7,6 @@ import {
   checkLocalLlmEndpoint,
   clearLocalLlmEndpoint,
   clearLocalLlmToken,
-  probeLocalLlmPorts,
   setLocalLlmEndpoint,
   setLocalLlmToken,
 } from "../../lib/ipc";
@@ -20,9 +19,11 @@ import type {
 import { runnerGuides, tuningFor } from "../../lib/workbenchGuide";
 import { withCode } from "../withCode";
 import { TokenChip } from "./fitDisplay";
-import { TUNING_ID } from "./locate";
+import { TUNING_ID, TUNING_TITLE } from "./locate";
 import { runnerOf } from "./readiness";
 import { RunnerGuideCard } from "./RunnerGuideCard";
+import { SectionLink } from "./SectionLink";
+import { sectionHelp, sectionLabel } from "./sections";
 import {
   Button,
   Callout,
@@ -35,13 +36,17 @@ import {
 } from "../ui";
 
 /**
- * "Connect an endpoint" — the address, the token, and what PM will and won't send there.
+ * "Model server" — the address, the token, and what PM will and won't send there.
  *
  * It owns its own form state (the typed URL, the typed token, the last check, the in-flight flags)
  * because none of it means anything outside this section: a half-typed address is not a fact about
  * the tab. What it reports upward is only what other sections read — that the stored config
  * changed, and that something went wrong — plus `onEndpointChanged`, which exists because a test
  * result in the roles section proves a MODEL on a SERVER and the server has just moved.
+ *
+ * What the port probe found is the tab's (`useServerDetect`), so this list and the start card's step
+ * 1 are one answer; while nothing is connected, the start card holds the install guide, and this
+ * section points there rather than keeping a second copy.
  */
 export function LocalAiEndpoint({
   config,
@@ -53,6 +58,8 @@ export function LocalAiEndpoint({
   error,
   tuningOpen,
   onTuningOpenChange,
+  detected,
+  onDetect,
 }: {
   config: LocalLlmConfig | null;
   status: LocalLlmStatus | null;
@@ -69,9 +76,16 @@ export function LocalAiEndpoint({
    *  Omitted, the fold keeps its own state. */
   tuningOpen?: boolean;
   onTuningOpenChange?: (open: boolean) => void;
+  /** What the tab's port probe found while nothing is connected, or null before it has answered. */
+  detected: DetectedEndpoint[] | null;
+  /** Look again now, resolving to what was found. */
+  onDetect: () => Promise<DetectedEndpoint[]>;
 }) {
   const [urlInput, setUrlInput] = useState("");
-  const [detected, setDetected] = useState<DetectedEndpoint[] | null>(null);
+  // Whether this section's own Auto-detect has been pressed: the probe also runs by itself, and
+  // "nothing answered" is the answer to a question — said once someone has asked it here, rather
+  // than as a second copy of what the start card's first step already says.
+  const [asked, setAsked] = useState(false);
   const [checking, setChecking] = useState(false);
   const [check, setCheck] = useState<EndpointCheck | null>(null);
   const [tokenInput, setTokenInput] = useState("");
@@ -98,13 +112,9 @@ export function LocalAiEndpoint({
 
   async function autodetect() {
     onError(null);
-    try {
-      const found = await probeLocalLlmPorts();
-      setDetected(found);
-      if (found.length === 1) setUrlInput(found[0].url);
-    } catch (e) {
-      onError(String(e));
-    }
+    setAsked(true);
+    const found = await onDetect();
+    if (found.length === 1) setUrlInput(found[0].url);
   }
 
   async function runCheck() {
@@ -164,7 +174,7 @@ export function LocalAiEndpoint({
     try {
       await clearLocalLlmEndpoint();
       setCheck(null);
-      setDetected(null);
+      setAsked(false);
       onEndpointChanged();
       await onReload();
     } catch (e) {
@@ -176,11 +186,11 @@ export function LocalAiEndpoint({
     <div
       id="sec-localai-endpoint"
       data-settings-section
-      data-help="settings-localai-endpoint"
+      data-help={sectionHelp("sec-localai-endpoint")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel action={configured && <StatusChip status={status} />}>
-        Connect an endpoint
+        {sectionLabel("sec-localai-endpoint")}
       </SectionLabel>
       {/* Which runners PM supports, stated up front and in BOTH states — this is a gating fact
           (what you need to have installed), not prose to fold away. */}
@@ -263,6 +273,28 @@ export function LocalAiEndpoint({
         </div>
       ) : (
         <div className="mt-2 space-y-3">
+          {detected && detected.length > 0 && (
+            <div className="text-xs">
+              <p className="text-ink4">Found on this computer:</p>
+              <ul className="mt-1 space-y-1">
+                {detected.map((d) => (
+                  <li key={d.url}>
+                    <button
+                      type="button"
+                      onClick={() => setUrlInput(d.url)}
+                      className="text-accent-text underline hover:brightness-110"
+                    >
+                      {d.label} — {d.url}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <p className="text-xs text-ink4">
+            Don't have one yet? Step 1 under <SectionLink to="sec-localai-start" /> has the install
+            steps for this computer.
+          </p>
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="secondary" onClick={() => void autodetect()}>
               Auto-detect a local server
@@ -271,31 +303,13 @@ export function LocalAiEndpoint({
               Looks for Ollama, LM Studio, and llama-server on this machine.
             </span>
           </div>
-          {detected && (
-            <div className="text-xs">
-              {detected.length === 0 ? (
-                <p className="text-ink4">
-                  Nothing answered on port 11434, 1234 or 8080. If you've already installed one,
-                  it's most likely not running — check the guide below for whether yours starts on
-                  its own. Otherwise install one and auto-detect again. You can also type an address
-                  yourself, if your server is on a different port or another machine.
-                </p>
-              ) : (
-                <ul className="space-y-1">
-                  {detected.map((d) => (
-                    <li key={d.url}>
-                      <button
-                        type="button"
-                        onClick={() => setUrlInput(d.url)}
-                        className="text-accent-text underline hover:brightness-110"
-                      >
-                        {d.label} — {d.url}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+          {asked && detected && detected.length === 0 && (
+            <p className="text-xs text-ink4">
+              Nothing answered on port 11434, 1234 or 8080. If you've already installed one, it's
+              most likely not running — step 1 under <SectionLink to="sec-localai-start" /> says,
+              for each server, whether it starts on its own. You can also type an address yourself,
+              if your server is on a different port or another machine.
+            </p>
           )}
           <div>
             <label {...urlField.labelProps} className="block text-sm font-medium text-ink2">
@@ -358,7 +372,7 @@ export function LocalAiEndpoint({
       {configured && runner && tuning && (
         <div id={TUNING_ID} className="mt-3">
           <Collapsible
-            title="Settings PM's numbers assume"
+            title={TUNING_TITLE}
             defaultOpen={false}
             open={tuningOpen}
             onOpenChange={onTuningOpenChange}
@@ -378,15 +392,14 @@ export function LocalAiEndpoint({
         </div>
       )}
 
-      {/* Outside the `configured` branch on purpose. It used to live inside the not-yet-connected
-          half, so the moment you connected anything the comparison vanished — and "was one of the
-          others a better choice for me?" is a question you mostly ask AFTER trying one. */}
-      <Collapsible
-        title={configured ? "Compare the three local servers" : "Don't have a local server yet?"}
-        defaultOpen={false}
-      >
-        <RunnerInstall />
-      </Collapsible>
+      {/* Once connected only. "Was one of the others a better choice for me?" is a question you mostly
+          ask AFTER trying one; before anything is connected, the start card's first step is the
+          guide — one guide on the page, not two that could disagree. */}
+      {configured && (
+        <Collapsible title="Compare the three local servers" defaultOpen={false}>
+          <RunnerInstall />
+        </Collapsible>
+      )}
 
       <SectionInfo title="What leaves your device">
         <p>

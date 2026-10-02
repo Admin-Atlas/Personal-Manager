@@ -7,7 +7,7 @@ import { Button, Callout, SectionInfo, SectionLabel, Select, SettingRow } from "
 import { TrayIconRow } from "../settings/TrayIconRow";
 import { minutes, QUIET_MINUTES } from "./quietPeriods";
 import { SectionLink } from "./SectionLink";
-import { sectionLabel } from "./sections";
+import { sectionHelp, sectionLabel } from "./sections";
 import { useReleaseSettings, type ReleaseSettings } from "./useReleaseSettings";
 
 /** How the three policies are worded, and — the part users actually need — when each one suits. */
@@ -30,7 +30,7 @@ const POLICIES: ReadonlyArray<{ value: string; label: string; when: string }> = 
 ];
 
 /**
- * Giving the graphics card back (#786 item 8).
+ * "Model memory" — giving the graphics card back (#786 item 8).
  *
  * The one mechanism PM uses is an explicit unload. It never sets a keep-alive on its own requests,
  * because measurement showed a single request carrying one reprograms that server for the rest of its
@@ -91,10 +91,10 @@ export function LocalAiLifecycle({
     <div
       id="sec-localai-lifecycle"
       data-settings-section
-      data-help="settings-localai-lifecycle"
+      data-help={sectionHelp("sec-localai-lifecycle")}
       className="mt-5 border-t border-border pt-4"
     >
-      <SectionLabel>Holding the graphics card</SectionLabel>
+      <SectionLabel>{sectionLabel("sec-localai-lifecycle")}</SectionLabel>
       {error && <Callout className="mt-2">{error}</Callout>}
       {!configured ? (
         <p className="mt-2 text-xs text-ink4">
