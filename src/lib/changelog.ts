@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.138.1-alpha",
+    date: "2026-10-02",
+    highlights: [
+      "Models that think before they answer, like gemma 4 and Qwen 3.5, no longer keep PM waiting on Ollama. They used to think through every request PM sent, even sorting a single document, and PM never shows that thinking: in PM's own check, filing one document took close to a minute and now takes about a second, with the same answer. PM now asks Ollama to skip the thinking, so background work stays well inside its time limit and chat replies start straight away. Models that never think are unaffected. LM Studio and llama-server are unchanged for now.",
+    ],
+  },
+  {
     version: "3.138.0-alpha",
     date: "2026-10-02",
     highlights: [
