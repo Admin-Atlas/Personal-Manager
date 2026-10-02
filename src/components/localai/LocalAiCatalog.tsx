@@ -284,7 +284,7 @@ function NumbersGuide() {
     ],
     [
       "Speed",
-      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement: PM divides the memory speed of whatever the model runs from by how much of the model it reads for each token. On a graphics card PM recognises, that makes it a ceiling — in PM's own checks on one laptop graphics card, real replies came 10–35% slower. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
+      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement: PM divides the memory speed of whatever the model runs from by how much of the model it reads for each token. On a graphics card PM recognises, that makes it a ceiling — in PM's own checks on one laptop graphics card, real replies came 10–60% slower, and the same model varied from day to day. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
     ],
     [
       "Memory",

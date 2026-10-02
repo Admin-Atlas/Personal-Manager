@@ -60,7 +60,7 @@ describe("speedLong", () => {
   it("names the card's published speed and PM's own measurement for a recognised card", () => {
     const text = speedLong(fit("gpu_published"), HW);
     expect(text).toContain("(384 GB/s)");
-    expect(text).toContain("10–35% slower");
+    expect(text).toContain("10–60% slower");
     expect(text).not.toMatch(/mixture-of-experts/);
   });
 

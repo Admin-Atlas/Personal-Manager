@@ -420,9 +420,12 @@ fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32, kv: KvCache) 
 /// input).
 ///
 /// Speed is an upper bound, not a forecast. On a recognised discrete GPU with the config resident on
-/// the GPU, it must never be below real decode speed, and has measured +11% (Qwen2.5 7B Q5_K_M: est
-/// 71, ~64 real) to +55% (gemma 3 4b Q4_K_M: est 162, ~105 real) above it on an RTX 5060 Laptop GPU
-/// at 384 GB/s (n=2). PM claims no tolerance for an unrecognised card, shared memory or system RAM,
+/// the GPU, it must never be below real decode speed. On an RTX 5060 Laptop GPU at 384 GB/s, real
+/// decode has come in 10–57% below it: Qwen2.5 7B Q5_K_M est 71, ~64 real one day and 44–47 another;
+/// gemma 3 4b Q4_K_M est 162, ~105 then ~75; gemma 4 12b Q3_K_M est 65.8, 28.5 (n=5, Ollama, full
+/// residency). On the slower day the card generated in P4 at 9001 of 12001 MHz memory clock, on mains
+/// with the performance profile, so a laptop's own power management moves the real figure by more
+/// than the model does. PM claims no tolerance for an unrecognised card, shared memory or system RAM,
 /// and no ranking may order by its magnitude: the one comparison PM makes is the background floor
 /// (better_fit), computed at the deliberately low SYSTEM_BANDWIDTH_GBPS.
 fn tokens_per_sec(

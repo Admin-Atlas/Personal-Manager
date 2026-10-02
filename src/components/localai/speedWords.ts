@@ -4,8 +4,8 @@
 // How a speed estimate is worded, wherever it is shown — from what it was worked out from.
 //
 // The figure is an upper bound, not a forecast (fit.rs, `tokens_per_sec`): memory bandwidth divided
-// by the bytes read per token. On a discrete graphics card PM recognises it has measured +11% to +55%
-// above real decode speed, so it is a ceiling and says "up to". On a card PM doesn't recognise, or
+// by the bytes read per token. On a discrete graphics card PM recognises, real decode has measured
+// 10–57% below it, so it is a ceiling and says "up to". On a card PM doesn't recognise, or
 // from system RAM, it rests on a typical bandwidth and can be wrong either way, so it says "about".
 // On memory shared with the processor PM puts no number on it at all. No "~" anywhere: a tilde reads
 // as "roughly this", which is the one thing a ceiling is not.
@@ -51,7 +51,7 @@ export function speedLong(
       const bw = hw?.gpu_bandwidth_gbps;
       const text = `Worked out from your graphics card's published memory speed${
         bw != null ? ` (${Math.round(bw)} GB/s)` : ""
-      }, not measured on this computer, so it's a best case: in PM's own checks on one laptop graphics card, real replies came 10–35% slower. Take it with a pinch of salt.`;
+      }, not measured on this computer, so it's a best case: in PM's own checks on one laptop graphics card, real replies came 10–60% slower, and the same model varied from day to day. Take it with a pinch of salt.`;
       return moe
         ? `${text} For a mixture-of-experts model the real figure can be much lower.`
         : text;
