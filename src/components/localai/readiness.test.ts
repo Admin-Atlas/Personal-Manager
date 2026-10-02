@@ -272,12 +272,14 @@ const installed = (
   over: Partial<LocalFitResult> = {},
   measured = true,
   spills_gpu = false,
+  card_unused = false,
 ): LocalInstalledModel => ({
   id,
   matched_repo: QWEN,
   fit: fit(over),
   measured,
   spills_gpu,
+  card_unused,
 });
 
 /** PM's pick as a model the user already has. */
@@ -570,6 +572,33 @@ describe("standing — where the user stands, first match wins", () => {
     ).toBe(clean);
     // And never without a separate card to spill off.
     expect(say(catalogue(), true, true, false)).toBe(clean);
+  });
+
+  it("says when the server isn't using the card at all, even of PM's own pick", () => {
+    const say = (pick: LocalPick, card = true) =>
+      standing({
+        ...both("qwen2.5-7b-instruct", "local_only"),
+        config: cfg({
+          base_url: "http://127.0.0.1:11434",
+          chat_model: "qwen2.5-7b-instruct",
+          background_model: "qwen2.5-7b-instruct",
+          chat_routing: "local",
+          background_routing: "local",
+        }),
+        recs: recs({
+          ...(card ? {} : { hardware: { ...recs().hardware, vram_gb: null } }),
+          pick,
+          installed: [installed("qwen2.5-7b-instruct", {}, true, false, true)],
+        }),
+      });
+    const clean =
+      "Chat and background work run on qwen2.5-7b-instruct, on this computer, and never use the cloud.";
+    const cardless = `${clean} Your server isn't using your graphics card, so qwen2.5-7b-instruct runs entirely from system memory — expect slow replies. Check that it can see the card; a different model won't help.`;
+    expect(say(catalogue())).toBe(cardless);
+    expect(
+      say(ownedPick({ id: "qwen2.5-7b-instruct", served: true, source: null, path: null })),
+    ).toBe(cardless);
+    expect(say(catalogue(), false)).toBe(clean);
   });
 });
 

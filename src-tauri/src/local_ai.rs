@@ -1286,8 +1286,8 @@ pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit
         .flatten()
         .cloned()
         .collect();
-    let owned = size_for_machine(&fit_hw, served, &disk.models, base_url.as_deref(), &bound).owned;
-    let on_disk = usable_copies(&owned);
+    let pick = size_for_machine(&fit_hw, served, &disk.models, base_url.as_deref(), &bound).pick;
+    let on_disk = notice_copy(&pick);
 
     Ok(better_fit_suggestion(
         &fit_hw,
@@ -2516,7 +2516,9 @@ struct Sizing {
     installed: Vec<InstalledModel>,
     on_disk: Vec<OnDiskModel>,
     /// The models the user already has that the pick weighed: served, or on disk for a server that
-    /// could serve them. The better-fit notice reads its "already downloaded" from these.
+    /// could serve them. Only the tests read them now — the better-fit notice takes its one copy from
+    /// the pick itself ([`notice_copy`]).
+    #[cfg(test)]
     owned: Vec<better_fit::OwnedOption>,
     pick: better_fit::Pick,
 }
@@ -2623,18 +2625,21 @@ fn size_for_machine(
         let measured = sized.as_ref().is_some_and(|(_, m)| *m) && probe.served_ctx.is_some();
         // `fit_hw` is THIS computer's card, so a server elsewhere says nothing about it: its
         // `/api/ps` describes its own machine, and its files are loaded onto its own memory.
-        let spills_gpu = base_url.is_some_and(openai_compat::host_is_loopback_literal)
+        let here = base_url.is_some_and(openai_compat::host_is_loopback_literal);
+        let spills_gpu = here
             && spills_gpu(
                 fit_hw,
                 probe.resident.as_ref(),
                 sized.as_ref().map(|(spec, _)| spec).filter(|_| measured),
             );
+        let card_unused = here && card_unused(fit_hw, probe.resident.as_ref());
         installed.push(InstalledModel {
             id: probe.id,
             matched_repo: entry.map(|e| e.repo.clone()),
             fit,
             measured,
             spills_gpu,
+            card_unused,
         });
     }
 
@@ -2682,6 +2687,7 @@ fn size_for_machine(
         curated,
         installed,
         on_disk,
+        #[cfg(test)]
         owned,
         pick,
     }
@@ -2696,11 +2702,10 @@ const RESIDENT_SPILL_SHARE: f64 = 0.05;
 /// least partly) from system memory — the one ground on which the tab may say so. The caller asks
 /// only for a server on this computer.
 ///
-/// The server's word covers more than a model that is too big: a server that cannot reach the card
-/// at all (a container started without it, a card its runtime doesn't support) reports `size_vram`
-/// 0, and one sharing the card with another program offloads part of a model that would fit alone.
-/// All of them run from system memory, which is what the tab says — not that the model is larger
-/// than the card.
+/// The server's word covers more than a model that is too big: one sharing the card with another
+/// program offloads part of a model that would fit alone. Both run partly from system memory, which
+/// is what the tab says, not that the model is larger than the card. A server that puts NOTHING on
+/// the card is a different fact, with different advice ([`card_unused`]), and is left out here.
 ///
 /// Only with a dedicated card: unified memory has no separate card to spill off, and with no card
 /// there is nothing to compare against. Then, in order:
@@ -2727,29 +2732,36 @@ fn spills_gpu(
         return false;
     };
     match resident {
-        Some(r) => r.size_gb > 0.0 && r.size_vram_gb < r.size_gb * (1.0 - RESIDENT_SPILL_SHARE),
+        Some(r) => {
+            r.size_gb > 0.0
+                && r.size_vram_gb > 0.0
+                && r.size_vram_gb < r.size_gb * (1.0 - RESIDENT_SPILL_SHARE)
+        }
         None => measured.is_some_and(|spec| fit::outgrows_card(spec, spec.target_context, vram)),
     }
 }
 
-/// The repos of the models the user already has that PM's pick could itself choose: a copy with a
-/// runnable config of its own, served or on disk for a server that could serve it — the very options
-/// [`size_for_machine`] made the pick from.
+/// Whether the server loaded a model with none of it on this machine's dedicated graphics card: a
+/// container started without the card, a card its runtime doesn't support, a CPU-only build. Then
+/// every model it runs is in system memory, PM's pick included, so the tab says the server isn't
+/// using the card rather than pointing at a smaller or a different model.
+fn card_unused(hw: &fit::FitHardware, resident: Option<&openai_compat::ResidentModel>) -> bool {
+    better_fit::basis_for(hw) == better_fit::PickBasis::Gpu
+        && resident.is_some_and(|r| r.size_gb > 0.0 && r.size_vram_gb <= 0.0)
+}
+
+/// The one copy the better-fit notice may call "already on this device": the copy PM's pick itself
+/// names, or none. Taken from the pick rather than worked out again, so the two cannot disagree.
 ///
-/// What the better-fit notice may call "already on this device". Matching the disk by repo alone,
-/// as it did, counted an LM Studio Q8_0 under an Ollama on 11434 — a file that server cannot load,
-/// and that would not fit the card if it could — and told the user PM's pick was already here
-/// directly above a pick card offering its download.
-fn usable_copies(owned: &[better_fit::OwnedOption]) -> Vec<String> {
-    owned
-        .iter()
-        .filter(|o| {
-            o.config
-                .as_ref()
-                .is_some_and(|c| better_fit::is_runnable(c.verdict))
-        })
-        .map(|o| o.repo.clone())
-        .collect()
+/// Every copy the pick could use was the earlier rule, and with two of them the notice named the
+/// larger while the pick, which prefers one a role uses and then one the server already serves,
+/// named the other — directly under it. Matching the disk by repo alone, before that, counted an LM
+/// Studio Q8_0 under an Ollama on 11434: a file that server cannot load.
+fn notice_copy(pick: &better_fit::Pick) -> Vec<String> {
+    match pick {
+        better_fit::Pick::Owned { repo, .. } => vec![repo.clone()],
+        better_fit::Pick::Catalogue { .. } | better_fit::Pick::Nothing { .. } => Vec::new(),
+    }
 }
 
 /// The pick's view of one curated model. Shared by the recommendations and the better-fit notice, so
@@ -3401,6 +3413,10 @@ pub struct InstalledModel {
     /// from system memory"; `false` whenever PM cannot show it, `fit.speed_basis` included — that
     /// is sized f16-first and says nothing about the cache the server really runs.
     pub spills_gpu: bool,
+    /// The server loaded it with nothing on this machine's dedicated graphics card ([`card_unused`]):
+    /// it isn't using the card at all. Distinct from `spills_gpu`, because switching models won't
+    /// help, and the tab must not say it would.
+    pub card_unused: bool,
 }
 
 /// One model the configured endpoint is serving, plus whether it can answer a chat turn.
@@ -3699,6 +3715,7 @@ mod tests {
             matched_repo: None,
             measured: false,
             spills_gpu: false,
+            card_unused: false,
             fit: fit::FitResult {
                 verdict: fit::Verdict::Comfortable,
                 quant: Some(fit::Quant::Q4_K_M),
@@ -5022,77 +5039,127 @@ mod tests {
 
     #[test]
     fn the_notice_names_the_pick_or_the_copy_the_pick_would_use_and_nothing_else() {
-        // One model on both roles, so nothing else shares the machine, and one other catalogue model
-        // as a copy the user has. The notice names the pick's download whenever it is a real step up
-        // from the model in use — even one PM would not run here, like Phi-3.5 mini on the laptop's
-        // card — and names a copy only where the pick would point at that copy instead.
+        // One model on both roles, so nothing else shares the machine, plus copies the user has: none,
+        // one served, or one served and one only on disk — the pair where the notice, taking the
+        // larger, used to name a different copy from the pick, which takes the served one. Built
+        // through `size_for_machine` exactly as the command builds them. Whatever the notice names is
+        // the pick's own: its download, or the copy it points at.
         let machines = [
             ("laptop, 10 free", laptop(10.0)),
             ("laptop, 20 free", laptop(20.0)),
             ("12 GB card, 24 free", card(12.0, Some(504.0), 24.0)),
+            ("no GPU, 12 free", no_gpu(12.0)),
             ("no GPU, 16 free", no_gpu(16.0)),
         ];
+        let url = Some("http://127.0.0.1:11434");
         let cat = local_catalog::catalog();
-        let tags: Vec<(&local_catalog::CatalogEntry, String)> = cat
+        // Each catalogue model as Ollama would hold it: its first fetchable tag and that file's size.
+        let held: Vec<(&local_catalog::CatalogEntry, String, String, f64)> = cat
             .entries
             .iter()
-            .filter_map(|e| Some((e, e.quants.iter().find_map(|q| q.ollama.clone())?)))
+            .filter(|e| e.fit == local_catalog::FitClass::Computed)
+            .filter_map(|e| {
+                let q = e.quants.iter().find(|q| q.ollama.is_some())?;
+                Some((e, q.ollama.clone()?, q.quant.clone(), q.file_gb))
+            })
             .collect();
-        let params = |repo: &str| {
-            cat.entries
-                .iter()
-                .find(|e| e.repo == repo)
-                .map(|e| e.parameters_b)
-                .unwrap()
-        };
-        let mut named_pick = 0usize;
-        for (label, hw) in machines {
-            let Pick::Catalogue {
-                repo: pick_repo, ..
-            } = pick_on(&hw)
-            else {
-                panic!("{label}: every one of these machines has a pick");
+        let as_served =
+            |(e, tag, quant, gb): &(&local_catalog::CatalogEntry, String, String, f64)| {
+                ServedProbe {
+                    served_ctx: Some(32768),
+                    ..served(tag, (gb * 1e9) as u64, quant, e.parameters_b)
+                }
             };
-            let pick_b = params(&pick_repo);
-            for (inuse, tag) in &tags {
-                if inuse.fit != local_catalog::FitClass::Computed {
-                    continue;
-                }
-                let alone = better_fit_suggestion(&hw, &[], Some(tag.clone()), Some(tag.clone()));
-                if pick_b >= inuse.parameters_b * 1.15 {
-                    assert_eq!(
-                        alone.as_ref().map(|s| s.repo.as_str()),
-                        Some(pick_repo.as_str()),
-                        "{label}: {tag} is well short of the pick"
-                    );
-                    named_pick += 1;
-                } else {
-                    assert_eq!(alone, None, "{label}: {tag} is within 15% of the pick");
-                }
-                for (other, _) in &tags {
-                    let copies = [other.repo.clone()];
-                    let Some(s) =
-                        better_fit_suggestion(&hw, &copies, Some(tag.clone()), Some(tag.clone()))
-                    else {
-                        continue;
-                    };
-                    if s.already_downloaded {
-                        assert_eq!(s.repo, other.repo, "{label}");
-                        assert!(
-                            other.parameters_b * 1.15 > pick_b,
-                            "{label}: {} is named over the pick {pick_repo}",
-                            other.repo
+        let as_file = |(e, _, quant, gb): &(&local_catalog::CatalogEntry, String, String, f64)| {
+            on_disk_file(
+                &format!(
+                    "{}:{}",
+                    e.repo.rsplit('/').next().unwrap(),
+                    quant.to_lowercase()
+                ),
+                DiskSource::Ollama,
+                *gb,
+                quant,
+            )
+        };
+        let (mut named_pick, mut named_copy, mut disk_picks) = (0usize, 0usize, 0usize);
+        for (label, hw) in machines {
+            for inuse in &held {
+                let bound = vec![inuse.1.clone(), inuse.1.clone()];
+                for (i, a) in held.iter().enumerate() {
+                    for b in held.iter().skip(i).map(Some).chain([None]) {
+                        let mut serve = vec![as_served(inuse)];
+                        if a.1 != inuse.1 {
+                            serve.push(as_served(a));
+                        }
+                        let files: Vec<DiskModel> = b.into_iter().map(as_file).collect();
+                        let pick = size_for_machine(&hw, serve, &files, url, &bound).pick;
+                        if matches!(pick, Pick::Owned { served: false, .. }) {
+                            disk_picks += 1;
+                        }
+                        let s = better_fit_suggestion(
+                            &hw,
+                            &notice_copy(&pick),
+                            Some(inuse.1.clone()),
+                            Some(inuse.1.clone()),
                         );
-                    } else {
-                        assert_eq!(s.repo, pick_repo, "{label}: {tag} with {}", other.repo);
+                        let Some(s) = s else { continue };
+                        match &pick {
+                            Pick::Owned { repo, .. } => {
+                                assert!(s.already_downloaded, "{label}: {s:?} against {pick:?}");
+                                assert_eq!(&s.repo, repo, "{label}");
+                                named_copy += 1;
+                            }
+                            Pick::Catalogue { repo, .. } => {
+                                assert!(!s.already_downloaded, "{label}: {s:?} against {pick:?}");
+                                assert_eq!(&s.repo, repo, "{label}");
+                                named_pick += 1;
+                            }
+                            Pick::Nothing { .. } => panic!("{label}: {s:?} with no pick"),
+                        }
                     }
                 }
             }
         }
         assert!(
-            named_pick > 20,
-            "the sweep must name the pick ({named_pick})"
+            named_pick > 100,
+            "the sweep must name downloads ({named_pick})"
         );
+        assert!(
+            named_copy > 100,
+            "the sweep must name copies ({named_copy})"
+        );
+        // The disk half of each pair must reach the pick at all, or the pair proves nothing.
+        assert!(
+            disk_picks > 100,
+            "a copy only on disk must be the pick ({disk_picks})"
+        );
+
+        // And the converse: with nothing but the model in use, a pick at least 15% larger is named,
+        // even over a model PM would not run here (Phi-3.5 mini's full-width cache on the laptop's
+        // card at 32k), and a pick within 15% is not.
+        for (label, hw) in [("laptop", laptop(20.0)), ("no GPU", no_gpu(16.0))] {
+            let Pick::Catalogue {
+                repo: pick_repo, ..
+            } = pick_on(&hw)
+            else {
+                panic!("{label} has a pick");
+            };
+            let pick_b = cat
+                .entries
+                .iter()
+                .find(|e| e.repo == pick_repo)
+                .unwrap()
+                .parameters_b;
+            for (e, tag, ..) in &held {
+                let s = better_fit_suggestion(&hw, &[], Some(tag.clone()), Some(tag.clone()));
+                if pick_b >= e.parameters_b * 1.15 {
+                    assert_eq!(s.map(|s| s.repo), Some(pick_repo.clone()), "{label}: {tag}");
+                } else {
+                    assert_eq!(s, None, "{label}: {tag}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5111,7 +5178,7 @@ mod tests {
             )
         };
         let usable = |url: &str, file: DiskModel| {
-            usable_copies(
+            notice_copy(
                 &size_for_machine(
                     &laptop(20.0),
                     vec![served(&gemma, 3_338_801_804, "Q4_K_M", 4.3)],
@@ -5119,7 +5186,7 @@ mod tests {
                     Some(url),
                     std::slice::from_ref(&gemma),
                 )
-                .owned,
+                .pick,
             )
         };
         let notice = |copies: &[String]| {
@@ -5393,7 +5460,12 @@ mod tests {
         // the estimate says — `size_vram` is a floor, so short of `size` is proof.
         assert!(spills_gpu(&hw, Some(&loaded(8.0, 5.5)), None));
         assert!(spills_gpu(&hw, Some(&loaded(8.0, 5.5)), Some(&q6)));
-        assert!(spills_gpu(&hw, Some(&loaded(8.0, 0.0)), None));
+        // Nothing on the card is the server not using it, which is its own fact.
+        assert!(!spills_gpu(&hw, Some(&loaded(8.0, 0.0)), None));
+        assert!(card_unused(&hw, Some(&loaded(2.6, 0.0))));
+        assert!(!card_unused(&hw, Some(&loaded(8.0, 5.5))));
+        assert!(!card_unused(&hw, None));
+        assert!(!card_unused(&no_gpu(20.0), Some(&loaded(2.6, 0.0))));
         // Loaded wholly on the card: the server's word stands over any estimate. A floor never
         // proves a fit, but a load the server reports on the card is not one PM may call spilled.
         assert!(spills_gpu(&hw, None, Some(&f16)));
@@ -5498,6 +5570,29 @@ mod tests {
                 ..probe()
             })
             .spills_gpu
+        );
+        assert!(
+            !remote(ServedProbe {
+                resident: Some(loaded(8.1, 0.0)),
+                ..probe()
+            })
+            .card_unused
+        );
+
+        // On this computer, a server holding nothing of it on the card isn't using the card: that,
+        // and not a spill, is what the row says, and the JSON carries it.
+        let cpu_only = row(
+            ServedProbe {
+                resident: Some(loaded(6.2, 0.0)),
+                ..probe()
+            },
+            &hw,
+        );
+        assert!(cpu_only.card_unused);
+        assert!(!cpu_only.spills_gpu);
+        assert_eq!(
+            serde_json::to_value(&cpu_only).unwrap()["card_unused"],
+            true
         );
     }
 }

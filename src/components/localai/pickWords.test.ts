@@ -87,7 +87,8 @@ const installed = (
   over: Partial<LocalFitResult> = {},
   measured = true,
   spills_gpu = false,
-): LocalInstalledModel => ({ id, matched_repo, fit: fit(over), measured, spills_gpu });
+  card_unused = false,
+): LocalInstalledModel => ({ id, matched_repo, fit: fit(over), measured, spills_gpu, card_unused });
 
 const nothing = (over: Partial<NothingPick> = {}): NothingPick => ({
   kind: "nothing",
@@ -432,6 +433,17 @@ describe("the lines about models the user already has", () => {
     expect(inUseLine(catalogue(), "qwen-other", r)).toBeNull();
     expect(inUseLine(catalogue(), `hf.co/${QWEN}:Q5_K_M`, r)).toBeNull();
     expect(inUseLine(catalogue(), null, r)).toBeNull();
+  });
+
+  it("never points at the pick when the server isn't using the card at all", () => {
+    // Ollama in a container started without the card: everything it loads sits in system memory,
+    // the pick included, so a bigger download would only be slower.
+    const r = recs({
+      installed: [installed("llama3.2:3b", QWEN, {}, true, false, true)],
+    });
+    expect(inUseLine(catalogue(), "llama3.2:3b", r)).toBe(
+      "You're using llama3.2:3b, which runs entirely from system memory because your server isn't using your graphics card.",
+    );
   });
 
   it("never says a model runs from system memory on the row's sizing alone", () => {

@@ -378,6 +378,16 @@ export function spillsOffCard(recs: LocalRecommendations | null, id: string): bo
   return recs.installed.find((m) => m.id === id)?.spills_gpu === true;
 }
 
+/**
+ * Whether the server holds `id` with nothing on the graphics card (`card_unused`): it isn't using the
+ * card at all, so the model runs from system memory and so would any other — PM's pick included,
+ * which is why this is said even of the pick, and never with a pointer to a different model.
+ */
+export function serverIgnoresCard(recs: LocalRecommendations | null, id: string): boolean {
+  if (!recs || !hasCard(recs)) return false;
+  return recs.installed.find((m) => m.id === id)?.card_unused === true;
+}
+
 /** The flags that start llama-server the way PM sized a fit: its context, one request at a time,
  *  and the compressed cache when PM sized it on one.
  *
@@ -586,6 +596,14 @@ export function standing(i: ReadinessInput): string {
   }
   for (const m of slow)
     text += ` ${m} runs at least partly from system memory rather than your graphics card — expect slow replies.`;
+  const cardless = new Set<string>();
+  for (const f of [chat, background]) {
+    if (f.atWork && f.model && serverIgnoresCard(i.recs, f.model)) cardless.add(f.model);
+  }
+  if (cardless.size > 0)
+    text += ` Your server isn't using your graphics card, so ${listJoin([...cardless])} ${
+      cardless.size > 1 ? "run" : "runs"
+    } entirely from system memory — expect slow replies. Check that it can see the card; a different model won't help.`;
   const unknown = ROLES.filter((r) => roleFacts(i, r).effective === "unknown");
   if (unknown.length > 0)
     text += ` PM can't read your saved keys right now, so it can't say whether ${who(unknown)} would fall back to the cloud.`;

@@ -1846,13 +1846,18 @@ export interface LocalInstalledModel {
   /** The fit is for the user's own file at the window the server proved it serves, not the
    *  catalogue's figure for the model (local_ai.rs InstalledModel.measured). */
   measured: boolean;
-  /** PM can show this model does not fit the dedicated graphics card, so it runs at least partly
-   *  from system memory (local_ai.rs InstalledModel.spills_gpu): the server holds less of it on the
-   *  card than its size, or — not known to be loaded — PM's figures for the user's own file at the
-   *  served context are over the card's whole memory even on a compressed cache. False on unified
-   *  memory, without a card, and whenever PM can't show it. The only ground for saying the user's
-   *  model "runs from system memory"; `fit.speed_basis` is sized f16 first and runs high by design. */
+  /** PM can show this model runs at least partly from system memory rather than the dedicated
+   *  graphics card (local_ai.rs InstalledModel.spills_gpu): the server holds some, but less than
+   *  all, of it on the card — which a model that would fit alone does too when another program holds
+   *  the card — or, not known to be loaded, PM's figures for the user's own file at the served
+   *  context are over the card's whole memory even on a compressed cache. Only for a server on this
+   *  computer; false on unified memory, without a card, and whenever PM can't show it. The only
+   *  ground for saying so; `fit.speed_basis` is sized f16 first and runs high by design. */
   spills_gpu: boolean;
+  /** The server loaded it with nothing on the card: it isn't using the graphics card at all (a
+   *  container started without it, an unsupported card, a CPU-only build), so every model it runs is
+   *  in system memory and switching models won't help (local_ai.rs InstalledModel.card_unused). */
+  card_unused: boolean;
 }
 
 /** Which runner a model found on disk belongs to (local_disk.rs DiskSource). */

@@ -585,6 +585,7 @@ describe("All models", () => {
             fit: fit(),
             measured: false,
             spills_gpu: false,
+            card_unused: false,
           },
         ],
       }),
@@ -741,6 +742,34 @@ describe("All models", () => {
       expect(card().textContent).toContain(
         "These are for this card's settings, not PM's pick, which is sized differently",
       );
+    });
+
+    it("with both rows on the pick's file, the band names the row that runs on the card", async () => {
+      getLocalLlmConfig.mockResolvedValue(cfg());
+      localModelRecommendations.mockResolvedValue(
+        recs({
+          curated: [
+            gemma4({
+              ollama_pull: Q3,
+              gpu_pull: { tag: Q3, sharded: false, same_file: true },
+              fit: fit({
+                quant: "Q3_K_M",
+                context: 262144,
+                kv: "f16",
+                est_memory_gb: 12.4,
+                verdict: "comfortable",
+                speed_basis: "system",
+              }),
+            }),
+          ],
+          pick: gemma4Pick,
+        }),
+      );
+      await mount();
+      const start = document.getElementById("sec-localai-start") as HTMLElement;
+      await within(start).findByRole("button", { name: "Download (5.5 GB)" });
+      expect(card().textContent).toContain(BAND("64k"));
+      expect(card().textContent).not.toContain("sized for a 256k context");
     });
 
     it("marks the row the pick really is, and says nothing more", async () => {

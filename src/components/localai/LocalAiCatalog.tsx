@@ -310,7 +310,10 @@ function bandLine(rec: LocalRecommendation, pick: LocalPick | undefined): string
           : "the best build of it that fits and that Ollama can download";
   // What the card itself shows, so the comparison names a figure the reader can see: the row with
   // the pick's file, or else how the card sizes the model as a whole.
-  const row = sameFile ? rungs.find((f) => f.quant === quant) : undefined;
+  // With both rows on the same file, the one that runs where the pick does: on a card, its row.
+  const row = sameFile
+    ? (pick.basis === "gpu" ? [...rungs].reverse() : rungs).find((f) => f.quant === quant)
+    : undefined;
   const full = !capped
     ? ""
     : row?.context != null

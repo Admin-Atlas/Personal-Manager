@@ -22,7 +22,7 @@ import type {
 import { powerOf } from "../../lib/powerRoute";
 import type { RunnerName } from "../../lib/workbenchGuide";
 import { TUNING_TITLE } from "./locate";
-import { spillsOffCard } from "./readiness";
+import { serverIgnoresCard, spillsOffCard } from "./readiness";
 import { sectionLabel } from "./sections";
 import { speedShort } from "./speedWords";
 
@@ -282,6 +282,10 @@ export function inUseLine(
   const b = bound.toLowerCase();
   if (b === (pick.kind === "owned" ? pick.id : pick.tag).toLowerCase()) return null;
   const row = recs.installed.find((m) => m.id === bound);
+  // A server not using the card at all runs any model from system memory, the pick included, so it
+  // is said without pointing at the pick.
+  if (pick.basis === "gpu" && serverIgnoresCard(recs, bound))
+    return `You're using ${bound}, which runs entirely from system memory because your server isn't using your graphics card.`;
   // Only when the backend showed it doesn't fit the card (`spills_gpu`, via `spillsOffCard`) — never
   // from the row's sizing, which is f16 first and high by design.
   if (pick.basis === "gpu" && spillsOffCard(recs, bound))
