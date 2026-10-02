@@ -56,6 +56,8 @@ const setLocalModelRescanCadence = vi.fn();
 const setLocalModelScanDir = vi.fn();
 const setLocalPowerPolicy = vi.fn();
 const keepLocalOnBattery = vi.fn();
+const localAiSettingsAreDefault = vi.fn();
+const resetLocalAiSettings = vi.fn();
 
 // A factory REPLACES the whole module, so every wrapper anything in the tab imports must be here.
 vi.mock("../../lib/ipc", () => ({
@@ -91,6 +93,9 @@ vi.mock("../../lib/ipc", () => ({
   setLocalModelScanDir: (...a: unknown[]) => setLocalModelScanDir(...a),
   setLocalPowerPolicy: (...a: unknown[]) => setLocalPowerPolicy(...a),
   keepLocalOnBattery: (...a: unknown[]) => keepLocalOnBattery(...a),
+  // The tab's "Reset to defaults" footer (#445).
+  localAiSettingsAreDefault: () => localAiSettingsAreDefault(),
+  resetLocalAiSettings: () => resetLocalAiSettings(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -296,6 +301,8 @@ beforeEach(() => {
   setLocalReleasePolicy.mockResolvedValue(undefined);
   setLocalPowerPolicy.mockResolvedValue(undefined);
   keepLocalOnBattery.mockResolvedValue(undefined);
+  localAiSettingsAreDefault.mockResolvedValue(false);
+  resetLocalAiSettings.mockResolvedValue(undefined);
   getTrayEnabled.mockResolvedValue(false);
   setTrayEnabled.mockResolvedValue(undefined);
   activeLocalPull.mockResolvedValue(null);
@@ -851,6 +858,36 @@ describe("the pick names the larger model it passed over for speed", () => {
     const line = within(start()).getByText(LINE);
     expect(reason.nextElementSibling).toBe(line);
     expect(shown(line)).toBe(true);
+  });
+
+  it("gives a copy on a server on another computer this card's figure as this card's", async () => {
+    // A server elsewhere runs at its own computer's speed, so the card must not call this card's
+    // figure how fast the user's copy replies "here" — the start card hands the line the server.
+    const tag = `hf.co/${GEMMA4}:Q3_K_M`;
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: "https://gpu-box.example.ts.net" }));
+    listLocalLlmModels.mockResolvedValue(served(tag));
+    localModelRecommendations.mockResolvedValue(
+      recs({
+        endpoint_configured: true,
+        pick: {
+          ...PICK,
+          passed_over: {
+            repo: GEMMA4,
+            display_name: "gemma 4 12b it",
+            quant: "Q3_K_M",
+            est_tokens_per_sec: 29.4,
+            have: { id: tag, display_name: "gemma 4 12b it", served: true },
+          },
+        },
+      }),
+    );
+    await mount();
+    await within(start()).findByText(/^The largest model in PM's list/);
+    const text = start().textContent ?? "";
+    expect(text).toContain(
+      "You already have gemma 4 12b it on your model server. It's larger than PM's pick, and PM expects it to reply at about 29 tok/s on this computer's graphics card",
+    );
+    expect(text).not.toContain("tok/s here");
   });
 
   it("and says nothing when nothing was passed over", async () => {

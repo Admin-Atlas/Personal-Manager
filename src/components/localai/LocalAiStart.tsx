@@ -306,9 +306,11 @@ function ShownPickCard({
     (chatLocal ? input.config?.chat_model : null) ??
     (input.config?.background_routing !== "cloud" ? input.config?.background_model : null) ??
     null;
-  const differs = betterFit?.repo === pick.repo ? null : inUseLine(pick, bound || null, recs);
+  const baseUrl = input.config?.base_url;
+  const differs =
+    betterFit?.repo === pick.repo ? null : inUseLine(pick, bound || null, recs, baseUrl);
   // The larger model PM passed over for speed — not when it is the one in use, which `differs` says.
-  const passedOver = passedOverLine(pick, recs, bound || null);
+  const passedOver = passedOverLine(pick, recs, bound || null, baseUrl);
 
   return (
     <div>

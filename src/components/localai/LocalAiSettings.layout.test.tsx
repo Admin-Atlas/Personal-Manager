@@ -59,6 +59,8 @@ const setLocalModelRescanCadence = vi.fn();
 const setLocalModelScanDir = vi.fn();
 const setLocalPowerPolicy = vi.fn();
 const keepLocalOnBattery = vi.fn();
+const localAiSettingsAreDefault = vi.fn();
+const resetLocalAiSettings = vi.fn();
 /** The push signal's listener, so a test can deliver a status the way the backend does. */
 const push = vi.hoisted(() => ({ listener: null as null | (() => void) }));
 
@@ -99,6 +101,9 @@ vi.mock("../../lib/ipc", () => ({
   setLocalModelScanDir: (...a: unknown[]) => setLocalModelScanDir(...a),
   setLocalPowerPolicy: (...a: unknown[]) => setLocalPowerPolicy(...a),
   keepLocalOnBattery: (...a: unknown[]) => keepLocalOnBattery(...a),
+  // The tab's "Reset to defaults" footer (#445).
+  localAiSettingsAreDefault: () => localAiSettingsAreDefault(),
+  resetLocalAiSettings: () => resetLocalAiSettings(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -350,6 +355,8 @@ beforeEach(() => {
   setLocalReleasePolicy.mockResolvedValue(undefined);
   setLocalPowerPolicy.mockResolvedValue(undefined);
   keepLocalOnBattery.mockResolvedValue(undefined);
+  localAiSettingsAreDefault.mockResolvedValue(false);
+  resetLocalAiSettings.mockResolvedValue(undefined);
   getTrayEnabled.mockResolvedValue(false);
   setTrayEnabled.mockResolvedValue(undefined);
   activeLocalPull.mockResolvedValue(null);

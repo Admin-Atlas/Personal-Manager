@@ -61,6 +61,10 @@ const passedOver = (over: Partial<LocalPassedOver> = {}): LocalPassedOver => ({
 });
 const HAVE_GEMMA4 = { id: GEMMA4_TAG, display_name: "gemma 4 12b it", served: true };
 
+/** The configured server: on this computer, or on another one (the backend's own remote example). */
+const HERE = "http://127.0.0.1:11434";
+const ELSEWHERE = "https://gpu-box.example.ts.net";
+
 const fit = (over: Partial<LocalFitResult> = {}): LocalFitResult => ({
   verdict: "tight",
   quant: "Q5_K_M",
@@ -474,19 +478,19 @@ describe("the lines about models the user already has", () => {
         installed("qwen-other", QWEN),
       ],
     });
-    expect(inUseLine(catalogue(), "big:14b", r)).toBe(
+    expect(inUseLine(catalogue(), "big:14b", r, HERE)).toBe(
       "You're using big:14b, which runs at least partly from system memory rather than your graphics card, so it replies slowly. PM's pick is sized to fit on the card.",
     );
-    expect(inUseLine(catalogue(), "mystery", r)).toBe(
+    expect(inUseLine(catalogue(), "mystery", r, HERE)).toBe(
       "You're using mystery, which isn't in PM's list, so PM can't compare the two.",
     );
-    expect(inUseLine(catalogue(), "gemma3:4b", r)).toBe(
+    expect(inUseLine(catalogue(), "gemma3:4b", r, HERE)).toBe(
       "You're using gemma3:4b. PM's pick is at least 15% larger and also fits.",
     );
     // The same model at another quant is not 15% smaller, and PM won't say it is.
-    expect(inUseLine(catalogue(), "qwen-other", r)).toBeNull();
-    expect(inUseLine(catalogue(), `hf.co/${QWEN}:Q5_K_M`, r)).toBeNull();
-    expect(inUseLine(catalogue(), null, r)).toBeNull();
+    expect(inUseLine(catalogue(), "qwen-other", r, HERE)).toBeNull();
+    expect(inUseLine(catalogue(), `hf.co/${QWEN}:Q5_K_M`, r, HERE)).toBeNull();
+    expect(inUseLine(catalogue(), null, r, HERE)).toBeNull();
   });
 
   it("never points at the pick when the server isn't using the card at all", () => {
@@ -495,7 +499,7 @@ describe("the lines about models the user already has", () => {
     const r = recs({
       installed: [installed("llama3.2:3b", QWEN, {}, true, false, true)],
     });
-    expect(inUseLine(catalogue(), "llama3.2:3b", r)).toBe(
+    expect(inUseLine(catalogue(), "llama3.2:3b", r, HERE)).toBe(
       "You're using llama3.2:3b, which runs entirely from system memory because your server isn't using your graphics card.",
     );
   });
@@ -508,7 +512,7 @@ describe("the lines about models the user already has", () => {
     const same = recs({
       installed: [installed("qwen2.5:7b-instruct-q8_0", QWEN, {}, true, false, false, 23.9)],
     });
-    expect(inUseLine(pick, "qwen2.5:7b-instruct-q8_0", same)).toBe(
+    expect(inUseLine(pick, "qwen2.5:7b-instruct-q8_0", same, HERE)).toBe(
       "You're using qwen2.5:7b-instruct-q8_0, but PM expects that build to reply at about 24 tok/s here — under the 30 tok/s it wants for chat. PM's pick is a quicker build of the same model, at about 31.",
     );
     // Another model, no larger than the pick: the speed, without claiming it is larger.
@@ -517,12 +521,12 @@ describe("the lines about models the user already has", () => {
         installed("llama3.1:8b-q8_0", "bartowski/gemma-3-4b-it-GGUF", {}, true, false, false, 28.3),
       ],
     });
-    expect(inUseLine(pick, "llama3.1:8b-q8_0", other)).toBe(
+    expect(inUseLine(pick, "llama3.1:8b-q8_0", other, HERE)).toBe(
       "You're using llama3.1:8b-q8_0, but PM expects it to reply at about 28 tok/s here — under the 30 tok/s it wants for chat. PM's pick should reply at about 31.",
     );
     // Without the backend's figure, nothing is said about speed.
     const unknown = recs({ installed: [installed("qwen2.5:7b-instruct-q8_0", QWEN)] });
-    expect(inUseLine(pick, "qwen2.5:7b-instruct-q8_0", unknown)).toBeNull();
+    expect(inUseLine(pick, "qwen2.5:7b-instruct-q8_0", unknown, HERE)).toBeNull();
   });
 
   it("never says a model runs from system memory on the row's sizing alone", () => {
@@ -532,14 +536,14 @@ describe("the lines about models the user already has", () => {
     const guessed = recs({
       installed: [installed("qwen2.5-7b-instruct", QWEN, { speed_basis: "system" }, false)],
     });
-    expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", guessed)).toBeNull();
+    expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", guessed, HERE)).toBeNull();
     // Measured is not enough either: the row is sized f16 first and high by design. The dev laptop's
     // Qwen2.5 7B Q6_K at a proven 32768 is 8.07 GB on f16, over the 7.96 GB card, and 7.25 GB — on
     // the card — on the q8_0 cache PM's tuning says to set. Without `spills_gpu`, nothing is said.
     const measured = recs({
       installed: [installed("qwen2.5-7b-instruct", QWEN, { speed_basis: "system" }, true, false)],
     });
-    expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", measured)).toBeNull();
+    expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", measured, HERE)).toBeNull();
   });
 
   it("says a model in use was passed over for speed, and how fast the pick should be", () => {
@@ -547,30 +551,30 @@ describe("the lines about models the user already has", () => {
     // the pick is the chat floor — not a size the 15% line could compare.
     const r = recs({ installed: [installed(GEMMA4_TAG, GEMMA4)] });
     const pick = catalogue({ passed_over: passedOver({ have: HAVE_GEMMA4 }) });
-    expect(inUseLine(pick, GEMMA4_TAG, r)).toBe(
+    expect(inUseLine(pick, GEMMA4_TAG, r, HERE)).toBe(
       `You're using ${GEMMA4_TAG}, which is larger, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat. PM's pick should reply at about 71.`,
     );
     // Bound in other case, the same model.
-    expect(inUseLine(pick, GEMMA4_TAG.toUpperCase(), r)).toContain("which is larger");
+    expect(inUseLine(pick, GEMMA4_TAG.toUpperCase(), r, HERE)).toContain("which is larger");
     // No figure for the pick, no promise about it.
     const unsized = catalogue({
       fit: fit({ est_tokens_per_sec: null, speed_basis: null }),
       passed_over: passedOver({ have: HAVE_GEMMA4 }),
     });
-    expect(inUseLine(unsized, GEMMA4_TAG, r)).toBe(
+    expect(inUseLine(unsized, GEMMA4_TAG, r, HERE)).toBe(
       `You're using ${GEMMA4_TAG}, which is larger, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat.`,
     );
     // A different bound model is not the one passed over.
-    expect(inUseLine(pick, "mystery", recs({ installed: [installed("mystery", null)] }))).toBe(
-      "You're using mystery, which isn't in PM's list, so PM can't compare the two.",
-    );
+    expect(
+      inUseLine(pick, "mystery", recs({ installed: [installed("mystery", null)] }), HERE),
+    ).toBe("You're using mystery, which isn't in PM's list, so PM can't compare the two.");
   });
 });
 
 describe("passedOverLine — the larger model PM passed over for speed", () => {
   it("names it, how fast PM expects it to be, and where to find it", () => {
     // Bobby's laptop, from the spec: the pick is Qwen3.5 9B, and gemma 4 12b is 2% under the floor.
-    expect(passedOverLine(catalogue({ passed_over: passedOver() }), recs(), null)).toBe(
+    expect(passedOverLine(catalogue({ passed_over: passedOver() }), recs(), null, HERE)).toBe(
       "gemma 4 12b it is larger and also fits your graphics card, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat. It's under All models if you'd rather have the larger model.",
     );
     // Both figures are the payload's, printed as whole numbers the way speedShort prints them.
@@ -579,30 +583,72 @@ describe("passedOverLine — the larger model PM passed over for speed", () => {
         catalogue({ passed_over: passedOver({ est_tokens_per_sec: 24.2 }) }),
         recs({ chat_speed: { ...SPEED, floor_tps: 25 } }),
         null,
+        HERE,
       ),
     ).toContain("about 24 tok/s here — under the 25 tok/s it wants for chat.");
   });
 
   it("says the user already has it, when they do", () => {
     const pick = catalogue({ passed_over: passedOver({ have: HAVE_GEMMA4 }) });
-    expect(passedOverLine(pick, recs(), null)).toBe(
+    expect(passedOverLine(pick, recs(), null, HERE)).toBe(
       "You already have gemma 4 12b it, which is larger and also fits your graphics card, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat.",
     );
     // On an owned pick too.
     expect(
-      passedOverLine(owned({ passed_over: passedOver({ have: HAVE_GEMMA4 }) }), recs(), "x"),
-    ).toBe(passedOverLine(pick, recs(), null));
+      passedOverLine(owned({ passed_over: passedOver({ have: HAVE_GEMMA4 }) }), recs(), "x", HERE),
+    ).toBe(passedOverLine(pick, recs(), null, HERE));
   });
 
   it("says nothing when nothing was passed over, or when the one passed over is in use", () => {
-    expect(passedOverLine(catalogue(), recs(), null)).toBeNull();
+    expect(passedOverLine(catalogue(), recs(), null, HERE)).toBeNull();
     const pick = catalogue({ passed_over: passedOver({ have: HAVE_GEMMA4 }) });
     // inUseLine says it then, as the model in use — never both.
-    expect(passedOverLine(pick, recs(), GEMMA4_TAG)).toBeNull();
-    expect(passedOverLine(pick, recs(), GEMMA4_TAG.toUpperCase())).toBeNull();
+    expect(passedOverLine(pick, recs(), GEMMA4_TAG, HERE)).toBeNull();
+    expect(passedOverLine(pick, recs(), GEMMA4_TAG.toUpperCase(), HERE)).toBeNull();
     // A copy the user doesn't have can't be the bound one: the plain line stays.
-    expect(passedOverLine(catalogue({ passed_over: passedOver() }), recs(), GEMMA4_TAG)).toContain(
-      "It's under All models",
+    expect(
+      passedOverLine(catalogue({ passed_over: passedOver() }), recs(), GEMMA4_TAG, HERE),
+    ).toContain("It's under All models");
+  });
+});
+
+describe("a copy on a server on another computer", () => {
+  // A server elsewhere runs at that computer's speed, whatever this card is — the rule the backend
+  // holds a served row's own figure to (`under_chat_floor_tps`). The pick still judges every copy
+  // against this card, so the line names the copy and why it isn't the pick, and gives this card's
+  // figure as this card's, never as how fast the copy replies "here".
+  const pick = catalogue({ passed_over: passedOver({ have: HAVE_GEMMA4 }) });
+  const r = recs({ installed: [installed(GEMMA4_TAG, GEMMA4)] });
+  const ON_THIS_CARD =
+    "It's larger than PM's pick, and PM expects it to reply at about 29 tok/s on this computer's graphics card — under the 30 tok/s it wants for chat — but your server runs it on its own hardware, so PM can't say how fast it is there.";
+
+  it("says the one in use is on the server, and gives no speed of its own", () => {
+    const line = inUseLine(pick, GEMMA4_TAG, r, ELSEWHERE);
+    expect(line).toBe(`You're using ${GEMMA4_TAG} on your model server. ${ON_THIS_CARD}`);
+    // And no comparison with the pick's own figure, which is this card's too.
+    expect(line).not.toMatch(/\bhere\b|PM's pick should reply/);
+  });
+
+  it("says the user has it on the server, when it isn't the one in use", () => {
+    const line = passedOverLine(pick, r, null, ELSEWHERE);
+    expect(line).toBe(`You already have gemma 4 12b it on your model server. ${ON_THIS_CARD}`);
+    expect(line).not.toMatch(/\bhere\b/);
+    // Still never both lines for the copy in use.
+    expect(passedOverLine(pick, r, GEMMA4_TAG, ELSEWHERE)).toBeNull();
+  });
+
+  it("is said only of a served copy off this computer", () => {
+    // On this computer, the copy runs at this card's speed and the line says so.
+    expect(inUseLine(pick, GEMMA4_TAG, r, HERE)).toContain("29 tok/s here");
+    expect(passedOverLine(pick, r, null, "http://localhost:11434")).toContain("29 tok/s here");
+    // A file on disk is on this computer whatever server is connected.
+    const onDisk = catalogue({
+      passed_over: passedOver({ have: { ...HAVE_GEMMA4, id: "gemma.gguf", served: false } }),
+    });
+    expect(passedOverLine(onDisk, r, null, ELSEWHERE)).toContain("29 tok/s here");
+    // Nothing of the user's: the line is about the model in PM's list on this computer.
+    expect(passedOverLine(catalogue({ passed_over: passedOver() }), r, null, ELSEWHERE)).toContain(
+      "29 tok/s here",
     );
   });
 });
@@ -731,9 +777,11 @@ describe("the pick card's copy keeps the tab's rules", () => {
         const d = diskLine(p, small);
         out.push(d.line, ...(d.over ? [d.over] : []), alsoHaveLine(p, r) ?? "");
       }
-      for (const bound of ["big:14b", "mystery", "gemma3:4b", GEMMA4_TAG])
-        out.push(inUseLine(p, bound, r) ?? "", passedOverLine(p, r, bound) ?? "");
-      out.push(passedOverLine(p, r, null) ?? "");
+      for (const url of [HERE, ELSEWHERE]) {
+        for (const bound of ["big:14b", "mystery", "gemma3:4b", GEMMA4_TAG])
+          out.push(inUseLine(p, bound, r, url) ?? "", passedOverLine(p, r, bound, url) ?? "");
+        out.push(passedOverLine(p, r, null, url) ?? "");
+      }
     }
     out.push(howPmPicks(SPEED), howPmPicks(null));
     const runners: (RunnerName | null)[] = ["Ollama", "LM Studio", "llama-server", null];

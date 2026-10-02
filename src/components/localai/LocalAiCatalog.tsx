@@ -353,7 +353,7 @@ function NumbersGuide() {
     ],
     [
       "MoE (mixture of experts)",
-      "A large model where only a few billion parameters fire per word. That makes it quicker than an ordinary model of its full size, but its whole weight still has to fit in memory — so a MoE is fast for its size, not lighter to load. On a graphics card it isn't as quick as an ordinary model the size of its active part: going by published reports, PM halves its estimate for a MoE there, since PM hasn't timed one itself — so take that figure with a pinch of salt. Cards show both the total and the active size.",
+      "A large model where only a few billion parameters fire per word. That makes it quicker than an ordinary model of its full size, but its whole weight still has to fit in memory — so a MoE is fast for its size, not lighter to load. On a graphics card it isn't as quick as an ordinary model the size of its active part: going by one published report, PM halves its estimate for a MoE there, since PM hasn't timed one itself — so take that figure with a pinch of salt. Cards show both the total and the active size.",
     ],
     [
       "Two ways to run (with a graphics card)",

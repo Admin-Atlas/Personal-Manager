@@ -77,7 +77,7 @@ describe("speedLong", () => {
 
   it("adds the mixture-of-experts caveat on both graphics-card bases, and nowhere else", () => {
     const MOE =
-      / This model is a mixture of experts, which PM hasn't timed: going by published reports, PM halves its figure again, so take it with a pinch of salt\.$/;
+      / This model is a mixture of experts, which PM hasn't timed: going by one published report, PM halves its figure again, so take it with a pinch of salt\.$/;
     for (const basis of BASES) {
       const withMoe = speedLong(fit(basis), HW, { moe: true }) ?? "";
       if (basis === "gpu_published" || basis === "gpu_typical") expect(withMoe).toMatch(MOE);
@@ -150,6 +150,22 @@ describe("the speed copy, everywhere", () => {
     // sentence to check.
     expect(claims.length).toBeGreaterThanOrEqual(3);
     for (const c of claims) expect(c).toMatch(/\btypical\b/);
+  });
+
+  it("rests the mixture-of-experts halving on the one report it has, everywhere it is said", () => {
+    // fit.rs `MOE_GPU_FACTOR` comes from a single published report (Qwen3.6 35B A3B on an RTX 4090),
+    // and these sentences exist to say how far to trust the figure: "reports" claims more evidence
+    // than PM has. The All models guide entry is pinned in LocalAiSettings.test.tsx.
+    const release = CHANGELOG.find((e) => e.version === "3.138.0-alpha");
+    const said = [
+      speedLong(fit("gpu_published"), HW, { moe: true }) ?? "",
+      ...(release?.highlights ?? []).filter((h) => /mixture-of-experts/.test(h)),
+    ];
+    expect(said).toHaveLength(2);
+    for (const s of said) {
+      expect(s).toMatch(/\bone published report\b/);
+      expect(s).not.toMatch(/\breports\b/);
+    }
   });
 });
 

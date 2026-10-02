@@ -465,9 +465,18 @@ pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<Strin
 
 /// Forget the local endpoint entirely: the base URL, both role models, and the token. Routing
 /// preferences are left as-is (absent base URL already makes them fall through to cloud).
+///
+/// The token goes first, in the order [`reset_local_ai_settings`] uses and for its reason: a
+/// keychain that refuses, or that PM couldn't read at launch and so can't say the token is gone
+/// from, fails the command before the address is deleted. The other way round, a failure left the
+/// server forgotten and its token saved, while the view — which reloads only on success — went on
+/// showing the server connected.
 #[tauri::command]
 pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     let state = app.state::<AppState>();
+    // Only to know the store is open; the guard is not held across the keychain call.
+    drop(state.conn()?);
+    secrets::clear_local_llm_endpoint_token()?;
     let conn = state.conn()?;
     db::delete_setting(&conn, LOCAL_BASE_URL_KEY)?;
     db::delete_setting(&conn, LOCAL_CHAT_MODEL_KEY)?;
@@ -475,7 +484,6 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     drop(conn);
     // No endpoint now owns a token — see `set_local_llm_endpoint`.
     state.local_ai.cache_release_endpoint(None);
-    secrets::clear_local_llm_endpoint_token()?;
     state.local_ai.clear_finished_test();
     // A forgotten endpoint should drop the chat sidebar's provider line to zero pixels at once.
     crate::llm_gateway::ping_status(&app);
@@ -547,6 +555,139 @@ fn role_routing_key(role: &str) -> Result<&'static str> {
         "background" => Ok(BACKGROUND_ROUTING_KEY),
         other => Err(Error::Other(format!("unknown role '{other}'"))),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reset the tab to its defaults (#445)
+// ---------------------------------------------------------------------------------------------
+
+/// Every stored setting someone can change on the Local AI tab, and so every row its "Reset to
+/// defaults" deletes. Absent is each one's default — every reader parses a missing row to the value
+/// the tab shows out of the box — so deleting the row is the whole of restoring it.
+///
+/// Deliberately not here:
+/// - [`local_catalog::CATALOG_VERSION_SEEN_KEY`] and [`local_catalog::LAST_RESCAN_KEY`]. They are
+///   PM's own record of which catalogue it has already looked at, not a choice made on the tab, and
+///   clearing them would only bring back a suggestion already dismissed.
+/// - Anything about the models themselves. What a server holds and what sits on disk are the
+///   user's, and a settings reset that unloaded or deleted weights would be a surprise nobody could
+///   undo.
+/// - The cloud (OpenRouter) key, which belongs to AI & Models, and chats and documents, which are
+///   not settings at all.
+/// - The tray icon ([`crate::tray::TRAY_ENABLED_KEY`]). Model memory shows its toggle beside what it
+///   means for a loaded model, but it is General's setting, and the confirm and What's New both say
+///   the reset leaves it.
+///
+/// The endpoint token is not a row — it lives in the OS keychain — so the reset clears it beside
+/// these, and "at its defaults" asks after it too.
+const LOCAL_AI_SETTINGS: &[&str] = &[
+    // Model server, and the two roles.
+    LOCAL_BASE_URL_KEY,
+    LOCAL_CHAT_MODEL_KEY,
+    LOCAL_BACKGROUND_MODEL_KEY,
+    CHAT_ROUTING_KEY,
+    BACKGROUND_ROUTING_KEY,
+    // Model memory: the release policy and both quiet periods.
+    residency::RELEASE_POLICY_KEY,
+    residency::RELEASE_IDLE_MINUTES_KEY,
+    residency::BATTERY_IDLE_MINUTES_KEY,
+    // On battery: the threshold, the roles it may move, and the cloud consent.
+    power::THRESHOLD_KEY,
+    power::SCOPE_KEY,
+    power::CONSENT_KEY,
+    // Already on this device, All models: the extra folder, the update check, the licences.
+    LOCAL_MODEL_SCAN_DIR_KEY,
+    local_catalog::RESCAN_CADENCE_KEY,
+    local_catalog::TERMS_ACCEPTED_KEY,
+];
+
+/// Delete every row in [`LOCAL_AI_SETTINGS`], in one transaction, so a reset is never half done.
+fn delete_local_ai_settings(conn: &rusqlite::Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for key in LOCAL_AI_SETTINGS {
+        db::delete_setting(&tx, key)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether any row in [`LOCAL_AI_SETTINGS`] is stored. A row holding the default value still
+/// counts: the question is whether there is anything for a reset to clear.
+fn local_ai_settings_stored(conn: &rusqlite::Connection) -> Result<bool> {
+    for key in LOCAL_AI_SETTINGS {
+        if db::get_setting(conn, key)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the Local AI tab is at its defaults: none of its settings stored, and no endpoint token
+/// in the keychain. The tab's "Reset to defaults" footer is disabled while this is true. A keychain
+/// that can't be read is an error, never "no token" — a footer that called the tab clean because PM
+/// couldn't look would hide the one thing a reset is for. That includes a keychain read that failed
+/// at launch, which the ordinary token reader degrades to "none" so the tab still loads; hence
+/// [`secrets::local_llm_endpoint_token_known_saved`] here rather than the `has_token` readout's.
+#[tauri::command]
+pub fn local_ai_settings_are_default(state: State<'_, AppState>) -> Result<bool> {
+    let stored = {
+        let conn = state.conn()?;
+        local_ai_settings_stored(&conn)?
+    };
+    Ok(!stored && !secrets::local_llm_endpoint_token_known_saved()?)
+}
+
+/// Put the Local AI tab back to how it was before anyone touched it (#445): delete every setting in
+/// [`LOCAL_AI_SETTINGS`], forget the endpoint token, and bring the in-memory state that mirrors
+/// those settings back in line, so nothing chosen before the reset goes on acting after it.
+///
+/// What it leaves alone is as deliberate as what it clears — see [`LOCAL_AI_SETTINGS`]. No model is
+/// unloaded or deleted, on any server or on disk, and a download or test already running carries
+/// on: both are backend-owned jobs the remounted tab picks back up.
+///
+/// The order is what makes a failure honest. The store is checked open first and the keychain goes
+/// next, before anything is deleted, so the likely failures — a locked vault, a keychain that
+/// refuses now, or one PM couldn't read at launch and so can't say the token is gone from
+/// ([`secrets::clear_local_llm_endpoint_token`]) — change nothing at all and the error describes the
+/// whole outcome. (The DB guard is not
+/// held across the keychain call: on macOS that call can wait on a consent prompt, and every DB
+/// user would wait with it.) Only a store that fails its own delete after the token has gone leaves
+/// a part done, and another press finishes it.
+///
+/// Synchronous, like [`clear_local_llm_endpoint`], so there is no await for the DB guard to be held
+/// across.
+#[tauri::command]
+pub fn reset_local_ai_settings(app: AppHandle) -> Result<()> {
+    let state = app.state::<AppState>();
+    // Only to know the store is open; the guard is let go at once (see above).
+    drop(state.conn()?);
+    secrets::clear_local_llm_endpoint_token()?;
+    // What the release scheduler would now read, taken under the same guard as the delete. The
+    // guard closes before any runtime lock is taken, so it is never held together with the power
+    // latch (see `learn_power_threshold`).
+    let release = {
+        let conn = state.conn()?;
+        delete_local_ai_settings(&conn)?;
+        stored_release_config(&conn)
+    };
+    let local = &state.local_ai;
+    // No endpoint owns a token now — see `set_local_llm_endpoint`.
+    local.cache_release_endpoint(None);
+    // The scheduler would otherwise keep honouring the old policy until its next tick.
+    local.cache_release_policy(release);
+    // The On battery latch keeps the threshold it was last told until it is told another. Absent is
+    // the default, and a raised threshold still reaches the cloud only through the latch's settle —
+    // and now only after the consent question, since the consent went with the rest.
+    local.power_apply_threshold(power::threshold_from(None), std::time::Instant::now());
+    // "Keep using local until I quit PM" was an answer to the On battery policy just taken back.
+    local.set_keep_local(false);
+    // The extra folder is gone, so the cached crawl that included it goes too.
+    local.clear_disk_models();
+    // A passing test proved a model answered on the server just forgotten.
+    local.clear_finished_test();
+    // The sidebar's provider line and the status chip should drop the forgotten server at once.
+    llm_gateway::ping_status(&app);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1565,17 +1706,10 @@ async fn release_tick(app: &AppHandle) {
     };
     // Refresh the policy if the vault is open; otherwise fall back to the last one PM could read.
     let fresh = state.conn().ok().map(|conn| {
-        let read = |key: &str| db::get_setting(&conn, key).ok().flatten();
-        let cfg = residency::ReleaseConfig {
-            policy: residency::ReleasePolicy::from_setting(
-                read(residency::RELEASE_POLICY_KEY).as_deref(),
-            ),
-            idle_after: residency::idle_after(read(residency::RELEASE_IDLE_MINUTES_KEY).as_deref()),
-            battery_idle_after: residency::battery_idle_after(
-                read(residency::BATTERY_IDLE_MINUTES_KEY).as_deref(),
-            ),
-        };
-        (cfg, read(LOCAL_BASE_URL_KEY))
+        (
+            stored_release_config(&conn),
+            db::get_setting(&conn, LOCAL_BASE_URL_KEY).ok().flatten(),
+        )
     });
     if let Some((cfg, base_url)) = &fresh {
         state.local_ai.cache_release_policy(*cfg);
@@ -1639,6 +1773,23 @@ async fn release_tick(app: &AppHandle) {
     }
     if changed {
         crate::llm_gateway::ping_status(app);
+    }
+}
+
+/// The release settings as stored, read the way the scheduler reads them: a row that can't be read
+/// counts as an absent one, and each resolves through its own parser. Shared with the tab reset,
+/// which hands the scheduler's cache the defaults it has just restored rather than leaving the old
+/// policy in force until the next tick.
+fn stored_release_config(conn: &rusqlite::Connection) -> residency::ReleaseConfig {
+    let read = |key: &str| db::get_setting(conn, key).ok().flatten();
+    residency::ReleaseConfig {
+        policy: residency::ReleasePolicy::from_setting(
+            read(residency::RELEASE_POLICY_KEY).as_deref(),
+        ),
+        idle_after: residency::idle_after(read(residency::RELEASE_IDLE_MINUTES_KEY).as_deref()),
+        battery_idle_after: residency::battery_idle_after(
+            read(residency::BATTERY_IDLE_MINUTES_KEY).as_deref(),
+        ),
     }
 }
 
@@ -6006,5 +6157,133 @@ mod tests {
             serde_json::to_value(&cpu_only).unwrap()["card_unused"],
             true
         );
+    }
+
+    // --- the tab reset (#445) ----------------------------------------------------------------
+
+    /// A throwaway encrypted store, mirroring `power`'s test fixture.
+    fn temp_db() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = db::open(&path, key).unwrap();
+        (dir, conn)
+    }
+
+    /// Every settings row, sorted, so "nothing else changed" is one comparison.
+    fn all_settings(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM settings ORDER BY key")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    /// Every setting the tab can change, written as the tab's own commands write it. Spelled out
+    /// rather than read from `LOCAL_AI_SETTINGS`, so the list itself is what is under test.
+    const TAB_SETTINGS: &[(&str, &str)] = &[
+        ("local_llm_base_url", "http://127.0.0.1:11434"),
+        ("local_llm_chat_model", "llama3.2:1b"),
+        ("local_llm_background_model", "qwen2.5:7b"),
+        ("local_llm_chat_routing", "local"),
+        ("local_llm_background_routing", "local-then-cloud"),
+        ("local_llm_release_policy", "idle"),
+        ("local_llm_release_idle_minutes", "10"),
+        ("local_llm_battery_idle_minutes", "3"),
+        ("local_llm_power_threshold", "40"),
+        ("local_llm_power_roles", "chat"),
+        ("local_llm_power_cloud_consent", "both"),
+        ("local_model_scan_dir", "/models"),
+        ("local_model_rescan_cadence", "manual"),
+        ("local_model_terms_accepted", "gemma,llama3.2"),
+    ];
+
+    #[test]
+    fn the_reset_list_is_exactly_the_tabs_settings() {
+        // One list each way: a key the tab gains without joining the reset would survive it, and a
+        // key the reset gains without a test seeding it is a deletion nothing checks.
+        let mut listed: Vec<&str> = LOCAL_AI_SETTINGS.to_vec();
+        let mut seeded: Vec<&str> = TAB_SETTINGS.iter().map(|(k, _)| *k).collect();
+        listed.sort_unstable();
+        seeded.sort_unstable();
+        assert_eq!(listed, seeded);
+        // And the two catalogue stamps are not in it: they are PM's bookkeeping, not a choice.
+        for stamp in [
+            local_catalog::CATALOG_VERSION_SEEN_KEY,
+            local_catalog::LAST_RESCAN_KEY,
+        ] {
+            assert!(
+                !LOCAL_AI_SETTINGS.contains(&stamp),
+                "{stamp} is not the tab's"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reset_deletes_every_tab_setting_and_no_other_row() {
+        let (_dir, conn) = temp_db();
+        // Whatever the store holds before any of this (migrations may seed rows) must survive too.
+        let mut expected = all_settings(&conn);
+        for (k, v) in TAB_SETTINGS {
+            db::set_setting(&conn, k, v).unwrap();
+        }
+        // What must survive: the catalogue stamps, which share the `local_model_` prefix, and a
+        // setting from another tab — the cloud model list, beside which the local roles sit.
+        let kept: &[(&str, &str)] = &[
+            (local_catalog::CATALOG_VERSION_SEEN_KEY, "3"),
+            (local_catalog::LAST_RESCAN_KEY, "2026-09-01T00:00:00+00:00"),
+            (crate::settings::CHAT_MODELS_KEY, "[\"openai/gpt-4o-mini\"]"),
+            // The tray icon, which Model memory mirrors but General owns. What's New and the
+            // confirm both say the reset leaves it, so this is what makes that true.
+            (crate::tray::TRAY_ENABLED_KEY, "true"),
+        ];
+        for (k, v) in kept {
+            db::set_setting(&conn, k, v).unwrap();
+        }
+        expected.extend(kept.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        expected.sort();
+        assert!(local_ai_settings_stored(&conn).unwrap());
+
+        delete_local_ai_settings(&conn).unwrap();
+
+        assert_eq!(all_settings(&conn), expected);
+        assert!(!local_ai_settings_stored(&conn).unwrap());
+        // And the release settings now read as their defaults, which is what the reset hands the
+        // scheduler's cache.
+        assert_eq!(
+            stored_release_config(&conn),
+            residency::ReleaseConfig {
+                policy: residency::ReleasePolicy::Server,
+                idle_after: residency::idle_after(None),
+                battery_idle_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn any_one_tab_setting_means_not_at_defaults() {
+        let (_dir, conn) = temp_db();
+        assert!(!local_ai_settings_stored(&conn).unwrap(), "a fresh store");
+        for (k, v) in TAB_SETTINGS {
+            db::set_setting(&conn, k, v).unwrap();
+            assert!(local_ai_settings_stored(&conn).unwrap(), "{k} alone");
+            delete_local_ai_settings(&conn).unwrap();
+            assert!(!local_ai_settings_stored(&conn).unwrap(), "{k} reset");
+        }
+        // A row holding the default value still counts: it is something a reset would clear.
+        db::set_setting(&conn, CHAT_ROUTING_KEY, "cloud").unwrap();
+        assert!(local_ai_settings_stored(&conn).unwrap());
+        // The catalogue stamps alone do not: dismissing a suggestion is not changing a setting.
+        delete_local_ai_settings(&conn).unwrap();
+        db::set_setting(&conn, local_catalog::CATALOG_VERSION_SEEN_KEY, "3").unwrap();
+        db::set_setting(
+            &conn,
+            local_catalog::LAST_RESCAN_KEY,
+            "2026-09-01T00:00:00+00:00",
+        )
+        .unwrap();
+        assert!(!local_ai_settings_stored(&conn).unwrap());
     }
 }

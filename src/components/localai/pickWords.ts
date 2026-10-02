@@ -20,6 +20,8 @@ import type {
   LocalFitResult,
   LocalLlmConfig,
   LocalLlmStatus,
+  LocalOwnedRef,
+  LocalPassedOver,
   LocalPick,
   LocalPickBasis,
   LocalRecommendations,
@@ -27,7 +29,7 @@ import type {
 import { powerOf } from "../../lib/powerRoute";
 import type { RunnerName } from "../../lib/workbenchGuide";
 import { TUNING_TITLE } from "./locate";
-import { serverIgnoresCard, spillsOffCard } from "./readiness";
+import { isLoopback, serverIgnoresCard, spillsOffCard } from "./readiness";
 import { sectionLabel } from "./sections";
 import { speedShort } from "./speedWords";
 
@@ -290,20 +292,41 @@ export function alsoHaveLine(pick: CataloguePick, recs: LocalRecommendations): s
 }
 
 /**
+ * Whether the user's copy of a model runs where this computer's graphics card says nothing about
+ * it: served by a server on another computer (`baseUrl` not loopback — "a server on another computer
+ * runs at that computer's speed, whatever this card is"). A copy on disk is a file on this one. The
+ * backend holds a served row's own speed to the same rule (`under_chat_floor_tps`); the pick does
+ * not, judging every copy against this card, so the words have to.
+ */
+function servedElsewhere(have: LocalOwnedRef, baseUrl: string | null | undefined): boolean {
+  return have.served && !isLoopback(baseUrl);
+}
+
+/** PM's figure for the user's copy on this card, said of this card and not of the server elsewhere
+ *  that runs it. */
+function slowOnThisCard(po: LocalPassedOver, recs: LocalRecommendations): string {
+  return `It's larger than PM's pick, and PM expects it to reply at about ${po.est_tokens_per_sec.toFixed(0)} tok/s on this computer's graphics card — under the ${floorOf(recs.chat_speed)} tok/s it wants for chat — but your server runs it on its own hardware, so PM can't say how fast it is there.`;
+}
+
+/**
  * The larger model PM passed over because it expects it to reply under the chat floor on this card
  * (better_fit.rs `passed_over`) — the user's own copy of it when they have one. null when nothing
  * was, or when that copy is the model a job runs on (`bound`): `inUseLine` says it then, as the
- * model in use.
+ * model in use. `baseUrl` is the configured server's: a copy it serves from another computer is
+ * given this card's figure as this card's, never as its own speed "here".
  */
 export function passedOverLine(
   pick: ShownPick,
   recs: LocalRecommendations,
   bound: string | null,
+  baseUrl: string | null | undefined,
 ): string | null {
   const po = pick.passed_over;
   if (!po) return null;
   const have = po.have;
   if (have && bound && have.id.toLowerCase() === bound.toLowerCase()) return null;
+  if (have && servedElsewhere(have, baseUrl))
+    return `You already have ${have.display_name} on your model server. ${slowOnThisCard(po, recs)}`;
   const slow = `PM expects it to reply at about ${po.est_tokens_per_sec.toFixed(0)} tok/s here — under the ${floorOf(recs.chat_speed)} tok/s it wants for chat`;
   if (have)
     return `You already have ${have.display_name}, which is larger and also fits your graphics card, but ${slow}.`;
@@ -312,12 +335,14 @@ export function passedOverLine(
 
 /**
  * When a job already runs on a different local model than the pick: what the difference is. null
- * when the bound model is the pick, or when PM can't say something true about the pair.
+ * when the bound model is the pick, or when PM can't say something true about the pair. `baseUrl` as
+ * for `passedOverLine`.
  */
 export function inUseLine(
   pick: ShownPick,
   bound: string | null,
   recs: LocalRecommendations,
+  baseUrl: string | null | undefined,
 ): string | null {
   if (!bound) return null;
   const b = bound.toLowerCase();
@@ -335,6 +360,9 @@ export function inUseLine(
   // isn't the pick is the chat floor, and the line says that rather than comparing sizes.
   const po = pick.passed_over;
   if (po?.have && po.have.id.toLowerCase() === b) {
+    // On a server elsewhere the pick's figure is this card's too, so it is no comparison either.
+    if (servedElsewhere(po.have, baseUrl))
+      return `You're using ${bound} on your model server. ${slowOnThisCard(po, recs)}`;
     const m = pick.fit.est_tokens_per_sec?.toFixed(0);
     return `You're using ${bound}, which is larger, but PM expects it to reply at about ${po.est_tokens_per_sec.toFixed(0)} tok/s here — under the ${floorOf(recs.chat_speed)} tok/s it wants for chat.${
       m != null ? ` PM's pick should reply at about ${m}.` : ""

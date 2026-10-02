@@ -40,7 +40,7 @@ export function speedShort(fit: SpeedFit): string | null {
  *  one is halved (fit.rs `MOE_GPU_FACTOR`), going by one published report rather than PM's own
  *  timing. */
 const MOE_SUFFIX =
-  " This model is a mixture of experts, which PM hasn't timed: going by published reports, PM halves its figure again, so take it with a pinch of salt.";
+  " This model is a mixture of experts, which PM hasn't timed: going by one published report, PM halves its figure again, so take it with a pinch of salt.";
 
 /**
  * Where the figure comes from and how far to trust it, as a sentence — or null when there is no

@@ -56,6 +56,8 @@ const setLocalModelRescanCadence = vi.fn();
 const setLocalModelScanDir = vi.fn();
 const setLocalPowerPolicy = vi.fn();
 const keepLocalOnBattery = vi.fn();
+const localAiSettingsAreDefault = vi.fn();
+const resetLocalAiSettings = vi.fn();
 
 // A factory REPLACES the whole module, so every function the component imports must appear here or
 // it is `undefined` at module-eval. The tab and its sections import every one of these.
@@ -100,6 +102,9 @@ vi.mock("../../lib/ipc", () => ({
   // The On battery section's two (#432) — and its consent ask, which imports the same pair.
   setLocalPowerPolicy: (...a: unknown[]) => setLocalPowerPolicy(...a),
   keepLocalOnBattery: (...a: unknown[]) => keepLocalOnBattery(...a),
+  // The tab's "Reset to defaults" footer (#445).
+  localAiSettingsAreDefault: () => localAiSettingsAreDefault(),
+  resetLocalAiSettings: () => resetLocalAiSettings(),
 }));
 
 // The folder picker is only reached by a click no test here makes, but the module is imported at
@@ -128,6 +133,8 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
+import { CHANGELOG } from "../../lib/changelog";
+import { SETTING_SAVED_EVENT } from "../../lib/settingsSaved";
 import { LocalAiSettings } from "./LocalAiSettings";
 import { sectionLabel } from "./sections";
 
@@ -232,6 +239,8 @@ beforeEach(() => {
   setLocalReleasePolicy.mockResolvedValue(undefined);
   setLocalPowerPolicy.mockResolvedValue(undefined);
   keepLocalOnBattery.mockResolvedValue(undefined);
+  localAiSettingsAreDefault.mockResolvedValue(false);
+  resetLocalAiSettings.mockResolvedValue(undefined);
   getTrayEnabled.mockResolvedValue(false);
   setTrayEnabled.mockResolvedValue(undefined);
   activeLocalPull.mockResolvedValue(null);
@@ -604,6 +613,21 @@ describe("model licence terms", () => {
       ),
     );
     expect(acceptLocalModelTerms).toHaveBeenCalledWith("gemma");
+  });
+
+  it("tells the reset footer about the acceptance, without waiting for the download", async () => {
+    // A licence accepted is one of the settings a reset clears, and not a `set_*` command — and the
+    // download it starts can run for an hour, so "re-read once it lands" is not soon enough.
+    acceptLocalModelTerms.mockResolvedValue(["gemma"]);
+    pullLocalModel.mockReturnValue(new Promise(() => {}));
+    await withCurated([model()]);
+    const before = localAiSettingsAreDefault.mock.calls.length;
+
+    fireEvent.click(await screen.findByRole("button", { name: /download/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /accept and download/i }));
+
+    await waitFor(() => expect(pullLocalModel).toHaveBeenCalled());
+    expect(localAiSettingsAreDefault.mock.calls.length).toBeGreaterThan(before);
   });
 
   it("never downloads when recording the acceptance fails", async () => {
@@ -1470,9 +1494,195 @@ describe("speed on the model list", () => {
     );
     const entry = term?.nextElementSibling?.textContent ?? "";
     expect(entry).toContain(
-      "On a graphics card it isn't as quick as an ordinary model the size of its active part: going by published reports, PM halves its estimate for a MoE there, since PM hasn't timed one itself",
+      "On a graphics card it isn't as quick as an ordinary model the size of its active part: going by one published report, PM halves its estimate for a MoE there, since PM hasn't timed one itself",
     );
     expect(entry).toContain("quicker than an ordinary model of its full size");
     expect(entry).not.toMatch(/runs at the speed of/);
+  });
+});
+
+describe("resetting the tab to its defaults", () => {
+  // The footer every other settings tab has (#445). Whether the tab is at its defaults is the
+  // backend's answer, so what is pinned here is that the tab ASKS — on mount and after each write it
+  // makes — and that a reset leaves nothing on screen from before it.
+  const resetButton = () =>
+    screen.getByRole("button", { name: "Reset to defaults" }) as HTMLButtonElement;
+  const start = () => document.getElementById("sec-localai-start") as HTMLElement;
+  /** The backend says something is stored, and the footer has heard it. */
+  async function offered() {
+    await loaded();
+    await waitFor(() => expect(resetButton().disabled).toBe(false));
+  }
+  async function confirmReset() {
+    fireEvent.click(resetButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Reset" }));
+  }
+
+  it("asks the backend, and is disabled and says so while nothing is stored", async () => {
+    localAiSettingsAreDefault.mockResolvedValue(true);
+    await loaded();
+    await waitFor(() => expect(localAiSettingsAreDefault).toHaveBeenCalled());
+    expect(screen.getByText("Reset Local AI")).toBeTruthy();
+    expect(screen.getByText("Everything on this tab is at its default.")).toBeTruthy();
+    expect(resetButton().disabled).toBe(true);
+  });
+
+  it("is offered once the backend says something is stored", async () => {
+    await offered();
+    expect(screen.getByText("Restore this tab's settings to their defaults.")).toBeTruthy();
+  });
+
+  it("never reads a failed answer as 'at its defaults'", async () => {
+    // A keychain PM couldn't read is not an empty one: hiding the reset then would hide the one
+    // control that clears the token.
+    localAiSettingsAreDefault.mockRejectedValue(new Error("the keychain is locked"));
+    await offered();
+  });
+
+  it("asks before resetting, says what goes and what stays, and Cancel calls nothing", async () => {
+    await offered();
+    fireEvent.click(resetButton());
+    expect(await screen.findByText("Reset Local AI to defaults?")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /^Disconnects your model server and forgets its access key, and puts roles, On battery, Model memory, the extra folder, the update check and the licences you agreed to back to their defaults\./,
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        /Your models stay where they are — on your server and on this computer — and so do your cloud key, your chats and the tray icon\.$/,
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+    expect(resetLocalAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("is described in What's New the way the confirm describes it: the tray icon stays", async () => {
+    // Model memory shows the tray toggle, but the reset leaves it (local_ai.rs `LOCAL_AI_SETTINGS`
+    // holds no tray key). A release note promising "all of it back to its defaults" with only
+    // models, cloud key and chats left alone was wrong for anyone with the tray on.
+    const release = CHANGELOG.find((e) => e.version === "3.138.0-alpha");
+    const notes = (release?.highlights ?? []).filter((h) => /Reset Local AI/.test(h));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatch(
+      /leaving your models, your cloud key, your chats and the tray icon where they are\./,
+    );
+    // The same list the confirm gives, which this tab's own tests above pin word for word.
+    await offered();
+    expect(screen.getByRole("switch", { name: /tray/i })).toBeTruthy();
+    fireEvent.click(resetButton());
+    expect(
+      await screen.findByText(/and so do your cloud key, your chats and the tray icon\.$/),
+    ).toBeTruthy();
+  });
+
+  it("resets, then reads the whole tab again: step 1, and nothing from before", async () => {
+    const onLocate = vi.fn();
+    const onBetterFitChange = vi.fn();
+    render(<LocalAiSettings onLocate={onLocate} onBetterFitChange={onBetterFitChange} />);
+    await screen.findByText(/Connected to/);
+    await waitFor(() => expect(resetButton().disabled).toBe(false));
+    const reads = {
+      config: getLocalLlmConfig.mock.calls.length,
+      recs: localModelRecommendations.mock.calls.length,
+      release: getLocalReleasePolicy.mock.calls.length,
+      test: activeLocalTest.mock.calls.length,
+    };
+    // What the backend holds once it has reset.
+    getLocalLlmConfig.mockResolvedValue(
+      cfg({ base_url: null, chat_model: null, background_model: null, chat_routing: "cloud" }),
+    );
+    listLocalLlmModels.mockResolvedValue([]);
+    localAiSettingsAreDefault.mockResolvedValue(true);
+
+    await confirmReset();
+
+    await waitFor(() => expect(resetLocalAiSettings).toHaveBeenCalledTimes(1));
+    // Every section starts again from what is stored — the stored config, the pick, the release
+    // settings, the backend's test — rather than one of them going on showing the old server.
+    await waitFor(() => expect(getLocalLlmConfig.mock.calls.length).toBeGreaterThan(reads.config));
+    await waitFor(() =>
+      expect(localModelRecommendations.mock.calls.length).toBeGreaterThan(reads.recs),
+    );
+    expect(getLocalReleasePolicy.mock.calls.length).toBeGreaterThan(reads.release);
+    expect(activeLocalTest.mock.calls.length).toBeGreaterThan(reads.test);
+    await waitFor(() =>
+      expect(start().querySelector('[aria-current="step"]')?.textContent).toContain(
+        "Get a model server",
+      ),
+    );
+    expect(screen.queryByText(/Connected to/)).toBeNull();
+    // The footer heard the new answer, and the reader is taken to where they now start.
+    await waitFor(() => expect(resetButton().disabled).toBe(true));
+    await waitFor(() => expect(onLocate).toHaveBeenCalledWith("sec-localai-start"));
+    // The update check was one of the settings; the better-fit dot follows it.
+    expect(onBetterFitChange).toHaveBeenCalled();
+  });
+
+  it("says a reset that failed, and leaves the tab, and the reader, where they were", async () => {
+    // The backend refuses before it changes anything (a locked vault, a keychain that won't let go
+    // of the token), so there is nothing new to show — and remounting would re-lay the tab out from
+    // its loading state and scroll the error out of sight.
+    resetLocalAiSettings.mockRejectedValue("couldn't remove the token from the keychain");
+    const onLocate = vi.fn();
+    render(<LocalAiSettings onLocate={onLocate} />);
+    await screen.findByText(/Connected to/);
+    await waitFor(() => expect(resetButton().disabled).toBe(false));
+    const configReads = getLocalLlmConfig.mock.calls.length;
+    const answers = localAiSettingsAreDefault.mock.calls.length;
+
+    await confirmReset();
+
+    expect(await screen.findByText("couldn't remove the token from the keychain")).toBeTruthy();
+    expect(getLocalLlmConfig.mock.calls.length).toBe(configReads);
+    expect(screen.getByText(/Connected to/)).toBeTruthy();
+    expect(onLocate).not.toHaveBeenCalled();
+    // The footer's own answer is asked again regardless: the store can fail after the token went.
+    expect(localAiSettingsAreDefault.mock.calls.length).toBeGreaterThan(answers);
+    expect(resetButton().disabled).toBe(false);
+  });
+
+  it("asks again after every write the tab makes", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ has_token: true }));
+    await offered();
+    let before = localAiSettingsAreDefault.mock.calls.length;
+
+    // A `set_*` write announces itself from ipc.ts's `invoke`, which is mocked away here — so the
+    // announcement is made by hand.
+    act(() => {
+      window.dispatchEvent(new Event(SETTING_SAVED_EVENT));
+    });
+    await waitFor(() =>
+      expect(localAiSettingsAreDefault.mock.calls.length).toBeGreaterThan(before),
+    );
+
+    // Forget token is not a `set_*` command, so the tab says so itself.
+    before = localAiSettingsAreDefault.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /forget token/i }));
+    fireEvent.click(screen.getByRole("button", { name: /forget it/i }));
+    await waitFor(() => expect(clearLocalLlmToken).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(localAiSettingsAreDefault.mock.calls.length).toBeGreaterThan(before),
+    );
+  });
+
+  it("keeps the newest answer when an older one lands last", async () => {
+    // A connect writes the address and then the token: two answers in flight, and the first to be
+    // asked must not be the one left on screen.
+    let stale!: (atDefaults: boolean) => void;
+    localAiSettingsAreDefault.mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => (stale = resolve)),
+    );
+    await loaded();
+    act(() => {
+      window.dispatchEvent(new Event(SETTING_SAVED_EVENT));
+    });
+    await waitFor(() => expect(resetButton().disabled).toBe(false));
+
+    await act(async () => {
+      stale(true);
+      await Promise.resolve();
+    });
+    expect(resetButton().disabled).toBe(false);
   });
 });

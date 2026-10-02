@@ -8,11 +8,13 @@ import {
   dismissLocalBetterFit,
   getLocalLlmConfig,
   listLocalLlmModels,
+  localAiSettingsAreDefault,
   localBetterFitNotice,
   localHardwareScan,
   localLlmStatus,
   localModelRecommendations,
   onLocalLlmStatus,
+  resetLocalAiSettings,
   setLocalLlmEndpoint,
   setLocalLlmRoleModel,
   setLocalLlmRouting,
@@ -28,6 +30,7 @@ import type {
   LocalRescanCadence,
   LocalServedModel,
 } from "../../lib/types";
+import { onSettingSaved } from "../../lib/settingsSaved";
 import { subscribeUntilCleanup } from "../../lib/subscribe";
 import { LocalAiCatalog } from "./LocalAiCatalog";
 import { LocalAiDownloaded } from "./LocalAiDownloaded";
@@ -44,6 +47,7 @@ import { usePull } from "./usePull";
 import { useReleaseSettings } from "./useReleaseSettings";
 import { useRoleTests } from "./useRoleTests";
 import { useServerDetect } from "./useServerDetect";
+import { TabResetSection } from "../settings/ResetControls";
 import { ConfirmDialog } from "../ui";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
@@ -67,16 +71,116 @@ import { ConfirmDialog } from "../ui";
  *  The first section, "Your local model", is a way through the rest: where the user stands, PM's
  *  pick, and four steps (`readiness.ts`). Its buttons make the same writes the sections do — they are
  *  wired here, beside the section controls that make them, so the two can't drift into two
- *  different things. */
-export function LocalAiSettings({
-  onBetterFitChange,
-  onLocate,
-}: {
+ *  different things.
+ *
+ *  Last comes the "Reset to defaults" footer every settings tab has (#445). Whether the tab is at
+ *  its defaults is the backend's answer, not one worked out here: the settings are fourteen stored
+ *  rows owned by five modules, plus a keychain entry, and only the backend can say none of them is
+ *  there. The answer is read again after every write the tab makes — every `set_*` command
+ *  announces itself (`onSettingSaved`), and the three that aren't one (Disconnect, Forget token,
+ *  accepting a licence) say so through `onSettingsWritten`. A reset then remounts the sections
+ *  under a new key, so every section, hook and fold starts again from what is now stored — nothing
+ *  can go on showing the server just forgotten — and the start card is back at step 1. */
+export function LocalAiSettings({ onBetterFitChange, onLocate }: LocalAiSettingsProps = {}) {
+  /** Bumped by a reset: the key the sections remount under. */
+  const [epoch, setEpoch] = useState(0);
+  // null until the backend has answered. Read as "at its defaults" meanwhile, the way the other tabs
+  // offer no reset before their defaults load; an answer that FAILS reads as not, so a keychain PM
+  // couldn't read never hides the reset.
+  const [atDefaults, setAtDefaults] = useState<boolean | null>(null);
+  // Writes land close together (a connect writes the address, then the token), and an older reply
+  // landing last would put back an answer a later write has moved past. Only the newest one counts.
+  const asked = useRef(0);
+  const refreshDefaults = useCallback(() => {
+    const n = ++asked.current;
+    localAiSettingsAreDefault()
+      .then((d) => {
+        if (n === asked.current) setAtDefaults(d);
+      })
+      .catch(() => {
+        if (n === asked.current) setAtDefaults(false);
+      });
+  }, []);
+  useEffect(() => {
+    refreshDefaults();
+    return onSettingSaved(refreshDefaults);
+  }, [refreshDefaults]);
+
+  // After a reset, take the reader to where they now start. The remount re-lays the whole tab out
+  // from its loading state, so wherever the scroll lands otherwise is an accident. In an effect, so
+  // it runs once the NEW sections are in the DOM rather than against the ones being replaced.
+  useEffect(() => {
+    if (epoch === 0) return;
+    const id = requestAnimationFrame(() => {
+      const start = "sec-localai-start";
+      if (onLocate) onLocate(start);
+      else document.getElementById(start)?.scrollIntoView?.();
+    });
+    return () => cancelAnimationFrame(id);
+    // Only on a reset: `onLocate` is a fresh function on each of the host's renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the reset alone
+  }, [epoch]);
+
+  async function reset() {
+    try {
+      await resetLocalAiSettings();
+    } catch (e) {
+      // The backend's likely failures — a locked vault, a keychain that refuses — come before it
+      // changes anything, so the tab stays as it is, and so does the reader's place beside the
+      // error the footer says. Its answer is read again all the same, in case the store failed
+      // after the token had gone.
+      refreshDefaults();
+      throw e;
+    }
+    setEpoch((n) => n + 1);
+    refreshDefaults();
+    // The update check is one of the settings, and the better-fit dot in the sidebar and the
+    // settings rail follows it.
+    onBetterFitChange?.();
+  }
+
+  return (
+    <>
+      <LocalAiTab
+        key={epoch}
+        onBetterFitChange={onBetterFitChange}
+        onLocate={onLocate}
+        onSettingsWritten={refreshDefaults}
+      />
+      <TabResetSection
+        tabName="Local AI"
+        isDefault={atDefaults ?? true}
+        onReset={reset}
+        confirmBody={
+          <>
+            Disconnects your model server and forgets its access key, and puts roles, On battery,
+            Model memory, the extra folder, the update check and the licences you agreed to back to
+            their defaults. Your models stay where they are — on your server and on this computer —
+            and so do your cloud key, your chats and the tray icon.
+          </>
+        }
+      />
+    </>
+  );
+}
+
+interface LocalAiSettingsProps {
   onBetterFitChange?: () => void;
   /** Scroll the host to the element with this id (Settings' own section jump), or omitted to
    *  scroll it into view directly. */
   onLocate?: (id: string) => void;
-} = {}) {
+}
+
+/** The tab's sections and the state they share — everything a reset starts again. */
+function LocalAiTab({
+  onBetterFitChange,
+  onLocate,
+  onSettingsWritten,
+}: LocalAiSettingsProps & {
+  /** A write landed that isn't a `set_*` command, so the reset footer's answer has to be re-read
+   *  by hand: a Disconnect, a Forget token, or a licence accepted. */
+  onSettingsWritten: () => void;
+}) {
   const [recs, setRecs] = useState<LocalRecommendations | null>(null);
   const [betterFit, setBetterFit] = useState<LocalBetterFit | null>(null);
   const [loading, setLoading] = useState(true);
@@ -167,6 +271,10 @@ export function LocalAiSettings({
   const isOllama = runnerOf(config?.base_url) === "Ollama";
 
   async function reloadConfig() {
+    // Called after the server, its token or a role has changed — Disconnect and Forget token among
+    // them, which aren't `set_*` commands and so announce nothing themselves. (After a download
+    // too, where the second look is merely spare.)
+    onSettingsWritten();
     const cfg = await getLocalLlmConfig();
     setConfig(cfg);
     if (cfg.base_url) {
@@ -196,7 +304,11 @@ export function LocalAiSettings({
   const pick = shownPick(recs);
   const pull = usePull({
     recs,
-    onRecs: setRecs,
+    // Only ever a licence just accepted, which is one of the settings a reset clears.
+    onRecs: (r) => {
+      setRecs(r);
+      onSettingsWritten();
+    },
     onReload: reloadConfig,
     onRefreshRecs: refreshRecs,
     // Said where it was asked for. A download this view only adopted has no asker: PM's pick's own
