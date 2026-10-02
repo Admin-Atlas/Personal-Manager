@@ -510,6 +510,8 @@ export function ProjectView({
             streamingThought={chat.streamingThought}
             thoughts={chat.thoughts}
             onLiveFold={chat.noteLiveFold}
+            onThoughtFold={chat.noteThoughtFold}
+            thoughtFold={chat.thoughtFold}
             onOpenChatCitation={onOpenChatCitation}
           />
           {idleDate && (

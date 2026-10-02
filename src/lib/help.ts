@@ -252,7 +252,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "chat-thinking": {
     title: "The model's thinking",
-    body: "What the model worked through before it answered, and how long it took. It's the model's own working, not checked facts, and it can be wrong even when the answer is right. PM stops a model that thinks for more than five minutes without answering, or whose thinking gets stuck repeating itself. If a conversation is too long to leave room to think, PM answers without thinking and says so. None of it is kept: it's gone when you restart PM.",
+    body: "What the model worked through before it answered, and how long it took. It's the model's own working, not checked facts, and it can be wrong even when the answer is right. PM stops a model that thinks for more than five minutes without answering, or whose thinking gets stuck repeating itself. On Ollama, if a conversation is too long to leave room to think, PM answers without thinking and says so. None of it is kept: it's gone when you restart PM.",
   },
 
   // Calendar (unified read-only view, card 8)

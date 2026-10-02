@@ -53,6 +53,11 @@ interface Props {
   /** Where the user leaves the live thinking fold (`useChatStream`'s `noteLiveFold`), so the settled
    *  fold that replaces it opens as they left it. Absent: the settled fold always starts folded. */
   onLiveFold?: (fold: ThoughtFold) => void;
+  /** Where the user leaves a settled turn's thinking fold, and where they left it last, keyed by
+   *  message id (`useChatStream`'s `noteThoughtFold` / `thoughtFold`). Both stable. Absent: a settled
+   *  fold remounts as its turn settled. */
+  onThoughtFold?: (id: number, fold: ThoughtFold) => void;
+  thoughtFold?: (id: number) => ThoughtFold | undefined;
   /** Developer mode only: the exact request PM sent for a turn, keyed by assistant message id, shown
    *  in a collapsed "prompt sent to the API" dropdown under that turn (card #395). Only turns sent this
    *  session carry one; reloaded history turns don't. */
@@ -555,6 +560,8 @@ const MessageBlock = memo(function MessageBlock({
   message,
   prompt,
   thought,
+  thoughtFold,
+  onThoughtFold,
   confidence,
   provider,
   showProvenance,
@@ -567,6 +574,8 @@ const MessageBlock = memo(function MessageBlock({
   message: Message;
   prompt?: PromptMessage[];
   thought?: ChatThought;
+  thoughtFold?: (id: number) => ThoughtFold | undefined;
+  onThoughtFold?: (id: number, fold: ThoughtFold) => void;
   confidence?: GroundingConfidence;
   provider?: ServedBy;
   showProvenance?: boolean;
@@ -603,7 +612,8 @@ const MessageBlock = memo(function MessageBlock({
           text={thought.text}
           seconds={thought.seconds}
           skipped={thought.skipped}
-          fold={thought.fold}
+          fold={thoughtFold?.(message.id) ?? thought.fold}
+          onFold={onThoughtFold ? (fold) => onThoughtFold(message.id, fold) : undefined}
         />
       )}
       <Bubble
@@ -659,6 +669,8 @@ export function ChatView({
   streamingThought,
   thoughts,
   onLiveFold,
+  onThoughtFold,
+  thoughtFold,
   prompts,
   confidences,
   providers,
@@ -773,6 +785,8 @@ export function ChatView({
             message={m}
             prompt={prompts?.[m.id]}
             thought={thoughts?.[m.id]}
+            thoughtFold={thoughtFold}
+            onThoughtFold={onThoughtFold}
             confidence={confidences?.[m.id]}
             provider={providers?.[m.id]}
             showProvenance={showProvenance}

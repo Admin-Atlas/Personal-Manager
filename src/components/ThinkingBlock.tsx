@@ -88,6 +88,11 @@ function ThinkingFold({
         >
           <div
             ref={boxRef}
+            // Focusable so a keyboard can scroll it: WebKit (macOS, Linux) never makes a scrolling
+            // box a tab stop by itself.
+            tabIndex={open ? 0 : -1}
+            role="region"
+            aria-label="The model's thinking"
             onScroll={() => {
               const el = boxRef.current;
               if (!el) return;
@@ -110,7 +115,13 @@ function ThinkingFold({
 /** A finished turn's thinking: folded, timed — or, for a turn PM answered without thinking because
  *  the conversation left no room, the one line that says so. When the user had opened the live fold,
  *  it stays open instead, at the place they left it (`fold`). */
-export function ThinkingBlock({ text, seconds, skipped, fold }: ChatThought) {
+export function ThinkingBlock({
+  text,
+  seconds,
+  skipped,
+  fold,
+  onFold,
+}: ChatThought & { onFold?: (fold: ThoughtFold) => void }) {
   if (skipped && !text) {
     return (
       <div className="flex justify-start" data-help="chat-thinking">
@@ -125,6 +136,7 @@ export function ThinkingBlock({ text, seconds, skipped, fold }: ChatThought) {
       autoOpen={false}
       live={false}
       fold={fold}
+      onFold={onFold}
     />
   );
 }

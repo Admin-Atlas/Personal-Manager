@@ -104,6 +104,15 @@ export function useChatStream(currentConvId: () => number | null) {
     if (id !== null) liveFolds.current.set(id, fold);
   }, []);
 
+  /** Where the user left a SETTLED turn's thinking fold, keyed by its message id. Kept in a ref, not
+   *  in `thoughts`, so a scroll in the fold re-renders nothing; the fold reads it when it next mounts
+   *  (a tab or conversation switch), so a fold the user closed stays closed. */
+  const settledFolds = useRef(new Map<number, ThoughtFold>());
+  const noteThoughtFold = useCallback((id: number, fold: ThoughtFold) => {
+    settledFolds.current.set(id, fold);
+  }, []);
+  const thoughtFold = useCallback((id: number) => settledFolds.current.get(id), []);
+
   /** Append the user's message optimistically and stream the assistant reply
    *  into `streaming`. Resolves once the exchange is persisted (whether or not
    *  the user is still viewing it) so the caller can reload persisted state.
@@ -255,5 +264,7 @@ export function useChatStream(currentConvId: () => number | null) {
     streamingThought,
     thoughts,
     noteLiveFold,
+    noteThoughtFold,
+    thoughtFold,
   };
 }

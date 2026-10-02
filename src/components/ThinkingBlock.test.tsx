@@ -209,3 +209,16 @@ describe("LiveThinkingBlock (while a reply streams)", () => {
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
 });
+
+describe("the thinking box, by keyboard", () => {
+  it("is a named tab stop while open, and not while folded", () => {
+    const { container } = render(
+      <ThinkingBlock text="Let me check." seconds={3} skipped={false} />,
+    );
+    const box = () => container.querySelector<HTMLElement>('[role="region"]')!;
+    expect(box().getAttribute("aria-label")).toBe("The model's thinking");
+    expect(box().tabIndex).toBe(-1);
+    fireEvent.click(container.querySelector("button[aria-expanded]")!);
+    expect(box().tabIndex).toBe(0);
+  });
+});

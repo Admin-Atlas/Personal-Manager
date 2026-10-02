@@ -189,6 +189,8 @@ export function useProjectChat(project: string | null) {
     thoughts: chat.thoughts,
     streamingThought: chat.streamingThought,
     noteLiveFold: chat.noteLiveFold,
+    noteThoughtFold: chat.noteThoughtFold,
+    thoughtFold: chat.thoughtFold,
     sending: chat.sending,
     error: chat.error,
     setError: chat.setError,

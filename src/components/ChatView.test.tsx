@@ -266,16 +266,28 @@ describe("the thinking fold, with the real stream", () => {
   // clears a round trip before the host reloads the messages. These run the real hook into the real
   // view through that sequence, the way App does, because neither half shows the bug on its own.
   type Chat = ReturnType<typeof useChatStream>;
-  function Host({ view, out }: { view: { current: number }; out: { chat?: Chat } }) {
+  // `mount` re-keys the view: a tab switch away and back, which unmounts it the way App's router does.
+  function Host({
+    view,
+    out,
+    mount = 0,
+  }: {
+    view: { current: number };
+    out: { chat?: Chat };
+    mount?: number;
+  }) {
     const chat = useChatStream(() => view.current);
     out.chat = chat;
     return (
       <ChatView
+        key={mount}
         messages={chat.messages}
         streaming={chat.streaming}
         streamingThought={chat.streamingThought}
         thoughts={chat.thoughts}
         onLiveFold={chat.noteLiveFold}
+        onThoughtFold={chat.noteThoughtFold}
+        thoughtFold={chat.thoughtFold}
       />
     );
   }
@@ -283,7 +295,7 @@ describe("the thinking fold, with the real stream", () => {
   function chatting() {
     const view = { current: 1 };
     const out: { chat?: Chat } = {};
-    const { container } = render(<Host view={view} out={out} />);
+    const { container, rerender } = render(<Host view={view} out={out} />);
     act(() => {
       void out.chat!.send(1, "Is the invoice paid?");
     });
@@ -295,6 +307,7 @@ describe("the thinking fold, with the real stream", () => {
       fold,
       header: () => fold()!.querySelector("button[aria-expanded]")!,
       box: () => fold()!.querySelector<HTMLElement>(".overflow-y-auto")!,
+      remount: (n: number) => rerender(<Host view={view} out={out} mount={n} />),
       container,
     };
   }
@@ -338,6 +351,38 @@ describe("the thinking fold, with the real stream", () => {
 
     expect(t.header().getAttribute("aria-expanded")).toBe("true");
     expect(t.box().scrollTop).toBe(120);
+  });
+
+  it("keeps a settled fold the user closed closed when the view comes back", async () => {
+    const t = chatting();
+    t.emit({ type: "thinking", text: "Let me check the invoice." });
+    t.emit({ type: "token", text: "Paid." });
+    fireEvent.click(t.header()); // opened mid-answer, so it settles open
+    t.emit({
+      type: "done",
+      message_id: 42,
+      content: "Paid.",
+      citations: [],
+      served_by: "local",
+      on_battery: false,
+    });
+    await act(async () => {
+      stream.resolve!();
+    });
+    act(() =>
+      t
+        .chat()
+        .setMessages([
+          message(41),
+          { ...message(42), role: "assistant", content: "Paid.", model: "gemma4:12b" },
+        ]),
+    );
+    expect(t.header().getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(t.header()); // and then the user closes it
+    expect(t.header().getAttribute("aria-expanded")).toBe("false");
+
+    t.remount(1);
+    expect(t.header().getAttribute("aria-expanded")).toBe("false");
   });
 
   it("draws the live thinking again for a chat left and returned to mid-thought", () => {

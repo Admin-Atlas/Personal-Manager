@@ -805,7 +805,8 @@ export function GeneralSettings() {
           <>
             Restores appearance (System, Mode, Accent, Depth, Location), the memory-map view, the
             pinboard delete confirmation, the Focus tab (which panels it shows and where the
-            briefing appears), and help mode to their defaults. Your time zone is left as-is.
+            briefing appears), the Chats sidebar's folds, the chat Thinking button (back to off),
+            and help mode to their defaults. Your time zone is left as-is.
           </>
         }
       />
