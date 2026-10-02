@@ -435,6 +435,80 @@ describe("Model server", () => {
     expect(error.closest("[data-settings-section]")?.id).toBe("sec-localai-endpoint");
   });
 
+  it("fresh: points at step 1's guide, and keeps no second copy", async () => {
+    await mount();
+    const endpoint = document.getElementById("sec-localai-endpoint") as HTMLElement;
+    expect(endpoint.textContent).toContain("Don't have one yet?");
+    expect(
+      within(endpoint).queryByRole("button", { name: "Compare the three local servers" }),
+    ).toBeNull();
+  });
+
+  it("detected: the guide is here, since step 1 is a Connect button now", async () => {
+    // Someone with only LM Studio running who wants Ollama had no install steps anywhere on the
+    // page until they connected, and two sentences pointed at guides that weren't rendered.
+    probeLocalLlmPorts.mockResolvedValue([OLLAMA]);
+    await mount();
+    const endpoint = document.getElementById("sec-localai-endpoint") as HTMLElement;
+    await within(endpoint).findByText(/Found on this computer/);
+    expect(endpoint.textContent).not.toContain("Don't have one yet?");
+    fireEvent.click(
+      within(endpoint).getByRole("button", { name: "Compare the three local servers" }),
+    );
+    // Nothing is connected, so PM is still looking — but step 1 has no Look now in this state.
+    // A runner's card is the one whose header names its port.
+    const ollama = within(endpoint).getByText("port 11434").parentElement?.parentElement;
+    const steps = Array.from(ollama?.querySelectorAll("li") ?? []).map((li) => li.textContent);
+    expect(steps[steps.length - 1]).toMatch(/^Come back to PM\. It finds Ollama by itself/);
+    expect(endpoint.textContent).not.toMatch(/Look now/);
+  });
+
+  it("connected: every server's last step starts with disconnecting", async () => {
+    // PM stops looking for servers while one is connected, so "it finds Ollama by itself" was a
+    // wait for nothing, and Your local model has no Connect to press.
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    await mount();
+    const endpoint = document.getElementById("sec-localai-endpoint") as HTMLElement;
+    fireEvent.click(
+      within(endpoint).getByRole("button", { name: "Compare the three local servers" }),
+    );
+    const cards = Array.from(endpoint.querySelectorAll("ol")).filter((ol) =>
+      ol.closest("div")?.textContent?.match(/port \d+/),
+    );
+    expect(cards).toHaveLength(3);
+    for (const ol of cards) {
+      const items = Array.from(ol.querySelectorAll("li"));
+      const last = items[items.length - 1]?.textContent ?? "";
+      expect(last).toMatch(/^To switch to it, press Disconnect… under Model server/);
+    }
+    expect(endpoint.textContent).not.toMatch(/finds Ollama by itself within/);
+  });
+
+  it("sets the context PM sized its pick for, not a fixed 32768", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    localModelRecommendations.mockResolvedValue(
+      recs({
+        curated: [gemmaRec()],
+        pick: {
+          ...PICK,
+          repo: "bartowski/gemma-2-2b-it-GGUF",
+          display_name: "gemma 2 2b it",
+          tag: "hf.co/bartowski/gemma-2-2b-it-GGUF:Q4_K_M",
+          fit: fit({ quant: "Q4_K_M", context: 8192, kv: "f16", est_memory_gb: 2.4 }),
+        },
+      }),
+    );
+    await mount();
+    const endpoint = document.getElementById("sec-localai-endpoint") as HTMLElement;
+    // The fold under Model server, and the comparison: both carry the pick's own number.
+    const tuning = document.getElementById("localai-tuning") as HTMLElement;
+    expect(tuning.textContent).toContain("8192 is the context PM sized its pick for.");
+    expect(tuning.textContent).not.toContain("32768");
+    expect(
+      endpoint.textContent?.split("8192 is the context PM sized its pick for.").length,
+    ).toBeGreaterThan(2);
+  });
+
   it("asks before disconnecting, and Cancel calls nothing", async () => {
     getLocalLlmConfig.mockResolvedValue(cfg());
     await mount();
@@ -504,7 +578,14 @@ describe("All models", () => {
     localModelRecommendations.mockResolvedValue(
       recs({
         pick: undefined,
-        installed: [{ id: "gemma2:2b", matched_repo: "bartowski/gemma-2-2b-it-GGUF", fit: fit() }],
+        installed: [
+          {
+            id: "gemma2:2b",
+            matched_repo: "bartowski/gemma-2-2b-it-GGUF",
+            fit: fit(),
+            measured: false,
+          },
+        ],
       }),
     );
     await mount();
@@ -512,6 +593,58 @@ describe("All models", () => {
     expect(card.textContent).toContain("Your server has gemma2:2b, another build of this model.");
     expect(within(card).queryByText("Installed")).toBeNull();
     expect(within(card).getByRole("button", { name: /^download$/i })).toBeTruthy();
+  });
+
+  it("says where PM's pick is when it runs the model as a file neither row offers", async () => {
+    // The dev laptop with 10 GB free: the card's one row is Q6_K at 7.38 GB, and the pick is Q5_K_M
+    // at 6.63 GB — the config that keeps the room PM leaves free on the card. Only the band line says
+    // so, and nothing tested it.
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    const q6 = `hf.co/${QWEN}:Q6_K`;
+    localModelRecommendations.mockResolvedValue(
+      recs({
+        curated: [
+          qwenRec({
+            ollama_pull: q6,
+            gpu_pull: null,
+            gpu: { kind: "single" },
+            fit: fit({ quant: "Q6_K", est_memory_gb: 7.38, verdict: "tight" }),
+          }),
+        ],
+        pick: { ...PICK, tag: `hf.co/${QWEN}:Q5_K_M`, fit: fit() },
+      }),
+    );
+    await mount();
+    const card = document.getElementById(
+      "localai-rec-bartowski-qwen2-5-7b-instruct-gguf",
+    ) as HTMLElement;
+    expect(card.textContent).toContain(
+      "PM's pick runs this model as Q5_K_M with a 32k context and a compressed cache, so it fits your graphics card with the room PM keeps free — it's under Your local model.",
+    );
+    expect(within(card).getByRole("button", { name: "Show it" })).toBeTruthy();
+    // The card's own file is not the pick, so it is not marked as one and keeps its Download.
+    expect(within(card).queryByText("PM's pick")).toBeNull();
+    expect(within(card).getByRole("button", { name: /^download$/i })).toBeTruthy();
+  });
+
+  it("keeps the pick's download on screen when the start card can't show it", async () => {
+    // Step 2 waits while the server is unreachable, so the progress moves to the pick's card — which
+    // is inside the folded list. The only Cancel was out of reach until someone opened it.
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    localLlmStatus.mockResolvedValue(status({ reachable: false }));
+    activeLocalPull.mockResolvedValue({
+      model: QWEN_TAG,
+      status: "downloading",
+      completed_bytes: 1024,
+      total_bytes: 4096,
+      running: true,
+      error: null,
+      started_at_ms: 0,
+    });
+    await mount();
+    const cancel = await within(models()).findByRole("button", { name: /cancel/i });
+    expect(cancel.closest("[inert]")).toBeNull();
+    expect(screen.getAllByRole("button", { name: /cancel/i })).toHaveLength(1);
   });
 
   it("labels a restricted licence in words, not in the warning colour", async () => {

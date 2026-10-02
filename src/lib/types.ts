@@ -1843,6 +1843,9 @@ export interface LocalInstalledModel {
   id: string;
   matched_repo: string | null;
   fit: LocalFitResult;
+  /** The fit is for the user's own file at the window the server proved it serves, not the
+   *  catalogue's figure for the model (local_ai.rs InstalledModel.measured). */
+  measured: boolean;
 }
 
 /** Which runner a model found on disk belongs to (local_disk.rs DiskSource). */
@@ -1891,8 +1894,10 @@ export interface LocalGpuResidency {
   /** "server" | "on-exit" | "idle". */
   policy: string;
   idle_minutes: number;
-  /** This endpoint has no unload route, so the two active policies cannot do anything here —
-   *  llama-server holds a model for its whole process life, and LM Studio has no unload gesture. */
+  /** This endpoint has no unload route PM drives, so the two active policies can't do anything here.
+   *  PM unloads only through Ollama's own API (/api/ps and a zero keep_alive). LM Studio can eject a
+   *  model itself (in the app, `lms unload`, or its REST API since 0.4.0), but PM doesn't drive it; a
+   *  llama-server started with a model holds it until it stops. */
   no_unload_route: boolean;
 }
 
@@ -1975,9 +1980,11 @@ export interface LocalRecommendations {
  *  shared between processor and graphics, or system RAM. */
 export type LocalPickBasis = "gpu" | "shared" | "system";
 
-/** Which of a curated card's rungs the pick is (better_fit.rs Rung): its highest-quality config, or
- *  the smaller one that stays on the graphics card. */
-export type LocalPickRung = "quality" | "gpu";
+/** How the pick's config relates to the highest-quality one that fits free memory at the pick's
+ *  context (better_fit.rs Rung): the same ("quality"), a smaller quant stepped down to stay on the
+ *  graphics card ("gpu"), or one stepped down to be quick enough for background work from shared or
+ *  system memory ("speed"). */
+export type LocalPickRung = "quality" | "gpu" | "speed";
 
 /** Why PM is not picking a model (better_fit.rs NoPick). */
 export type LocalNoPick = "nothing_on_gpu" | "too_slow" | "too_little_memory";

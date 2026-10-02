@@ -78,4 +78,26 @@ describe("the Local AI tab's help", () => {
     // The fold it names is the one Model server shows.
     expect(HELP["settings-localai-endpoint"].body).toContain(`“${TUNING_TITLE}”`);
   });
+
+  it("calls a speed a ceiling only on a graphics card PM recognises", () => {
+    // On a card it doesn't recognise PM uses a typical 400 GB/s, and the tab says the real figure
+    // "could be half that, or double" — so an unscoped "on a graphics card they're ceilings" told
+    // the reader the opposite of the line beside the number. System-memory speeds are a typical
+    // 40 GB/s, not a published one, so they get no ceiling either.
+    for (const { help } of LOCALAI_SECTIONS) {
+      const body = HELP[help].body;
+      for (const m of body.matchAll(/[^.]*\bceilings?\b[^.]*\./g)) {
+        expect(m[0], help).toMatch(/graphics card PM recognises/);
+        expect(m[0], help).toMatch(/rough guide/);
+      }
+    }
+  });
+
+  it("says the limit on unloading is PM's, not the servers'", () => {
+    // LM Studio can eject a model (in the app, `lms unload`, or its REST API since 0.4.0). What is
+    // true is that PM only drives Ollama's unload.
+    const body = HELP["settings-localai-lifecycle"].body;
+    expect(body).not.toMatch(/Only Ollama can unload/);
+    expect(body).toMatch(/PM can only ask Ollama to unload a model/);
+  });
 });

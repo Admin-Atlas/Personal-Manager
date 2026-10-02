@@ -43,13 +43,18 @@
 //! 1. **Where it would run decides how it is judged** ([`basis_for`]). With a discrete graphics card
 //!    a model must fit entirely on it, with the reserve PM keeps free there ([`fit::resident_fit`]):
 //!    one that spills into system RAM replies many times slower. Without one — or on memory shared
-//!    with the processor — the RAM fit stands, but only if a cautious estimate says it is quick
-//!    enough for background work ([`background_floor_tps`]).
-//! 2. **The largest eligible model wins**, ties broken by repo so the answer is stable. Eligible is a
-//!    runnable config (Comfortable or Tight, never a halved context) that Ollama can fetch.
-//! 3. **A model the user already has wins** when it fits the same way and nothing eligible is at
+//!    with the processor — it must fit free memory at a quant a cautious estimate says is quick
+//!    enough for background work ([`system_config`], [`background_floor_tps`]). Either way PM steps
+//!    down through the quants to find one, so more free memory can only ever widen the choice.
+//! 2. **At the context PM will run it at** ([`pick_context`]), not the one it was trained to: the
+//!    32768 PM's own setup steps give a model at most, or less for a model trained on less.
+//! 3. **The largest eligible model wins**, ties broken by repo so the answer is stable. Eligible is a
+//!    runnable config (Comfortable or Tight at that context, never a halved one) that Ollama can
+//!    fetch — judged among the fetchable quants only, so a larger file with no tag never displaces a
+//!    smaller one that has one.
+//! 4. **A model the user already has wins** when it fits the same way and nothing eligible is at
 //!    least [`MIN_IMPROVEMENT`] larger — the same 15% the notice uses.
-//! 4. **When nothing qualifies, say why** ([`NoPick`]). Never the least-bad option.
+//! 5. **When nothing qualifies, say why** ([`NoPick`]). Never the least-bad option.
 
 use serde::Serialize;
 
@@ -68,8 +73,9 @@ pub struct Candidate {
     pub display_name: String,
     pub parameters_b: f64,
     pub verdict: fit::Verdict,
-    /// Already downloaded to this machine (#449) — the strongest kind of suggestion, since acting on
-    /// it costs nothing.
+    /// Already on this machine (#449) as a copy PM's pick could itself choose — one the connected
+    /// server can serve, with a runnable config of its own. The strongest kind of suggestion, since
+    /// acting on it costs nothing.
     pub on_disk: bool,
     /// What it would occupy, from its own `FitResult`. `None` when it could not be sized — which
     /// [`is_runnable`] already excludes, so in practice this is `Some` for anything that survives to
@@ -204,13 +210,16 @@ pub fn basis_for(hw: &fit::FitHardware) -> PickBasis {
     }
 }
 
-/// Which of a curated card's rungs the judged config is: its highest-quality (RAM) config, or the
-/// smaller one that stays on the graphics card.
+/// How the judged config relates to the highest-quality config that fits free memory at the same
+/// context: it is that config, or a smaller one PM stepped down to for where the pick runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rung {
     Quality,
+    /// Smaller, so it stays entirely on the graphics card with the reserve kept.
     Gpu,
+    /// Smaller, so it clears [`background_floor_tps`] from shared or system memory.
+    Speed,
 }
 
 /// Why PM is not picking a model for this computer — each one its own sentence in the UI, because
@@ -241,59 +250,108 @@ pub fn background_floor_tps() -> f64 {
         / (tunables::BACKGROUND_TOTAL_TIMEOUT - tunables::COLD_LOAD_ALLOWANCE).as_secs_f64()
 }
 
+/// The longest context the pick judges a model at.
+///
+/// 32768 is the most PM's own setup steps ever give a model — the Ollama step sets
+/// `OLLAMA_CONTEXT_LENGTH` to the pick's context, 32768 when there is none (workbenchGuide.ts) —
+/// and PM never asks for more per request, so it is the context the pick's config will really run
+/// at. Judged at its TRAINED context instead (131072 for Llama 3.x and Phi 3.5, 262144 for Qwen3.5
+/// and gemma 4), a long-context model was sized for a window Ollama would never give it, and every
+/// one that fits the card at 32k was turned away as a halved context while the pick called a
+/// smaller model "the largest that fits". The cards in All models keep judging at the trained
+/// context: this caps the pick, and the notice that judges as the pick does, nothing else.
+pub const PICK_CONTEXT: u32 = 32_768;
+
+/// The context the pick judges one model at: [`PICK_CONTEXT`], or the model's trained context when
+/// that is shorter. A server PROVEN to have loaded it with a longer window raises it to that window,
+/// because that is what is really resident, and judging less would flatter it.
+pub fn pick_context(trained: u32, served: Option<u32>) -> u32 {
+    trained.min(PICK_CONTEXT).max(served.unwrap_or(0))
+}
+
 /// One model as the pick judges it.
 #[derive(Debug, Clone)]
 pub struct Judged {
     /// The config PM would run it at here, or `None` when there is no acceptable one: nothing
-    /// runnable fits the card on a GPU basis, or the RAM config is not runnable or is too slow.
+    /// runnable fits the card on a GPU basis, or nothing runnable clears the floor on Shared/System.
     pub config: Option<fit::FitResult>,
     /// Which rung `config` is. `Quality` when there is no config.
     pub rung: Rung,
-    /// The RAM config is runnable. The caller narrows this to configs Ollama can also fetch, since
-    /// this function knows no catalogue.
+    /// Some config fits free memory and is runnable, at the pick's context — what `NothingOnGpu`
+    /// may point at. The caller judges a catalogue model among the quants Ollama can fetch, so for
+    /// those this already means a fetchable one.
     pub ram_runnable: bool,
-    /// Shared/System only: the RAM config is runnable but fails [`background_floor_tps`].
+    /// Shared/System only: something is runnable, but no runnable config clears
+    /// [`background_floor_tps`].
     pub too_slow: bool,
 }
 
-/// Judge one model for the pick, given its RAM fit. Pure.
+/// Judge one model for the pick at `context` (normally [`pick_context`]). Pure.
 ///
 /// On a GPU basis the config is [`fit::resident_fit`], kept only when runnable, and no speed floor
-/// applies — a config resident on a discrete card is far above it. On a Shared or System basis the
-/// RAM fit itself is the config, but only when [`fit::system_tokens_per_sec`] clears the floor.
-/// The floor applies on Shared too: shared memory is not a faster pool than the RAM it comes from.
-pub fn judge(spec: &fit::ModelSpec, hw: &fit::FitHardware, ram_fit: &fit::FitResult) -> Judged {
+/// applies — a config resident on a discrete card is far above it. On a Shared or System basis it is
+/// [`system_config`]: the best runnable config among the quants that clear the floor. The floor
+/// applies on Shared too: shared memory is not a faster pool than the RAM it comes from. Both step
+/// down through the quants, so neither can turn a model away for want of memory it then gets.
+pub fn judge(spec: &fit::ModelSpec, hw: &fit::FitHardware, context: u32) -> Judged {
+    let spec = &at_context(spec, context);
+    let ram_fit = fit::fit(spec, hw);
     let ram_runnable = is_runnable(ram_fit.verdict);
-    match basis_for(hw) {
-        PickBasis::Gpu => {
-            let config = fit::resident_fit(spec, hw, ram_fit).filter(|g| is_runnable(g.verdict));
-            let rung = match &config {
-                Some(g)
-                    if (g.quant, g.context, g.kv)
-                        != (ram_fit.quant, ram_fit.context, ram_fit.kv) =>
-                {
-                    Rung::Gpu
-                }
-                _ => Rung::Quality,
-            };
-            Judged {
-                config,
-                rung,
-                ram_runnable,
-                too_slow: false,
-            }
+    let (config, smaller) = match basis_for(hw) {
+        PickBasis::Gpu => (
+            fit::resident_fit(spec, hw, &ram_fit).filter(|g| is_runnable(g.verdict)),
+            Rung::Gpu,
+        ),
+        PickBasis::Shared | PickBasis::System => (system_config(spec, hw, context), Rung::Speed),
+    };
+    let rung = match &config {
+        Some(c) if (c.quant, c.context, c.kv) != (ram_fit.quant, ram_fit.context, ram_fit.kv) => {
+            smaller
         }
-        PickBasis::Shared | PickBasis::System => {
-            let quick = ram_fit.quant.is_some_and(|q| {
-                fit::system_tokens_per_sec(spec.active_params_b, q) >= background_floor_tps()
-            });
-            Judged {
-                config: (ram_runnable && quick).then(|| ram_fit.clone()),
-                rung: Rung::Quality,
-                ram_runnable,
-                too_slow: ram_runnable && !quick,
-            }
-        }
+        _ => Rung::Quality,
+    };
+    let too_slow = basis_for(hw) != PickBasis::Gpu && ram_runnable && config.is_none();
+    Judged {
+        config,
+        rung,
+        ram_runnable,
+        too_slow,
+    }
+}
+
+/// The best config that runs from shared or system memory quickly enough for background work, at
+/// `context`: the RAM fit built only from the quants whose [`fit::system_tokens_per_sec`] clears
+/// [`background_floor_tps`], kept when runnable.
+///
+/// It steps down through the quants the way the GPU basis steps down to stay on the card. Checking
+/// the floor only at the highest-quality quant that fits turned a larger model away whenever that
+/// one quant was too slow, even with a smaller quant of it quick enough — so freeing memory could
+/// SHRINK the pick: 8 GB free picked Qwen2.5 7B at Q4_K_M, and 9 GB free, where its best quant became
+/// a too-slow Q5_K_M, picked a 3.9B. Built from the quick quants alone, the answer only grows as free
+/// memory does.
+pub fn system_config(
+    spec: &fit::ModelSpec,
+    hw: &fit::FitHardware,
+    context: u32,
+) -> Option<fit::FitResult> {
+    let floor = background_floor_tps();
+    let quick = fit::ModelSpec {
+        candidates: spec
+            .candidates
+            .iter()
+            .copied()
+            .filter(|c| fit::system_tokens_per_sec(spec.active_params_b, c.quant) >= floor)
+            .collect(),
+        ..at_context(spec, context)
+    };
+    // No quick quant at all leaves no candidates, which `fit` answers `Unknown`: not runnable.
+    Some(fit::fit(&quick, hw)).filter(|f| is_runnable(f.verdict))
+}
+
+fn at_context(spec: &fit::ModelSpec, context: u32) -> fit::ModelSpec {
+    fit::ModelSpec {
+        target_context: context,
+        ..spec.clone()
     }
 }
 
@@ -310,8 +368,8 @@ pub struct CatalogueOption {
     /// The download for the judged config's quant — weights plus any projector, which Ollama pulls
     /// with them — read from the same catalogue row as `tag`. `None` only when there is no config.
     pub download_gb: Option<f64>,
-    /// Its RAM config would be fine from system memory: runnable, fetchable and over the floor. What
-    /// `NothingOnGpu`'s `system_fallback` reports.
+    /// It would be fine from system memory: [`system_config`] finds a runnable, fetchable config over
+    /// the floor. What `NothingOnGpu`'s `system_fallback` reports.
     pub system_ok: bool,
 }
 
@@ -934,6 +992,7 @@ mod tests {
                 quant: fit::Quant::Q8_0,
                 weight_gb: 7.54,
             }],
+            kv_geometry: None,
         };
         let system = fit::FitHardware {
             available_ram_gb: 32.0,
@@ -949,7 +1008,7 @@ mod tests {
         for hw in [system, shared] {
             let rf = fit::fit(&spec, &hw);
             assert!(is_runnable(rf.verdict));
-            let j = judge(&spec, &hw, &rf);
+            let j = judge(&spec, &hw, PICK_CONTEXT);
             assert!(j.config.is_none(), "{hw:?}");
             assert!(j.too_slow && j.ram_runnable, "{hw:?}");
         }
@@ -961,7 +1020,7 @@ mod tests {
             ..system
         };
         let rf = fit::fit(&spec, &card);
-        let j = judge(&spec, &card, &rf);
+        let j = judge(&spec, &card, PICK_CONTEXT);
         assert!(!j.too_slow);
         let config = j.config.expect("resident on a 24 GB card");
         assert_eq!(
@@ -980,7 +1039,7 @@ mod tests {
             ..spec
         };
         let rf = fit::fit(&small, &system);
-        let j = judge(&small, &system, &rf);
+        let j = judge(&small, &system, PICK_CONTEXT);
         assert_eq!(j.config, Some(rf));
         assert!(!j.too_slow);
     }
@@ -1004,6 +1063,7 @@ mod tests {
                     weight_gb: 4.4,
                 },
             ],
+            kv_geometry: None,
         };
         let hw = fit::FitHardware {
             available_ram_gb: 22.0,
@@ -1011,10 +1071,119 @@ mod tests {
             gpu_bandwidth_gbps: None,
             unified_memory: false,
         };
-        let rf = fit::fit(&spec, &hw);
-        let j = judge(&spec, &hw, &rf);
+        let j = judge(&spec, &hw, PICK_CONTEXT);
         assert_eq!(j.rung, Rung::Gpu);
         assert_eq!(j.config.unwrap().quant, Some(fit::Quant::Q4_K_M));
+    }
+
+    /// Qwen2.5 7B's three middle quants and its real KV geometry, at its trained 32768.
+    fn qwen_7b() -> fit::ModelSpec {
+        let q = |quant, weight_gb| fit::QuantCandidate { quant, weight_gb };
+        fit::ModelSpec {
+            arch: fit::Architecture::Dense,
+            active_params_b: 7.62,
+            target_context: 32768,
+            projector_gb: None,
+            candidates: vec![
+                q(fit::Quant::Q8_0, 7.54),
+                q(fit::Quant::Q5_K_M, 5.07),
+                q(fit::Quant::Q4_K_M, 4.36),
+            ],
+            kv_geometry: Some(fit::KvGeometry {
+                bytes_per_token: 57_344.0,
+                window_bytes_per_token: 0.0,
+                window: 0,
+                state_bytes: 0.0,
+            }),
+        }
+    }
+
+    fn no_card(free: f64) -> fit::FitHardware {
+        fit::FitHardware {
+            available_ram_gb: free,
+            vram_gb: None,
+            gpu_bandwidth_gbps: None,
+            unified_memory: false,
+        }
+    }
+
+    #[test]
+    fn off_the_card_a_quicker_quant_of_the_same_model_still_counts() {
+        // 12 GB free (a 10 GB budget): the best quant that fits is Q8_0, at 4.95 tok/s from RAM —
+        // under the 8.53 floor. The Q4_K_M fits too and clears it at 8.6. Judging the Q8_0 alone
+        // threw the whole model away; stepping down keeps it, as the GPU basis already did.
+        let spec = qwen_7b();
+        let hw = no_card(12.0);
+        assert_eq!(fit::fit(&spec, &hw).quant, Some(fit::Quant::Q8_0));
+        let j = judge(&spec, &hw, PICK_CONTEXT);
+        let config = j.config.expect("the Q4_K_M is quick enough");
+        assert_eq!(config.quant, Some(fit::Quant::Q4_K_M));
+        assert!(is_runnable(config.verdict));
+        assert_eq!(j.rung, Rung::Speed);
+        assert!(!j.too_slow);
+        assert_eq!(system_config(&spec, &hw, PICK_CONTEXT), Some(config));
+    }
+
+    #[test]
+    fn more_free_memory_never_takes_a_config_away() {
+        // The rule has to be monotonic in free memory: the pick used to SHRINK as memory was freed,
+        // because a bigger budget reached a higher, slower quant that then failed the floor.
+        for (label, hw_at) in [
+            ("system", no_card as fn(f64) -> fit::FitHardware),
+            ("shared", |free| fit::FitHardware {
+                vram_gb: Some(free),
+                unified_memory: true,
+                ..no_card(free)
+            }),
+        ] {
+            let mut had = false;
+            for tenth in 40..=640 {
+                let free = f64::from(tenth) / 10.0;
+                let has = judge(&qwen_7b(), &hw_at(free), PICK_CONTEXT)
+                    .config
+                    .is_some();
+                assert!(
+                    has || !had,
+                    "{label}: a config at less memory was lost at {free} GB"
+                );
+                had |= has;
+            }
+            assert!(had, "{label}: it must fit somewhere in the sweep");
+        }
+    }
+
+    #[test]
+    fn the_pick_judges_a_long_context_model_at_the_context_pm_runs_it_at() {
+        assert_eq!(pick_context(131_072, None), PICK_CONTEXT);
+        assert_eq!(
+            pick_context(8192, None),
+            8192,
+            "never longer than it was trained for"
+        );
+        // A server proven to hold more holds more, so that is what is judged...
+        assert_eq!(pick_context(131_072, Some(65_536)), 65_536);
+        // ...but a short proven window is only the server's current setting: PM's setup raises it.
+        assert_eq!(pick_context(131_072, Some(4096)), PICK_CONTEXT);
+
+        // Trained on 131072, it fits an 8 GB card only below that — but at the 32768 PM will run
+        // it at, it fits at full context. Judged at its trained context, it was a halved context
+        // and could never be the pick.
+        let spec = fit::ModelSpec {
+            target_context: 131_072,
+            ..qwen_7b()
+        };
+        let card = fit::FitHardware {
+            available_ram_gb: 20.0,
+            vram_gb: Some(8.0),
+            gpu_bandwidth_gbps: Some(384.0),
+            unified_memory: false,
+        };
+        let trained = judge(&spec, &card, 131_072);
+        assert!(trained.config.is_none(), "{:?}", trained.config);
+        let j = judge(&spec, &card, pick_context(spec.target_context, None));
+        let config = j.config.expect("it fits the card at 32k");
+        assert_eq!(config.context, Some(PICK_CONTEXT));
+        assert!(is_runnable(config.verdict));
     }
 
     #[test]
@@ -1057,5 +1226,6 @@ mod tests {
         }
         assert_eq!(serde_json::to_value(PickBasis::Shared).unwrap(), "shared");
         assert_eq!(serde_json::to_value(Rung::Quality).unwrap(), "quality");
+        assert_eq!(serde_json::to_value(Rung::Speed).unwrap(), "speed");
     }
 }

@@ -195,11 +195,13 @@ export function LocalAiStart({
       <SectionInfo title="How PM picks">
         <p>
           PM looks for the largest model in its list that runs entirely on your graphics card with
-          the room PM keeps free, because a model that spills into system memory replies many times
-          slower. On a computer without a separate graphics card, it only considers models its
-          cautious estimate says are quick enough for PM's background work. If you already have a
-          model that fits that way and nothing in the list is at least 15% larger, PM points at the
-          one you have. It never downloads or switches anything for you.
+          the room PM keeps free, at the context PM sizes it for — 32k tokens, less for a model made
+          for less, and more for one your server already runs with more — because a model that
+          spills into system memory replies many times slower. On a computer without a separate
+          graphics card, it only considers models its cautious estimate says are quick enough for
+          PM's background work. If you already have a model that fits that way and nothing in the
+          list is at least 15% larger, PM points at the one you have. It never downloads or switches
+          anything for you.
         </p>
       </SectionInfo>
     </div>
@@ -286,11 +288,13 @@ function ShownPickCard({
   const servedIds = new Set(input.served.map((m) => m.id.toLowerCase()));
   const inUse = pickInUse(pick, input.config, input.status, servedIds);
   const { row, params, reserve } = facts(pick, recs);
-  const runner = runnerOf(input.config?.base_url);
+  const configured = !!input.config?.base_url;
+  // Before connecting, the server step 1 offers to connect is the one PM found running.
+  const offered = list[0].action?.kind === "connect" ? list[0].action.url : null;
   const settings = settingsLine(pick.fit, {
-    configured: !!input.config?.base_url,
-    runner,
-    setupShown: list[0].setup !== null,
+    configured,
+    runner: runnerOf(configured ? input.config?.base_url : offered),
+    setup: list[0].setup,
     commandShown: list[1].command !== null,
   });
   const moe = !!rec && rec.active_parameters_b + 0.01 < rec.parameters_b;
@@ -453,7 +457,13 @@ function StepRow({
       {step.line && <p className="mt-1 text-xs text-ink3">{step.line}</p>}
       {step.state !== "waiting" && (
         <>
-          {step.setup && <RunnerSetup key={step.setup} preselect={step.setup} />}
+          {step.setup && (
+            <RunnerSetup
+              key={step.setup}
+              preselect={step.setup}
+              pickContext={shownPick(input.recs)?.fit.context ?? null}
+            />
+          )}
           {step.progress && (
             <div className="mt-2">
               <IngestProgress
@@ -515,8 +525,16 @@ function StepRow({
  * it is the step. The only runner guide on the page while nothing is connected: Model server's
  * comparison appears once there is something to compare against.
  */
-function RunnerSetup({ preselect }: { preselect: RunnerName }) {
-  const guides = runnerGuides();
+/** The install steps, with the context step set to what PM sized its pick for, so "the steps are in
+ *  step 1" points at steps that set the number the pick card names. */
+function RunnerSetup({
+  preselect,
+  pickContext,
+}: {
+  preselect: RunnerName;
+  pickContext: number | null;
+}) {
+  const guides = runnerGuides(undefined, pickContext);
   const [chosen, setChosen] = useState<RunnerName>(preselect);
   const g = guides.find((x) => x.name === chosen) ?? guides[0];
   return (

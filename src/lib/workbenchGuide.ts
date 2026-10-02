@@ -20,6 +20,20 @@
 //   * llama-server's `-c/--ctx-size` defaults to 0, "loaded from model": the model's whole trained
 //     context, not a small one. The old step said the opposite.
 //
+// Re-checked 02-10-2026: the llama.cpp server README and source on context shift; LM Studio's REST
+// and CLI docs, and llama-server's router mode, on unloading.
+//   * `--context-shift` is "default: disabled", and the server refuses a prompt longer than its
+//     context with an error (`exceed_context_size_error`, HTTP 400) — it never trims one. The
+//     llama-server step said it discarded the oldest part instead.
+//   * LM Studio has `POST /api/v1/models/unload` (0.4.0+) and `lms unload`, and llama-server in
+//     router mode has `POST /models/unload`. So "only Ollama can unload" was false; what is true is
+//     that PM only drives Ollama's (Model memory says so).
+//
+// The numbers in the steps are the ones PM sized its pick for, when there is a pick to size them by
+// (`pickContext`): a step that says "set it to 32768" beside a pick sized for 8k sends the reader
+// somewhere PM never measured. Without a pick they are the 32k PM sizes most graphics-card configs
+// for.
+//
 // What the 30-08 pass corrected, recorded so none of it is "fixed" back:
 //   * The flat "4,096-token default" was wrong on every platform. Ollama picks its default from
 //     VRAM — under 24 GiB → 4k, 24-48 GiB → 32k, 48 GiB and up → 256k (docs.ollama.com/context-
@@ -85,6 +99,37 @@ export interface RunnerGuide {
    * defect this field exists to fix.
    */
   lifecycle: string;
+  /**
+   * The last step again, for someone who already has a server connected. `steps` ends with the
+   * version for someone with nothing connected — PM looks for a running server by itself, and the
+   * start card offers to connect what it finds — and none of that happens while a server IS
+   * connected: PM stops looking, and the only way to another one is through Disconnect.
+   */
+  whileConnected: string;
+}
+
+/** The context the guides set when there is no pick to size them by: the 32k PM sizes most
+ *  graphics-card configs for. */
+const DEFAULT_CONTEXT = 32768;
+
+/** The context a guide's steps set, and whether it is the pick's own — so a step says "the context
+ *  PM sized its pick for" only when it is. A pick sized at 4k or less was sized at what a server
+ *  starts with, so there is nothing to change for it, and the step that gives a model room keeps its
+ *  32k. */
+interface GuideContext {
+  n: number;
+  fromPick: boolean;
+}
+
+function contextOf(pickContext: number | null): GuideContext {
+  return pickContext != null && pickContext > 4096
+    ? { n: pickContext, fromPick: true }
+    : { n: DEFAULT_CONTEXT, fromPick: false };
+}
+
+/** Said after a step's command when the number in it is the pick's. */
+function pickNote(c: GuideContext): string {
+  return c.fromPick ? ` ${c.n} is the context PM sized its pick for.` : "";
 }
 
 /**
@@ -113,9 +158,14 @@ const OLLAMA_KV_SCOPE =
   " Ollama applies it to every model it runs, and only compresses the cache where Flash Attention is on — which it switches on by itself when your graphics card supports it.";
 
 /** Ollama's last step, the same on every platform: PM finds it by itself, and then it is the one
- *  server PM can download its pick into. */
+ *  server PM can download its pick into. It names no button: it is shown both before anything is
+ *  found (where the start card has Look now) and once something else is (where it doesn't). */
 const OLLAMA_LAST_STEP =
-  "Come back to PM. It finds Ollama by itself within about half a minute — or press Look now under Your local model — then connect it there, and PM can download its pick into it for you. (First-run onboarding looks for it by itself too.)";
+  "Come back to PM. It finds Ollama by itself within about half a minute — then connect it under Your local model, and PM can download its pick into it for you. (First-run onboarding looks for it by itself too.)";
+
+/** The same, for someone already connected to a server — PM isn't looking while one is. */
+const OLLAMA_WHILE_CONNECTED =
+  "To switch to it, press Disconnect… under Model server: PM only looks for a server while none is connected. It then finds Ollama within about half a minute — connect it under Your local model, and PM can download its pick into it for you.";
 
 /** The two settings PM's numbers assume, worded for one server — the context it sized for, and the
  *  compressed cache. */
@@ -125,13 +175,14 @@ export interface RunnerTuning {
 }
 
 /** Ollama's context and cache steps on this platform: the same strings its guide shows. */
-function ollamaTuning(platform: SetupPlatform): RunnerTuning {
+function ollamaTuning(platform: SetupPlatform, c: GuideContext): RunnerTuning {
   switch (platform) {
     case "mac":
       return {
         context:
           OLLAMA_CONTEXT_WHY +
-          "To change it, run `launchctl setenv OLLAMA_CONTEXT_LENGTH 32768`, then restart Ollama." +
+          `To change it, run \`launchctl setenv OLLAMA_CONTEXT_LENGTH ${c.n}\`, then restart Ollama.` +
+          pickNote(c) +
           OLLAMA_CONTEXT_HAZARD,
         cache:
           OLLAMA_KV_WHEN +
@@ -142,7 +193,8 @@ function ollamaTuning(platform: SetupPlatform): RunnerTuning {
       return {
         context:
           OLLAMA_CONTEXT_WHY +
-          'To change it, run `sudo systemctl edit ollama.service` and add `Environment="OLLAMA_CONTEXT_LENGTH=32768"` under `[Service]`, then `sudo systemctl daemon-reload && sudo systemctl restart ollama`.' +
+          `To change it, run \`sudo systemctl edit ollama.service\` and add \`Environment="OLLAMA_CONTEXT_LENGTH=${c.n}"\` under \`[Service]\`, then \`sudo systemctl daemon-reload && sudo systemctl restart ollama\`.` +
+          pickNote(c) +
           OLLAMA_CONTEXT_HAZARD,
         cache:
           OLLAMA_KV_WHEN +
@@ -153,7 +205,8 @@ function ollamaTuning(platform: SetupPlatform): RunnerTuning {
       return {
         context:
           OLLAMA_CONTEXT_WHY +
-          "To change it, quit Ollama from the task bar first — setting this while it is running does nothing — then search Settings for \u201cenvironment variables\u201d, open Edit environment variables for your account, add `OLLAMA_CONTEXT_LENGTH` as 32768, and start Ollama again from the Start menu." +
+          `To change it, quit Ollama from the task bar first — setting this while it is running does nothing — then search Settings for \u201cenvironment variables\u201d, open Edit environment variables for your account, add \`OLLAMA_CONTEXT_LENGTH\` as ${c.n}, and start Ollama again from the Start menu.` +
+          pickNote(c) +
           OLLAMA_CONTEXT_HAZARD,
         cache:
           OLLAMA_KV_WHEN +
@@ -163,11 +216,15 @@ function ollamaTuning(platform: SetupPlatform): RunnerTuning {
   }
 }
 
-/** How to install Ollama on this platform — the runner PM can drive a one-click model pull for. */
-export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
+/** How to install Ollama on this platform — the runner PM can drive a one-click model pull for.
+ *  `pickContext` is the context PM sized its pick for, or null when there is no pick. */
+export function ollamaGuide(
+  platform: SetupPlatform = PLATFORM,
+  pickContext: number | null = null,
+): RunnerGuide {
   // The context step, then the cache step straight after it — the two settings PM's numbers assume,
   // shared word for word with `tuningFor`.
-  const tuning = ollamaTuning(platform);
+  const tuning = ollamaTuning(platform, contextOf(pickContext));
   const base = {
     name: "Ollama",
     summary:
@@ -179,6 +236,7 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
     models:
       "Its own library, by a name like `qwen2.5:7b-instruct-q4_K_M` — or any Hugging Face GGUF repo, as `hf.co/<user>/<repo>:<QUANT>`. It's the only runner PM can download into for you, and it does so through Hugging Face, so the file you get is the one the model list measured.",
     caveat: null,
+    whileConnected: OLLAMA_WHILE_CONNECTED,
   };
   switch (platform) {
     case "mac":
@@ -222,6 +280,33 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
   }
 }
 
+/** LM Studio's context step, the same on every platform — and the context half of its tuning. With
+ *  a pick, it gives the number to set rather than only saying to look. */
+function lmStudioContext(c: GuideContext): string {
+  const why =
+    "a short context is silently truncated, and PM's background work sends more than a few thousand tokens at a time.";
+  return c.fromPick
+    ? `Set the model's context length to ${c.n} in its load settings before you rely on it — that's the context PM sized its pick for, and ${why}`
+    : `Check the model's context-length slider before you rely on it — ${why}`;
+}
+
+/** LM Studio's compressed-cache setting, worded by what its API calls it (the in-app label wording is
+ *  unverified) — the cache half of its tuning, and the guide's step after the context one, which
+ *  says first when it applies, the way Ollama's does. */
+const LM_STUDIO_CACHE =
+  "In the same load settings, set the K and V cache quantization to Q8_0. The V cache needs Flash Attention switched on there too.";
+const LM_STUDIO_CACHE_STEP =
+  "If PM's pick says it was sized with a compressed (q8_0) cache, set the K and V cache quantization to Q8_0 in the same load settings. The V cache needs Flash Attention switched on there too.";
+
+/** LM Studio's last step, the same on every platform. PM can't download into it, so the model is
+ *  got in its own app first. */
+const LM_STUDIO_LAST_STEP =
+  "Come back to PM and connect to that address under Your local model or Model server. PM can't download into LM Studio, so get your model in its app first — Your local model says which one PM would pick.";
+
+/** The same, for someone already connected to a server — PM isn't looking while one is. */
+const LM_STUDIO_WHILE_CONNECTED =
+  "To switch to it, press Disconnect… under Model server, then connect to its address there or under Your local model. PM can't download into LM Studio, so get your model in its app first — Your local model says which one PM would pick.";
+
 /**
  * LM Studio's lifecycle is genuinely the same on all three platforms — it is an app setting, not an
  * OS integration — so it is named once here and referenced from each arm rather than being set on the
@@ -232,20 +317,16 @@ export function ollamaGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
  * Checked 2026-08-30 against lmstudio.ai/docs — the "run the LLM server on login" setting, and that
  * with it on, exiting minimises to the tray and the server keeps serving.
  */
-/** LM Studio's context step, the same on every platform — and the context half of its tuning. */
-const LM_STUDIO_CONTEXT =
-  "Check the model's context-length slider before you rely on it — a short context is silently truncated, and PM's background work sends more than a few thousand tokens at a time.";
-
-/** LM Studio's last step, the same on every platform. PM can't download into it, so the model is
- *  got in its own app first. */
-const LM_STUDIO_LAST_STEP =
-  "Come back to PM and connect to that address under Your local model or Model server. PM can't download into LM Studio, so get your model in its app first — Your local model says which one PM would pick.";
-
 const LM_STUDIO_LIFECYCLE =
   "The server runs only while LM Studio is running, and it is off until you switch it on. In app settings (Ctrl/Cmd + ,) you can turn on running the LLM server on login \u2014 with that on, closing the window minimises it to the tray and the server keeps answering. Whether the server was on is remembered between launches.";
 
 /** How to install LM Studio — the runner with a real app around it, and the narrowest hardware. */
-export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
+export function lmStudioGuide(
+  platform: SetupPlatform = PLATFORM,
+  pickContext: number | null = null,
+): RunnerGuide {
+  // The context step, then the cache step — the two settings PM's numbers assume.
+  const tuning = [lmStudioContext(contextOf(pickContext)), LM_STUDIO_CACHE_STEP];
   const base = {
     name: "LM Studio",
     summary:
@@ -257,6 +338,7 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
     models:
       "In its Discover tab — search by name, or paste a Hugging Face `user/model` string straight into the search box.",
     caveat: null as string | null,
+    whileConnected: LM_STUDIO_WHILE_CONNECTED,
   };
   switch (platform) {
     case "mac":
@@ -270,7 +352,7 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install LM Studio — run `brew install --cask lm-studio`, or download it from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (⌘2).",
           "Turn the server on: the toggle at the top of the Developer tab, or `lms server start` in a terminal. It listens on http://127.0.0.1:1234.",
-          LM_STUDIO_CONTEXT,
+          ...tuning,
           LM_STUDIO_LAST_STEP,
         ],
       };
@@ -284,7 +366,7 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install LM Studio — run `curl -fsSL https://lmstudio.ai/install.sh | bash`, or download the AppImage from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (Ctrl+2).",
           "Turn the server on: the toggle at the top of the Developer tab, or `lms server start` in a terminal. It listens on http://127.0.0.1:1234.",
-          LM_STUDIO_CONTEXT,
+          ...tuning,
           LM_STUDIO_LAST_STEP,
         ],
       };
@@ -298,7 +380,7 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
           "Install LM Studio — run `irm https://lmstudio.ai/install.ps1 | iex` in PowerShell, or download it from lmstudio.ai/download.",
           "Open it once and download a model from the Discover tab (Ctrl+2).",
           "Turn the server on: the toggle at the top of the Developer tab, or `lms server start` in a terminal. It listens on http://127.0.0.1:1234.",
-          LM_STUDIO_CONTEXT,
+          ...tuning,
           LM_STUDIO_LAST_STEP,
         ],
       };
@@ -306,7 +388,11 @@ export function lmStudioGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
 }
 
 /** How to install llama.cpp's `llama-server` — the engine the other two are built on. */
-export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuide {
+export function llamaServerGuide(
+  platform: SetupPlatform = PLATFORM,
+  pickContext: number | null = null,
+): RunnerGuide {
+  const c = contextOf(pickContext);
   const base = {
     name: "llama-server",
     summary:
@@ -316,11 +402,13 @@ export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuid
     bestFor:
       "Pick this if you're comfortable in a terminal and want the leanest option, or the newest models the moment they appear on Hugging Face.",
     models:
-      "Straight from Hugging Face, in the same command that starts it — PM shows the exact line for its pick under Your local model, and for every model under All models.",
+      "Straight from Hugging Face, in the same command that starts it — All models has that line for each model you don't have yet, with the context and cache PM sized it for, and once you're connected Your local model has the one for PM's pick.",
     // `caveat` means a hardware exclusion everywhere else in this file. llama-server has none — what
     // it had here was a LIFECYCLE fact wearing the wrong label, which is the drift `lifecycle` exists
     // to stop. Moved verbatim; nothing replaces it, because there is nothing to exclude on.
     caveat: null as string | null,
+    whileConnected:
+      "To switch to it, press Disconnect… under Model server, then connect to its address there or under Your local model. All models has the command for each model, with the context and cache PM sized it for.",
   };
   // Same on all three platforms, and for the same reason as LM Studio's: it is a property of running
   // a foreground process, not of the OS.
@@ -330,9 +418,11 @@ export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuid
     "Start it with a model — for example `llama-server -hf ggml-org/gemma-3-4b-it-GGUF:Q4_K_M`. It downloads the model the first time, then serves it on http://127.0.0.1:8080.",
     // `-c/--ctx-size` defaults to 0, "loaded from model" (the server README, 01-10-2026): without
     // it a current build allocates the model's whole trained context. The old line said the
-    // default was small, which was the opposite.
-    "Add `--ctx-size 32768` — without it, current builds use the model's whole trained context, which for many models is far more memory than PM sized for; and llama-server discards the oldest part of an over-long prompt rather than refusing it.",
-    "Come back here and connect to that address. Your local model and All models show the exact command for each model.",
+    // default was small, which was the opposite — and that an over-long prompt is trimmed, when the
+    // server refuses it (context shift is off by default, and never trimmed a prompt anyway).
+    `Add \`--ctx-size ${c.n}\` — without it, current builds use the model's whole trained context, which for many models is far more memory than PM sized for.${pickNote(c)} A prompt longer than the context is refused with an error, not trimmed.`,
+    "If PM's pick says it was sized with a compressed (q8_0) cache, also add `-fa on -ctk q8_0 -ctv q8_0`.",
+    "Come back to PM and connect to that address under Your local model or Model server. All models has the command for each model, with the context and cache PM sized it for.",
   ];
   switch (platform) {
     case "mac":
@@ -368,8 +458,15 @@ export function llamaServerGuide(platform: SetupPlatform = PLATFORM): RunnerGuid
  * A list rather than three named calls, so the tab renders whatever is here and a fourth runner
  * never touches the component.
  */
-export function runnerGuides(platform: SetupPlatform = PLATFORM): RunnerGuide[] {
-  return [ollamaGuide(platform), lmStudioGuide(platform), llamaServerGuide(platform)];
+export function runnerGuides(
+  platform: SetupPlatform = PLATFORM,
+  pickContext: number | null = null,
+): RunnerGuide[] {
+  return [
+    ollamaGuide(platform, pickContext),
+    lmStudioGuide(platform, pickContext),
+    llamaServerGuide(platform, pickContext),
+  ];
 }
 
 /**
@@ -378,56 +475,28 @@ export function runnerGuides(platform: SetupPlatform = PLATFORM): RunnerGuide[] 
  *
  * Ollama's are its own guide's steps for this platform, word for word, so the two can't disagree.
  * LM Studio's cache line names the load setting by what its API calls it (the K and V cache
- * quantization); the in-app label wording is unverified.
+ * quantization); the in-app label wording is unverified. `pickContext` is the context PM sized its
+ * pick for, as for the guides.
  */
 export function tuningFor(
   runner: RunnerName | null,
   platform: SetupPlatform = PLATFORM,
+  pickContext: number | null = null,
 ): RunnerTuning | null {
+  const c = contextOf(pickContext);
   switch (runner) {
     case "Ollama":
-      return ollamaTuning(platform);
+      return ollamaTuning(platform, c);
     case "LM Studio":
-      return {
-        context: LM_STUDIO_CONTEXT,
-        cache:
-          "In the same load settings, set the K and V cache quantization to Q8_0. The V cache needs Flash Attention switched on there too.",
-      };
+      return { context: lmStudioContext(c), cache: LM_STUDIO_CACHE };
     case "llama-server":
       return {
-        context:
-          "Add `--ctx-size <n>` with the context PM sized for — current builds otherwise use the model's whole trained context.",
+        context: c.fromPick
+          ? `Add \`--ctx-size ${c.n}\`, the context PM sized its pick for — current builds otherwise use the model's whole trained context.`
+          : "Add `--ctx-size <n>` with the context PM sized for — current builds otherwise use the model's whole trained context.",
         cache: "For the compressed cache, also add `-fa on -ctk q8_0 -ctv q8_0`.",
       };
     default:
       return null;
   }
-}
-
-/**
- * The command that gets `repo` into `runner`, or null when PM can't honestly give one.
- *
- * `repo` is a Hugging Face GGUF repo id (`bartowski/Qwen2.5-7B-Instruct-GGUF`) — what the catalogue
- * actually stores — and `quant` is the quantization PM's fit picked for this machine.
- *
- * Only llama-server gets a command, and that is not an oversight:
- *   * llama-server takes a Hugging Face repo id directly. `-hf <user>/<model>[:quant]` is its
- *     documented form; the quant is optional and case-insensitive.
- *   * LM Studio names models its own way and its `lms get` documentation never says a raw Hugging
- *     Face repo id is accepted — so PM points at the Discover tab, which documents accepting one,
- *     rather than printing a command that may not work.
- *   * Ollama gets no command HERE because it does not need one: it has a Download button. Ollama
- *     routes by the host in a model name and Hugging Face serves Ollama manifests, so
- *     `hf.co/<repo>:<QUANT>` pulls the exact file the catalogue measured — but that tag is written
- *     by the generator only after it has checked the registry, and it reaches the UI from the
- *     catalogue through Rust. This display helper must not re-derive it: a composed-here tag would
- *     be a guess wearing a verified tag's clothes.
- */
-export function installCommand(
-  runner: "ollama" | "lmstudio" | "llama-server",
-  repo: string,
-  quant: string | null,
-): string | null {
-  if (runner !== "llama-server") return null;
-  return `llama-server -hf ${repo}${quant ? `:${quant}` : ""}`;
 }

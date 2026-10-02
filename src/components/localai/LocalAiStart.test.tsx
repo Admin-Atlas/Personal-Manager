@@ -119,6 +119,13 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
 }));
 
 import { LocalAiSettings } from "./LocalAiSettings";
+import {
+  ACTION_MIRRORS,
+  COPY_COLLISIONS,
+  SAME_SECTION_POINTERS,
+  type StepAction,
+} from "./readiness";
+import { sectionLabel } from "./sections";
 
 afterEach(cleanup);
 
@@ -303,6 +310,9 @@ beforeEach(() => {
 /** The start section. */
 const start = () => document.getElementById("sec-localai-start") as HTMLElement;
 
+/** Any section, by its anchor. */
+const section = (id: string) => document.getElementById(id) as HTMLElement;
+
 /** Whether an element is on screen — not inside a closed fold, whose body is `inert`. */
 const shown = (el: Element) => el.closest("[inert]") === null;
 
@@ -348,6 +358,31 @@ describe("a fresh install's first paint", () => {
     now.mockRestore();
   });
 
+  it("never probes the local ports for someone already connected", async () => {
+    // The tab mounts before its config read lands, and "not connected" assumed in that moment sent
+    // every long-connected user's visit a probe of three local ports — whatever runs on 8080 included.
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    await mount();
+    await waitFor(() => expect(start().textContent).toContain("Your server is answering at"));
+    fireEvent.focus(window);
+    expect(probeLocalLlmPorts).not.toHaveBeenCalled();
+  });
+
+  it("says a failed read of the setup, rather than reading it forever", async () => {
+    // Nothing reads the config again until the tab does, so "Reading…" and "Checking…" would never
+    // end. The error itself is Model server's to say.
+    getLocalLlmConfig.mockRejectedValue(new Error("the keychain is locked"));
+    render(<LocalAiSettings />);
+    await waitFor(() =>
+      expect(start().textContent).toContain(
+        "PM couldn't read your local AI setup, so it can't say where things stand.",
+      ),
+    );
+    expect(start().textContent).not.toContain("Reading your local AI setup");
+    expect(within(start()).getByText("Needs attention", { selector: "h2 + span" })).toBeTruthy();
+    expect(section("sec-localai-endpoint").textContent).toContain("the keychain is locked");
+  });
+
   it("shows the runner guide for the one chosen, and nowhere else", async () => {
     await mount();
     await screen.findByRole("group", { name: "Server to install" });
@@ -381,6 +416,21 @@ describe("step 1 with a server found", () => {
     await waitFor(() => expect(setLocalLlmEndpoint).toHaveBeenCalledWith("http://127.0.0.1:11434"));
     expect(setLocalLlmEndpoint).toHaveBeenCalledTimes(1);
     expect(setLocalLlmToken).not.toHaveBeenCalled();
+  });
+
+  it("points the pick's settings at steps that will be there, not ones that aren't yet", async () => {
+    // Model server's "Settings PM's numbers assume" only renders once something is connected.
+    probeLocalLlmPorts.mockResolvedValue([OLLAMA]);
+    await mount();
+    await within(start()).findByRole("button", { name: "Connect to Ollama" });
+    expect(start().textContent).toContain(
+      `the steps are under ${sectionLabel("sec-localai-endpoint")}, in “Settings PM's numbers assume”, once you've connected.`,
+    );
+    expect(
+      within(section("sec-localai-endpoint")).queryByRole("button", {
+        name: /Settings PM's numbers assume/,
+      }),
+    ).toBeNull();
   });
 
   it("says a refused connect in the start card, where it was asked for", async () => {
@@ -749,6 +799,348 @@ describe("Depth never hides what justifies the pick", () => {
     // The parameter count is detail, and only that.
     expect(text).not.toContain("7.62B parameters");
   });
+});
+
+describe("the pick's reason says at which context it fits", () => {
+  it("in the pick's own line and in How PM picks", async () => {
+    // A larger model that only fits the card with less than PM sizes for is passed over, so "the
+    // largest that fits entirely on your graphics card" is only true at that context.
+    getLocalLlmConfig.mockResolvedValue(cfg());
+    await mount();
+    await within(start()).findByText("PM's pick for this computer");
+    const text = start().textContent ?? "";
+    expect(text).toContain(
+      "The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for",
+    );
+    expect(text).toContain(
+      "runs entirely on your graphics card with the room PM keeps free, at the context PM sizes it for — 32k tokens, less for a model made for less, and more for one your server already runs with more — because",
+    );
+  });
+});
+
+describe("every start-card action makes the write its section control makes", () => {
+  // `ACTION_MIRRORS` names, for each kind of action, the ipc wrappers it calls and the section
+  // control that already makes those calls. Each case presses the start card's button in one render
+  // and the control in another; both must make every call the table names, the same calls, and no
+  // other write. A kind added to the table without a case here fails to compile.
+  const WRITES = {
+    setLocalLlmEndpoint,
+    setLocalLlmToken,
+    pullLocalModel,
+    setLocalLlmRoleModel,
+    setLocalLlmRouting,
+    testLocalLlm,
+    releaseLocalGpu,
+  };
+  const WRAPPERS: Record<string, ReturnType<typeof vi.fn>> = { ...WRITES, probeLocalLlmPorts };
+
+  interface MirrorCase {
+    arrange: () => void;
+    /** Wait until the tab has settled where the press happens. */
+    ready?: () => Promise<void>;
+    start: () => Promise<void>;
+    control: () => Promise<void>;
+    /** What of a call must match, when not all of it can. */
+    same?: (call: unknown[]) => unknown[];
+  }
+
+  const ownedServed = () =>
+    recs({
+      pick: {
+        kind: "owned",
+        id: "qwen2.5:latest",
+        repo: QWEN,
+        display_name: "Qwen2.5 7B Instruct",
+        served: true,
+        source: null,
+        path: null,
+        shards: 1,
+        measured: true,
+        fit: fit(),
+        basis: "gpu",
+      },
+    });
+  const working = () => {
+    getLocalLlmConfig.mockResolvedValue(
+      cfg({
+        chat_model: "qwen2.5:latest",
+        background_model: "qwen2.5:latest",
+        chat_routing: "local",
+        background_routing: "local",
+      }),
+    );
+    listLocalLlmModels.mockResolvedValue(served("qwen2.5:latest"));
+    localLlmStatus.mockResolvedValue(status({ effective: "local_only", cloud_key: "absent" }));
+  };
+  const lookedOnce = async () => {
+    await waitFor(() => expect(probeLocalLlmPorts).toHaveBeenCalledTimes(1));
+    await within(start()).findByRole("button", { name: "Look now" });
+  };
+
+  const CASES: Record<StepAction["kind"], MirrorCase> = {
+    connect: {
+      arrange: () => probeLocalLlmPorts.mockResolvedValue([OLLAMA]),
+      start: async () => {
+        fireEvent.click(await within(start()).findByRole("button", { name: "Connect to Ollama" }));
+        await waitFor(() => expect(setLocalLlmEndpoint).toHaveBeenCalled());
+      },
+      control: async () => {
+        const endpoint = section("sec-localai-endpoint");
+        fireEvent.click(
+          await within(endpoint).findByRole("button", { name: `Ollama — ${OLLAMA.url}` }),
+        );
+        fireEvent.click(within(endpoint).getByRole("button", { name: "Connect" }));
+        await waitFor(() => expect(setLocalLlmEndpoint).toHaveBeenCalled());
+      },
+    },
+    detect: {
+      arrange: () => {},
+      ready: lookedOnce,
+      start: async () => {
+        fireEvent.click(within(start()).getByRole("button", { name: "Look now" }));
+        await waitFor(() => expect(probeLocalLlmPorts).toHaveBeenCalledTimes(2));
+      },
+      control: async () => {
+        fireEvent.click(
+          within(section("sec-localai-endpoint")).getByRole("button", {
+            name: "Auto-detect a local server",
+          }),
+        );
+        await waitFor(() => expect(probeLocalLlmPorts).toHaveBeenCalledTimes(2));
+      },
+    },
+    download: {
+      arrange: () => getLocalLlmConfig.mockResolvedValue(cfg()),
+      ready: async () => {
+        await within(start()).findByRole("button", { name: "Download (5.1 GB)" });
+      },
+      start: async () => {
+        fireEvent.click(within(start()).getByRole("button", { name: "Download (5.1 GB)" }));
+        await waitFor(() => expect(pullLocalModel).toHaveBeenCalled());
+      },
+      control: async () => {
+        fireEvent.click(
+          within(section("sec-localai-models")).getAllByRole("button", { name: /^download$/i })[0],
+        );
+        await waitFor(() => expect(pullLocalModel).toHaveBeenCalled());
+      },
+      // One Download per tag: the start card's is the pick's rung and All models' the model's other
+      // one, so they fetch two files of one model with the same call.
+      same: (call) => [String(call[0]).startsWith(`hf.co/${QWEN}:`)],
+    },
+    assign: {
+      arrange: () => {
+        getLocalLlmConfig.mockResolvedValue(cfg());
+        listLocalLlmModels.mockResolvedValue(served("qwen2.5:latest"));
+        localModelRecommendations.mockResolvedValue(ownedServed());
+        localLlmStatus.mockResolvedValue(status({ effective: "cloud", cloud_key: "present" }));
+      },
+      ready: async () => {
+        await within(start()).findByRole("button", { name: "Use Qwen2.5 7B Instruct for both" });
+      },
+      start: async () => {
+        fireEvent.click(
+          within(start()).getByRole("button", { name: "Use Qwen2.5 7B Instruct for both" }),
+        );
+        await waitFor(() => expect(setLocalLlmRouting).toHaveBeenCalledTimes(2));
+      },
+      control: async () => {
+        const roles = section("sec-localai-roles");
+        const set = (name: string, value: string) =>
+          fireEvent.change(within(roles).getByRole("combobox", { name }), { target: { value } });
+        set("Chat model", "qwen2.5:latest");
+        set("Background work model", "qwen2.5:latest");
+        set("Where chat runs", "local-then-cloud");
+        set("Where background work runs", "local-then-cloud");
+        await waitFor(() => expect(setLocalLlmRouting).toHaveBeenCalledTimes(2));
+      },
+    },
+    test: {
+      arrange: () => {
+        working();
+        testLocalLlm.mockReturnValue(new Promise(() => {}));
+      },
+      ready: async () => {
+        await within(start()).findByRole("button", { name: "Send a test message" });
+      },
+      start: async () => {
+        fireEvent.click(within(start()).getByRole("button", { name: "Send a test message" }));
+        await waitFor(() => expect(testLocalLlm).toHaveBeenCalled());
+      },
+      control: async () => {
+        const roles = section("sec-localai-roles");
+        fireEvent.click(within(roles).getAllByRole("button", { name: /^test it$/i })[0]);
+        await waitFor(() => expect(testLocalLlm).toHaveBeenCalled());
+      },
+    },
+    release: {
+      arrange: () => {
+        working();
+        localGpuResidency.mockResolvedValue({
+          resident: [{ model: "qwen2.5:latest", size_gb: 7, size_vram_gb: 6.5, pm_loaded: true }],
+          vram_gb: 7.96,
+          dgpu_displays: [],
+          policy: "server",
+          idle_minutes: 5,
+          no_unload_route: false,
+        });
+      },
+      ready: async () => {
+        await within(start()).findByRole("button", { name: "Free it now" });
+        const lifecycle = section("sec-localai-lifecycle");
+        await waitFor(() =>
+          expect(
+            (within(lifecycle).getByRole("button", { name: "Release now" }) as HTMLButtonElement)
+              .disabled,
+          ).toBe(false),
+        );
+      },
+      start: async () => {
+        fireEvent.click(within(start()).getByRole("button", { name: "Free it now" }));
+        await waitFor(() => expect(releaseLocalGpu).toHaveBeenCalled());
+      },
+      control: async () => {
+        fireEvent.click(
+          within(section("sec-localai-lifecycle")).getByRole("button", { name: "Release now" }),
+        );
+        await waitFor(() => expect(releaseLocalGpu).toHaveBeenCalled());
+      },
+    },
+    locate: {
+      arrange: () => {
+        getLocalLlmConfig.mockResolvedValue(cfg());
+        localModelRecommendations.mockResolvedValue(recs({ pick: undefined }));
+      },
+      ready: async () => {
+        await within(start()).findByRole("button", { name: "Go to All models" });
+      },
+      start: async () => {
+        fireEvent.click(within(start()).getByRole("button", { name: "Go to All models" }));
+        await waitFor(() =>
+          expect(
+            screen.getByRole("button", { name: "Show the model" }).getAttribute("aria-expanded"),
+          ).toBe("true"),
+        );
+      },
+      control: async () => {},
+    },
+  };
+
+  /** Render the tab as `c` arranges it, press with `press`, and return the calls each wrapper saw
+   *  during the press — functions (a progress callback) as a placeholder, since each render has
+   *  its own. */
+  async function pressed(c: MirrorCase, press: () => Promise<void>) {
+    vi.clearAllMocks();
+    c.arrange();
+    await mount();
+    await c.ready?.();
+    const before = Object.fromEntries(
+      Object.entries(WRAPPERS).map(([n, f]) => [n, f.mock.calls.length]),
+    );
+    await press();
+    const calls = Object.fromEntries(
+      Object.entries(WRAPPERS).map(([n, f]) => [
+        n,
+        f.mock.calls
+          .slice(before[n])
+          .map((call) =>
+            c.same ? c.same(call) : call.map((a) => (typeof a === "function" ? "fn" : a)),
+          ),
+      ]),
+    );
+    cleanup();
+    return calls;
+  }
+
+  for (const [kind, c] of Object.entries(CASES) as [StepAction["kind"], MirrorCase][]) {
+    it(`${kind}: ${ACTION_MIRRORS[kind].control ?? "writes nothing"}`, async () => {
+      const mirror = ACTION_MIRRORS[kind];
+      const fromStart = await pressed(c, c.start);
+      for (const n of mirror.ipc) expect(fromStart[n]?.length, n).toBeGreaterThan(0);
+      for (const n of Object.keys(WRITES))
+        if (!mirror.ipc.includes(n)) expect(fromStart[n], `${n} from the start card`).toEqual([]);
+      if (mirror.control === null) return;
+      const fromControl = await pressed(c, c.control);
+      expect(fromControl).toEqual(fromStart);
+    });
+  }
+});
+
+describe("the rendered card keeps the tab's copy rules", () => {
+  // readiness.test.ts and pickWords.test.ts sweep the words those modules make. This sweeps the card
+  // as rendered — what it adds itself (the better-fit line, what the server is holding, "How PM
+  // picks") and the server guide it shows — against the same two lists.
+  const states: Array<[string, () => void]> = [
+    ["fresh", () => {}],
+    ["detected", () => probeLocalLlmPorts.mockResolvedValue([OLLAMA])],
+    [
+      "connected, a better fit, PM's model loaded",
+      () => {
+        getLocalLlmConfig.mockResolvedValue(
+          cfg({
+            chat_model: "gemma3:4b",
+            background_model: "gemma3:4b",
+            chat_routing: "local-then-cloud",
+            background_routing: "local-then-cloud",
+          }),
+        );
+        listLocalLlmModels.mockResolvedValue(served("gemma3:4b"));
+        localLlmStatus.mockResolvedValue(status({ effective: "local_then_cloud" }));
+        localBetterFitNotice.mockResolvedValue({
+          repo: QWEN,
+          display_name: "Qwen2.5 7B Instruct",
+          replaces: "gemma3:4b",
+          already_downloaded: false,
+        });
+        localGpuResidency.mockResolvedValue({
+          resident: [{ model: "gemma3:4b", size_gb: 4, size_vram_gb: 3.5, pm_loaded: true }],
+          vram_gb: 7.96,
+          dgpu_displays: [],
+          policy: "server",
+          idle_minutes: 5,
+          no_unload_route: false,
+        });
+      },
+    ],
+    [
+      "connected, someone else's model loaded",
+      () => {
+        getLocalLlmConfig.mockResolvedValue(
+          cfg({
+            chat_model: "gemma3:4b",
+            background_model: "gemma3:4b",
+            chat_routing: "local",
+            background_routing: "local",
+          }),
+        );
+        listLocalLlmModels.mockResolvedValue(served("gemma3:4b"));
+        localLlmStatus.mockResolvedValue(status({ effective: "local_only", cloud_key: "absent" }));
+        localGpuResidency.mockResolvedValue({
+          resident: [{ model: "gemma3:4b", size_gb: 4, size_vram_gb: 3.5, pm_loaded: false }],
+          vram_gb: 7.96,
+          dgpu_displays: [],
+          policy: "server",
+          idle_minutes: 5,
+          no_unload_route: false,
+        });
+      },
+    ],
+  ];
+  for (const [name, arrange] of states) {
+    it(name, async () => {
+      arrange();
+      await mount();
+      await waitFor(() => expect(start().querySelectorAll("li").length).toBeGreaterThan(0));
+      await within(start()).findAllByText(/PM's pick for this computer/);
+      const text = start().textContent ?? "";
+      for (const re of COPY_COLLISIONS) expect(text, `${re}`).not.toMatch(re);
+      const stripped = SAME_SECTION_POINTERS.reduce(
+        (t, re) => t.replace(new RegExp(re.source, `${re.flags}g`), ""),
+        text,
+      );
+      expect(stripped).not.toMatch(/\b(above|below)\b/i);
+    });
+  }
 });
 
 describe("the adopted download's error", () => {

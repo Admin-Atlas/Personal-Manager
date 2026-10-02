@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { activeLocalTest, testLocalLlm } from "../../lib/ipc";
 import type { LocalRole } from "../../lib/localModelState";
@@ -29,6 +29,14 @@ export interface RoleTests {
  * which the tab bumps whenever the stored endpoint or its token changes. A new epoch drops every
  * result and re-reads the backend's job — exactly what remounting the roles section used to do, back
  * when that section held this state and the epoch was its `key`.
+ *
+ * Re-reading it must not bring the old result back. The backend's job keeps its last finished pass
+ * until something clears it, and forgetting the token clears nothing there, so the re-read handed
+ * back the very pass the new epoch had just dropped: "the last test replied in 2.4 s" about a server
+ * that may now refuse PM. So after a new epoch only whether a test is RUNNING is taken from the job,
+ * and a finished result is taken from it again only once this view has run a test of its own
+ * against the new server. The same goes for a test this view started: if the server moves while it
+ * runs, its answer is about the old one and is dropped.
  */
 export function useRoleTests(endpointEpoch: number): RoleTests {
   // Which role's test is in flight, and the last outcome per role. Shared across the two rows
@@ -41,11 +49,21 @@ export function useRoleTests(endpointEpoch: number): RoleTests {
   // The server moved: forget what was proved against the old one. Done while rendering rather than
   // in an effect, so no frame ever shows the old server's pass under the new one's address.
   const [epoch, setEpoch] = useState(endpointEpoch);
+  // Whether a finished result in the backend's job can be about the server as it is now: true on
+  // mount (the job is the only way a result that landed while the tab was away gets shown), false
+  // from a new epoch until a test this view ran against the new server has answered.
+  const [adoptResults, setAdoptResults] = useState(true);
   if (epoch !== endpointEpoch) {
     setEpoch(endpointEpoch);
     setTesting(null);
     setTests({});
+    setAdoptResults(false);
   }
+  // The epoch as of the last commit, for a test's answer to be checked against when it lands.
+  const epochNow = useRef(endpointEpoch);
+  useEffect(() => {
+    epochNow.current = endpointEpoch;
+  }, [endpointEpoch]);
 
   /** Drop a test result the settings above it have just made untrue — the same rule the endpoint
    *  Check follows when the URL or token changes. A pass shown against a model you have since
@@ -63,12 +81,16 @@ export function useRoleTests(endpointEpoch: number): RoleTests {
    *  loaded, yield to chat, own nothing it did not load, record no health verdict) and OWNS the job,
    *  so this promise resolving is a convenience rather than the only way the answer arrives. */
   async function runTest(role: LocalRole) {
+    const asked = endpointEpoch;
     setTesting(role);
     setTests((t) => ({ ...t, [role]: { result: null, error: null } }));
     try {
       const result = await testLocalLlm(role);
+      if (epochNow.current !== asked) return;
       setTests((t) => ({ ...t, [role]: { result, error: null } }));
+      setAdoptResults(true);
     } catch (e) {
+      if (epochNow.current !== asked) return;
       setTests((t) => ({ ...t, [role]: { result: null, error: String(e) } }));
     } finally {
       setTesting(null);
@@ -91,7 +113,7 @@ export function useRoleTests(endpointEpoch: number): RoleTests {
         .then((snap) => {
           if (cancelled || !snap) return;
           setTesting(snap.running ? snap.role : null);
-          if (snap.result) {
+          if (snap.result && adoptResults) {
             setTests((t) => ({
               ...t,
               [snap.role]: { result: snap.result, error: null },
@@ -113,7 +135,7 @@ export function useRoleTests(endpointEpoch: number): RoleTests {
       cancelled = true;
       clearInterval(id);
     };
-  }, [testing, endpointEpoch]);
+  }, [testing, endpointEpoch, adoptResults]);
 
   return { testing, tests, runTest, clearTest };
 }

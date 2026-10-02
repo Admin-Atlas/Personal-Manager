@@ -713,9 +713,9 @@ pub fn model_in(resident: &[ResidentModel], model: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResidentModel {
     pub model: String,
-    /// Total bytes the server placed for it, in GB.
+    /// Total bytes the server placed for it, in GiB.
     pub size_gb: f64,
-    /// The share of that it reports as being on the GPU, in GB.
+    /// The share of that it reports as being on the GPU, in GiB.
     ///
     /// A FLOOR, not a measurement. It counts the weights the server placed and excludes the CUDA
     /// context and compute buffers: measured on a laptop card, a model reporting 2.70 GiB here was
@@ -739,12 +739,16 @@ pub fn resident_from_ps(value: &serde_json::Value) -> Vec<ResidentModel> {
                         .get("model")
                         .or_else(|| m.get("name"))
                         .and_then(|n| n.as_str())?;
+                    // GiB, like every other `*_gb` the Local AI tab shows and compares: these sit
+                    // beside the card's `vram_gb` and are rendered with `formatGib`. They were 1e9
+                    // bytes, which read a load 7.4% larger than the same load anywhere else.
+                    let gib = |key: &str| {
+                        m.get(key).and_then(|s| s.as_u64()).unwrap_or(0) as f64 / 1_073_741_824.0
+                    };
                     Some(ResidentModel {
                         model: name.to_string(),
-                        size_gb: m.get("size").and_then(|s| s.as_u64()).unwrap_or(0) as f64 / 1e9,
-                        size_vram_gb: m.get("size_vram").and_then(|s| s.as_u64()).unwrap_or(0)
-                            as f64
-                            / 1e9,
+                        size_gb: gib("size"),
+                        size_vram_gb: gib("size_vram"),
                         context_length: m
                             .get("context_length")
                             .and_then(|c| c.as_u64())
@@ -1848,11 +1852,12 @@ mod tests {
             resident[0].model,
             "hf.co/ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
         );
-        assert!((resident[0].size_gb - 2.896).abs() < 0.001);
+        // 2_896_083_024 bytes in GiB — the 2.70 the comment below quotes, not 2.90 in decimal GB.
+        assert!((resident[0].size_gb - 2.697).abs() < 0.001);
         // `size_vram` is carried, but it is a FLOOR: on this measurement the card was actually
         // holding 3.95 GiB against the 2.70 GiB reported, because the CUDA context and compute
         // buffers sit outside it. Nothing may use this to prove something fits.
-        assert!((resident[0].size_vram_gb - 2.896).abs() < 0.001);
+        assert!((resident[0].size_vram_gb - 2.697).abs() < 0.001);
 
         // Nothing loaded, and a body that is not a `/api/ps` answer at all, both read as "nothing".
         let empty: serde_json::Value = serde_json::from_str(r#"{"models":[]}"#).unwrap();

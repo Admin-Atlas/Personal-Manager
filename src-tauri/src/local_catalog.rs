@@ -53,6 +53,10 @@ pub struct CatalogEntry {
     /// entry always carries a projector size (it drops the flag otherwise), so this is `Some` iff
     /// `multimodal`.
     pub projector_gb: Option<f64>,
+    /// What a token costs this model's KV cache, read from its GGUF header's attention geometry.
+    /// `None` only when the generator could not read that header, and the fit then falls back to
+    /// its parameter-count proxy — the committed catalogue carries it on every entry (pinned below).
+    pub kv_cache: Option<CatalogKvCache>,
     pub fit: FitClass,
     pub quants: Vec<CatalogQuant>,
     /// What this model's weights are licensed under. Required, not optional: an entry with no
@@ -80,6 +84,21 @@ pub struct EntryLicence {
     pub open: bool,
     /// A plain-language paragraph, written for a person to read in the download dialog.
     pub summary: String,
+}
+
+/// A catalogue entry's KV-cache geometry, in bytes at f16 (`kvFromHeader` in the generator says
+/// where each figure comes from). Bridged into [`fit::KvGeometry`] by [`entry_to_spec`].
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogKvCache {
+    /// What one token adds across the layers whose cache spans the whole context.
+    pub bytes_per_token: f64,
+    /// What one token adds across the sliding-window layers, which hold only `window` tokens.
+    pub window_bytes_per_token: f64,
+    /// The sliding window in tokens, or `None` when the model has no sliding layers.
+    pub window: Option<u32>,
+    /// A hybrid model's fixed recurrent state, f32 (0 when it has none).
+    pub state_bytes: f64,
 }
 
 /// One downloadable quantization with its measured on-disk size.
@@ -278,6 +297,14 @@ pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
         target_context: entry.context_length,
         projector_gb: entry.projector_gb,
         candidates,
+        // Every spec PM builds for a model starts here — the card, a served copy, a file on disk —
+        // so all of them are sized from the entry's real attention geometry, not the proxy.
+        kv_geometry: entry.kv_cache.map(|kv| fit::KvGeometry {
+            bytes_per_token: kv.bytes_per_token,
+            window_bytes_per_token: kv.window_bytes_per_token,
+            window: kv.window.unwrap_or(0),
+            state_bytes: kv.state_bytes,
+        }),
     }
 }
 
@@ -397,7 +424,7 @@ mod tests {
         // Pinned, not `>=`: the version is decoration unless something compares it. Bumping it in
         // the generator without landing the matching Rust change fails here rather than at runtime.
         assert_eq!(
-            cat.schema_version, 3,
+            cat.schema_version, 4,
             "catalog schema version must match what this module parses"
         );
         assert!(
@@ -421,6 +448,27 @@ mod tests {
             );
             assert!(e.context_length >= 256, "{}: context", e.repo);
             assert!(!e.quants.is_empty(), "{}: needs at least one quant", e.repo);
+
+            // Every entry is sized from its own attention geometry. An entry without one falls back
+            // to the parameter-count proxy, which under-counted Phi 3.5 mini 13x and is exactly what
+            // made PM recommend configs that did not fit — so a regenerated catalogue that lost the
+            // figure for any entry fails here rather than quietly going back to it.
+            let kv = e
+                .kv_cache
+                .unwrap_or_else(|| panic!("{}: no KV geometry from its GGUF header", e.repo));
+            assert!(
+                kv.bytes_per_token > 0.0
+                    && kv.window_bytes_per_token >= 0.0
+                    && kv.state_bytes >= 0.0,
+                "{}: KV geometry {kv:?}",
+                e.repo
+            );
+            assert_eq!(
+                kv.window.is_some(),
+                kv.window_bytes_per_token > 0.0,
+                "{}: a sliding window comes with sliding layers, and only then",
+                e.repo
+            );
 
             // Generator invariant: multimodal iff a projector size is present.
             assert_eq!(
@@ -507,6 +555,43 @@ mod tests {
         assert!(
             cat.entries.iter().any(|e| e.licence.open),
             "catalog should still contain at least one open-licence model"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_carries_the_attention_geometry_the_fit_was_calibrated_against() {
+        // The two entries measured on a real card (fit.rs
+        // `the_estimate_brackets_the_loads_measured_on_a_real_card`), the one the proxy got most
+        // wrong, and a hybrid. Read off each GGUF header on 02-10-2026.
+        let geometry = |repo: &str| {
+            let e = catalog().entries.iter().find(|e| e.repo == repo).unwrap();
+            entry_to_spec(e).kv_geometry.unwrap()
+        };
+        let g = |full: f64, windowed: f64, window: u32, state: f64| fit::KvGeometry {
+            bytes_per_token: full,
+            window_bytes_per_token: windowed,
+            window,
+            state_bytes: state,
+        };
+        // 28 layers × 4 KV heads × 128 × K,V × 2 bytes.
+        assert_eq!(
+            geometry("bartowski/Qwen2.5-7B-Instruct-GGUF"),
+            g(57_344.0, 0.0, 0, 0.0)
+        );
+        // Five global layers and 29 sliding ones, window 1024.
+        assert_eq!(
+            geometry("ggml-org/gemma-3-4b-it-GGUF"),
+            g(20_480.0, 118_784.0, 1024, 0.0)
+        );
+        // No grouped-query attention: 32 layers × 32 KV heads × 96 × 2 × 2.
+        assert_eq!(
+            geometry("bartowski/Phi-3.5-mini-instruct-GGUF"),
+            g(393_216.0, 0.0, 0, 0.0)
+        );
+        // A hybrid: a cache on 8 of 32 layers, a fixed state on the other 24.
+        assert_eq!(
+            geometry("unsloth/Qwen3.5-4B-GGUF"),
+            g(32_768.0, 0.0, 0, 52_690_944.0)
         );
     }
 

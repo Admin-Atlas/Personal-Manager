@@ -223,7 +223,11 @@ export function DownloadedModels({
           {/* The first few, then the rest folded — no inner scroller, so the wheel moves the tab. */}
           <div className="space-y-2">
             {recs.on_disk.slice(0, FIRST).map((m) => (
-              <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
+              <OnDiskCard
+                key={`${m.source}:${m.path}:${m.name}`}
+                model={m}
+                connected={configured}
+              />
             ))}
           </div>
           {recs.on_disk.length > FIRST && (
@@ -234,7 +238,11 @@ export function DownloadedModels({
             >
               <div className="mt-2 space-y-2">
                 {recs.on_disk.slice(FIRST).map((m) => (
-                  <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
+                  <OnDiskCard
+                    key={`${m.source}:${m.path}:${m.name}`}
+                    model={m}
+                    connected={configured}
+                  />
                 ))}
               </div>
             </Collapsible>
@@ -283,10 +291,12 @@ function runsIn(fit: LocalFitResult): string {
   }
 }
 
-function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
+function OnDiskCard({ model, connected }: { model: LocalOnDiskModel; connected: boolean }) {
   const { showMeta } = useDepth();
   // The same words the start card uses for PM's pick when it is a file on this computer.
-  const how = onDiskHow(model.source, model.shards, model.path, model.fit);
+  // Connected or not changes the advice: an Ollama-folder file shows up by itself only once Ollama
+  // is connected, and while connected the listing has already taken out everything served.
+  const how = onDiskHow(model.source, model.shards, model.path, model.fit, connected);
   return (
     <div className="rounded-[var(--radius-sm)] border border-border px-3 py-2">
       <div className="flex flex-wrap items-baseline justify-between gap-2">

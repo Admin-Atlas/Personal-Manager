@@ -7,20 +7,15 @@
 // LM Studio, 8080 llama-server). A guide that tells you to connect to a port PM never looks at is
 // worse than no guide, and nothing else would catch a drift between the two lists.
 //
-// And `installCommand` must keep refusing to invent a command. Only llama-server documents taking a
-// Hugging Face repo id (`-hf <user>/<model>[:quant]`), which is exactly what the catalogue stores.
-// Ollama DOES accept `hf.co/<repo>:<quant>` — that is what the Download button pulls since #793 —
-// but only the catalogue's per-quant tag is byte-verified against the HF tree, so this DISPLAY
-// helper must never re-derive one (workbenchGuide.ts documents the rule; the verified tag arrives
-// as data). LM Studio's `lms get` documentation still never says an HF repo id is accepted, so LM
-// Studio gets no command at all. A copy box with a command that silently does nothing — or fetches
-// an unverified file — is the outcome being guarded against.
+// (The per-model commands left this file: All models prints `hfServeCommand`, which carries the
+// context and cache PM sized each model at, and the catalogue's own verified Ollama tag. Its tests
+// are with the catalogue's.)
 
 import { describe, expect, it } from "vitest";
 
 import { LOCALAI_SECTIONS } from "../components/localai/sections";
 import type { SetupPlatform } from "./setupGuide";
-import { installCommand, runnerGuides, tuningFor, type RunnerName } from "./workbenchGuide";
+import { runnerGuides, tuningFor, type RunnerName } from "./workbenchGuide";
 
 const PLATFORMS: SetupPlatform[] = ["windows", "mac", "linux"];
 
@@ -153,7 +148,7 @@ describe("the settings PM's numbers assume", () => {
     // about a layout the guide cannot see — and several were wrong.
     for (const platform of PLATFORMS) {
       for (const g of runnerGuides(platform)) {
-        for (const text of [...g.steps, g.models]) {
+        for (const text of [...g.steps, g.models, g.whileConnected]) {
           expect(text, `${g.name} on ${platform}`).not.toMatch(/\b(above|below)\b/i);
         }
       }
@@ -167,7 +162,7 @@ describe("the settings PM's numbers assume", () => {
     const named = new Set<string>();
     for (const platform of PLATFORMS) {
       for (const g of runnerGuides(platform)) {
-        for (const text of [...g.steps, g.models]) {
+        for (const text of [...g.steps, g.models, g.whileConnected]) {
           for (const name of ["Your local model", "Model server", "All models"]) {
             if (text.includes(name)) named.add(name);
           }
@@ -181,13 +176,65 @@ describe("the settings PM's numbers assume", () => {
     for (const name of named) expect(labels.has(name), name).toBe(true);
   });
 
-  it("no longer says llama-server's default context is small", () => {
-    // `-c` defaults to 0, "loaded from model": the model's whole trained context.
+  it("no longer says llama-server's default context is small, or that it trims a long prompt", () => {
+    // `-c` defaults to 0, "loaded from model": the model's whole trained context. And with context
+    // shift off by default, the server answers a prompt longer than its context with a 400
+    // (`exceed_context_size_error`) — it never drops the oldest part.
     for (const platform of PLATFORMS) {
       const llama = runnerGuides(platform).find((g) => g.name === "llama-server");
       const ctx = llama?.steps.find((step) => step.includes("--ctx-size"));
       expect(ctx).toMatch(/whole trained context/);
       expect(ctx).not.toMatch(/far smaller/);
+      expect(ctx).toMatch(/refused with an error, not trimmed/);
+      for (const step of llama?.steps ?? []) {
+        expect(step).not.toMatch(/discards the oldest|rather than refusing/);
+      }
+    }
+  });
+
+  it("sets the number PM sized its pick for, on every server and platform", () => {
+    // The pick card says "PM sized this for an 8k context … the steps are …", and the steps it
+    // pointed at said 32768 whatever the pick was. Followed, they ran the model at a context PM
+    // never sized — and above it, into the spill their own warning describes.
+    for (const platform of PLATFORMS) {
+      const guides = runnerGuides(platform, 8192);
+      const step = (name: string, needle: string) =>
+        guides.find((g) => g.name === name)?.steps.find((s) => s.includes(needle)) ?? "";
+      const ollama = step("Ollama", "OLLAMA_CONTEXT_LENGTH");
+      expect(ollama, platform).toMatch(
+        /OLLAMA_CONTEXT_LENGTH[ =]8192|OLLAMA_CONTEXT_LENGTH` as 8192/,
+      );
+      expect(ollama, platform).not.toContain("32768");
+      expect(ollama, platform).toContain("8192 is the context PM sized its pick for.");
+      expect(step("llama-server", "--ctx-size"), platform).toContain("`--ctx-size 8192`");
+      expect(step("LM Studio", "context length"), platform).toContain("context length to 8192");
+      // The fold under Model server says the same as the guide, word for word.
+      expect(guides[0].steps).toContain(tuningFor("Ollama", platform, 8192)?.context);
+      expect(tuningFor("llama-server", platform, 8192)?.context).toContain("`--ctx-size 8192`");
+      expect(tuningFor("LM Studio", platform, 8192)?.context).toContain("context length to 8192");
+    }
+  });
+
+  it("claims nothing about a pick it wasn't given, or one sized at what a server starts with", () => {
+    for (const pickContext of [null, 4096]) {
+      for (const g of runnerGuides("linux", pickContext)) {
+        for (const step of g.steps) expect(step).not.toMatch(/sized its pick for/);
+      }
+      const ollama = runnerGuides("linux", pickContext)[0].steps.find((s) =>
+        s.includes("OLLAMA_CONTEXT_LENGTH"),
+      );
+      expect(ollama).toContain("OLLAMA_CONTEXT_LENGTH=32768");
+    }
+  });
+
+  it("tells LM Studio and llama-server about the compressed cache too, after the context", () => {
+    for (const platform of PLATFORMS) {
+      for (const name of ["LM Studio", "llama-server"]) {
+        const steps = runnerGuides(platform).find((g) => g.name === name)?.steps ?? [];
+        const ctx = steps.findIndex((s) => /context length|context-length|--ctx-size/.test(s));
+        const kv = steps.findIndex((s) => /q8_0/i.test(s) && /compressed/.test(s));
+        expect(kv, `${name} on ${platform}`).toBe(ctx + 1);
+      }
     }
   });
 
@@ -210,17 +257,29 @@ describe("the settings PM's numbers assume", () => {
   });
 });
 
-describe("installCommand", () => {
-  const repo = "bartowski/Qwen2.5-7B-Instruct-GGUF";
-
-  it("gives llama-server the documented -hf form, with the quant PM picked", () => {
-    expect(installCommand("llama-server", repo, "Q4_K_M")).toBe(`llama-server -hf ${repo}:Q4_K_M`);
-    // The quant is optional in llama.cpp's own syntax, so an unscored model still gets a command.
-    expect(installCommand("llama-server", repo, null)).toBe(`llama-server -hf ${repo}`);
+describe("the step that brings you back to PM", () => {
+  // The guides render in two places with different truths. In the start card's step 1 nothing is
+  // connected, PM looks for a server every half minute, and it offers to connect what it finds. In
+  // Model server's comparison a server can be connected already, PM has stopped looking, and the
+  // only way to another server is Disconnect — so "it finds Ollama by itself" was a wait for nothing.
+  it("names no button that isn't there once a server has been found", () => {
+    // The comparison also shows while a server is found but not connected, where step 1 is a
+    // Connect button and there is no Look now.
+    for (const platform of PLATFORMS) {
+      for (const g of runnerGuides(platform)) {
+        expect(g.steps[g.steps.length - 1], `${g.name} on ${platform}`).not.toMatch(/Look now/);
+      }
+    }
   });
 
-  it("invents nothing for the two runners that don't take a Hugging Face repo id", () => {
-    expect(installCommand("ollama", repo, "Q4_K_M")).toBeNull();
-    expect(installCommand("lmstudio", repo, "Q4_K_M")).toBeNull();
+  it("has a version for someone connected, that starts with disconnecting", () => {
+    for (const platform of PLATFORMS) {
+      for (const g of runnerGuides(platform)) {
+        expect(g.whileConnected, `${g.name} on ${platform}`).toMatch(
+          /^To switch to it, press Disconnect… under Model server/,
+        );
+        expect(g.whileConnected).not.toMatch(/Look now/);
+      }
+    }
   });
 });

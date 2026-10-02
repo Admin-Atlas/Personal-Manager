@@ -45,8 +45,9 @@ import {
  * result in the roles section proves a MODEL on a SERVER and the server has just moved.
  *
  * What the port probe found is the tab's (`useServerDetect`), so this list and the start card's step
- * 1 are one answer; while nothing is connected, the start card holds the install guide, and this
- * section points there rather than keeping a second copy.
+ * 1 are one answer. While step 1 is showing the install guide, this section points there rather than
+ * keeping a second copy; whenever it isn't — a server was found, or one is connected — the
+ * comparison here is the guide, so there is always one on the page.
  */
 export function LocalAiEndpoint({
   config,
@@ -60,6 +61,8 @@ export function LocalAiEndpoint({
   onTuningOpenChange,
   detected,
   onDetect,
+  guideInStart,
+  pickContext,
 }: {
   config: LocalLlmConfig | null;
   status: LocalLlmStatus | null;
@@ -80,6 +83,10 @@ export function LocalAiEndpoint({
   detected: DetectedEndpoint[] | null;
   /** Look again now, resolving to what was found. */
   onDetect: () => Promise<DetectedEndpoint[]>;
+  /** The start card's step 1 is showing the install guide right now. */
+  guideInStart: boolean;
+  /** The context PM sized its pick for, so the steps here set that number — or null with no pick. */
+  pickContext: number | null;
 }) {
   const [urlInput, setUrlInput] = useState("");
   // Whether this section's own Auto-detect has been pressed: the probe also runs by itself, and
@@ -108,7 +115,10 @@ export function LocalAiEndpoint({
   // The two settings PM sized its numbers for, worded for the server this is — or nothing, for a
   // server PM can't name by its port.
   const runner = runnerOf(storedUrl);
-  const tuning = tuningFor(runner);
+  const tuning = tuningFor(runner, undefined, pickContext);
+  // The comparison is the guide whenever step 1 isn't: once a server is found, step 1 is a Connect
+  // button, and someone with only LM Studio running who wants Ollama had no install steps anywhere.
+  const compare = configured || (detected?.length ?? 0) > 0;
 
   async function autodetect() {
     onError(null);
@@ -291,10 +301,14 @@ export function LocalAiEndpoint({
               </ul>
             </div>
           )}
-          <p className="text-xs text-ink4">
-            Don't have one yet? Step 1 under <SectionLink to="sec-localai-start" /> has the install
-            steps for this computer.
-          </p>
+          {/* Only while it's true: once a server is found, step 1 is a Connect button and the guide
+              is the comparison below this form. */}
+          {guideInStart && (
+            <p className="text-xs text-ink4">
+              Don't have one yet? Step 1 under <SectionLink to="sec-localai-start" /> has the
+              install steps for this computer.
+            </p>
+          )}
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="secondary" onClick={() => void autodetect()}>
               Auto-detect a local server
@@ -392,12 +406,13 @@ export function LocalAiEndpoint({
         </div>
       )}
 
-      {/* Once connected only. "Was one of the others a better choice for me?" is a question you mostly
-          ask AFTER trying one; before anything is connected, the start card's first step is the
-          guide — one guide on the page, not two that could disagree. */}
-      {configured && (
+      {/* Whenever the start card's first step isn't the guide: once connected ("was one of the
+          others a better choice for me?" is a question you mostly ask AFTER trying one), and once a
+          server is found but not yet connected. Before that, step 1 is the guide — one guide on the
+          page, not two that could disagree. */}
+      {compare && (
         <Collapsible title="Compare the three local servers" defaultOpen={false}>
-          <RunnerInstall />
+          <RunnerInstall connected={configured} pickContext={pickContext} />
         </Collapsible>
       )}
 
@@ -504,9 +519,18 @@ function EndpointCheckResult({ check }: { check: EndpointCheck }) {
  *
  *  This used to be the Ollama guide plus one sentence conceding the other two exist, which left a
  *  user who had never installed any of them with no way to tell them apart — and PM auto-detects
- *  all three, so "which one?" is a question PM creates and ought to answer. */
-function RunnerInstall() {
-  const guides = runnerGuides();
+ *  all three, so "which one?" is a question PM creates and ought to answer.
+ *
+ *  `connected`: each guide ends with the step for someone who has to disconnect first, since PM
+ *  doesn't look for another server while one is connected. */
+function RunnerInstall({
+  connected,
+  pickContext,
+}: {
+  connected: boolean;
+  pickContext: number | null;
+}) {
+  const guides = runnerGuides(undefined, pickContext);
   return (
     <div className="mt-1 text-xs text-ink4">
       <p>
@@ -516,7 +540,7 @@ function RunnerInstall() {
       </p>
       <div className="mt-3 space-y-3">
         {guides.map((g) => (
-          <RunnerGuideCard key={g.name} guide={g} />
+          <RunnerGuideCard key={g.name} guide={g} connected={connected} />
         ))}
       </div>
     </div>

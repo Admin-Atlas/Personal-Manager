@@ -59,8 +59,8 @@ export function BatteryReleaseRow({
         </p>
       ) : noUnloadRoute ? (
         <p className="text-xs text-ink4">
-          Your server can't unload a model on request, so this can't do anything with it — see{" "}
-          {lifecycle}.
+          PM can only unload a model through Ollama, so this can't do anything with your server —
+          see {lifecycle}.
         </p>
       ) : batteryIdle == null ? null : batteryIdle > 0 ? (
         <p className="text-xs text-ink4">

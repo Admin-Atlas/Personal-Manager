@@ -29,16 +29,22 @@ export interface ServerDetect {
  * The tab's, so the start card and Model server read one answer: two probes would be two answers,
  * a moment apart. A failed probe is "nothing found", never an error — the ports are the user's, and
  * nothing answering on them is the ordinary state of a fresh install.
+ *
+ * `configured` is null until the tab has read whether something is connected, and nothing is
+ * probed until then: the tab mounts before its config read lands, and a "not connected" assumed in
+ * that moment sent every long-connected user's tab open a probe of three local ports. `detect`
+ * itself still looks whenever it is called, and resolves to what it found.
  */
-export function useServerDetect(configured: boolean): ServerDetect {
+export function useServerDetect(configured: boolean | null): ServerDetect {
   const [detected, setDetected] = useState<DetectedEndpoint[] | null>(null);
   const [detecting, setDetecting] = useState(false);
   const pending = useRef<Promise<DetectedEndpoint[]> | null>(null);
   const lastAt = useRef(0);
   // Read when a look lands, so one that was sent before connecting can't fill the list after it.
-  const configuredRef = useRef(configured);
+  // Not yet known counts as connected here: an answer has nowhere to be shown until the tab knows.
+  const configuredRef = useRef(configured !== false);
   useEffect(() => {
-    configuredRef.current = configured;
+    configuredRef.current = configured !== false;
   }, [configured]);
 
   const detect = useCallback((): Promise<DetectedEndpoint[]> => {
@@ -60,7 +66,7 @@ export function useServerDetect(configured: boolean): ServerDetect {
   }, []);
 
   useEffect(() => {
-    if (configured) {
+    if (configured !== false) {
       setDetected(null);
       return;
     }

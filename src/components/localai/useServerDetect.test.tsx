@@ -20,6 +20,8 @@ vi.mock("../../lib/ipc", () => ({
 import { useServerDetect } from "./useServerDetect";
 
 const OLLAMA: DetectedEndpoint = { url: "http://127.0.0.1:11434", label: "Ollama", models: [] };
+/** The tab's config read hasn't landed yet. */
+const UNREAD: { configured: boolean | null } = { configured: null };
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -47,6 +49,41 @@ describe("useServerDetect", () => {
     renderHook(() => useServerDetect(true));
     await act(async () => {});
     expect(probeLocalLlmPorts).not.toHaveBeenCalled();
+  });
+
+  it("never probes before the tab knows whether anything is connected", async () => {
+    // The tab mounts before its config read lands. Taking that moment for "not connected" sent a
+    // long-connected user's every visit a probe of three local ports, its answer thrown away.
+    const { result, rerender } = renderHook(
+      ({ configured }: { configured: boolean | null }) => useServerDetect(configured),
+      { initialProps: UNREAD },
+    );
+    await act(async () => {});
+    expect(probeLocalLlmPorts).not.toHaveBeenCalled();
+    expect(result.current.detected).toBeNull();
+    rerender({ configured: true });
+    await act(async () => {});
+    expect(probeLocalLlmPorts).not.toHaveBeenCalled();
+  });
+
+  it("looks as soon as the read says nothing is connected", async () => {
+    const { result, rerender } = renderHook(
+      ({ configured }: { configured: boolean | null }) => useServerDetect(configured),
+      { initialProps: UNREAD },
+    );
+    rerender({ configured: false });
+    await waitFor(() => expect(result.current.detected).toEqual([OLLAMA]));
+    expect(probeLocalLlmPorts).toHaveBeenCalledTimes(1);
+  });
+
+  it("still looks when asked before it knows, and keeps the answer off the list", async () => {
+    const { result } = renderHook(() => useServerDetect(null));
+    let found: DetectedEndpoint[] = [];
+    await act(async () => {
+      found = await result.current.detect();
+    });
+    expect(found).toEqual([OLLAMA]);
+    expect(result.current.detected).toBeNull();
   });
 
   it("shares a look already running instead of starting a second", async () => {

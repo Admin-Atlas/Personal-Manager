@@ -139,12 +139,17 @@ export function LocalAiLifecycle({
 
           {residency?.no_unload_route && (
             // Unfolded: a gating fact. Offering a picker that silently does nothing would be worse
-            // than the absence of the feature.
+            // than the absence of the feature. The limit is PM's, not the server's: PM unloads only
+            // through Ollama's own API (`/api/ps` and a zero `keep_alive`), and this server answered
+            // that it hasn't got it. LM Studio can eject a model (in the app, `lms unload`, or its
+            // own REST API since 0.4.0), and a llama-server started with a model holds it until it
+            // stops — so the copy says how to get the memory back on each, rather than that it can't
+            // be done.
             <p className="mt-1 text-xs text-st-due">
-              This server has no way to unload a model on request, so the options below can't do
-              anything with it and are switched off. llama-server keeps its model for as long as it
-              is running, and LM Studio has no unload command — stopping the server is the only way
-              to get the memory back. Ollama can do it.
+              PM can only unload a model through Ollama, so the options below can't do anything with
+              this server and are switched off. To get the memory back yourself: in LM Studio, eject
+              the model (or run <span className="font-mono">lms unload</span>); llama-server holds
+              the model it was started with until you stop it.
             </p>
           )}
 

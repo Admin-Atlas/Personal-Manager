@@ -12,8 +12,19 @@ import { withCode } from "../withCode";
  * hand-kept copies of one card would drift the way the guide's own facts did before `lifecycle` got
  * a field. The guide's strings mark commands with backticks, so every line that can carry one goes
  * through `withCode`: printed raw, the backticks read as part of the command.
+ *
+ * `connected`: a server is connected already, so the last step is the guide's `whileConnected` —
+ * PM stops looking for servers while one is connected, and "it finds it by itself" would be a wait
+ * for something that never happens.
  */
-export function RunnerGuideCard({ guide: g }: { guide: RunnerGuide }) {
+export function RunnerGuideCard({
+  guide: g,
+  connected = false,
+}: {
+  guide: RunnerGuide;
+  connected?: boolean;
+}) {
+  const steps = connected ? [...g.steps.slice(0, -1), g.whileConnected] : g.steps;
   return (
     <div className="rounded-[var(--radius-sm)] border border-border p-2.5">
       <div className="flex flex-wrap items-baseline gap-x-2">
@@ -34,7 +45,7 @@ export function RunnerGuideCard({ guide: g }: { guide: RunnerGuide }) {
         <span className="text-ink3">Staying running:</span> {withCode(g.lifecycle)}
       </p>
       <ol className="ml-4 mt-1.5 list-decimal space-y-1">
-        {g.steps.map((s, i) => (
+        {steps.map((s, i) => (
           <li key={i}>{withCode(s)}</li>
         ))}
       </ol>

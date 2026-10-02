@@ -146,10 +146,13 @@ export function LocalAiRoles({
             // exactly one. This state only became something a user can sit in once the endpoint
             // check learned to accept a server with an empty model list (#790) — before that a
             // fresh runner failed to connect at all, so nothing here had to speak for it.
+            // It names no destination: with no model, a job goes wherever its routing and keys send
+            // it — the cloud for a keyed Cloud or fall-back job, nowhere for a Local only one or a
+            // keyless one — and the line under each job already says which.
             <p className="text-xs text-ink4">
-              This server isn't serving any models yet, so there is nothing to assign and both roles
-              stay on cloud. Download a model into it and it will appear here within about half a
-              minute.
+              This server isn't serving any models yet, so there is nothing to assign yet — the line
+              under each job says where it goes meanwhile. Download a model into it and it will
+              appear here within about half a minute.
             </p>
           )}
           {/* Arithmetic, not a hedge. This used to be one unconditional paragraph fired at every
@@ -270,13 +273,20 @@ const ROUTING_OPTIONS = [
   { value: "local-then-cloud", label: "Local, fall back to cloud" },
 ];
 
+/** When a job set to Local, fall back to cloud goes to the cloud, from what the gateway actually
+ *  falls back on — not only a server that is down: a reply that fails or times out on a running one,
+ *  and a request PM won't send because it is longer than the window the server gives the model. Said
+ *  "only if your server fails" before, which a long chat on a healthy server disproved. */
+const WHEN_SERVER_CANT =
+  "when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model";
+
 /** Who each routing suits — said for the one chosen, so the choice is made against a reason. The
  *  section it names is read from the list, so a rename can't leave it naming a heading that's gone. */
 const GOOD_IF: Record<string, string> = {
   cloud:
     "Good if this computer is slow, or you'd rather not keep a model loaded. What you send goes to OpenRouter.",
   local: `Good if nothing should ever go to the cloud. If your server is down, this job doesn't answer, and ${sectionLabel("sec-localai-power")} never moves it.`,
-  "local-then-cloud": `Good for most setups with a cloud key: your own model when it can, your cloud model when your server is down. It's the only setting ${sectionLabel("sec-localai-power")} can move.`,
+  "local-then-cloud": `Good for most setups with a cloud key: your own model when it can, your cloud model ${WHEN_SERVER_CANT}. It's the only setting ${sectionLabel("sec-localai-power")} can move.`,
 };
 
 /** The routing Select's and the model Select's names, per role. */
@@ -307,7 +317,7 @@ function effectiveLine(
     case "local_only":
       return `Runs on ${model} ${where}, and never uses the cloud.`;
     case "local_then_cloud":
-      return `Runs on ${model} ${where}; your cloud model answers only if your server fails.`;
+      return `Runs on ${model} ${where}; your cloud model answers ${WHEN_SERVER_CANT}.`;
     case "cloud_for_power":
       return `On battery, so this is on your cloud model for now; ${model} is waiting.`;
     case "nothing":

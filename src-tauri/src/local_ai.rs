@@ -516,14 +516,21 @@ pub fn set_local_llm_routing(app: AppHandle, role: String, pref: String) -> Resu
     Ok(())
 }
 
+/// A new token is a different server as far as a test result is concerned: the last pass proved a
+/// model answered with the OLD credential. Cleared here, as the endpoint commands do, because the
+/// view re-reads the backend's finished test every time it mounts.
 #[tauri::command]
-pub fn set_local_llm_token(token: String) -> Result<()> {
-    secrets::set_local_llm_endpoint_token(&token)
+pub fn set_local_llm_token(state: State<'_, AppState>, token: String) -> Result<()> {
+    secrets::set_local_llm_endpoint_token(&token)?;
+    state.local_ai.clear_finished_test();
+    Ok(())
 }
 
 #[tauri::command]
-pub fn clear_local_llm_token() -> Result<()> {
-    secrets::clear_local_llm_endpoint_token()
+pub fn clear_local_llm_token(state: State<'_, AppState>) -> Result<()> {
+    secrets::clear_local_llm_endpoint_token()?;
+    state.local_ai.clear_finished_test();
+    Ok(())
 }
 
 fn role_model_key(role: &str) -> Result<&'static str> {
@@ -1254,33 +1261,33 @@ pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit
         unified_memory: hardware.unified_memory,
     };
 
-    // Which curated models are already downloaded (#449) — a suggestion the user can act on for free.
+    // Which curated models the user already has a usable copy of (#449) — a suggestion they can act
+    // on for free. Derived exactly as PM's pick derives the models you already have
+    // ([`size_for_machine`]), so "already on this device" names only a copy the pick could itself
+    // choose: one the connected server can serve, with a runnable config of its own.
     //
-    // Both rungs, because the crawl alone is not enough to answer this: on a packaged Linux install
-    // it cannot read Ollama's store, so every model the user has pulled reads `on_disk: false` and
-    // this notice cheerfully recommends downloading something already sitting on the disk. What the
-    // endpoint serves is the second rung, and for Ollama it IS the store — `/v1/models` lists what
-    // has been pulled, not what is resident. Best-effort: the gate, the keychain or the server being
-    // unavailable degrades to the crawl's answer rather than failing a passive notice.
-    let mut on_disk: Vec<String> = disk_scan(&app)
-        .await
-        .models
-        .iter()
-        .filter_map(|m| local_catalog::match_installed(&m.name).map(|e| e.repo.clone()))
-        .collect();
-    if let Endpoint::Ready(base_url, token) = configured_endpoint(&app)
+    // Both sources, because the crawl alone is not enough to answer this: on a packaged Linux
+    // install it cannot read Ollama's store, so every model the user has pulled is missing from it.
+    // What the endpoint serves is the second source, and for Ollama it IS the store — `/v1/models`
+    // lists what has been pulled, not what is resident. Best-effort: the gate, the keychain or the
+    // server being unavailable degrades to the crawl's answer rather than failing a passive notice.
+    let disk = disk_scan(&app).await;
+    let served = match configured_endpoint(&app)
         .await
         .unwrap_or(Endpoint::Unconfigured)
     {
-        for id in openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
+        Endpoint::Ready(url, token) => probe_served(&app, &url, token.as_ref().map(|s| s.expose()))
             .await
-            .unwrap_or_default()
-        {
-            if let Some(entry) = local_catalog::match_installed(&id) {
-                on_disk.push(entry.repo.clone());
-            }
-        }
-    }
+            .unwrap_or_default(),
+        Endpoint::Refused | Endpoint::Unconfigured => Vec::new(),
+    };
+    let bound: Vec<String> = [&chat_model, &background_model]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let owned = size_for_machine(&fit_hw, served, &disk.models, base_url.as_deref(), &bound).owned;
+    let on_disk = usable_copies(&owned);
 
     Ok(better_fit_suggestion(
         &fit_hw,
@@ -1311,7 +1318,7 @@ fn better_fit_suggestion(
             // Judged exactly as PM's pick judges it, so the notice can never suggest a model the
             // pick at the top of the tab would refuse — one that only fits system RAM beside a
             // graphics card, or one too slow for background work.
-            let option = catalogue_option(e, fit_hw, &f, &spec);
+            let option = catalogue_option(e, fit_hw, &spec);
             better_fit::Candidate {
                 repo: e.repo.clone(),
                 display_name: e.display_name.clone(),
@@ -1399,9 +1406,9 @@ pub fn set_local_model_rescan_cadence(state: State<'_, AppState>, cadence: Strin
 #[derive(serde::Serialize)]
 pub struct ResidentEntry {
     pub model: String,
-    /// Total bytes the server placed for it, in GB.
+    /// Total bytes the server placed for it, in GiB.
     pub size_gb: f64,
-    /// The share the server reports as being on the GPU, in GB. A FLOOR: it excludes the CUDA
+    /// The share the server reports as being on the GPU, in GiB. A FLOOR: it excludes the CUDA
     /// context and compute buffers, and was measured 1.25 GB low on a real load. Never rendered as
     /// "this is what your card is holding".
     pub size_vram_gb: f64,
@@ -2332,44 +2339,19 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     // missing section.
     let endpoint = configured_endpoint(&app).await?;
     let endpoint_configured = !matches!(endpoint, Endpoint::Unconfigured);
-    let mut served = Vec::new();
     // Whether the endpoint ANSWERED, which `installed` alone cannot say: an empty list is both "a
     // server with nothing in it" and "no server answered", and the panel below has to tell a
     // first-time installer apart from someone whose address is wrong. `probe` already separates
     // them — a runner with an empty store returns `Ok(vec![])`, which #790 taught `is_models_list`
     // to accept — so this needs no second request.
-    let mut endpoint_answered = false;
-    if let Endpoint::Ready(base_url, token) = endpoint {
-        let tok = token.as_ref().map(|s| s.expose());
-        // The real byte size of every model in the store. `None` for anything that is not an Ollama;
-        // those fall back to the catalogue estimate, which is all PM ever had.
-        let tags = openai_compat::ollama_tags(&base_url, tok).await;
-        if let Ok(models) = openai_compat::probe(&base_url, tok).await {
-            endpoint_answered = true;
-            for id in models {
-                // The window the server actually loaded it with, when it has been observed. Only a
-                // PROVEN reading is used: an unproven one is either PM's own floor or the model's
-                // trained capacity, and substituting either for the catalogue's figure would trade
-                // one guess for another while looking like a measurement.
-                let served_ctx = app
-                    .state::<AppState>()
-                    .local_ai
-                    .cached_window(&base_url, &id)
-                    .filter(|w| w.source.is_proven())
-                    .map(|w| w.tokens);
-                let tag = tags
-                    .iter()
-                    .flatten()
-                    .find(|t| t.name.eq_ignore_ascii_case(&id))
-                    .cloned();
-                served.push(ServedProbe {
-                    id,
-                    tag,
-                    served_ctx,
-                });
-            }
+    let probed = match &endpoint {
+        Endpoint::Ready(base_url, token) => {
+            probe_served(&app, base_url, token.as_ref().map(|s| s.expose())).await
         }
-    }
+        Endpoint::Refused | Endpoint::Unconfigured => None,
+    };
+    let endpoint_answered = probed.is_some();
+    let served = probed.unwrap_or_default();
 
     let disk = disk_scan(&app).await;
 
@@ -2390,6 +2372,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         installed,
         on_disk,
         pick,
+        ..
     } = size_for_machine(&fit_hw, served, &disk.models, base_url.as_deref(), &bound);
 
     // Rescan cadence — read-only in PR4 (the Local AI tab sets it and stamps the seen version in PR5).
@@ -2453,6 +2436,46 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     })
 }
 
+/// What the endpoint serves, with what PM can measure about each model, or `None` when it did not
+/// answer — which is not the same thing as a server with nothing in it.
+async fn probe_served(
+    app: &AppHandle,
+    base_url: &str,
+    token: Option<&str>,
+) -> Option<Vec<ServedProbe>> {
+    // The real byte size of every model in the store. `None` for anything that is not an Ollama;
+    // those fall back to the catalogue estimate, which is all PM ever had.
+    let tags = openai_compat::ollama_tags(base_url, token).await;
+    let models = openai_compat::probe(base_url, token).await.ok()?;
+    Some(
+        models
+            .into_iter()
+            .map(|id| {
+                // The window the server actually loaded it with, when it has been observed. Only a
+                // PROVEN reading is used: an unproven one is either PM's own floor or the model's
+                // trained capacity, and substituting either for the catalogue's figure would trade
+                // one guess for another while looking like a measurement.
+                let served_ctx = app
+                    .state::<AppState>()
+                    .local_ai
+                    .cached_window(base_url, &id)
+                    .filter(|w| w.source.is_proven())
+                    .map(|w| w.tokens);
+                let tag = tags
+                    .iter()
+                    .flatten()
+                    .find(|t| t.name.eq_ignore_ascii_case(&id))
+                    .cloned();
+                ServedProbe {
+                    id,
+                    tag,
+                    served_ctx,
+                }
+            })
+            .collect(),
+    )
+}
+
 /// One model the configured endpoint answered with, as the probe saw it.
 struct ServedProbe {
     id: String,
@@ -2467,6 +2490,9 @@ struct Sizing {
     curated: Vec<Recommendation>,
     installed: Vec<InstalledModel>,
     on_disk: Vec<OnDiskModel>,
+    /// The models the user already has that the pick weighed: served, or on disk for a server that
+    /// could serve them. The better-fit notice reads its "already downloaded" from these.
+    owned: Vec<better_fit::OwnedOption>,
     pick: better_fit::Pick,
 }
 
@@ -2499,9 +2525,9 @@ fn size_for_machine(
                 let spec = local_catalog::entry_to_spec(e);
                 let fit = fit::fit(&spec, fit_hw);
                 let gpu = fit::gpu_fit(&spec, fit_hw, &fit);
-                // What the pick weighs, from the same spec and RAM fit as the card. It changes
-                // nothing on the card: the pick never filters, reorders or re-badges this list.
-                options.push(catalogue_option(e, fit_hw, &fit, &spec));
+                // What the pick weighs, from the same spec as the card. It changes nothing on the
+                // card: the pick never filters, reorders or re-badges this list.
+                options.push(catalogue_option(e, fit_hw, &spec));
                 (fit, gpu)
             }
         };
@@ -2563,16 +2589,18 @@ fn size_for_machine(
                 &probe.id,
                 entry,
                 sized,
-                &fit,
+                probe.served_ctx,
                 fit_hw,
                 &options,
                 is_bound(&probe.id, bound),
             ));
         }
+        let measured = sized.as_ref().is_some_and(|(_, m)| *m) && probe.served_ctx.is_some();
         installed.push(InstalledModel {
             id: probe.id,
             matched_repo: entry.map(|e| e.repo.clone()),
             fit,
+            measured,
         });
     }
 
@@ -2597,7 +2625,6 @@ fn size_for_machine(
                     m,
                     entry,
                     spec,
-                    &fit,
                     fit_hw,
                     is_bound(&m.name, bound),
                 ));
@@ -2621,8 +2648,29 @@ fn size_for_machine(
         curated,
         installed,
         on_disk,
+        owned,
         pick,
     }
+}
+
+/// The repos of the models the user already has that PM's pick could itself choose: a copy with a
+/// runnable config of its own, served or on disk for a server that could serve it — the very options
+/// [`size_for_machine`] made the pick from.
+///
+/// What the better-fit notice may call "already on this device". Matching the disk by repo alone,
+/// as it did, counted an LM Studio Q8_0 under an Ollama on 11434 — a file that server cannot load,
+/// and that would not fit the card if it could — and told the user PM's pick was already here
+/// directly above a pick card offering its download.
+fn usable_copies(owned: &[better_fit::OwnedOption]) -> Vec<String> {
+    owned
+        .iter()
+        .filter(|o| {
+            o.config
+                .as_ref()
+                .is_some_and(|c| better_fit::is_runnable(c.verdict))
+        })
+        .map(|o| o.repo.clone())
+        .collect()
 }
 
 /// The pick's view of one curated model. Shared by the recommendations and the better-fit notice, so
@@ -2630,23 +2678,30 @@ fn size_for_machine(
 fn catalogue_option(
     e: &local_catalog::CatalogEntry,
     hw: &fit::FitHardware,
-    fit: &fit::FitResult,
     spec: &fit::ModelSpec,
 ) -> better_fit::CatalogueOption {
-    let mut judged = better_fit::judge(spec, hw, fit);
+    // The pick names a download, so it is judged among the quants Ollama can fetch. Judging every
+    // quant and only then refusing a config whose quant has no tag turned a model away for having a
+    // larger, untagged file that fits — Qwen2.5 72B on a card or a machine big enough for its Q5_K_M
+    // — while its tagged Q4_K_M fitted too. `judge` knows no catalogue, so this is done here, and it
+    // makes `ram_runnable` and `system_ok` fetchable by construction as well.
+    let fetchable = fit::ModelSpec {
+        candidates: spec
+            .candidates
+            .iter()
+            .copied()
+            .filter(|c| pull_target_for(e, Some(c.quant)).0.is_some())
+            .collect(),
+        ..spec.clone()
+    };
+    let context = better_fit::pick_context(e.context_length, None);
+    let judged = better_fit::judge(&fetchable, hw, context);
     let config_quant = judged.config.as_ref().and_then(|c| c.quant);
     let tag = pull_target_for(e, config_quant).0;
     // What `ollama pull` fetches for that tag: the weights and, for a multimodal model, the
     // projector layer that comes with them.
     let download_gb = quant_row(e, config_quant).map(|q| q.file_gb + e.projector_gb.unwrap_or(0.0));
-    // `judge` knows no catalogue, so "would run from system RAM" is narrowed here to a RAM config
-    // Ollama can also fetch — the only kind `NothingOnGpu` may point at.
-    judged.ram_runnable &= pull_target_for(e, fit.quant).0.is_some();
-    let system_ok = judged.ram_runnable
-        && fit.quant.is_some_and(|q| {
-            fit::system_tokens_per_sec(spec.active_params_b, q)
-                >= better_fit::background_floor_tps()
-        });
+    let system_ok = better_fit::system_config(&fetchable, hw, context).is_some();
     better_fit::CatalogueOption {
         repo: e.repo.clone(),
         display_name: e.display_name.clone(),
@@ -2658,28 +2713,47 @@ fn catalogue_option(
     }
 }
 
-/// The pick's view of a model the endpoint serves.
+/// The pick's view of a model the endpoint serves, judged at the context it will run at
+/// ([`better_fit::pick_context`], raised to the window its server was seen loading it with).
 ///
 /// When the served id IS a curated card's pull tag, it is the very file PM sized for that card, so
-/// the card's judgement stands — measured, because PM knows exactly which file it is. Without this,
-/// the same file judged on its own `/api/tags` size — 5.44 billion bytes, for a Qwen2.5 7B Q5_K_M the
-/// catalogue lists at 5.07 — no longer fits the 8 GB card PM picked it for without halving its
-/// context, and the user's own copy of PM's pick would be disqualified.
+/// the card's judgement stands — measured, because PM knows exactly which file it is. Judged on its
+/// own `/api/tags` size it now comes out the same, since that size is read in the catalogue's own
+/// GiB; this keeps the two from differing by a rounding at a budget's edge.
+///
+/// When PM could NOT measure it — LM Studio and llama-server have no `/api/tags`, so neither its
+/// size nor its quant is known — it is judged on the heaviest build the catalogue lists, never the
+/// best one that fits. Judged the generous way, a server holding the Q8_0 was told its model "fits
+/// entirely on your graphics card" from the Q5_K_M's figures, and the download that would actually
+/// have fixed it was hidden. The pessimistic way, an unmeasured copy wins only if every build of it
+/// would fit; otherwise the catalogue pick and its "get this quant" step stand.
 fn served_option(
     id: &str,
     entry: &local_catalog::CatalogEntry,
     (spec, measured): &(fit::ModelSpec, bool),
-    ram_fit: &fit::FitResult,
+    served_ctx: Option<u32>,
     hw: &fit::FitHardware,
     options: &[better_fit::CatalogueOption],
     bound: bool,
 ) -> better_fit::OwnedOption {
-    let same_file = options.iter().find(|o| {
-        o.judged.config.is_some() && o.tag.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(id))
-    });
+    let context = better_fit::pick_context(entry.context_length, served_ctx);
+    // The catalogue judged its own file at the default pick context; a server proven to run it with a
+    // longer window holds more than that, so it is judged afresh below.
+    let same_file = (context == better_fit::pick_context(entry.context_length, None))
+        .then(|| {
+            options.iter().find(|o| {
+                o.judged.config.is_some()
+                    && o.tag.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(id))
+            })
+        })
+        .flatten();
     let (config, measured) = match same_file {
         Some(o) => (o.judged.config.clone(), true),
-        None => (better_fit::judge(spec, hw, ram_fit).config, *measured),
+        None if !*measured => (
+            better_fit::judge(&heaviest(spec), hw, context).config,
+            false,
+        ),
+        None => (better_fit::judge(spec, hw, context).config, true),
     };
     better_fit::OwnedOption {
         id: id.to_string(),
@@ -2697,13 +2771,27 @@ fn served_option(
     }
 }
 
+/// `spec` cut down to its heaviest candidate: the build to assume when PM cannot tell which one a
+/// server loaded.
+fn heaviest(spec: &fit::ModelSpec) -> fit::ModelSpec {
+    fit::ModelSpec {
+        candidates: spec
+            .candidates
+            .iter()
+            .copied()
+            .max_by(|a, b| a.weight_gb.total_cmp(&b.weight_gb))
+            .into_iter()
+            .collect(),
+        ..spec.clone()
+    }
+}
+
 /// The pick's view of a model found on disk. Always measured: `on_disk_spec` only succeeds when the
 /// file's quant is known, and its size is read off the disk.
 fn disk_option(
     m: &local_disk::DiskModel,
     entry: &local_catalog::CatalogEntry,
     spec: &fit::ModelSpec,
-    ram_fit: &fit::FitResult,
     hw: &fit::FitHardware,
     bound: bool,
 ) -> better_fit::OwnedOption {
@@ -2717,7 +2805,12 @@ fn disk_option(
         path: Some(m.path.clone()),
         shards: m.shards,
         measured: true,
-        config: better_fit::judge(spec, hw, ram_fit).config,
+        config: better_fit::judge(
+            spec,
+            hw,
+            better_fit::pick_context(entry.context_length, None),
+        )
+        .config,
         bound,
     }
 }
@@ -2729,17 +2822,34 @@ fn is_bound(id: &str, bound: &[String]) -> bool {
 }
 
 /// Whether the configured endpoint could serve a model found in this runner's folder, judged by the
-/// endpoint's port against [`KNOWN_PORTS`]. With no endpoint configured, every runner counts: the
-/// user has not chosen one yet. A port PM does not recognise counts none, since PM cannot say what
-/// it is talking to.
+/// endpoint's host and port. With no endpoint configured, every runner counts: the user has not
+/// chosen one yet.
+///
+/// The host has to be this machine — `localhost` or a loopback address, the set the posture check
+/// calls `Loopback` and the frontend's `isLoopback` agrees with. A file on this disk is no use to an
+/// Ollama on another computer however its port reads; counting it, by port alone, made a local
+/// `qwen2.5:7b` the pick for a LAN server that would never list it, and told the user it would
+/// "show up by itself" once Ollama was connected — which it already was, to a different machine.
+/// The cost is a server reached through this machine's own LAN address no longer counting its own
+/// files, and for Ollama that costs nothing: what it serves already covers its own store.
+///
+/// Then the port, against [`KNOWN_PORTS`]. A port PM does not recognise counts none, since PM
+/// cannot say what it is talking to.
 fn runner_can_serve(source: local_disk::DiskSource, base_url: Option<&str>) -> bool {
     use local_disk::DiskSource;
     let Some(url) = base_url.map(str::trim).filter(|u| !u.is_empty()) else {
         return true;
     };
-    let Ok((_, _, port)) = split_scheme_host_port(url) else {
+    let Ok((_, host, port)) = split_scheme_host_port(url) else {
         return false;
     };
+    let on_this_machine = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| classify_ip(ip) == EndpointClass::Loopback);
+    if !on_this_machine {
+        return false;
+    }
     match KNOWN_PORTS
         .iter()
         .find(|(p, _)| *p == port)
@@ -2963,8 +3073,9 @@ fn safe_quant_label(label: &str) -> Option<String> {
 ///     never added to a separate projector figure. Getting that backwards is the double-count #588
 ///     fixed.
 ///   * **The context the server actually loaded it with**, instead of the model's TRAINED capacity.
-///     Not a nicety: gemma-3-4b trains at 131072, so the catalogue's KV term for it is 4.07 GB —
-///     44% of the entire estimate — for a window the server was never serving. #792 already ruled
+///     Not a nicety: gemma-3-4b trains at 131072, so the catalogue's KV term for it was 4.07 GB
+///     under the old parameter-count proxy — 44% of the entire estimate — for a window the server
+///     was never serving. #792 already ruled
 ///     that number unusable for the context meter, and it was still driving the memory estimate.
 ///
 /// Falls back to the catalogue spec whenever either measurement is missing, which is exactly the
@@ -3010,9 +3121,14 @@ fn served_quant(tag: &openai_compat::OllamaTag) -> Option<fit::Quant> {
         .or_else(|| tag.name.rsplit(':').next().and_then(fit::Quant::from_label))
 }
 
-/// Billions-of-bytes GB, matching every other size in this feature.
+/// GiB (2^30 bytes), the unit of every size in this feature: the catalogue's `file_gb`, the on-disk
+/// scan's `size_gb`, and the VRAM and free RAM the hardware probe reports.
+///
+/// It was 1e9 bytes, under a comment claiming the same — so a served file read 7.4% larger than the
+/// very same file in the catalogue (5.44 against 5.07 for Qwen2.5 7B Q5_K_M), no longer fitted the
+/// 8 GB card PM had picked it for, and PM told the user to download the model they were serving.
 fn bytes_to_gb(bytes: u64) -> f64 {
-    bytes as f64 / 1e9
+    bytes as f64 / 1_073_741_824.0
 }
 
 /// The spec to score an on-disk model with, using the REAL file size on disk as the weight term, or
@@ -3195,6 +3311,11 @@ pub struct InstalledModel {
     pub id: String,
     pub matched_repo: Option<String>,
     pub fit: fit::FitResult,
+    /// The fit describes the user's OWN file at the window the server proved it serves: its size and
+    /// quant came from `/api/tags`, and the context from a load PM saw. Without both it is the
+    /// catalogue's figure for the model, which is a fair guess but no grounds for telling someone
+    /// their model "runs from system memory".
+    pub measured: bool,
 }
 
 /// One model the configured endpoint is serving, plus whether it can answer a chat turn.
@@ -3491,6 +3612,7 @@ mod tests {
         InstalledModel {
             id: id.to_string(),
             matched_repo: None,
+            measured: false,
             fit: fit::FitResult {
                 verdict: fit::Verdict::Comfortable,
                 quant: Some(fit::Quant::Q4_K_M),
@@ -4150,11 +4272,31 @@ mod tests {
         }
     }
 
+    /// The repo of a pick's `also_have`, or a panic naming what it was instead.
+    fn also_have_of(p: &Pick) -> Option<&str> {
+        match p {
+            Pick::Catalogue { also_have, .. } => also_have.as_ref().map(|o| o.id.as_str()),
+            other => panic!("expected a catalogue pick, got {other:?}"),
+        }
+    }
+
+    /// The owned option for `id`, as the pick weighed it.
+    fn owned_named<'a>(s: &'a Sizing, id: &str) -> &'a better_fit::OwnedOption {
+        s.owned
+            .iter()
+            .find(|o| o.id == id)
+            .unwrap_or_else(|| panic!("{id} was weighed as a model you have"))
+    }
+
+    const GEMMA4_12B: &str = "unsloth/gemma-4-12b-it-GGUF";
+
     #[test]
-    fn on_the_dev_laptop_the_pick_is_the_qwen_7b_that_stays_on_the_card() {
-        // The redesign's headline case, at four amounts of free RAM. The card's own sort head is the
-        // RAM config — Q8_0 at 10.04 GB, which spills off the 7.96 GB card to about 5 tok/s — and the
-        // pick is the smaller rung of the same model that fits the card with the reserve kept.
+    fn on_the_dev_laptop_the_pick_is_the_largest_model_that_stays_on_the_card() {
+        // The redesign's headline case, at four amounts of free RAM. Sized from each model's own
+        // attention geometry and judged at the 32768 PM runs it at, the largest model that fits the
+        // 7.96 GB card with the reserve kept is gemma 4 12b at Q3_K_M: its sliding-window layers and
+        // single-KV-head global layers make 32768 tokens of cache under 1 GB. Judged at its trained
+        // 262144 it was a halved context and never eligible, so the pick was the 7.62B Qwen2.5.
         for free in [10.0, 13.4, 20.0, 24.0] {
             match pick_on(&laptop(free)) {
                 Pick::Catalogue {
@@ -4167,18 +4309,18 @@ mod tests {
                     also_have,
                     ..
                 } => {
-                    assert_eq!(repo, QWEN_7B, "{free} GB");
+                    assert_eq!(repo, GEMMA4_12B, "{free} GB");
                     assert_eq!(rung, Rung::Gpu, "{free} GB");
-                    assert_eq!(tag, format!("hf.co/{QWEN_7B}:Q5_K_M"), "{free} GB");
-                    assert_eq!(fit.quant, Some(fit::Quant::Q5_K_M), "{free} GB");
+                    assert_eq!(tag, format!("hf.co/{GEMMA4_12B}:Q3_K_M"), "{free} GB");
+                    assert_eq!(fit.quant, Some(fit::Quant::Q3_K_M), "{free} GB");
                     assert_eq!(fit.context, Some(32768), "{free} GB");
-                    assert_eq!(fit.kv, fit::KvCache::Q8_0, "{free} GB");
-                    assert_eq!(fit.est_memory_gb, Some(6.63), "{free} GB");
+                    assert_eq!(fit.kv, fit::KvCache::F16, "{free} GB");
+                    assert_eq!(fit.est_memory_gb, Some(6.93), "{free} GB");
                     assert_eq!(fit.verdict, fit::Verdict::Tight, "{free} GB");
-                    // The estimate Bobby's measurement (about 64 real) was taken against.
-                    assert_eq!(fit.est_tokens_per_sec, Some(71.0), "{free} GB");
+                    assert_eq!(fit.est_tokens_per_sec, Some(65.8), "{free} GB");
                     assert_eq!(fit.speed_basis, Some(fit::SpeedBasis::GpuPublished));
-                    assert!((download_gb - 5.07).abs() < 1e-9, "{download_gb}");
+                    // Weights plus the vision projector Ollama pulls with them.
+                    assert!((download_gb - 5.46).abs() < 1e-9, "{download_gb}");
                     assert_eq!(basis, PickBasis::Gpu);
                     assert_eq!(also_have, None);
                 }
@@ -4186,39 +4328,61 @@ mod tests {
             }
         }
 
-        // The pick changes nothing about the list: its head at 20 GB is still the RAM config.
+        // The pick changes nothing about the list: its head at 20 GB is still the RAM config, and
+        // the card keeps judging at the model's trained context.
         let s = size_for_machine(&laptop(20.0), Vec::new(), &[], None, &[]);
         let head = &s.curated[0];
-        assert_eq!(head.repo, QWEN_7B);
-        assert_eq!(head.fit.quant, Some(fit::Quant::Q8_0));
-        assert_eq!(head.fit.est_memory_gb, Some(10.04));
-        assert_eq!(head.fit.est_tokens_per_sec, Some(5.0));
+        assert_eq!(head.repo, "unsloth/gemma-4-26B-A4B-it-GGUF");
+        assert_eq!(head.fit.quant, Some(fit::Quant::Q3_K_M));
+        assert_eq!(head.fit.context, Some(262144));
         assert_eq!(head.fit.speed_basis, Some(fit::SpeedBasis::System));
+        let card = s.curated.iter().find(|r| r.repo == GEMMA4_12B).unwrap();
+        assert_eq!(
+            card.fit.context,
+            Some(262144),
+            "the card keeps its trained context"
+        );
     }
 
     #[test]
     fn plenty_of_free_ram_never_talks_the_pick_into_a_model_the_card_cannot_hold() {
-        // At 24 GB the Qwen2.5 14B fits system RAM comfortably and is twice the size — the very
-        // model a size-only rule would choose, at system-RAM speed. It has no config on the card.
+        // At 24 GB the Qwen2.5 14B and the 25B gemma 4 MoE both fit system RAM, and both are larger
+        // than the pick — the very models a size-only rule would choose, at system-RAM speed. Neither
+        // has a config on the card.
         let hw = laptop(24.0);
-        let e = entry("bartowski/Qwen2.5-14B-Instruct-GGUF");
-        let spec = local_catalog::entry_to_spec(e);
-        let rf = fit::fit(&spec, &hw);
-        assert!(better_fit::is_runnable(rf.verdict), "{rf:?}");
-        assert_eq!(fit::gpu_fit(&spec, &hw, &rf), fit::GpuFit::NoGpuResident);
         let p = pick_on(&hw);
         let (repo, ..) = catalogue_pick(&p);
-        assert_ne!(repo, e.repo);
-        assert_eq!(repo, QWEN_7B);
+        for big in [
+            "bartowski/Qwen2.5-14B-Instruct-GGUF",
+            "unsloth/gemma-4-26B-A4B-it-GGUF",
+        ] {
+            let e = entry(big);
+            let spec = local_catalog::entry_to_spec(e);
+            let rf = fit::fit(&spec, &hw);
+            assert!(better_fit::is_runnable(rf.verdict), "{big}: {rf:?}");
+            assert_eq!(
+                fit::gpu_fit(&spec, &hw, &rf),
+                fit::GpuFit::NoGpuResident,
+                "{big}"
+            );
+            assert_ne!(repo, e.repo);
+        }
+        assert_eq!(repo, GEMMA4_12B);
     }
 
     #[test]
     fn serving_the_picks_own_file_makes_it_the_model_you_already_have() {
-        let id = format!("hf.co/{QWEN_7B}:Q5_K_M");
+        // The manifest total Hugging Face serves for this tag (model + projector + template +
+        // params layers), which is what Ollama's `/api/tags` reports once it is pulled.
+        let id = format!("hf.co/{GEMMA4_12B}:Q3_K_M");
         let hw = laptop(20.0);
-        let probe = served(&id, 5_444_833_987, "Q5_K_M", 7.62);
-        let tag = probe.tag.clone().unwrap();
-        let s = size_for_machine(&hw, vec![probe], &[], Some("http://127.0.0.1:11434"), &[]);
+        let s = size_for_machine(
+            &hw,
+            vec![served(&id, 5_868_989_011, "Q3_K_M", 11.91)],
+            &[],
+            Some("http://127.0.0.1:11434"),
+            &[],
+        );
         match &s.pick {
             Pick::Owned {
                 id: got,
@@ -4230,23 +4394,51 @@ mod tests {
                 ..
             } => {
                 assert_eq!(got, &id);
-                assert_eq!(repo, QWEN_7B);
+                assert_eq!(repo, GEMMA4_12B);
                 assert!(served);
                 assert!(measured, "it is the very file PM sized");
-                assert_eq!(fit.quant, Some(fit::Quant::Q5_K_M));
-                assert_eq!(fit.kv, fit::KvCache::Q8_0);
-                assert_eq!(fit.est_memory_gb, Some(6.63));
+                assert_eq!(fit.quant, Some(fit::Quant::Q3_K_M));
+                assert_eq!(fit.est_memory_gb, Some(6.93));
                 assert_eq!(*basis, PickBasis::Gpu);
             }
             other => panic!("expected the served model, got {other:?}"),
         }
+    }
 
-        // Why the tag rule exists: judged on its own `/api/tags` size, the same file needs its
-        // context halved to stay on the card, and would have lost to its own catalogue card.
-        let (spec, measured) = served_spec(Some(entry(QWEN_7B)), Some(&tag), None).unwrap();
+    #[test]
+    fn a_served_file_is_measured_in_the_same_gib_as_the_catalogue() {
+        // 5_444_833_987 bytes is the catalogue's Qwen2.5 7B Q5_K_M, 5.07 GiB. Read in decimal GB it
+        // was 5.44, the same file no longer fitted the card at 32k, and a server that named it
+        // anything but the catalogue's own tag was told to download the model it was serving.
+        let hw = laptop(20.0);
+        let probe = served("qwen2.5:7b-instruct-q5_K_M", 5_444_833_987, "Q5_K_M", 7.62);
+        let (spec, measured) = served_spec(Some(entry(QWEN_7B)), probe.tag.as_ref(), None).unwrap();
         assert!(measured);
-        let own = better_fit::judge(&spec, &hw, &fit::fit(&spec, &hw));
-        assert!(own.config.is_none(), "{:?}", own.config);
+        assert!((spec.candidates[0].weight_gb - 5.07).abs() < 0.005);
+
+        for other_name in [
+            "qwen2.5:7b-instruct-q5_K_M",
+            "hf.co/lmstudio-community/Qwen2.5-7B-Instruct-GGUF:Q5_K_M",
+        ] {
+            let s = size_for_machine(
+                &hw,
+                vec![served(other_name, 5_444_833_987, "Q5_K_M", 7.62)],
+                &[],
+                Some("http://127.0.0.1:11434"),
+                &[],
+            );
+            let own = owned_named(&s, other_name);
+            assert!(own.measured, "{other_name}");
+            let config = own
+                .config
+                .as_ref()
+                .expect("the user's own file fits the card at 32k");
+            assert_eq!(config.quant, Some(fit::Quant::Q5_K_M), "{other_name}");
+            assert_eq!(config.context, Some(32768), "{other_name}");
+            assert_eq!(config.est_memory_gb, Some(6.5), "{other_name}");
+            // So the pick, which is larger, names it as the model you already have.
+            assert_eq!(also_have_of(&s.pick), Some(other_name));
+        }
     }
 
     #[test]
@@ -4260,25 +4452,21 @@ mod tests {
             &[],
         );
         assert_eq!(s.installed[0].matched_repo.as_deref(), Some(QWEN_7B));
-        match &s.pick {
-            Pick::Owned {
-                id, measured, fit, ..
-            } => {
-                assert_eq!(id, "qwen2.5:latest");
-                assert!(measured);
-                assert_eq!(fit.quant, Some(fit::Quant::Q4_K_M));
-                assert_eq!(fit.context, Some(32768));
-                assert_eq!(fit.kv, fit::KvCache::Q8_0);
-                assert_eq!(fit.est_memory_gb, Some(6.24));
-                assert_eq!(fit.verdict, fit::Verdict::Tight);
-            }
-            other => panic!("expected the served model, got {other:?}"),
-        }
+        let own = owned_named(&s, "qwen2.5:latest");
+        assert!(own.measured);
+        let fit = own.config.as_ref().expect("its Q4_K_M fits the card");
+        assert_eq!(fit.quant, Some(fit::Quant::Q4_K_M));
+        assert_eq!(fit.context, Some(32768));
+        assert_eq!(fit.kv, fit::KvCache::F16);
+        assert_eq!(fit.est_memory_gb, Some(6.61));
+        assert_eq!(fit.verdict, fit::Verdict::Tight);
+        // 7.6 × 1.15 is short of gemma 4 12b's 11.91, so it is named beside the pick.
+        assert_eq!(also_have_of(&s.pick), Some("qwen2.5:latest"));
     }
 
     #[test]
     fn a_smaller_model_you_have_is_named_beside_the_pick_rather_than_chosen() {
-        // gemma 3 4b fits the card too, but 3.88 × 1.15 is well short of 7.62.
+        // gemma 3 4b fits the card too, but 3.88 × 1.15 is well short of 11.91.
         let s = size_for_machine(
             &laptop(20.0),
             vec![served("gemma3:4b", 3_338_801_804, "Q4_K_M", 4.3)],
@@ -4290,7 +4478,7 @@ mod tests {
             Pick::Catalogue {
                 repo, also_have, ..
             } => {
-                assert_eq!(repo, QWEN_7B);
+                assert_eq!(repo, GEMMA4_12B);
                 assert_eq!(
                     also_have.as_ref(),
                     Some(&OwnedRef {
@@ -4306,8 +4494,8 @@ mod tests {
 
     #[test]
     fn a_copy_on_disk_that_only_fits_the_card_at_half_its_context_is_not_the_pick() {
-        // The Q6_K on disk spills past the reserve at full context, so the pick stays the Q5_K_M —
-        // and the disk copy is not even named beside it, since it has no acceptable config.
+        // The Q6_K on disk spills past the reserve at 32k even with a q8_0 cache (7.25 GB against
+        // 6.96), so it is not even named beside the pick: it has no acceptable config.
         let file = on_disk_file(
             "bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q6_K.gguf",
             DiskSource::HuggingFace,
@@ -4316,24 +4504,13 @@ mod tests {
         );
         let s = size_for_machine(&laptop(20.0), Vec::new(), &[file], None, &[]);
         assert_eq!(s.on_disk.len(), 1, "the card itself is still listed");
-        match &s.pick {
-            Pick::Catalogue {
-                repo,
-                fit,
-                also_have,
-                ..
-            } => {
-                assert_eq!(repo, QWEN_7B);
-                assert_eq!(fit.quant, Some(fit::Quant::Q5_K_M));
-                assert_eq!(also_have, &None);
-            }
-            other => panic!("expected a catalogue pick, got {other:?}"),
-        }
+        assert_eq!(catalogue_pick(&s.pick).0, GEMMA4_12B);
+        assert_eq!(also_have_of(&s.pick), None);
     }
 
     #[test]
     fn a_file_on_disk_counts_only_for_a_server_that_could_serve_it() {
-        // An LM Studio download that would otherwise be the pick: Q4_K_M fits the card at f16.
+        // An LM Studio download that fits the card at 32k with an f16 cache.
         let file = on_disk_file(
             "lmstudio-community/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
             DiskSource::LmStudio,
@@ -4351,15 +4528,20 @@ mod tests {
             .pick
         };
         for url in [None, Some("http://127.0.0.1:1234")] {
-            match pick_with(url) {
-                Pick::Owned { source, .. } => assert_eq!(source, Some(DiskSource::LmStudio)),
-                other => panic!("{url:?}: expected the LM Studio file, got {other:?}"),
-            }
+            assert_eq!(
+                also_have_of(&pick_with(url)),
+                Some(file.name.as_str()),
+                "{url:?}"
+            );
         }
-        // Connected to an Ollama, or to a port PM can't place: no use to it however well it fits.
-        for url in ["http://127.0.0.1:11434", "http://127.0.0.1:9999"] {
-            let p = pick_with(Some(url));
-            assert_eq!(catalogue_pick(&p).0, QWEN_7B, "{url}");
+        // Connected to an Ollama, to a port PM can't place, or to an LM Studio on ANOTHER machine:
+        // no use to it however well it fits.
+        for url in [
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:9999",
+            "http://192.168.1.20:1234",
+        ] {
+            assert_eq!(also_have_of(&pick_with(Some(url))), None, "{url}");
         }
 
         assert!(runner_can_serve(
@@ -4369,6 +4551,10 @@ mod tests {
         assert!(runner_can_serve(
             DiskSource::Folder,
             Some("http://localhost:8080")
+        ));
+        assert!(runner_can_serve(
+            DiskSource::Ollama,
+            Some("http://[::1]:11434")
         ));
         assert!(!runner_can_serve(
             DiskSource::Ollama,
@@ -4382,6 +4568,54 @@ mod tests {
             DiskSource::LmStudio,
             Some("http://127.0.0.1:11434")
         ));
+        // The right port on another computer is still another computer: a file on this disk is no
+        // use to it, and "it shows up by itself once Ollama is connected" would never come true.
+        for (source, url) in [
+            (DiskSource::Ollama, "http://192.168.1.20:11434"),
+            (DiskSource::HuggingFace, "http://10.0.0.5:8080"),
+            (DiskSource::LmStudio, "https://models.example.com:1234"),
+        ] {
+            assert!(!runner_can_serve(source, Some(url)), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_server_that_cannot_say_which_build_it_loaded_is_judged_on_the_heaviest() {
+        // LM Studio and llama-server have no `/api/tags`, so a served `qwen2.5-7b-instruct` could be
+        // any of the catalogue's builds. With 8 GB free and no card the catalogue pick is its
+        // Q4_K_M; judged generously, the served copy borrowed that Q4_K_M's figures and became the
+        // pick "you already have" — whatever was really loaded. Judged on the Q8_0, it does not fit.
+        let lm_studio = || ServedProbe {
+            id: "qwen2.5-7b-instruct".to_string(),
+            tag: None,
+            served_ctx: None,
+        };
+        let s = size_for_machine(
+            &no_gpu(8.0),
+            vec![lm_studio()],
+            &[],
+            Some("http://127.0.0.1:1234"),
+            &[],
+        );
+        let own = owned_named(&s, "qwen2.5-7b-instruct");
+        assert!(!own.measured);
+        assert_eq!(own.config, None);
+        let (repo, quant, _) = catalogue_pick(&s.pick);
+        assert_eq!((repo, quant), (QWEN_7B, Some(fit::Quant::Q4_K_M)));
+
+        // Where even the heaviest build fits, that is the one it is judged at.
+        let s = size_for_machine(
+            &card(24.0, Some(1008.0), 48.0),
+            vec![lm_studio()],
+            &[],
+            Some("http://127.0.0.1:1234"),
+            &[],
+        );
+        let own = owned_named(&s, "qwen2.5-7b-instruct");
+        assert_eq!(
+            own.config.as_ref().and_then(|c| c.quant),
+            Some(fit::Quant::Q8_0)
+        );
     }
 
     #[test]
@@ -4395,9 +4629,10 @@ mod tests {
             }
         );
         for (free, repo, quant) in [
-            (4.5, "bartowski/gemma-2-2b-it-GGUF", fit::Quant::Q5_K_M),
-            // Qwen2.5 7B Q8_0 fits here too, but at 4.95 tok/s from RAM it fails the 8.53 floor.
-            (16.0, "unsloth/Qwen3.5-4B-GGUF", fit::Quant::Q8_0),
+            (4.5, "bartowski/gemma-2-2b-it-GGUF", fit::Quant::Q4_K_M),
+            // The MoE reads only its 3.82B active parameters a token, so its Q3_K_M clears the floor
+            // at 21.4 tok/s from RAM where every dense model past 9B cannot.
+            (16.0, "unsloth/gemma-4-26B-A4B-it-GGUF", fit::Quant::Q3_K_M),
             // Not the 72B, which fits at Q3_K_M and would reply at about 1.1 tok/s.
             (56.0, "unsloth/Qwen3.6-35B-A3B-GGUF", fit::Quant::Q8_0),
         ] {
@@ -4410,6 +4645,51 @@ mod tests {
                     assert_eq!(rung, Rung::Quality);
                 }
                 _ => unreachable!(),
+            }
+        }
+
+        // 12 GB free: Qwen3.5 9B's best quant that fits is too slow from RAM, and its Q3_K_M is
+        // not. Judging only the best quant threw the model away and picked something smaller.
+        match pick_on(&no_gpu(12.0)) {
+            Pick::Catalogue {
+                repo, fit, rung, ..
+            } => {
+                assert_eq!(repo, "unsloth/Qwen3.5-9B-GGUF");
+                assert_eq!(fit.quant, Some(fit::Quant::Q3_K_M));
+                assert_eq!(rung, Rung::Speed);
+            }
+            other => panic!("expected a catalogue pick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_pick_never_shrinks_as_memory_is_freed() {
+        // On every basis, more free memory can only widen what fits: the pick's size must never go
+        // down as it grows. It did off the card — 8 GB free picked Qwen2.5 7B, and 9 GB, where that
+        // model's best quant became a too-slow Q5_K_M, picked a 3.9B.
+        let size = |p: &Pick| match p {
+            Pick::Catalogue { repo, .. } => entry(repo).parameters_b,
+            _ => 0.0,
+        };
+        for (label, hw_at) in [
+            ("no card", no_gpu as fn(f64) -> fit::FitHardware),
+            ("shared", |free| fit::FitHardware {
+                vram_gb: Some(12.0),
+                unified_memory: true,
+                ..no_gpu(free)
+            }),
+            ("8 GB card", laptop),
+            ("12 GB card", |free| card(12.0, Some(504.0), free)),
+        ] {
+            let mut best = 0.0_f64;
+            for half in 4..=128 {
+                let free = f64::from(half) / 2.0;
+                let got = size(&pick_on(&hw_at(free)));
+                assert!(
+                    got >= best,
+                    "{label}: the pick shrank to {got}B at {free} GB"
+                );
+                best = got;
             }
         }
     }
@@ -4518,19 +4798,73 @@ mod tests {
 
     #[test]
     fn the_better_fit_notice_never_suggests_what_the_pick_would_refuse() {
-        // Both roles on the pick itself, 24 GB free: the 14B fits RAM comfortably and is the kind of
-        // "upgrade" the notice used to volunteer, though it cannot live on this card.
+        // Both roles on Qwen2.5 7B, 24 GB free: the 14B and the 25B gemma 4 MoE fit RAM comfortably
+        // and are the kind of "upgrade" the notice used to volunteer, though neither can live on
+        // this card. What it suggests is what the pick would choose.
         let qwen = format!("hf.co/{QWEN_7B}:Q5_K_M");
-        assert_eq!(
-            better_fit_suggestion(&laptop(24.0), &[], Some(qwen.clone()), Some(qwen)),
-            None
-        );
+        let s = better_fit_suggestion(&laptop(24.0), &[], Some(qwen.clone()), Some(qwen))
+            .expect("the pick is larger than what runs");
+        assert_eq!(s.repo, GEMMA4_12B);
 
         // Where the pick agrees there is something better, the notice still says so.
         let gemma = "hf.co/bartowski/gemma-2-2b-it-GGUF:Q8_0".to_string();
         let s = better_fit_suggestion(&no_gpu(16.0), &[], Some(gemma.clone()), Some(gemma))
             .expect("a larger model clears the floor here");
-        assert_eq!(s.repo, "unsloth/Qwen3.5-4B-GGUF");
+        assert_eq!(s.repo, QWEN_7B);
+    }
+
+    #[test]
+    fn already_on_this_device_means_a_copy_the_pick_could_use() {
+        // A role on gemma 3 4b, and the notice's suggestion is Qwen3.5 9B. An LM Studio Q8_0 of it
+        // sits on disk under an Ollama on 11434: a file that server cannot load, and at 8.87 GB one
+        // that would not fit the card if it could. Matched by repo alone, the notice called PM's
+        // pick "already on this device" right above a pick card offering its download.
+        let qwen35_9b = "unsloth/Qwen3.5-9B-GGUF";
+        let gemma = "gemma3:4b".to_string();
+        let lm_studio = |quant: &str, gb: f64| {
+            on_disk_file(
+                &format!("{qwen35_9b}/Qwen3.5-9B-{quant}.gguf"),
+                DiskSource::LmStudio,
+                gb,
+                quant,
+            )
+        };
+        let usable = |url: &str, file: DiskModel| {
+            usable_copies(
+                &size_for_machine(
+                    &laptop(20.0),
+                    vec![served(&gemma, 3_338_801_804, "Q4_K_M", 4.3)],
+                    &[file],
+                    Some(url),
+                    std::slice::from_ref(&gemma),
+                )
+                .owned,
+            )
+        };
+        let notice = |copies: &[String]| {
+            better_fit_suggestion(
+                &laptop(20.0),
+                copies,
+                Some(gemma.clone()),
+                Some(gemma.clone()),
+            )
+            .expect("a larger model fits the card")
+        };
+
+        let copies = usable("http://127.0.0.1:11434", lm_studio("Q8_0", 8.87));
+        assert!(!copies.iter().any(|r| r == qwen35_9b), "{copies:?}");
+        let s = notice(&copies);
+        assert_eq!(s.repo, qwen35_9b);
+        assert!(!s.already_downloaded);
+
+        // The right server, but the wrong file: the Q8_0 does not fit the card at 32k.
+        let copies = usable("http://127.0.0.1:1234", lm_studio("Q8_0", 8.87));
+        assert!(!copies.iter().any(|r| r == qwen35_9b), "{copies:?}");
+
+        // A Q3_K_M LM Studio can serve, which runs on the card: that one is already here.
+        let copies = usable("http://127.0.0.1:1234", lm_studio("Q3_K_M", 4.35));
+        assert!(copies.iter().any(|r| r == qwen35_9b), "{copies:?}");
+        assert!(notice(&copies).already_downloaded);
     }
 
     #[test]
@@ -4558,17 +4892,23 @@ mod tests {
 
     #[test]
     fn a_role_set_to_a_model_puts_it_first_among_the_ones_you_have() {
-        // No card, 16 GB free: the pick would be Qwen3.5 4B (4.21B), and both of these are within
+        // No card, 6.5 GB free: the pick would be Qwen3.5 4B (4.21B), and both of these are within
         // 15% of it and clear the floor, so both qualify. Unbound, the larger one wins; once a role
-        // uses the smaller one, it does — matched case-insensitively, as the server's ids are.
+        // uses the smaller one, it does — matched case-insensitively, as the server's ids are. The
+        // Qwen tag's size is the manifest total Hugging Face serves for it.
         let both = || {
             vec![
-                served("phi3.5:latest", 2_176_178_913, "Q4_K_M", 3.8),
+                served(
+                    "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M",
+                    3_413_361_504,
+                    "Q4_K_M",
+                    4.21,
+                ),
                 served("gemma3:4b", 3_338_801_804, "Q4_K_M", 4.3),
             ]
         };
         let id = |bound: &[String]| match size_for_machine(
-            &no_gpu(16.0),
+            &no_gpu(6.5),
             both(),
             &[],
             Some("http://127.0.0.1:11434"),
@@ -4579,14 +4919,16 @@ mod tests {
             Pick::Owned { id, .. } => id,
             other => panic!("expected an owned pick, got {other:?}"),
         };
-        assert_eq!(id(&[]), "gemma3:4b");
-        assert_eq!(id(&["PHI3.5:latest".to_string()]), "phi3.5:latest");
+        assert_eq!(id(&[]), "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M");
+        assert_eq!(id(&["GEMMA3:4b".to_string()]), "gemma3:4b");
     }
 
     #[test]
     fn the_pick_on_every_other_machine_in_the_redesign_table() {
-        // The rest of the table the redesign was simulated against, so a change to the rule shows
-        // up as a changed row here rather than as a surprise on someone's machine.
+        // The rest of the table the redesign was simulated against, re-run with every model's KV
+        // cache sized from its own attention geometry and the pick judged at the 32768 PM runs it
+        // at, so a change to the rule shows up as a changed row here rather than as a surprise on
+        // someone's machine.
         let shared = |vram: f64, free: f64| fit::FitHardware {
             available_ram_gb: free,
             vram_gb: Some(vram),
@@ -4602,35 +4944,46 @@ mod tests {
                 "bartowski/gemma-2-2b-it-GGUF",
                 Q6_K,
                 8192,
-                KV_F16,
-                2.67,
+                KV_Q8,
+                2.84,
             ),
             (
+                // Phi 3.5 mini was this row at 131072 and 4.85 GB, sized 13x too small: with no
+                // grouped-query attention its cache alone is 6.4 GB at q8_0 at 32k.
                 "6 GB card, 12 free",
                 card(6.0, Some(288.0), 12.0),
-                "bartowski/Phi-3.5-mini-instruct-GGUF",
-                Q4_K_M,
-                131072,
+                QWEN_7B,
+                Q3_K_M,
+                32768,
                 KV_Q8,
-                4.85,
+                4.98,
             ),
             (
                 "12 GB card, 24 free",
                 card(12.0, Some(504.0), 24.0),
                 "bartowski/Qwen2.5-14B-Instruct-GGUF",
-                Q4_K_M,
+                Q3_K_M,
                 32768,
                 KV_Q8,
-                10.92,
+                10.53,
             ),
             (
                 "16 GB card, 32 free",
                 card(16.0, Some(448.0), 32.0),
-                "bartowski/Qwen2.5-14B-Instruct-GGUF",
-                Q6_K,
+                "unsloth/gemma-4-26B-A4B-it-GGUF",
+                Q3_K_M,
                 32768,
-                KV_Q8,
-                13.84,
+                KV_F16,
+                14.38,
+            ),
+            (
+                "24 GB card, 48 free",
+                card(24.0, Some(1008.0), 48.0),
+                "unsloth/Qwen3.6-35B-A3B-GGUF",
+                Q4_K_M,
+                32768,
+                KV_F16,
+                22.64,
             ),
         ] {
             let p = pick_on(&hw);
@@ -4645,14 +4998,17 @@ mod tests {
                 other => panic!("{label}: expected a catalogue pick, got {other:?}"),
             }
         }
+        let phi = "bartowski/Phi-3.5-mini-instruct-GGUF";
+        assert_ne!(
+            catalogue_pick(&pick_on(&card(6.0, Some(288.0), 12.0))).0,
+            phi
+        );
 
-        // A 24 GB card: the MoE, whose speed estimate (about 596) is the one that needs its caveat.
+        // The 24 GB card's MoE, whose speed estimate (about 479) is the one that needs its caveat.
         match pick_on(&card(24.0, Some(1008.0), 48.0)) {
-            Pick::Catalogue { repo, fit, .. } => {
-                assert_eq!(repo, "unsloth/Qwen3.6-35B-A3B-GGUF");
-                assert_eq!(fit.quant, Some(Q3_K_M));
-                assert_eq!(fit.verdict, fit::Verdict::Comfortable);
-                assert!((fit.est_tokens_per_sec.unwrap() - 596.0).abs() < 1.0);
+            Pick::Catalogue { fit, .. } => {
+                assert_eq!(fit.verdict, fit::Verdict::Tight);
+                assert!((fit.est_tokens_per_sec.unwrap() - 479.0).abs() < 1.0);
             }
             other => panic!("expected a catalogue pick, got {other:?}"),
         }
@@ -4668,14 +5024,15 @@ mod tests {
             (
                 "no GPU, 6 free",
                 no_gpu(6.0),
-                "bartowski/gemma-2-2b-it-GGUF",
-                Q8_0,
+                "unsloth/Qwen3.5-4B-GGUF",
+                Q3_K_M,
             ),
+            ("no GPU, 8 free", no_gpu(8.0), QWEN_7B, Q4_K_M),
             (
                 "no GPU, 9 free",
                 no_gpu(9.0),
-                "ggml-org/gemma-3-4b-it-GGUF",
-                Q4_K_M,
+                "unsloth/Qwen3.5-9B-GGUF",
+                Q3_K_M,
             ),
             (
                 "no GPU, 24 free",
@@ -4686,26 +5043,26 @@ mod tests {
             (
                 "Mac 16 GB, 6 free",
                 shared(12.0, 6.0),
-                "bartowski/gemma-2-2b-it-GGUF",
-                Q8_0,
+                "unsloth/Qwen3.5-4B-GGUF",
+                Q3_K_M,
             ),
             (
                 "Mac 16 GB, 11 free",
                 shared(12.0, 11.0),
-                "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                "unsloth/Qwen3.5-9B-GGUF",
                 Q3_K_M,
             ),
             (
                 "Mac 32 GB, 20 free",
                 shared(24.0, 20.0),
-                "unsloth/gemma-4-26B-A4B-it-GGUF",
+                "unsloth/Qwen3.6-35B-A3B-GGUF",
                 Q3_K_M,
             ),
             // An integrated GPU shares the RAM it reports, so the floor applies to it too.
             (
                 "iGPU, 10 free",
                 shared(2.0, 10.0),
-                "unsloth/Qwen3.5-4B-GGUF",
+                "unsloth/Qwen3.5-9B-GGUF",
                 Q3_K_M,
             ),
         ] {

@@ -22,6 +22,7 @@ import {
   isEmbeddingOrReranker,
   isMoe,
   isUnmodelledArch,
+  kvFromHeader,
   matchesQuant,
   pickProjector,
   prettyName,
@@ -219,6 +220,161 @@ describe("activeFromHeader", () => {
   it("returns null when the inactive experts would exceed the whole model", () => {
     // A wrong header must not produce a negative or zero active count that then sails into fit.rs.
     expect(activeFromHeader(header(), 1_000_000)).toBeNull();
+  });
+});
+
+describe("kvFromHeader", () => {
+  // The KV term fit.rs sizes a model with. Its old params × context proxy could not see attention
+  // geometry and under-counted Phi 3.5 mini 13x, which made PM pick a 128k-context config for a 6 GB
+  // card that needs about 27 GB of cache. Every header below is the real one, read off Hugging Face
+  // on 02-10-2026, cut down to the keys this function reads.
+  const llama31 = {
+    "general.architecture": "llama",
+    "llama.block_count": 32,
+    "llama.embedding_length": 4096,
+    "llama.attention.head_count": 32,
+    "llama.attention.head_count_kv": 8,
+  };
+
+  it("sizes a model without grouped-query attention from all of its heads", () => {
+    // Phi 3.5 mini: 32 layers × 32 KV heads × head_dim 96 (3072 / 32) × K and V × 2 bytes.
+    const phi = {
+      "general.architecture": "phi3",
+      "phi3.block_count": 32,
+      "phi3.embedding_length": 3072,
+      "phi3.attention.head_count": 32,
+      "phi3.attention.head_count_kv": 32,
+      // llama.cpp switches SWA off for phi3, so this window must not shrink anything.
+      "phi3.attention.sliding_window": 262144,
+    };
+    expect(kvFromHeader(phi)).toEqual({
+      bytes_per_token: 393_216,
+      window_bytes_per_token: 0,
+      window: null,
+      state_bytes: 0,
+    });
+  });
+
+  it("counts only the KV heads of a grouped-query model, at llama.cpp's head-size default", () => {
+    // 32 layers × 8 KV heads × 128 × 2 × 2. No key_length in the header: 4096 / 32.
+    expect(kvFromHeader(llama31).bytes_per_token).toBe(131_072);
+    // Explicit key/value lengths win over the default.
+    const explicit = {
+      ...llama31,
+      "llama.attention.key_length": 64,
+      "llama.attention.value_length": 64,
+    };
+    expect(kvFromHeader(explicit).bytes_per_token).toBe(65_536);
+    // No head_count_kv at all is llama.cpp's "every head", not a guess.
+    const noGqa = { ...llama31, "llama.attention.head_count_kv": undefined };
+    expect(kvFromHeader(noGqa).bytes_per_token).toBe(524_288);
+  });
+
+  it("puts gemma 3's sliding layers apart: five in every six, capped at the header's window", () => {
+    const gemma3 = {
+      "general.architecture": "gemma3",
+      "gemma3.block_count": 34,
+      "gemma3.embedding_length": 2560,
+      "gemma3.attention.head_count": 8,
+      "gemma3.attention.head_count_kv": 4,
+      "gemma3.attention.key_length": 256,
+      "gemma3.attention.value_length": 256,
+      "gemma3.attention.sliding_window": 1024,
+    };
+    // Layers 5, 11, 17, 23 and 29 are global: 5 × 4096 bytes. The other 29 slide.
+    expect(kvFromHeader(gemma3)).toEqual({
+      bytes_per_token: 5 * 4096,
+      window_bytes_per_token: 29 * 4096,
+      window: 1024,
+      state_bytes: 0,
+    });
+    // Without its window there is nothing to cap at, so every layer counts in full.
+    const noWindow = { ...gemma3, "gemma3.attention.sliding_window": undefined };
+    expect(kvFromHeader(noWindow).bytes_per_token).toBe(34 * 4096);
+  });
+
+  it("alternates gemma 2's layers", () => {
+    const gemma2 = {
+      "general.architecture": "gemma2",
+      "gemma2.block_count": 26,
+      "gemma2.embedding_length": 2304,
+      "gemma2.attention.head_count": 8,
+      "gemma2.attention.head_count_kv": 4,
+      "gemma2.attention.key_length": 256,
+      "gemma2.attention.value_length": 256,
+      "gemma2.attention.sliding_window": 4096,
+    };
+    const kv = kvFromHeader(gemma2);
+    expect(kv.bytes_per_token).toBe(13 * 4096);
+    expect(kv.window_bytes_per_token).toBe(13 * 4096);
+    expect(kv.window).toBe(4096);
+  });
+
+  it("reads gemma 4's own pattern, per-layer KV heads and sliding head sizes", () => {
+    // gemma-4-12b-it: global layers have ONE KV head of 512; sliding ones eight of 256.
+    const pattern = Array.from({ length: 48 }, (_, i) => i % 6 !== 5);
+    const gemma4 = {
+      "general.architecture": "gemma4",
+      "gemma4.block_count": 48,
+      "gemma4.embedding_length": 3840,
+      "gemma4.attention.head_count": 16,
+      "gemma4.attention.head_count_kv": pattern.map((s) => (s ? 8 : 1)),
+      "gemma4.attention.key_length": 512,
+      "gemma4.attention.value_length": 512,
+      "gemma4.attention.key_length_swa": 256,
+      "gemma4.attention.value_length_swa": 256,
+      "gemma4.attention.sliding_window": 1024,
+      "gemma4.attention.sliding_window_pattern": pattern,
+      "gemma4.attention.shared_kv_layers": 0,
+    };
+    expect(kvFromHeader(gemma4)).toEqual({
+      bytes_per_token: 8 * (1024 * 1 * 2),
+      window_bytes_per_token: 40 * (512 * 8 * 2),
+      window: 1024,
+      state_bytes: 0,
+    });
+    // Layers that reuse an earlier layer's cache add none of their own: the last six here.
+    const sharing = { ...gemma4, "gemma4.attention.shared_kv_layers": 6 };
+    expect(kvFromHeader(sharing)).toEqual({
+      bytes_per_token: 7 * 2048,
+      window_bytes_per_token: 35 * 8192,
+      window: 1024,
+      state_bytes: 0,
+    });
+  });
+
+  it("gives a hybrid model a cache on its attention layers only, and a fixed state on the rest", () => {
+    // Qwen3.5 4B: every fourth of 32 layers attends; the other 24 are linear attention.
+    const qwen35 = {
+      "general.architecture": "qwen35",
+      "qwen35.block_count": 32,
+      "qwen35.embedding_length": 2560,
+      "qwen35.attention.head_count": 16,
+      "qwen35.attention.head_count_kv": 4,
+      "qwen35.attention.key_length": 256,
+      "qwen35.attention.value_length": 256,
+      "qwen35.full_attention_interval": 4,
+      "qwen35.ssm.conv_kernel": 4,
+      "qwen35.ssm.inner_size": 4096,
+      "qwen35.ssm.state_size": 128,
+      "qwen35.ssm.group_count": 16,
+    };
+    // n_embd_r = 3 × (4096 + 2 × 16 × 128) = 24576; n_embd_s = 128 × 4096 = 524288; f32.
+    expect(kvFromHeader(qwen35)).toEqual({
+      bytes_per_token: 8 * 4096,
+      window_bytes_per_token: 0,
+      window: null,
+      state_bytes: 24 * (24_576 + 524_288) * 4,
+    });
+    // A hybrid whose state cannot be sized is not sized at all.
+    expect(kvFromHeader({ ...qwen35, "qwen35.ssm.inner_size": undefined })).toBeNull();
+  });
+
+  it("returns null rather than guessing when the header lacks the geometry", () => {
+    expect(kvFromHeader({ ...llama31, "llama.block_count": undefined })).toBeNull();
+    expect(kvFromHeader({ ...llama31, "llama.attention.head_count": undefined })).toBeNull();
+    expect(kvFromHeader({ ...llama31, "llama.attention.head_count_kv": "eight" })).toBeNull();
+    expect(kvFromHeader({ ...llama31, "llama.attention.head_count_kv": 0 })).toBeNull();
   });
 });
 

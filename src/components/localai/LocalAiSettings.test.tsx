@@ -11,7 +11,7 @@
 // do — a token that is still in the keychain after you thought you removed it, a model PM will let
 // you assign but cannot answer with. Not render-coverage for its own sake.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INERT_POWER_VIEW } from "../../lib/powerRoute";
@@ -865,6 +865,29 @@ describe("a split card, where the same model runs two ways", () => {
     ).toBeTruthy();
   });
 
+  it("gives each row a llama-server line that runs it the way the row was sized", async () => {
+    // A bare `-hf repo:quant` loads the model's whole trained context on a current build, which is
+    // not what either row measured — and the page called it "the exact command for each model".
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [split()] });
+    const { container } = await loaded();
+    fireEvent.click(await screen.findByRole("button", { name: /install it another way/i }));
+    const models = container.querySelector("#sec-localai-models") as HTMLElement;
+    expect(
+      within(models).getByText(
+        "llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0 --ctx-size 32768",
+      ),
+    ).toBeTruthy();
+    expect(
+      within(models).getByText(
+        "llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M --ctx-size 32768 -fa on -ctk q8_0 -ctv q8_0",
+      ),
+    ).toBeTruthy();
+    // An `ollama pull` can't carry either, so the card says what to set instead.
+    expect(models.textContent).toContain(
+      "An ollama pull only fetches the file: Ollama runs every model at the one context it is set to, so set that to the context on the row you choose, and its cache to q8_0 if the row shows “q8_0 KV”, for it to run the way PM sized it.",
+    );
+  });
+
   it("marks a rung Installed only when that exact quant is being served", async () => {
     listLocalLlmModels.mockResolvedValue(
       served({ id: "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M", embedding: false }),
@@ -931,8 +954,43 @@ describe("a download owned by the backend", () => {
 
     const downloading = await screen.findByRole("button", { name: /downloading/i });
     expect((downloading as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByRole("button", { name: /cancel/i })).toBeTruthy();
     expect(pullLocalModel).not.toHaveBeenCalled();
+    // The list comes back folded on every mount, and a closed fold is `inert`: role queries still
+    // find what is inside it, which is how this used to pass with the only Cancel out of reach. The
+    // progress and the Cancel are above the fold while it is closed.
+    const cancel = screen.getByRole("button", { name: /cancel/i });
+    expect(cancel.closest("[inert]")).toBeNull();
+    expect(
+      screen
+        .getByRole("progressbar", { name: "Downloading Phi 3.5 mini instruct" })
+        .closest("[inert]"),
+    ).toBeNull();
+  });
+
+  it("is shown once: above the folded list, then on its card once the list is open", async () => {
+    localModelRecommendations.mockResolvedValue({ ...recs(), curated: [pulled()] });
+    activeLocalPull.mockResolvedValue({
+      model: "hf.co/bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",
+      status: "downloading",
+      completed_bytes: 1024,
+      total_bytes: 4096,
+      running: true,
+      error: null,
+      started_at_ms: 0,
+    });
+    const { container } = await loaded();
+    await screen.findByRole("button", { name: /cancel/i });
+    const models = container.querySelector("#sec-localai-models") as HTMLElement;
+
+    fireEvent.click(within(models).getByRole("button", { name: "Show it" }));
+
+    expect(
+      within(models).getByRole("button", { name: "Show the model" }).getAttribute("aria-expanded"),
+    ).toBe("true");
+    const cancels = screen.getAllByRole("button", { name: /cancel/i });
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0].closest("#localai-rec-bartowski-phi-3-5-mini-instruct-gguf")).toBeTruthy();
+    expect(cancels[0].closest("[inert]")).toBeNull();
   });
 
   it("still clears its own marker when the download finishes", async () => {
@@ -1167,6 +1225,62 @@ describe("the On battery section (#432)", () => {
   });
 });
 
+describe("PM's pick follows the server", () => {
+  // The backend counts a file on disk towards the pick only if the stored server could serve it,
+  // and reports what a server holds only once there is one — so the pick and "Already on this
+  // device" change when the server does, even when what it serves (nothing) doesn't.
+  it("is read again on connecting to a server that serves nothing yet", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    listLocalLlmModels.mockResolvedValue([]);
+    setLocalLlmEndpoint.mockResolvedValue("http://127.0.0.1:11434");
+    render(<LocalAiSettings />);
+    fireEvent.change(await screen.findByLabelText("Endpoint URL"), {
+      target: { value: "http://127.0.0.1:11434" },
+    });
+    await waitFor(() => expect(localModelRecommendations).toHaveBeenCalledTimes(1));
+
+    getLocalLlmConfig.mockResolvedValue(cfg({ chat_model: "", chat_routing: "cloud" }));
+    localModelRecommendations.mockResolvedValue({ ...recs(), endpoint_inventory: 0 });
+    fireEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+
+    await waitFor(() => expect(localModelRecommendations).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/nothing has been downloaded into it yet/)).toBeTruthy();
+  });
+
+  it("is read again on disconnecting from one", async () => {
+    listLocalLlmModels.mockResolvedValue([]);
+    clearLocalLlmEndpoint.mockResolvedValue(undefined);
+    await loaded();
+    // The listing has answered (the empty-server line only shows once it has).
+    await screen.findByText(/isn't serving any models yet/i);
+    expect(localModelRecommendations).toHaveBeenCalledTimes(1);
+
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect…" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Disconnect" }));
+
+    await waitFor(() => expect(localModelRecommendations).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("looking for a server on this computer", () => {
+  it("never probes the ports for a user who is already connected", async () => {
+    // `configured` is false until the stored config has been read, so every visit to the tab sent a
+    // probe to 11434, 1234 and 8080 and threw the answer away.
+    await loaded();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(probeLocalLlmPorts).not.toHaveBeenCalled();
+  });
+
+  it("still looks once the config says nothing is connected", async () => {
+    getLocalLlmConfig.mockResolvedValue(cfg({ base_url: null }));
+    render(<LocalAiSettings />);
+    await waitFor(() => expect(probeLocalLlmPorts).toHaveBeenCalledTimes(1));
+  });
+});
+
 describe("disconnecting", () => {
   // It forgets more than the address — the token and both jobs' models go with it — so it asks.
   it("asks first, and backing out calls nothing", async () => {
@@ -1301,9 +1415,10 @@ describe("speed on the model list", () => {
       "Speeds are estimates from published or typical memory speeds, not measurements",
     );
     expect(models.textContent).not.toMatch(/~\s?\d/);
-    // The numbers guide names where the cache setting lives, by its section.
+    // The numbers guide names where the settings live, by its section — and only as somewhere they
+    // are once a server is connected, which is the only time that fold exists.
     expect(models.textContent).toContain(
-      `your server needs that setting too (${sectionLabel("sec-localai-endpoint")}, “Settings PM's numbers assume”).`,
+      `your server needs that setting too, and the context the card shows. Each model's commands say what to set, and once your server is connected, ${sectionLabel("sec-localai-endpoint")}'s “Settings PM's numbers assume” has the steps.`,
     );
   });
 });

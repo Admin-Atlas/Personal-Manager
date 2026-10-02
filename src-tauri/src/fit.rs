@@ -7,7 +7,7 @@
 //! The math follows the standard GGUF local-inference budget used by the public VRAM/RAM
 //! calculators (weights + KV cache + a runtime overhead, scored against available memory minus a
 //! reserve): this is PM's own implementation of that well-known approach, not a port of any one
-//! tool. Two deliberate choices keep it honest:
+//! tool. Three deliberate choices keep it honest:
 //!   * The **weight** term uses the catalog's *measured* per-quant `file_gb` (real bytes on disk),
 //!     which is more accurate than reconstructing size from `params × bytes_per_param` — especially
 //!     for K-quants, IQ-quants, and sharded/MoE files. `bytes_per_param` survives only for the
@@ -18,6 +18,10 @@
 //!     Each result records the precision it was sized at in its `kv` field, surfaced per-config in the
 //!     UI. f16 is always tried first, so this only ever *rescues* a config — never changes one that
 //!     already fit.
+//!   * The **KV** size comes from the model's own attention geometry ([`KvGeometry`]: its layers,
+//!     KV heads and head size, its sliding-window layers, a hybrid's recurrent state), read from
+//!     the GGUF header — not from its parameter count, which cannot see grouped-query attention and
+//!     was off 13x for a model without it.
 //!
 //! No I/O, no DB, no tauri — every function here is a pure projection of its inputs, unit-tested
 //! below. The numeric constants are first-pass estimates that need calibration against a real
@@ -69,11 +73,28 @@ const SYSTEM_BANDWIDTH_GBPS: f64 = 40.0;
 /// unknown case. A recognised card overrides this with its real spec via `FitHardware`.
 const GPU_BANDWIDTH_FALLBACK_GBPS: f64 = 400.0;
 
-/// f16 KV-cache proxy: GB of cache per (billion active params × token). Deliberately a compact
-/// heuristic, not a per-architecture derivation — it can't see `n_kv_heads`/`head_dim`, so it
-/// trends conservative for wide models. The q8_0 rung scales this by [`KvCache::size_ratio`].
-/// CALIBRATE.
+/// f16 KV-cache proxy: GB of cache per (billion active params × token), used ONLY for a spec that
+/// carries no [`KvGeometry`] — every catalogue entry carries one, so in practice that is a test or
+/// an entry whose GGUF header the generator could not read. It cannot see `n_kv_heads`/`head_dim`,
+/// and it is wrong in both directions: calibrated on Qwen2.5 7B, it under-counts a model without
+/// grouped-query attention (Phi 3.5 mini) about 13x and the Llama 3.x family 2-4.5x, and
+/// over-counts sliding-window and hybrid models. The q8_0 rung scales this by
+/// [`KvCache::size_ratio`].
 const KV_GB_PER_BPARAM_TOKEN: f64 = 8e-6;
+
+/// Bytes in the GB every size in this module is counted in. `file_gb` is written in GiB by the
+/// catalogue generator, and the hardware probe reports VRAM and free RAM in GiB, so the KV term has
+/// to be too.
+const GIB: f64 = 1_073_741_824.0;
+
+/// Tokens a sliding-window layer holds beyond its window: one batch, so a batch can be appended
+/// before the oldest tokens fall out. Both runners PM sets up size it this way — llama.cpp's
+/// sliding-window cache at `n_swa + n_ubatch` (src/llama-kv-cache-iswa.cpp, with `--swa-full` off,
+/// llama-server's default) and Ollama's at the window plus its 512-token batch. Measured on Ollama
+/// 0.33: gemma 3 4b's 29 sliding layers did not grow at all between an 8192 and a 32768 context. A
+/// runtime that allocates sliding layers at the full context (`swa_full`) would exceed this
+/// estimate.
+const SWA_BATCH_TOKENS: u32 = 512;
 
 // --- input / output model ----------------------------------------------------------------------
 
@@ -196,13 +217,13 @@ pub enum KvCache {
 }
 
 impl KvCache {
-    /// Cache size relative to f16. q8_0 stores 8-bit values plus a per-block fp16 scale, so it lands a
-    /// little above half of f16 — mirroring the 1.06-vs-2.0 bytes-per-weight ratio of Q8_0 vs f16
-    /// weights. CALIBRATE.
+    /// Cache size relative to f16. q8_0 stores each block of 32 values as 32 bytes plus one fp16
+    /// scale — 34 bytes against f16's 64 — so it is exactly 34/64 of f16. It was 0.53, a hair under
+    /// that, and the memory contract is never to come in under the real figure.
     fn size_ratio(self) -> f64 {
         match self {
             KvCache::F16 => 1.0,
-            KvCache::Q8_0 => 0.53,
+            KvCache::Q8_0 => 34.0 / 64.0,
         }
     }
 }
@@ -217,8 +238,28 @@ const KV_LADDER: [KvCache; 2] = [KvCache::F16, KvCache::Q8_0];
 #[derive(Debug, Clone, Copy)]
 pub struct QuantCandidate {
     pub quant: Quant,
-    /// Measured file size in GB (billions of bytes) — the weight-memory term.
+    /// Measured file size in GiB (2^30 bytes, the unit of every size here) — the weight-memory term.
     pub weight_gb: f64,
+}
+
+/// What a model's KV cache costs, from its own attention geometry rather than its parameter count.
+///
+/// Read out of each catalogue entry's GGUF header by `scripts/generate-local-catalog.mjs`
+/// (`kvFromHeader`, which says where each rule comes from): the layers whose cache spans the whole
+/// context, the sliding-window layers that hold only their window, and the fixed recurrent state a
+/// hybrid linear-attention model keeps on most layers instead of a cache. Bytes, at f16.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KvGeometry {
+    /// What one token adds across the layers that keep the whole context.
+    pub bytes_per_token: f64,
+    /// What one token adds across the sliding-window layers, which hold at most
+    /// `window + SWA_BATCH_TOKENS` tokens however long the context.
+    pub window_bytes_per_token: f64,
+    /// The sliding window, in tokens. Irrelevant when `window_bytes_per_token` is zero.
+    pub window: u32,
+    /// The recurrent state of a hybrid model's linear-attention layers: f32, and the same at every
+    /// context and every cache precision.
+    pub state_bytes: f64,
 }
 
 /// The machine's memory, projected to just what fit-scoring needs.
@@ -254,6 +295,10 @@ pub struct ModelSpec {
     /// scan measures a projector that is genuinely already there.
     pub projector_gb: Option<f64>,
     pub candidates: Vec<QuantCandidate>,
+    /// The model's attention geometry, when known. Every catalogue entry carries one, and a served or
+    /// on-disk model matched to an entry inherits that entry's. `None` falls back to the
+    /// [`KV_GB_PER_BPARAM_TOKEN`] proxy.
+    pub kv_geometry: Option<KvGeometry>,
 }
 
 /// How well a model fits, coarsely — the vocabulary the UI speaks.
@@ -343,19 +388,30 @@ pub fn gpu_reserve_gb() -> f64 {
     GPU_RESERVE_GB
 }
 
-/// KV-cache footprint for `ctx` tokens at `active_params_b` billion active params, at the given cache
-/// precision (`f16` is the conservative default; `q8_0` is roughly half the size).
-pub fn kv_cache_gb(active_params_b: f64, ctx: u32, kv: KvCache) -> f64 {
-    KV_GB_PER_BPARAM_TOKEN * active_params_b * f64::from(ctx) * kv.size_ratio()
+/// KV-cache footprint, in GiB, for `ctx` tokens of `spec` at the given cache precision (`f16` is the
+/// conservative default; `q8_0` is 34/64 of it).
+///
+/// From the model's [`KvGeometry`] when the spec carries one: the full-context layers pay for every
+/// token, the sliding-window layers for no more than their window plus a batch, and a hybrid's
+/// recurrent state is added once, uncompressed. Measured against a live Ollama 0.33 (q8_0 cache,
+/// flash attention, an RTX 5060 Laptop GPU, 02-10-2026), the footprint this feeds came out +9.6%
+/// over Qwen2.5 7B Q5_K_M's real load at 32768 tokens and +11.4% at 8192, and +2.0% / +1.6% over
+/// gemma 3 4b Q4_K_M's: inside the ±15% contract, and never under it. Without a geometry, the
+/// parameter-count proxy ([`KV_GB_PER_BPARAM_TOKEN`]).
+pub fn kv_cache_gb(spec: &ModelSpec, ctx: u32, kv: KvCache) -> f64 {
+    let Some(g) = spec.kv_geometry else {
+        return KV_GB_PER_BPARAM_TOKEN * spec.active_params_b * f64::from(ctx) * kv.size_ratio();
+    };
+    let window_tokens = ctx.min(g.window.saturating_add(SWA_BATCH_TOKENS));
+    let cache =
+        g.bytes_per_token * f64::from(ctx) + g.window_bytes_per_token * f64::from(window_tokens);
+    (cache * kv.size_ratio() + g.state_bytes) / GIB
 }
 
 /// Total resident footprint for one (candidate, context, KV-precision) triple: measured weights + KV
 /// + a flat overhead + the multimodal projector (0 when there is none).
 fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32, kv: KvCache) -> f64 {
-    cand.weight_gb
-        + kv_cache_gb(spec.active_params_b, ctx, kv)
-        + OVERHEAD_GB
-        + spec.projector_gb.unwrap_or(0.0)
+    cand.weight_gb + kv_cache_gb(spec, ctx, kv) + OVERHEAD_GB + spec.projector_gb.unwrap_or(0.0)
 }
 
 /// Rough decode throughput: read bandwidth divided by the *active* weight bytes touched per token
@@ -769,6 +825,7 @@ mod tests {
             target_context: ctx,
             projector_gb: None,
             candidates,
+            kv_geometry: None,
         }
     }
 
@@ -952,18 +1009,123 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_scales_with_active_params_and_context() {
-        assert!((kv_cache_gb(7.0, 4096, KvCache::F16) - 8e-6 * 7.0 * 4096.0).abs() < EPS);
+    fn without_a_geometry_the_kv_proxy_scales_with_active_params_and_context() {
+        let spec = dense(7.0, 4096, vec![]);
+        assert!((kv_cache_gb(&spec, 4096, KvCache::F16) - 8e-6 * 7.0 * 4096.0).abs() < EPS);
         // Doubling context doubles KV.
         assert!(
-            (kv_cache_gb(7.0, 8192, KvCache::F16) - 2.0 * kv_cache_gb(7.0, 4096, KvCache::F16))
+            (kv_cache_gb(&spec, 8192, KvCache::F16) - 2.0 * kv_cache_gb(&spec, 4096, KvCache::F16))
                 .abs()
                 < EPS
         );
-        // q8_0 is a little above half of f16 (near-lossless, roughly halved footprint).
-        let f16 = kv_cache_gb(7.0, 8192, KvCache::F16);
-        let q8 = kv_cache_gb(7.0, 8192, KvCache::Q8_0);
-        assert!(q8 < f16 && q8 > 0.4 * f16, "q8_0 KV should be ~half of f16");
+        // q8_0 is exactly 34/64 of f16: 32 one-byte values and one two-byte scale per block of 32.
+        let f16 = kv_cache_gb(&spec, 8192, KvCache::F16);
+        let q8 = kv_cache_gb(&spec, 8192, KvCache::Q8_0);
+        assert!((q8 - f16 * 34.0 / 64.0).abs() < EPS, "{q8} vs {f16}");
+    }
+
+    /// The geometry a catalogue entry carries, in bytes per token at f16.
+    fn geometry(full: f64, windowed: f64, window: u32, state: f64) -> KvGeometry {
+        KvGeometry {
+            bytes_per_token: full,
+            window_bytes_per_token: windowed,
+            window,
+            state_bytes: state,
+        }
+    }
+
+    #[test]
+    fn a_model_without_grouped_query_attention_is_sized_from_its_own_heads() {
+        // Phi 3.5 mini: 32 layers × 32 KV heads × 96 × K and V × 2 bytes = 393216 bytes a token,
+        // so 12 GiB at 32768 tokens. The proxy said about 1 GB — the 13x under-count that made PM
+        // pick a 128k-context Phi for a 6 GB card that would need about 27 GB of q8_0 cache.
+        let proxy = dense(3.82, 131072, vec![q(Quant::Q4_K_M, 2.23)]);
+        let phi = ModelSpec {
+            kv_geometry: Some(geometry(393_216.0, 0.0, 0, 0.0)),
+            ..proxy.clone()
+        };
+        assert!((kv_cache_gb(&phi, 32768, KvCache::F16) - 12.0).abs() < EPS);
+        assert!((kv_cache_gb(&phi, 32768, KvCache::Q8_0) - 6.375).abs() < EPS);
+        assert!(
+            kv_cache_gb(&phi, 32768, KvCache::F16)
+                > 10.0 * kv_cache_gb(&proxy, 32768, KvCache::F16)
+        );
+        // And so it no longer fits a 6 GB card at its trained context: the resident budget is 5.
+        let card = FitHardware {
+            available_ram_gb: 12.0,
+            vram_gb: Some(6.0),
+            gpu_bandwidth_gbps: Some(288.0),
+            unified_memory: false,
+        };
+        let rf = fit(&phi, &card);
+        let resident = resident_fit(&phi, &card, &rf).expect("something fits the card");
+        assert_eq!(resident.verdict, Verdict::HalvedContext, "{resident:?}");
+    }
+
+    #[test]
+    fn a_sliding_window_layer_stops_growing_at_its_window() {
+        // gemma 3 4b: five full layers, 29 that keep only the last 1024 tokens (+ one 512 batch).
+        let spec = ModelSpec {
+            kv_geometry: Some(geometry(20_480.0, 118_784.0, 1024, 0.0)),
+            ..dense(3.88, 131072, vec![q(Quant::Q4_K_M, 2.32)])
+        };
+        let windowed = 118_784.0 * 1536.0 / GIB;
+        let at = |ctx: u32| kv_cache_gb(&spec, ctx, KvCache::F16);
+        assert!((at(32768) - (20_480.0 * 32768.0 / GIB + windowed)).abs() < EPS);
+        assert!((at(131072) - (20_480.0 * 131072.0 / GIB + windowed)).abs() < EPS);
+        // Below the window the sliding layers hold the whole (short) context, like any other layer.
+        assert!((at(1024) - (20_480.0 + 118_784.0) * 1024.0 / GIB).abs() < EPS);
+    }
+
+    #[test]
+    fn a_hybrid_models_recurrent_state_is_paid_once_and_never_compressed() {
+        // Qwen3.5 4B: 8 attention layers keep a cache; the 24 linear-attention layers a fixed f32
+        // state of 52690944 bytes between them, which q8_0 does not shrink and context does not grow.
+        let spec = ModelSpec {
+            kv_geometry: Some(geometry(32_768.0, 0.0, 0, 52_690_944.0)),
+            ..dense(4.21, 262144, vec![q(Quant::Q4_K_M, 2.55)])
+        };
+        let state = 52_690_944.0 / GIB;
+        let cache = |ctx: u32| 32_768.0 * f64::from(ctx) / GIB;
+        assert!((kv_cache_gb(&spec, 32768, KvCache::F16) - (cache(32768) + state)).abs() < EPS);
+        assert!(
+            (kv_cache_gb(&spec, 32768, KvCache::Q8_0) - (cache(32768) * 34.0 / 64.0 + state)).abs()
+                < EPS
+        );
+    }
+
+    #[test]
+    fn the_estimate_brackets_the_loads_measured_on_a_real_card() {
+        // Ollama 0.33, q8_0 cache, flash attention, RTX 5060 Laptop GPU, 02-10-2026: what the card
+        // held for the model (nvidia-smi, less the 79 MiB it held idle), at two contexts each. The
+        // geometries are the catalogue's own for these two entries (pinned in local_catalog). The
+        // memory contract is ±15%, and never under.
+        let qwen = ModelSpec {
+            kv_geometry: Some(geometry(57_344.0, 0.0, 0, 0.0)),
+            ..dense(7.62, 32768, vec![q(Quant::Q5_K_M, 5.07)])
+        };
+        let gemma = ModelSpec {
+            projector_gb: Some(0.79),
+            kv_geometry: Some(geometry(20_480.0, 118_784.0, 1024, 0.0)),
+            ..dense(3.88, 131072, vec![q(Quant::Q4_K_M, 2.32)])
+        };
+        for (label, spec, ctx, measured_mib) in [
+            ("qwen 8k", &qwen, 8192, 5333.0),
+            ("qwen 32k", &qwen, 32768, 6071.0),
+            ("gemma 8k", &gemma, 8192, 3809.0),
+            ("gemma 32k", &gemma, 32768, 4045.0),
+        ] {
+            let measured = measured_mib / 1024.0;
+            let est = footprint_gb(spec, &spec.candidates[0], ctx, KvCache::Q8_0);
+            assert!(
+                est >= measured,
+                "{label}: {est:.2} under the real {measured:.2}"
+            );
+            assert!(
+                est <= measured * 1.15,
+                "{label}: {est:.2} over the real {measured:.2} by >15%"
+            );
+        }
     }
 
     #[test]
@@ -1524,7 +1686,7 @@ mod tests {
     #[test]
     fn the_resident_config_keeps_the_reserve_in_the_band_gpu_fit_calls_single() {
         // The dev-laptop case from the redesign spec: 7.96 GB card, 10 GB free. The RAM config is
-        // Qwen2.5 7B Q6_K at 7.38 GB — under raw VRAM, so `gpu_fit` reports one config, but 0.58 GB
+        // Qwen2.5 7B Q6_K at 7.25 GB — under raw VRAM, so `gpu_fit` reports one config, but 0.29 GB
         // short of the reserve. The resident config is the Q5_K_M that keeps it.
         let e = crate::local_catalog::catalog()
             .entries
@@ -1538,15 +1700,18 @@ mod tests {
         };
         let rf = fit(&spec, &hw);
         assert_eq!(rf.quant, Some(Quant::Q6_K));
-        assert_eq!(rf.est_memory_gb, Some(7.38));
+        assert_eq!(rf.est_memory_gb, Some(7.25));
         assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::Single);
 
         let g = resident_fit(&spec, &hw, &rf).expect("a config that keeps the reserve");
         assert_eq!(g.quant, Some(Quant::Q5_K_M));
         assert_eq!(g.kv, KvCache::Q8_0);
         assert_eq!(g.context, Some(32768));
-        assert_eq!(g.est_memory_gb, Some(6.63));
+        // 6.63 under the parameter-count proxy; 6.50 from its own geometry, which is still +9.6%
+        // over the 5.93 GiB this very config was measured holding on that card.
+        assert_eq!(g.est_memory_gb, Some(6.5));
         assert_eq!(g.speed_basis, Some(SpeedBasis::GpuPublished));
+        // The estimate Bobby's measurement (about 64 real) was taken against.
         assert_eq!(g.est_tokens_per_sec, Some(71.0));
 
         // The two guards `gpu_fit` opens with, and a RAM verdict that already refused.

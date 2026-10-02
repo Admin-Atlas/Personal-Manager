@@ -82,6 +82,9 @@ export function LocalAiSettings({
   const [loading, setLoading] = useState(true);
   const [rescanning, setRescanning] = useState(false);
   const [config, setConfig] = useState<LocalLlmConfig | null>(null);
+  // The stored config couldn't be read on mount, so `config` is null for good rather than for now —
+  // nothing reads it again until the tab remounts or a connect writes one.
+  const [configError, setConfigError] = useState<string | null>(null);
   const [status, setStatus] = useState<LocalLlmStatus | null>(null);
   const [served, setServed] = useState<LocalServedModel[]>([]);
   // Whether `served` is an ANSWER rather than a starting value. It starts empty and is filled
@@ -203,7 +206,10 @@ export function LocalAiSettings({
   });
   const roleTests = useRoleTests(endpointEpoch);
   const release = useReleaseSettings({ status });
-  const detect = useServerDetect(configured);
+  // Not before the stored config has been read, like the status poll below: `configured` is false
+  // until it has, so a connected user's every visit to the tab sent a probe to three local ports
+  // whose answer was then thrown away.
+  const detect = useServerDetect(config === null ? null : configured);
 
   useEffect(() => {
     let cancelled = false;
@@ -225,7 +231,10 @@ export function LocalAiSettings({
             .catch(() => {});
         }
       } catch (e) {
-        if (!cancelled) setError("endpoint", String(e));
+        if (!cancelled) {
+          setError("endpoint", String(e));
+          setConfigError(String(e));
+        }
       }
       try {
         const r = await localModelRecommendations();
@@ -265,10 +274,24 @@ export function LocalAiSettings({
     const withServer = pollKey;
     let cancelled = false;
     setStatus(null);
-    const tick = () => {
+    // Replies can land out of order — a poll and a push fired close together — and an older one
+    // landing last would put back a state a write has already moved past (the same "Use … for both"
+    // button, just pressed). A later call reads later settings, so only the newest reply counts.
+    let issued = 0;
+    let applied = 0;
+    const fetchStatus = () => {
+      const n = ++issued;
       localLlmStatus()
-        .then((s) => !cancelled && setStatus(s))
+        .then((s) => {
+          if (!cancelled && n > applied) {
+            applied = n;
+            setStatus(s);
+          }
+        })
         .catch(() => {});
+    };
+    const tick = () => {
+      fetchStatus();
       if (!withServer) return;
       listLocalLlmModels()
         .then((m) => {
@@ -288,9 +311,7 @@ export function LocalAiSettings({
     // starts and again when it ends, so the hint appears and clears with the call.
     const offStatus = subscribeUntilCleanup(() =>
       onLocalLlmStatus(() => {
-        localLlmStatus()
-          .then((s) => !cancelled && setStatus(s))
-          .catch(() => {});
+        fetchStatus();
       }),
     );
     return () => {
@@ -300,25 +321,26 @@ export function LocalAiSettings({
     };
   }, [pollKey]);
 
-  // The pick and the "installed" rows are worked out against what the server serves, so when that
-  // changes — connecting, a download landing, a model removed by hand — they are read again. The
-  // first answer after mount is the baseline the initial read already matches.
-  const servedKey = served
-    .map((m) => m.id)
-    .sort()
-    .join("\n");
-  const servedBaseline = useRef<string | null>(null);
+  // The pick and the "installed" rows are worked out against the stored server and what it serves,
+  // so when either changes — connecting, disconnecting, a download landing, a model removed by hand —
+  // they are read again. The server is part of the key, not only its list: the backend counts a file
+  // on disk towards the pick only if the stored server could serve it, and reports what the server
+  // holds only once there is one, so connecting to an EMPTY server changes the pick and the
+  // "Already on this device" ladder while the list stays the same empty list it was before. The first
+  // answer after mount is the baseline the initial read already matches.
+  const recsKey = [config?.base_url ?? "", ...served.map((m) => m.id).sort()].join("\n");
+  const recsBaseline = useRef<string | null>(null);
   const servedKnown = config !== null && (!configured || servedLoaded);
   useEffect(() => {
     if (!servedKnown) return;
-    if (servedBaseline.current === null) {
-      servedBaseline.current = servedKey;
+    if (recsBaseline.current === null) {
+      recsBaseline.current = recsKey;
       return;
     }
-    if (servedBaseline.current === servedKey) return;
-    servedBaseline.current = servedKey;
+    if (recsBaseline.current === recsKey) return;
+    recsBaseline.current = recsKey;
     void refreshRecs();
-  }, [servedKey, servedKnown, refreshRecs]);
+  }, [recsKey, servedKnown, refreshRecs]);
 
   /** Acknowledge the better-fit suggestion: it stays quiet until the cadence says to look again.
    *  Clears the dot here and, via the callback, in the sidebar and the settings nav. */
@@ -436,6 +458,7 @@ export function LocalAiSettings({
   const prog = pull.pullProg;
   const input: ReadinessInput = {
     config,
+    configError,
     status,
     served,
     servedLoaded,
@@ -501,6 +524,8 @@ export function LocalAiSettings({
         onTuningOpenChange={setTuningOpen}
         detected={detect.detected}
         onDetect={detect.detect}
+        guideInStart={stepList[0].setup !== null}
+        pickContext={pick?.fit.context ?? null}
       />
 
       <LocalAiRoles

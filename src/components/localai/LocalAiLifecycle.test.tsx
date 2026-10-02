@@ -117,11 +117,15 @@ describe("LocalAiLifecycle", () => {
     expect(screen.getByText(/somewhat more/i)).toBeTruthy();
   });
 
-  it("says plainly when the server cannot release at all", async () => {
-    // llama-server and LM Studio have no unload gesture. Offering a picker that silently does
-    // nothing would be worse than not having the feature.
+  it("says plainly when PM cannot release from this server, and how to do it yourself", async () => {
+    // PM unloads only through Ollama's own API. Offering a picker that silently does nothing would
+    // be worse than not having the feature — but the limit is PM's, not the server's: LM Studio
+    // documents an eject (`lms unload`, and `POST /api/v1/models/unload` since 0.4.0). This said LM
+    // Studio "has no unload command", which sent people to stop a server they didn't need to.
     await loaded({ no_unload_route: true });
-    expect(await screen.findByText(/no way to unload a model on request/i)).toBeTruthy();
+    const line = await screen.findByText(/PM can only unload a model through Ollama/);
+    expect(line.textContent).toMatch(/in LM Studio, eject the model \(or run lms unload\)/);
+    expect(line.textContent).not.toMatch(/no unload command|no way to unload|only way/);
   });
 
   it("mentions an external display on the card, and promises to do nothing about it", async () => {

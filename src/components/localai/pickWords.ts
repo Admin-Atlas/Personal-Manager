@@ -22,6 +22,7 @@ import type {
 import { powerOf } from "../../lib/powerRoute";
 import type { RunnerName } from "../../lib/workbenchGuide";
 import { TUNING_TITLE } from "./locate";
+import { spillsOffCard } from "./readiness";
 import { sectionLabel } from "./sections";
 import { speedShort } from "./speedWords";
 
@@ -63,13 +64,10 @@ export function pickInUse(
   servedIds: ReadonlySet<string>,
 ): boolean {
   if (!config || !status) return false;
-  const id =
-    pick.kind === "owned"
-      ? pick.id.toLowerCase()
-      : servedIds.has(pick.tag.toLowerCase())
-        ? pick.tag.toLowerCase()
-        : null;
-  if (!id) return false;
+  // Served, either way: a job bound to a model the server isn't serving runs on nothing, whatever
+  // its route says — and an owned pick may be a file on disk.
+  const id = pick.kind === "owned" ? pick.id.toLowerCase() : pick.tag.toLowerCase();
+  if (!((pick.kind === "owned" && pick.served) || servedIds.has(id))) return false;
   const power = powerOf(status);
   const local = (e: string | undefined) => e === "local_only" || e === "local_then_cloud";
   return (
@@ -87,14 +85,19 @@ export function eyebrow(pick: ShownPick, inUse: boolean): string {
   return "PM's pick for this computer";
 }
 
-/** Why this model, from its verdict and what it was judged against. Never speed. */
+/** Why this model, from its verdict and what it was judged against. Never speed.
+ *
+ *  "Fits entirely on your graphics card" is a claim about one context: every model is judged at
+ *  the context PM sizes it for (better_fit.rs `pick_context`: 32k tokens, less for a model made for
+ *  less, more for one the server is proven to run with more), and a larger one that only fits with
+ *  less than that is passed over — so the sentence says which context. */
 export function why(pick: ShownPick): string {
   const r = room(pick.fit);
   let text: string;
   if (pick.kind === "catalogue") {
     switch (pick.basis) {
       case "gpu":
-        text = `The largest model in PM's list that fits entirely on your graphics card${r}.`;
+        text = `The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for${r}.`;
         break;
       case "shared":
         text = `The largest model in PM's list that fits the memory this computer shares between its processor and graphics${r}, and that PM's cautious estimate says is quick enough for its background work.`;
@@ -109,7 +112,7 @@ export function why(pick: ShownPick): string {
   }
   if (pick.kind === "owned" && !pick.measured)
     text +=
-      " PM can't see which file your server loaded, so these figures are for the version PM would pick.";
+      " PM can't see which file your server loaded, so these figures are for the largest version of it in PM's list.";
   return text;
 }
 
@@ -155,16 +158,21 @@ export function facts(
  * What the server has to be set to for the model to run the way PM sized it — or null when PM sized
  * it at a server's usual settings (a 4k context on an f16 cache), with nothing to change.
  *
- * `setupShown`: the start card is showing the server guide (step 1), so Ollama's steps are there;
- * otherwise they are in Model server's tuning fold. `commandShown`: step 2 is showing a llama-server
- * command, which already carries the settings.
+ * Worded for the server it is about, and pointing only at steps that are on the page:
+ *   * `runner`: the connected server by its port — or, before anything is connected, the one PM
+ *     found running, which step 1 offers to connect;
+ *   * `setup`: the server guide step 1 is showing while nothing is connected or found — Ollama's
+ *     carries its two settings as steps, LM Studio's has no number to set, so its line gives them;
+ *   * Model server's tuning fold exists only once something is connected, so before then it is
+ *     where the steps will be, not where they are;
+ *   * `commandShown`: step 2 is showing a llama-server command, which already carries the settings.
  */
 export function settingsLine(
   fit: Pick<LocalFitResult, "context" | "kv">,
   server: {
     configured: boolean;
     runner: RunnerName | null;
-    setupShown: boolean;
+    setup: RunnerName | null;
     commandShown: boolean;
   },
 ): string | null {
@@ -175,19 +183,25 @@ export function settingsLine(
   const sized = `PM sized this for a ${kOf(fit.context)} context${
     cache ? " with a compressed (q8_0) cache" : ""
   }`;
-  if (!server.configured || server.runner === "Ollama") {
-    return `${sized}. Ollama only runs it that way once ${both ? "both are" : "that's"} set — the steps are ${
-      server.setupShown
+  const fold = `under ${sectionLabel("sec-localai-endpoint")}, in “${TUNING_TITLE}”`;
+  // Before connecting, the guide step 1 is showing is the server the reader is about to set up.
+  const runner = server.configured ? server.runner : (server.setup ?? server.runner);
+  if (runner === "Ollama") {
+    const where = server.configured
+      ? fold
+      : server.setup === "Ollama"
         ? "in step 1 below"
-        : `under ${sectionLabel("sec-localai-endpoint")}, in “${TUNING_TITLE}”`
-    }.`;
+        : `${fold}, once you've connected`;
+    return `${sized}. Ollama only runs it that way once ${both ? "both are" : "that's"} set — the steps are ${where}.`;
   }
-  if (server.runner === "LM Studio") {
+  if (runner === "LM Studio") {
+    // LM Studio's V cache compresses only with Flash Attention on. Model server's tuning step says
+    // so too, but only once something is connected — before that, this line is all there is.
     return `${sized}. In LM Studio, set the context length to ${fit.context ?? ""}${
-      cache ? " and the K and V cache quantization to Q8_0" : ""
+      cache ? " and the K and V cache quantization to Q8_0, with Flash Attention on," : ""
     } in the model's load settings.`;
   }
-  if (server.runner === "llama-server" && server.commandShown) {
+  if (runner === "llama-server" && server.commandShown) {
     return `${sized} — the command in step 2 includes ${both ? "both settings" : "that setting"}.`;
   }
   return `${sized}; your server needs ${both ? "both settings" : "that setting"} too, or the model may not fit.`;
@@ -268,7 +282,8 @@ export function inUseLine(
   const b = bound.toLowerCase();
   if (b === (pick.kind === "owned" ? pick.id : pick.tag).toLowerCase()) return null;
   const row = recs.installed.find((m) => m.id === bound);
-  if (pick.basis === "gpu" && row?.fit.speed_basis === "system")
+  // Only from the served model's own figures, never the catalogue's guess at them (`spillsOffCard`).
+  if (pick.basis === "gpu" && spillsOffCard(recs, bound))
     return `You're using ${bound}, which is larger than your graphics card's memory, so it runs from system memory. PM's pick fits on the card.`;
   if (row && row.matched_repo === null)
     return `You're using ${bound}, which isn't in PM's list, so PM can't compare the two.`;

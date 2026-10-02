@@ -4,6 +4,7 @@
 import type { ReactNode } from "react";
 
 import type {
+  LocalFitResult,
   LocalPick,
   LocalRecommendation,
   LocalRecommendations,
@@ -12,9 +13,10 @@ import type {
 import { formatBytes, formatGib } from "../../lib/format";
 import { useDepth } from "../../theme";
 import { IngestProgress } from "../IngestProgress";
-import { installCommand, type RunnerName } from "../../lib/workbenchGuide";
+import type { RunnerName } from "../../lib/workbenchGuide";
 import { ConfigRow, FitBadge, TokenChip } from "./fitDisplay";
 import { recCardId, TUNING_TITLE, useLocate } from "./locate";
+import { hfServeCommand } from "./readiness";
 import { sectionHelp, sectionLabel } from "./sections";
 import { SPEED_LIST_NOTE, speedShort } from "./speedWords";
 import type { ModelPull } from "./usePull";
@@ -35,7 +37,10 @@ import { Button, Callout, Collapsible, SectionInfo, SectionLabel, Select } from 
  *
  * One Download per tag: while the start card's step 2 offers PM's pick, that rung here says "PM's
  * pick" and points there instead of offering a second button for the same file — and a download's
- * progress shows once, on the start card for the pick, on its card otherwise.
+ * progress shows once, on the start card for the pick, on its card otherwise. While the list is
+ * folded, the progress a card would show is shown above the fold instead: the tab unmounts on every
+ * switch and the fold comes back closed, and a multi-gigabyte download with its only Cancel inside a
+ * closed fold is a download nothing on the page says is running.
  */
 export function LocalAiCatalog({
   recs,
@@ -68,9 +73,10 @@ export function LocalAiCatalog({
   pickDownloadTag?: string | null;
   /** The start card is showing the pick's download progress, so its card doesn't too. */
   pickProgressShown?: boolean;
-  /** The "Show all … models" fold, held by the tab so a pointer can open it. */
-  open?: boolean;
-  onOpenChange?: (open: boolean) => void;
+  /** The "Show all … models" fold, held by the tab so a pointer can open it — and so this section
+   *  knows whether a card's progress can be seen. */
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onCadence: (cadence: string) => void;
   /** Something in this section went wrong — a download it asked for, the cadence — said here
    *  rather than at the top of the tab. */
@@ -78,8 +84,20 @@ export function LocalAiCatalog({
 }) {
   const { pulling, pullProg } = pull;
   const { showMeta } = useDepth();
+  const locate = useLocate();
   const pick = recs?.pick;
   const count = recs?.curated.length ?? 0;
+  // A running download's progress is this section's unless the start card is showing it (PM's pick,
+  // while step 2 is on it). It goes on the card that offers the file while the list is open, and
+  // above the fold while it is closed — or always, for a download no card here offers.
+  const progressHere =
+    pulling !== null && !(pickProgressShown && pick?.kind === "catalogue" && pick.tag === pulling);
+  const pulledRec =
+    pulling === null
+      ? null
+      : (recs?.curated.find((r) => r.ollama_pull === pulling || r.gpu_pull?.tag === pulling) ??
+        null);
+  const progressAboveFold = progressHere && (!open || pulledRec === null);
   // Never folded: why the list offers no Download is a gating hint, and the doctrine never folds
   // those.
   const gating = !configured
@@ -123,6 +141,26 @@ export function LocalAiCatalog({
       <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
         <NumbersGuide />
       </Collapsible>
+      {/* Never folded: a status readout, and the only Cancel there is while the list is closed. */}
+      {progressAboveFold && pulling !== null && (
+        <PullProgressRow
+          name={pulledRec?.display_name ?? pulling}
+          pullProg={pullProg}
+          startedAt={pull.startedAt}
+          onCancel={pull.cancel}
+          action={
+            pulledRec && (
+              <Button
+                variant="tertiary"
+                size="sm"
+                onClick={() => locate?.(`rec:${pulledRec.repo}`)}
+              >
+                Show it
+              </Button>
+            )
+          }
+        />
+      )}
       {loading ? (
         <p className="mt-3 text-xs text-ink4">Sizing models against your machine…</p>
       ) : recs && count > 0 ? (
@@ -150,10 +188,7 @@ export function LocalAiCatalog({
                 pullingTag={pulling}
                 pullProg={pullProg}
                 startedAt={pull.startedAt}
-                progressHere={
-                  pulling !== null &&
-                  !(pickProgressShown && pick?.kind === "catalogue" && pick.tag === pulling)
-                }
+                progressHere={progressHere && !progressAboveFold}
                 onPull={(tag) => pull.requestPull(rec, tag, "models")}
                 servedTags={servedTags}
                 onCancel={pull.cancel}
@@ -219,9 +254,14 @@ function bandLine(rec: LocalRecommendation, pick: LocalPick | undefined): string
   if (pick?.kind !== "catalogue" || pick.repo !== rec.repo) return null;
   if (pick.tag === rec.ollama_pull || pick.tag === rec.gpu_pull?.tag) return null;
   const k = `${((pick.fit.context ?? 0) / 1024).toFixed(0)}k`;
-  return `PM's pick runs this model as ${pick.fit.quant ?? "a smaller file"} with a ${k} context${
+  const as = `PM's pick runs this model as ${pick.fit.quant ?? "a smaller file"} with a ${k} context${
     pick.fit.kv === "q8_0" ? " and a compressed cache" : ""
-  }, so it fits your graphics card with the room PM keeps free — it's under ${sectionLabel("sec-localai-start")}.`;
+  }`;
+  const why =
+    pick.basis === "gpu"
+      ? "so it fits your graphics card with the room PM keeps free"
+      : "the build quick enough for PM's background work from memory";
+  return `${as}, ${why} — it's under ${sectionLabel("sec-localai-start")}.`;
 }
 
 function NumbersGuide() {
@@ -271,12 +311,21 @@ function NumbersGuide() {
         Memory figures are designed to run a little high — about 11% above a real load when PM
         measured one — so a model PM says fits should fit. Memory assumes an f16 cache unless a card
         shows “q8_0 KV”, where PM sized it on a compressed (near-lossless) cache to keep a larger
-        context or quant — your server needs that setting too (
-        {sectionLabel("sec-localai-endpoint")}, “{TUNING_TITLE}”). Your real speed and memory depend
-        on your server and its settings.
+        context or quant — your server needs that setting too, and the context the card shows. Each
+        model's commands say what to set, and once your server is connected,{" "}
+        {sectionLabel("sec-localai-endpoint")}'s “{TUNING_TITLE}” has the steps. Your real speed and
+        memory depend on your server and its settings.
       </p>
     </dl>
   );
+}
+
+/** One way to run a model the card shows: its label, the Ollama tag that fetches it (null when PM
+ *  has no tag to give), and the config PM sized it at. */
+interface Rung {
+  label: string;
+  tag: string | null;
+  fit: Pick<LocalFitResult, "quant" | "context" | "kv">;
 }
 
 /** How to get a model PM can't download for you.
@@ -284,61 +333,158 @@ function NumbersGuide() {
  *  Honest per runner rather than one command pretending to be universal: the three name models three
  *  different ways, and the same weights are `qwen2.5:7b-instruct-q4_K_M` to Ollama, `…@q4_k_m` to LM
  *  Studio and `user/repo:Q4_K_M` to llama-server. Pasting one into another gets you nothing. So PM
- *  prints the command it can stand behind and describes the route for the two it can't. */
+ *  prints the command it can stand behind and describes the route for the two it can't.
+ *
+ *  llama-server takes a Hugging Face repo id directly (`-hf <user>/<model>[:quant]`, its documented
+ *  form). LM Studio's `lms get` documentation never says it accepts one, so PM points at the Discover
+ *  tab, which does. Ollama's line is the catalogue's own `hf.co/<repo>:<QUANT>` tag, written by the
+ *  generator only after it checked the registry, and never composed here: a tag made up in the view
+ *  would be a guess wearing a verified tag's clothes.
+ *
+ *  And each says the config PM sized it at, because that is what the card's figures are for.
+ *  llama-server's line carries it (the same `hfServeCommand` the start card prints): without
+ *  `--ctx-size`, a current build loads the model's whole trained context, which is not what the card
+ *  measured. An `ollama pull` can't carry it — Ollama runs a model at the context it is set to — so
+ *  the hint says the number to set instead. */
 function ModelInstallHint({
   repo,
-  quant,
   rungs,
   shardedQuant,
 }: {
   repo: string;
-  quant: string | null;
   /** Every way to run this model that PM can name, one per rung the card shows. A split card offers
-   *  two genuinely different files; printing only one of them is what stranded the GPU rung. */
-  rungs: { label: string; tag: string }[];
+   *  two genuinely different configs; printing only one of them is what stranded the GPU rung. */
+  rungs: Rung[];
   shardedQuant: boolean;
 }) {
-  const cmd = installCommand("llama-server", repo, quant);
+  // One llama-server line per distinct config: a split whose rungs share a file still runs it two
+  // ways, at two contexts or caches, and those are different commands.
+  const serve: { label: string; cmd: string }[] = [];
+  for (const r of rungs) {
+    const cmd = hfServeCommand(repo, r.fit);
+    if (!serve.some((x) => x.cmd === cmd)) serve.push({ label: r.label, cmd });
+  }
+  const pulls = rungs.filter((r): r is Rung & { tag: string } => !!r.tag);
+  const { ollama, lmStudio } = settingsFor(rungs);
   return (
     <div className="mt-2 space-y-1.5">
-      {cmd && (
-        <div className="flex items-center gap-2">
-          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
-            {cmd}
-          </code>
-          <Button
-            variant="tertiary"
-            size="sm"
-            onClick={() => void navigator.clipboard?.writeText(cmd)}
-          >
-            Copy
-          </Button>
-        </div>
-      )}
-      {rungs.map((r) => (
-        <div key={r.tag} className="flex items-center gap-2">
-          {rungs.length > 1 && (
-            <span className="shrink-0 text-[0.625rem] text-ink4">{r.label}</span>
-          )}
-          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
-            {`ollama pull ${r.tag}`}
-          </code>
-          <Button
-            variant="tertiary"
-            size="sm"
-            onClick={() => void navigator.clipboard?.writeText(`ollama pull ${r.tag}`)}
-          >
-            Copy
-          </Button>
-        </div>
+      {serve.map((x) => (
+        <CommandRow key={x.cmd} label={serve.length > 1 ? x.label : null} cmd={x.cmd} />
+      ))}
+      {pulls.map((r) => (
+        <CommandRow
+          key={r.tag}
+          label={pulls.length > 1 ? r.label : null}
+          cmd={`ollama pull ${r.tag}`}
+        />
       ))}
       <p className="text-[0.6875rem] text-ink4">
-        That command downloads and serves it in one step. In LM Studio, paste{" "}
-        <span className="font-mono text-ink3">{repo}</span> into the Discover tab's search.
+        {serve.length > 1 ? "Each llama-server line downloads" : "The llama-server line downloads"}{" "}
+        the model and serves it in one step, with the settings PM sized it for.
+        {ollama &&
+          pulls.length > 0 &&
+          ` An ollama pull only fetches the file: Ollama runs every model at the one context it is set to, so ${ollama} for it to run the way PM sized it.`}{" "}
+        In LM Studio, paste <span className="font-mono text-ink3">{repo}</span> into the Discover
+        tab's search{lmStudio ? `, and ${lmStudio}` : ""}.
         {shardedQuant
           ? " Ollama can't fetch this quantization — it ships as split files, which Ollama won't pull. A smaller one of the same model will work."
           : ""}
       </p>
+    </div>
+  );
+}
+
+/** What Ollama and LM Studio need set for the rungs to run as sized — the context, and the
+ *  compressed cache where PM sized on one — or nulls when every rung is at what a server starts with
+ *  (a 4k context on an f16 cache). One number when the rungs agree; the rows, when they don't. */
+function settingsFor(rungs: Rung[]): { ollama: string | null; lmStudio: string | null } {
+  const changes = rungs.some((r) => r.fit.kv === "q8_0" || (r.fit.context ?? 0) > 4096);
+  if (!changes || rungs.length === 0) return { ollama: null, lmStudio: null };
+  const [first] = rungs;
+  const uniform = rungs.every(
+    (r) => r.fit.context === first.fit.context && r.fit.kv === first.fit.kv,
+  );
+  const lmCache = "the K and V cache quantization at Q8_0 (with Flash Attention on)";
+  if (!uniform)
+    return {
+      ollama:
+        "set that to the context on the row you choose, and its cache to q8_0 if the row shows “q8_0 KV”,",
+      lmStudio: `load it with the context on the row you choose — and, if the row shows “q8_0 KV”, ${lmCache}`,
+    };
+  const { context, kv } = first.fit;
+  const q8 = kv === "q8_0";
+  if (context == null)
+    return q8
+      ? { ollama: "set its cache to q8_0", lmStudio: `load it with ${lmCache}` }
+      : { ollama: null, lmStudio: null };
+  return {
+    ollama: `set that to ${context}${q8 ? " and its cache to q8_0" : ""}`,
+    lmStudio: `load it with a context length of ${context}${q8 ? ` and ${lmCache}` : ""}`,
+  };
+}
+
+/** A command to copy, with the rung it is for when the card has more than one. */
+function CommandRow({ label, cmd }: { label: string | null; cmd: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      {label && <span className="shrink-0 text-[0.625rem] text-ink4">{label}</span>}
+      <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
+        {cmd}
+      </code>
+      <Button variant="tertiary" size="sm" onClick={() => void navigator.clipboard?.writeText(cmd)}>
+        Copy
+      </Button>
+    </div>
+  );
+}
+
+/** A download's progress, its status and its Cancel — on its card, or above the folded list. */
+function PullProgressRow({
+  name,
+  pullProg,
+  startedAt,
+  onCancel,
+  action,
+}: {
+  name: string;
+  pullProg: PullProgress | null;
+  startedAt: number | null;
+  onCancel: () => void;
+  /** Beside Cancel: a way to the card, when it is folded away. */
+  action?: ReactNode;
+}) {
+  const { showMeta } = useDepth();
+  const pct =
+    pullProg && pullProg.total_bytes
+      ? Math.min(100, Math.round((100 * (pullProg.completed_bytes ?? 0)) / pullProg.total_bytes))
+      : null;
+  return (
+    <div className="mt-2">
+      {/* The shared per-depth progress surface: shimmer while the total is unknown (the
+          manifest/verify phases used to render a FULL bar, which reads as "done"), percent once
+          bytes flow. The status word stays at every Depth — it is a status readout, never folded;
+          the byte counts are detail. */}
+      <IngestProgress
+        processed={pct ?? 0}
+        total={pct != null ? 100 : null}
+        label={`Downloading ${name}`}
+        mode="percent"
+        startedAt={startedAt ?? undefined}
+      />
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <p className="min-w-0 truncate font-mono text-[0.625rem] text-ink4">
+          {pullProg?.status ?? "starting…"}
+          {showMeta && pullProg?.total_bytes
+            ? ` · ${formatBytes(pullProg.completed_bytes)} / ${formatBytes(pullProg.total_bytes)}`
+            : ""}
+        </p>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {action}
+          <Button variant="tertiary" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+        </span>
+      </div>
     </div>
   );
 }
@@ -371,7 +517,8 @@ function RecommendationCard({
   pullingTag: string | null;
   pullProg: PullProgress | null;
   startedAt: number | null;
-  /** This card shows the running download's progress (the start card shows the pick's). */
+  /** This card shows the running download's progress — not the start card (the pick's), and not the
+   *  line above the folded list. */
   progressHere: boolean;
   onPull: (tag: string) => void;
   onCancel: () => void;
@@ -391,6 +538,8 @@ function RecommendationCard({
   const ramTarget = { tag: rec.ollama_pull, sharded: rec.sharded_quant };
   const gpuTarget = rec.gpu_pull;
   const isSplit = rec.gpu.kind === "split";
+  // Its progress shows here only when it isn't shown elsewhere (the start card, or above the folded
+  // list); the button says "Downloading…" either way, because that is what the file is doing.
   const pulling =
     progressHere &&
     pullingTag !== null &&
@@ -424,10 +573,6 @@ function RecommendationCard({
   };
   // MoE when fewer params are active per token than the model holds (matches the catalog's own rule).
   const isMoe = rec.active_parameters_b + 0.01 < rec.parameters_b;
-  const pct =
-    pullProg && pullProg.total_bytes
-      ? Math.min(100, Math.round((100 * (pullProg.completed_bytes ?? 0)) / pullProg.total_bytes))
-      : null;
   return (
     <div id={recCardId(rec.repo)} className="rounded-[var(--radius-sm)] border border-border p-3">
       <div className="flex items-start justify-between gap-3">
@@ -526,7 +671,7 @@ function RecommendationCard({
               onClick={() => rec.ollama_pull && onPull(rec.ollama_pull)}
               disabled={busy || f.verdict === "stay_on_cloud"}
             >
-              {pulling ? "Downloading\u2026" : "Download"}
+              {pullingTag === rec.ollama_pull ? "Downloading\u2026" : "Download"}
             </Button>
           ) : null}
         </div>
@@ -541,55 +686,40 @@ function RecommendationCard({
       )}
 
       {pulling && (
-        <div className="mt-2">
-          {/* The shared per-depth progress surface: shimmer while the total is unknown (the
-              manifest/verify phases used to render a FULL bar, which reads as "done"), percent
-              once bytes flow. The status word stays at every Depth — it is a status readout, never
-              folded; the byte counts are detail. */}
-          <IngestProgress
-            processed={pct ?? 0}
-            total={pct != null ? 100 : null}
-            label={`Downloading ${rec.display_name}`}
-            mode="percent"
-            startedAt={startedAt ?? undefined}
-          />
-          <div className="mt-1 flex items-center justify-between gap-2">
-            <p className="min-w-0 truncate font-mono text-[0.625rem] text-ink4">
-              {pullProg?.status ?? "starting…"}
-              {showMeta && pullProg?.total_bytes
-                ? ` · ${formatBytes(pullProg.completed_bytes)} / ${formatBytes(pullProg.total_bytes)}`
-                : ""}
-            </p>
-            <Button variant="tertiary" size="sm" onClick={onCancel}>
-              Cancel
-            </Button>
-          </div>
-        </div>
+        <PullProgressRow
+          name={rec.display_name}
+          pullProg={pullProg}
+          startedAt={startedAt}
+          onCancel={onCancel}
+        />
       )}
 
       {!installed &&
         (() => {
           // Every way to get this model that PM can name. Always folded: the card is the summary,
           // and the commands are for the reader who has decided. "Install it another way" when PM
-          // can download it for you, "How to get it" when it can't.
-          const rungs = [
-            { label: "Highest quality", tag: rec.ollama_pull },
-            ...(isSplit && !gpuTarget?.same_file
-              ? [{ label: "Fastest on GPU", tag: gpuTarget?.tag ?? null }]
+          // can download it for you, "How to get it" when it can't. A split's GPU rung is its own
+          // config even when it is the same file — its Ollama tag is then the first rung's, so only
+          // its llama-server line differs.
+          const rungs: Rung[] = [
+            { label: "Highest quality", tag: rec.ollama_pull, fit: f },
+            ...(rec.gpu.kind === "split"
+              ? [
+                  {
+                    label: "Fastest on GPU",
+                    tag: gpuTarget?.same_file ? null : (gpuTarget?.tag ?? null),
+                    fit: rec.gpu.fit,
+                  },
+                ]
               : []),
-          ].filter((r): r is { label: string; tag: string } => !!r.tag);
+          ];
           return (
             <Collapsible
               title={canPull ? "Install it another way" : "How to get it"}
               defaultOpen={false}
               className="mt-2"
             >
-              <ModelInstallHint
-                repo={rec.repo}
-                quant={f.quant}
-                rungs={rungs}
-                shardedQuant={rec.sharded_quant}
-              />
+              <ModelInstallHint repo={rec.repo} rungs={rungs} shardedQuant={rec.sharded_quant} />
             </Collapsible>
           );
         })()}

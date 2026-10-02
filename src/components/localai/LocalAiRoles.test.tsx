@@ -133,7 +133,7 @@ describe("each role's row", () => {
     show();
     expect(
       screen.getByText(
-        "Good for most setups with a cloud key: your own model when it can, your cloud model when your server is down. It's the only setting On battery can move.",
+        "Good for most setups with a cloud key: your own model when it can, your cloud model when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model. It's the only setting On battery can move.",
       ),
     ).toBeTruthy();
     expect(
@@ -164,7 +164,7 @@ describe("the line that says where a job really goes", () => {
       "Runs on tiny-chat:1b on this computer, and never uses the cloud.",
     );
     expect(line("local_then_cloud", cfg({ base_url: "http://192.168.1.20:11434" }))).toBe(
-      "Runs on tiny-chat:1b on your model server; your cloud model answers only if your server fails.",
+      "Runs on tiny-chat:1b on your model server; your cloud model answers when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model.",
     );
   });
 
@@ -189,13 +189,42 @@ describe("the line that says where a job really goes", () => {
 
   it("adds when the server isn't serving the model the job is set to", () => {
     expect(line("local_then_cloud", cfg(), [{ id: "other-chat:3b", embedding: false }])).toBe(
-      "Runs on tiny-chat:1b on this computer; your cloud model answers only if your server fails. Your server isn't serving tiny-chat:1b right now.",
+      "Runs on tiny-chat:1b on this computer; your cloud model answers when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model. Your server isn't serving tiny-chat:1b right now.",
     );
   });
 
   it("says nothing until the status has been read", () => {
     const { container } = show({ st: null });
     expect(container.querySelector("p.text-ink3")).toBeNull();
+  });
+
+  it("never says the cloud answers only when the server is down", () => {
+    // The gateway also falls back on a running server: a reply that fails or times out, and a
+    // request longer than the window the server gives the model (a long chat on Ollama's default
+    // 4k). "Only if your server fails" told someone a long chat stayed on their computer.
+    show({ config: cfg({ chat_routing: "local-then-cloud" }) });
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/only if your server|when your server is down/);
+    expect(text).toMatch(/a request is too long for the window it gives the model/);
+  });
+});
+
+describe("a server serving nothing yet", () => {
+  // With no model, a job goes wherever its routing and keys send it: a keyed Cloud job to the cloud,
+  // a Local only or keyless one nowhere. The empty-server hint sat beside the row's own line saying
+  // "nothing to answer with" while it claimed "both roles stay on cloud".
+  it("names no destination of its own, and leaves that to each job's line", () => {
+    show({
+      config: cfg({ chat_routing: "local", chat_model: null }),
+      st: status("nothing"),
+      served: [],
+    });
+    const hint = screen.getByText(/isn't serving any models yet/);
+    expect(hint.textContent).not.toMatch(/cloud/);
+    expect(hint.textContent).toMatch(/the line under each job says where it goes meanwhile/);
+    expect(
+      screen.getByText("No local model chosen, so this job has nothing to answer with."),
+    ).toBeTruthy();
   });
 });
 

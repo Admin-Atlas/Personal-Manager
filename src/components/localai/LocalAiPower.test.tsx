@@ -554,13 +554,15 @@ describe("On battery, hand the memory back (#432)", () => {
     await settled();
   });
 
-  it("is off when the server can't unload anything", async () => {
+  it("is off when PM has no way to unload from the server", async () => {
     await loaded({ no_unload_route: true });
+    // The limit is PM's: LM Studio can eject a model, PM just can't ask it to.
     expect(
       await screen.findByText(
-        /Your server can't unload a model on request, so this can't do anything with it/,
+        /PM can only unload a model through Ollama, so this can't do anything with your server/,
       ),
     ).toBeTruthy();
+    expect(screen.queryByText(/can't unload a model on request/)).toBeNull();
     expect(batteryRow().disabled).toBe(true);
   });
 

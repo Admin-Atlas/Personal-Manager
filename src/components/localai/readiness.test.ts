@@ -13,6 +13,7 @@ import type {
   LocalDiskSource,
   LocalFitResult,
   LocalGpuResidency,
+  LocalInstalledModel,
   LocalLlmConfig,
   LocalLlmStatus,
   LocalPick,
@@ -24,13 +25,15 @@ import type {
   PowerView,
 } from "../../lib/types";
 import {
-  ACTION_MIRRORS,
   assignPlan,
+  COPY_COLLISIONS,
   isLoopback,
+  onDiskHow,
   overall,
   primaryOf,
   rightNow,
   runnerOf,
+  SAME_SECTION_POINTERS,
   standing,
   steps,
   whereOf,
@@ -260,6 +263,37 @@ const LLAMA: DetectedEndpoint = { url: "http://127.0.0.1:8080", label: "llama-se
 const served = (...ids: string[]): LocalServedModel[] =>
   ids.map((id) => ({ id, embedding: false }));
 
+/** A served model's row. `measured`: its figures are for the user's own file at the context the
+ *  server serves — an Ollama tag's real size — rather than the catalogue's guess at them. */
+const installed = (
+  id: string,
+  over: Partial<LocalFitResult> = {},
+  measured = true,
+): LocalInstalledModel & { measured: boolean } => ({
+  id,
+  matched_repo: QWEN,
+  fit: fit(over),
+  measured,
+});
+
+/** PM's pick as a model the user already has. */
+const ownedPick = (
+  over: Partial<Extract<LocalPick, { kind: "owned" }>> = {},
+): Extract<LocalPick, { kind: "owned" }> => ({
+  kind: "owned",
+  id: "q.gguf",
+  repo: QWEN,
+  display_name: "Qwen2.5 7B Instruct",
+  served: false,
+  source: "hugging_face",
+  path: "/m/q.gguf",
+  shards: 1,
+  measured: true,
+  fit: fit(),
+  basis: "gpu",
+  ...over,
+});
+
 /** Chat and background both on `model`, both running on it with the given route. */
 const both = (model: string, effective: PowerRoleView["effective"], routing = "local") =>
   input({
@@ -278,6 +312,24 @@ describe("standing — where the user stands, first match wins", () => {
     expect(standing(input({ config: null }))).toBe("Reading your local AI setup…");
   });
 
+  it("says the read failed rather than reading forever", () => {
+    // Nothing reads the config again until the tab does, so "Reading…" would never end.
+    const failed = input({ config: null, configError: "the keychain is locked" });
+    expect(standing(failed)).toBe(
+      "PM couldn't read your local AI setup, so it can't say where things stand.",
+    );
+    const [server, ...rest] = steps(failed);
+    expect(server).toMatchObject({
+      state: "attention",
+      line: `PM couldn't read your local AI setup — what went wrong is under ${sectionLabel("sec-localai-endpoint")}.`,
+      action: { kind: "locate", to: "sec-localai-endpoint", label: "What to check" },
+    });
+    for (const s of rest) expect(s.state).toBe("waiting");
+    expect(overall(steps(failed), failed)).toEqual({ label: "Needs attention", token: "--st-due" });
+    // Once a read lands, the old failure says nothing.
+    expect(standing({ ...input(), configError: "earlier" })).not.toContain("couldn't read");
+  });
+
   it("names a server it found, before anything is connected", () => {
     const fresh = { config: cfg({ base_url: null }) };
     expect(standing(input({ ...fresh, detected: [OLLAMA] }))).toBe(
@@ -294,8 +346,10 @@ describe("standing — where the user stands, first match wins", () => {
 
   it("says a runner looks installed when its folder is there, readable or not", () => {
     const fresh = { config: cfg({ base_url: null }), detected: [] };
+    // LM Studio can be open on screen with its server off — how it starts — so "isn't running"
+    // would be false of the app the user is looking at.
     expect(standing(input({ ...fresh, recs: recs({ disk_sources_present: ["lm_studio"] }) }))).toBe(
-      "LM Studio looks installed here, but it isn't running, so PM can't use it yet.",
+      "LM Studio looks installed here, but its server isn't on, so PM can't use it yet.",
     );
     expect(
       standing(
@@ -317,10 +371,7 @@ describe("standing — where the user stands, first match wins", () => {
     expect(standing(input({ ...fresh, status: routes({ effective: "nothing" }) }))).toBe(
       "No local model is set up on this computer yet, and there's no cloud key either, so PM has no AI model to use yet.",
     );
-    // "Nothing" with a key present is a job set to Local with no server — not a missing key.
-    expect(
-      standing(input({ ...fresh, status: routes({ effective: "nothing", cloud_key: "present" }) })),
-    ).toBe("No local model is set up on this computer yet.");
+    // A job set to Cloud with no key of its own, beside one that has one: nothing more to say.
     expect(
       standing(
         input({
@@ -329,6 +380,34 @@ describe("standing — where the user stands, first match wins", () => {
         }),
       ),
     ).toBe("No local model is set up on this computer yet.");
+  });
+
+  it("says a job left on a local model has nothing to answer with until a server is connected", () => {
+    // Disconnect keeps the routing. "Nothing" with a key present is that job — not a missing key —
+    // and Assign roles shows no rows to say so while nothing is connected.
+    const left = {
+      config: cfg({ base_url: null, chat_routing: "local" }),
+      detected: [],
+      status: routes(
+        { effective: "nothing", cloud_key: "present" },
+        { effective: "cloud", cloud_key: "present" },
+      ),
+    };
+    expect(standing(input(left))).toBe(
+      "No local model is set up on this computer yet. Chat is set to run on a local model, so it can't answer until PM is connected to a model server.",
+    );
+    expect(standing(input({ ...left, detected: [OLLAMA] }))).toBe(
+      "Ollama is running on this computer, but PM isn't connected to it yet. Chat is set to run on a local model, so it can't answer until PM is connected to a model server.",
+    );
+    const bothLeft = input({
+      ...left,
+      config: cfg({ base_url: null, chat_routing: "local", background_routing: "local" }),
+      status: routes({ effective: "nothing", cloud_key: "present" }),
+      recs: recs({ disk_sources_present: ["ollama"] }),
+    });
+    expect(standing(bothLeft)).toBe(
+      "Ollama looks installed here, but it isn't running, so PM can't use it yet. Chat and background work are set to run on a local model, so they can't answer until PM is connected to a model server.",
+    );
   });
 
   it("is checking once connected and before the status arrives", () => {
@@ -426,9 +505,9 @@ describe("standing — where the user stands, first match wins", () => {
         background_routing: "local-then-cloud",
       }),
       served: served("big:70b"),
-      recs: recs({
-        installed: [{ id: "big:70b", matched_repo: null, fit: fit({ speed_basis: "system" }) }],
-      }),
+      // A row the backend can send: "system" only ever comes from a catalogue match, and the claim
+      // only from a measured one.
+      recs: recs({ installed: [installed("big:70b", { speed_basis: "system" })] }),
       status: routes(
         { effective: "cloud_for_power", cloud_key: "present", route: "cloud" },
         { effective: "unknown", cloud_key: "unreadable" },
@@ -437,6 +516,42 @@ describe("standing — where the user stands, first match wins", () => {
     expect(standing(i)).toBe(
       "Chat runs on big:70b, on this computer, with your cloud model as a fallback. Background work runs on gone:7b, on this computer. On battery, chat is on your cloud model for now. Your server isn't serving gone:7b right now. big:70b is larger than your graphics card's memory, so it runs from system memory — expect slow replies. PM can't read your saved keys right now, so it can't say whether background work would fall back to the cloud.",
     );
+  });
+
+  it("says a model runs from system memory only from the user's own file", () => {
+    // The dev laptop on LM Studio, serving its own Q4_K_M of Qwen 7B, which fits the card. LM Studio
+    // has no /api/tags, so the row is the catalogue's guess — Q8_0 at 10 GB, because 20 GB is free —
+    // and the pick, judged against the card, is that same model.
+    const lms = (pick: LocalPick, measured: boolean) =>
+      standing({
+        ...both("qwen2.5-7b-instruct", "local_only"),
+        config: cfg({
+          base_url: "http://127.0.0.1:1234",
+          chat_model: "qwen2.5-7b-instruct",
+          background_model: "qwen2.5-7b-instruct",
+          chat_routing: "local",
+          background_routing: "local",
+        }),
+        recs: recs({
+          pick,
+          installed: [
+            installed(
+              "qwen2.5-7b-instruct",
+              { quant: "Q8_0", est_memory_gb: 10.04, speed_basis: "system" },
+              measured,
+            ),
+          ],
+        }),
+      });
+    const clean =
+      "Chat and background work run on qwen2.5-7b-instruct, on this computer, and never use the cloud.";
+    expect(lms(catalogue(), false)).toBe(clean);
+    // Measured or not, never of the pick itself: the card beside it says it fits on the card.
+    expect(
+      lms(ownedPick({ id: "qwen2.5-7b-instruct", served: true, source: null, path: null }), true),
+    ).toBe(clean);
+    // A measured file that really is larger than the card is still said.
+    expect(lms(catalogue(), true)).toContain("runs from system memory — expect slow replies");
   });
 });
 
@@ -472,6 +587,15 @@ describe("steps — four, in order, with at most one next", () => {
         pick: { kind: "nothing", reason: "too_slow", basis: "system", system_fallback: false },
       }),
       served: [],
+    }),
+    readFailed: input({ config: null, configError: "the keychain is locked" }),
+    onBattery: { ...both(QWEN_TAG, "cloud_for_power", "local-then-cloud"), justAssigned: true },
+    ownFile: { ...both("my-finetune", "local_only"), recs: recs({ pick: ownedPick() }) },
+    modelGone: { ...both("gone:7b", "local_only"), served: [] },
+    reconnected: input({
+      config: cfg({ chat_routing: "local-then-cloud", background_routing: "local-then-cloud" }),
+      served: served(QWEN_TAG),
+      status: routes({ effective: "cloud", cloud_key: "present" }),
     }),
   };
 
@@ -555,8 +679,19 @@ describe("steps — four, in order, with at most one next", () => {
       }),
     );
     expect(lms.setup).toBe("LM Studio");
+    // Opening the app isn't enough: its server starts off, and PM would never notice.
     expect(lms.line).toBe(
-      "LM Studio looks installed — PM found its model folder — but it isn't answering. Start it, and PM notices within about half a minute.",
+      "LM Studio looks installed — PM found its model folder — but its server isn't answering. Open LM Studio and switch its server on (the toggle at the top of its Developer tab), and PM notices within about half a minute.",
+    );
+    const [ollama] = steps(
+      input({
+        config: cfg({ base_url: null }),
+        detected: [],
+        recs: recs({ disk_sources_present: ["ollama"] }),
+      }),
+    );
+    expect(ollama.line).toBe(
+      "Ollama looks installed — PM found its model folder — but it isn't answering. Start it, and PM notices within about half a minute.",
     );
     expect(steps(STATES.looking)[0]).toMatchObject({
       state: "checking",
@@ -641,6 +776,65 @@ describe("steps — four, in order, with at most one next", () => {
     expect(overall(list, own)?.label).toBe("Set up");
   });
 
+  it("step 2 is done the same way when the pick is a file on disk", () => {
+    // A llama-server user serving their own fine-tune, with a catalogue GGUF in the Hugging Face
+    // cache that became the pick: the serve command would replace the model they chose.
+    const llama = {
+      ...both("my-finetune", "local_only"),
+      config: cfg({
+        base_url: "http://127.0.0.1:8080",
+        chat_model: "my-finetune",
+        background_model: "my-finetune",
+        chat_routing: "local",
+        background_routing: "local",
+      }),
+      recs: recs({ pick: ownedPick() }),
+    };
+    const list = steps(llama);
+    expect(list[1]).toMatchObject({ state: "done", action: null, command: null });
+    expect(list[1].line).toBe(
+      `Your jobs already run on a model your server has. Qwen2.5 7B Instruct is PM's pick for this computer, if you'd like to try it — it's under ${sectionLabel("sec-localai-downloaded")} too.`,
+    );
+    expect(overall(list, llama)?.label).toBe("Set up");
+    // With nothing at work on it yet, serving the file is the step.
+    const idle = steps({ ...llama, config: cfg({ base_url: "http://127.0.0.1:8080" }) })[1];
+    expect(idle).toMatchObject({
+      state: "next",
+      line: "It's a file on this computer. llama-server can serve it as it is:",
+    });
+  });
+
+  it("step 2 counts a job as at work only on a model the server is serving", () => {
+    // The user removed the bound model (`ollama rm`): its route still reads Local only — the route
+    // only knows a model is chosen — but the server is empty, and the pick's download is exactly
+    // what it needs.
+    const gone = (servedNow: LocalServedModel[]) =>
+      input({
+        config: cfg({
+          chat_model: "gone:7b",
+          background_model: "gone:7b",
+          chat_routing: "local",
+          background_routing: "local",
+        }),
+        served: servedNow,
+        status: routes({ effective: "local_only" }),
+      });
+    const empty = steps(gone([]));
+    expect(empty[1]).toMatchObject({
+      state: "next",
+      action: { kind: "download", tag: QWEN_TAG, label: "Download (5.1 GB)" },
+    });
+    expect(primaryOf(empty[1])).not.toBeNull();
+    expect(empty[2].line).toBe(
+      "Chat is set to gone:7b, which your server isn't serving right now.",
+    );
+    const other = steps(gone(served("other:3b")))[1];
+    expect(other.state).toBe("next");
+    expect(other.line).not.toContain("already run on a model your server has");
+    // The same for a pick that is a file on disk.
+    expect(steps({ ...gone([]), recs: recs({ pick: ownedPick() }) })[1].state).toBe("next");
+  });
+
   it("step 2 is done once the server has the pick", () => {
     expect(steps(STATES.servedUnassigned)[1]).toMatchObject({
       state: "done",
@@ -696,12 +890,27 @@ describe("steps — four, in order, with at most one next", () => {
       line: "It's split into 3 files, so PM can't give you a one-line command to serve it.",
       command: null,
     });
+    // Step 2 is only ever shown connected, and a file in LM Studio's or Ollama's folder only counts
+    // for a server on that runner's port — so that runner is connected, and isn't serving it.
     expect(disk("lm_studio", "/m/q.gguf")).toMatchObject({
-      line: "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
+      line: "It's in LM Studio. Load it there — PM sees it within about half a minute.",
       command: null,
     });
     expect(disk("ollama", "/m/blobs").line).toBe(
+      "It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else.",
+    );
+  });
+
+  it("words a file on disk for a server that isn't connected yet, for Already on this device", () => {
+    const f = fit();
+    expect(onDiskHow("ollama", 1, "/m/blobs", f).line).toBe(
       "It's in Ollama's folder — once Ollama is connected, it shows up by itself.",
+    );
+    expect(onDiskHow("lm_studio", 1, "/m/q.gguf", f).line).toBe(
+      "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
+    );
+    expect(onDiskHow("ollama", 1, "/m/blobs", f, true).line).not.toContain(
+      "once Ollama is connected",
     );
   });
 
@@ -844,6 +1053,41 @@ describe("steps — four, in order, with at most one next", () => {
     ]);
   });
 
+  it("step 3 offers the one-click way out of the no-model trap, saying what it writes", () => {
+    // Switching servers: Disconnect clears both models and keeps the routing, so the reconnect lands
+    // in the trap with a server full of models.
+    const reconnected = input({
+      config: cfg({ chat_routing: "local-then-cloud", background_routing: "local-then-cloud" }),
+      served: served(QWEN_TAG),
+      status: routes({ effective: "cloud", cloud_key: "present" }),
+    });
+    const roles = steps(reconnected)[2];
+    expect(roles.state).toBe("attention");
+    expect(roles.action).toMatchObject({ kind: "locate", to: "sec-localai-roles" });
+    expect(roles.secondary).toHaveLength(1);
+    const use = roles.secondary[0];
+    expect(use).toMatchObject({ kind: "assign", label: "Use Qwen2.5 7B Instruct for both" });
+    const plan = use.kind === "assign" ? use.plan : null;
+    expect(plan?.models).toEqual({ chat: QWEN_TAG, background: QWEN_TAG });
+    expect(plan?.routing).toEqual({ chat: null, background: null });
+    // Said before the click, in one space-separated sentence.
+    expect(roles.notes).toEqual([
+      "One model for both jobs — chat and background work — so your server only ever holds one. Chat keeps its current setting, Local, fall back to cloud. Background work keeps its current setting, Local, fall back to cloud.",
+    ]);
+    // Never a primary: the trap is the thing to see.
+    expect(primaryOf(roles)).toBeNull();
+    // A job already at work keeps its model: nothing is offered over it.
+    const working = steps(
+      input({
+        config: cfg({ chat_model: "a", chat_routing: "local", background_routing: "local" }),
+        served: served("a"),
+        status: routes({ effective: "local_only" }, { effective: "nothing" }),
+      }),
+    )[2];
+    expect(working.state).toBe("attention");
+    expect(working.secondary).toEqual([]);
+  });
+
   it("step 3 says who uses what once it is done", () => {
     // One of PM's own downloads is named as PM's list names it, not by its hf.co tag.
     expect(steps(STATES.returning)[2].line).toBe(
@@ -893,10 +1137,13 @@ describe("steps — four, in order, with at most one next", () => {
       state: "next",
       action: { kind: "test", role: "chat", label: "Send a test message" },
     });
-    // After a restart nothing is remembered, and nothing nags.
+    // After a restart nothing is remembered, and nothing nags. Named by model: a test of the other
+    // job's different model is still a test since PM started.
     const restart = steps(STATES.returning)[3];
     expect(restart.state).toBe("optional");
-    expect(restart.line).toBe("No test since PM started, or since your server changed.");
+    expect(restart.line).toBe(
+      "No test of Qwen2.5 7B Instruct since PM started, or since your server changed.",
+    );
     expect(restart.secondary).toEqual([
       { kind: "test", role: "chat", label: "Send a test message" },
     ]);
@@ -955,6 +1202,40 @@ describe("steps — four, in order, with at most one next", () => {
       tests: { running: null, chat: { result: result({ model: "old" }), error: null } },
     })[3];
     expect(stale.state).toBe("optional");
+    // A test asks a model, not a job: background work's Test it of the model chat uses too answers
+    // for chat — on its own row, or as the one test the backend remembers across a tab switch.
+    const viaBackground = steps({
+      ...STATES.returning,
+      tests: { running: null, background: { result: result({}), error: null } },
+    })[3];
+    expect(viaBackground).toMatchObject({ state: "done", line: "The last test replied in 2.4 s." });
+    const afterAssign = steps({
+      ...STATES.assigned,
+      tests: { running: null, background: { result: result({}), error: null } },
+    })[3];
+    expect(afterAssign.state).toBe("done");
+    // Of a different model, it doesn't.
+    const otherModel = steps({
+      ...STATES.returning,
+      tests: { running: null, background: { result: result({ model: "old" }), error: null } },
+    })[3];
+    expect(otherModel.state).toBe("optional");
+  });
+
+  it("step 4 offers a test on battery, without making it the step", () => {
+    // Both jobs are on Local, fall back to cloud, and On battery has moved them: step 3 is done,
+    // so "After step 3." under it would be false — and a test still asks the local model.
+    const battery = both(QWEN_TAG, "cloud_for_power", "local-then-cloud");
+    for (const i of [battery, { ...battery, justAssigned: true }]) {
+      const list = steps(i);
+      expect(list[2].state).toBe("done");
+      expect(list[3]).toMatchObject({
+        state: "optional",
+        line: "Chat and background work are on your cloud model while the battery is low, but a test still asks the local model, and loads it to answer.",
+        secondary: [{ kind: "test", role: "chat", label: "Send a test message" }],
+      });
+      expect(primaryOf(list[3])).toBeNull();
+    }
   });
 
   it("step 4 points at the tuning fold for a small window the server really serves", () => {
@@ -978,6 +1259,39 @@ describe("steps — four, in order, with at most one next", () => {
     expect(steps(unnamed)[3].action).toMatchObject({ to: "sec-localai-endpoint" });
   });
 
+  it("step 4 words a small window for the job that meets it", () => {
+    // Only chat runs locally: the window is chat's model's, and nothing of background work's is cut
+    // into pieces for it — what it limits is how long a chat can be.
+    const chatOnly = (effective: "local_only" | "local_then_cloud") =>
+      steps(
+        input({
+          config: cfg({
+            chat_model: QWEN_TAG,
+            chat_routing: effective === "local_only" ? "local" : "local-then-cloud",
+          }),
+          served: served(QWEN_TAG),
+          status: {
+            ...routes(
+              { effective, cloud_key: "present" },
+              { effective: "cloud", cloud_key: "present" },
+            ),
+            served_window: 4096,
+            served_window_proven: true,
+            window_source: "slots",
+          },
+        }),
+      )[3];
+    const alone = chatOnly("local_only");
+    expect(alone.state).toBe("attention");
+    expect(alone.line).toBe(
+      "Your server gives the model room for 4,096 tokens at a time, so a long chat can be too much for it to answer. Giving it more room fixes that.",
+    );
+    expect(chatOnly("local_then_cloud").line).toBe(
+      "Your server gives the model room for 4,096 tokens at a time, so a long chat can be too much for it to answer, and goes to your cloud model instead. Giving it more room fixes that.",
+    );
+    expect(alone.line).not.toContain("background work");
+  });
+
   it("step 4 waits on step 3 while no job runs locally", () => {
     expect(steps(STATES.servedUnassigned)[3]).toMatchObject({
       state: "waiting",
@@ -997,9 +1311,14 @@ describe("assignPlan — one model on both jobs, the routing each needs", () => 
   it("falls back to the cloud only for a job that has a key to fall back on", () => {
     const keyed = assignPlan(cfg(), power("present", "present"), "m", true);
     expect(keyed.routing).toEqual({ chat: "local-then-cloud", background: "local-then-cloud" });
+    // Said right before the write, so it says every way a request still leaves for the cloud
+    // (llm_gateway.rs): the server not answering (or resting, or at an address PM won't send to); a
+    // prompt over the window it is proven to serve, while it answers perfectly well; a reply that
+    // fails or times out; and On battery's move, once allowed. Never "only if your server stops".
     expect(keyed.sentence).toBe(
-      `${prefix}PM sets both to Local, fall back to cloud: your cloud model answers only if your server stops. Choose Local only under ${sectionLabel("sec-localai-roles")} to keep everything on this computer.`,
+      `${prefix}PM sets both to Local, fall back to cloud: your cloud model answers whenever PM can't use your server — it isn't answering, a request is too long for the room your server gives the model, or a reply fails or times out — and when your battery runs low, if you've allowed that under ${sectionLabel("sec-localai-power")}. Choose Local only under ${sectionLabel("sec-localai-roles")} to keep everything on this computer.`,
     );
+    expect(keyed.sentence).not.toMatch(/only if/);
     expect(assignPlan(cfg(), power("present", "present"), "m", false).sentence).toContain(
       "to keep everything on your server.",
     );
@@ -1102,30 +1421,9 @@ describe("rightNow — what a returning user came to see", () => {
 });
 
 describe("the card's copy keeps the tab's rules", () => {
-  /** Phrases other sections own. A start-card string that repeated one would make a test that
-   *  looks for that section's sentence find two. */
-  const COLLISIONS = [
-    /Connected to/,
-    /PM can't reach it at the moment/,
-    /resting the connection/,
-    /isn't serving any models yet/i,
-    /no models in it yet/i,
-    /Answered in/,
-    /won't both stay loaded/i,
-    /can't call it/i,
-    /couldn't size one of them/i,
-    /Your server is serving/,
-    /PM is sizing its work for/,
-    /hasn't read your server's context window yet/,
-    /that is the model's own limit/,
-    /would wait its turn/,
-    /already running/,
-    /testing/i,
-    /the graphics card is free/i,
-  ];
-  /** The only "above"/"below" allowed: three point inside this same section, and a battery level
-   *  "or below" is a number, not a direction. */
-  const SAME_SECTION = [/step 1 below/, /the name below/, /just above/, /\d+% or below/];
+  // The lists are readiness.ts's own (`COPY_COLLISIONS`, `SAME_SECTION_POINTERS`), so the pick
+  // card's sweep in pickWords.test.ts and the rendered card's in LocalAiStart.test.tsx hold the same
+  // rules as this one.
 
   /** Every string the card can show across a broad spread of states. */
   function everything(): string[] {
@@ -1211,6 +1509,45 @@ describe("the card's copy keeps the tab's rules", () => {
         served: [],
       }),
       input({ recs: null, recsLoading: false }),
+      input({ config: null, configError: "the keychain is locked" }),
+      input({
+        config: cfg({ base_url: null, chat_routing: "local" }),
+        detected: [OLLAMA],
+        status: routes({ effective: "nothing", cloud_key: "present" }),
+      }),
+      input({
+        config: cfg({ base_url: null }),
+        detected: [],
+        recs: recs({ disk_sources_present: ["lm_studio"] }),
+      }),
+      input({
+        config: cfg({ chat_routing: "local-then-cloud", background_routing: "local-then-cloud" }),
+        served: served(QWEN_TAG),
+        status: routes({ effective: "cloud", cloud_key: "present" }),
+      }),
+      both(QWEN_TAG, "cloud_for_power", "local-then-cloud"),
+      { ...both("my-finetune", "local_only"), recs: recs({ pick: ownedPick() }) },
+      { ...both("gone:7b", "local_only"), served: [], recs: recs({ pick: ownedPick() }) },
+      {
+        ...both("gone:7b", "local_only"),
+        served: [],
+        recs: recs({ pick: ownedPick({ source: "ollama" }) }),
+      },
+      {
+        ...both("gone:7b", "local_only"),
+        served: [],
+        recs: recs({ pick: ownedPick({ source: "lm_studio" }) }),
+      },
+      input({
+        config: cfg({ chat_model: QWEN_TAG, chat_routing: "local" }),
+        served: served(QWEN_TAG),
+        status: {
+          ...routes({ effective: "local_only" }, { effective: "cloud", cloud_key: "present" }),
+          served_window: 4096,
+          served_window_proven: true,
+          window_source: "slots",
+        },
+      }),
     ];
     for (const i of cases) {
       out.push(standing(i));
@@ -1254,13 +1591,13 @@ describe("the card's copy keeps the tab's rules", () => {
   it("repeats no phrase a section owns", () => {
     const strings = everything();
     expect(strings.length).toBeGreaterThan(80);
-    for (const s of strings) for (const re of COLLISIONS) expect(s, `${re}`).not.toMatch(re);
+    for (const s of strings) for (const re of COPY_COLLISIONS) expect(s, `${re}`).not.toMatch(re);
   });
 
   it("points nowhere by direction, except inside this section", () => {
     for (const s of everything()) {
-      const stripped = SAME_SECTION.reduce((t, re) => t.replace(re, ""), s);
-      expect(stripped).not.toMatch(/\b(above|below)\b/i);
+      const stripped = SAME_SECTION_POINTERS.reduce((t, re) => t.replace(re, ""), s);
+      expect(stripped, s).not.toMatch(/\b(above|below)\b/i);
     }
   });
 
@@ -1304,20 +1641,5 @@ describe("the card's copy keeps the tab's rules", () => {
       "Check",
     ])
       expect(labels.has(taken), taken).toBe(false);
-  });
-
-  it("mirrors a section control with every action that writes", () => {
-    expect(ACTION_MIRRORS).toEqual({
-      connect: { ipc: ["setLocalLlmEndpoint"], control: "Model server › Connect" },
-      download: { ipc: ["pullLocalModel"], control: "All models › Download" },
-      assign: {
-        ipc: ["setLocalLlmRoleModel", "setLocalLlmRouting"],
-        control: "Assign roles › the model and “Where … runs” selects",
-      },
-      test: { ipc: ["testLocalLlm"], control: "Assign roles › Test it" },
-      release: { ipc: ["releaseLocalGpu"], control: "Model memory › Release now" },
-      detect: { ipc: ["probeLocalLlmPorts"], control: "Model server › Auto-detect a local server" },
-      locate: { ipc: [], control: null },
-    });
   });
 });

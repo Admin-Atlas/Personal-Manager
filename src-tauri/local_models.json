@@ -1,8 +1,8 @@
 {
-  "schema_version": 3,
-  "catalog_version": 4,
-  "content_hash": "sha256:81d3e95aa3df0b3e51af3ecdc675bb734c9928c86a386ca45091e9a4cbf92735",
-  "generated_at": "2026-08-26",
+  "schema_version": 4,
+  "catalog_version": 5,
+  "content_hash": "sha256:ba96679a950f361b5fb803737bb216eaaefc0b9becd592780c5431db3efc7588",
+  "generated_at": "2026-10-02",
   "source": "huggingface-gguf",
   "entries": [
     {
@@ -16,6 +16,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.1,
+      "kv_cache": {
+        "bytes_per_token": 40960,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -44,6 +50,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 4096,
+        "window_bytes_per_token": 22528,
+        "window": 512,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -78,6 +90,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 32768,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -124,6 +142,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 53248,
+        "window_bytes_per_token": 53248,
+        "window": 4096,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -170,6 +194,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 114688,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -216,6 +246,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 393216,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -268,6 +304,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.79,
+      "kv_cache": {
+        "bytes_per_token": 20480,
+        "window_bytes_per_token": 118784,
+        "window": 1024,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -302,6 +344,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.63,
+      "kv_cache": {
+        "bytes_per_token": 32768,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 52690944
+      },
       "fit": "computed",
       "quants": [
         {
@@ -354,6 +402,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 57344,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -406,6 +460,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 131072,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -458,6 +518,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.86,
+      "kv_cache": {
+        "bytes_per_token": 32768,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 52690944
+      },
       "fit": "computed",
       "quants": [
         {
@@ -510,6 +576,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.16,
+      "kv_cache": {
+        "bytes_per_token": 16384,
+        "window_bytes_per_token": 327680,
+        "window": 1024,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -562,6 +634,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 196608,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -614,6 +692,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 1.11,
+      "kv_cache": {
+        "bytes_per_token": 20480,
+        "window_bytes_per_token": 204800,
+        "window": 1024,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {
@@ -666,6 +750,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.86,
+      "kv_cache": {
+        "bytes_per_token": 65536,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 156893184
+      },
       "fit": "computed",
       "quants": [
         {
@@ -718,6 +808,12 @@
       "multimodal": true,
       "reasoning": null,
       "projector_gb": 0.84,
+      "kv_cache": {
+        "bytes_per_token": 20480,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 65863680
+      },
       "fit": "computed",
       "quants": [
         {
@@ -770,6 +866,12 @@
       "multimodal": false,
       "reasoning": null,
       "projector_gb": null,
+      "kv_cache": {
+        "bytes_per_token": 327680,
+        "window_bytes_per_token": 0,
+        "window": null,
+        "state_bytes": 0
+      },
       "fit": "computed",
       "quants": [
         {

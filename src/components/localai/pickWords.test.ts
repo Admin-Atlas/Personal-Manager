@@ -9,13 +9,16 @@ import { describe, expect, it } from "vitest";
 
 import { INERT_POWER_VIEW } from "../../lib/powerRoute";
 import type {
+  LocalDiskSource,
   LocalFitResult,
+  LocalInstalledModel,
   LocalLlmConfig,
   LocalLlmStatus,
   LocalPick,
   LocalRecommendation,
   LocalRecommendations,
 } from "../../lib/types";
+import type { RunnerName } from "../../lib/workbenchGuide";
 import {
   alsoHaveLine,
   diskLine,
@@ -30,6 +33,7 @@ import {
   type NothingPick,
   type ShownPick,
 } from "./pickWords";
+import { COPY_COLLISIONS, SAME_SECTION_POINTERS } from "./readiness";
 import { sectionLabel } from "./sections";
 
 const QWEN = "bartowski/Qwen2.5-7B-Instruct-GGUF";
@@ -73,6 +77,15 @@ const owned = (over: Partial<Extract<LocalPick, { kind: "owned" }>> = {}): Shown
   basis: "gpu",
   ...over,
 });
+
+/** A served model's row. `measured`: its figures are for the user's own file at the context the
+ *  server serves — the only rows a "runs from system memory" claim may rest on. */
+const installed = (
+  id: string,
+  matched_repo: string | null,
+  over: Partial<LocalFitResult> = {},
+  measured = true,
+): LocalInstalledModel & { measured: boolean } => ({ id, matched_repo, fit: fit(over), measured });
 
 const nothing = (over: Partial<NothingPick> = {}): NothingPick => ({
   kind: "nothing",
@@ -156,8 +169,10 @@ const recs = (over: Partial<LocalRecommendations> = {}): LocalRecommendations =>
 
 describe("why — the reason for the pick", () => {
   it("names what it fits, by basis", () => {
+    // At which context: a larger model that fits the card only with less than PM sizes for is
+    // passed over, so "the largest that fits entirely" without it is false.
     expect(why(catalogue())).toBe(
-      "The largest model in PM's list that fits entirely on your graphics card — with only a little room to spare.",
+      "The largest model in PM's list that fits entirely on your graphics card at the context PM sizes it for — with only a little room to spare.",
     );
     expect(why(catalogue({ basis: "shared", fit: fit({ verdict: "comfortable" }) }))).toBe(
       "The largest model in PM's list that fits the memory this computer shares between its processor and graphics, with room to spare, and that PM's cautious estimate says is quick enough for its background work.",
@@ -189,9 +204,11 @@ describe("why — the reason for the pick", () => {
     );
   });
 
-  it("admits when the figures are for the version PM would pick, not the file served", () => {
+  it("admits when the figures are for the largest version in PM's list, not the file served", () => {
+    // The backend judges an unmeasured served model at the heaviest build PM lists for it — the
+    // cautious reading — so that is what the hedge has to name.
     expect(why(owned({ measured: false }))).toMatch(
-      / PM can't see which file your server loaded, so these figures are for the version PM would pick\.$/,
+      / PM can't see which file your server loaded, so these figures are for the largest version of it in PM's list\.$/,
     );
     expect(why(owned({ measured: true }))).not.toContain("can't see which file");
   });
@@ -265,10 +282,12 @@ describe("facts — every figure the pick rests on", () => {
 });
 
 describe("settingsLine — what the server has to be set to", () => {
-  const server = (over: Partial<Parameters<typeof settingsLine>[1]> = {}) => ({
+  const server = (
+    over: Partial<Parameters<typeof settingsLine>[1]> = {},
+  ): Parameters<typeof settingsLine>[1] => ({
     configured: true,
-    runner: "Ollama" as const,
-    setupShown: false,
+    runner: "Ollama",
+    setup: null,
     commandShown: false,
     ...over,
   });
@@ -284,16 +303,48 @@ describe("settingsLine — what the server has to be set to", () => {
     expect(
       settingsLine(
         fit({ kv: "f16" }),
-        server({ configured: false, runner: null, setupShown: true }),
+        server({ configured: false, runner: null, setup: "Ollama" }),
       ),
     ).toBe(
       "PM sized this for a 32k context. Ollama only runs it that way once that's set — the steps are in step 1 below.",
     );
   });
 
+  it("never points at steps that aren't on the page yet", () => {
+    // An Ollama found running but not yet connected: step 1 shows no guide, and Model server's
+    // tuning fold only appears once something is connected.
+    expect(settingsLine(fit(), server({ configured: false, runner: "Ollama", setup: null }))).toBe(
+      `PM sized this for a 32k context with a compressed (q8_0) cache. Ollama only runs it that way once both are set — the steps are under ${sectionLabel("sec-localai-endpoint")}, in “Settings PM's numbers assume”, once you've connected.`,
+    );
+    // LM Studio installed but idle: step 1 shows LM Studio's guide, which has no number to set —
+    // so the line gives the values, rather than pointing at Ollama's steps that aren't showing.
+    const idle = settingsLine(
+      fit(),
+      server({ configured: false, runner: null, setup: "LM Studio" }),
+    );
+    expect(idle).toBe(
+      "PM sized this for a 32k context with a compressed (q8_0) cache. In LM Studio, set the context length to 32768 and the K and V cache quantization to Q8_0, with Flash Attention on, in the model's load settings.",
+    );
+    // Found running, not connected, the same.
+    expect(
+      settingsLine(fit(), server({ configured: false, runner: "LM Studio", setup: null })),
+    ).toBe(idle);
+    // Nothing found yet, and no guide showing: no pointer at all.
+    expect(
+      settingsLine(fit({ kv: "f16" }), server({ configured: false, runner: null, setup: null })),
+    ).toBe(
+      "PM sized this for a 32k context; your server needs that setting too, or the model may not fit.",
+    );
+  });
+
   it("gives LM Studio the two values, and llama-server's command its due", () => {
+    // A quantized V cache needs Flash Attention on: half of a two-part setting is a model that
+    // won't load the way the card says.
     expect(settingsLine(fit(), server({ runner: "LM Studio" }))).toBe(
-      "PM sized this for a 32k context with a compressed (q8_0) cache. In LM Studio, set the context length to 32768 and the K and V cache quantization to Q8_0 in the model's load settings.",
+      "PM sized this for a 32k context with a compressed (q8_0) cache. In LM Studio, set the context length to 32768 and the K and V cache quantization to Q8_0, with Flash Attention on, in the model's load settings.",
+    );
+    expect(settingsLine(fit({ kv: "f16" }), server({ runner: "LM Studio" }))).toBe(
+      "PM sized this for a 32k context. In LM Studio, set the context length to 32768 in the model's load settings.",
     );
     expect(settingsLine(fit(), server({ runner: "llama-server", commandShown: true }))).toBe(
       "PM sized this for a 32k context with a compressed (q8_0) cache — the command in step 2 includes both settings.",
@@ -343,11 +394,7 @@ describe("the lines about models the user already has", () => {
   it("names the one that lost only on size, with both sizes", () => {
     const r = recs({
       installed: [
-        {
-          id: "gemma3:4b",
-          matched_repo: "bartowski/gemma-3-4b-it-GGUF",
-          fit: fit({ speed_basis: "gpu_published" }),
-        },
+        installed("gemma3:4b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "gpu_published" }),
       ],
     });
     const pick = catalogue({
@@ -360,12 +407,14 @@ describe("the lines about models the user already has", () => {
   });
 
   it("says why a model in use differs from the pick, only when it can say something true", () => {
+    // A row the backend can really send: "system" figures only ever come from a catalogue match, and
+    // only measured ones — the user's own file, at the context the server serves — describe it.
     const r = recs({
       installed: [
-        { id: "big:14b", matched_repo: null, fit: fit({ speed_basis: "system" }) },
-        { id: "mystery", matched_repo: null, fit: fit() },
-        { id: "gemma3:4b", matched_repo: "bartowski/gemma-3-4b-it-GGUF", fit: fit() },
-        { id: "qwen-other", matched_repo: QWEN, fit: fit() },
+        installed("big:14b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "system" }),
+        installed("mystery", null),
+        installed("gemma3:4b", "bartowski/gemma-3-4b-it-GGUF"),
+        installed("qwen-other", QWEN),
       ],
     });
     expect(inUseLine(catalogue(), "big:14b", r)).toBe(
@@ -381,6 +430,16 @@ describe("the lines about models the user already has", () => {
     expect(inUseLine(catalogue(), "qwen-other", r)).toBeNull();
     expect(inUseLine(catalogue(), `hf.co/${QWEN}:Q5_K_M`, r)).toBeNull();
     expect(inUseLine(catalogue(), null, r)).toBeNull();
+  });
+
+  it("never says a model runs from system memory on the catalogue's guess about it", () => {
+    // LM Studio and llama-server have no /api/tags, so PM can't see which file they loaded: the row
+    // is the catalogue's best quant for the memory free right now (Q8_0 at 10 GB with 20 GB free),
+    // while the user's own Q4_K_M sits on the card.
+    const guessed = recs({
+      installed: [installed("qwen2.5-7b-instruct", QWEN, { speed_basis: "system" }, false)],
+    });
+    expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", guessed)).toBeNull();
   });
 });
 
@@ -434,5 +493,83 @@ describe("eyebrow — the line above the name", () => {
       pickInUse(catalogue(), cfg(tag), running("local_only"), new Set([tag.toLowerCase()])),
     ).toBe(true);
     expect(pickInUse(catalogue(), cfg(tag), running("local_only"), new Set())).toBe(false);
+    // An owned pick that is a file on disk runs nothing until the server serves it — whatever the
+    // route says of a job bound to its name.
+    const onDisk = owned({ id: "q.gguf", served: false, source: "hugging_face" });
+    expect(pickInUse(onDisk, cfg("q.gguf"), running("local_only"), new Set())).toBe(false);
+    expect(pickInUse(onDisk, cfg("q.gguf"), running("local_only"), new Set(["q.gguf"]))).toBe(true);
+  });
+});
+
+describe("the pick card's copy keeps the tab's rules", () => {
+  // The same two rules readiness.test.ts holds the steps to, over every string this file can make:
+  // no phrase another section owns, and no "above"/"below" pointing out of the section.
+  function everything(): string[] {
+    const out: string[] = [];
+    const r = recs({
+      installed: [
+        installed("big:14b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "system" }),
+        installed("mystery", null),
+        installed("gemma3:4b", "bartowski/gemma-3-4b-it-GGUF"),
+      ],
+    });
+    const sources: LocalDiskSource[] = ["ollama", "lm_studio", "hugging_face", "folder"];
+    const picks: ShownPick[] = [];
+    for (const verdict of ["comfortable", "tight"] as const)
+      for (const basis of ["gpu", "shared", "system"] as const) {
+        picks.push(
+          catalogue({ basis, fit: fit({ verdict }) }),
+          catalogue({
+            basis,
+            fit: fit({ verdict }),
+            also_have: { id: "gemma3:4b", display_name: "gemma 3 4b it", served: true },
+          }),
+          owned({ basis, fit: fit({ verdict }) }),
+          owned({ basis, fit: fit({ verdict }), measured: false }),
+          ...sources.map((source) =>
+            owned({ basis, fit: fit({ verdict }), served: false, source }),
+          ),
+        );
+      }
+    const small = recs({ hardware: { ...recs().hardware, disk_free_gb: 1 } });
+    for (const p of picks) {
+      out.push(why(p), eyebrow(p, true), eyebrow(p, false));
+      const f = facts(p, r);
+      out.push(...f.row, f.reserve, ...(f.params ? [f.params] : []));
+      if (p.kind === "catalogue") {
+        const d = diskLine(p, small);
+        out.push(d.line, ...(d.over ? [d.over] : []), alsoHaveLine(p, r) ?? "");
+      }
+      for (const bound of ["big:14b", "mystery", "gemma3:4b"])
+        out.push(inUseLine(p, bound, r) ?? "");
+    }
+    const runners: (RunnerName | null)[] = ["Ollama", "LM Studio", "llama-server", null];
+    for (const kv of ["q8_0", "f16"] as const)
+      for (const configured of [true, false])
+        for (const runner of runners)
+          for (const setup of runners)
+            for (const commandShown of [true, false])
+              out.push(
+                settingsLine(fit({ kv }), { configured, runner, setup, commandShown }) ?? "",
+              );
+    for (const reason of ["nothing_on_gpu", "too_slow", "too_little_memory"] as const)
+      for (const basis of ["gpu", "shared", "system"] as const)
+        for (const system_fallback of [true, false])
+          for (const hasCloud of [true, false])
+            out.push(nothingSentence(nothing({ reason, basis, system_fallback }), r, hasCloud));
+    return out.filter(Boolean);
+  }
+
+  it("repeats no phrase a section owns", () => {
+    const strings = everything();
+    expect(strings.length).toBeGreaterThan(200);
+    for (const s of strings) for (const re of COPY_COLLISIONS) expect(s, `${re}`).not.toMatch(re);
+  });
+
+  it("points nowhere by direction, except inside this section", () => {
+    for (const s of everything()) {
+      const stripped = SAME_SECTION_POINTERS.reduce((t, re) => t.replace(re, ""), s);
+      expect(stripped, s).not.toMatch(/\b(above|below)\b/i);
+    }
   });
 });

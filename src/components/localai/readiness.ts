@@ -11,12 +11,15 @@
 // from the routing preference alone, because "set to local" and "runs locally" are different facts
 // and the start card is the one place that must never confuse them.
 //
-// The rules the card's copy keeps, each pinned in readiness.test.ts:
+// The rules the card's copy keeps:
 //   * at most one step is "next", and it is the first one still to do — so the card has one primary;
-//   * no string repeats a phrase a section already says (the collision list), so a test looking for
+//   * no string repeats a phrase a section already says (`COPY_COLLISIONS`), so a test looking for
 //     one section's sentence never finds two;
-//   * no string points "above" or "below" except inside this same section;
+//   * no string points "above" or "below" except inside this same section (`SAME_SECTION_POINTERS`);
 //   * every action makes exactly the write a section control makes (`ACTION_MIRRORS`).
+// readiness.test.ts pins the first three over every string here and in pickWords.ts, and
+// LocalAiStart.test.tsx over the rendered card; LocalAiStart.test.tsx presses both sides of each
+// mirror.
 
 import { formatGib } from "../../lib/format";
 import type { LocalRole } from "../../lib/localModelState";
@@ -27,6 +30,7 @@ import type {
   LocalDiskSource,
   LocalFitResult,
   LocalGpuResidency,
+  LocalInstalledModel,
   LocalLlmConfig,
   LocalLlmStatus,
   LocalPick,
@@ -97,6 +101,9 @@ export function whereOf(url: string | null | undefined): string {
 /** Everything the start card reads. Every field is the tab's own state, untouched. */
 export interface ReadinessInput {
   config: LocalLlmConfig | null;
+  /** Reading the stored config failed, so `config` is null for good rather than for now — the card
+   *  says so instead of "Reading…" forever. Absent or null while there is nothing to report. */
+  configError?: string | null;
   status: LocalLlmStatus | null;
   served: LocalServedModel[];
   /** `served` is an answer rather than a starting value (the tab's own note on it). */
@@ -163,8 +170,10 @@ export interface Step {
 /**
  * Every start-card action makes the same write as a section control, so pressing one is never a
  * different thing from doing it by hand further down. The ipc wrappers each kind calls, and the
- * control that already makes that call — readiness.test.ts pins the table, and the start card's own
- * test presses both and compares the calls.
+ * control that already makes that call. LocalAiStart.test.tsx reads this table: for every kind it
+ * presses the start card's button and then the control named here, and checks both made the calls
+ * listed — so a kind added here without a case there fails to compile, and a button rewired to
+ * another write fails the suite.
  */
 export const ACTION_MIRRORS: Record<
   StepAction["kind"],
@@ -182,6 +191,37 @@ export const ACTION_MIRRORS: Record<
   // Moves the reader, writes nothing.
   locate: { ipc: [], control: null },
 };
+
+/** Phrases other sections own. A start-card string that repeated one would make a test that looks
+ *  for that section's sentence find two. */
+export const COPY_COLLISIONS: readonly RegExp[] = [
+  /Connected to/,
+  /PM can't reach it at the moment/,
+  /resting the connection/,
+  /isn't serving any models yet/i,
+  /no models in it yet/i,
+  /Answered in/,
+  /won't both stay loaded/i,
+  /can't call it/i,
+  /couldn't size one of them/i,
+  /Your server is serving/,
+  /PM is sizing its work for/,
+  /hasn't read your server's context window yet/,
+  /that is the model's own limit/,
+  /would wait its turn/,
+  /already running/,
+  /testing/i,
+  /the graphics card is free/i,
+];
+
+/** The only "above"/"below" the card may say: three point inside this same section, and a battery
+ *  level "or below" is a number, not a direction. */
+export const SAME_SECTION_POINTERS: readonly RegExp[] = [
+  /step 1 below/,
+  /the name below/,
+  /just above/,
+  /\d+% or below/,
+];
 
 /** The kinds that can be the card's one primary button — the ones that do the step. */
 const PRIMARY_KINDS: ReadonlySet<StepAction["kind"]> = new Set([
@@ -306,6 +346,12 @@ function servedId(i: ReadinessInput, id: string): string | null {
   return i.served.find((m) => m.id.toLowerCase() === lower)?.id ?? null;
 }
 
+/** The job runs on its model, and the server is serving that model right now. The same exact-id
+ *  test step 3's not-served trap uses, so steps 2 and 3 can never disagree about it. */
+function runsOnServed(i: ReadinessInput, f: RoleFacts): boolean {
+  return f.atWork && f.model !== "" && i.served.some((m) => m.id === f.model);
+}
+
 /** The catalogue name for a pull tag, or the tag itself. */
 function nameForTag(recs: LocalRecommendations | null, tag: string): string {
   const rec = recs?.curated.find((r) => r.ollama_pull === tag || r.gpu_pull?.tag === tag);
@@ -315,6 +361,27 @@ function nameForTag(recs: LocalRecommendations | null, tag: string): string {
 /** Whether a fit's machine is one with a separate graphics card. */
 export function hasCard(recs: LocalRecommendations | null): boolean {
   return !!recs && recs.hardware.vram_gb != null && !recs.hardware.unified_memory;
+}
+
+/** Whether a served model's figures are for the user's own file, at the context the server serves
+ *  it with (`measured`). Everything else on the row is the catalogue's
+ *  guess: the best quant for whatever memory is free right now, at the model's trained context —
+ *  which can put a file that sits on the card into system memory, and moves as free memory does. */
+function measuredRow(row: LocalInstalledModel): boolean {
+  return row.measured === true;
+}
+
+/**
+ * Whether PM can say `id` runs from system memory on a machine with a graphics card: the served
+ * model's own figures (`measuredRow`) put it there. Never said from a guess, and never of PM's own
+ * pick, which was judged against the card itself — the pick card beside it would say the opposite.
+ */
+export function spillsOffCard(recs: LocalRecommendations | null, id: string): boolean {
+  if (!recs || !hasCard(recs)) return false;
+  const pick = recs.pick;
+  if (pick?.kind === "owned" && pick.id === id && pick.basis === "gpu") return false;
+  const row = recs.installed.find((m) => m.id === id);
+  return !!row && measuredRow(row) && row.fit.speed_basis === "system";
 }
 
 /** The flags that start llama-server the way PM sized a fit: its context, and the compressed cache
@@ -338,12 +405,18 @@ export function hfServeCommand(
  * each model under Already on this device. The command is llama-server serving the file as it is,
  * for a single file whose path can be quoted; a split model gets no one-liner, and a path with a
  * quote in it gets none rather than one that breaks.
+ *
+ * `connected`: PM is connected to a server, and the model is still listed as on disk — so that server
+ * isn't serving it. A file in Ollama's or LM Studio's folder only counts for a server on that
+ * runner's own port, so the server is that runner: "once Ollama is connected" would be said of an
+ * Ollama that already is, and "switch LM Studio's server on" of one that is answering.
  */
 export function onDiskHow(
   source: LocalDiskSource,
   shards: number,
   path: string | null,
   fit: Pick<LocalFitResult, "context" | "kv">,
+  connected = false,
 ): { line: string; command: string | null } {
   const command =
     shards <= 1 && path && !path.includes('"')
@@ -352,12 +425,16 @@ export function onDiskHow(
   switch (source) {
     case "ollama":
       return {
-        line: "It's in Ollama's folder — once Ollama is connected, it shows up by itself.",
+        line: connected
+          ? "It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else."
+          : "It's in Ollama's folder — once Ollama is connected, it shows up by itself.",
         command: null,
       };
     case "lm_studio":
       return {
-        line: "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
+        line: connected
+          ? "It's in LM Studio. Load it there — PM sees it within about half a minute."
+          : "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
         command,
       };
     default:
@@ -376,32 +453,51 @@ export function onDiskHow(
  */
 export function standing(i: ReadinessInput): string {
   const { config, status } = i;
-  if (!config) return "Reading your local AI setup…";
+  if (!config)
+    return i.configError
+      ? "PM couldn't read your local AI setup, so it can't say where things stand."
+      : "Reading your local AI setup…";
   const chat = roleFacts(i, "chat");
   const background = roleFacts(i, "background");
 
   if (!config.base_url) {
+    // A job still set to run locally has nothing to answer with until a server is connected —
+    // Disconnect keeps the routing — and nothing else on the tab says so while nothing is: Assign
+    // roles shows no rows until then.
+    const stuck = ROLES.filter((r) => {
+      const f = roleFacts(i, r);
+      return f.effective === "nothing" && f.routing !== "cloud";
+    });
+    const waiting =
+      stuck.length > 0
+        ? ` ${whoCap(stuck)} ${isAre(stuck)} set to run on a local model, so ${
+            stuck.length > 1 ? "they" : "it"
+          } can't answer until PM is connected to a model server.`
+        : "";
     const found = sortedDetected(i.detected ?? []).map(detectedName);
     if (found.length === 1)
-      return `${found[0]} is running on this computer, but PM isn't connected to it yet.`;
+      return `${found[0]} is running on this computer, but PM isn't connected to it yet.${waiting}`;
     if (found.length === 2)
-      return `${found[0]} and ${found[1]} are running on this computer, but PM isn't connected to either yet.`;
+      return `${found[0]} and ${found[1]} are running on this computer, but PM isn't connected to either yet.${waiting}`;
     if (found.length > 2)
-      return `${listJoin(found)} are running on this computer, but PM isn't connected to any of them yet.`;
+      return `${listJoin(found)} are running on this computer, but PM isn't connected to any of them yet.${waiting}`;
     const idle = installedButIdle(i.recs);
-    if (idle) return `${idle} looks installed here, but it isn't running, so PM can't use it yet.`;
-    let tail = ".";
-    if (chat.effective === "cloud" && background.effective === "cloud") {
-      tail = ", so PM uses your cloud model for everything.";
-    } else if (
+    // LM Studio the app and LM Studio the server are two things: it can be open on screen with its
+    // server off, which is how it starts. Ollama is its server.
+    if (idle === "LM Studio")
+      return `LM Studio looks installed here, but its server isn't on, so PM can't use it yet.${waiting}`;
+    if (idle)
+      return `${idle} looks installed here, but it isn't running, so PM can't use it yet.${waiting}`;
+    if (chat.effective === "cloud" && background.effective === "cloud")
+      return "No local model is set up on this computer yet, so PM uses your cloud model for everything.";
+    if (
       chat.effective === "nothing" &&
       background.effective === "nothing" &&
       cloudKeyOf(i, "chat") === "absent" &&
       cloudKeyOf(i, "background") === "absent"
-    ) {
-      tail = ", and there's no cloud key either, so PM has no AI model to use yet.";
-    }
-    return `No local model is set up on this computer yet${tail}`;
+    )
+      return "No local model is set up on this computer yet, and there's no cloud key either, so PM has no AI model to use yet.";
+    return `No local model is set up on this computer yet.${waiting}`;
   }
 
   if (!status) return "Checking your model server…";
@@ -449,16 +545,12 @@ export function standing(i: ReadinessInput): string {
       missing.add(f.model);
   }
   for (const m of missing) text += ` Your server isn't serving ${m} right now.`;
-  if (hasCard(i.recs)) {
-    const slow = new Set<string>();
-    for (const f of [chat, background]) {
-      if (!f.atWork || !f.model) continue;
-      const row = i.recs?.installed.find((m) => m.id === f.model);
-      if (row?.fit.speed_basis === "system") slow.add(f.model);
-    }
-    for (const m of slow)
-      text += ` ${m} is larger than your graphics card's memory, so it runs from system memory — expect slow replies.`;
+  const slow = new Set<string>();
+  for (const f of [chat, background]) {
+    if (f.atWork && f.model && spillsOffCard(i.recs, f.model)) slow.add(f.model);
   }
+  for (const m of slow)
+    text += ` ${m} is larger than your graphics card's memory, so it runs from system memory — expect slow replies.`;
   const unknown = ROLES.filter((r) => roleFacts(i, r).effective === "unknown");
   if (unknown.length > 0)
     text += ` PM can't read your saved keys right now, so it can't say whether ${who(unknown)} would fall back to the cloud.`;
@@ -565,14 +657,25 @@ const LOOKING_NOTE = "PM looks for a running server every half minute while this
 function serverStep(i: ReadinessInput): Step {
   const step = blank("server", 1, "Get a model server");
   const { config, status } = i;
-  if (!config) return { ...step, state: "checking" };
+  const toEndpoint: StepAction = {
+    kind: "locate",
+    to: "sec-localai-endpoint",
+    label: "What to check",
+  };
+  if (!config) {
+    // The read failed, and nothing reads it again until the tab does: "Checking…" would never end.
+    // What went wrong is said once, in Model server — the section that owns the stored address.
+    return i.configError
+      ? {
+          ...step,
+          state: "attention",
+          line: `PM couldn't read your local AI setup — what went wrong is under ${sectionLabel("sec-localai-endpoint")}.`,
+          action: toEndpoint,
+        }
+      : { ...step, state: "checking" };
+  }
   const url = config.base_url;
   if (url) {
-    const toEndpoint: StepAction = {
-      kind: "locate",
-      to: "sec-localai-endpoint",
-      label: "What to check",
-    };
     if (!status) return { ...step, state: "checking", line: `Checking your server at ${url}…` };
     if (status.in_cooldown)
       return {
@@ -619,7 +722,11 @@ function serverStep(i: ReadinessInput): Step {
     return {
       ...step,
       state: "next",
-      line: `${idle} looks installed — PM found its model folder — but it isn't answering. Start it, and PM notices within about half a minute.`,
+      // Opening LM Studio isn't enough: its server starts off, and has a switch of its own.
+      line:
+        idle === "LM Studio"
+          ? "LM Studio looks installed — PM found its model folder — but its server isn't answering. Open LM Studio and switch its server on (the toggle at the top of its Developer tab), and PM notices within about half a minute."
+          : `${idle} looks installed — PM found its model folder — but it isn't answering. Start it, and PM notices within about half a minute.`,
       setup: idle,
       notes: [LOOKING_NOTE],
       secondary: [LOOK_NOW],
@@ -655,6 +762,15 @@ function modelStep(i: ReadinessInput): Step {
     return { ...step, state: "checking", line: "Checking what your server has…" };
   const capable = chatCapable(i);
   const allModels = sectionLabel("sec-localai-models");
+  // A job already runs on a model the server is serving: a setup that works is set up. The pick
+  // stays on its card as an option (with the card's own "you're using…" line), never as the step
+  // left to do — otherwise someone who chose a different model is told "Setting up" for as long as
+  // they keep it, with the pick's download or serve command as the thing left to do. "Serving" is
+  // checked, not assumed from the route: a job bound to a model the server has since dropped still
+  // reads as running locally, and there the pick's download is exactly what the server needs.
+  const working = ROLES.some((r) => runsOnServed(i, roleFacts(i, r)));
+  const tryIt = (name: string, where: string) =>
+    `Your jobs already run on a model your server has. ${name} is PM's pick for this computer, if you'd like to try it — it's under ${where} too.`;
 
   if (shown?.kind === "catalogue") {
     if (servedId(i, shown.tag)) return { ...step, state: "done", line: "Your server has it." };
@@ -666,18 +782,7 @@ function modelStep(i: ReadinessInput): Step {
         notes: ["You can leave this tab — the download carries on."],
       };
     }
-    // A job already runs on a model the server has: a setup that works is set up. The pick stays on
-    // its card as an option (with the card's own "you're using…" line), never as the step left to
-    // do — otherwise someone who chose a different model is told "Setting up" for as long as they
-    // keep it, with a primary Download pointed at a model they didn't pick.
-    const atWork = roleFacts(i, "chat").atWork || roleFacts(i, "background").atWork;
-    if (atWork) {
-      return {
-        ...step,
-        state: "done",
-        line: `Your jobs already run on a model your server has. ${shown.display_name} is PM's pick for this computer, if you'd like to try it — it's under ${allModels} too.`,
-      };
-    }
+    if (working) return { ...step, state: "done", line: tryIt(shown.display_name, allModels) };
     // Offered as an alternative to the download.
     const others =
       capable.length > 0
@@ -746,7 +851,16 @@ function modelStep(i: ReadinessInput): Step {
   if (shown?.kind === "owned") {
     if (shown.served || servedId(i, shown.id))
       return { ...step, state: "done", line: "Your server has it." };
-    const how = onDiskHow(shown.source ?? "folder", shown.shards, shown.path, shown.fit);
+    // The same rule as the catalogue's pick. A file on disk is listed, with how to serve it, under
+    // Already on this device.
+    if (working)
+      return {
+        ...step,
+        state: "done",
+        line: tryIt(shown.display_name, sectionLabel("sec-localai-downloaded")),
+      };
+    // Connected (step 2 waits on step 1), and the server isn't serving it.
+    const how = onDiskHow(shown.source ?? "folder", shown.shards, shown.path, shown.fit, true);
     // LM Studio's own route is the one to give for a model in LM Studio: no llama-server line.
     return {
       ...step,
@@ -826,7 +940,13 @@ export function assignPlan(
   if (set.length > 0 && unreadable.length === set.length) {
     clause = `PM can't read your saved keys right now, so it sets ${who(set)} to Local only.`;
   } else if (set.length === 2 && set.every((r) => routing[r] === "local-then-cloud")) {
-    clause = `PM sets both to Local, fall back to cloud: your cloud model answers only if your server stops. Choose Local only under ${sectionLabel("sec-localai-roles")} to keep everything ${loopback ? "on this computer" : "on your server"}.`;
+    // Every way the gateway hands a Local-then-cloud request to the cloud (llm_gateway.rs,
+    // run_local_complete / run_local_stream / resolve_provider): nothing answering, or the server
+    // resting after failures in a row, or its address no longer one PM will send to; a prompt over
+    // the window the server is proven to serve (prompt_fit_failure), with the server up and well; a
+    // timeout or a failed reply, before any of it is shown; and On battery's move, which needs the
+    // user's own say-so. "Only if your server stops" ruled out all but the first.
+    clause = `PM sets both to Local, fall back to cloud: your cloud model answers whenever PM can't use your server — it isn't answering, a request is too long for the room your server gives the model, or a reply fails or times out — and when your battery runs low, if you've allowed that under ${sectionLabel("sec-localai-power")}. Choose Local only under ${sectionLabel("sec-localai-roles")} to keep everything ${loopback ? "on this computer" : "on your server"}.`;
   } else if (
     set.length === 2 &&
     set.every((r) => routing[r] === "local") &&
@@ -840,13 +960,19 @@ export function assignPlan(
   }
   const kept = ROLES.filter((r) => routing[r] === null).map((r) => {
     const stored = r === "chat" ? config.chat_routing : config.background_routing;
-    return ` ${ROLE_NAME[r]} keeps its current setting, ${ROUTING_LABEL[stored] ?? stored}.`;
+    return `${ROLE_NAME[r]} keeps its current setting, ${ROUTING_LABEL[stored] ?? stored}.`;
   });
   return {
     models: { chat: model, background: model },
     routing,
-    sentence:
-      `One model for both jobs — chat and background work — so your server only ever holds one. ${clause}${kept.join("")}`.trim(),
+    // Joined rather than concatenated: with both jobs kept there is no clause, and a space for it.
+    sentence: [
+      "One model for both jobs — chat and background work — so your server only ever holds one.",
+      clause,
+      ...kept,
+    ]
+      .filter(Boolean)
+      .join(" "),
   };
 }
 
@@ -857,10 +983,27 @@ function rolesStep(i: ReadinessInput): Step {
   const background = roleFacts(i, "background");
   const facts = [chat, background];
   const roles = toRoles();
+  // "Use … for both", while no job is at work yet and there is a model to offer.
+  const cand = !chat.atWork && !background.atWork ? candidate(i) : null;
+  const plan = cand
+    ? assignPlan(
+        i.config,
+        i.status
+          ? powerOf(i.status)
+          : { chat: { cloud_key: "absent" }, background: { cloud_key: "absent" } },
+        cand.id,
+        isLoopback(i.config.base_url),
+      )
+    : null;
+  const useForBoth: StepAction | null =
+    cand && plan ? { kind: "assign", plan, label: `Use ${cand.name} for both` } : null;
 
   // The traps first: a job that looks set up and can't do what it says.
   for (const f of facts) {
     if (f.routing !== "cloud" && !f.model) {
+      // Disconnect keeps each job's routing and clears its model, so a reconnect lands here. When
+      // there is a model to offer, the one-click way out is offered beside the way by hand, with
+      // the sentence that says what it writes.
       return {
         ...step,
         state: "attention",
@@ -868,6 +1011,8 @@ function rolesStep(i: ReadinessInput): Step {
           f.effective === "cloud" ? "it uses your cloud model" : "it has nothing to answer with"
         }.`,
         action: roles,
+        secondary: useForBoth ? [useForBoth] : [],
+        notes: plan ? [plan.sentence] : [],
       };
     }
   }
@@ -919,22 +1064,8 @@ function rolesStep(i: ReadinessInput): Step {
   }
 
   if (!chat.atWork && !background.atWork) {
-    const cand = candidate(i);
-    if (cand && i.config) {
-      const plan = assignPlan(
-        i.config,
-        i.status
-          ? powerOf(i.status)
-          : { chat: { cloud_key: "absent" }, background: { cloud_key: "absent" } },
-        cand.id,
-        isLoopback(i.config.base_url),
-      );
-      return {
-        ...step,
-        state: "next",
-        line: plan.sentence,
-        action: { kind: "assign", plan, label: `Use ${cand.name} for both` },
-      };
+    if (useForBoth && plan) {
+      return { ...step, state: "next", line: plan.sentence, action: useForBoth };
     }
     return {
       ...step,
@@ -976,8 +1107,23 @@ function checkStep(i: ReadinessInput): Step {
   if (!i.config?.base_url) return waitingOn(step, 1);
   const chat = roleFacts(i, "chat");
   const background = roleFacts(i, "background");
-  const role: LocalRole | null = chat.local ? "chat" : background.local ? "background" : null;
-  if (!role) return waitingOn(step, 3);
+  // The job whose model a test asks: one answering locally first. A job On battery has moved to the
+  // cloud still counts — step 3 is done for it — and its local model can still be tested.
+  const facts = chat.local
+    ? chat
+    : background.local
+      ? background
+      : chat.atWork
+        ? chat
+        : background.atWork
+          ? background
+          : null;
+  if (!facts) return waitingOn(step, 3);
+  const role = facts.role;
+  /** The jobs On battery has moved to the cloud for now. */
+  const moved = ROLES.filter((r) => roleFacts(i, r).effective === "cloud_for_power");
+  // No job answers locally, so every one at work is a moved one.
+  const onBattery = !chat.local && !background.local;
   if (i.tests.running) {
     return {
       ...step,
@@ -988,11 +1134,19 @@ function checkStep(i: ReadinessInput): Step {
   const status = i.status;
   const win = status?.served_window ?? null;
   const proven = !!status?.served_window_proven && status?.window_source !== "models_meta";
-  if (win != null && proven && win < COMFORTABLE_WINDOW) {
+  // Worded for the job that meets the window: background work is cut into pieces to fit it, and a
+  // chat is refused by it — sent to the cloud instead where it can be. Only while a job is answering
+  // locally: On battery, nothing is meeting it right now.
+  if (!onBattery && win != null && proven && win < COMFORTABLE_WINDOW) {
+    const room = `Your server gives the model room for ${win.toLocaleString()} tokens at a time`;
     return {
       ...step,
       state: "attention",
-      line: `Your server gives the model room for ${win.toLocaleString()} tokens at a time, so PM sends background work in smaller pieces. Giving it more room makes that work better.`,
+      line: background.local
+        ? `${room}, so PM sends background work in smaller pieces. Giving it more room makes that work better.`
+        : `${room}, so a long chat can be too much for it to answer${
+            chat.effective === "local_then_cloud" ? ", and goes to your cloud model instead" : ""
+          }. Giving it more room fixes that.`,
       action: {
         kind: "locate",
         // The steps live in Model server's tuning fold, which exists only for a server PM can name.
@@ -1001,8 +1155,14 @@ function checkStep(i: ReadinessInput): Step {
       },
     };
   }
-  const model = role === "chat" ? chat.model : background.model;
-  const test = role === "chat" ? i.tests.chat : i.tests.background;
+  const model = facts.model;
+  const own = role === "chat" ? i.tests.chat : i.tests.background;
+  const other = role === "chat" ? i.tests.background : i.tests.chat;
+  // A test asks a model, not a job: the other job's test of this same model answers for this one
+  // too. Each job has its own Test it, and the backend remembers only the last test across a tab
+  // switch.
+  const test =
+    own?.error || own?.result?.model === model ? own : other?.result?.model === model ? other : own;
   const tryAgain: StepAction = { kind: "test", role, label: "Try again" };
   const failed = {
     ...step,
@@ -1024,6 +1184,15 @@ function checkStep(i: ReadinessInput): Step {
     };
   }
   const send: StepAction = { kind: "test", role, label: "Send a test message" };
+  // Never a primary on battery: a test loads the local model On battery has just moved off.
+  if (onBattery) {
+    return {
+      ...step,
+      state: "optional",
+      line: `${whoCap(moved)} ${isAre(moved)} on your cloud model while the battery is low, but a test still asks the local model, and loads it to answer.`,
+      secondary: [send],
+    };
+  }
   if (i.justAssigned) {
     return {
       ...step,
@@ -1033,21 +1202,23 @@ function checkStep(i: ReadinessInput): Step {
     };
   }
   // A restart forgets test results (they live in memory only), so this never nags a returning user.
+  // Named by model: a test of the other job's different model is still a test since PM started.
   return {
     ...step,
     state: "optional",
-    line: "No test since PM started, or since your server changed.",
+    line: `No test of ${facts.name} since PM started, or since your server changed.`,
     secondary: [send],
   };
 }
 
 /** The chip beside the section's heading. null while PM is still reading the setup, rather than a
- *  "Not set up" said about a server that may be answering perfectly well. */
+ *  "Not set up" said about a server that may be answering perfectly well — and "Needs attention"
+ *  once that read has failed, since it won't finish by itself. */
 export function overall(
   list: readonly Step[],
-  i: Pick<ReadinessInput, "config" | "status">,
+  i: Pick<ReadinessInput, "config" | "configError" | "status">,
 ): { label: string; token: string } | null {
-  if (!i.config) return null;
+  if (!i.config) return i.configError ? { label: "Needs attention", token: "--st-due" } : null;
   if (i.config.base_url && !i.status) return null;
   if (list.some((s) => s.state === "attention"))
     return { label: "Needs attention", token: "--st-due" };
