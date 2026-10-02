@@ -8,8 +8,8 @@
 //! `model` + `messages` + `stream` — carrying NONE of OpenRouter's body fields (no `provider`
 //! ZDR pin, no `cache_control`, no `models` fallback array), because a local server understands
 //! none of them and rejecting or ignoring them varies by server. The one addition is Ollama's own
-//! `reasoning_effort: "none"`, sent only to a server that has said it is an Ollama (see
-//! [`Thinking`]), because a model that thinks before it answers otherwise spends most of every call
+//! `reasoning_effort: "none"`, sent only to a server that has said it is an Ollama recent enough to
+//! take it (see [`Thinking`]), because a model that thinks before it answers otherwise spends most of every call
 //! PM makes on thinking nobody reads.
 //!
 //! Design: everything that can be wrong *without a socket* — SSE framing, failure classification,
@@ -319,9 +319,16 @@ impl SseAssembler {
             }
             // Streaming servers put the delta under `delta.content`; a couple of "OpenAI-compatible"
             // servers stream a single buffered message under `message.content` — tolerate both.
-            if let Some(tok) = value["choices"][0]["delta"]["content"].as_str() {
-                events.push(SseEvent::Token(tok.to_string()));
-            } else if let Some(tok) = value["choices"][0]["message"]["content"].as_str() {
+            //
+            // An EMPTY content is not a token. Ollama sends `"content": ""` on every chunk a
+            // thinking model spends thinking (beside `reasoning`, which PM does not show), and on
+            // its first chunk. Passed on, fifty of those in a row read as a one-token loop and the
+            // guard killed the reply mid-thought; they also counted as the first token, which
+            // switched off the fallback to the cloud for a reply that had not started.
+            let tok = value["choices"][0]["delta"]["content"]
+                .as_str()
+                .or_else(|| value["choices"][0]["message"]["content"].as_str());
+            if let Some(tok) = tok.filter(|t| !t.is_empty()) {
                 events.push(SseEvent::Token(tok.to_string()));
             }
         }
@@ -535,7 +542,7 @@ pub fn chat_body(
 
 // --- switching thinking off -------------------------------------------------------------------------
 
-/// The one `reasoning_effort` PM sends, and only to an Ollama.
+/// The one `reasoning_effort` PM sends, and only to an Ollama of [`THINKING_OFF_SINCE`] or later.
 ///
 /// A model that thinks before it answers does it on every call unless told not to, and PM reads only
 /// the answer. Measured on Ollama 0.33.0 with gemma 4 12b Q3_K_M (an RTX 5060 Laptop GPU), filing one
@@ -551,13 +558,20 @@ pub fn chat_body(
 /// `think: false` on `/v1` (gemma 4 still thought for 655-789 tokens), so neither is an alternative.
 pub const THINKING_OFF: &str = "none";
 
-/// Whether an endpoint takes [`THINKING_OFF`]. Learned once per endpoint per session, from
-/// `/api/version`, and remembered in [`THINKING`].
+/// The first Ollama that takes [`THINKING_OFF`] from every model. Read from Ollama's source by tag:
+/// 0.11.5-0.12.3 pass `"none"` through as a think level and refuse it with a 400 ("invalid think
+/// value"), 0.11.4 and earlier have no such field, and 0.12.4 maps it to `think: false` but then
+/// demands the thinking capability for it, so a model that never thinks is refused there. 0.12.5 is
+/// the first that only asks for the capability when thinking is turned ON.
+pub const THINKING_OFF_SINCE: (u64, u64, u64) = (0, 12, 5);
+
+/// Whether an endpoint takes [`THINKING_OFF`]. Learned once per endpoint, from `/api/version`, and
+/// remembered in [`THINKING`] until the endpoint or its token is saved again ([`forget_thinking`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Thinking {
-    /// An Ollama: PM switches thinking off.
+    /// An Ollama of [`THINKING_OFF_SINCE`] or later: PM switches thinking off.
     Switchable,
-    /// Not an Ollama, or an Ollama that refused the switch: the body goes exactly as it did before.
+    /// Anything else: the body goes exactly as it did before.
     ///
     /// For llama-server, LM Studio and the rest this is the old behaviour, not a fix. Each has its
     /// own switch (llama-server, for one, takes `chat_template_kwargs` for a template that reads
@@ -567,45 +581,77 @@ pub enum Thinking {
     Leave,
 }
 
-/// What PM has learned per endpoint. A failed probe is not recorded, so the next call asks again.
-static THINKING: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, Thinking>>,
-> = std::sync::LazyLock::new(Default::default);
+/// What PM has learned per endpoint, and which models on it refused the switch anyway. Only a
+/// definite answer is recorded (see [`thinking_from_version`]), so an endpoint that could not answer
+/// is asked again on the next call.
+#[derive(Default)]
+struct KnownThinking {
+    endpoints: std::collections::HashMap<String, Thinking>,
+    refused: std::collections::HashSet<(String, String)>,
+}
 
-fn remember_thinking(base_url: &str, thinking: Thinking) {
+static THINKING: std::sync::LazyLock<std::sync::Mutex<KnownThinking>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Forget everything learned about switching thinking off. Called whenever the endpoint or its token
+/// is saved: a new address may be a different server, and a new token can turn a 401 into an answer.
+pub fn forget_thinking() {
     if let Ok(mut known) = THINKING.lock() {
-        known.insert(base_url.to_string(), thinking);
+        *known = KnownThinking::default();
     }
 }
 
-/// Whether an `/api/version` body is Ollama's: `{"version": "<non-empty string>"}`.
-///
-/// llama-server 404s the route. LM Studio is reported (not measured here) to answer a route it
-/// doesn't have with a 200 whose body is an `error` object, so a status alone is not enough.
-pub fn is_ollama_version(value: &serde_json::Value) -> bool {
-    value
-        .get("version")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.trim().is_empty())
+/// An Ollama version string as `(major, minor, patch)`: `0.33.0`, or `0.12.5-rc1` with its
+/// pre-release tag dropped. `None` for anything else, including a development build's `0.0.0`
+/// stand-in, which says nothing about what the server takes.
+pub fn ollama_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let mut next = || parts.next()?.parse::<u64>().ok();
+    let version = (next()?, next()?, next()?);
+    (version != (0, 0, 0)).then_some(version)
 }
 
-/// Whether a refused request was refused for the thinking switch, so PM can drop it and resend.
+/// What one `/api/version` answer says, or `None` when it says nothing either way.
 ///
-/// The two refusals Ollama 0.33.0 has for the field, both 400s: `invalid reasoning value: …` and
-/// `"<model>" does not support thinking`. Neither happens with `"none"` on that version, so this is
-/// insurance for one that validates the field differently. 422 is the usual validation status for a
-/// server that is not Ollama but answers `/api/version` like one.
-pub fn refuses_thinking_switch(status: u16, body: &str) -> bool {
-    if status != 400 && status != 422 {
-        return false;
+/// - A 404 or 405 is a server without the route: llama-server, vLLM. Recorded as [`Thinking::Leave`].
+/// - A 2xx whose JSON carries a version of [`THINKING_OFF_SINCE`] or later is an Ollama that takes
+///   the switch. Any other 2xx JSON is a server that answered and is not one: LM Studio is reported
+///   (not measured here) to answer a route it doesn't have with a 200 and an `error` object, and
+///   LocalAI, KoboldCpp and llama-swap answer this route with versions or shapes that are not a
+///   recent Ollama's. Both recorded as `Leave`.
+/// - Anything else (401, 403, 407, 408, 429, a 5xx, or a 2xx whose body is not JSON) is a proxy or a
+///   server that could not answer right now, and is not recorded.
+pub fn thinking_from_version(status: u16, body: Option<&serde_json::Value>) -> Option<Thinking> {
+    match status {
+        404 | 405 => Some(Thinking::Leave),
+        200..=299 => {
+            let body = body?;
+            let recent = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .and_then(ollama_version)
+                .is_some_and(|v| v >= THINKING_OFF_SINCE);
+            Some(if recent {
+                Thinking::Switchable
+            } else {
+                Thinking::Leave
+            })
+        }
+        _ => None,
     }
-    let body = body.to_ascii_lowercase();
-    body.contains("reasoning") || body.contains("thinking")
 }
 
-/// Whether to switch thinking off for this endpoint, asking it the first time.
-async fn thinking_for(base_url: &str, token: Option<&str>) -> Thinking {
-    if let Some(known) = THINKING.lock().ok().and_then(|k| k.get(base_url).copied()) {
+/// Whether to switch thinking off for this model on this endpoint, asking the endpoint the first
+/// time.
+async fn thinking_for(base_url: &str, model: &str, token: Option<&str>) -> Thinking {
+    let key = (base_url.to_string(), model.to_string());
+    if let Some(known) = THINKING.lock().ok().and_then(|k| {
+        if k.refused.contains(&key) {
+            return Some(Thinking::Leave);
+        }
+        k.endpoints.get(base_url).copied()
+    }) {
         return known;
     }
     let url = format!("{base_url}/api/version");
@@ -615,30 +661,38 @@ async fn thinking_for(base_url: &str, token: Option<&str>) -> Thinking {
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    // Unreachable or timed out: nothing learned, so nothing recorded, and the call that follows will
-    // most likely fail the same way. Leave, for this call only.
+    // Unreachable or timed out: nothing learned, and the call that follows will most likely fail
+    // the same way. Leave, for this call only.
     let Ok(response) = req.send().await else {
         return Thinking::Leave;
     };
-    let ollama = response.status().is_success()
-        && response
-            .json::<serde_json::Value>()
-            .await
-            .is_ok_and(|v| is_ollama_version(&v));
-    let thinking = if ollama {
-        Thinking::Switchable
+    let status = response.status().as_u16();
+    let body = if response.status().is_success() {
+        response.json::<serde_json::Value>().await.ok()
     } else {
-        Thinking::Leave
+        None
     };
-    remember_thinking(base_url, thinking);
+    let Some(thinking) = thinking_from_version(status, body.as_ref()) else {
+        return Thinking::Leave;
+    };
+    if let Ok(mut known) = THINKING.lock() {
+        known.endpoints.insert(base_url.to_string(), thinking);
+    }
     thinking
+}
+
+/// Whether a refusal is one the thinking switch could have caused, so PM resends without it.
+fn may_refuse_the_switch(status: u16) -> bool {
+    status == 400 || status == 422
 }
 
 /// POST one chat request and return the response once the server has accepted it.
 ///
 /// Switches thinking off where [`thinking_for`] says the server takes it. If the server refuses the
-/// switch ([`refuses_thinking_switch`]), PM remembers that, resends once without it, and from then on
-/// sends this endpoint the body it always did.
+/// request with a 400 or 422, PM resends it once without the switch, and only when THAT succeeds —
+/// proof it was the switch the server objected to — does it stop sending the switch for this model
+/// on this endpoint. A refusal that has nothing to do with the switch fails the same way twice and
+/// is reported as it always was, with nothing remembered.
 async fn post_chat(
     base_url: &str,
     model: &str,
@@ -647,7 +701,8 @@ async fn post_chat(
     stream: bool,
     deadline: Option<Duration>,
 ) -> LocalResult<reqwest::Response> {
-    let mut thinking_off = thinking_for(base_url, token).await == Thinking::Switchable;
+    let mut thinking_off = thinking_for(base_url, model, token).await == Thinking::Switchable;
+    let mut resent = false;
     let url = format!("{base_url}/v1/chat/completions");
     loop {
         let body = chat_body(model, messages, stream, thinking_off);
@@ -667,12 +722,19 @@ async fn post_chat(
         })?;
         let status = response.status();
         if status.is_success() {
+            if resent {
+                if let Ok(mut known) = THINKING.lock() {
+                    known
+                        .refused
+                        .insert((base_url.to_string(), model.to_string()));
+                }
+            }
             return Ok(response);
         }
         let body = response.text().await.unwrap_or_default();
-        if thinking_off && refuses_thinking_switch(status.as_u16(), &body) {
-            remember_thinking(base_url, Thinking::Leave);
+        if thinking_off && may_refuse_the_switch(status.as_u16()) {
             thinking_off = false;
+            resent = true;
             continue;
         }
         return Err(LocalFailure::new(
@@ -2310,42 +2372,285 @@ mod tests {
     }
 
     #[test]
-    fn only_ollamas_version_answer_says_ollama() {
-        assert!(is_ollama_version(&serde_json::json!({"version": "0.33.0"})));
-        // LM Studio's 200 for a route it doesn't have.
-        assert!(!is_ollama_version(&serde_json::json!({
-            "error": "Unexpected endpoint or method. (GET /api/version)"
-        })));
-        assert!(!is_ollama_version(&serde_json::json!({"version": ""})));
-        assert!(!is_ollama_version(&serde_json::json!({"version": 3})));
-        assert!(!is_ollama_version(&serde_json::json!([])));
+    fn only_a_recent_ollamas_version_answer_takes_the_switch() {
+        let answer = |v: serde_json::Value| thinking_from_version(200, Some(&v));
+        assert_eq!(
+            answer(serde_json::json!({"version": "0.33.0"})),
+            Some(Thinking::Switchable)
+        );
+        assert_eq!(
+            answer(serde_json::json!({"version": "0.12.5"})),
+            Some(Thinking::Switchable)
+        );
+        assert_eq!(
+            answer(serde_json::json!({"version": "0.12.5-rc1"})),
+            Some(Thinking::Switchable)
+        );
+        // 0.12.4 refuses "none" for a model that never thinks, and 0.11.5-0.12.3 refuse it outright.
+        for old in ["0.12.4", "0.12.3", "0.12.0", "0.11.5", "0.11.4", "0.1.32"] {
+            assert_eq!(
+                answer(serde_json::json!({ "version": old })),
+                Some(Thinking::Leave),
+                "{old}"
+            );
+        }
+        // A development build, LM Studio's 200 for a route it doesn't have, and servers that answer
+        // the route with something that is not a recent Ollama's version: all answered, none takes it.
+        for other in [
+            serde_json::json!({"version": "0.0.0"}),
+            serde_json::json!({"error": "Unexpected endpoint or method. (GET /api/version)"}),
+            serde_json::json!({"version": "0.9.0"}),
+            serde_json::json!({"version": "v2.26.0"}),
+            serde_json::json!({"version": "v150"}),
+            serde_json::json!({"version": ""}),
+            serde_json::json!({"version": 3}),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(answer(other.clone()), Some(Thinking::Leave), "{other}");
+        }
+        // No such route is an answer too.
+        assert_eq!(thinking_from_version(404, None), Some(Thinking::Leave));
+        assert_eq!(thinking_from_version(405, None), Some(Thinking::Leave));
+        // A proxy that wants a token, a server that is restarting or rate-limiting, or a 2xx whose
+        // body never arrived say nothing about what the server is, so nothing is recorded.
+        for status in [401, 403, 407, 408, 429, 500, 502, 503] {
+            assert_eq!(thinking_from_version(status, None), None, "{status}");
+        }
+        assert_eq!(thinking_from_version(200, None), None);
     }
 
     #[test]
-    fn a_refused_switch_is_told_apart_from_every_other_refusal() {
-        // The two refusals Ollama 0.33.0 has for the field, verbatim.
-        assert!(refuses_thinking_switch(
-            400,
-            r#"{"error":{"message":"invalid reasoning value: \"bogus\" (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")","type":"invalid_request_error"}}"#
-        ));
-        assert!(refuses_thinking_switch(
-            400,
-            r#"{"error":{"message":"\"hf.co/unsloth/gemma-4-12b-it-GGUF:Q3_K_M\" does not support thinking","type":"invalid_request_error"}}"#
-        ));
-        assert!(refuses_thinking_switch(
-            422,
-            "unknown field `reasoning_effort`"
-        ));
-        // A missing model, a full context or a server error is not about the switch, so it is never
-        // retried without it.
-        assert!(!refuses_thinking_switch(
-            404,
-            r#"{"error":"model \"x\" not found"}"#
-        ));
-        assert!(!refuses_thinking_switch(
-            400,
-            "the request exceeds the available context size"
-        ));
-        assert!(!refuses_thinking_switch(500, "reasoning parser crashed"));
+    fn only_a_plain_version_number_is_read_as_one() {
+        assert_eq!(ollama_version("0.33.0"), Some((0, 33, 0)));
+        assert_eq!(ollama_version(" 0.12.5-rc1 "), Some((0, 12, 5)));
+        assert_eq!(ollama_version("0.12.5+dirty"), Some((0, 12, 5)));
+        assert_eq!(ollama_version("0.0.0"), None);
+        assert_eq!(ollama_version("v0.33.0"), None);
+        assert_eq!(ollama_version("0.33"), None);
+        assert_eq!(ollama_version("0.33.x"), None);
+        assert_eq!(ollama_version(""), None);
+    }
+
+    #[test]
+    fn only_a_refusal_the_switch_could_cause_is_resent_without_it() {
+        assert!(may_refuse_the_switch(400));
+        assert!(may_refuse_the_switch(422));
+        for status in [401, 403, 404, 408, 429, 500, 503] {
+            assert!(!may_refuse_the_switch(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_thinking_models_empty_chunks_are_not_tokens() {
+        // Ollama 0.33.0's shape for a model that is thinking: content "" beside the reasoning.
+        let mut wire = String::from(
+            "data: {\"model\":\"gemma4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        );
+        for _ in 0..80 {
+            wire.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"hm\"}}]}\n\n");
+        }
+        wire.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Taxes\"}}]}\n\n");
+        wire.push_str(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        wire.push_str("data: [DONE]\n\n");
+        let events = SseAssembler::default().feed(wire.as_bytes());
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SseEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, ["Taxes"]);
+        // And so the loop guard never sees a run of them.
+        let mut guard = LoopGuard::default();
+        assert!(!tokens.iter().any(|t| guard.observe(t)));
+    }
+
+    /// A one-thread HTTP server for the thinking switch: it answers `/api/version` with `version`
+    /// (or `version_status`), and a chat request with a 400 when it carries the switch and
+    /// `refuses_switch` says so, else with a one-word completion. Every request is logged as
+    /// `"<path> <model> switch|plain"`. Blocking std I/O on purpose: the crate's tokio has no `net`.
+    struct MockServer {
+        base_url: String,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn mock_server(
+        version_status: u16,
+        version: &'static str,
+        refuses_switch: fn(&str) -> bool,
+        refuses_everything: bool,
+    ) -> MockServer {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let (status, reply) = if path == "/api/version" {
+                    (version_status, format!(r#"{{"version":"{version}"}}"#))
+                } else {
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let model = json["model"].as_str().unwrap_or("").to_string();
+                    let switch = json.get("reasoning_effort").is_some();
+                    seen.lock().unwrap().push(format!(
+                        "{path} {model} {}",
+                        if switch { "switch" } else { "plain" }
+                    ));
+                    if refuses_everything || (switch && refuses_switch(&model)) {
+                        (400, r#"{"error":{"message":"no"}}"#.to_string())
+                    } else {
+                        (
+                            200,
+                            r#"{"model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#
+                                .to_string(),
+                        )
+                    }
+                };
+                if path == "/api/version" {
+                    seen.lock().unwrap().push(path);
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        MockServer { base_url, log }
+    }
+
+    impl MockServer {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+    }
+
+    async fn ask(server: &MockServer, model: &str) -> LocalResult<Completion> {
+        complete_within(
+            &server.base_url,
+            model,
+            None,
+            &[msg("user", "hi")],
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_recent_ollama_is_asked_once_and_gets_the_switch_on_every_call() {
+        let server = mock_server(200, "0.33.0", |_| false, false);
+        ask(&server, "gemma4").await.unwrap();
+        ask(&server, "gemma4").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions gemma4 switch",
+                "/v1/chat/completions gemma4 switch"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refuses_the_switch_loses_it_and_no_other_model_does() {
+        let server = mock_server(200, "0.12.5", |m| m == "picky", false);
+        ask(&server, "picky").await.unwrap();
+        ask(&server, "picky").await.unwrap();
+        ask(&server, "other").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions picky switch",
+                "/v1/chat/completions picky plain",
+                "/v1/chat/completions picky plain",
+                "/v1/chat/completions other switch"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_switch_did_not_cause_is_reported_and_forgets_nothing() {
+        let server = mock_server(200, "0.33.0", |_| false, true);
+        let Err(err) = ask(&server, "m").await else {
+            panic!("a refused request must fail");
+        };
+        assert_eq!(
+            err.kind,
+            classify_http(400, r#"{"error":{"message":"no"}}"#)
+        );
+        assert!(ask(&server, "m").await.is_err());
+        // Resent once without the switch each time, and the switch still goes first.
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions m switch",
+                "/v1/chat/completions m plain",
+                "/v1/chat/completions m switch",
+                "/v1/chat/completions m plain"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_ollama_or_another_server_never_sees_the_switch() {
+        for (status, version) in [(200, "0.12.3"), (200, "0.12.4"), (404, "")] {
+            let server = mock_server(status, version, |_| true, false);
+            ask(&server, "m").await.unwrap();
+            ask(&server, "m").await.unwrap();
+            assert_eq!(
+                server.take(),
+                [
+                    "/api/version",
+                    "/v1/chat/completions m plain",
+                    "/v1/chat/completions m plain"
+                ],
+                "{status} {version}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_that_could_not_answer_is_asked_again() {
+        let server = mock_server(401, "0.33.0", |_| false, false);
+        ask(&server, "m").await.unwrap();
+        ask(&server, "m").await.unwrap();
+        assert_eq!(
+            server.take(),
+            [
+                "/api/version",
+                "/v1/chat/completions m plain",
+                "/api/version",
+                "/v1/chat/completions m plain"
+            ]
+        );
     }
 }

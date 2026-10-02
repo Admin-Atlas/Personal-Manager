@@ -458,6 +458,8 @@ pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<Strin
     // The last test proved a model answered on the OLD server. Cleared in the backend, not just in
     // the view, because the view re-reads this snapshot every time it mounts.
     state.local_ai.clear_finished_test();
+    // Whether to switch thinking off was learned from the old server, which this may not be.
+    openai_compat::forget_thinking();
     // A newly-configured endpoint should light up the chat sidebar / status chip at once.
     crate::llm_gateway::ping_status(&app);
     Ok(normalized)
@@ -485,6 +487,7 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     // No endpoint now owns a token — see `set_local_llm_endpoint`.
     state.local_ai.cache_release_endpoint(None);
     state.local_ai.clear_finished_test();
+    openai_compat::forget_thinking();
     // A forgotten endpoint should drop the chat sidebar's provider line to zero pixels at once.
     crate::llm_gateway::ping_status(&app);
     Ok(())
@@ -526,11 +529,13 @@ pub fn set_local_llm_routing(app: AppHandle, role: String, pref: String) -> Resu
 
 /// A new token is a different server as far as a test result is concerned: the last pass proved a
 /// model answered with the OLD credential. Cleared here, as the endpoint commands do, because the
-/// view re-reads the backend's finished test every time it mounts.
+/// view re-reads the backend's finished test every time it mounts. What PM learned about switching
+/// thinking off goes too: a proxy that refused the old token never said what was behind it.
 #[tauri::command]
 pub fn set_local_llm_token(state: State<'_, AppState>, token: String) -> Result<()> {
     secrets::set_local_llm_endpoint_token(&token)?;
     state.local_ai.clear_finished_test();
+    openai_compat::forget_thinking();
     Ok(())
 }
 
@@ -538,6 +543,7 @@ pub fn set_local_llm_token(state: State<'_, AppState>, token: String) -> Result<
 pub fn clear_local_llm_token(state: State<'_, AppState>) -> Result<()> {
     secrets::clear_local_llm_endpoint_token()?;
     state.local_ai.clear_finished_test();
+    openai_compat::forget_thinking();
     Ok(())
 }
 
