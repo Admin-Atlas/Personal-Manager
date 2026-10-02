@@ -234,6 +234,9 @@ function listJoin(items: readonly string[]): string {
 interface RoleFacts {
   role: LocalRole;
   model: string;
+  /** How the start card names the model: PM's catalogue name for one of its own downloads (an
+   *  `hf.co/…:Q5_K_M` tag means nothing to most people), the id itself otherwise. */
+  name: string;
   routing: string;
   /** Where its requests really go, or null while there is no status. */
   effective: EffectiveRoute | null;
@@ -254,6 +257,7 @@ function roleFacts(i: ReadinessInput, role: LocalRole): RoleFacts {
   return {
     role,
     model,
+    name: model ? nameForTag(i.recs, model) : model,
     routing,
     effective,
     local,
@@ -421,9 +425,9 @@ export function standing(i: ReadinessInput): string {
   let text: string;
   if (chat.atWork && background.atWork && chat.model === background.model) {
     if (chat.effective === "local_only" && background.effective === "local_only") {
-      text = `Chat and background work run on ${chat.model}, ${where}, and never use the cloud.`;
+      text = `Chat and background work run on ${chat.name}, ${where}, and never use the cloud.`;
     } else if (fallsBack(chat) && fallsBack(background)) {
-      text = `Chat and background work run on ${chat.model}, ${where}, with your cloud model as a fallback.`;
+      text = `Chat and background work run on ${chat.name}, ${where}, with your cloud model as a fallback.`;
     } else {
       text = sentences(chat, background, where);
     }
@@ -485,10 +489,10 @@ function roleSentence(f: RoleFacts, where: string): string {
   const runs = f.role === "chat" ? "Chat runs" : "Background work runs";
   switch (f.effective) {
     case "local_only":
-      return `${runs} on ${f.model}, ${where}, and never uses the cloud.`;
+      return `${runs} on ${f.name}, ${where}, and never uses the cloud.`;
     case "local_then_cloud":
     case "cloud_for_power":
-      return `${runs} on ${f.model}, ${where}, with your cloud model as a fallback.`;
+      return `${runs} on ${f.name}, ${where}, with your cloud model as a fallback.`;
     case "cloud":
       return `${ROLE_NAME[f.role]} uses your cloud model.`;
     case "nothing":
@@ -497,7 +501,7 @@ function roleSentence(f: RoleFacts, where: string): string {
       }.`;
     case "unknown":
       // Its local model is known; whether it falls back is what PM can't read, said once after.
-      return f.local ? `${runs} on ${f.model}, ${where}.` : "";
+      return f.local ? `${runs} on ${f.name}, ${where}.` : "";
     default:
       return "";
   }
@@ -791,7 +795,9 @@ function candidate(i: ReadinessInput): { id: string; name: string } | null {
       return { id, name: nameForTag(i.recs, i.lastPulledTag) };
   }
   const capable = chatCapable(i);
-  return capable.length === 1 ? { id: capable[0].id, name: capable[0].id } : null;
+  return capable.length === 1
+    ? { id: capable[0].id, name: nameForTag(i.recs, capable[0].id) }
+    : null;
 }
 
 /**
@@ -938,8 +944,11 @@ function rolesStep(i: ReadinessInput): Step {
     };
   }
 
-  const c = chat.atWork ? chat.model : null;
-  const b = background.atWork ? background.model : null;
+  // Names, unless two different builds share one: then the ids, or the sentence would say chat and
+  // background work use "different" models with the same name.
+  const sameName = chat.model !== background.model && chat.name === background.name;
+  const c = chat.atWork ? (sameName ? chat.model : chat.name) : null;
+  const b = background.atWork ? (sameName ? background.model : background.name) : null;
   /** The other job's half of the sentence, from where its requests really go. */
   const elsewhere = (f: RoleFacts) => {
     const name = who([f.role]);

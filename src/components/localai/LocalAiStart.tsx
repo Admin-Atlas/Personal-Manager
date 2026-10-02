@@ -295,7 +295,12 @@ function ShownPickCard({
   });
   const moe = !!rec && rec.active_parameters_b + 0.01 < rec.parameters_b;
   const qualifier = speedLong(pick.fit, recs.hardware, { moe });
-  const disk = pick.kind === "catalogue" ? diskLine(pick, recs) : null;
+  // The download only matters while there is one to make: once the server has the pick, "5.1 GB
+  // download" is a figure about something already done.
+  const disk =
+    pick.kind === "catalogue" && !servedIds.has(pick.tag.toLowerCase())
+      ? diskLine(pick, recs)
+      : null;
   const also = pick.kind === "catalogue" ? alsoHaveLine(pick, recs) : null;
   // The job's local model, when one runs on a model other than the pick. The better-fit line already
   // says this when it names the pick's own repo, so it isn't said twice.

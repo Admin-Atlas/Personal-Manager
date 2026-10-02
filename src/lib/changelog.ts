@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.138.0-alpha",
+    date: "2026-10-02",
+    highlights: [
+      "Settings › Local AI now starts with the model PM would run on your computer, and four steps to get it going: get a model server, get the model, put it to work, and check it works. Only the step you're on has a button, and each one does something you could also do by hand further down. PM's pick is the largest model in its list that fits entirely on your graphics card — or, without one, that fits your free memory and is quick enough for background work — and if you already have one that does about as well, it says so and points you at that instead. When nothing suits your computer, it says why rather than suggesting the least-bad option. And if you already run a model of your own choosing, PM treats that as set up and leaves its pick as a suggestion.",
+      "Speeds now say where they come from. On a graphics card PM recognises they're shown as “up to” — a ceiling worked out from the card's published memory speed; in PM's own checks real replies came 10–35% slower, so take them with a pinch of salt. On chips that share memory with the processor PM no longer shows a number at all, because it can't estimate one honestly yet. PM also now tells you how to turn on the compressed memory cache it sized many models for — without it, those models don't fit the way PM said they would.",
+      "Everything about battery now lives in On battery, including handing the graphics card's memory back, and each option says what it saves and what it costs. The rest of the tab is easier to find your way around: sections are named for what they do, nothing points “above” or “below” at the wrong place any more, errors appear in the section they belong to, disconnecting asks first, and the model-memory readout updates after a test loads a model. Ollama's usual model names (like qwen2.5:latest) are now recognised, and the “a better model is available” nudge no longer suggests models your graphics card can't hold.",
+    ],
+  },
+  {
     version: "3.137.0-alpha",
     date: "2026-10-01",
     highlights: [

@@ -845,7 +845,10 @@ describe("steps — four, in order, with at most one next", () => {
   });
 
   it("step 3 says who uses what once it is done", () => {
-    expect(steps(STATES.returning)[2].line).toBe(`Chat and background work both use ${QWEN_TAG}.`);
+    // One of PM's own downloads is named as PM's list names it, not by its hf.co tag.
+    expect(steps(STATES.returning)[2].line).toBe(
+      "Chat and background work both use Qwen2.5 7B Instruct.",
+    );
     const split = input({
       config: cfg({
         chat_model: "a",
@@ -869,6 +872,20 @@ describe("steps — four, in order, with at most one next", () => {
       status: routes({ effective: "nothing" }, { effective: "local_only" }),
     });
     expect(steps(bgOnly)[2].line).toBe("Background work uses b; chat has nothing to answer with.");
+    // Two builds of one model would read as one name twice; then the ids say which is which.
+    const twoBuilds = input({
+      config: cfg({
+        chat_model: QWEN_TAG,
+        background_model: `hf.co/${QWEN}:Q8_0`,
+        chat_routing: "local",
+        background_routing: "local",
+      }),
+      served: served(QWEN_TAG, `hf.co/${QWEN}:Q8_0`),
+      status: routes({ effective: "local_only" }),
+    });
+    expect(steps(twoBuilds)[2].line).toBe(
+      `Chat uses ${QWEN_TAG}; background work uses hf.co/${QWEN}:Q8_0.`,
+    );
   });
 
   it("step 4 asks for a test right after an assignment, and only then", () => {
