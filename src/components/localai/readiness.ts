@@ -30,7 +30,6 @@ import type {
   LocalDiskSource,
   LocalFitResult,
   LocalGpuResidency,
-  LocalInstalledModel,
   LocalLlmConfig,
   LocalLlmStatus,
   LocalPick,
@@ -363,31 +362,31 @@ export function hasCard(recs: LocalRecommendations | null): boolean {
   return !!recs && recs.hardware.vram_gb != null && !recs.hardware.unified_memory;
 }
 
-/** Whether a served model's figures are for the user's own file, at the context the server serves
- *  it with (`measured`). Everything else on the row is the catalogue's
- *  guess: the best quant for whatever memory is free right now, at the model's trained context —
- *  which can put a file that sits on the card into system memory, and moves as free memory does. */
-function measuredRow(row: LocalInstalledModel): boolean {
-  return row.measured === true;
-}
-
 /**
- * Whether PM can say `id` runs from system memory on a machine with a graphics card: the served
- * model's own figures (`measuredRow`) put it there. Never said from a guess, and never of PM's own
- * pick, which was judged against the card itself — the pick card beside it would say the opposite.
+ * Whether PM can say `id` runs from system memory on a machine with a graphics card: the backend
+ * showed the served model does not fit the card (`spills_gpu` — the server reports it holds less of
+ * it on the card than its size, or PM's own figures for the user's file at the served context are
+ * over the card even on a compressed cache). Never said from the row's sizing alone — that is f16
+ * first and runs high by design, so it can put a model that sits on the card into system memory —
+ * and never of PM's own pick, which was judged against the card itself: the pick card beside it would
+ * say the opposite.
  */
 export function spillsOffCard(recs: LocalRecommendations | null, id: string): boolean {
   if (!recs || !hasCard(recs)) return false;
   const pick = recs.pick;
   if (pick?.kind === "owned" && pick.id === id && pick.basis === "gpu") return false;
-  const row = recs.installed.find((m) => m.id === id);
-  return !!row && measuredRow(row) && row.fit.speed_basis === "system";
+  return recs.installed.find((m) => m.id === id)?.spills_gpu === true;
 }
 
-/** The flags that start llama-server the way PM sized a fit: its context, and the compressed cache
- *  when PM sized it on one. */
+/** The flags that start llama-server the way PM sized a fit: its context, one request at a time,
+ *  and the compressed cache when PM sized it on one.
+ *
+ *  `-np 1` because one slot is what PM sized the memory for. Left to itself, llama-server opens four
+ *  slots sharing one cache, and that holds the parts of it that are a fixed size — a sliding-window
+ *  model's window, a hybrid model's recurrent state — four times over, past the figure on the card.
+ *  Ollama sets its own slot count, one by default. */
 function serveFlags(fit: Pick<LocalFitResult, "context" | "kv">): string {
-  return `${fit.context != null ? ` --ctx-size ${fit.context}` : ""}${
+  return `${fit.context != null ? ` --ctx-size ${fit.context}` : ""} -np 1${
     fit.kv === "q8_0" ? " -fa on -ctk q8_0 -ctv q8_0" : ""
   }`;
 }
@@ -400,41 +399,77 @@ export function hfServeCommand(
   return `llama-server -hf ${repo}${fit.quant ? `:${fit.quant}` : ""}${serveFlags(fit)}`;
 }
 
+/** The runner whose own folder a file is in — the one server it can count for. */
+const RUNNER_OF_SOURCE: Partial<Record<LocalDiskSource, RunnerName>> = {
+  ollama: "Ollama",
+  lm_studio: "LM Studio",
+};
+
+/** The port each runner listens on by default, inverted from `RUNNER_BY_PORT`. */
+const USUAL_PORT: Record<RunnerName, string> = Object.fromEntries(
+  Object.entries(RUNNER_BY_PORT).map(([port, runner]) => [runner, port]),
+) as Record<RunnerName, string>;
+
+/** What PM is connected to instead of a file's own runner on this computer, as a sentence names it. */
+function otherServer(own: RunnerName, baseUrl: string): string {
+  const runner = runnerOf(baseUrl);
+  if (runner === own) return `the ${own} on your model server`;
+  if (runner) return runner;
+  return `a server that isn't ${own} on its usual port (${USUAL_PORT[own]})`;
+}
+
 /**
  * How to get a model already on this computer served — the same words for PM's pick (step 2) and for
  * each model under Already on this device. The command is llama-server serving the file as it is,
  * for a single file whose path can be quoted; a split model gets no one-liner, and a path with a
  * quote in it gets none rather than one that breaks.
  *
- * `connected`: PM is connected to a server, and the model is still listed as on disk — so that server
- * isn't serving it. A file in Ollama's or LM Studio's folder only counts for a server on that
- * runner's own port, so the server is that runner: "once Ollama is connected" would be said of an
- * Ollama that already is, and "switch LM Studio's server on" of one that is answering.
+ * `baseUrl` is the stored endpoint, or null when PM isn't connected. A file in Ollama's or LM
+ * Studio's folder counts only for that runner, on its own port, on this computer (local_ai.rs
+ * `runner_can_serve`) — but Already on this device lists every runner's unserved files, whatever is
+ * connected. So the connected words ("isn't serving it", no "switch LM Studio's server on") are said
+ * only when the endpoint is that file's own runner here; for a file another runner holds, the line
+ * says what PM is connected to instead and what using the file would take. Step 2 only ever shows a
+ * pick that passed that test, so there the endpoint is always the file's own.
  */
 export function onDiskHow(
   source: LocalDiskSource,
   shards: number,
   path: string | null,
   fit: Pick<LocalFitResult, "context" | "kv">,
-  connected = false,
+  baseUrl: string | null = null,
+  /** Whether that server answered PM's last look. A file of its own runner is listed whatever it
+   *  serves when it didn't, so "isn't serving it" would be a guess. */
+  answered = true,
 ): { line: string; command: string | null } {
   const command =
     shards <= 1 && path && !path.includes('"')
       ? `llama-server -m "${path}"${serveFlags(fit)}`
       : null;
+  const own = RUNNER_OF_SOURCE[source];
+  const ownHere = !!own && isLoopback(baseUrl) && runnerOf(baseUrl) === own;
+  const elsewhere = own && baseUrl && !ownHere ? otherServer(own, baseUrl) : null;
   switch (source) {
     case "ollama":
       return {
-        line: connected
-          ? "It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else."
-          : "It's in Ollama's folder — once Ollama is connected, it shows up by itself.",
+        line: ownHere
+          ? answered
+            ? "It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else."
+            : "It's in Ollama's folder on this computer, and the Ollama PM is connected to isn't answering — once it's running, this shows up by itself."
+          : elsewhere
+            ? `It's in Ollama's folder on this computer, but PM is connected to ${elsewhere} — once this computer's Ollama is connected instead, it shows up by itself.`
+            : "It's in Ollama's folder — once Ollama is connected, it shows up by itself.",
         command: null,
       };
     case "lm_studio":
       return {
-        line: connected
-          ? "It's in LM Studio. Load it there — PM sees it within about half a minute."
-          : "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
+        line: ownHere
+          ? answered
+            ? "It's in LM Studio. Load it there — PM sees it within about half a minute."
+            : "It's in LM Studio, and the LM Studio server PM is connected to isn't answering. Load it there and switch LM Studio's server on — PM sees it within about half a minute."
+          : elsewhere
+            ? `It's in LM Studio, but PM is connected to ${elsewhere}. To use it, load it in LM Studio, switch LM Studio's server on and connect PM to that instead.`
+            : "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
         command,
       };
     default:
@@ -550,7 +585,7 @@ export function standing(i: ReadinessInput): string {
     if (f.atWork && f.model && spillsOffCard(i.recs, f.model)) slow.add(f.model);
   }
   for (const m of slow)
-    text += ` ${m} is larger than your graphics card's memory, so it runs from system memory — expect slow replies.`;
+    text += ` ${m} runs at least partly from system memory rather than your graphics card — expect slow replies.`;
   const unknown = ROLES.filter((r) => roleFacts(i, r).effective === "unknown");
   if (unknown.length > 0)
     text += ` PM can't read your saved keys right now, so it can't say whether ${who(unknown)} would fall back to the cloud.`;
@@ -859,8 +894,15 @@ function modelStep(i: ReadinessInput): Step {
         state: "done",
         line: tryIt(shown.display_name, sectionLabel("sec-localai-downloaded")),
       };
-    // Connected (step 2 waits on step 1), and the server isn't serving it.
-    const how = onDiskHow(shown.source ?? "folder", shown.shards, shown.path, shown.fit, true);
+    // Connected (step 2 waits on step 1), and the server isn't serving it. An owned pick on disk
+    // passed `runner_can_serve`, so this endpoint is the file's own runner.
+    const how = onDiskHow(
+      shown.source ?? "folder",
+      shown.shards,
+      shown.path,
+      shown.fit,
+      i.config.base_url,
+    );
     // LM Studio's own route is the one to give for a model in LM Studio: no llama-server line.
     return {
       ...step,

@@ -282,9 +282,10 @@ export function inUseLine(
   const b = bound.toLowerCase();
   if (b === (pick.kind === "owned" ? pick.id : pick.tag).toLowerCase()) return null;
   const row = recs.installed.find((m) => m.id === bound);
-  // Only from the served model's own figures, never the catalogue's guess at them (`spillsOffCard`).
+  // Only when the backend showed it doesn't fit the card (`spills_gpu`, via `spillsOffCard`) — never
+  // from the row's sizing, which is f16 first and high by design.
   if (pick.basis === "gpu" && spillsOffCard(recs, bound))
-    return `You're using ${bound}, which is larger than your graphics card's memory, so it runs from system memory. PM's pick fits on the card.`;
+    return `You're using ${bound}, which runs at least partly from system memory rather than your graphics card, so it replies slowly. PM's pick is sized to fit on the card.`;
   if (row && row.matched_repo === null)
     return `You're using ${bound}, which isn't in PM's list, so PM can't compare the two.`;
   const p = recs.curated.find((r) => r.repo === pick.repo)?.parameters_b ?? null;

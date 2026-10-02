@@ -293,7 +293,7 @@ export const HELP: Record<string, HelpEntry> = {
   // The Local AI tab's sections, in the tab's order, each titled with its rail label (sections.ts).
   "settings-localai-start": {
     title: "Your local model",
-    body: "Where your local AI stands, and what to do next. PM picks one model for this computer from its list: the largest that fits entirely on your graphics card with the room PM keeps free, at the context PM runs it at (32k, or less for a model made for less) — or, without a separate graphics card, the largest that fits your free memory in a build PM's cautious estimate says is quick enough for background work — or one you already have, when nothing in the list that fits is at least 15% larger. Under it are four steps, in order: get a model server, get the model, put it to work, and check it works. Nothing here downloads or changes anything until you press a button, and every button does something you can also do in the sections that follow. Speeds are estimates from published or typical memory speeds, not measurements: on a graphics card PM recognises they're ceilings, not promises, and anywhere else a rough guide in either direction.",
+    body: "Where your local AI stands, and what to do next. PM picks one model for this computer from its list: the largest that fits entirely on your graphics card with the room PM keeps free, at the context PM sizes it for (32k, or less for a model made for less) — or, without a separate graphics card, the largest that fits your free memory in a build PM's cautious estimate says is quick enough for background work — or one you already have, when nothing in the list that fits is at least 15% larger. Under it are four steps, in order: get a model server, get the model, put it to work, and check it works. Nothing here downloads or changes anything until you press a button, and every button does something you can also do in the sections that follow. Speeds are estimates from published or typical memory speeds, not measurements: on a graphics card PM recognises they're ceilings, not promises, and anywhere else a rough guide in either direction.",
   },
   "settings-localai-endpoint": {
     title: "Model server",
@@ -301,7 +301,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-localai-roles": {
     title: "Assign roles",
-    body: "Choose where chat and background work run — Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server) — and which local model each uses. Each line says what will really happen with your keys and server as they are. The On battery section is separate: it can move a job set to Local, fall back to cloud onto your cloud model while the battery is low, and asks before it first does.",
+    body: "Choose where chat and background work run — Cloud, Local only, or Local with a fall-back to your cloud model when your server can't answer (it isn't reachable, a reply fails or times out before anything is shown, or a request is too long for the window the server gives the model) — and which local model each uses. Each line says what will really happen with your keys and server as they are. The On battery section is separate: it can move a job set to Local, fall back to cloud onto your cloud model while the battery is low, and asks before it first does.",
   },
   "settings-localai-power": {
     title: "On battery",

@@ -584,6 +584,7 @@ describe("All models", () => {
             matched_repo: "bartowski/gemma-2-2b-it-GGUF",
             fit: fit(),
             measured: false,
+            spills_gpu: false,
           },
         ],
       }),
@@ -595,7 +596,7 @@ describe("All models", () => {
     expect(within(card).getByRole("button", { name: /^download$/i })).toBeTruthy();
   });
 
-  it("says where PM's pick is when it runs the model as a file neither row offers", async () => {
+  it("says where PM's pick is when it is a file neither row offers", async () => {
     // The dev laptop with 10 GB free: the card's one row is Q6_K at 7.38 GB, and the pick is Q5_K_M
     // at 6.63 GB — the config that keeps the room PM leaves free on the card. Only the band line says
     // so, and nothing tested it.
@@ -618,13 +619,226 @@ describe("All models", () => {
     const card = document.getElementById(
       "localai-rec-bartowski-qwen2-5-7b-instruct-gguf",
     ) as HTMLElement;
+    // The same context as the card, so what separates them is the step down PM took to stay on the
+    // card with its room kept free (`rung: "gpu"`).
     expect(card.textContent).toContain(
-      "PM's pick runs this model as Q5_K_M with a 32k context and a compressed cache, so it fits your graphics card with the room PM keeps free — it's under Your local model.",
+      "PM's pick is this model as Q5_K_M at a 32k context on a compressed (q8_0) cache, so it fits your graphics card with the room PM keeps free. It's under Your local model.",
     );
     expect(within(card).getByRole("button", { name: "Show it" })).toBeTruthy();
     // The card's own file is not the pick, so it is not marked as one and keeps its Download.
     expect(within(card).queryByText("PM's pick")).toBeNull();
     expect(within(card).getByRole("button", { name: /^download$/i })).toBeTruthy();
+  });
+
+  describe("PM's pick is matched to a row by its config, not its tag", () => {
+    // The pick is judged at the context PM sizes it for (32k at most) and the cards at the model's
+    // trained one, so the pick's own file is often on a row here run another way. The dev laptop
+    // (7.96 GB card, 20 GB free, an empty Ollama): the pick is gemma 4 12b as Q3_K_M at 32768 on f16,
+    // 6.93 GB; the card's "Fastest on GPU" row is the same Q3_K_M file at 65536 on q8_0, 6.74 GB,
+    // its context halved from 262144 — the same tag, a different config.
+    const GEMMA4 = "unsloth/gemma-4-12b-it-GGUF";
+    const Q3 = `hf.co/${GEMMA4}:Q3_K_M`;
+    const gemma4 = (over: Partial<LocalRecommendation> = {}) =>
+      qwenRec({
+        repo: GEMMA4,
+        display_name: "gemma 4 12b it",
+        architecture: "gemma4",
+        parameters_b: 11.91,
+        active_parameters_b: 11.91,
+        context_length: 262144,
+        multimodal: true,
+        ollama_pull: `hf.co/${GEMMA4}:Q8_0`,
+        gpu_pull: { tag: Q3, sharded: false, same_file: false },
+        fit: fit({
+          quant: "Q8_0",
+          context: 262144,
+          kv: "f16",
+          est_memory_gb: 16.93,
+          verdict: "comfortable",
+          speed_basis: "system",
+        }),
+        gpu: {
+          kind: "split",
+          fit: fit({
+            quant: "Q3_K_M",
+            context: 65536,
+            kv: "q8_0",
+            est_memory_gb: 6.74,
+            verdict: "halved_context",
+            notes: ["Context reduced to 65536 tokens (from 262144) to fit your memory."],
+          }),
+        },
+        ...over,
+      });
+    const gemma4Pick: LocalPick = {
+      kind: "catalogue",
+      repo: GEMMA4,
+      display_name: "gemma 4 12b it",
+      rung: "gpu",
+      tag: Q3,
+      fit: fit({ quant: "Q3_K_M", context: 32768, kv: "f16", est_memory_gb: 6.93 }),
+      download_gb: 5.5,
+      basis: "gpu",
+      also_have: null,
+    };
+    const card = () =>
+      document.getElementById("localai-rec-unsloth-gemma-4-12b-it-gguf") as HTMLElement;
+    // The card's own row with that file, by the figures the reader can see on it.
+    const BAND = (row: string) =>
+      `PM's pick is this card's Q3_K_M file at a 32k context on an f16 cache, the build that fits your graphics card at the context PM sizes it for — this card's Q3_K_M row is sized for a ${row} context on a compressed (q8_0) cache. It's under Your local model.`;
+
+    it("the dev laptop: the row with the pick's file isn't marked as the pick, and the band says what is", async () => {
+      getLocalLlmConfig.mockResolvedValue(cfg());
+      localModelRecommendations.mockResolvedValue(recs({ curated: [gemma4()], pick: gemma4Pick }));
+      await mount();
+      // Step 2 offers the pick's download, so this is the state the chip used to be shown in.
+      const start = document.getElementById("sec-localai-start") as HTMLElement;
+      await within(start).findByRole("button", { name: "Download (5.5 GB)" });
+      expect(card().textContent).toContain(BAND("64k"));
+      expect(within(card()).queryByText("PM's pick")).toBeNull();
+      // One way to the start card — the band line's — and the file's one Download is there: the
+      // Q3_K_M row offers none, and the other row, a different file, keeps its own.
+      expect(within(card()).getAllByRole("button", { name: "Show it" })).toHaveLength(1);
+      expect(within(card()).getAllByRole("button", { name: /^download$/i })).toHaveLength(1);
+      // Its commands are the card's, and say so; none of them is the pick's config.
+      expect(card().textContent).toContain(
+        "These are for this card's rows, not PM's pick, which is sized differently — its own steps are under Your local model.",
+      );
+      expect(card().textContent).toContain(
+        `llama-server -hf ${GEMMA4}:Q3_K_M --ctx-size 65536 -np 1 -fa on -ctk q8_0 -ctv q8_0`,
+      );
+      expect(card().textContent).not.toContain("--ctx-size 32768");
+    });
+
+    it("the dev laptop with 10 GB free: a one-row card with the pick's file at 128k is not the pick", async () => {
+      getLocalLlmConfig.mockResolvedValue(cfg());
+      localModelRecommendations.mockResolvedValue(
+        recs({
+          curated: [
+            gemma4({
+              ollama_pull: Q3,
+              gpu_pull: null,
+              gpu: { kind: "single" },
+              fit: fit({
+                quant: "Q3_K_M",
+                context: 131072,
+                kv: "q8_0",
+                est_memory_gb: 7.27,
+                verdict: "halved_context",
+              }),
+            }),
+          ],
+          pick: gemma4Pick,
+        }),
+      );
+      await mount();
+      const start = document.getElementById("sec-localai-start") as HTMLElement;
+      await within(start).findByRole("button", { name: "Download (5.5 GB)" });
+      expect(card().textContent).toContain(BAND("128k"));
+      expect(within(card()).queryByText("PM's pick")).toBeNull();
+      expect(within(card()).getAllByRole("button", { name: "Show it" })).toHaveLength(1);
+      expect(within(card()).queryByRole("button", { name: /^download$/i })).toBeNull();
+      expect(card().textContent).toContain(
+        "These are for this card's settings, not PM's pick, which is sized differently",
+      );
+    });
+
+    it("marks the row the pick really is, and says nothing more", async () => {
+      // The same file at the pick's own context and cache: that row is the pick.
+      getLocalLlmConfig.mockResolvedValue(cfg());
+      localModelRecommendations.mockResolvedValue(
+        recs({
+          curated: [gemma4({ gpu: { kind: "split", fit: gemma4Pick.fit } })],
+          pick: gemma4Pick,
+        }),
+      );
+      await mount();
+      const start = document.getElementById("sec-localai-start") as HTMLElement;
+      await within(start).findByRole("button", { name: "Download (5.5 GB)" });
+      expect(within(card()).getByText("PM's pick")).toBeTruthy();
+      expect(card().textContent).not.toContain("PM's pick is");
+      expect(card().textContent).not.toContain("not PM's pick");
+      expect(within(card()).getAllByRole("button", { name: "Show it" })).toHaveLength(1);
+    });
+
+    // Why the pick is not the card's row, from what really separates them (`pick.rung`, and the
+    // context): never "quick enough" of a heavier build that differs only by the 32k it is sized for.
+    const NO_CARD = { ...recs().hardware, gpu_name: null, gpu_vendor: null, vram_gb: null };
+    const REASONS: Array<[string, Partial<LocalRecommendations>, string]> = [
+      [
+        "a build stepped down to be quick enough from memory (speed)",
+        {
+          hardware: NO_CARD,
+          curated: [
+            gemma4({
+              gpu_pull: null,
+              gpu: { kind: "single" },
+              ollama_pull: `hf.co/${GEMMA4}:Q5_K_M`,
+              fit: fit({ quant: "Q5_K_M", context: 131072, kv: "f16", speed_basis: "system" }),
+            }),
+          ],
+          pick: {
+            ...gemma4Pick,
+            rung: "speed",
+            basis: "system",
+            fit: fit({ quant: "Q3_K_M", context: 32768, kv: "q8_0", speed_basis: "system" }),
+          },
+        },
+        "PM's pick is this model as Q3_K_M at a 32k context on a compressed (q8_0) cache, the build quick enough for PM's background work from memory — this card sizes the model for as much of its 256k context as fits. It's under Your local model.",
+      ],
+      [
+        "the highest-quality build at the context PM sizes it for (quality)",
+        {
+          hardware: NO_CARD,
+          curated: [
+            gemma4({
+              gpu_pull: null,
+              gpu: { kind: "single" },
+              ollama_pull: Q3,
+              fit: fit({ quant: "Q3_K_M", context: 262144, kv: "f16", speed_basis: "system" }),
+            }),
+          ],
+          pick: {
+            ...gemma4Pick,
+            tag: `hf.co/${GEMMA4}:Q4_K_M`,
+            rung: "quality",
+            basis: "system",
+            fit: fit({ quant: "Q4_K_M", context: 32768, kv: "q8_0", speed_basis: "system" }),
+          },
+        },
+        "PM's pick is this model as Q4_K_M at a 32k context on a compressed (q8_0) cache, the build that fits your free memory at the context PM sizes it for — this card sizes the model for as much of its 256k context as fits. It's under Your local model.",
+      ],
+      [
+        "a build stepped down to keep the card's room free (gpu)",
+        {
+          curated: [
+            gemma4({
+              gpu: {
+                kind: "split",
+                fit: fit({
+                  quant: "Q4_K_M",
+                  context: 65536,
+                  kv: "q8_0",
+                  verdict: "halved_context",
+                }),
+              },
+              gpu_pull: { tag: `hf.co/${GEMMA4}:Q4_K_M`, sharded: false, same_file: false },
+            }),
+          ],
+          pick: gemma4Pick,
+        },
+        "PM's pick is this model as Q3_K_M at a 32k context on an f16 cache, so it fits your graphics card with the room PM keeps free — this card sizes the model for as much of its 256k context as fits. It's under Your local model.",
+      ],
+    ];
+    for (const [name, over, band] of REASONS) {
+      it(`says why: ${name}`, async () => {
+        getLocalLlmConfig.mockResolvedValue(cfg());
+        localModelRecommendations.mockResolvedValue(recs(over));
+        await mount();
+        await waitFor(() => expect(card().textContent).toContain(band));
+        expect(within(card()).queryByText("PM's pick")).toBeNull();
+      });
+    }
   });
 
   it("keeps the pick's download on screen when the start card can't show it", async () => {

@@ -88,12 +88,22 @@ const KV_GB_PER_BPARAM_TOKEN: f64 = 8e-6;
 const GIB: f64 = 1_073_741_824.0;
 
 /// Tokens a sliding-window layer holds beyond its window: one batch, so a batch can be appended
-/// before the oldest tokens fall out. Both runners PM sets up size it this way — llama.cpp's
-/// sliding-window cache at `n_swa + n_ubatch` (src/llama-kv-cache-iswa.cpp, with `--swa-full` off,
-/// llama-server's default) and Ollama's at the window plus its 512-token batch. Measured on Ollama
-/// 0.33: gemma 3 4b's 29 sliding layers did not grow at all between an 8192 and a 32768 context. A
-/// runtime that allocates sliding layers at the full context (`swa_full`) would exceed this
-/// estimate.
+/// before the oldest tokens fall out — at ONE slot, which is the only case this holds for.
+///
+/// llama.cpp sizes a sliding-window cache at `n_swa × slots + n_ubatch` with a unified cache
+/// (src/llama-kv-cache-iswa.cpp, `--swa-full` off, llama-server's default), and a hybrid model's
+/// recurrent state once per slot (`rs_size = max(1, n_seq_max)`). So `window + 512` here, and the
+/// single state [`kv_cache_gb`] adds, are what one slot allocates:
+///   * Ollama hands llama-server its own `-np`: `NumParallel`, 1 by default, and forced to 1 for
+///     qwen35/qwen35moe whatever it is set to. Measured on Ollama 0.33: gemma 3 4b's 29 sliding
+///     layers did not grow at all between an 8192 and a 32768 context.
+///   * llama-server left to itself picks 4 unified slots (`-np` auto): `4 × window + n_ubatch` in
+///     each sliding layer, and four recurrent states — about 0.5 GB more than this for gemma 4 12b
+///     at 32k with a q8_0 cache. Every llama-server command PM prints pins `-np 1` for that reason.
+///
+/// A runtime that allocates sliding layers at the full context (`swa_full`, the llama.cpp library's
+/// own default) or runs several slots exceeds this estimate; LM Studio's settings for either are not
+/// ones PM can see or pin.
 const SWA_BATCH_TOKENS: u32 = 512;
 
 // --- input / output model ----------------------------------------------------------------------
@@ -253,12 +263,12 @@ pub struct KvGeometry {
     /// What one token adds across the layers that keep the whole context.
     pub bytes_per_token: f64,
     /// What one token adds across the sliding-window layers, which hold at most
-    /// `window + SWA_BATCH_TOKENS` tokens however long the context.
+    /// `window + SWA_BATCH_TOKENS` tokens however long the context, at one slot.
     pub window_bytes_per_token: f64,
     /// The sliding window, in tokens. Irrelevant when `window_bytes_per_token` is zero.
     pub window: u32,
-    /// The recurrent state of a hybrid model's linear-attention layers: f32, and the same at every
-    /// context and every cache precision.
+    /// The recurrent state of a hybrid model's linear-attention layers, for one slot: f32, and the
+    /// same at every context and every cache precision.
     pub state_bytes: f64,
 }
 
@@ -393,11 +403,13 @@ pub fn gpu_reserve_gb() -> f64 {
 ///
 /// From the model's [`KvGeometry`] when the spec carries one: the full-context layers pay for every
 /// token, the sliding-window layers for no more than their window plus a batch, and a hybrid's
-/// recurrent state is added once, uncompressed. Measured against a live Ollama 0.33 (q8_0 cache,
-/// flash attention, an RTX 5060 Laptop GPU, 02-10-2026), the footprint this feeds came out +9.6%
-/// over Qwen2.5 7B Q5_K_M's real load at 32768 tokens and +11.4% at 8192, and +2.0% / +1.6% over
-/// gemma 3 4b Q4_K_M's: inside the ±15% contract, and never under it. Without a geometry, the
-/// parameter-count proxy ([`KV_GB_PER_BPARAM_TOKEN`]).
+/// recurrent state is added once, uncompressed. Both of the last two are what ONE slot allocates —
+/// what Ollama runs, and what PM's llama-server commands pin with `-np 1`; llama-server's own
+/// default of four slots holds more ([`SWA_BATCH_TOKENS`]). Measured against a live Ollama 0.33
+/// (q8_0 cache, flash attention, an RTX 5060 Laptop GPU, 02-10-2026), the footprint this feeds came
+/// out +9.6% over Qwen2.5 7B Q5_K_M's real load at 32768 tokens and +11.4% at 8192, and +2.0% /
+/// +1.6% over gemma 3 4b Q4_K_M's: inside the ±15% contract, and never under it. Without a
+/// geometry, the parameter-count proxy ([`KV_GB_PER_BPARAM_TOKEN`]).
 pub fn kv_cache_gb(spec: &ModelSpec, ctx: u32, kv: KvCache) -> f64 {
     let Some(g) = spec.kv_geometry else {
         return KV_GB_PER_BPARAM_TOKEN * spec.active_params_b * f64::from(ctx) * kv.size_ratio();
@@ -674,6 +686,28 @@ pub fn resident_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> 
     (!matches!(g.verdict, Verdict::Unknown | Verdict::StayOnCloud)).then_some(g)
 }
 
+/// Whether `spec` at `ctx` is larger than a card of `vram_gb` even at its gentlest — its smallest
+/// file with a q8_0 cache — by more than the estimate's own error band ([`ESTIMATE_TOLERANCE`]).
+///
+/// What PM may say "runs from system memory" from when it cannot see where the server put a model.
+/// Two things stand between an estimate past the card and a model that really spills, and this
+/// clears both. The cache precision is the one setting of the user's server PM cannot read, so it
+/// is sized at q8_0, the smaller: a fit that takes f16 whenever free RAM allows put a 5.82 GB Q6_K
+/// at 32k "off the card" on an Ollama running a q8_0 cache, where it sits at 7.25 GB on a 7.96 GB
+/// card. And the estimate runs high by design, so a figure just past the card is one a real load
+/// may well fit. `false` for a spec PM cannot score: the refuse-to-guess guards [`fit_within`]
+/// opens with.
+pub fn outgrows_card(spec: &ModelSpec, ctx: u32, vram_gb: f64) -> bool {
+    if matches!(spec.arch, Architecture::Ssm) {
+        return false;
+    }
+    spec.candidates
+        .iter()
+        .map(|c| footprint_gb(spec, c, ctx, KvCache::Q8_0))
+        .reduce(f64::min)
+        .is_some_and(|gentlest| gentlest > vram_gb * (1.0 + ESTIMATE_TOLERANCE))
+}
+
 /// A fit result for a model we deliberately won't score — an unmodelled architecture, or (from the
 /// installed scan) a model not in the catalog. The verdict is `Unknown`; `reason` is the single
 /// user-facing note.
@@ -709,8 +743,9 @@ fn round1(x: f64) -> f64 {
 // --- two models on one machine (#786 item 6) ----------------------------------------------------
 
 /// The memory estimate's own stated tolerance (DECISIONS.md ±15%), measured at +11.3% against a real
-/// load on real hardware. A combined figure that overshoots a budget by less than this is inside PM's
-/// own error bar, and PM has to say so rather than pick a side it cannot defend.
+/// load on real hardware. A combined figure that overshoots a budget by less than this — or one
+/// model's figure that overshoots the card ([`outgrows_card`]) — is inside PM's own error bar, and
+/// PM has to say so rather than pick a side it cannot defend.
 ///
 /// The asymmetry is deliberate and it is the whole reason this band exists. The estimate runs HIGH,
 /// so "these fit" is the safe verdict — if the over-estimate fits, the real thing fits. "These will
@@ -1730,5 +1765,54 @@ mod tests {
         let cloud = fit(&spec, &gpu(2.0, 7.96));
         assert_eq!(cloud.verdict, Verdict::StayOnCloud);
         assert_eq!(resident_fit(&spec, &gpu(2.0, 7.96), &cloud), None);
+    }
+
+    #[test]
+    fn only_a_model_past_the_card_at_its_gentlest_and_past_the_band_outgrows_it() {
+        // A served Qwen2.5 7B Q6_K, 5.82 GB, at the 32768 its server was seen loading: 8.07 GB with
+        // an f16 cache, which the RAM fit takes whenever free RAM allows — and 7.25 GB with a q8_0
+        // one, which sits on a 7.96 GB card. PM cannot read which cache the server runs.
+        let e = crate::local_catalog::catalog()
+            .entries
+            .iter()
+            .find(|e| e.repo == "bartowski/Qwen2.5-7B-Instruct-GGUF")
+            .expect("catalogue entry");
+        let served = |files: Vec<QuantCandidate>| ModelSpec {
+            candidates: files,
+            projector_gb: Some(0.0),
+            ..crate::local_catalog::entry_to_spec(e)
+        };
+        let q6 = served(vec![q(Quant::Q6_K, 5.82)]);
+        let f16 = footprint_gb(&q6, &q6.candidates[0], 32768, KvCache::F16);
+        let q8 = footprint_gb(&q6, &q6.candidates[0], 32768, KvCache::Q8_0);
+        assert!(
+            (f16 - 8.07).abs() < 0.005 && (q8 - 7.25).abs() < 0.005,
+            "{f16} / {q8}"
+        );
+        assert!(
+            !outgrows_card(&q6, 32768, 7.96),
+            "past the card at f16 only"
+        );
+
+        // Past a 6.5 GB card even at q8_0, but by less than the estimate's own error band.
+        assert!(q8 > 6.5 && q8 <= 6.5 * (1.0 + ESTIMATE_TOLERANCE));
+        assert!(!outgrows_card(&q6, 32768, 6.5));
+        // Past a 6 GB card by more than the band: that one outgrows it.
+        assert!(outgrows_card(&q6, 32768, 6.0));
+        // A shorter window holds less, so the context it is judged at is the one passed in.
+        assert!(!outgrows_card(&q6, 4096, 6.0));
+
+        // With more than one build to choose from, the smallest decides: any of them spilling is
+        // not enough.
+        let either = served(vec![q(Quant::Q8_0, 7.54), q(Quant::Q3_K_M, 3.55)]);
+        assert!(!outgrows_card(&either, 32768, 6.0));
+
+        // Nothing PM cannot score is said to outgrow anything.
+        assert!(!outgrows_card(&served(vec![]), 32768, 1.0));
+        let ssm = ModelSpec {
+            arch: Architecture::Ssm,
+            ..q6.clone()
+        };
+        assert!(!outgrows_card(&ssm, 32768, 1.0));
     }
 }

@@ -35,12 +35,15 @@ import { Button, Callout, Collapsible, SectionInfo, SectionLabel, Select } from 
  * marked, and what the progress bar says. The licence dialog that has to be answered before a
  * restricted model is fetched is the hook's too, and renders once, at the tab.
  *
- * One Download per tag: while the start card's step 2 offers PM's pick, that rung here says "PM's
- * pick" and points there instead of offering a second button for the same file — and a download's
- * progress shows once, on the start card for the pick, on its card otherwise. While the list is
- * folded, the progress a card would show is shown above the fold instead: the tab unmounts on every
- * switch and the fold comes back closed, and a multi-gigabyte download with its only Cancel inside a
- * closed fold is a download nothing on the page says is running.
+ * One Download per tag: while the start card's step 2 offers PM's pick, a rung here with the pick's
+ * file offers no second button for it — and a download's progress shows once, on the start card for
+ * the pick, on its card otherwise. Only a rung that IS the pick — its file, context and cache — says
+ * "PM's pick": the pick is judged at the context PM sizes it for and the cards at the model's
+ * trained one, so the same file is often on a rung here at another config, and the card's band line
+ * says what the pick is instead. While the list is folded, the progress a card would show is shown
+ * above the fold instead: the tab unmounts on every switch and the fold comes back closed, and a
+ * multi-gigabyte download with its only Cancel inside a closed fold is a download nothing on the
+ * page says is running.
  */
 export function LocalAiCatalog({
   recs,
@@ -194,6 +197,7 @@ export function LocalAiCatalog({
                 onCancel={pull.cancel}
                 busy={pulling !== null}
                 pickTag={pickDownloadTag}
+                pickFit={pick?.kind === "catalogue" && pick.repo === rec.repo ? pick.fit : null}
                 band={bandLine(rec, pick)}
               />
             ))}
@@ -248,20 +252,71 @@ function otherBuild(
   return id ? `Your server has ${id}, another build of this model.` : null;
 }
 
-/** PM's pick runs this model at a config neither rung shows — it keeps the room PM leaves free on
- *  the card, which the cards' own rung does not — so the card says what the pick is, and where. */
+/** One way to run a model: its file (the quant), its context and its cache. */
+type RunConfig = Pick<LocalFitResult, "quant" | "context" | "kv">;
+
+/** The same way to run a model — the file, the context and the cache all agree. A tag names only
+ *  the file, so two rungs (or a rung and the pick) can share one and still run it differently. */
+function sameConfig(a: RunConfig, b: RunConfig): boolean {
+  return a.quant === b.quant && a.context === b.context && a.kv === b.kv;
+}
+
+/** The configs a card's rungs show: the highest-quality one, and a split's GPU one. */
+function rungFits(rec: LocalRecommendation): RunConfig[] {
+  return rec.gpu.kind === "split" ? [rec.fit, rec.gpu.fit] : [rec.fit];
+}
+
+/** "32k", from a token count. */
+function kTokens(n: number): string {
+  return `${(n / 1024).toFixed(0)}k`;
+}
+
+/**
+ * PM's pick is this model at a config no rung shows, so the card says what the pick is and where.
+ *
+ * Matched on the config, never the tag: the pick is judged at the context PM sizes it for (32k, or
+ * less for a model made for less, better_fit.rs `pick_context`) and the cards at the model's trained
+ * one, so the pick's own file is often on a rung here at a longer context and a compressed cache —
+ * the dev laptop's gemma 4 12b is Q3_K_M at 32k on f16 as the pick, and Q3_K_M at 64k on q8_0 as the
+ * card's GPU rung.
+ *
+ * The reason is the one that really separates them. When a rung has the pick's file, or the pick is
+ * the highest-quality build at its own context (`rung: "quality"`), it is the context; otherwise it
+ * is the step down `pick.rung` says PM took — to keep the room it leaves free on the card ("gpu"), or
+ * to be quick enough from memory ("speed"). A pick that matches no rung at the model's full context
+ * differs only in being a build Ollama can fetch, which the card's best file need not be.
+ */
 function bandLine(rec: LocalRecommendation, pick: LocalPick | undefined): string | null {
   if (pick?.kind !== "catalogue" || pick.repo !== rec.repo) return null;
-  if (pick.tag === rec.ollama_pull || pick.tag === rec.gpu_pull?.tag) return null;
-  const k = `${((pick.fit.context ?? 0) / 1024).toFixed(0)}k`;
-  const as = `PM's pick runs this model as ${pick.fit.quant ?? "a smaller file"} with a ${k} context${
-    pick.fit.kv === "q8_0" ? " and a compressed cache" : ""
-  }`;
+  const rungs = rungFits(rec);
+  if (rungs.some((f) => sameConfig(f, pick.fit))) return null;
+  const { quant, context, kv } = pick.fit;
+  const sameFile = quant != null && rungs.some((f) => f.quant === quant);
+  const capped = context != null && context < rec.context_length;
+  const build = sameFile
+    ? `this card's ${quant} file`
+    : `this model as ${quant ?? "another build"}`;
+  const cache = (k: LocalFitResult["kv"]) =>
+    k === "q8_0" ? "a compressed (q8_0) cache" : "an f16 cache";
+  const as = `PM's pick is ${build}${context != null ? ` at a ${kTokens(context)} context` : ""} on ${cache(kv)}`;
+  const fitsWhat = pick.basis === "gpu" ? "your graphics card" : "your free memory";
   const why =
-    pick.basis === "gpu"
-      ? "so it fits your graphics card with the room PM keeps free"
-      : "the build quick enough for PM's background work from memory";
-  return `${as}, ${why} — it's under ${sectionLabel("sec-localai-start")}.`;
+    capped && (sameFile || pick.rung === "quality")
+      ? `the build that fits ${fitsWhat} at the context PM sizes it for`
+      : pick.rung === "gpu"
+        ? "so it fits your graphics card with the room PM keeps free"
+        : pick.rung === "speed"
+          ? "the build quick enough for PM's background work from memory"
+          : "the best build of it that fits and that Ollama can download";
+  // What the card itself shows, so the comparison names a figure the reader can see: the row with
+  // the pick's file, or else how the card sizes the model as a whole.
+  const row = sameFile ? rungs.find((f) => f.quant === quant) : undefined;
+  const full = !capped
+    ? ""
+    : row?.context != null
+      ? ` — this card's ${quant} row is sized for a ${kTokens(row.context)} context on ${cache(row.kv)}`
+      : ` — this card sizes the model for as much of its ${kTokens(rec.context_length)} context as fits`;
+  return `${as}, ${why}${full}. It's under ${sectionLabel("sec-localai-start")}.`;
 }
 
 function NumbersGuide() {
@@ -308,11 +363,11 @@ function NumbersGuide() {
         </div>
       ))}
       <p className="pt-1 text-ink4">
-        Memory figures are designed to run a little high — about 11% above a real load when PM
-        measured one — so a model PM says fits should fit. Memory assumes an f16 cache unless a card
-        shows “q8_0 KV”, where PM sized it on a compressed (near-lossless) cache to keep a larger
-        context or quant — your server needs that setting too, and the context the card shows. Each
-        model's commands say what to set, and once your server is connected,{" "}
+        Memory figures are designed never to come in under a real load — between about 2% and 11%
+        above it in PM's checks — so a model PM says fits should fit. Memory assumes an f16 cache
+        unless a card shows “q8_0 KV”, where PM sized it on a compressed (near-lossless) cache to
+        keep a larger context or quant — your server needs that setting too, and the context the
+        card shows. Each model's commands say what to set, and once your server is connected,{" "}
         {sectionLabel("sec-localai-endpoint")}'s “{TUNING_TITLE}” has the steps. Your real speed and
         memory depend on your server and its settings.
       </p>
@@ -325,7 +380,7 @@ function NumbersGuide() {
 interface Rung {
   label: string;
   tag: string | null;
-  fit: Pick<LocalFitResult, "quant" | "context" | "kv">;
+  fit: RunConfig;
 }
 
 /** How to get a model PM can't download for you.
@@ -350,12 +405,16 @@ function ModelInstallHint({
   repo,
   rungs,
   shardedQuant,
+  pickElsewhere,
 }: {
   repo: string;
   /** Every way to run this model that PM can name, one per rung the card shows. A split card offers
    *  two genuinely different configs; printing only one of them is what stranded the GPU rung. */
   rungs: Rung[];
   shardedQuant: boolean;
+  /** PM's pick is this model at a config no rung shows (the band line), so these commands are the
+   *  card's, and say so rather than read as the pick's. */
+  pickElsewhere: boolean;
 }) {
   // One llama-server line per distinct config: a split whose rungs share a file still runs it two
   // ways, at two contexts or caches, and those are different commands.
@@ -389,6 +448,8 @@ function ModelInstallHint({
         {shardedQuant
           ? " Ollama can't fetch this quantization — it ships as split files, which Ollama won't pull. A smaller one of the same model will work."
           : ""}
+        {pickElsewhere &&
+          ` These are for this card's ${rungs.length > 1 ? "rows" : "settings"}, not PM's pick, which is sized differently — its own steps are under ${sectionLabel("sec-localai-start")}.`}
       </p>
     </div>
   );
@@ -503,6 +564,7 @@ function RecommendationCard({
   busy,
   servedTags,
   pickTag,
+  pickFit,
   band,
 }: {
   rec: LocalRecommendation;
@@ -529,7 +591,9 @@ function RecommendationCard({
   servedTags: Set<string>;
   /** The tag the start card is offering to download as PM's pick, or null. */
   pickTag: string | null;
-  /** The reserve-band line, when PM's pick is this model at a config no rung shows. */
+  /** The config PM's pick is sized at, when the pick is this model; null otherwise. */
+  pickFit: RunConfig | null;
+  /** What PM's pick is, when it is this model at a config no rung shows. */
   band: string | null;
 }) {
   const { showMeta } = useDepth();
@@ -550,20 +614,26 @@ function RecommendationCard({
     </Button>
   );
 
+  const pickChip = (
+    <span className="flex items-center gap-1.5">
+      <TokenChip token="--accent">PM's pick</TokenChip>
+      {showIt}
+    </span>
+  );
+  /** Whether a rung IS PM's pick, while the start card offers its download: the pick's file, at the
+   *  pick's context and cache. The same file at another config is not, whatever its tag says. */
+  const isPick = (tag: string | null, fit: RunConfig) =>
+    tag !== null && tag === pickTag && pickFit !== null && sameConfig(fit, pickFit);
+
   /** One rung's own action: it is already here, it is PM's pick (whose Download is on the start
-   *  card), PM can fetch it, or neither (the commands below). */
-  const rungAction = (t: { tag: string | null } | null): ReactNode => {
+   *  card), PM can fetch it, or neither (the commands below). A rung with the pick's file at another
+   *  config offers nothing: the file's one Download is the start card's, and the band line says so. */
+  const rungAction = (t: { tag: string | null } | null, fit: RunConfig): ReactNode => {
     const tag = t?.tag ?? null;
     if (!tag) return null;
     if (servedTags.has(tag.toLowerCase()))
       return <span className="text-[0.625rem] font-medium text-st-quick">Installed</span>;
-    if (tag === pickTag)
-      return (
-        <span className="flex items-center gap-1.5">
-          <TokenChip token="--accent">PM's pick</TokenChip>
-          {showIt}
-        </span>
-      );
+    if (tag === pickTag) return isPick(tag, fit) ? pickChip : null;
     if (!canPull) return null;
     return (
       <Button variant="secondary" size="sm" onClick={() => onPull(tag)} disabled={busy}>
@@ -622,15 +692,24 @@ function RecommendationCard({
                   one button wired to the Highest-quality rung, plus a caption admitting the faster
                   rung could not be fetched — which was also FALSE whenever the two rungs differ
                   only in context or KV precision, a split `gpu_fit` produces by design. */}
-              <ConfigRow label="Highest quality" fit={f} action={rungAction(ramTarget)} />
+              <ConfigRow label="Highest quality" fit={f} action={rungAction(ramTarget, f)} />
+              {/* The same file as the first row has its one action there — unless this row is the
+                  pick's own config, which is what the chip marks. */}
               <ConfigRow
                 label="Fastest on GPU"
                 fit={rec.gpu.fit}
-                action={gpuTarget?.same_file ? undefined : rungAction(gpuTarget)}
+                action={
+                  gpuTarget?.same_file
+                    ? isPick(rec.ollama_pull, rec.gpu.fit)
+                      ? pickChip
+                      : undefined
+                    : rungAction(gpuTarget, rec.gpu.fit)
+                }
               />
               {gpuTarget?.same_file ? (
                 <p className="text-[0.625rem] text-ink4">
-                  Both rows are the same file — the difference is the settings PM runs it with.
+                  Both rows are the same file — the difference is the settings your server runs it
+                  with.
                 </p>
               ) : (
                 gpuTarget?.sharded && (
@@ -660,10 +739,11 @@ function RecommendationCard({
           {isSplit ? null : installed ? (
             <span className="text-xs font-medium text-st-quick">Installed</span>
           ) : rec.ollama_pull && rec.ollama_pull === pickTag ? (
-            <span className="flex items-center gap-1.5">
-              <TokenChip token="--accent">PM's pick</TokenChip>
-              {showIt}
-            </span>
+            // The pick's file: marked only when the card runs it the pick's way; otherwise its one
+            // Download is the start card's, and the band line says what the pick is.
+            isPick(rec.ollama_pull, f) ? (
+              pickChip
+            ) : null
           ) : canPull && rec.ollama_pull ? (
             <Button
               variant="secondary"
@@ -719,7 +799,12 @@ function RecommendationCard({
               defaultOpen={false}
               className="mt-2"
             >
-              <ModelInstallHint repo={rec.repo} rungs={rungs} shardedQuant={rec.sharded_quant} />
+              <ModelInstallHint
+                repo={rec.repo}
+                rungs={rungs}
+                shardedQuant={rec.sharded_quant}
+                pickElsewhere={band !== null}
+              />
             </Collapsible>
           );
         })()}

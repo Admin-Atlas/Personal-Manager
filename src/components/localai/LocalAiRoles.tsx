@@ -257,10 +257,10 @@ export function LocalAiRoles({
           <span className="text-ink2">Cloud</span> keeps using your OpenRouter model.{" "}
           <span className="text-ink2">Local only</span> uses the model you picked and fails if it's
           unreachable. <span className="text-ink2">Local, fall back to cloud</span> tries local
-          first and quietly hands off to your cloud model only on a hard failure (an unreachable or
-          broken server) — never to chase quality. The On battery section is separate from fallback:
-          it can move a role set to Local, fall back to cloud onto your cloud model while your
-          battery is low, and it asks you before it first does. Local only is never moved.
+          first and quietly hands off to your cloud model {WHEN_SERVER_CANT}. It never switches to
+          chase quality. The On battery section is separate from fallback: it can move a role set to
+          Local, fall back to cloud onto your cloud model while your battery is low, and it asks you
+          before it first does. Local only is never moved.
         </p>
       </SectionInfo>
     </div>
@@ -274,11 +274,14 @@ const ROUTING_OPTIONS = [
 ];
 
 /** When a job set to Local, fall back to cloud goes to the cloud, from what the gateway actually
- *  falls back on — not only a server that is down: a reply that fails or times out on a running one,
- *  and a request PM won't send because it is longer than the window the server gives the model. Said
- *  "only if your server fails" before, which a long chat on a healthy server disproved. */
+ *  falls back on — not only a server that is down: a reply that fails or times out on a running one
+ *  before anything of it is shown (a chat reply that has started streaming finishes where it began,
+ *  or fails there — llm_gateway.rs `run_local_stream`), and a request PM won't send because it is
+ *  longer than the window the server gives the model. Said "only if your server fails" before, which
+ *  a long chat on a healthy server disproved. The section's own "How routing & fallback work" fold
+ *  says it with these words too, so the two can't drift. */
 const WHEN_SERVER_CANT =
-  "when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model";
+  "when your server can't — it isn't reachable, a reply fails or times out before anything is shown, or a request is too long for the window it gives the model";
 
 /** Who each routing suits — said for the one chosen, so the choice is made against a reason. The
  *  section it names is read from the list, so a rename can't leave it naming a heading that's gone. */

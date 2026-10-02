@@ -28,6 +28,11 @@
 //   * LM Studio has `POST /api/v1/models/unload` (0.4.0+) and `lms unload`, and llama-server in
 //     router mode has `POST /models/unload`. So "only Ollama can unload" was false; what is true is
 //     that PM only drives Ollama's (Model memory says so).
+//   * llama-server's `-np/--parallel` is "auto" by default, which the server turns into four slots
+//     sharing one cache (common/arg.cpp, tools/server/server.cpp), and a sliding-window cache and a
+//     hybrid model's recurrent state are sized per slot (llama-kv-cache-iswa.cpp). PM sizes for one
+//     slot, so every llama-server line it prints — here, and `serveFlags` in readiness.ts — says
+//     `-np 1`.
 //
 // The numbers in the steps are the ones PM sized its pick for, when there is a pick to size them by
 // (`pickContext`): a step that says "set it to 32768" beside a pick sized for 8k sends the reader
@@ -415,7 +420,10 @@ export function llamaServerGuide(
   const lifecycle =
     "It runs only while its terminal window is open, and doesn't start with your machine. You launch it each session.";
   const serve = [
-    "Start it with a model — for example `llama-server -hf ggml-org/gemma-3-4b-it-GGUF:Q4_K_M`. It downloads the model the first time, then serves it on http://127.0.0.1:8080.",
+    // `-np 1`: one slot is what PM sizes the memory for. Left out, llama-server opens four slots
+    // sharing one cache, which holds a sliding-window model's window and a hybrid model's recurrent
+    // state four times over — more than PM's figure (llama.cpp server.cpp, llama-kv-cache-iswa.cpp).
+    "Start it with a model — for example `llama-server -hf ggml-org/gemma-3-4b-it-GGUF:Q4_K_M -np 1`. It downloads the model the first time, then serves it on http://127.0.0.1:8080. `-np 1` has it answer one request at a time, which is what PM sized the memory for — by default it keeps room for four at once, and on many models that takes more memory.",
     // `-c/--ctx-size` defaults to 0, "loaded from model" (the server README, 01-10-2026): without
     // it a current build allocates the model's whole trained context. The old line said the
     // default was small, which was the opposite — and that an over-long prompt is trimmed, when the
@@ -492,8 +500,8 @@ export function tuningFor(
     case "llama-server":
       return {
         context: c.fromPick
-          ? `Add \`--ctx-size ${c.n}\`, the context PM sized its pick for — current builds otherwise use the model's whole trained context.`
-          : "Add `--ctx-size <n>` with the context PM sized for — current builds otherwise use the model's whole trained context.",
+          ? `Add \`--ctx-size ${c.n}\`, the context PM sized its pick for, and \`-np 1\`, so it answers one request at a time as PM sized it — current builds otherwise use the model's whole trained context, and keep room for four requests at once.`
+          : "Add `--ctx-size <n>` with the context PM sized for, and `-np 1`, so it answers one request at a time as PM sized it — current builds otherwise use the model's whole trained context, and keep room for four requests at once.",
         cache: "For the compressed cache, also add `-fa on -ctk q8_0 -ctv q8_0`.",
       };
     default:

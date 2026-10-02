@@ -15,13 +15,20 @@
 //! 2. **The baseline is the *best* model you already run**, not the first one found. Someone running
 //!    a large chat model and a small background one should not be nagged about something that only
 //!    beats the small one.
-//! 3. **A candidate must be runnable and meaningfully bigger** — a fit PM actually computed, a
-//!    verdict no worse than the one being replaced, and [`MIN_IMPROVEMENT`] more parameters.
-//! 4. **A model already on disk wins.** "You already have this downloaded" is a far better
-//!    suggestion than "download this", and costs the user nothing.
-//! 5. **Only a model PM's pick could choose.** A candidate the pick below would exclude — one that
-//!    fits system RAM but not the graphics card, or one too slow for background work — is never
-//!    volunteered here either, so the notice and the pick cannot contradict each other.
+//! 3. **A candidate must be runnable and meaningfully bigger** — judged as the pick judges it, at
+//!    the context PM runs it at and where it would run, and [`MIN_IMPROVEMENT`] more parameters.
+//!    Comfortable and Tight count alike, as they do for the pick: a notice that also asked for no
+//!    less headroom than the model being replaced turned away the very model the pick chose.
+//! 4. **A model already on disk wins where the pick's would.** "You already have this downloaded"
+//!    is a far better suggestion than "download this", and costs the user nothing — but only for a
+//!    copy within [`MIN_IMPROVEMENT`] of the pick's download, the one the pick itself would name.
+//! 5. **Only PM's pick.** A candidate the pick below would exclude — one that fits system RAM but
+//!    not the graphics card, or one too slow for background work — is never volunteered here
+//!    either. The one download the notice will name is the pick's own: the largest eligible model,
+//!    and none at all when the user already has a copy of something within [`MIN_IMPROVEMENT`] of
+//!    it, which the pick would point at instead. When that download does not qualify, the notice
+//!    stays silent rather than naming a smaller one, so the notice and the pick cannot contradict
+//!    each other.
 //!
 //! Flag, never gate: the caller surfaces this passively and the user can always ignore it. Whether
 //! it is time to look at all is the *cadence*'s decision ([`crate::local_catalog::rescan_due`]),
@@ -72,14 +79,16 @@ pub struct Candidate {
     pub repo: String,
     pub display_name: String,
     pub parameters_b: f64,
+    /// The verdict of the config the pick would run it at ([`Judged::config`]), or `Unknown` when
+    /// there is none.
     pub verdict: fit::Verdict,
     /// Already on this machine (#449) as a copy PM's pick could itself choose — one the connected
     /// server can serve, with a runnable config of its own. The strongest kind of suggestion, since
     /// acting on it costs nothing.
     pub on_disk: bool,
-    /// What it would occupy, from its own `FitResult`. `None` when it could not be sized — which
-    /// [`is_runnable`] already excludes, so in practice this is `Some` for anything that survives to
-    /// the joint check.
+    /// What it would occupy, from the same config as `verdict`. `None` when there is no config —
+    /// which [`is_runnable`] already excludes, so in practice this is `Some` for anything that
+    /// survives to the joint check.
     pub footprint_gb: Option<f64>,
     /// The pick could choose it: [`judge`] found a config that runs where it should and Ollama can
     /// fetch it. `false` keeps it out of [`suggest`] — rule 5 above.
@@ -96,8 +105,8 @@ pub struct Candidate {
 pub struct Beside {
     /// The footprint of the model on the role `baseline` did not pick.
     pub footprint_gb: f64,
-    /// The budget the pair has to fit inside — [`fit::ram_budget_gb`], the same one the candidate's
-    /// own verdict was computed against.
+    /// The budget the pair has to fit inside — [`fit::ram_budget_gb`], the one every config the pick
+    /// judges has to fit as well, wherever it runs.
     pub budget_gb: f64,
 }
 
@@ -123,41 +132,56 @@ pub fn baseline<'a>(assigned: impl IntoIterator<Item = &'a Candidate>) -> Option
 
 /// The model worth suggesting over `current`, if any.
 ///
-/// `candidates` is every scored curated model; the caller marks the ones already on disk. Ties break
-/// toward a model already downloaded, then toward the larger one, then by repo so the choice is
-/// stable across calls (a suggestion that flickers between two equals is its own kind of noise).
+/// `candidates` is every scored curated model, judged as the pick judges it; the caller marks the
+/// ones already on disk. It names what the pick names (rule 5): the pick's download, or the copy the
+/// user already has within [`MIN_IMPROVEMENT`] of it, the larger of those and then by repo so the
+/// choice is stable across calls (a suggestion that flickers between two equals is its own kind of
+/// noise) — and only when that is worth interrupting for.
 pub fn suggest(
     current: Option<&Candidate>,
     candidates: &[Candidate],
     beside: Option<Beside>,
 ) -> Option<Suggestion> {
+    // The baseline need not be one PM would run here: the comparison reads only its size and what it
+    // shares the machine with. A model that does not fit the card at the context PM sizes for (Phi-3.5
+    // mini's full-width cache on the dev laptop) is the user's strongest reason to hear about one that
+    // does, and silencing the notice for it left the pick card offering a 12B with nothing above it.
     let current = current?;
-    // A baseline we couldn't score is not a baseline — no honest comparison exists.
-    if !is_runnable(current.verdict) {
-        return None;
-    }
-    candidates
-        .iter()
-        .filter(|c| c.repo != current.repo)
-        .filter(|c| c.pick_eligible)
-        .filter(|c| is_runnable(c.verdict))
-        // No worse a fit than what's already running — a bigger model that only fits at a halved
-        // context is not an upgrade.
-        .filter(|c| rank(c.verdict) <= rank(current.verdict))
-        .filter(|c| c.parameters_b >= current.parameters_b * MIN_IMPROVEMENT)
-        .filter(|c| fits_beside(c, beside))
-        .max_by(|a, b| {
-            a.on_disk
-                .cmp(&b.on_disk)
-                .then(a.parameters_b.total_cmp(&b.parameters_b))
-                .then_with(|| b.repo.cmp(&a.repo))
-        })
-        .map(|best| Suggestion {
-            repo: best.repo.clone(),
-            display_name: best.display_name.clone(),
-            replaces: current.display_name.clone(),
-            already_downloaded: best.on_disk,
-        })
+    // Everything the pick could choose. A bigger model that only fits at a halved context is not an
+    // upgrade, and `is_runnable` already says so.
+    let eligible = || {
+        candidates
+            .iter()
+            .filter(|c| c.pick_eligible && is_runnable(c.verdict))
+    };
+    let larger = |a: &&Candidate, b: &&Candidate| {
+        a.parameters_b
+            .total_cmp(&b.parameters_b)
+            .then_with(|| b.repo.cmp(&a.repo))
+    };
+    let worth = |c: &&Candidate| {
+        c.repo != current.repo
+            && c.parameters_b >= current.parameters_b * MIN_IMPROVEMENT
+            && fits_beside(c, beside)
+    };
+    // What the pick names: the largest eligible model, ties to the lower repo, exactly as [`pick`]
+    // orders them — unless the user has a copy within 15% of it, which the pick would point at
+    // instead (its rule 4). Only then is a copy named. A copy that is larger than the user's model
+    // but well short of the pick's download used to win here, so the notice said "Qwen3.5 9B is
+    // already on this device" directly above a pick card offering gemma 4 12b.
+    let named = eligible().max_by(larger).map(|top| {
+        candidates
+            .iter()
+            .filter(|c| c.on_disk && c.parameters_b * MIN_IMPROVEMENT > top.parameters_b)
+            .max_by(larger)
+            .unwrap_or(top)
+    });
+    named.filter(worth).map(|best| Suggestion {
+        repo: best.repo.clone(),
+        display_name: best.display_name.clone(),
+        replaces: current.display_name.clone(),
+        already_downloaded: best.on_disk,
+    })
 }
 
 /// Whether a candidate still fits once the OTHER role's model is on the machine too.
@@ -538,16 +562,6 @@ pub fn pick(basis: PickBasis, catalogue: &[CatalogueOption], owned: &[OwnedOptio
     }
 }
 
-fn rank(v: fit::Verdict) -> u8 {
-    match v {
-        fit::Verdict::Comfortable => 0,
-        fit::Verdict::Tight => 1,
-        fit::Verdict::HalvedContext => 2,
-        fit::Verdict::StayOnCloud => 3,
-        fit::Verdict::Unknown => 4,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bigger_model_with_a_worse_fit_is_not_an_upgrade() {
+    fn a_bigger_model_that_only_fits_at_a_halved_context_is_not_an_upgrade() {
         let current = cand("small", 7.0, fit::Verdict::Comfortable, false);
         // Bigger, but only at a halved context, or not at all — neither is worth volunteering.
         let pool = vec![
@@ -610,28 +624,101 @@ mod tests {
         ];
         assert_eq!(suggest(Some(&current), &pool, None), None);
 
-        // A tight fit is still a fit — but only when the current model isn't already comfortable.
-        let tight_current = cand("small", 7.0, fit::Verdict::Tight, false);
+        // A tight fit is a fit, whatever headroom the current model has: the pick ranks the two
+        // alike. Asking for no less headroom than the model being replaced turned away the pick
+        // itself — a Tight gemma 4 26B on a machine where a 2B ran comfortably — and the notice
+        // named a smaller model directly above the pick card.
         let pool = vec![cand("bigger", 14.0, fit::Verdict::Tight, false)];
+        assert_eq!(suggest(Some(&current), &pool, None).unwrap().repo, "bigger");
+        let tight_current = cand("small", 7.0, fit::Verdict::Tight, false);
         assert!(suggest(Some(&tight_current), &pool, None).is_some());
-        assert_eq!(suggest(Some(&current), &pool, None), None);
     }
 
     #[test]
-    fn a_model_already_on_disk_wins_over_a_bigger_download() {
+    fn the_only_download_the_notice_names_is_the_picks_own() {
+        // The pick names the largest eligible model. When that one does not fit beside the other
+        // role's model, naming the next one down would put a second download above the pick card,
+        // so the notice keeps quiet instead.
         let current = cand("small", 7.0, fit::Verdict::Comfortable, false);
         let pool = vec![
-            cand("downloaded", 14.0, fit::Verdict::Comfortable, true),
-            cand(
-                "bigger-but-not-here",
-                32.0,
-                fit::Verdict::Comfortable,
-                false,
-            ),
+            cand("mid", 14.0, fit::Verdict::Comfortable, false),
+            cand("big", 32.0, fit::Verdict::Tight, false),
+        ];
+        assert_eq!(suggest(Some(&current), &pool, None).unwrap().repo, "big");
+        let tight = Beside {
+            footprint_gb: 6.0,
+            budget_gb: 30.0,
+        };
+        assert_eq!(suggest(Some(&current), &pool, Some(tight)), None);
+        let roomy = Beside {
+            footprint_gb: 6.0,
+            budget_gb: 40.0,
+        };
+        assert_eq!(
+            suggest(Some(&current), &pool, Some(roomy)).unwrap().repo,
+            "big"
+        );
+    }
+
+    #[test]
+    fn a_copy_within_fifteen_percent_of_the_download_is_what_the_pick_would_use() {
+        // The user has an 11B, too close to the 10B they run to be worth a notice, and within 15%
+        // of the 12B download — so PM's pick is the 11B they have, not the download. Naming the
+        // download here would contradict the pick card.
+        let current = cand("ten", 10.0, fit::Verdict::Comfortable, false);
+        let download = cand("twelve", 12.0, fit::Verdict::Comfortable, false);
+        let have = cand("eleven", 11.0, fit::Verdict::Comfortable, true);
+        assert_eq!(
+            suggest(Some(&current), &[download.clone(), have], None),
+            None
+        );
+        let p = pick(
+            PickBasis::Gpu,
+            &[option("twelve", 12.0, true)],
+            &[owned("eleven", 11.0, true, false)],
+        );
+        assert!(matches!(p, Pick::Owned { .. }), "{p:?}");
+
+        // Without that copy, the download is the pick and the notice names it.
+        assert_eq!(
+            suggest(Some(&current), &[download], None).unwrap().repo,
+            "twelve"
+        );
+    }
+
+    #[test]
+    fn a_copy_on_disk_wins_only_where_the_pick_would_name_it() {
+        let current = cand("small", 7.0, fit::Verdict::Comfortable, false);
+        // Within 15% of the download, the copy is the pick, and it costs nothing to act on.
+        let pool = vec![
+            cand("downloaded", 14.5, fit::Verdict::Comfortable, true),
+            cand("download", 16.0, fit::Verdict::Comfortable, false),
         ];
         let s = suggest(Some(&current), &pool, None).unwrap();
         assert_eq!(s.repo, "downloaded");
         assert!(s.already_downloaded, "costs the user nothing to act on");
+        let p = pick(
+            PickBasis::Gpu,
+            &[option("download", 16.0, true)],
+            &[owned("downloaded", 14.5, true, false)],
+        );
+        assert!(matches!(p, Pick::Owned { .. }), "{p:?}");
+
+        // Well short of it, the pick is the download, so the notice names the download too. Naming
+        // the copy put "already on this device" above a pick card offering a bigger model.
+        let pool = vec![
+            cand("downloaded", 14.0, fit::Verdict::Comfortable, true),
+            cand("download", 32.0, fit::Verdict::Comfortable, false),
+        ];
+        let s = suggest(Some(&current), &pool, None).unwrap();
+        assert_eq!(s.repo, "download");
+        assert!(!s.already_downloaded);
+        let p = pick(
+            PickBasis::Gpu,
+            &[option("download", 32.0, true)],
+            &[owned("downloaded", 14.0, true, false)],
+        );
+        assert!(matches!(p, Pick::Catalogue { .. }), "{p:?}");
     }
 
     #[test]
@@ -642,11 +729,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unscoreable_current_model_yields_no_comparison() {
-        // If we can't say how well what they run fits, we can't honestly say something fits better.
-        let current = cand("mystery", 7.0, fit::Verdict::Unknown, false);
-        let pool = vec![cand("big", 70.0, fit::Verdict::Comfortable, false)];
-        assert_eq!(suggest(Some(&current), &pool, None), None);
+    fn a_model_pm_would_not_run_here_still_hears_about_the_pick() {
+        // Phi-3.5 mini's full-width cache does not fit the dev laptop's card at 32k, so it has no
+        // config the pick would run. The comparison needs only its size, and a model that does fit
+        // is the news its user most needs: staying silent left the pick card alone offering a 12B.
+        let current = cand("phi", 3.82, fit::Verdict::Unknown, false);
+        let pool = vec![cand("big", 11.91, fit::Verdict::Tight, false)];
+        assert_eq!(suggest(Some(&current), &pool, None).unwrap().repo, "big");
     }
 
     #[test]

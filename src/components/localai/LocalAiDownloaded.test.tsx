@@ -11,7 +11,7 @@
 // The last suite covers what that framing MISSED: the list being empty is not the same as having
 // nothing downloaded, and a folder PM cannot read is not a folder that is absent.
 
-import { render } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
 import { DownloadedModels } from "./LocalAiDownloaded";
@@ -240,7 +240,72 @@ describe("each model says how to get it served", () => {
       "To use it here: It's a file on this computer. llama-server can serve it as it is:",
     );
     expect(container.querySelector("code")?.textContent).toBe(
-      'llama-server -m "/models/gemma-3-4b-it-Q4_K_M.gguf" --ctx-size 8192',
+      'llama-server -m "/models/gemma-3-4b-it-Q4_K_M.gguf" --ctx-size 8192 -np 1',
+    );
+  });
+
+  it("words each file for the server PM is really connected to, not just for being connected", () => {
+    // The list holds every runner's unserved files whatever is connected — only PM's pick is limited
+    // to the connected runner's. So "the Ollama PM is connected to isn't serving it" is said only
+    // while that is this computer's Ollama, and "PM sees it" of an LM Studio file only while LM
+    // Studio is the server; a file another runner holds says what PM is connected to instead.
+    const OLLAMA_FILE: LocalOnDiskModel = {
+      ...MODEL,
+      name: "llama3.2:3b",
+      source: "ollama",
+      path: "/home/u/.ollama/models/manifests/registry.ollama.ai/library/llama3.2/3b",
+    };
+    const say = (model: LocalOnDiskModel, baseUrl: string, answered = true) => {
+      const { container } = render(
+        <DownloadedModels
+          recs={recs({
+            on_disk: [model],
+            disk_sources_present: [model.source],
+            // The connected server answered, serving one other model.
+            endpoint_inventory: answered ? 1 : null,
+          })}
+          configured
+          baseUrl={baseUrl}
+          onPickFolder={noop}
+          onClearFolder={noop}
+        />,
+      );
+      const text = container.textContent ?? "";
+      cleanup();
+      return text;
+    };
+
+    // Connected to LM Studio, with an Ollama download LM Studio doesn't serve.
+    const onLms = say(OLLAMA_FILE, "http://127.0.0.1:1234");
+    expect(onLms).toContain(
+      "To use it here: It's in Ollama's folder on this computer, but PM is connected to LM Studio — once this computer's Ollama is connected instead, it shows up by itself.",
+    );
+    expect(onLms).not.toContain("the Ollama PM is connected to");
+    // Connected to this computer's Ollama: it is that server that isn't serving it.
+    expect(say(OLLAMA_FILE, "http://127.0.0.1:11434")).toContain(
+      "To use it here: It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else.",
+    );
+
+    // Connected to Ollama, with an LM Studio download: PM won't see it there, so it says what to do.
+    const onOllama = say(MODEL, "http://127.0.0.1:11434");
+    expect(onOllama).toContain(
+      "To use it here: It's in LM Studio, but PM is connected to Ollama. To use it, load it in LM Studio, switch LM Studio's server on and connect PM to that instead.",
+    );
+    expect(onOllama).not.toContain("Load it there — PM sees it");
+    // Connected to LM Studio itself: load it, and PM sees it.
+    expect(say(MODEL, "http://127.0.0.1:1234")).toContain(
+      "To use it here: It's in LM Studio. Load it there — PM sees it within about half a minute.",
+    );
+
+    // The file's own server is connected but didn't answer: every file of its runner is listed then,
+    // so PM says what it knows — it isn't answering — rather than that it isn't serving this one.
+    const down = say(OLLAMA_FILE, "http://127.0.0.1:11434", false);
+    expect(down).toContain(
+      "To use it here: It's in Ollama's folder on this computer, and the Ollama PM is connected to isn't answering — once it's running, this shows up by itself.",
+    );
+    expect(down).not.toContain("isn't serving it");
+    expect(say(MODEL, "http://127.0.0.1:1234", false)).toContain(
+      "switch LM Studio's server on — PM sees it within about half a minute.",
     );
   });
 

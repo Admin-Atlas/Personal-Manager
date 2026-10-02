@@ -264,16 +264,20 @@ const served = (...ids: string[]): LocalServedModel[] =>
   ids.map((id) => ({ id, embedding: false }));
 
 /** A served model's row. `measured`: its figures are for the user's own file at the context the
- *  server serves — an Ollama tag's real size — rather than the catalogue's guess at them. */
+ *  server serves — an Ollama tag's real size — rather than the catalogue's guess at them.
+ *  `spills_gpu`: the backend showed it doesn't fit the card — the only ground for "runs from system
+ *  memory". */
 const installed = (
   id: string,
   over: Partial<LocalFitResult> = {},
   measured = true,
-): LocalInstalledModel & { measured: boolean } => ({
+  spills_gpu = false,
+): LocalInstalledModel => ({
   id,
   matched_repo: QWEN,
   fit: fit(over),
   measured,
+  spills_gpu,
 });
 
 /** PM's pick as a model the user already has. */
@@ -505,24 +509,27 @@ describe("standing — where the user stands, first match wins", () => {
         background_routing: "local-then-cloud",
       }),
       served: served("big:70b"),
-      // A row the backend can send: "system" only ever comes from a catalogue match, and the claim
-      // only from a measured one.
-      recs: recs({ installed: [installed("big:70b", { speed_basis: "system" })] }),
+      // A row the backend can send: a measured file over the card, which the backend marks as
+      // spilling — the only row the claim is made of.
+      recs: recs({ installed: [installed("big:70b", { speed_basis: "system" }, true, true)] }),
       status: routes(
         { effective: "cloud_for_power", cloud_key: "present", route: "cloud" },
         { effective: "unknown", cloud_key: "unreadable" },
       ),
     });
     expect(standing(i)).toBe(
-      "Chat runs on big:70b, on this computer, with your cloud model as a fallback. Background work runs on gone:7b, on this computer. On battery, chat is on your cloud model for now. Your server isn't serving gone:7b right now. big:70b is larger than your graphics card's memory, so it runs from system memory — expect slow replies. PM can't read your saved keys right now, so it can't say whether background work would fall back to the cloud.",
+      "Chat runs on big:70b, on this computer, with your cloud model as a fallback. Background work runs on gone:7b, on this computer. On battery, chat is on your cloud model for now. Your server isn't serving gone:7b right now. big:70b runs at least partly from system memory rather than your graphics card — expect slow replies. PM can't read your saved keys right now, so it can't say whether background work would fall back to the cloud.",
     );
   });
 
-  it("says a model runs from system memory only from the user's own file", () => {
-    // The dev laptop on LM Studio, serving its own Q4_K_M of Qwen 7B, which fits the card. LM Studio
-    // has no /api/tags, so the row is the catalogue's guess — Q8_0 at 10 GB, because 20 GB is free —
-    // and the pick, judged against the card, is that same model.
-    const lms = (pick: LocalPick, measured: boolean) =>
+  it("says a model runs from system memory only when PM can show it doesn't fit the card", () => {
+    // The row's own sizing can't carry the claim. LM Studio has no /api/tags, so its row is the
+    // catalogue's guess — Q8_0 at 10 GB, because 20 GB is free — for a Q4_K_M that fits the card.
+    // And a measured row is sized f16 first, high by design: the dev laptop serving Qwen2.5 7B Q6_K
+    // at a proven 32768 comes to 8.07 GB on f16, over its 7.96 GB card, and 7.25 GB on the card on
+    // the q8_0 cache PM's own tuning says to set. Only `spills_gpu` — the server holding less of it on
+    // the card than its size, or the file over the whole card even on q8_0 — says it.
+    const say = (pick: LocalPick, measured: boolean, spills: boolean, card = true) =>
       standing({
         ...both("qwen2.5-7b-instruct", "local_only"),
         config: cfg({
@@ -533,25 +540,36 @@ describe("standing — where the user stands, first match wins", () => {
           background_routing: "local",
         }),
         recs: recs({
+          ...(card ? {} : { hardware: { ...recs().hardware, vram_gb: null } }),
           pick,
           installed: [
             installed(
               "qwen2.5-7b-instruct",
               { quant: "Q8_0", est_memory_gb: 10.04, speed_basis: "system" },
               measured,
+              spills,
             ),
           ],
         }),
       });
     const clean =
       "Chat and background work run on qwen2.5-7b-instruct, on this computer, and never use the cloud.";
-    expect(lms(catalogue(), false)).toBe(clean);
-    // Measured or not, never of the pick itself: the card beside it says it fits on the card.
+    expect(say(catalogue(), false, false)).toBe(clean);
+    expect(say(catalogue(), true, false)).toBe(clean);
+    // Shown to spill, it is said.
+    expect(say(catalogue(), true, true)).toBe(
+      `${clean} qwen2.5-7b-instruct runs at least partly from system memory rather than your graphics card — expect slow replies.`,
+    );
+    // Never of the pick itself, which was judged against the card — the card beside it says it fits.
     expect(
-      lms(ownedPick({ id: "qwen2.5-7b-instruct", served: true, source: null, path: null }), true),
+      say(
+        ownedPick({ id: "qwen2.5-7b-instruct", served: true, source: null, path: null }),
+        true,
+        true,
+      ),
     ).toBe(clean);
-    // A measured file that really is larger than the card is still said.
-    expect(lms(catalogue(), true)).toContain("runs from system memory — expect slow replies");
+    // And never without a separate card to spill off.
+    expect(say(catalogue(), true, true, false)).toBe(clean);
   });
 });
 
@@ -737,7 +755,7 @@ describe("steps — four, in order, with at most one next", () => {
     );
     const llama = on("http://127.0.0.1:8080");
     expect(llama.command).toBe(
-      `llama-server -hf ${QWEN}:Q5_K_M --ctx-size 32768 -fa on -ctk q8_0 -ctv q8_0`,
+      `llama-server -hf ${QWEN}:Q5_K_M --ctx-size 32768 -np 1 -fa on -ctk q8_0 -ctv q8_0`,
     );
     const other = on("http://127.0.0.1:9000");
     expect(other.line).toBe(
@@ -859,10 +877,20 @@ describe("steps — four, in order, with at most one next", () => {
   });
 
   it("step 2 says how to serve a pick that is a file on this computer", () => {
+    // A file on disk is an owned option only for a server that could serve it (local_ai.rs
+    // `runner_can_serve`): Ollama's folder for Ollama, LM Studio's for LM Studio, any other file for
+    // llama-server — each on its own port on this computer. So that is the endpoint step 2 sees.
+    const SERVER: Record<LocalDiskSource, string> = {
+      ollama: "http://127.0.0.1:11434",
+      lm_studio: "http://127.0.0.1:1234",
+      hugging_face: "http://127.0.0.1:8080",
+      folder: "http://127.0.0.1:8080",
+    };
     const disk = (source: LocalDiskSource, path: string, shards = 1) =>
       steps(
         input({
           served: [],
+          config: cfg({ base_url: SERVER[source] }),
           recs: recs({
             pick: {
               kind: "owned",
@@ -882,7 +910,7 @@ describe("steps — four, in order, with at most one next", () => {
       )[1];
     expect(disk("hugging_face", "/m/q.gguf")).toMatchObject({
       line: "It's a file on this computer. llama-server can serve it as it is:",
-      command: 'llama-server -m "/m/q.gguf" --ctx-size 32768 -fa on -ctk q8_0 -ctv q8_0',
+      command: 'llama-server -m "/m/q.gguf" --ctx-size 32768 -np 1 -fa on -ctk q8_0 -ctv q8_0',
     });
     // A path PM can't quote gets no command rather than one that breaks.
     expect(disk("folder", '/m/"odd".gguf').command).toBeNull();
@@ -909,8 +937,79 @@ describe("steps — four, in order, with at most one next", () => {
     expect(onDiskHow("lm_studio", 1, "/m/q.gguf", f).line).toBe(
       "It's in LM Studio. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
     );
-    expect(onDiskHow("ollama", 1, "/m/blobs", f, true).line).not.toContain(
+    expect(onDiskHow("ollama", 1, "/m/blobs", f, "http://127.0.0.1:11434").line).not.toContain(
       "once Ollama is connected",
+    );
+  });
+
+  it("words a file for the server PM is really connected to, which may be another runner's", () => {
+    // Already on this device lists every runner's unserved files whatever is connected — only PM's
+    // pick is limited to the connected runner's (local_ai.rs `runner_can_serve`). So "the Ollama PM
+    // is connected to" is said only while that is this computer's Ollama, and "PM sees it" of an LM
+    // Studio file only while LM Studio is the server.
+    const f = fit();
+    const ollama = (url: string | null) => onDiskHow("ollama", 1, "/m/blobs", f, url).line;
+    const lms = (url: string | null) => onDiskHow("lm_studio", 1, "/m/q.gguf", f, url).line;
+    const CONNECTED_OLLAMA =
+      "It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else.";
+    const CONNECTED_LMS =
+      "It's in LM Studio. Load it there — PM sees it within about half a minute.";
+
+    // Its own runner, on this computer: the connected words.
+    expect(ollama("http://127.0.0.1:11434")).toBe(CONNECTED_OLLAMA);
+    expect(ollama("http://localhost:11434")).toBe(CONNECTED_OLLAMA);
+    expect(lms("http://127.0.0.1:1234")).toBe(CONNECTED_LMS);
+
+    // Another runner: says which, and what using the file would take.
+    expect(ollama("http://127.0.0.1:1234")).toBe(
+      "It's in Ollama's folder on this computer, but PM is connected to LM Studio — once this computer's Ollama is connected instead, it shows up by itself.",
+    );
+    expect(ollama("http://127.0.0.1:8080")).toBe(
+      "It's in Ollama's folder on this computer, but PM is connected to llama-server — once this computer's Ollama is connected instead, it shows up by itself.",
+    );
+    expect(lms("http://127.0.0.1:11434")).toBe(
+      "It's in LM Studio, but PM is connected to Ollama. To use it, load it in LM Studio, switch LM Studio's server on and connect PM to that instead.",
+    );
+    // The same runner somewhere else is not this computer's.
+    expect(ollama("http://192.168.1.20:11434")).toBe(
+      "It's in Ollama's folder on this computer, but PM is connected to the Ollama on your model server — once this computer's Ollama is connected instead, it shows up by itself.",
+    );
+    // A port PM doesn't know is no runner's own.
+    expect(lms("http://127.0.0.1:9000")).toBe(
+      "It's in LM Studio, but PM is connected to a server that isn't LM Studio on its usual port (1234). To use it, load it in LM Studio, switch LM Studio's server on and connect PM to that instead.",
+    );
+    for (const url of [
+      "http://127.0.0.1:1234",
+      "http://127.0.0.1:8080",
+      "http://192.168.1.20:11434",
+    ])
+      expect(ollama(url)).not.toBe(CONNECTED_OLLAMA);
+    for (const url of [
+      "http://127.0.0.1:11434",
+      "http://127.0.0.1:8080",
+      "http://192.168.1.20:1234",
+    ])
+      expect(lms(url)).not.toBe(CONNECTED_LMS);
+    // Any other file is llama-server's to serve, whatever is connected.
+    expect(onDiskHow("hugging_face", 1, "/m/q.gguf", f, "http://127.0.0.1:11434").line).toBe(
+      "It's a file on this computer. llama-server can serve it as it is:",
+    );
+  });
+
+  it("doesn't diagnose a file's own server from a look that got no answer", () => {
+    // With the connected server down, every file of its runner is listed, served or not, so
+    // "isn't serving it" would be a guess — and for LM Studio, switching the server on is the
+    // step that's missing.
+    const f = fit();
+    expect(onDiskHow("ollama", 1, "/m/blobs", f, "http://127.0.0.1:11434", false).line).toBe(
+      "It's in Ollama's folder on this computer, and the Ollama PM is connected to isn't answering — once it's running, this shows up by itself.",
+    );
+    expect(onDiskHow("lm_studio", 1, "/m/q.gguf", f, "http://127.0.0.1:1234", false).line).toBe(
+      "It's in LM Studio, and the LM Studio server PM is connected to isn't answering. Load it there and switch LM Studio's server on — PM sees it within about half a minute.",
+    );
+    // Another runner's file reads the same whether or not the connected server answered.
+    expect(onDiskHow("ollama", 1, "/m/blobs", f, "http://127.0.0.1:1234", false).line).toBe(
+      onDiskHow("ollama", 1, "/m/blobs", f, "http://127.0.0.1:1234", true).line,
     );
   });
 

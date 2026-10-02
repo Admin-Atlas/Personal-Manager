@@ -35,6 +35,7 @@ export function LocalAiDownloaded({
   recs,
   loading,
   configured,
+  baseUrl = null,
   onPickFolder,
   onClearFolder,
   error,
@@ -42,6 +43,8 @@ export function LocalAiDownloaded({
   recs: LocalRecommendations | null;
   loading: boolean;
   configured: boolean;
+  /** The stored endpoint, which decides how each file's advice is worded (`onDiskHow`). */
+  baseUrl?: string | null;
   onPickFolder: () => void;
   onClearFolder: () => void;
   /** Something in this section went wrong, said here rather than at the top of the tab. */
@@ -83,6 +86,7 @@ export function LocalAiDownloaded({
         <DownloadedModels
           recs={recs}
           configured={configured}
+          baseUrl={baseUrl}
           onPickFolder={onPickFolder}
           onClearFolder={onClearFolder}
         />
@@ -176,12 +180,16 @@ function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): ReactNode
 export function DownloadedModels({
   recs,
   configured,
+  baseUrl = null,
   onPickFolder,
   onClearFolder,
 }: {
   recs: LocalRecommendations;
   /** An endpoint is saved. Decides which half of the gating hint applies. */
   configured: boolean;
+  /** The stored endpoint. This list holds every runner's unserved files whatever is connected, so
+   *  each card words its advice against the server PM is really connected to, not just "connected". */
+  baseUrl?: string | null;
   onPickFolder: () => void;
   onClearFolder: () => void;
 }) {
@@ -226,7 +234,8 @@ export function DownloadedModels({
               <OnDiskCard
                 key={`${m.source}:${m.path}:${m.name}`}
                 model={m}
-                connected={configured}
+                baseUrl={configured ? baseUrl : null}
+                answered={recs.endpoint_inventory != null}
               />
             ))}
           </div>
@@ -241,7 +250,8 @@ export function DownloadedModels({
                   <OnDiskCard
                     key={`${m.source}:${m.path}:${m.name}`}
                     model={m}
-                    connected={configured}
+                    baseUrl={configured ? baseUrl : null}
+                    answered={recs.endpoint_inventory != null}
                   />
                 ))}
               </div>
@@ -291,12 +301,21 @@ function runsIn(fit: LocalFitResult): string {
   }
 }
 
-function OnDiskCard({ model, connected }: { model: LocalOnDiskModel; connected: boolean }) {
+function OnDiskCard({
+  model,
+  baseUrl,
+  answered,
+}: {
+  model: LocalOnDiskModel;
+  baseUrl: string | null;
+  answered: boolean;
+}) {
   const { showMeta } = useDepth();
-  // The same words the start card uses for PM's pick when it is a file on this computer.
-  // Connected or not changes the advice: an Ollama-folder file shows up by itself only once Ollama
-  // is connected, and while connected the listing has already taken out everything served.
-  const how = onDiskHow(model.source, model.shards, model.path, model.fit, connected);
+  // The same words the start card uses for PM's pick when it is a file on this computer. What is
+  // connected changes the advice: an Ollama-folder file shows up by itself only once this computer's
+  // Ollama is connected, and only that server's listing has already taken out what it serves — a
+  // file another runner holds is listed whatever PM is connected to.
+  const how = onDiskHow(model.source, model.shards, model.path, model.fit, baseUrl, answered);
   return (
     <div className="rounded-[var(--radius-sm)] border border-border px-3 py-2">
       <div className="flex flex-wrap items-baseline justify-between gap-2">

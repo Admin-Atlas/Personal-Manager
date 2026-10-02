@@ -192,6 +192,24 @@ describe("the settings PM's numbers assume", () => {
     }
   });
 
+  it("pins llama-server to one slot in every command it prints, and says why", () => {
+    // Left to itself llama-server opens four slots sharing one cache, which holds a sliding-window
+    // model's window and a hybrid model's recurrent state four times over — past the figure PM
+    // sized. One slot is what PM sizes for.
+    for (const platform of PLATFORMS) {
+      for (const pickContext of [null, 8192]) {
+        const llama = runnerGuides(platform, pickContext).find((g) => g.name === "llama-server");
+        const commands = (llama?.steps ?? []).flatMap((step) =>
+          [...step.matchAll(/`(llama-server [^`]*)`/g)].map((m) => m[1]),
+        );
+        expect(commands.length, platform).toBeGreaterThan(0);
+        for (const cmd of commands) expect(cmd, platform).toContain(" -np 1");
+        expect(llama?.steps.join(" "), platform).toMatch(/what PM sized the memory for/);
+        expect(tuningFor("llama-server", platform, pickContext)?.context).toContain("`-np 1`");
+      }
+    }
+  });
+
   it("sets the number PM sized its pick for, on every server and platform", () => {
     // The pick card says "PM sized this for an 8k context … the steps are …", and the steps it
     // pointed at said 32768 whatever the pick was. Followed, they ran the model at a context PM

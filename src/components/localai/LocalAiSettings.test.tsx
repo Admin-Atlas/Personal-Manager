@@ -376,9 +376,9 @@ describe("assigning a model to a role", () => {
     });
 
     it("refuses to call a pair that lands inside its own margin of error", async () => {
-      // The memory estimate ran +11.3% against a real load and is only claimed to +-15%. Saying
-      // "these will not both stay loaded" from inside that band would be a confident wrong warning
-      // about a setup that works — worse than the vague prose this replaced.
+      // The memory estimate ran between +1.6% and +11.4% against real loads, and is only claimed to
+      // +-15%. Saying "these will not both stay loaded" from inside that band would be a confident
+      // wrong warning about a setup that works — worse than the vague prose this replaced.
       await withCo(co({ ram: "too_close", combined_gb: 15, ram_budget_gb: 14 }));
       expect(await screen.findByText(/can't call it/i)).toBeTruthy();
       expect(screen.queryByText(/won't both stay loaded/i)).toBeNull();
@@ -874,12 +874,12 @@ describe("a split card, where the same model runs two ways", () => {
     const models = container.querySelector("#sec-localai-models") as HTMLElement;
     expect(
       within(models).getByText(
-        "llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0 --ctx-size 32768",
+        "llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q8_0 --ctx-size 32768 -np 1",
       ),
     ).toBeTruthy();
     expect(
       within(models).getByText(
-        "llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M --ctx-size 32768 -fa on -ctk q8_0 -ctv q8_0",
+        "llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M --ctx-size 32768 -np 1 -fa on -ctk q8_0 -ctv q8_0",
       ),
     ).toBeTruthy();
     // An `ollama pull` can't carry either, so the card says what to set instead.

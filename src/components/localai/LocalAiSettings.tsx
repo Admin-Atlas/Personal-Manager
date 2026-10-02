@@ -590,6 +590,7 @@ export function LocalAiSettings({
         recs={recs}
         loading={loading}
         configured={configured}
+        baseUrl={config?.base_url ?? null}
         onPickFolder={() => void pickScanFolder()}
         onClearFolder={() => void clearScanFolder()}
         error={errors.downloaded}

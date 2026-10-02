@@ -79,13 +79,15 @@ const owned = (over: Partial<Extract<LocalPick, { kind: "owned" }>> = {}): Shown
 });
 
 /** A served model's row. `measured`: its figures are for the user's own file at the context the
- *  server serves — the only rows a "runs from system memory" claim may rest on. */
+ *  server serves. `spills_gpu`: the backend showed it doesn't fit the card — the only rows a "runs
+ *  from system memory" claim may rest on. */
 const installed = (
   id: string,
   matched_repo: string | null,
   over: Partial<LocalFitResult> = {},
   measured = true,
-): LocalInstalledModel & { measured: boolean } => ({ id, matched_repo, fit: fit(over), measured });
+  spills_gpu = false,
+): LocalInstalledModel => ({ id, matched_repo, fit: fit(over), measured, spills_gpu });
 
 const nothing = (over: Partial<NothingPick> = {}): NothingPick => ({
   kind: "nothing",
@@ -407,18 +409,18 @@ describe("the lines about models the user already has", () => {
   });
 
   it("says why a model in use differs from the pick, only when it can say something true", () => {
-    // A row the backend can really send: "system" figures only ever come from a catalogue match, and
-    // only measured ones — the user's own file, at the context the server serves — describe it.
+    // A row the backend can really send: a measured file it showed doesn't fit the card (`spills_gpu`)
+    // is the only one the system-memory line is said of.
     const r = recs({
       installed: [
-        installed("big:14b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "system" }),
+        installed("big:14b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "system" }, true, true),
         installed("mystery", null),
         installed("gemma3:4b", "bartowski/gemma-3-4b-it-GGUF"),
         installed("qwen-other", QWEN),
       ],
     });
     expect(inUseLine(catalogue(), "big:14b", r)).toBe(
-      "You're using big:14b, which is larger than your graphics card's memory, so it runs from system memory. PM's pick fits on the card.",
+      "You're using big:14b, which runs at least partly from system memory rather than your graphics card, so it replies slowly. PM's pick is sized to fit on the card.",
     );
     expect(inUseLine(catalogue(), "mystery", r)).toBe(
       "You're using mystery, which isn't in PM's list, so PM can't compare the two.",
@@ -432,7 +434,7 @@ describe("the lines about models the user already has", () => {
     expect(inUseLine(catalogue(), null, r)).toBeNull();
   });
 
-  it("never says a model runs from system memory on the catalogue's guess about it", () => {
+  it("never says a model runs from system memory on the row's sizing alone", () => {
     // LM Studio and llama-server have no /api/tags, so PM can't see which file they loaded: the row
     // is the catalogue's best quant for the memory free right now (Q8_0 at 10 GB with 20 GB free),
     // while the user's own Q4_K_M sits on the card.
@@ -440,6 +442,13 @@ describe("the lines about models the user already has", () => {
       installed: [installed("qwen2.5-7b-instruct", QWEN, { speed_basis: "system" }, false)],
     });
     expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", guessed)).toBeNull();
+    // Measured is not enough either: the row is sized f16 first and high by design. The dev laptop's
+    // Qwen2.5 7B Q6_K at a proven 32768 is 8.07 GB on f16, over the 7.96 GB card, and 7.25 GB — on
+    // the card — on the q8_0 cache PM's tuning says to set. Without `spills_gpu`, nothing is said.
+    const measured = recs({
+      installed: [installed("qwen2.5-7b-instruct", QWEN, { speed_basis: "system" }, true, false)],
+    });
+    expect(inUseLine(catalogue(), "qwen2.5-7b-instruct", measured)).toBeNull();
   });
 });
 
@@ -508,7 +517,7 @@ describe("the pick card's copy keeps the tab's rules", () => {
     const out: string[] = [];
     const r = recs({
       installed: [
-        installed("big:14b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "system" }),
+        installed("big:14b", "bartowski/gemma-3-4b-it-GGUF", { speed_basis: "system" }, true, true),
         installed("mystery", null),
         installed("gemma3:4b", "bartowski/gemma-3-4b-it-GGUF"),
       ],

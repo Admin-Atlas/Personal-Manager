@@ -10,6 +10,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { HELP } from "../../lib/help";
 import { INERT_POWER_VIEW } from "../../lib/powerRoute";
 import type {
   EffectiveRoute,
@@ -33,7 +34,7 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
 }));
 
 import { LocalAiRoles } from "./LocalAiRoles";
-import { sectionLabel } from "./sections";
+import { sectionHelp, sectionLabel } from "./sections";
 
 const cfg = (over: Partial<LocalLlmConfig> = {}): LocalLlmConfig => ({
   base_url: "http://127.0.0.1:11434",
@@ -133,7 +134,7 @@ describe("each role's row", () => {
     show();
     expect(
       screen.getByText(
-        "Good for most setups with a cloud key: your own model when it can, your cloud model when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model. It's the only setting On battery can move.",
+        "Good for most setups with a cloud key: your own model when it can, your cloud model when your server can't — it isn't reachable, a reply fails or times out before anything is shown, or a request is too long for the window it gives the model. It's the only setting On battery can move.",
       ),
     ).toBeTruthy();
     expect(
@@ -164,7 +165,7 @@ describe("the line that says where a job really goes", () => {
       "Runs on tiny-chat:1b on this computer, and never uses the cloud.",
     );
     expect(line("local_then_cloud", cfg({ base_url: "http://192.168.1.20:11434" }))).toBe(
-      "Runs on tiny-chat:1b on your model server; your cloud model answers when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model.",
+      "Runs on tiny-chat:1b on your model server; your cloud model answers when your server can't — it isn't reachable, a reply fails or times out before anything is shown, or a request is too long for the window it gives the model.",
     );
   });
 
@@ -189,7 +190,7 @@ describe("the line that says where a job really goes", () => {
 
   it("adds when the server isn't serving the model the job is set to", () => {
     expect(line("local_then_cloud", cfg(), [{ id: "other-chat:3b", embedding: false }])).toBe(
-      "Runs on tiny-chat:1b on this computer; your cloud model answers when your server can't — it isn't reachable, a reply fails or times out, or a request is too long for the window it gives the model. Your server isn't serving tiny-chat:1b right now.",
+      "Runs on tiny-chat:1b on this computer; your cloud model answers when your server can't — it isn't reachable, a reply fails or times out before anything is shown, or a request is too long for the window it gives the model. Your server isn't serving tiny-chat:1b right now.",
     );
   });
 
@@ -199,13 +200,27 @@ describe("the line that says where a job really goes", () => {
   });
 
   it("never says the cloud answers only when the server is down", () => {
-    // The gateway also falls back on a running server: a reply that fails or times out, and a
-    // request longer than the window the server gives the model (a long chat on Ollama's default
-    // 4k). "Only if your server fails" told someone a long chat stayed on their computer.
+    // The gateway also falls back on a running server: a reply that fails or times out before
+    // anything of it is shown, and a request longer than the window the server gives the model (a
+    // long chat on Ollama's default 4k). "Only if your server fails" told someone a long chat stayed
+    // on their computer — and so did "only on a hard failure (an unreachable or broken server)" in
+    // the section's own fold and its help, after the role lines were fixed.
+    const NARROW =
+      /only if your server|when your server is down|only on a hard failure|unreachable or broken server/;
     show({ config: cfg({ chat_routing: "local-then-cloud" }) });
+    // The whole section, the folded "How routing & fallback work" included — a fold mounts its body.
     const text = document.body.textContent ?? "";
-    expect(text).not.toMatch(/only if your server|when your server is down/);
-    expect(text).toMatch(/a request is too long for the window it gives the model/);
+    expect(text).not.toMatch(NARROW);
+    const fold = screen.getByText(/tries local first/);
+    expect(fold.textContent).toMatch(/it isn't reachable/);
+    expect(fold.textContent).toMatch(/a reply fails or times out before anything is shown/);
+    expect(fold.textContent).toMatch(/a request is too long for the window it gives the model/);
+    // The section's help says the same three.
+    const help = HELP[sectionHelp("sec-localai-roles")].body;
+    expect(help).not.toMatch(NARROW);
+    expect(help).toMatch(/isn't reachable/);
+    expect(help).toMatch(/a reply fails or times out before anything is shown/);
+    expect(help).toMatch(/a request is too long for the window the server gives the model/);
   });
 });
 

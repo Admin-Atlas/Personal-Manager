@@ -91,7 +91,7 @@ fn client_for(base_url: &str) -> &'static reqwest::Client {
 }
 
 /// Whether the URL's host is `localhost` or a loopback IP literal — a cheap string check (no DNS).
-fn host_is_loopback_literal(base_url: &str) -> bool {
+pub(crate) fn host_is_loopback_literal(base_url: &str) -> bool {
     let after_scheme = base_url
         .split_once("://")
         .map(|(_, rest)| rest)
