@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.1-alpha",
+    date: "2026-10-07",
+    highlights: [
+      "Under-the-hood tidying: this month’s library updates in one go. The framework PM runs on moves up a version, along with its pieces for picking files, restarting PM and keeping it to a single window. A few libraries deep inside PM picked up fixes for security and reliability problems, and the tools that only run while PM is being built or tested moved up too. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.139.0-alpha",
     date: "2026-10-02",
     highlights: [

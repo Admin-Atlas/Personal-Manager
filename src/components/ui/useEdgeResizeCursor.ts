@@ -5,17 +5,27 @@
 //
 // PM runs undecorated (`decorations: false`), so Tauri synthesises the resize border itself. On
 // Windows that border is a transparent HWND answering WM_NCHITTEST, and the OS supplies the cursor
-// for free; on macOS AppKit owns it. On Linux, `tauri-runtime-wry`'s GTK path connects only
-// `connect_button_press_event` and `connect_touch_event` — it calls `begin_resize_drag` on press and
-// NEVER sets a cursor. tao carries the same gap as an acknowledged FIXME ("calling
-// begin_resize_drag uses the default cursor, it should show a resizing cursor instead"), and its own
-// hover handler sets the cursor on the toplevel GdkWindow, which the webview child masks. So
-// dragging an edge works, but nothing tells you an edge is there.
+// for free; on macOS AppKit owns it. On Linux, up to Tauri 2.11 `tauri-runtime-wry`'s GTK path
+// connected only `connect_button_press_event` and `connect_touch_event` — it called
+// `begin_resize_drag` on press and never set a cursor. tao carries the same gap as an acknowledged
+// FIXME ("calling begin_resize_drag uses the default cursor, it should show a resizing cursor
+// instead"), and its own hover handler sets the cursor on the toplevel GdkWindow, which the webview
+// child masks. So dragging an edge worked, but nothing told you an edge was there.
 //
-// The fix is CSS, deliberately: WebKit paints the cursor from its own hit test, which is the only
-// layer that can win over the webview child. We only move a class on <html>; the resize itself keeps
-// being performed by the native GTK press handler that already works. No DOM overlay, so nothing can
-// steal a click from the scrollbar thumb, the caption buttons, or a collapse tab.
+// Since Tauri 2.12 (tauri#15701, `undecorated_resizing.rs`) the GTK path also connects
+// `connect_motion_notify_event`: inside the same `5 x scale` band it sets the resize cursor on the
+// webview's own GdkWindow and returns `Propagation::Stop`, so WebKit never sees in-band motion. Its
+// press handler now returns `Stop` in the band too, so a click there starts a resize and no longer
+// reaches the page. So this hook is mostly inert: the one in-band event that still reaches it is
+// the mouse move WebKit makes from the pointer entering the window through an edge (Tauri
+// intercepts motion, not crossing events), where the two cursors can briefly alternate. It stays
+// until the Linux restored-window live test confirms the native cursor, then it is retired in a
+// follow-up.
+//
+// The fix was CSS, deliberately: WebKit paints the cursor from its own hit test, which up to 2.11
+// was the only layer that could win over the webview child. We only move a class on <html>; the
+// resize itself is performed by the native GTK press handler. No DOM overlay, so the hook itself
+// never steals a click.
 //
 // Deliberately mirrors the native hit test rather than approximating it, since a cursor that appears
 // where `begin_resize_drag` will NOT fire is worse than no cursor at all:

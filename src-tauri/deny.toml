@@ -7,26 +7,14 @@
 # silently. This is also the single source for the release NOTICE generation.
 
 [advisories]
-# Mirror src-tauri/.cargo/audit.toml: every id is a transitive, non-exploitable
-# advisory in Tauri's gtk-rs (Linux-WebKit) stack or a build-time/unicode tree —
-# PM ships Windows/macOS and never calls the affected APIs. See the 2026-06-17
-# DECISIONS glib entry; re-evaluate when Tauri adopts gtk-rs 0.20.
+# Mirror src-tauri/.cargo/audit.toml. Both ids are transitive advisories in Tauri's gtk-rs 0.18
+# (Linux WebKit) stack whose affected code PM never reaches; no fix is reachable until Tauri moves
+# to gtk 0.19 / glib 0.22 or gtk4. cargo-deny's "workspace" scope already skips transitive
+# unsound/unmaintained crates, so these record the decision (and keep `cargo audit`, which warns
+# on every crate, quiet). See the 2026-06-17 and 2026-10-07 DECISIONS entries.
 ignore = [
-  "RUSTSEC-2025-0098", # glib VariantStrIter unsound (gtk-rs stack; API never called)
-  "RUSTSEC-2024-0429", # gtk-rs bindings unsound (Linux WebKit backend only)
-  "RUSTSEC-2024-0419", # proc-macro-error unmaintained (build-time macro only)
-  "RUSTSEC-2024-0370", # unic-char-property unmaintained (transitive unicode tree)
-  "RUSTSEC-2025-0081", # unic-* unmaintained
-  "RUSTSEC-2025-0075", # unic-* unmaintained
-  "RUSTSEC-2025-0080", # unic-* unmaintained
-  "RUSTSEC-2025-0100", # unic-* unmaintained
-  # quick-xml <0.41 DoS pair — reached ONLY via plist (tauri/tauri-utils parsing
-  # PM's OWN bundle Info.plist), never untrusted/remote XML, so the attacker-XML
-  # DoS both advisories describe is unreachable. No patched version is reachable:
-  # plist 1.9.0 (latest, pinned by tauri 2.11.3) requires quick-xml ^0.39.2, and
-  # the fix is only in quick-xml >=0.41.0 — blocked until plist upstream bumps it.
-  "RUSTSEC-2026-0194", # quick-xml quadratic duplicate-attr check (untrusted XML only)
-  "RUSTSEC-2026-0195", # quick-xml NsReader unbounded namespace alloc (untrusted XML only)
+  "RUSTSEC-2024-0429", # glib 0.18 VariantStrIter unsound (gtk-rs stack; API never called)
+  "RUSTSEC-2024-0370", # proc-macro-error unmaintained (via glib-macros 0.18; build-time only)
 ]
 # Only treat unmaintained crates that are OUR direct dependencies as failures;
 # transitive-unmaintained noise (gtk-rs, etc.) is already covered above.
