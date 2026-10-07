@@ -18,6 +18,11 @@ describe("fallbackCopy", () => {
     expect(fallbackCopy("hard_failure:model_loading")).toContain("loading");
     expect(fallbackCopy("hard_failure:reply_too_large")).toContain("too large");
     expect(fallbackCopy("hard_failure:degenerate_stream")).toContain("unusable");
+    // `fail_kind_slug(&LocalFailKind::UnfinishedThought)` in llm_gateway.rs: a model that thought
+    // and never answered must not read as the generic "couldn't answer".
+    expect(fallbackCopy("hard_failure:unfinished_thought")).toBe(
+      "your local model thought without answering",
+    );
   });
 
   // The banked half of a contract whose other half is compiler-enforced. `FallbackReason::PowerPolicy`

@@ -393,6 +393,7 @@ fn fail_kind_slug(kind: &LocalFailKind) -> &'static str {
         LocalFailKind::ClientError(_) => "client_error",
         LocalFailKind::ReplyTooLarge => "reply_too_large",
         LocalFailKind::PromptTooLarge => "prompt_too_large",
+        LocalFailKind::UnfinishedThought => "unfinished_thought",
     }
 }
 
@@ -462,6 +463,105 @@ impl CallMeta {
 pub struct LlmOutcome {
     pub completion: Completion,
     pub meta: CallMeta,
+}
+
+/// A note to the chat UI about the thinking it is showing. Sent only for a send that asked to see the
+/// thinking, like the thinking itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingNote {
+    /// The local leg failed after thinking was shown, before any answer; the cloud answers instead.
+    /// The UI drops the shown thinking now — it was the local model's, not the answering one's.
+    FellBack,
+    /// Thinking was asked for, but the prompt leaves the model no room to think in a proven window,
+    /// so this turn was sent with thinking off. Sent with the local model's first answer token, so
+    /// it only ever describes a reply the local model gave ([`LocalLeg::forward`]).
+    NoRoom,
+}
+
+/// What a chat stream hands the command layer: a piece of the answer, a piece of the thinking (only
+/// when the send asked for it), or a note about that thinking.
+pub enum ChatDelta<'a> {
+    Answer(&'a str),
+    Thinking(&'a str),
+    Note(ThinkingNote),
+}
+
+/// What a failed local chat leg does next.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AfterLocalFailure {
+    Surface,
+    FallBack { drop_thinking: bool },
+}
+
+/// Thinking is not an answer: only an answer token rules the cloud out. Shown thinking is dropped
+/// (a note to the UI) before the cloud answers, so a cloud reply never sits under local thinking.
+pub(crate) fn after_local_failure(
+    answered: bool,
+    shown_thinking: bool,
+    has_cloud: bool,
+) -> AfterLocalFailure {
+    if has_cloud && !answered {
+        AfterLocalFailure::FallBack {
+            drop_thinking: shown_thinking,
+        }
+    } else {
+        AfterLocalFailure::Surface
+    }
+}
+
+/// What the local chat leg has streamed so far, and the one note it may still owe the UI.
+#[derive(Default)]
+pub(crate) struct LocalLeg {
+    /// An answer token has streamed, which rules the cloud out.
+    answered: bool,
+    /// Thinking has been shown, which a fallback must drop first.
+    shown_thinking: bool,
+    /// This turn goes with thinking off for want of room, and the UI hasn't been told yet.
+    owes_no_room: bool,
+}
+
+impl LocalLeg {
+    /// Forward one local stream delta. The [`ThinkingNote::NoRoom`] note waits for the first answer
+    /// token, because the UI reads it as "Answered without thinking" about the local model's window
+    /// — true only of a reply the local model gives. A leg that fails before answering falls back
+    /// with the note never sent, so the cloud's reply (which shows no thinking anyway) isn't blamed
+    /// on the local window. Pure, so the order is testable without a server.
+    pub(crate) fn forward<F: FnMut(ChatDelta<'_>)>(
+        &mut self,
+        delta: openai_compat::StreamDelta<'_>,
+        on_delta: &mut F,
+    ) {
+        match delta {
+            openai_compat::StreamDelta::Answer(t) => {
+                if std::mem::take(&mut self.owes_no_room) {
+                    on_delta(ChatDelta::Note(ThinkingNote::NoRoom));
+                }
+                self.answered = true;
+                on_delta(ChatDelta::Answer(t));
+            }
+            openai_compat::StreamDelta::Thinking(t) => {
+                self.shown_thinking = true;
+                on_delta(ChatDelta::Thinking(t));
+            }
+        }
+    }
+}
+
+/// Whether a prompt that already passed the normal fit gate leaves no room to think. Only a
+/// PROVEN window decides — PM never acts on its own conservative guess (same rule as the gate).
+pub(crate) fn no_room_to_think(est: i64, proven_window: Option<i64>) -> bool {
+    context_budget::thinking_prompt_ceiling(proven_window).is_some_and(|c| est > c)
+}
+
+/// Adapt a delta sink to the cloud client's `FnMut(&str)`: answers only, and an empty delta is not
+/// a token (the rule #852 set for the local arm, now on both).
+fn answers_only<'f, F: FnMut(ChatDelta<'_>)>(on_delta: &'f mut F) -> impl FnMut(&str) + 'f {
+    move |t: &str| {
+        if !t.is_empty() {
+            on_delta(ChatDelta::Answer(t))
+        }
+    }
 }
 
 /// Nudge any listening UI (the Local AI tab, the chat sidebar's provider line) to refetch
@@ -956,17 +1056,23 @@ async fn cloud_complete(
     })
 }
 
-/// Stream a chat completion through the resolved route, forwarding each token to `on_token`, and
-/// return the completion plus how it was served. The interactive chat path.
+/// Stream a chat completion through the resolved route, forwarding each answer delta to `on_delta`,
+/// and return the completion plus how it was served. The interactive chat path.
+///
+/// `show_thinking` is the chat Thinking button, read by the frontend at send time. Only a local arm
+/// reads it: there it also forwards the model's thinking and the [`ThinkingNote`]s about it. The
+/// cloud arms ignore it and forward answers only. Background work goes through [`complete`], which
+/// has no such argument, so it can never think.
 pub async fn stream_chat<F>(
     app: &AppHandle,
     plan: &RoutePlan,
     messages: &[ChatMessage],
     cache_through: Option<usize>,
-    on_token: F,
+    show_thinking: bool,
+    mut on_delta: F,
 ) -> Result<LlmOutcome>
 where
-    F: FnMut(&str),
+    F: FnMut(ChatDelta<'_>),
 {
     match plan {
         RoutePlan::Cloud(arm) => {
@@ -976,7 +1082,7 @@ where
                 &arm.models,
                 messages,
                 cache_through,
-                on_token,
+                answers_only(&mut on_delta),
             )
             .await?;
             Ok(LlmOutcome {
@@ -985,10 +1091,28 @@ where
             })
         }
         RoutePlan::LocalOnly(local) => {
-            run_local_stream(app, local, messages, cache_through, None, on_token).await
+            run_local_stream(
+                app,
+                local,
+                messages,
+                cache_through,
+                None,
+                show_thinking,
+                on_delta,
+            )
+            .await
         }
         RoutePlan::LocalThenCloud { local, cloud } => {
-            run_local_stream(app, local, messages, cache_through, Some(cloud), on_token).await
+            run_local_stream(
+                app,
+                local,
+                messages,
+                cache_through,
+                Some(cloud),
+                show_thinking,
+                on_delta,
+            )
+            .await
         }
         RoutePlan::CloudForPower {
             cloud,
@@ -1000,7 +1124,7 @@ where
                 &cloud.models,
                 messages,
                 cache_through,
-                on_token,
+                answers_only(&mut on_delta),
             )
             .await?;
             Ok(LlmOutcome {
@@ -1016,18 +1140,20 @@ where
 }
 
 /// The local arm of [`stream_chat`]: chat is FOREGROUND, so it preempts any in-flight background
-/// local call and is never itself preempted. Falls back to cloud ONLY before the first token — once
-/// content has streamed, a mid-stream failure is surfaced as an error, never silently reissued.
+/// local call and is never itself preempted. Falls back to cloud only before the first ANSWER token.
+/// Thinking is not an answer, and if it was shown a `FellBack` note drops it first. Once an answer
+/// has streamed, a mid-stream failure is surfaced as an error, never silently reissued.
 async fn run_local_stream<F>(
     app: &AppHandle,
     local: &LocalArm,
     messages: &[ChatMessage],
     cache_through: Option<usize>,
     cloud: Option<&CloudArm>,
-    mut on_token: F,
+    show_thinking: bool,
+    mut on_delta: F,
 ) -> Result<LlmOutcome>
 where
-    F: FnMut(&str),
+    F: FnMut(ChatDelta<'_>),
 {
     let state = app.state::<AppState>();
     let rt = &state.local_ai;
@@ -1039,7 +1165,7 @@ where
                     cloud,
                     messages,
                     cache_through,
-                    on_token,
+                    on_delta,
                     FallbackReason::Cooldown,
                     local.model.clone(),
                 )
@@ -1058,7 +1184,7 @@ where
                     cloud,
                     messages,
                     cache_through,
-                    on_token,
+                    on_delta,
                     FallbackReason::EndpointRefused,
                     local.model.clone(),
                 )
@@ -1090,7 +1216,7 @@ where
                     cloud,
                     messages,
                     cache_through,
-                    on_token,
+                    on_delta,
                     FallbackReason::HardFailure(failure.kind),
                     local.model.clone(),
                 )
@@ -1100,12 +1226,27 @@ where
         };
     }
 
-    let start = Instant::now();
-    let mut first = false;
     let token = local.token.as_ref().map(Secret::expose);
+
+    // Asked to think, but this prompt leaves no room for it in the window the server proved. On a
+    // Switchable Ollama the turn goes with thinking off and the UI says so (once the local model
+    // answers: `LocalLeg::forward`): an overflow mid-thought would context-shift the system prompt
+    // (and its SECURITY paragraph) away, or end in a reply with no answer. Elsewhere PM can't
+    // switch thinking off, so the turn goes as it is (residual).
+    let mut leg = LocalLeg::default();
+    if show_thinking {
+        let (window, proven) = sizing_window(rt, local);
+        let est =
+            context_budget::est_messages_tokens_upper(messages.iter().map(|m| m.content.as_str()));
+        leg.owes_no_room = no_room_to_think(est, proven.then_some(window))
+            && openai_compat::takes_thinking_off(&local.base_url, &local.model, token).await;
+    }
+    let want_thinking = show_thinking && !leg.owes_no_room;
+
+    let start = Instant::now();
     let local_result = {
-        let first = &mut first;
-        let on_token = &mut on_token;
+        let leg = &mut leg;
+        let on_delta = &mut on_delta;
         // Same rule as the background arm: marked before the request, so a load PM caused but never
         // got an answer from is still PM's to release.
         rt.mark_pm_loaded(&local.base_url, &local.model);
@@ -1114,10 +1255,8 @@ where
             &local.model,
             token,
             messages,
-            |t: &str| {
-                *first = true;
-                on_token(t);
-            },
+            want_thinking,
+            |delta| leg.forward(delta, on_delta),
         );
         rt.slot.run_foreground(attempt).await
     };
@@ -1143,37 +1282,44 @@ where
         Err(failure) => {
             rt.record(CallOutcome::for_failure(&failure.kind));
             ping_status(app);
-            match cloud {
-                // Nothing shown yet — a clean fallback to cloud is safe.
-                Some(cloud) if !first => {
+            match (
+                after_local_failure(leg.answered, leg.shown_thinking, cloud.is_some()),
+                cloud,
+            ) {
+                // No answer shown yet — a fallback to cloud is safe, once any shown thinking is gone.
+                (AfterLocalFailure::FallBack { drop_thinking }, Some(cloud)) => {
+                    if drop_thinking {
+                        on_delta(ChatDelta::Note(ThinkingNote::FellBack));
+                    }
                     cloud_stream(
                         cloud,
                         messages,
                         cache_through,
-                        on_token,
+                        on_delta,
                         FallbackReason::HardFailure(failure.kind),
                         local.model.clone(),
                     )
                     .await
                 }
-                // Local-only, or the local leg already streamed content: surface the failure.
+                // Local-only, or the local leg already streamed an answer: surface the failure.
                 _ => Err(local_failure_to_error(&failure)),
             }
         }
     }
 }
 
-/// A cloud stream tagged as a FALLBACK (records the reason + the local model it displaced).
+/// A cloud stream tagged as a FALLBACK (records the reason + the local model it displaced). Answers
+/// only: the cloud arm shows no thinking.
 async fn cloud_stream<F>(
     cloud: &CloudArm,
     messages: &[ChatMessage],
     cache_through: Option<usize>,
-    on_token: F,
+    mut on_delta: F,
     reason: FallbackReason,
     displaced: String,
 ) -> Result<LlmOutcome>
 where
-    F: FnMut(&str),
+    F: FnMut(ChatDelta<'_>),
 {
     let start = Instant::now();
     let completion = openrouter::stream_chat(
@@ -1181,7 +1327,7 @@ where
         &cloud.models,
         messages,
         cache_through,
-        on_token,
+        answers_only(&mut on_delta),
     )
     .await?;
     Ok(LlmOutcome {
@@ -1384,6 +1530,7 @@ pub(crate) fn local_failure_to_error(failure: &LocalFailure) -> Error {
         LocalFailKind::PromptTooLarge => {
             "this job needs more context than your local server is serving, so PM didn't send it"
         }
+        LocalFailKind::UnfinishedThought => "the local model thought but never answered",
     };
     // For a server that ANSWERED (a bad request / a 5xx), surface its own words — it's the user's own
     // local server, so echoing its message is safe and the fastest way to diagnose a bad model id.
@@ -1397,6 +1544,9 @@ pub(crate) fn local_failure_to_error(failure: &LocalFailure) -> Error {
         // The two numbers and the setting that changes them ARE the fix here, so the detail is the
         // whole point of the message rather than a diagnostic appended to it.
         | LocalFailKind::PromptTooLarge
+        // Which bound stopped the thought, and the one thing to change: the detail is the diagnosis
+        // and the hint.
+        | LocalFailKind::UnfinishedThought
             if !detail.is_empty() =>
         {
             format!("{base} ({})", crate::error::truncate_detail(detail))
@@ -1607,6 +1757,159 @@ mod tests {
             fail_kind_slug(&LocalFailKind::PromptTooLarge),
             "prompt_too_large"
         );
+    }
+
+    /// Thinking is not an answer: the two rows where no answer streamed and a cloud is configured
+    /// fall back, and the shown thinking is dropped exactly when there was some. Nothing else does.
+    #[test]
+    fn only_an_answer_rules_out_the_cloud_and_shown_thinking_is_dropped_first() {
+        use AfterLocalFailure::{FallBack, Surface};
+        // (answered, shown_thinking, has_cloud) → what happens next.
+        for (answered, shown_thinking, has_cloud, next) in [
+            (false, false, false, Surface),
+            (false, true, false, Surface),
+            (true, false, false, Surface),
+            (true, true, false, Surface),
+            (
+                false,
+                false,
+                true,
+                FallBack {
+                    drop_thinking: false,
+                },
+            ),
+            // A failure mid-thought still falls back, and the thinking goes first.
+            (
+                false,
+                true,
+                true,
+                FallBack {
+                    drop_thinking: true,
+                },
+            ),
+            // An answer has started: the reply is never silently reissued.
+            (true, false, true, Surface),
+            (true, true, true, Surface),
+        ] {
+            assert_eq!(
+                after_local_failure(answered, shown_thinking, has_cloud),
+                next,
+                "answered={answered} shown_thinking={shown_thinking} has_cloud={has_cloud}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_proven_window_can_leave_no_room_to_think() {
+        // PM never acts on its own conservative guess.
+        assert!(!no_room_to_think(1_000_000, None));
+        // 4096 proven: the thinking ceiling is 2048.
+        assert!(!no_room_to_think(2000, Some(4096)));
+        assert!(
+            !no_room_to_think(2048, Some(4096)),
+            "at the ceiling still fits"
+        );
+        assert!(no_room_to_think(2049, Some(4096)));
+        // 32768 proven: 29696.
+        assert!(!no_room_to_think(29_696, Some(32768)));
+        assert!(no_room_to_think(29_697, Some(32768)));
+    }
+
+    #[test]
+    fn a_thought_with_no_answer_reads_as_one_and_carries_its_hint() {
+        assert_eq!(
+            fail_kind_slug(&LocalFailKind::UnfinishedThought),
+            "unfinished_thought"
+        );
+        let detail = openai_compat::ThoughtStop::TooLong.detail(true);
+        let msg = local_failure_to_error(&LocalFailure {
+            kind: LocalFailKind::UnfinishedThought,
+            detail: detail.clone(),
+        })
+        .to_string();
+        assert_eq!(
+            msg,
+            format!("the local model thought but never answered ({detail})")
+        );
+        assert_eq!(
+            msg,
+            "the local model thought but never answered (it thought for 5 minutes without \
+             starting its answer, so PM stopped it — turn off Thinking for a straight answer)"
+        );
+        // And the slug the FallbackStrip maps is the one a fell-back turn's `Fallback.reason` carries.
+        assert_eq!(
+            FallbackReason::HardFailure(LocalFailKind::UnfinishedThought).as_log_str(),
+            "hard_failure:unfinished_thought"
+        );
+    }
+
+    #[test]
+    fn the_cloud_arm_hears_answers_only_and_never_an_empty_one() {
+        let mut seen: Vec<String> = Vec::new();
+        {
+            let mut sink = |d: ChatDelta<'_>| match d {
+                ChatDelta::Answer(t) => seen.push(format!("answer:{t}")),
+                ChatDelta::Thinking(t) => seen.push(format!("thinking:{t}")),
+                ChatDelta::Note(n) => seen.push(format!("note:{n:?}")),
+            };
+            let mut on_token = answers_only(&mut sink);
+            on_token("");
+            on_token("Hi");
+            on_token("");
+            on_token(" there");
+        }
+        assert_eq!(seen, ["answer:Hi", "answer: there"]);
+    }
+
+    /// "Answered without thinking" is about the local model's window, so it goes out with the local
+    /// model's answer and never ahead of a leg that fails first — the cloud's fallback reply would
+    /// otherwise sit under it, beside the FallbackStrip that gives the real reason.
+    #[test]
+    fn the_no_room_note_waits_for_the_local_models_answer() {
+        use openai_compat::StreamDelta;
+        let run = |owes_no_room: bool, deltas: &[StreamDelta<'_>]| {
+            let mut seen: Vec<String> = Vec::new();
+            let mut sink = |d: ChatDelta<'_>| match d {
+                ChatDelta::Answer(t) => seen.push(format!("answer:{t}")),
+                ChatDelta::Thinking(t) => seen.push(format!("thinking:{t}")),
+                ChatDelta::Note(n) => seen.push(format!("note:{n:?}")),
+            };
+            let mut leg = LocalLeg {
+                owes_no_room,
+                ..LocalLeg::default()
+            };
+            for &d in deltas {
+                leg.forward(d, &mut sink);
+            }
+            (seen, leg.answered, leg.shown_thinking)
+        };
+
+        // The local model answers: the note comes first, once, then the answer as it streams.
+        let (seen, answered, _) = run(
+            true,
+            &[StreamDelta::Answer("Hi"), StreamDelta::Answer(" there")],
+        );
+        assert_eq!(seen, ["note:NoRoom", "answer:Hi", "answer: there"]);
+        assert!(answered);
+
+        // The leg fails before answering: nothing was said, and it falls back with no thinking to
+        // drop — so the cloud's reply sits under no note at all.
+        let (seen, answered, shown_thinking) = run(true, &[]);
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_eq!(
+            after_local_failure(answered, shown_thinking, true),
+            AfterLocalFailure::FallBack {
+                drop_thinking: false
+            }
+        );
+
+        // No note owed: answers and thinking pass straight through, and the leg keeps count.
+        let (seen, answered, shown_thinking) = run(
+            false,
+            &[StreamDelta::Thinking("Hmm."), StreamDelta::Answer("Hi")],
+        );
+        assert_eq!(seen, ["thinking:Hmm.", "answer:Hi"]);
+        assert!(answered && shown_thinking);
     }
 
     #[test]
