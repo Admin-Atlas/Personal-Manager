@@ -1,8 +1,9 @@
 # Dependabot — keep PM's dependencies current across its three ecosystems.
 #
 # The gtk-rs / Linux-WebKit transitive stack is intentionally ignored: it compiles
-# only into Tauri's Linux WebKit backend, PM ships Windows/macOS, and these crates
-# move as one unit with Tauri (no fix reachable until Tauri adopts gtk-rs 0.20).
+# only into Tauri's Linux WebKit backend, the affected code is never reached, and
+# these crates move as one unit with Tauri (no fix reachable until Tauri moves to
+# gtk 0.19 / glib 0.22 or gtk4).
 # Mirrors src-tauri/.cargo/audit.toml; see the 2026-06-17 DECISIONS glib entry.
 version: 2
 updates:

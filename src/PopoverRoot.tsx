@@ -30,7 +30,8 @@ import { useExternalLinks } from "./lib/useExternalLinks";
 
 export function PopoverRoot() {
   // This window is frameless AND resizable, so on Linux it had the same invisible edges the main
-  // window did — the GTK path performs the resize but never sets a cursor. It does not mount
+  // window did — up to Tauri 2.11 the GTK path performed the resize but never set a cursor (2.12
+  // sets one itself; see useEdgeResizeCursor.ts). It does not mount
   // TitleBar, so it did not inherit the fix. The hook's `isMaximized` read is the one extra plugin
   // permission granted in capabilities/briefing.json; `onResized` rides the listen permission that
   // was already there.

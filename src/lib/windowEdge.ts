@@ -16,8 +16,10 @@ export type WindowEdge = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw" | nul
  * Which edge `(x, y)` sits on within a `width` x `height` window, given a `band` inset in the same
  * units. Corners take precedence over the sides that form them, matching the native hit test.
  *
- * The band is inclusive: a point exactly `band` from an edge is still on it, since the native
- * comparison is `<=`.
+ * Matches the native comparisons exactly: `x < band` and `y < band` on the left and top, and
+ * `x >= width - band` and `y >= height - band` on the right and bottom. So a point exactly `band`
+ * in from the left or top is interior, and one exactly `band` in from the right or bottom is on
+ * the edge.
  */
 export function edgeAt(
   x: number,
@@ -26,9 +28,9 @@ export function edgeAt(
   height: number,
   band: number,
 ): WindowEdge {
-  const nearW = x <= band;
+  const nearW = x < band;
   const nearE = x >= width - band;
-  const nearN = y <= band;
+  const nearN = y < band;
   const nearS = y >= height - band;
   if (nearN && nearW) return "nw";
   if (nearN && nearE) return "ne";

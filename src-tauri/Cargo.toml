@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.139.0-alpha"
+version = "3.139.1-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -151,8 +151,11 @@ tauri-plugin-single-instance = "2"
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 # Windows Hello for the optional, opt-in app-lock (a soft UI gate — see applock.rs).
-# Microsoft-maintained bindings (the same `windows` 0.61 Tauri already resolves, so no
-# duplicate version); windows-future supplies the `IAsyncOperation::get()` we block on.
+# Microsoft-maintained bindings; windows-future supplies the `IAsyncOperation::get()` we block on.
+# Held on 0.61 / windows-future 0.2. Since Tauri 2.12 the Tauri stack resolves windows 0.62, and
+# only this and iana-time-zone's windows-core edge keep 0.61. Moving to 0.62 / 0.3, plus
+# `cargo update -p iana-time-zone`, drops ~9 duplicate crates; it is a follow-up that needs live
+# tests of Windows Hello, the AppContainer sandbox and the vault ACL probe.
 windows = { version = "0.61", features = [
     "Security_Credentials_UI",
     "Win32_Foundation",

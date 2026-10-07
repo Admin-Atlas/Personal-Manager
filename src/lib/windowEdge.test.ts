@@ -31,10 +31,16 @@ describe("edgeAt", () => {
     expect(edgeAt(W, H, W, H, BAND)).toBe("se");
   });
 
-  it("treats the band as inclusive, and just past it as interior", () => {
-    expect(edgeAt(500, BAND, W, H, BAND)).toBe("n");
-    expect(edgeAt(500, BAND + 0.5, W, H, BAND)).toBeNull();
+  it("compares like the native hit test: strictly on the left and top, inclusively on the right and bottom", () => {
+    // tauri-runtime-wry: `cx < left + border`, `cx >= right - border`, and the same for y.
+    expect(edgeAt(500, BAND - 0.5, W, H, BAND)).toBe("n");
+    expect(edgeAt(500, BAND, W, H, BAND)).toBeNull();
+    expect(edgeAt(BAND - 0.5, 400, W, H, BAND)).toBe("w");
+    expect(edgeAt(BAND, 400, W, H, BAND)).toBeNull();
     expect(edgeAt(W - BAND, 400, W, H, BAND)).toBe("e");
+    expect(edgeAt(W - BAND - 0.5, 400, W, H, BAND)).toBeNull();
+    expect(edgeAt(500, H - BAND, W, H, BAND)).toBe("s");
+    expect(edgeAt(500, H - BAND - 0.5, W, H, BAND)).toBeNull();
   });
 
   it("widens with the scale factor, since the native band is 5 x the GTK scale", () => {
