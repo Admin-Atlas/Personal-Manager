@@ -177,8 +177,64 @@ pub fn resolve_provider(
     }
 }
 
+/// Where a role's requests really go right now, once the preference has met the keys and the local
+/// endpoint as they are — the status's answer to "what will actually happen?", so the Local AI tab
+/// never has to infer it from the preference alone (which is how "no model chosen, so it uses the
+/// cloud" came to be said of a role that had nothing to answer with).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveRoute {
+    /// The cloud model answers.
+    Cloud,
+    /// The local model answers, with no cloud behind it.
+    LocalOnly,
+    /// The local model answers, and the cloud model takes over on a hard failure.
+    LocalThenCloud,
+    /// A "Local, fall back to cloud" role the On battery policy has moved to the cloud.
+    CloudForPower,
+    /// Nothing can answer: no key for a cloud route, or no local model for a local one.
+    Nothing,
+    /// The secret store could not be read, so whether a cloud key exists is unknown.
+    Unknown,
+}
+
+/// The route [`resolve`] would build for a role, without building it. Pure: mirrors
+/// [`resolve_provider`] + [`hydrate_local_then_cloud`] + the empty-model rule in [`local_arm`],
+/// pinned against them by `effective_route_is_the_plan_resolve_would_build`.
+///
+/// `local_ready` is an endpoint AND a model for the role; `moved_for_power` is the status's
+/// `PowerRoute::Cloud`. "Local only" never reads a key, so an unreadable store cannot make it
+/// `Unknown` — exactly as `resolve` never asks.
+pub fn effective_route(
+    pref: ProviderPref,
+    local_ready: bool,
+    key: KeyPresence,
+    moved_for_power: bool,
+) -> EffectiveRoute {
+    match pref {
+        ProviderPref::Cloud => match key {
+            KeyPresence::Present => EffectiveRoute::Cloud,
+            KeyPresence::Absent => EffectiveRoute::Nothing,
+            KeyPresence::Unreadable => EffectiveRoute::Unknown,
+        },
+        ProviderPref::Local if local_ready => EffectiveRoute::LocalOnly,
+        ProviderPref::Local => EffectiveRoute::Nothing,
+        ProviderPref::LocalThenCloud => match (local_ready, key) {
+            // `resolve` hydrates the cloud arm on this route whether or not local is ready, and an
+            // unreadable store errors there.
+            (_, KeyPresence::Unreadable) => EffectiveRoute::Unknown,
+            (true, KeyPresence::Present) if moved_for_power => EffectiveRoute::CloudForPower,
+            (true, KeyPresence::Present) => EffectiveRoute::LocalThenCloud,
+            (true, KeyPresence::Absent) => EffectiveRoute::LocalOnly,
+            (false, KeyPresence::Present) => EffectiveRoute::Cloud,
+            (false, KeyPresence::Absent) => EffectiveRoute::Nothing,
+        },
+    }
+}
+
 /// Whether a role's cloud key can be read, for the status's "could the policy move this?" answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KeyPresence {
     Present,
     Absent,
@@ -1989,6 +2045,94 @@ mod tests {
     }
 
     #[test]
+    fn effective_route_is_the_plan_resolve_would_build() {
+        // The status's route sentence must be the route, not a reading of the preference. So every
+        // row of `effective_route` is checked against what `resolve` actually composes — the pure
+        // `resolve_provider`, then the arm hydration with dummy arms standing in for a configured
+        // endpoint and a stored key.
+        use KeyPresence::*;
+        let moved_ctx = RuntimeContext {
+            battery_low: true,
+            scope: PowerScope::Both,
+            consent: Consent::ALL,
+            keep_local: false,
+        };
+        for role in [Role::Chat, Role::Background] {
+            for pref in [
+                ProviderPref::Cloud,
+                ProviderPref::Local,
+                ProviderPref::LocalThenCloud,
+            ] {
+                for local_ready in [true, false] {
+                    for key in [Present, Absent] {
+                        for moved in [true, false] {
+                            let ctx = if moved {
+                                moved_ctx
+                            } else {
+                                RuntimeContext::default()
+                            };
+                            assert_eq!(ctx.moves(role), moved);
+                            let local = local_ready.then(arm);
+                            let cloud_arm = (key == Present).then(|| cloud(&["a"]));
+                            let choice = resolve_provider(role, &RoutingPrefs::uniform(pref), &ctx);
+                            let plan = match choice {
+                                ProviderChoice::Cloud => cloud_arm.map(RoutePlan::Cloud),
+                                ProviderChoice::Local => local.map(RoutePlan::LocalOnly),
+                                ProviderChoice::LocalThenCloud | ProviderChoice::CloudForPower => {
+                                    hydrate_local_then_cloud(
+                                        choice == ProviderChoice::CloudForPower,
+                                        local,
+                                        cloud_arm,
+                                    )
+                                }
+                            };
+                            let built = match plan {
+                                None => EffectiveRoute::Nothing,
+                                Some(RoutePlan::Cloud(_)) => EffectiveRoute::Cloud,
+                                Some(RoutePlan::LocalOnly(_)) => EffectiveRoute::LocalOnly,
+                                Some(RoutePlan::LocalThenCloud { .. }) => {
+                                    EffectiveRoute::LocalThenCloud
+                                }
+                                Some(RoutePlan::CloudForPower { .. }) => {
+                                    EffectiveRoute::CloudForPower
+                                }
+                            };
+                            assert_eq!(
+                                effective_route(pref, local_ready, key, moved),
+                                built,
+                                "{role:?} {pref:?} ready={local_ready} {key:?} moved={moved}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // An unreadable store: `resolve` errors hydrating the cloud arm, so the status cannot say
+        // where the role goes — except "Local only", which never reads a key.
+        for local_ready in [true, false] {
+            for moved in [true, false] {
+                assert_eq!(
+                    effective_route(ProviderPref::Cloud, local_ready, Unreadable, moved),
+                    EffectiveRoute::Unknown
+                );
+                assert_eq!(
+                    effective_route(ProviderPref::LocalThenCloud, local_ready, Unreadable, moved),
+                    EffectiveRoute::Unknown
+                );
+                assert_eq!(
+                    effective_route(ProviderPref::Local, local_ready, Unreadable, moved),
+                    if local_ready {
+                        EffectiveRoute::LocalOnly
+                    } else {
+                        EffectiveRoute::Nothing
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn r11_hydration_substitutes_only_a_both_arms_pair() {
         match hydrate_local_then_cloud(
             true,
@@ -2082,6 +2226,23 @@ mod tests {
             (PowerBlocked::LocalOnly, "local_only"),
         ] {
             assert_eq!(json(serde_json::to_value(blocked).unwrap()), wire);
+        }
+        for (route, wire) in [
+            (EffectiveRoute::Cloud, "cloud"),
+            (EffectiveRoute::LocalOnly, "local_only"),
+            (EffectiveRoute::LocalThenCloud, "local_then_cloud"),
+            (EffectiveRoute::CloudForPower, "cloud_for_power"),
+            (EffectiveRoute::Nothing, "nothing"),
+            (EffectiveRoute::Unknown, "unknown"),
+        ] {
+            assert_eq!(json(serde_json::to_value(route).unwrap()), wire);
+        }
+        for (key, wire) in [
+            (KeyPresence::Present, "present"),
+            (KeyPresence::Absent, "absent"),
+            (KeyPresence::Unreadable, "unreadable"),
+        ] {
+            assert_eq!(json(serde_json::to_value(key).unwrap()), wire);
         }
     }
 

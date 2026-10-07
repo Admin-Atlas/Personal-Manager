@@ -6,19 +6,37 @@
 // what Rust decided: why it can't act when it can't (and never "no key" about keys PM simply couldn't
 // read), no value presented as the user's before PM has read it, a write that failed never left
 // standing, and nowhere a promise that switching stops the battery draining.
+//
+// "On battery, hand the memory back" lives here now, beside every other battery decision, and its
+// tests moved with it from LocalAiLifecycle.test.tsx with their assertions intact.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INERT_POWER_VIEW, REDUCES_POWER } from "../../lib/powerRoute";
-import type { LocalLlmStatus, PowerRoleView, PowerView } from "../../lib/types";
+import type { LocalGpuResidency, LocalLlmStatus, PowerRoleView, PowerView } from "../../lib/types";
 
 const setLocalPowerPolicy = vi.fn();
 const keepLocalOnBattery = vi.fn();
+const localGpuResidency = vi.fn();
+const releaseLocalGpu = vi.fn();
+const getLocalReleasePolicy = vi.fn();
+const setLocalReleasePolicy = vi.fn();
+const getTrayEnabled = vi.fn();
+const setTrayEnabled = vi.fn();
 
+// A factory REPLACES the whole module, so every function the section imports must be here. The
+// release four are the battery row's (through `useReleaseSettings`); the tray pair is Model
+// memory's, which one test renders beside this section on the same release settings.
 vi.mock("../../lib/ipc", () => ({
   setLocalPowerPolicy: (...a: unknown[]) => setLocalPowerPolicy(...a),
   keepLocalOnBattery: (...a: unknown[]) => keepLocalOnBattery(...a),
+  localGpuResidency: () => localGpuResidency(),
+  releaseLocalGpu: () => releaseLocalGpu(),
+  getLocalReleasePolicy: () => getLocalReleasePolicy(),
+  setLocalReleasePolicy: (...a: unknown[]) => setLocalReleasePolicy(...a),
+  getTrayEnabled: () => getTrayEnabled(),
+  setTrayEnabled: (...a: unknown[]) => setTrayEnabled(...a),
 }));
 
 vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
@@ -26,12 +44,27 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ depth: "standard" }),
 }));
 
+import { LocalAiLifecycle } from "./LocalAiLifecycle";
 import { LocalAiPower } from "./LocalAiPower";
+import { sectionLabel } from "./sections";
+import { useReleaseSettings } from "./useReleaseSettings";
+
+const residency = (over: Partial<LocalGpuResidency> = {}): LocalGpuResidency => ({
+  resident: [],
+  vram_gb: 8,
+  dgpu_displays: [],
+  policy: "server",
+  idle_minutes: 5,
+  no_unload_route: false,
+  ...over,
+});
 
 const movable = (over: Partial<PowerRoleView> = {}): PowerRoleView => ({
   route: "unchanged",
   blocked: null,
   local_model: "gemma3:4b",
+  effective: "local_then_cloud",
+  cloud_key: "present",
   ...over,
 });
 
@@ -98,18 +131,30 @@ beforeEach(() => {
   vi.clearAllMocks();
   setLocalPowerPolicy.mockResolvedValue(undefined);
   keepLocalOnBattery.mockResolvedValue(undefined);
+  localGpuResidency.mockResolvedValue(residency());
+  releaseLocalGpu.mockResolvedValue(0);
+  getLocalReleasePolicy.mockResolvedValue({
+    policy: "server",
+    idle_minutes: 5,
+    battery_idle_minutes: 0,
+  });
+  setLocalReleasePolicy.mockResolvedValue(undefined);
+  getTrayEnabled.mockResolvedValue(false);
+  setTrayEnabled.mockResolvedValue(undefined);
 });
 afterEach(cleanup);
 
 describe("when the section can't act", () => {
   it("says so plainly for a cloud-only setup, with the controls shown and disabled", () => {
-    show(null, { configured: false, anyLocal: false });
-    expect(screen.getByText("Switch to cloud on battery — unavailable")).toBeTruthy();
-    expect(
-      screen.getByText(
-        "This setting decides when PM uses a local model instead of the cloud. You're currently using OpenRouter for everything, so there's nothing to switch between. If you set up a local model in Local AI, this becomes available.",
-      ),
-    ).toBeTruthy();
+    const { container } = show(null, { configured: false, anyLocal: false });
+    expect(screen.getByText("Switch to the cloud on battery — not available yet")).toBeTruthy();
+    // The pointer to the start card is a section name (a link inside the tab, plain text here), so
+    // the sentence spans an element: read it as the reader does, whole.
+    expect(container.textContent).toContain(
+      `This moves work from a local model to your cloud model while a laptop's battery is low. Nothing runs on a local model yet, so there's nothing to move — ${sectionLabel("sec-localai-start")} walks you through setting one up.`,
+    );
+    // Not "you're using OpenRouter for everything": a keyless user uses nothing at all.
+    expect(screen.queryByText(/OpenRouter for everything/)).toBeNull();
     expectAllDisabled();
   });
 
@@ -162,7 +207,7 @@ describe("when the section can't act", () => {
     expect(body.textContent).toContain("Chat is set to Local only, which never uses the cloud.");
     expect(body.textContent).toContain("Background work already uses the cloud.");
     expect(body.textContent).toContain(
-      "set a role to Local, fall back to cloud under Assign roles above.",
+      "set a role to Local, fall back to cloud under Assign roles.",
     );
     expectAllDisabled();
   });
@@ -371,5 +416,252 @@ describe("the readout", () => {
       expect(container.textContent).not.toMatch(/stops? draining/i);
       cleanup();
     }
+  });
+});
+
+describe("the two groups", () => {
+  it("says what each one saves and what it costs, unfolded", () => {
+    const { container } = show(status(power()));
+    const headings = Array.from(container.querySelectorAll("h3")).map((h) => h.textContent);
+    expect(headings).toEqual(["Moving work to the cloud", "Handing back the graphics card"]);
+    expect(container.textContent).toContain(
+      `Saves: sending requests to your cloud model ${REDUCES_POWER}. Costs: what you send leaves this computer and is billed to your OpenRouter key, and PM asks you before the first time.`,
+    );
+    expect(container.textContent).toContain(
+      "Costs: the next message waits a few seconds while the model loads again. Works with Ollama; nothing leaves this computer.",
+    );
+    // The tray lives in Model memory, and the pointer names it rather than a direction.
+    expect(container.textContent).toContain(
+      `With the tray icon on (under ${sectionLabel("sec-localai-lifecycle")}), closing the window doesn't quit PM, so it stays on.`,
+    );
+    // Ready: nothing is folded away.
+    expect(screen.queryByRole("button", { name: "What you could set here" })).toBeNull();
+  });
+
+  it("folds both groups for a cloud-only setup, keeping the controls mounted and disabled", async () => {
+    const { container } = show(null, { configured: false, anyLocal: false });
+    const fold = screen.getByRole("button", { name: "What you could set here" });
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    // Mounted, so what the section would do is still there; disabled, because it can't yet.
+    expectAllDisabled();
+    await waitFor(() => expect(getLocalReleasePolicy).toHaveBeenCalled());
+    expect(batteryRow().disabled).toBe(true);
+    expect(batteryRow().closest("[inert]")).not.toBeNull();
+    expect(container.querySelectorAll("h3")).toHaveLength(2);
+  });
+
+  it("folds them on a machine with no battery too", () => {
+    show(status(power({ has_battery: false, source: "ac", percent: null })));
+    expect(
+      screen.getByRole("button", { name: "What you could set here" }).getAttribute("aria-expanded"),
+    ).toBe("false");
+  });
+
+  it("keeps the consent line and Withdraw outside the fold", () => {
+    // Taking back permission for data to leave the machine is never something to go looking for.
+    show(status(power({ consent: "both" })), { anyLocal: false });
+    expect(screen.getByRole("button", { name: "What you could set here" })).toBeTruthy();
+    const withdraw = screen.getByRole("button", { name: "Withdraw" });
+    expect(withdraw.closest("[inert]")).toBeNull();
+    fireEvent.click(withdraw);
+    expect(setLocalPowerPolicy).toHaveBeenCalledWith({ consent: "none" });
+  });
+
+  it("asks the consent question as the section, not as the app-wide strip", () => {
+    show(
+      status(
+        power({
+          source: "battery",
+          state: "battery_low",
+          consent_needed: true,
+          chat: movable({ route: "needs_consent" }),
+          background: movable({ route: "needs_consent" }),
+        }),
+      ),
+    );
+    expect(screen.getByText(/You can change any of this below\./)).toBeTruthy();
+    expect(screen.queryByText(/in Settings → Local AI → On battery/)).toBeNull();
+  });
+});
+
+// Moved here from LocalAiLifecycle.test.tsx with the row, assertions intact.
+const batteryRow = () =>
+  screen.getByRole("combobox", { name: "On battery, hand the memory back" }) as HTMLSelectElement;
+
+describe("On battery, hand the memory back (#432)", () => {
+  /** Render the section with the release settings it reads, and wait for them to be asked for. */
+  const loaded = async (
+    over: Partial<LocalGpuResidency> = {},
+    s: LocalLlmStatus | null = status(power()),
+  ) => {
+    localGpuResidency.mockResolvedValue(residency(over));
+    const view = show(s);
+    await waitFor(() => expect(localGpuResidency).toHaveBeenCalled());
+    return view;
+  };
+
+  /** Wait for the stored value to land — the row is disabled until it has. */
+  const settled = async () => {
+    await waitFor(() => expect(batteryRow().disabled).toBe(false));
+  };
+
+  it("writes only its own field", async () => {
+    await loaded();
+    await settled();
+    fireEvent.change(batteryRow(), { target: { value: "5" } });
+    // Positional, with the policy left alone: a battery change must not restate (and so risk
+    // overwriting) the release policy it shares its storage with.
+    expect(setLocalReleasePolicy).toHaveBeenCalledWith(null, undefined, 5);
+    expect(
+      await screen.findByText(/counting from no earlier than when you unplugged/),
+    ).toBeTruthy();
+  });
+
+  it("shows nothing as stored until PM has read it", async () => {
+    // A read that never answers: the row must not present "As set under …" as the user's choice.
+    getLocalReleasePolicy.mockReturnValue(new Promise(() => {}));
+    await loaded();
+    expect(batteryRow().disabled).toBe(true);
+    expect(batteryRow().value).toBe("");
+  });
+
+  it("names the policy it defers to by its section, not by a direction", async () => {
+    await loaded();
+    await settled();
+    const zero = within(batteryRow()).getByRole("option", {
+      name: `As set under ${sectionLabel("sec-localai-lifecycle")}`,
+    });
+    expect(zero.textContent).not.toMatch(/\b(above|below)\b/);
+    expect(
+      screen.getByText(/On battery, PM does whatever "Give the memory back" under/),
+    ).toBeTruthy();
+  });
+
+  it("is off for a desktop, and says why", async () => {
+    await loaded({}, status(power({ source: "ac", has_battery: false })));
+    expect(
+      await screen.findByText("PM didn't find a battery on this machine, so this never applies."),
+    ).toBeTruthy();
+    expect(batteryRow().disabled).toBe(true);
+  });
+
+  it("stays usable while the power readout isn't known, and on a laptop", async () => {
+    // null is "not known to be a desktop", never "is a desktop".
+    await loaded({}, null);
+    await settled();
+    cleanup();
+    await loaded({}, status(power({ source: "ac", has_battery: true })));
+    await settled();
+  });
+
+  it("is off when PM has no way to unload from the server", async () => {
+    await loaded({ no_unload_route: true });
+    // The limit is PM's: LM Studio can eject a model, PM just can't ask it to.
+    expect(
+      await screen.findByText(
+        /PM can only unload a model through Ollama, so this can't do anything with your server/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/can't unload a model on request/)).toBeNull();
+    expect(batteryRow().disabled).toBe(true);
+  });
+
+  it("is off until a server is connected", async () => {
+    show(null, { configured: false, anyLocal: false });
+    // Stored and read — the placeholder has gone — and still off: there is no server to hand memory
+    // back from.
+    await waitFor(() => expect(batteryRow().value).toBe("0"));
+    expect(batteryRow().disabled).toBe(true);
+  });
+
+  it("shows the stored value", async () => {
+    // The battery half of Model memory's "qualifies the chosen policy only when it is set".
+    getLocalReleasePolicy.mockResolvedValue({
+      policy: "server",
+      idle_minutes: 5,
+      battery_idle_minutes: 10,
+    });
+    await loaded();
+    await waitFor(() => expect(batteryRow().value).toBe("10"));
+  });
+
+  it("shows a stored value that isn't on the list rather than snapping to a neighbour", async () => {
+    getLocalReleasePolicy.mockResolvedValue({
+      policy: "server",
+      idle_minutes: 5,
+      battery_idle_minutes: 7,
+    });
+    await loaded();
+    await settled();
+    expect(batteryRow().value).toBe("7");
+  });
+
+  it("puts a failed write back to what PM has stored, and says so", async () => {
+    // This used to be swallowed: the picker kept showing a choice that was never saved, so the
+    // setting quietly did not apply.
+    await loaded();
+    await settled();
+    setLocalReleasePolicy.mockRejectedValueOnce(new Error("vault locked"));
+    fireEvent.change(batteryRow(), { target: { value: "5" } });
+
+    expect(
+      await screen.findByText("Couldn't save that. This shows what PM has stored."),
+    ).toBeTruthy();
+    await waitFor(() => expect(batteryRow().value).toBe("0"));
+    // Re-read, not guessed: once on mount, once after the failure.
+    expect(getLocalReleasePolicy).toHaveBeenCalledTimes(2);
+
+    // And it clears on the next change that does save.
+    fireEvent.change(batteryRow(), { target: { value: "2" } });
+    await waitFor(() =>
+      expect(screen.queryByText("Couldn't save that. This shows what PM has stored.")).toBeNull(),
+    );
+  });
+
+  it("shows nothing as stored when neither the save nor reading it back worked", async () => {
+    // Leaving the unsaved choice on screen beside "this shows what PM has stored" would be a lie —
+    // in either section. The two pickers live in two sections now, on the tab's one set of release
+    // settings, so both are rendered here on one, the way the tab does.
+    const ready = status(power());
+    function Both() {
+      const release = useReleaseSettings({ status: ready });
+      return (
+        <>
+          <LocalAiPower
+            status={ready}
+            configured
+            anyLocalRoleWithModel
+            onError={onError}
+            release={release}
+          />
+          <LocalAiLifecycle configured power={ready.power} release={release} />
+        </>
+      );
+    }
+    render(<Both />);
+    await waitFor(() => expect(localGpuResidency).toHaveBeenCalled());
+    await settled();
+    setLocalReleasePolicy.mockRejectedValueOnce(new Error("vault locked"));
+    getLocalReleasePolicy.mockRejectedValueOnce(new Error("vault locked"));
+    fireEvent.change(batteryRow(), { target: { value: "5" } });
+    expect(
+      await screen.findByText("Couldn't save that, and PM couldn't read back what is stored."),
+    ).toBeTruthy();
+    expect(batteryRow().value).toBe("");
+    expect(batteryRow().disabled).toBe(true);
+    const policy = screen.getByRole("combobox", {
+      name: "Give the memory back",
+    }) as HTMLSelectElement;
+    expect(policy.value).toBe("");
+    expect(policy.disabled).toBe(true);
+  });
+
+  it("counts only a positive AC reading as a desktop", async () => {
+    // A wedged read is an Unknown sample; it isn't evidence that the battery has gone.
+    await loaded({}, status(power({ source: "unknown", has_battery: false })));
+    await settled();
+    expect(
+      screen.queryByText("PM didn't find a battery on this machine, so this never applies."),
+    ).toBeNull();
   });
 });

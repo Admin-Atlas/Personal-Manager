@@ -3,9 +3,10 @@
 
 // Dev-time generator for the curated local-model catalog (#296) shipped at
 // `src-tauri/local_models.json`. It refreshes a small, hand-picked SEED of GGUF repos from the
-// Hugging Face API — real per-quant file sizes, architecture, context window, and (for MoE models)
-// the active-parameter count read out of the GGUF header — so the app can size each model against a
-// user's hardware with `fit.rs`.
+// Hugging Face API — real per-quant file sizes, architecture, context window, and, read out of the
+// GGUF header, every model's KV-cache geometry, (for MoE models) the active-parameter count, and
+// per quant the bytes one decode step reads from its tensor table — so the app can size each model
+// against a user's hardware with `fit.rs`.
 //
 // Run it by hand (`just generate-local-catalog`); it is NOT part of the PR check gate (network, rate
 // limits, non-determinism). A scheduled Action that runs it and opens a PR is a fast-follow.
@@ -25,7 +26,7 @@
 // dropped seed would delete a model AND bump `catalog_version`, so a blip must not masquerade as a
 // real update. Only a model that fetched fine but doesn't qualify (embedding, no curated quant) drops.
 
-import { gguf } from "@huggingface/gguf";
+import { gguf, GGMLQuantizationType as GGML } from "@huggingface/gguf";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -34,7 +35,7 @@ import { dirname, join } from "node:path";
 const HF = "https://huggingface.co";
 const UA = "pm-local-catalog-generator (Personal-Manager)";
 const DEFAULT_QUANTS = ["Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"];
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 // Bounded retries for transient Hugging Face failures (network drop / HTTP 5xx) before we give up.
 const MAX_ATTEMPTS = 4;
 
@@ -238,11 +239,15 @@ async function buildEntry(seed) {
   const ggufFiles = tree.filter((f) => f.type === "file" && /\.gguf$/i.test(f.path));
 
   const quants = [];
+  // The first quant's first shard, read for its decode bytes and reused as step 4's header.
+  let header = null;
   for (const label of seed.quants || DEFAULT_QUANTS) {
     const size = sumQuantShards(ggufFiles, label);
     if (!size) continue;
     // `size.bytes` is the raw pre-gib() figure, which is what makes the comparison exact.
     const manifest = size.sharded ? null : await fetchOllamaManifest(repo, label);
+    const read = await readQuantDecode(repo, label, quantShardPaths(ggufFiles, label));
+    if (quants.length === 0) header = read.metadata;
     quants.push({
       quant: label,
       file_gb: gib(size.bytes),
@@ -254,6 +259,8 @@ async function buildEntry(seed) {
         bytes: size.bytes,
         manifest,
       }),
+      decode_bytes: read.decode.decode_bytes,
+      decode_slow_bytes: read.decode.decode_slow_bytes,
     });
   }
   if (quants.length === 0) {
@@ -266,22 +273,31 @@ async function buildEntry(seed) {
   const multimodal = projectorBytes != null;
   const projectorGb = multimodal ? gib(projectorBytes) : null;
 
-  // 4. Active params: dense == total; MoE is read from the GGUF header (decision E — never
+  // 4. The GGUF header, for two things the HF JSON does not carry: a MoE's expert geometry and every
+  //    model's attention geometry. Any quant's header will do — both describe the architecture, not
+  //    the quantization — so it is the first quant's first shard, already read above for its decode
+  //    bytes (`header`).
+
+  // 5. Active params: dense == total; MoE is read from the GGUF header (decision E — never
   //    total×used/count). A MoE we can't parse is EXCLUDED from the curated catalog.
   const looksMoe = isMoe(repo, architecture);
   let activeParams = totalParams;
   let fit = "computed";
   if (looksMoe) {
-    const firstShard = ggufFiles
-      .filter((f) => matchesQuant(f.path, quants[0].quant) && !/mmproj/i.test(f.path))
-      .map((f) => f.path)
-      .sort()[0];
-    const active = await moeActiveParams(repo, firstShard, totalParams);
+    const active = header ? activeFromHeader(header, totalParams) : null;
     if (active && active > 0 && active <= totalParams) {
       activeParams = active;
     } else {
       return drop("MoE active-params unreadable from GGUF (decision E)");
     }
+  }
+
+  // 6. What a token costs in the KV cache, from the attention geometry. Without it fit.rs falls back
+  //    to its params × context proxy, which cannot see grouped-query attention and under-counts a
+  //    model without it by an order of magnitude — so a missing figure is said out loud, never quiet.
+  const kvCache = header ? kvFromHeader(header) : null;
+  if (!kvCache) {
+    console.warn(`    no KV geometry for ${repo}: fit.rs keeps the params × context proxy for it`);
   }
   // Unmodelled architectures we can't fit-score: keep the row but mark it honestly.
   if (isUnmodelledArch(architecture)) fit = "unknown";
@@ -297,39 +313,189 @@ async function buildEntry(seed) {
     multimodal,
     reasoning: null,
     projector_gb: projectorGb,
+    kv_cache: kvCache,
     fit,
     quants,
   };
   return { entry, evidence };
 }
 
-// --- GGUF header parse for MoE active params ---------------------------------------------------
+// --- GGUF header parse: MoE active params and attention geometry -------------------------------
 
-// Read a MoE model's active-parameter count out of the GGUF header (decision E — never derived from
-// HF JSON). `general.parameter_count` isn't always present, so the total comes from the caller (the
-// HF `gguf.total`); the header supplies the expert geometry to subtract the inactive experts.
-async function moeActiveParams(repo, shardPath, totalParams) {
+// A header range read answered 4xx: the file is gated or gone. Permanent, so never retried.
+class HeaderUnavailable extends Error {}
+
+// Read one file's GGUF header — its metadata and its tensor table, never the tensors themselves —
+// over HTTP range requests, as `{ metadata, tensorInfos }`, or `null`.
+//
+// Every range read goes through `hfFetch`, so a network drop or a 5xx is retried there and, if it
+// persists, ABORTS the run like every other fetch in this file. A parse failure is retried here, in
+// case a read came back short. Only what persists past both is `null` — a 4xx (a gated or vanished
+// file) or a header `gguf()` cannot parse — and the caller decides what that costs: a MoE is dropped
+// (decision E), a dense model keeps the KV proxy, and a quant's decode bytes are written as null. A
+// network blip must not masquerade as any of them.
+async function readGguf(repo, shardPath) {
   if (!shardPath) return null;
   const url = `${HF}/${repo}/resolve/main/${shardPath}`;
-  let metadata;
+  const viaHf = async (u, init) => {
+    const res = await hfFetch(u, init?.headers ?? {});
+    if (!res.ok) throw new HeaderUnavailable(`HTTP ${res.status}`);
+    return res;
+  };
   for (let attempt = 1; ; attempt++) {
     try {
-      ({ metadata } = await gguf(url));
-      break;
+      const { metadata, tensorInfos } = await gguf(url, { fetch: viaHf });
+      return { metadata, tensorInfos };
     } catch (e) {
-      // Retry a transient header-range read; only after it persists is this a real decision-E
-      // exclusion (an unparseable MoE header → drop). A network blip must not masquerade as one.
-      if (attempt < MAX_ATTEMPTS) {
+      if (e instanceof AbortRun) throw e;
+      if (!(e instanceof HeaderUnavailable) && attempt < MAX_ATTEMPTS) {
         await sleep(backoffMs(attempt));
         continue;
       }
-      console.warn(
-        `    gguf parse failed for ${repo} after ${MAX_ATTEMPTS} attempts: ${e?.message || e}`,
-      );
+      console.warn(`    GGUF header unreadable for ${repo}: ${e?.message || e}`);
       return null;
     }
   }
-  return activeFromHeader(metadata, totalParams);
+}
+
+/** Read every shard of one quant and work out its decode bytes (`decodeBytes`), returning them
+ *  with the first shard's metadata — the header step 4 reads the model's geometry from.
+ *
+ *  A shard PM could not read, or a tensor table `decodeBytes` refuses, writes `null` for both fields
+ *  and says so: fit.rs then falls back to the parameter count for that quant. The row itself is never
+ *  dropped — its size and its tag were measured from the tree, not the header — and a network blip
+ *  still aborts the run inside `readGguf`, as everywhere else. */
+async function readQuantDecode(repo, label, paths) {
+  const unread = { decode_bytes: null, decode_slow_bytes: null };
+  const shards = [];
+  for (const path of paths) {
+    const shard = await readGguf(repo, path);
+    if (!shard) {
+      console.warn(`    no decode bytes for ${repo} ${label}: ${path} unreadable`);
+      return { metadata: shards[0]?.metadata ?? null, decode: unread };
+    }
+    shards.push(shard);
+  }
+  const metadata = shards[0]?.metadata ?? null;
+  if (!metadata) return { metadata, decode: unread };
+  try {
+    return {
+      metadata,
+      decode: decodeBytes(
+        shards.flatMap((s) => s.tensorInfos),
+        metadata,
+      ),
+    };
+  } catch (e) {
+    console.warn(`    no decode bytes for ${repo} ${label}: ${e?.message || e}`);
+    return { metadata, decode: unread };
+  }
+}
+
+/** GGML tensor type id → `[elements per block, bytes per block]`: ggml's own `blck_size` and
+ *  `type_size` for every type a catalogue file can carry (ggml/src/ggml.c `type_traits`). A tensor
+ *  occupies its element count over the first, times the second. */
+export const GGML_BLOCK = {
+  [GGML.F32]: [1, 4],
+  [GGML.F16]: [1, 2],
+  [GGML.Q4_0]: [32, 18],
+  [GGML.Q4_1]: [32, 20],
+  [GGML.Q5_0]: [32, 22],
+  [GGML.Q5_1]: [32, 24],
+  [GGML.Q8_0]: [32, 34],
+  [GGML.Q8_1]: [32, 36],
+  [GGML.Q2_K]: [256, 84],
+  [GGML.Q3_K]: [256, 110],
+  [GGML.Q4_K]: [256, 144],
+  [GGML.Q5_K]: [256, 176],
+  [GGML.Q6_K]: [256, 210],
+  [GGML.Q8_K]: [256, 292],
+  [GGML.IQ2_XXS]: [256, 66],
+  [GGML.IQ2_XS]: [256, 74],
+  [GGML.IQ3_XXS]: [256, 98],
+  [GGML.IQ1_S]: [256, 50],
+  [GGML.IQ4_NL]: [32, 18],
+  [GGML.IQ3_S]: [256, 110],
+  [GGML.IQ2_S]: [256, 82],
+  [GGML.IQ4_XS]: [256, 136],
+  [GGML.I8]: [1, 1],
+  [GGML.I16]: [1, 2],
+  [GGML.I32]: [1, 4],
+  [GGML.I64]: [1, 8],
+  [GGML.F64]: [1, 8],
+  [GGML.IQ1_M]: [256, 56],
+  [GGML.BF16]: [1, 2],
+  [GGML.MXFP4]: [32, 17],
+};
+
+/** The tensor types fit.rs charges as slow to unpack (`decode_slow_bytes`, `GPU_SLOW_BYTE_COST`):
+ *  Q2_K, Q3_K and the i-quants. Only Q3_K is measured — the three Q3_K_M models timed on the dev
+ *  laptop, whose Q3_K bytes streamed at about 38% of the card's bandwidth against 56% for the rest.
+ *  The others are assumed by kinship with it, the other k-quant below Q4_K and the i-quants, and
+ *  none of them has been timed. */
+export const SLOW_TENSOR_TYPES = new Set([
+  GGML.Q2_K,
+  GGML.Q3_K,
+  GGML.IQ2_XXS,
+  GGML.IQ2_XS,
+  GGML.IQ3_XXS,
+  GGML.IQ1_S,
+  GGML.IQ4_NL,
+  GGML.IQ3_S,
+  GGML.IQ2_S,
+  GGML.IQ4_XS,
+  GGML.IQ1_M,
+]);
+
+/** The bytes one decode step reads, from a quant's tensor table (every shard's, concatenated) and
+ *  its first shard's metadata: `{ decode_bytes, decode_slow_bytes }`, integers, the second the part
+ *  of the first in `SLOW_TENSOR_TYPES`. What fit.rs divides a card's bandwidth by, in place of
+ *  active params × bytes per param, which read 1.25-1.63x too few bytes for both catalogue MoEs.
+ *
+ *  Every tensor streams in full, at its element count over its block size times its block bytes,
+ *  with three exceptions, each the way llama.cpp's decode reads it:
+ *    * `token_embd.weight` is one row looked up per token, so it counts only when there is no
+ *      `output.weight` — a tied embedding IS the output head, read whole every token;
+ *    * a `per_layer_token_embd` table (gemma 3n, gemma 4) is looked up a row at a time, so it
+ *      counts nothing;
+ *    * a routed-expert tensor (`*_exps.*`) counts at `expert_used_count / expert_count`, the share
+ *      of experts a token reaches. Shared experts (`*_shexp.*`) run on every token and count in full.
+ *  A type `GGML_BLOCK` does not know, or routed experts without their counts, THROWS rather than
+ *  guess: the caller writes null for that quant. */
+export function decodeBytes(tensorInfos, metadata) {
+  const arch = String(metadata["general.architecture"] || "");
+  const tied = !tensorInfos.some((t) => t.name === "output.weight");
+  let expertShare;
+  const routedShare = () => {
+    if (expertShare === undefined) {
+      const count = Number(metadata[`${arch}.expert_count`]);
+      const used = Number(metadata[`${arch}.expert_used_count`]);
+      if (!(count > 0 && used > 0 && used <= count)) {
+        throw new Error(`routed experts without usable ${arch}.expert_* counts`);
+      }
+      expertShare = used / count;
+    }
+    return expertShare;
+  };
+  let total = 0;
+  let slow = 0;
+  for (const t of tensorInfos) {
+    const block = GGML_BLOCK[t.dtype];
+    if (!block) throw new Error(`${t.name}: unknown GGML tensor type ${t.dtype}`);
+    const [elements, bytes] = block;
+    const n = t.shape.reduce((a, d) => a * Number(d), 1);
+    let streamed = (n / elements) * bytes;
+    if (t.name === "token_embd.weight") {
+      if (!tied) streamed = 0;
+    } else if (/per_layer_token_embd/.test(t.name)) {
+      streamed = 0;
+    } else if (/_exps\./.test(t.name)) {
+      streamed *= routedShare();
+    }
+    total += streamed;
+    if (SLOW_TENSOR_TYPES.has(t.dtype)) slow += streamed;
+  }
+  return { decode_bytes: Math.round(total), decode_slow_bytes: Math.round(slow) };
 }
 
 /** The MoE active-parameter arithmetic, split out of the fetch so it can be tested without a network
@@ -356,6 +522,116 @@ export function activeFromHeader(metadata, totalParams) {
   const inactive = (nExpert - nUsed) * nBlock * 3 * dModel * dFfn;
   const active = totalParams - inactive;
   return active > 0 ? active : null;
+}
+
+/** Architectures whose sliding-window layers llama.cpp places by a fixed rule instead of a header
+ *  key — `set_swa_pattern(n)` in its loader (src/llama-model.cpp, src/llama-hparams.cpp): layer `i`
+ *  slides when `i % n < n - 1`. So gemma2 alternates, and gemma3 slides five layers in every six. */
+const SWA_EVERY = { gemma2: 2, gemma3: 6 };
+
+/** What one token costs this model's KV cache, read from its GGUF header: the attention geometry the
+ *  `params × context` proxy in fit.rs cannot see. `null` when the header lacks a usable layer count
+ *  or head geometry, and fit.rs then keeps the proxy for that entry.
+ *
+ *  Every layer that keeps a cache stores `(key_length + value_length) × head_count_kv` values a
+ *  token, two bytes each at f16 — llama.cpp's `n_embd_k_gqa + n_embd_v_gqa`. The fallbacks are
+ *  llama.cpp's own: `key_length`/`value_length` default to `embedding_length / head_count`, and
+ *  `head_count_kv` to `head_count`, which is the no-grouped-query-attention case (Phi 3.5 mini). Any
+ *  of them may be one number or one per layer (gemma4's `head_count_kv`).
+ *
+ *  Which layers pay for the whole context comes from the header where the header says it, and from
+ *  llama.cpp's loader where it does not:
+ *    * Sliding-window layers hold only the last `attention.sliding_window` tokens, so they are
+ *      counted apart (`window_bytes_per_token`) and fit.rs caps them at the window. gemma4 names
+ *      them in `attention.sliding_window_pattern` (true = sliding), with their own
+ *      `key_length_swa`/`value_length_swa`. gemma2 and gemma3 carry the window but not the pattern,
+ *      so `SWA_EVERY` supplies it. phi3 carries a window as well, but llama.cpp switches SWA off
+ *      for phi3, so its layers count in full — as do every other architecture's, the direction that
+ *      can only over-count.
+ *    * Hybrid linear-attention models (qwen35, qwen35moe) keep a cache only on every
+ *      `full_attention_interval`-th layer: llama.cpp marks layer `i` recurrent when
+ *      `(i + 1) % interval != 0`. A recurrent layer holds a fixed state instead, sized as llama.cpp
+ *      sizes it from the `ssm.*` keys — `n_embd_r + n_embd_s` values, f32 — which no context or
+ *      cache precision changes (`state_bytes`).
+ *    * The last `attention.shared_kv_layers` layers (gemma3n, gemma4) reuse an earlier layer's cache
+ *      and add none of their own.
+ *
+ *  Measured against a live Ollama 0.33 (q8_0 cache, flash attention, RTX 5060 Laptop GPU): raising
+ *  num_ctx from 8192 to 32768 grew the card's use by 31.5 KB a token for Qwen2.5 7B, against the
+ *  30.5 KB this geometry gives at q8_0, and by 10.1 KB for gemma 3 4b against 10.9 KB for its five
+ *  full layers — its 29 sliding layers did not grow at all. */
+export function kvFromHeader(metadata) {
+  const arch = String(metadata["general.architecture"] || "");
+  const raw = (k) => metadata[`${arch}.${k}`] ?? metadata[k];
+  const num = (v) => (v === undefined || v === null ? undefined : Number(v));
+  // One value for every layer, or that layer's entry in a per-layer array.
+  const at = (k, i) => {
+    const v = raw(k);
+    return num(Array.isArray(v) ? v[i] : v);
+  };
+  const usable = (x) => Number.isFinite(x) && x >= 0;
+
+  const nLayer = num(raw("block_count"));
+  if (!Number.isInteger(nLayer) || nLayer <= 0) return null;
+  const nEmbd = num(raw("embedding_length"));
+
+  const window = num(raw("attention.sliding_window"));
+  const pattern = raw("attention.sliding_window_pattern");
+  const every = SWA_EVERY[arch];
+  const slides = (i) => {
+    if (!Number.isInteger(window) || window <= 0) return false;
+    if (Array.isArray(pattern)) return Boolean(pattern[i]);
+    return every ? i % every < every - 1 : false;
+  };
+  const interval = num(raw("full_attention_interval"));
+  const attends = (i) => !(Number.isInteger(interval) && interval > 0) || (i + 1) % interval === 0;
+  const shared = num(raw("attention.shared_kv_layers"));
+  const ownsCache = (i) => !(Number.isInteger(shared) && shared > 0 && i >= nLayer - shared);
+
+  let full = 0;
+  let windowed = 0;
+  let recurrent = 0;
+  for (let i = 0; i < nLayer; i++) {
+    if (!ownsCache(i)) continue;
+    if (!attends(i)) {
+      recurrent += 1;
+      continue;
+    }
+    const nHead = at("attention.head_count", i);
+    const nHeadKv = at("attention.head_count_kv", i) ?? nHead;
+    const sliding = slides(i);
+    const dim = (key) =>
+      (sliding ? at(`attention.${key}_swa`, i) : undefined) ??
+      at(`attention.${key}`, i) ??
+      nEmbd / nHead;
+    const kLen = dim("key_length");
+    const vLen = dim("value_length");
+    if (![nHeadKv, kLen, vLen].every(usable)) return null;
+    const bytes = Math.ceil((kLen + vLen) * nHeadKv * 2);
+    if (sliding) windowed += bytes;
+    else full += bytes;
+  }
+  if (full + windowed <= 0) return null;
+
+  let state = 0;
+  if (recurrent > 0) {
+    const conv = num(raw("ssm.conv_kernel"));
+    const inner = num(raw("ssm.inner_size"));
+    const dState = num(raw("ssm.state_size"));
+    const groups = num(raw("ssm.group_count")) ?? 0;
+    if (![conv, inner, dState, groups].every(usable)) return null;
+    // llama.cpp's n_embd_r (the convolution state) and n_embd_s (the recurrent state proper).
+    const r = Math.max(conv - 1, 0) * (inner + 2 * groups * dState);
+    const s = dState * inner;
+    state = recurrent * (r + s) * 4;
+  }
+
+  return {
+    bytes_per_token: full,
+    window_bytes_per_token: windowed,
+    window: windowed > 0 ? window : null,
+    state_bytes: state,
+  };
 }
 
 // --- small pure helpers ------------------------------------------------------------------------
@@ -413,10 +689,19 @@ async function fetchOllamaManifest(repo, quant) {
   }
 }
 
+/** The files that make up one quant's weights, sorted: every shard of it, never its projector or a
+ *  draft head. One list for the size `sumQuantShards` sums and the headers `readQuantDecode` reads,
+ *  so the decode bytes always describe the file the size does. */
+export function quantShardPaths(files, label) {
+  return files
+    .filter((f) => matchesQuant(f.path, label) && !/mmproj/i.test(f.path) && !isDraftHead(f.path))
+    .map((f) => f.path)
+    .sort();
+}
+
 export function sumQuantShards(files, label) {
-  const parts = files.filter(
-    (f) => matchesQuant(f.path, label) && !/mmproj/i.test(f.path) && !isDraftHead(f.path),
-  );
+  const paths = new Set(quantShardPaths(files, label));
+  const parts = files.filter((f) => paths.has(f.path));
   if (parts.length === 0) return null;
   const bytes = parts.reduce((n, f) => n + (Number(f.size) || 0), 0);
   return bytes > 0 ? { bytes, sharded: parts.length > 1 } : null;

@@ -11,10 +11,11 @@
 // The last suite covers what that framing MISSED: the list being empty is not the same as having
 // nothing downloaded, and a folder PM cannot read is not a folder that is absent.
 
-import { render } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
 import { DownloadedModels } from "./LocalAiDownloaded";
+import { sectionLabel } from "./sections";
 
 // `useTheme` is stubbed so the section's <Button>s don't need the full ThemeProvider, matching
 // ConnectorItemRow.test.tsx.
@@ -54,6 +55,7 @@ const MODEL: LocalOnDiskModel = {
     kv: "f16",
     est_memory_gb: 3.4,
     est_tokens_per_sec: 40,
+    speed_basis: "system",
     notes: [],
   },
 };
@@ -79,6 +81,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     },
     reserve_gb: 2,
     gpu_reserve_gb: 1,
+    chat_speed: { floor_tps: 30, reply_tokens: 300, reply_secs: 10 },
     catalog_version: 1,
     catalog_generated_at: "2026-07-26",
     endpoint_configured: true,
@@ -95,6 +98,7 @@ function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
     disk_truncated: false,
     scan_dir: null,
     terms_accepted: [],
+    live_available_ram_gb: 20,
     ...over,
   };
 }
@@ -121,7 +125,9 @@ describe("DownloadedModels — the unserved gating hint", () => {
         onClearFolder={noop}
       />,
     );
-    expect(container.textContent).toContain("Connect an endpoint");
+    expect(container.textContent).toContain(
+      `Connect your server under ${sectionLabel("sec-localai-endpoint")}`,
+    );
     expect(container.textContent).not.toContain("None of these can be assigned yet");
   });
 
@@ -135,7 +141,7 @@ describe("DownloadedModels — the unserved gating hint", () => {
       />,
     );
     expect(container.textContent).not.toContain("can be assigned");
-    expect(container.textContent).not.toContain("Connect an endpoint");
+    expect(container.textContent).not.toContain("Connect your server under");
   });
 });
 
@@ -217,5 +223,138 @@ describe("a store PM is not allowed to read", () => {
     const { container } = render4({ endpoint_inventory: 0 });
     expect(container.textContent).toContain("nothing has been downloaded into it yet");
     expect(container.textContent).not.toContain("No model folder found");
+  });
+});
+
+describe("each model says how to get it served", () => {
+  // The hint above the list promises "each one says how to get it served"; this is that promise.
+  it("gives a single file the llama-server line that serves it as PM sized it", () => {
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [{ ...MODEL, source: "hugging_face" }] })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain(
+      "To use it here: It's a file on this computer. llama-server can serve it as it is:",
+    );
+    expect(container.querySelector("code")?.textContent).toBe(
+      'llama-server -m "/models/gemma-3-4b-it-Q4_K_M.gguf" --ctx-size 8192 -np 1',
+    );
+  });
+
+  it("words each file for the server PM is really connected to, not just for being connected", () => {
+    // The list holds every runner's unserved files whatever is connected — only PM's pick is limited
+    // to the connected runner's. So "the Ollama PM is connected to isn't serving it" is said only
+    // while that is this computer's Ollama, and "PM sees it" of an LM Studio file only while LM
+    // Studio is the server; a file another runner holds says what PM is connected to instead.
+    const OLLAMA_FILE: LocalOnDiskModel = {
+      ...MODEL,
+      name: "llama3.2:3b",
+      source: "ollama",
+      path: "/home/u/.ollama/models/manifests/registry.ollama.ai/library/llama3.2/3b",
+    };
+    const say = (model: LocalOnDiskModel, baseUrl: string, answered = true) => {
+      const { container } = render(
+        <DownloadedModels
+          recs={recs({
+            on_disk: [model],
+            disk_sources_present: [model.source],
+            // The connected server answered, serving one other model.
+            endpoint_inventory: answered ? 1 : null,
+          })}
+          configured
+          baseUrl={baseUrl}
+          onPickFolder={noop}
+          onClearFolder={noop}
+        />,
+      );
+      const text = container.textContent ?? "";
+      cleanup();
+      return text;
+    };
+
+    // Connected to LM Studio, with an Ollama download LM Studio doesn't serve.
+    const onLms = say(OLLAMA_FILE, "http://127.0.0.1:1234");
+    expect(onLms).toContain(
+      "To use it here: It's in Ollama's folder on this computer, but PM is connected to LM Studio — once this computer's Ollama is connected instead, it shows up by itself.",
+    );
+    expect(onLms).not.toContain("the Ollama PM is connected to");
+    // Connected to this computer's Ollama: it is that server that isn't serving it.
+    expect(say(OLLAMA_FILE, "http://127.0.0.1:11434")).toContain(
+      "To use it here: It's in an Ollama folder on this computer, but the Ollama PM is connected to isn't serving it — it probably keeps its models somewhere else.",
+    );
+
+    // Connected to Ollama, with an LM Studio download: PM won't see it there, so it says what to do.
+    const onOllama = say(MODEL, "http://127.0.0.1:11434");
+    expect(onOllama).toContain(
+      "To use it here: It's in LM Studio, but PM is connected to Ollama. To use it, load it in LM Studio, switch LM Studio's server on and connect PM to that instead.",
+    );
+    expect(onOllama).not.toContain("Load it there — PM sees it");
+    // Connected to LM Studio itself: load it, and PM sees it.
+    expect(say(MODEL, "http://127.0.0.1:1234")).toContain(
+      "To use it here: It's in LM Studio. Load it there — PM sees it within about half a minute.",
+    );
+
+    // The file's own server is connected but didn't answer: every file of its runner is listed then,
+    // so PM says what it knows — it isn't answering — rather than that it isn't serving this one.
+    const down = say(OLLAMA_FILE, "http://127.0.0.1:11434", false);
+    expect(down).toContain(
+      "To use it here: It's in Ollama's folder on this computer, and the Ollama PM is connected to isn't answering — once it's running, this shows up by itself.",
+    );
+    expect(down).not.toContain("isn't serving it");
+    expect(say(MODEL, "http://127.0.0.1:1234", false)).toContain(
+      "switch LM Studio's server on — PM sees it within about half a minute.",
+    );
+  });
+
+  it("says where a model runs from what its speed was worked out from", () => {
+    const onCard = { ...MODEL, fit: { ...MODEL.fit, speed_basis: "gpu_published" as const } };
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [onCard] })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain("On your graphics card");
+    expect(container.textContent).not.toContain("In system memory");
+  });
+
+  it("shows four, and folds the rest rather than scrolling them", () => {
+    const many = Array.from({ length: 6 }, (_, k) => ({
+      ...MODEL,
+      name: `model-${k}`,
+      path: `/m/${k}.gguf`,
+    }));
+    const { container, getByRole } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: many })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    const fold = getByRole("button", { name: "Show the other 2" });
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".overflow-y-auto")).toBeNull();
+    expect(container.textContent).toContain("model-5");
+  });
+
+  it("points an empty server at the start card's pick", () => {
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [], disk_sources_present: [], disk_found: 0, endpoint_inventory: 0 })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain(
+      `Your server is running, but nothing has been downloaded into it yet — ${sectionLabel("sec-localai-start")} suggests one for this computer.`,
+    );
   });
 });

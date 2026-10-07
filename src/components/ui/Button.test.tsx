@@ -142,3 +142,24 @@ describe("Button danger variant", () => {
     expect(text).toEqual(["text-xs"]);
   });
 });
+
+describe("Button variant", () => {
+  // Readable from outside, so a screen's primaries can be counted — the one-primary rule — without
+  // parsing class strings.
+  it("names its variant on the element, secondary by default", () => {
+    const { getAllByRole } = render(
+      <>
+        <Button variant="primary">A</Button>
+        <Button>B</Button>
+        <Button variant="tertiary">C</Button>
+        <Button variant="danger">D</Button>
+      </>,
+    );
+    expect(getAllByRole("button").map((b) => b.getAttribute("data-variant"))).toEqual([
+      "primary",
+      "secondary",
+      "tertiary",
+      "danger",
+    ]);
+  });
+});

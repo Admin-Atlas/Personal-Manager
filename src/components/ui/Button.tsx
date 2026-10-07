@@ -80,6 +80,9 @@ export function Button({
   const terminal = system === "terminal";
   return (
     <button
+      // The variant, readable from outside: a test can count the primaries on a screen — the
+      // one-primary-per-screen rule — without parsing class strings.
+      data-variant={variant}
       className={cn(
         "inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center gap-1.5 rounded-[var(--radius-sm)] transition disabled:cursor-not-allowed",
         SIZE[size],

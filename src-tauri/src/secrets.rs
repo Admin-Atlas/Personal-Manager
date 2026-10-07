@@ -206,6 +206,13 @@ enum BundleState {
     Untrusted,
 }
 
+/// Said when a caller needs to know what the keychain holds and PM can't read it
+/// ([`SecretCache::absence_is_known`]). True whether the read was refused or the item is damaged,
+/// and of a readout as much as a removal: the refusal comes before any keychain item is touched.
+const UNREADABLE_KEYCHAIN: &str = "PM can't read its saved keys from the keychain, so it can't \
+     tell what's saved there and has changed nothing in it. If your login keychain is locked, \
+     unlock it, then quit and reopen PM.";
+
 #[derive(Default)]
 struct SecretCache {
     loaded: bool,
@@ -398,6 +405,36 @@ impl SecretCache {
         Ok(())
     }
 
+    /// Fail unless an "absent" from this cache can be believed (see [`BundleState`]). `bundled` is
+    /// [`BUNDLED`] outside tests — a parameter so the refusal can be tested on a platform that
+    /// doesn't bundle. Pure: no keychain.
+    fn absence_is_known(&self, bundled: bool) -> Result<()> {
+        if absent_is_ambiguous_for(bundled, self.bundle) {
+            return Err(Error::Other(UNREADABLE_KEYCHAIN.into()));
+        }
+        Ok(())
+    }
+
+    /// [`get`](Self::get) for a caller whose answer is a claim about the keychain itself — "nothing
+    /// is saved" — rather than a value to use. On the bundled platform, after a bundle read that
+    /// failed or wouldn't parse, `get` answers `None` for a secret it simply couldn't see; this
+    /// answers an error instead, before any keychain item is touched.
+    fn get_known(&mut self, name: &str, bundled: bool) -> Result<Option<String>> {
+        self.load()?;
+        self.absence_is_known(bundled)?;
+        self.get(name)
+    }
+
+    /// [`delete`](Self::delete) that never reports a secret gone while it may still be saved. In the
+    /// state [`get_known`](Self::get_known) refuses, `delete` can't rewrite the bundle that holds the
+    /// value (`persist` rightly refuses), yet answers `Ok` — and records the name as proven absent,
+    /// so every later read agrees it is gone. This refuses first, and changes nothing.
+    fn delete_known(&mut self, name: &str, bundled: bool) -> Result<()> {
+        self.load()?;
+        self.absence_is_known(bundled)?;
+        self.delete(name)
+    }
+
     /// Spend one more keychain read, but ONLY if the last one failed.
     ///
     /// `load` deliberately burns its single attempt before reading, so a dismissed macOS consent
@@ -558,13 +595,29 @@ pub fn set_local_llm_endpoint_token(value: &str) -> Result<()> {
     set(LOCAL_LLM_ENDPOINT_TOKEN, value)
 }
 
+/// Forget the local-endpoint token; absent is success. An error, never a quiet `Ok`, when PM can't
+/// read the keychain well enough to know the token is gone (see [`SecretCache::delete_known`]):
+/// a token left behind would be sent to whichever server is connected next, with nothing on the tab
+/// to show it is there.
 pub fn clear_local_llm_endpoint_token() -> Result<()> {
-    delete(LOCAL_LLM_ENDPOINT_TOKEN)
+    cache().delete_known(LOCAL_LLM_ENDPOINT_TOKEN, BUNDLED)
 }
 
 /// Whether a local-endpoint bearer token is stored (presence only — the value never leaves Rust).
+/// Degrades to `false` while the keychain can't be read, like every other reader here, so the tab
+/// that shows it still loads; [`local_llm_endpoint_token_known_saved`] is for a caller that must
+/// not mistake "can't tell" for "no".
 pub fn has_local_llm_endpoint_token() -> Result<bool> {
     Ok(get_local_llm_endpoint_token()?.is_some())
+}
+
+/// [`has_local_llm_endpoint_token`], but an error rather than `false` when PM can't read the
+/// keychain well enough to know (see [`SecretCache::get_known`]) — for an answer that claims nothing
+/// is saved, such as "this tab is at its defaults".
+pub fn local_llm_endpoint_token_known_saved() -> Result<bool> {
+    Ok(cache()
+        .get_known(LOCAL_LLM_ENDPOINT_TOKEN, BUNDLED)?
+        .is_some_and(|v| !v.trim().is_empty()))
 }
 
 // --- Google OAuth (Step 6) ---
@@ -1138,6 +1191,58 @@ mod tests {
             cache.persist().is_err(),
             "a partial view must not replace the real item"
         );
+    }
+
+    #[test]
+    fn an_unreadable_bundle_never_says_the_server_token_is_gone() {
+        // The Local AI tab's reset (#445), Forget token and Disconnect clear the endpoint token, and
+        // the reset footer asks whether one is saved. On macOS, after a bundle read that was refused
+        // or wouldn't parse, `get` answered "absent" for a token it couldn't see and `delete`
+        // answered "done" without being able to rewrite the item holding it: the reset reported
+        // success, the footer said the tab was at its defaults, and the token came back on the next
+        // launch that could read the bundle — paired with whichever server was connected next.
+        // Only the refusing direction is asserted: the accepting one reaches the real OS keychain.
+        let mut cache = SecretCache {
+            loaded: true,
+            bundle: BundleState::Untrusted,
+            ..Default::default()
+        };
+        let readout = cache.get_known(LOCAL_LLM_ENDPOINT_TOKEN, true);
+        assert!(
+            readout.is_err(),
+            "\"can't tell\" must never read as \"none saved\""
+        );
+        let cleared = cache.delete_known(LOCAL_LLM_ENDPOINT_TOKEN, true);
+        assert!(
+            cleared.is_err(),
+            "a token PM couldn't remove must not be reported gone"
+        );
+        assert_eq!(
+            cleared.unwrap_err().to_string(),
+            readout.unwrap_err().to_string()
+        );
+        // And the refusal changed nothing: in particular the name is not now recorded as proven
+        // absent, which is what the plain `delete` does and every later read then believes.
+        assert!(cache.absent.is_empty());
+        assert!(cache.present.is_empty());
+        assert_eq!(cache.bundle, BundleState::Untrusted);
+        // Only that state refuses: a clean read, or a platform where each secret is its own item,
+        // knows what it holds.
+        for (bundled, state) in [
+            (true, BundleState::Trusted),
+            (false, BundleState::Untrusted),
+            (false, BundleState::Trusted),
+        ] {
+            let cache = SecretCache {
+                loaded: true,
+                bundle: state,
+                ..Default::default()
+            };
+            assert!(
+                cache.absence_is_known(bundled).is_ok(),
+                "bundled={bundled}, {state:?}"
+            );
+        }
     }
 
     #[test]

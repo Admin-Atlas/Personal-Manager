@@ -82,7 +82,13 @@ describe("ProviderChip", () => {
           power: {
             ...INERT_POWER_VIEW,
             state: "battery_low",
-            chat: { route: "cloud", blocked: null, local_model: "gemma3:4b" },
+            chat: {
+              route: "cloud",
+              blocked: null,
+              local_model: "gemma3:4b",
+              effective: "cloud_for_power",
+              cloud_key: "present",
+            },
           },
         })}
       />,
@@ -102,7 +108,13 @@ describe("ProviderChip", () => {
           status={st({
             power: {
               ...INERT_POWER_VIEW,
-              chat: { route, blocked: null, local_model: "gemma3:4b" },
+              chat: {
+                route,
+                blocked: null,
+                local_model: "gemma3:4b",
+                effective: "local_then_cloud",
+                cloud_key: "present",
+              },
             },
           })}
         />,

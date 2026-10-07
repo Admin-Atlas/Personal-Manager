@@ -13,6 +13,8 @@
 
 import { describe, expect, it } from "vitest";
 
+import { TUNING_TITLE } from "../components/localai/locate";
+import { LOCALAI_SECTIONS } from "../components/localai/sections";
 import { STATUS_LABEL } from "../components/ui/StatusBadge";
 import { HELP } from "./help";
 
@@ -54,5 +56,50 @@ describe("help registry hygiene", () => {
     expect(entry, "no help entry for settings-localai-power").toBeDefined();
     expect(entry?.title).toBe("On battery");
     expect(entry?.body).toMatch(/reduces power use by not running inference on your GPU/);
+  });
+});
+
+describe("the Local AI tab's help", () => {
+  it("has an entry for every section, titled with the section's own name", () => {
+    // Each section's wrapper points its `data-help` at its row's id; an entry titled with an old name
+    // would explain a heading the reader can't find.
+    for (const { id, label, help } of LOCALAI_SECTIONS) {
+      expect(HELP[help], `${id} → ${help}`).toBeDefined();
+      expect(HELP[help].title).toBe(label);
+    }
+  });
+
+  it("says nothing the redesign made untrue", () => {
+    const bodies = LOCALAI_SECTIONS.map((s) => HELP[s.help].body).join(" ");
+    // The speeds are estimates or rough guides now, never "conservative".
+    expect(bodies).not.toContain("The numbers are conservative estimates.");
+    // Sections are named, never pointed at by direction.
+    expect(bodies).not.toMatch(/\b(above|below)\b/);
+    // The fold it names is the one Model server shows.
+    expect(HELP["settings-localai-endpoint"].body).toContain(`“${TUNING_TITLE}”`);
+  });
+
+  it("no Local AI help calls a speed a ceiling", () => {
+    // A card's figure is an estimate scaled by PM's own tests, worded "about" wherever it is shown,
+    // and it can be under or over the real speed — so a "ceiling" anywhere would tell the reader the
+    // opposite of the line beside the number.
+    for (const { help } of LOCALAI_SECTIONS) {
+      expect(HELP[help].body, help).not.toMatch(/\bceilings?\b/);
+      expect(HELP[help].body, help).not.toMatch(/up to \d/);
+    }
+  });
+
+  it("never names the chat floor's figure", () => {
+    // Help is static and the backend owns the floor (better_fit.rs `chat_floor_tps`), so a number
+    // here could go on teaching one the pick no longer uses.
+    for (const { help } of LOCALAI_SECTIONS) expect(HELP[help].body, help).not.toMatch(/tok\/s/);
+  });
+
+  it("says the limit on unloading is PM's, not the servers'", () => {
+    // LM Studio can eject a model (in the app, `lms unload`, or its REST API since 0.4.0). What is
+    // true is that PM only drives Ollama's unload.
+    const body = HELP["settings-localai-lifecycle"].body;
+    expect(body).not.toMatch(/Only Ollama can unload/);
+    expect(body).toMatch(/PM can only ask Ollama to unload a model/);
   });
 });

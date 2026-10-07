@@ -46,8 +46,17 @@ export function PowerConsentStrip({ status }: { status: LocalLlmStatus | null })
  *
  * The safe answer comes first. "Keep using local" is the in-memory override, so PM asks again after
  * a restart; "Never switch" is the persistent no, stored as threshold 0.
+ *
+ * `inSettings`: asked from inside On battery itself, where the controls are just under the question —
+ * so it says so, instead of sending someone to the section they are already in.
  */
-export function PowerConsentAsk({ power }: { power: PowerView }) {
+export function PowerConsentAsk({
+  power,
+  inSettings = false,
+}: {
+  power: PowerView;
+  inSettings?: boolean;
+}) {
   // "sent" stays disabled until a snapshot arrives AFTER the answer: every one of these commands
   // pings the status, and that snapshot either unmounts this or, if it still asks, hands the buttons
   // back. Re-enabling on the resolve alone would offer a second answer to a question already gone.
@@ -81,8 +90,10 @@ export function PowerConsentAsk({ power }: { power: PowerView }) {
         <p>{consentText(power)}</p>
         <p className="text-xs">
           PM asks this once. If something else becomes able to move later, it asks once about that
-          too. "Keep using local" lasts until you quit PM, and PM asks again next time. You can
-          change any of this in Settings → Local AI → On battery.
+          too. "Keep using local" lasts until you quit PM, and PM asks again next time.{" "}
+          {inSettings
+            ? "You can change any of this below."
+            : "You can change any of this in Settings → Local AI → On battery."}
         </p>
         {failed && <p className="text-xs text-st-due">Couldn't save that. Try again.</p>}
       </div>

@@ -1,14 +1,30 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { ReactNode } from "react";
+
 import { formatGib } from "../../lib/format";
-import type { LocalDiskSource, LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
+import type {
+  LocalDiskSource,
+  LocalFitResult,
+  LocalOnDiskModel,
+  LocalRecommendations,
+} from "../../lib/types";
+import { useDepth } from "../../theme";
+import { CommandLine } from "./CommandLine";
 import { downloadedState, type DownloadedState } from "./downloadedState";
 import { ConfigRow, FitBadge } from "./fitDisplay";
-import { Button, SectionInfo, SectionLabel } from "../ui";
+import { onDiskHow } from "./readiness";
+import { SectionLink } from "./SectionLink";
+import { sectionHelp, sectionLabel } from "./sections";
+import { Button, Callout, Collapsible, SectionInfo, SectionLabel } from "../ui";
+
+/** How many models the list shows before the rest fold away. */
+const FIRST = 4;
 
 /**
- * "Already downloaded" (#449) — the models this device has, whoever put them there.
+ * "Already on this device" (#449) — the models this device has, whoever put them there, and for each
+ * one how to get it served.
  *
  * The whole section, because its copy and its empty states are one argument: an empty list means
  * four different things (nothing downloaded, a runner installed but empty, a folder PM is not
@@ -19,25 +35,33 @@ export function LocalAiDownloaded({
   recs,
   loading,
   configured,
+  baseUrl = null,
   onPickFolder,
   onClearFolder,
+  error,
 }: {
   recs: LocalRecommendations | null;
   loading: boolean;
   configured: boolean;
+  /** The stored endpoint, which decides how each file's advice is worded (`onDiskHow`). */
+  baseUrl?: string | null;
   onPickFolder: () => void;
   onClearFolder: () => void;
+  /** Something in this section went wrong, said here rather than at the top of the tab. */
+  error?: string | null;
 }) {
+  const { showMeta } = useDepth();
   return (
     <div
       id="sec-localai-downloaded"
       data-settings-section
-      data-help="settings-localai-downloaded"
+      data-help={sectionHelp("sec-localai-downloaded")}
       className="mt-5 border-t border-border pt-4"
     >
       <SectionLabel
         align="baseline"
         action={
+          showMeta &&
           !loading &&
           recs &&
           recs.installed.length + recs.on_disk.length > 0 && (
@@ -53,14 +77,16 @@ export function LocalAiDownloaded({
           )
         }
       >
-        Already downloaded
+        {sectionLabel("sec-localai-downloaded")}
       </SectionLabel>
+      {error && <Callout className="mt-2">{error}</Callout>}
       {loading ? (
         <p className="mt-2 text-xs text-ink4">Looking for downloaded models…</p>
       ) : recs ? (
         <DownloadedModels
           recs={recs}
           configured={configured}
+          baseUrl={baseUrl}
           onPickFolder={onPickFolder}
           onClearFolder={onClearFolder}
         />
@@ -101,14 +127,18 @@ const DISK_SOURCE_LABEL: Record<LocalDiskSource, string> = {
 
 /** The one sentence for each state that isn't a list. Split out so the copy sits beside the ladder's
  *  reasoning instead of inside a nested ternary, and so each branch can be read against the machine
- *  state it describes. */
-function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): string {
+ *  state it describes. Sections are named, never pointed at "above" or "below". */
+function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): ReactNode {
   switch (state.kind) {
     case "endpointHasAll": {
       const one = state.count === 1;
-      return `Your server has ${state.count} model${one ? "" : "s"} downloaded, and PM can see ${
-        one ? "it" : "them all"
-      } — ${one ? "it's" : "they're"} listed under Assign roles above.`;
+      return (
+        <>
+          Your server has {state.count} model{one ? "" : "s"} downloaded, and PM can see{" "}
+          {one ? "it" : "them all"} — you can give {one ? "it" : "them"} a job under{" "}
+          <SectionLink to="sec-localai-roles" />.
+        </>
+      );
     }
     case "allServed":
       return `Found ${listJoin(
@@ -117,16 +147,26 @@ function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): string {
     case "folderEmpty":
       return `Found ${listJoin(state.runners)} on this device, but nothing downloaded into it yet.`;
     case "endpointEmpty":
-      return "Your server is running, but nothing has been downloaded into it yet — pick one from Recommended models above.";
+      return (
+        <>
+          Your server is running, but nothing has been downloaded into it yet —{" "}
+          <SectionLink to="sec-localai-start" /> suggests one for this computer.
+        </>
+      );
     case "blocked":
       // Never suggests changing the permissions. The store belongs to a service account, and telling
       // someone to loosen one so a settings panel can count files would be a bad trade PM has no
       // business proposing. Connecting the server gets the same answer and costs nothing.
-      return state.root.source === "folder"
-        ? `PM isn't allowed to read the folder you pointed it at (${state.root.path}), so it can't say what's in there.`
-        : `${DISK_SOURCE_LABEL[state.root.source]} keeps its models at ${
-            state.root.path
-          }, and PM isn't allowed to read that folder — the packaged Linux server owns its store as its own user, which is normal and nothing is wrong. Connect it below and PM will ask the server what it has instead.`;
+      return state.root.source === "folder" ? (
+        `PM isn't allowed to read the folder you pointed it at (${state.root.path}), so it can't say what's in there.`
+      ) : (
+        <>
+          {DISK_SOURCE_LABEL[state.root.source]} keeps its models at {state.root.path}, and PM isn't
+          allowed to read that folder — the packaged Linux server owns its store as its own user,
+          which is normal and nothing is wrong. Connect it under{" "}
+          <SectionLink to="sec-localai-endpoint" /> and PM will ask the server what it has instead.
+        </>
+      );
     case "noFolder":
       return `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`;
   }
@@ -140,15 +180,20 @@ function emptyCopy(state: Exclude<DownloadedState, { kind: "list" }>): string {
 export function DownloadedModels({
   recs,
   configured,
+  baseUrl = null,
   onPickFolder,
   onClearFolder,
 }: {
   recs: LocalRecommendations;
   /** An endpoint is saved. Decides which half of the gating hint applies. */
   configured: boolean;
+  /** The stored endpoint. This list holds every runner's unserved files whatever is connected, so
+   *  each card words its advice against the server PM is really connected to, not just "connected". */
+  baseUrl?: string | null;
   onPickFolder: () => void;
   onClearFolder: () => void;
 }) {
+  const { showMeta } = useDepth();
   const found = recs.disk_sources_present
     .filter((s) => s !== "folder")
     .map((s) => DISK_SOURCE_LABEL[s]);
@@ -169,16 +214,50 @@ export function DownloadedModels({
       ) : (
         <>
           <p className="mb-2 text-xs text-ink4">
-            {configured
-              ? "None of these can be assigned yet — PM can only use a model your endpoint is actually serving. Load one in the app you downloaded it with and it shows up under Assign roles above within about half a minute."
-              : "This is what's on your device, not what PM can use yet. Connect an endpoint above, then load the model in the app you downloaded it with, and it appears under Assign roles."}
+            {configured ? (
+              <>
+                None of these can be assigned yet — PM can only use a model your server is actually
+                serving. Each one says how to get it served; it then shows up under{" "}
+                <SectionLink to="sec-localai-roles" /> within about half a minute.
+              </>
+            ) : (
+              <>
+                This is what's on your device, not what PM can use yet. Connect your server under{" "}
+                <SectionLink to="sec-localai-endpoint" /> first; each model says how to get it
+                served, and it then appears under <SectionLink to="sec-localai-roles" />.
+              </>
+            )}
           </p>
-          <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
-            {recs.on_disk.map((m) => (
-              <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
+          {/* The first few, then the rest folded — no inner scroller, so the wheel moves the tab. */}
+          <div className="space-y-2">
+            {recs.on_disk.slice(0, FIRST).map((m) => (
+              <OnDiskCard
+                key={`${m.source}:${m.path}:${m.name}`}
+                model={m}
+                baseUrl={configured ? baseUrl : null}
+                answered={recs.endpoint_inventory != null}
+              />
             ))}
           </div>
-          {found.length > 0 && (
+          {recs.on_disk.length > FIRST && (
+            <Collapsible
+              title={`Show the other ${recs.on_disk.length - FIRST}`}
+              defaultOpen={false}
+              className="mt-2"
+            >
+              <div className="mt-2 space-y-2">
+                {recs.on_disk.slice(FIRST).map((m) => (
+                  <OnDiskCard
+                    key={`${m.source}:${m.path}:${m.name}`}
+                    model={m}
+                    baseUrl={configured ? baseUrl : null}
+                    answered={recs.endpoint_inventory != null}
+                  />
+                ))}
+              </div>
+            </Collapsible>
+          )}
+          {showMeta && found.length > 0 && (
             <p className="mt-2 text-xs text-ink4">Found via {listJoin(found)}.</p>
           )}
         </>
@@ -208,7 +287,35 @@ export function DownloadedModels({
   );
 }
 
-function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
+/** Where a fit runs, from what its speed was worked out from — the card's config row says it rather
+ *  than assuming system memory for a model that sits on the graphics card. */
+function runsIn(fit: LocalFitResult): string {
+  switch (fit.speed_basis) {
+    case "gpu_published":
+    case "gpu_typical":
+      return "On your graphics card";
+    case "shared":
+      return "In shared memory";
+    default:
+      return "In system memory";
+  }
+}
+
+function OnDiskCard({
+  model,
+  baseUrl,
+  answered,
+}: {
+  model: LocalOnDiskModel;
+  baseUrl: string | null;
+  answered: boolean;
+}) {
+  const { showMeta } = useDepth();
+  // The same words the start card uses for PM's pick when it is a file on this computer. What is
+  // connected changes the advice: an Ollama-folder file shows up by itself only once this computer's
+  // Ollama is connected, and only that server's listing has already taken out what it serves — a
+  // file another runner holds is listed whatever PM is connected to.
+  const how = onDiskHow(model.source, model.shards, model.path, model.fit, baseUrl, answered);
   return (
     <div className="rounded-[var(--radius-sm)] border border-border px-3 py-2">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -217,15 +324,17 @@ function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
       </div>
       <p className="mt-0.5 text-xs text-ink4">
         {DISK_SOURCE_LABEL[model.source]} · {formatGib(model.size_gb)}
-        {model.quant ? ` · ${model.quant}` : ""}
-        {model.shards > 1 ? ` · ${model.shards} files` : ""}
+        {showMeta && model.quant ? ` · ${model.quant}` : ""}
+        {showMeta && model.shards > 1 ? ` · ${model.shards} files` : ""}
       </p>
-      <ConfigRow label="In system memory" fit={model.fit} />
+      <ConfigRow label={runsIn(model.fit)} fit={model.fit} />
       {model.fit.notes.map((n, i) => (
         <p key={i} className="mt-1 text-xs text-ink4">
           {n}
         </p>
       ))}
+      <p className="mt-1 text-xs text-ink3">To use it here: {how.line}</p>
+      {how.command && <CommandLine command={how.command} />}
     </div>
   );
 }
