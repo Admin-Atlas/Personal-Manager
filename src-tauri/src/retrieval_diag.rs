@@ -19,6 +19,8 @@
 //! judges) and query-time reranking. Background work on the background key; the pure
 //! [`build_messages`] is unit-tested without a network call.
 
+use tauri::Manager;
+
 use crate::commands_dev::DevRetrievalExplain;
 use crate::error::Result;
 use crate::openrouter::ChatMessage;
@@ -40,8 +42,24 @@ pub async fn diagnose(
     let messages = build_messages(symptom, query, explain);
     // No cache_prefix: each diagnostic carries a different explain state, so there's no stable
     // prefix to reuse across calls.
-    let crate::llm_gateway::LlmOutcome { completion, .. } =
+    let crate::llm_gateway::LlmOutcome { completion, meta } =
         crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    // Billed, so it gets a usage row like every other background call — before the reply is judged,
+    // because an unusable one was billed all the same. `"background"`: the kind CHECK admits no other.
+    // The guard is taken after the await and dropped at the end of the `if let`.
+    let state = app.state::<crate::AppState>();
+    if let Ok(conn) = state.conn() {
+        crate::commands::log_usage(
+            &conn,
+            "background",
+            completion
+                .model
+                .as_deref()
+                .or(Some(plan.primary_model_id())),
+            &completion.usage,
+            &meta,
+        );
+    }
     // "Not best-effort" (above) applies to the reply too: a blank 200 used to return Ok("") — an
     // empty diagnosis presented as success — and a cut-off one displayed mid-sentence, unmarked.
     match completion.usable_text() {

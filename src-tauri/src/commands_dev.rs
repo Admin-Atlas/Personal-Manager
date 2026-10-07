@@ -214,6 +214,11 @@ const TABLES: &[Table] = &[
             plain("completion_tokens"),
             plain("cost_usd"),
             plain("created_at"),
+            // The v37 serving columns: which provider answered, how long it took, and why cloud
+            // served a request a local route preferred (a failure, or the On battery policy).
+            plain("provider"),
+            plain("latency_ms"),
+            plain("fallback_reason"),
         ],
     },
     Table {

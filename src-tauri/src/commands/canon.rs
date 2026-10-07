@@ -700,7 +700,7 @@ pub async fn propose_project_metadata(
     names: Option<Vec<String>>,
     on_event: Channel<ProjectProposalEvent>,
 ) -> Result<()> {
-    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+    let Some(mut plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
@@ -737,7 +737,12 @@ pub async fn propose_project_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
-    for t in targets {
+    for (i, t) in targets.into_iter().enumerate() {
+        // One model call per project, so a long list re-resolves between them (#432): a run started
+        // on mains follows the user onto battery at the next project.
+        if i > 0 {
+            llm_gateway::refresh_plan(&app, Role::Background, &mut plan);
+        }
         let others: Vec<String> = all_projects
             .iter()
             .filter(|p| **p != t.name)
@@ -746,7 +751,12 @@ pub async fn propose_project_metadata(
         let (proposal, usage_info) =
             projects::propose(&app, &plan, &t.name, &t.samples, &others).await;
         if let Some((usage, served, meta)) = usage_info {
-            usage_rows.push((served, usage, meta));
+            // Attributed now: the plan the run ends on may not be the one that billed this call.
+            usage_rows.push((
+                served.or_else(|| Some(plan.primary_model_id().to_string())),
+                usage,
+                meta,
+            ));
         }
         let _ = on_event.send(ProjectProposalEvent::Proposed {
             project: t.name,

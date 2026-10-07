@@ -19,49 +19,7 @@ import type {
   FileDisposition,
   NameDisposition,
 } from "../lib/types";
-import { Button, Callout, Dialog } from "./ui";
-
-/** One radio row. Plain radios rather than a segmented control: these are consequential, mutually
- *  exclusive choices that each need a sentence of explanation, which a compact toggle can't carry. */
-function Choice<T extends string>({
-  name,
-  value,
-  current,
-  onSelect,
-  label,
-  detail,
-  disabled,
-}: {
-  name: string;
-  value: T;
-  current: T;
-  onSelect: (v: T) => void;
-  label: string;
-  detail: string;
-  disabled: boolean;
-}) {
-  const id = `${name}-${value}`;
-  return (
-    <label
-      htmlFor={id}
-      className="flex cursor-pointer items-start gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 hover:bg-surface"
-    >
-      <input
-        id={id}
-        type="radio"
-        name={name}
-        checked={current === value}
-        onChange={() => onSelect(value)}
-        disabled={disabled}
-        className="mt-0.5 shrink-0"
-      />
-      <span className="text-sm leading-snug">
-        <span className="text-ink2">{label}</span>
-        <span className="block text-xs text-ink4">{detail}</span>
-      </span>
-    </label>
-  );
-}
+import { Button, Callout, Dialog, RadioChoice } from "./ui";
 
 export function DeleteProjectDialog({
   project,
@@ -159,7 +117,7 @@ export function DeleteProjectDialog({
 
           <fieldset className="mt-4">
             <legend className="text-xs font-medium text-ink3">Its files</legend>
-            <Choice
+            <RadioChoice
               name="files"
               value="unsorted"
               current={files}
@@ -168,7 +126,7 @@ export function DeleteProjectDialog({
               detail="Kept and still searchable; they return to the review queue's inbox."
               disabled={busy}
             />
-            <Choice
+            <RadioChoice
               name="files"
               value="delete"
               current={files}
@@ -181,7 +139,7 @@ export function DeleteProjectDialog({
 
           <fieldset className="mt-3">
             <legend className="text-xs font-medium text-ink3">Its chats</legend>
-            <Choice
+            <RadioChoice
               name="chats"
               value="global"
               current={chats}
@@ -190,7 +148,7 @@ export function DeleteProjectDialog({
               detail="They stay in your history, just no longer tied to a project."
               disabled={busy}
             />
-            <Choice
+            <RadioChoice
               name="chats"
               value="delete"
               current={chats}
@@ -203,7 +161,7 @@ export function DeleteProjectDialog({
 
           <fieldset className="mt-3">
             <legend className="text-xs font-medium text-ink3">Its name</legend>
-            <Choice
+            <RadioChoice
               name="pname"
               value="unsorted"
               current={name}
@@ -212,7 +170,7 @@ export function DeleteProjectDialog({
               detail="If this name turns up in a future document, it files to your inbox instead of quietly recreating the project."
               disabled={busy}
             />
-            <Choice
+            <RadioChoice
               name="pname"
               value="free"
               current={name}

@@ -3089,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "3.136.2-alpha"
+version = "3.137.0-alpha"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -3106,6 +3106,8 @@ dependencies = [
  "libc",
  "notify",
  "notify-debouncer-full",
+ "objc2-core-foundation",
+ "objc2-io-kit",
  "open",
  "reqwest 0.12.28",
  "rrule",

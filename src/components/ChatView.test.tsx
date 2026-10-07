@@ -110,3 +110,44 @@ describe("Reduced motion", () => {
     }
   });
 });
+
+describe("the provenance footer", () => {
+  const reply = {
+    ...message(2),
+    role: "assistant" as const,
+    content: "an answer",
+    model: "openai/gpt-test",
+  };
+
+  it("says when a reply went to the cloud because of the battery", () => {
+    // A power-routed turn is a deliberate route (#432), so it is worded in the footer — plainly,
+    // with its reason on hover — rather than surfacing as the fallback strip.
+    const { container } = render(
+      <ChatView
+        messages={[message(1), reply]}
+        streaming={null}
+        showProvenance
+        providers={{ 2: "cloud-on-battery" }}
+      />,
+    );
+    const footer = container.querySelector('[data-help="chat-provenance"]');
+    expect(footer?.textContent).toBe("via gpt-test · cloud, on battery");
+    expect(footer?.getAttribute("title")).toBe(
+      "Sent to your cloud model because you were on battery.",
+    );
+  });
+
+  it("keeps the plain words, and no battery title, for an ordinary turn", () => {
+    const { container } = render(
+      <ChatView
+        messages={[message(1), reply]}
+        streaming={null}
+        showProvenance
+        providers={{ 2: "cloud" }}
+      />,
+    );
+    const footer = container.querySelector('[data-help="chat-provenance"]');
+    expect(footer?.textContent).toBe("via gpt-test · cloud");
+    expect(footer?.hasAttribute("title")).toBe(false);
+  });
+});

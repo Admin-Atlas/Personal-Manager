@@ -27,6 +27,8 @@ export { SegmentedControl, type SegOption, type SegmentedControlProps } from "./
 // nothing supplied.
 export { SectionLabel, type SectionLabelProps } from "./SectionLabel";
 export { SettingRow, type SettingRowProps } from "./SettingRow";
+// A radio row with its explanation — the other way a Settings label is associated with its control.
+export { RadioChoice, type RadioChoiceProps } from "./RadioChoice";
 export { Card, type CardProps } from "./Card";
 export { Collapsible, type CollapsibleProps } from "./Collapsible";
 export { SectionInfo, type SectionInfoProps } from "./SectionInfo";

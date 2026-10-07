@@ -531,9 +531,11 @@ pub async fn distill_blob(
     existing: &[String],
 ) -> Result<Vec<DraftPreference>> {
     let messages = distill_messages(blob, existing);
-    // Distillation doesn't record usage, so the serving metadata is discarded.
-    let crate::llm_gateway::LlmOutcome { completion: c, .. } =
-        crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome {
+        completion: c,
+        meta,
+    } = crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    log_billed(app, plan, &c, &meta);
     // This one must not degrade quietly. Its caller — `commands::prefs::migrate_preferences_once` —
     // stamps `MIGRATED_FLAG_KEY` in the same transaction as the records it inserts, and that flag is
     // a ONE-WAY DOOR: the migration is guarded on it and never runs again. An unreadable reply
@@ -555,6 +557,27 @@ pub async fn distill_blob(
             "couldn't read the imported profile — the model's reply held no readable list".into(),
         )
     })
+}
+
+/// Record a billed call's usage row, logged before the reply is judged: an unusable reply was billed
+/// all the same. `"background"` because `usage_log.kind` admits only the kinds its CHECK lists, and a
+/// new one would be rejected and only printed. Best-effort, like every usage row.
+fn log_billed(
+    app: &tauri::AppHandle,
+    plan: &crate::llm_gateway::RoutePlan,
+    c: &crate::openrouter::Completion,
+    meta: &crate::llm_gateway::CallMeta,
+) {
+    use tauri::Manager;
+    let state = app.state::<crate::AppState>();
+    let Ok(conn) = state.conn() else { return };
+    crate::commands::log_usage(
+        &conn,
+        "background",
+        c.model.as_deref().or(Some(plan.primary_model_id())),
+        &c.usage,
+        meta,
+    );
 }
 
 /// Cap on the already-known list injected into the distil prompt. A user with hundreds of records
@@ -629,8 +652,11 @@ pub async fn parse_statement(
     project_names: &[String],
 ) -> Result<DraftPreference> {
     let messages = parse_messages(text, project_names);
-    let crate::llm_gateway::LlmOutcome { completion: c, .. } =
-        crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome {
+        completion: c,
+        meta,
+    } = crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    log_billed(app, plan, &c, &meta);
     // A cut-off or blank reply is the MODEL's failure — saying "try rephrasing" for it blames the
     // user's sentence for something no rephrasing can fix.
     let Some(reply) = c.usable_text() else {

@@ -35,6 +35,7 @@ const done = (over: Partial<Extract<ChatEvent, { type: "done" }>> = {}): ChatEve
   content: "yo",
   citations: [],
   served_by: "cloud",
+  on_battery: false,
   ...over,
 });
 
@@ -99,5 +100,19 @@ describe("useChatStream provider honesty", () => {
 
     expect(result.current.fallback).toBeNull();
     expect(result.current.providers[9]).toBeUndefined();
+  });
+
+  it("records a power-routed turn as such, and never as a fallback", () => {
+    // The On battery policy (#432) is a choice the user made, not something that went wrong: the
+    // footer words it, and the warning strip — the failure family's surface — stays down.
+    const current = 1;
+    const { result } = renderHook(() => useChatStream(() => current));
+    act(() => {
+      void result.current.send(1, "hi");
+    });
+    act(() => h.onEvent!(done({ message_id: 42, served_by: "cloud", on_battery: true })));
+
+    expect(result.current.providers[42]).toBe("cloud-on-battery");
+    expect(result.current.fallback).toBeNull();
   });
 });

@@ -58,7 +58,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "sidebar-models": {
     title: "Models in use",
-    body: "The models PM is currently using — 'Chat' for your conversations and 'Tasks' for background work (sorting and learning). Each row names whatever will actually answer: if you have pointed that role at a model on your own machine, that is the name you see, and the cloud model behind it becomes the fallback. A '+N' badge means auto-switch is on with N fallback models behind it. 'Local' below them is your own model server's connection. Click to change any of it in Settings.",
+    body: "The models PM is currently using — 'Chat' for your conversations and 'Tasks' for background work (sorting and learning). Each row names whatever will actually answer: if you have pointed that role at a model on your own machine, that is the name you see, and the cloud model behind it becomes the fallback. A '+N' badge means auto-switch is on with N fallback models behind it. 'Local' below them is your own model server's connection. Click to change any of it in Settings. On battery, a row can say 'on battery': PM has moved that role to your cloud model under your On battery setting, and the row names the cloud model answering. 'kept local' means you asked PM to stay on this machine anyway.",
   },
   "sidebar-search": {
     title: "Search",
@@ -304,11 +304,15 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-localai-roles": {
     title: "Assign roles",
-    body: "Choose which local model answers your chats and which runs background work, and how each falls back: Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server).",
+    body: "Choose which local model answers your chats and which runs background work, and how each falls back: Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server). The On battery section below is separate: it can move a role set to Local, fall back to cloud onto your cloud model while the battery is low, and asks before it first does.",
+  },
+  "settings-localai-power": {
+    title: "On battery",
+    body: 'When your laptop is on battery and the charge falls to the level you choose, PM can send new requests from your local model to your cloud model instead. That reduces power use by not running inference on your GPU. You choose what moves — chat, background work, or both — and only roles set to Local, fall back to cloud ever move. PM waits a minute before acting on any change, comes back to your local model about a minute after you plug in, and asks you before it first moves anything — once for what it asks about, and once more only if something else could move later. A reply that has started always finishes where it began. "Keep using local until I quit PM" keeps your own model for the rest of the session and is never saved.',
   },
   "settings-localai-lifecycle": {
     title: "Holding the graphics card",
-    body: "A local model sits in your graphics card's memory for as long as your server keeps it there, which on some setups is forever. This decides when PM hands that memory back: never (your server's business), when you quit PM, or after a quiet period. PM only ever unloads a model it loaded itself \u2014 one you started in a terminal is left alone \u2014 and it never changes how long your server keeps models by itself, because asking for that once would reprogram the server for every program that talks to it.",
+    body: "A local model sits in your graphics card's memory for as long as your server keeps it there, which on some setups is forever. This decides when PM hands that memory back: never (your server's business), when you quit PM, or after a quiet period. PM only ever unloads a model it loaded itself \u2014 one you started in a terminal is left alone \u2014 and it never changes how long your server keeps models by itself, because asking for that once would reprogram the server for every program that talks to it. On battery it can also hand the memory back after a quiet spell, whatever the policy above says.",
   },
   "settings-localai-downloaded": {
     title: "Already downloaded",

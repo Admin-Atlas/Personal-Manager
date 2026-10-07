@@ -79,6 +79,10 @@ mod outlook_calendar;
 mod pathguard;
 mod paths;
 mod photos;
+// The On battery policy (#432): the pure latch and settings parsers in `power`, the per-OS reading of
+// the machine's power source in `power_source`. The watcher that joins them lives in `local_ai`.
+mod power;
+mod power_source;
 mod preferences;
 mod project_activity;
 mod projects;
@@ -820,7 +824,26 @@ impl AppState {
         // during ordinary use, well before anyone reaches for Rebuild — which is also independently
         // guarded (`rebuild_core` calls this first).
         self.reconcile_chat_identity();
+        // Teach the On battery latch this store's threshold now, not at the watcher's next tick. On
+        // a passphrase vault the store was shut at launch, so the latch has been running on "never",
+        // and the launch baseline — there so a cold start on battery can't load a model before the
+        // policy engages — would otherwise arrive up to a poll after the first message.
+        self.learn_power_threshold();
         Ok(())
+    }
+
+    /// Hand the open store's On battery threshold to the latch (#432). The DB guard is dropped
+    /// before the latch's leaf lock is taken, so the two are never held together.
+    fn learn_power_threshold(&self) {
+        let threshold = self.conn().ok().and_then(|conn| {
+            db::get_setting(&conn, power::THRESHOLD_KEY)
+                .ok()
+                .map(|v| power::threshold_from(v.as_deref()))
+        });
+        if let Some(t) = threshold {
+            self.local_ai
+                .power_apply_threshold(t, std::time::Instant::now());
+        }
     }
 
     /// Take the open connection out of the session, closing the store (the `Drop` of the
@@ -1510,6 +1533,10 @@ pub fn run() {
             // mid-sync, and a no-op until there are milestones/events in the near window.
             flags::spawn_flag_detection_scheduler(handle.clone());
             local_ai::spawn_release_scheduler(handle.clone());
+            // The On battery watcher (#432): reads the machine's power source every thirty seconds
+            // and feeds the latch routing reads. Its own loop, so a release waiting on the slot's
+            // lane can never stall it.
+            local_ai::spawn_power_watcher(handle.clone());
 
             // Tell the provider surfaces the moment a local call starts, not only when it ends.
             //
@@ -1600,6 +1627,8 @@ pub fn run() {
             local_ai::release_local_gpu,
             local_ai::get_local_release_policy,
             local_ai::set_local_release_policy,
+            local_ai::set_local_power_policy,
+            local_ai::keep_local_on_battery,
             local_ai::set_local_model_rescan_cadence,
             settings::get_settings,
             settings::settings_defaults,

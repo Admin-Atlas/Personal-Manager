@@ -366,12 +366,15 @@ export type ChatEvent =
   // Developer mode only: the exact assembled request + the confidence readout, once before streaming.
   | { type: "prompt"; messages: PromptMessage[]; confidence: GroundingConfidence }
   // `served_by` is which provider actually answered ("local"/"cloud"), for the per-message footer.
+  // `on_battery` is the On battery policy having moved this turn to the cloud (#432) — a deliberate
+  // route the footer words, never a failure, so it never arrives as a `fallback` event.
   | {
       type: "done";
       message_id: number;
       content: string;
       citations: Citation[];
       served_by: "local" | "cloud";
+      on_battery: boolean;
     }
   | { type: "error"; message: string }
   // The reply was served by cloud despite a local-endpoint preference (#297): local failed or was
@@ -379,6 +382,10 @@ export type ChatEvent =
   // (`hard_failure:<kind>` / `cooldown`); `FallbackStrip` maps it to friendly copy. Arrives after
   // the tokens, before `done`.
   | { type: "fallback"; from_model: string; to_model: string; reason: string };
+
+/** Who answered a turn, as the per-message footer words it: `served_by` plus the `on_battery` flag
+ *  from the same `done` event, folded into one value so the footer has one table to read. */
+export type ServedBy = "local" | "cloud" | "cloud-on-battery";
 
 /** A cloud-served fallback the chat honesty strip renders (#297). Mirrors `ChatEvent`'s `fallback`
  *  arm minus the discriminant. Shared by `useChatStream`'s transient state and `FallbackStrip`. */
@@ -1882,6 +1889,8 @@ export interface LocalGpuResidency {
 export interface LocalReleaseSettings {
   policy: string;
   idle_minutes: number;
+  /** "On battery, hand the memory back" (#432), in whole minutes. 0 = off. */
+  battery_idle_minutes: number;
 }
 
 /** How two models bound to the two roles behave sharing one server (fit.rs CoResidencyFit).
@@ -2012,6 +2021,59 @@ export interface AiProviderStatus {
   onboarding_done: boolean;
 }
 
+/** The machine's power source as last read, before PM settles on it (power.rs PowerSource). */
+export type PowerSourceName = "ac" | "battery" | "unknown";
+/** What PM acts on, after the level and time guards (power.rs PowerState). "mains" also covers a
+ *  machine PM can't read and a reading PM has stopped trusting. */
+export type PowerState = "mains" | "battery" | "battery_low";
+/** Which roles the On battery policy may move (power.rs PowerScope). */
+export type PowerScope = "chat" | "background" | "both";
+/** What the policy is doing to one role right now (llm_gateway.rs PowerRoute). */
+export type PowerRoute = "unchanged" | "needs_consent" | "kept_local" | "cloud";
+/** Why the policy can never move a role, in the order the copy prefers (llm_gateway.rs
+ *  PowerBlocked). */
+export type PowerBlocked =
+  "cloud_routing" | "no_local_model" | "no_key" | "key_unreadable" | "local_only";
+
+/** One role's half of the On battery answer (local_ai.rs PowerRoleView). */
+export interface PowerRoleView {
+  route: PowerRoute;
+  /** null = the policy can move this role. */
+  blocked: PowerBlocked | null;
+  /** The role's bound local model — parked, not gone, while `route` is "cloud". null for a role
+   *  that goes to the cloud anyway. */
+  local_model: string | null;
+}
+
+/** The On battery policy's stored values and live state (#432, local_ai.rs PowerView). Computed in
+ *  Rust by the same functions routing uses, so the UI only words it and never re-derives the
+ *  threshold, the return band or the one-minute guard. */
+export interface PowerView {
+  /** The latest raw reading, before settling. */
+  source: PowerSourceName;
+  percent: number | null;
+  has_battery: boolean;
+  /** What PM acts on. */
+  state: PowerState;
+  /** The open store's switch level; 0 = never switch. */
+  threshold: number;
+  /** The level the battery has to climb back to before PM returns to local while unplugged. */
+  return_at: number;
+  roles: PowerScope;
+  /** The roles the user has said may go to the cloud on battery, or null for none. Per role: a yes
+   *  about background work is not a yes about chat. */
+  consent: PowerScope | null;
+  /** Some role would move now but for the one-time question — the consent strip's only trigger. */
+  consent_needed: boolean;
+  /** "Keep using local until I quit PM". In memory only, never saved. */
+  keep_local: boolean;
+  /** Some OpenRouter key exists for either role. Chat's "no_key" alone can't tell a keyless setup
+   *  from one with only a background key. */
+  any_cloud_key: boolean;
+  chat: PowerRoleView;
+  background: PowerRoleView;
+}
+
 /** Live endpoint status for the tab's connection chip (local_ai.rs LocalLlmStatus). */
 export interface LocalLlmStatus {
   configured: boolean;
@@ -2020,7 +2082,8 @@ export interface LocalLlmStatus {
   cooldown_remaining_s: number;
   probed_now: boolean;
   /** The local model bound to Chat, but only when chat routing actually sends chat to it — null
-   *  means the role goes to cloud and the cloud model is the true answer for that row. */
+   *  while the role goes to cloud, including while the On battery policy has moved it, so the cloud
+   *  model is the true answer for that row. */
   chat_local_model: string | null;
   /** The same for background work. */
   background_local_model: string | null;
@@ -2051,9 +2114,13 @@ export interface LocalLlmStatus {
   chat_loaded: boolean | null;
   background_loaded: boolean | null;
   /** PM itself handed this model back, on the user's release policy — the difference between "your
-   *  server let it go" and "you asked PM to". Only meaningful while it is not loaded. */
+   *  server let it go" and "you asked PM to". Only meaningful while it is not loaded. The loaded and
+   *  released fields describe the role's BOUND local model, also while the On battery policy has
+   *  parked it. */
   chat_released: boolean;
   background_released: boolean;
+  /** The On battery policy (#432). */
+  power: PowerView;
 }
 
 /** What one "does this actually work" test found (local_ai.rs LocalTestResult). */

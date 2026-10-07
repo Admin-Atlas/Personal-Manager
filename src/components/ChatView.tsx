@@ -18,6 +18,7 @@ import type {
   GroundingConfidence,
   Message,
   PromptMessage,
+  ServedBy,
 } from "../lib/types";
 import { scrollBehavior, useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
@@ -48,10 +49,11 @@ interface Props {
   /** Developer mode only: the grounding-confidence readout for a turn (top rerank score / threshold /
    *  gated), keyed by assistant message id, shown under the answer for calibrating the gate (card #402). */
   confidences?: Record<number, GroundingConfidence>;
-  /** Which provider answered each turn ("local"/"cloud"), keyed by assistant message id (#297). Live-
-   *  session only (from the `done` event) — a reloaded-from-history turn has no entry and shows the
-   *  model name alone (the provider is not persisted). */
-  providers?: Record<number, "local" | "cloud">;
+  /** Which provider answered each turn ("local"/"cloud", or "cloud-on-battery" for a turn the On
+   *  battery policy moved), keyed by assistant message id (#297, #432). Live-session only (from the
+   *  `done` event) — a reloaded-from-history turn has no entry and shows the model name alone (the
+   *  provider is not persisted). */
+  providers?: Record<number, ServedBy>;
   /** Show the per-message "via <model> · local/cloud" provenance footer. True only when a local
    *  endpoint is configured, so a cloud-only user sees no change (#297). */
   showProvenance?: boolean;
@@ -520,6 +522,14 @@ function ConfidenceThresholdControl() {
   );
 }
 
+/** How the provenance footer words who answered. A power-routed turn is a cloud reply the user's
+ *  own On battery setting chose (#432) — said plainly, never as a failure. */
+const SERVED_LABEL: Record<ServedBy, string> = {
+  local: "local",
+  cloud: "cloud",
+  "cloud-on-battery": "cloud, on battery",
+};
+
 /** One message and, for a grounded assistant turn, its sources — wired so an inline
  *  `[n]` marker scrolls to and flashes source n. `highlight` flashes the whole turn when a chat
  *  citation navigated here to it (card 7E PR3); `registerBlock` lets the parent scroll it into view. */
@@ -544,7 +554,7 @@ const MessageBlock = memo(function MessageBlock({
   message: Message;
   prompt?: PromptMessage[];
   confidence?: GroundingConfidence;
-  provider?: "local" | "cloud";
+  provider?: ServedBy;
   showProvenance?: boolean;
   showPrompt?: boolean;
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
@@ -604,9 +614,17 @@ const MessageBlock = memo(function MessageBlock({
         <SaveAsNoteButton message={message} />
       )}
       {showProvenance && message.role === "assistant" && atLeast("standard") && message.model && (
-        <p className="px-1 text-[0.625rem] text-ink4" data-help="chat-provenance">
+        <p
+          className="px-1 text-[0.625rem] text-ink4"
+          data-help="chat-provenance"
+          title={
+            provider === "cloud-on-battery"
+              ? "Sent to your cloud model because you were on battery."
+              : undefined
+          }
+        >
           via {shortModel(message.model)}
-          {provider ? ` · ${provider}` : ""}
+          {provider ? ` · ${SERVED_LABEL[provider]}` : ""}
         </p>
       )}
     </div>

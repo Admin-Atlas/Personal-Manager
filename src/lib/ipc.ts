@@ -62,6 +62,7 @@ import type {
   LocalServedModel,
   LocalTestResult,
   LocalTestSnapshot,
+  PowerScope,
   PullProgress,
   PullSnapshot,
   LanguageOptions,
@@ -1622,8 +1623,6 @@ export const restoreFromGdrive = (name: string, passphrase: string) =>
 export const localHardwareScan = (force = false) =>
   invoke<LocalHardware>("local_hardware_scan", { force });
 
-/** The Workbench payload: the hardware scan + the curated catalog scored against this machine +
- *  any models the configured endpoint already serves + any found on disk, sorted best-fit first. */
 /** What the local server currently has loaded, and what PM may release (#786 item 8). */
 export const localGpuResidency = () => invoke<LocalGpuResidency>("local_gpu_residency");
 
@@ -1633,11 +1632,37 @@ export const releaseLocalGpu = () => invoke<number>("release_local_gpu");
 
 export const getLocalReleasePolicy = () => invoke<LocalReleaseSettings>("get_local_release_policy");
 
-/** Store the release policy. `idleMinutes` is clamped in Rust, so an out-of-range value is corrected
- *  rather than rejected. */
-export const setLocalReleasePolicy = (policy: string, idleMinutes?: number) =>
-  invoke<void>("set_local_release_policy", { policy, idleMinutes });
+/** Store the release policy. Each argument left out (or `null`) leaves its stored value alone, so
+ *  the battery row can write its one field without restating the policy. `idleMinutes` and
+ *  `batteryIdleMinutes` are clamped in Rust, so an out-of-range value is corrected rather than
+ *  rejected; `batteryIdleMinutes: 0` turns the on-battery release off. */
+export const setLocalReleasePolicy = (
+  policy: string | null,
+  idleMinutes?: number,
+  batteryIdleMinutes?: number,
+) => invoke<void>("set_local_release_policy", { policy, idleMinutes, batteryIdleMinutes });
 
+/** Store the On battery policy (#432). Each field left out leaves its stored value alone.
+ *  `threshold: 0` is "never switch". `consent` names the roles a yes is about — it is added to any
+ *  earlier yes and never covers a role the question didn't name — and `"none"` withdraws every yes.
+ *  The backend pings `local-llm://status`, so the status snapshot catches up without a refetch. */
+export const setLocalPowerPolicy = (p: {
+  threshold?: number;
+  roles?: PowerScope;
+  consent?: PowerScope | "none";
+}) =>
+  invoke<void>("set_local_power_policy", {
+    threshold: p.threshold ?? null,
+    roles: p.roles ?? null,
+    consent: p.consent ?? null,
+  });
+
+/** "Keep using local until I quit PM" (#432). Memory only — deliberately not a `set_*` command, so
+ *  the Settings "Saved ✓" tick never claims something was saved that a restart forgets. */
+export const keepLocalOnBattery = (on: boolean) => invoke<void>("keep_local_on_battery", { on });
+
+/** The Workbench payload: the hardware scan + the curated catalog scored against this machine +
+ *  any models the configured endpoint already serves + any found on disk, sorted best-fit first. */
 export const localModelRecommendations = () =>
   invoke<LocalRecommendations>("local_model_recommendations");
 
