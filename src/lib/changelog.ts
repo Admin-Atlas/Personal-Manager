@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.6-alpha",
+    date: "2026-10-08",
+    highlights: [
+      "Under-the-hood tidying: five sets of the tests PM runs on its own code were leaving throwaway folders behind, about 60 on every full check and nearly 700 on one developer’s machine in under a day. They now clear up after themselves. A note in PM’s build settings about a Windows library that is waiting for an update has been corrected too, and so have a few notes on how Windows updates install. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.139.5-alpha",
     date: "2026-10-08",
     highlights: [

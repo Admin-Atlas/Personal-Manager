@@ -11,11 +11,11 @@
 //
 // Importing the module does not run the gate — entry-point guard at the bottom of it.
 
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   contentHash,
@@ -58,12 +58,19 @@ const entry = (repo, id, term, over = {}) => ({
   ...over,
 });
 
+// Every fixture tree is removed after its test, so a run leaves nothing behind in the temp folder.
+const roots = [];
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 /**
  * A throwaway tree. `content_hash` is computed from the entries as given, so a test that wants the
  * hash check to fire has to break it deliberately rather than by accident.
  */
 function fixture({ entries, terms, models, schemaVersion = 2, hash }) {
   const root = mkdtempSync(join(tmpdir(), "pm-model-licences-"));
+  roots.push(root);
   mkdirSync(join(root, "src-tauri", "src"), { recursive: true });
   writeFileSync(
     join(root, CATALOGUE_FILE),

@@ -7,10 +7,10 @@
 //! Microsoft's cloud vouches for it OR it carries an Authenticode signature chaining to a
 //! Trusted Root CA. There is **no per-app "Run anyway"** override. Our Windows installer is
 //! an unsigned NSIS `*-setup.exe` (the updater's minisign key is not an Authenticode cert),
-//! so SAC blocks it. The stock `tauri-plugin-updater` (2.11+) applies an update by running
-//! Tauri's `cleanup_before_exit` (**every window hidden, the tray icon dropped**), then
-//! `ShellExecuteW(setup.exe)`, then `std::process::exit(0)`; when the launch fails it returns
-//! an error instead of exiting, and `src/lib/useUpdater.ts` has to bring the main window back
+//! so SAC blocks it. The stock `tauri-plugin-updater` applies an update by running Tauri's
+//! `cleanup_before_exit` (**every window hidden, the tray icon dropped**), then
+//! `ShellExecuteW(setup.exe)`, then `std::process::exit(0)`; since 2.11, when the launch fails it
+//! returns an error instead of exiting, and `src/lib/useUpdater.ts` has to bring the main window back
 //! to say so. (Up to 2.10 it never checked the launch, so the block was invisible: the app
 //! closed and reopened on the old version.) Either way a restart under enforcement cannot
 //! succeed, so the updater banner reads this state to warn *before* offering one.

@@ -528,9 +528,12 @@ mod tests {
 
     const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
-    fn open() -> Connection {
-        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap()
+    /// A throwaway encrypted store. The caller holds the folder, so it is removed when the test
+    /// ends.
+    fn open() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        (dir, conn)
     }
 
     /// An index-only document with one anchor location, exactly as the v54 backfill leaves it.
@@ -580,7 +583,7 @@ mod tests {
         // complete pass planned a Delete and flagged a live file `source_missing`, unrecoverably —
         // `set_state` for the NEW id resolved through `document_of`, found nothing, and wrote
         // nothing, on that pass and every one after it.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:F1");
         conn.execute(
             "UPDATE documents SET source_id = 'gdrive:swm:R9:F1' WHERE id = ?1",
@@ -634,7 +637,7 @@ mod tests {
         // same place. The place is not lost — it is recorded under the new id — so what is left at
         // the old id is a second record of it, naming something that no longer exists. Left behind
         // it would be reaped as missing; it goes instead.
-        let conn = open();
+        let (_dir, conn) = open();
         let keeper = doc(&conn, "gdrive:swm:R9:F1");
         let other = doc(&conn, "gdrive:a@x.com:F1");
         assert!(rekey(&conn, "gdrive:a@x.com:F1", "gdrive:swm:R9:F1").unwrap());
@@ -675,7 +678,7 @@ mod tests {
         // The property the whole model exists for, and Bobby's reason for choosing it: the file is
         // gone from one Drive account while the copy in a tracked folder is still there and still
         // being edited. A primary-only model would either go stale or reap it.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:f1");
         record(
             &conn,
@@ -721,7 +724,7 @@ mod tests {
         // The query #711 depends on. Read off `documents.source_id`, as every connector did before
         // v54, a folded duplicate's id would come back as a brand-new file on the next pass and the
         // duplicate would rebuild itself forever.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:swm:root1:f1");
         record(
             &conn,
@@ -753,7 +756,7 @@ mod tests {
     fn a_shared_drive_namespace_is_excluded_from_its_accounts_own_set() {
         // My Drive ids and shared-drive ids share the account prefix; the reconcile of one must not
         // see the other's files or it would delete them as absent.
-        let conn = open();
+        let (_dir, conn) = open();
         doc(&conn, "gdrive:a@x.com:f1");
         doc(&conn, "gdrive:a@x.com:sd:drive9:f2");
         let mine = known_ids(&conn, "gdrive:a@x.com:", Some("gdrive:a@x.com:sd:")).unwrap();
@@ -764,7 +767,7 @@ mod tests {
     fn one_expired_account_does_not_flip_a_file_the_user_also_has_locally() {
         // The fan-out moves LOCATIONS; the document's state is re-derived from all of them. Before
         // v54 this was a single UPDATE over `documents` and the local copy went unreachable too.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:f1");
         record(
             &conn,
@@ -801,7 +804,7 @@ mod tests {
         // `documents`' pointer columns describe the ANCHOR location, because that is what every
         // pre-v54 reader of them assumes. A sibling's ref must not leak into the row and send the
         // reader to the wrong place.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:f1");
         record(
             &conn,
@@ -834,7 +837,7 @@ mod tests {
     fn a_document_with_no_locations_is_left_entirely_alone() {
         // Vault documents, chats, photos and promoted imports are not described by this table, and
         // blanking their columns would be destructive rather than merely wrong.
-        let conn = open();
+        let (_dir, conn) = open();
         conn.execute(
             "INSERT INTO documents (vault_path, title, content_hash, project, source_type, \
                  source_state, external_ref) \
@@ -859,7 +862,7 @@ mod tests {
     fn re_observing_a_location_keeps_when_pm_first_saw_it_there() {
         // `first_seen_at` answers "since when has PM known the file was here" — a re-observation
         // does not change that, and the duplicate panel orders siblings by it.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:f1");
         let before: String = conn
             .query_row(
@@ -904,7 +907,7 @@ mod tests {
         // A re-observation that reports no path has not discovered there isn't one — and
         // `external_ref` is the reader's only way back to a local file, so blanking it would make
         // the document unopenable on the strength of a connector saying nothing.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "local:abc:f9");
         record(
             &conn,
@@ -932,7 +935,7 @@ mod tests {
     fn an_unreachable_copy_is_still_worth_opening() {
         // Only `source_missing` has nothing to try. An expired sign-in should reach the provider and
         // surface ITS error, which tells the user what to do; PM's stored guess does not.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:f1");
         set_state(&conn, "gdrive:a@x.com:f1", SourceState::Unreachable).unwrap();
         let best = fetchable(&conn, id).unwrap().unwrap();
@@ -993,7 +996,7 @@ mod tests {
         // The lookup that stops a second document being minted. The owner indexed the file; the
         // recipient's shared-with-me walk reaches the same fileId under a root id the owner never
         // sees, and lands on the document that already exists.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:1AbC");
         let key = provenance_key("gdrive:swm:rootB:1AbC").unwrap();
         assert_eq!(document_for_key(&conn, &key).unwrap(), Some(id));
@@ -1008,7 +1011,7 @@ mod tests {
         // second, divergent copy of the rule as SQL. So every pre-#711 row arrives NULL and this is
         // what makes it findable — including the legacy twin shape, which is exactly the case the
         // SQL version would have got wrong.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:sd:drive9:1AbC");
         conn.execute("UPDATE document_locations SET provenance_key = NULL", [])
             .unwrap();
@@ -1024,7 +1027,7 @@ mod tests {
         // `document_locations.document_id` cascades on delete, so a fold that deleted first would
         // destroy the very locations it meant to rescue — and the folded id would come back as a
         // brand-new file on the next pass, rebuilding the duplicate forever.
-        let conn = open();
+        let (_dir, conn) = open();
         let survivor = doc(&conn, "gdrive:a@x.com:1AbC");
         let doomed = doc(&conn, "gdrive:swm:rootB:1AbC");
         assert_eq!(move_all(&conn, doomed, survivor).unwrap(), 1);
@@ -1047,7 +1050,7 @@ mod tests {
         // NULL says "PM has not looked yet", and the sync path decides whether to spend a request
         // on the ancestry lookup by exactly that difference — collapse them and every root-level
         // file is re-walked on every pass, forever.
-        let conn = open();
+        let (_dir, conn) = open();
         let id = doc(&conn, "gdrive:a@x.com:f1");
         record(
             &conn,
@@ -1146,7 +1149,7 @@ mod tests {
 
     #[test]
     fn an_unknown_source_id_is_a_miss_rather_than_a_write() {
-        let conn = open();
+        let (_dir, conn) = open();
         assert!(!set_state(&conn, "gdrive:nobody:f1", SourceState::Ok).unwrap());
         assert!(!set_external_ref(&conn, "gdrive:nobody:f1", Some("/x")).unwrap());
         assert!(document_of(&conn, "gdrive:nobody:f1").unwrap().is_none());

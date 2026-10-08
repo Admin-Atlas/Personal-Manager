@@ -776,24 +776,22 @@ pub async fn propose_project_metadata(
 #[cfg(test)]
 mod merge_project_tests {
     use super::resolve_merge_pair;
+    use crate::commands::shared::temp_db;
     use crate::entities;
 
-    const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-
-    fn conn_with_projects(names: &[&str]) -> rusqlite::Connection {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = crate::db::open(&dir.path().join("t.sqlite"), DB_KEY).unwrap();
-        // Leak the tempdir: the Connection must outlive it, and these are short-lived tests.
-        std::mem::forget(dir);
+    /// A throwaway store holding these projects. The caller holds the folder, so it is removed
+    /// when the test ends.
+    fn conn_with_projects(names: &[&str]) -> (tempfile::TempDir, rusqlite::Connection) {
+        let (dir, conn) = temp_db();
         for n in names {
             entities::resolve_project(&conn, n, true).unwrap();
         }
-        conn
+        (dir, conn)
     }
 
     #[test]
     fn resolves_a_real_pair_and_reports_the_target_canonical() {
-        let conn = conn_with_projects(&["Landing Page Redesign", "Marketing"]);
+        let (_dir, conn) = conn_with_projects(&["Landing Page Redesign", "Marketing"]);
         let (from, into, canonical) =
             resolve_merge_pair(&conn, "Landing Page Redesign", "Marketing").unwrap();
         assert_ne!(from, into);
@@ -803,7 +801,7 @@ mod merge_project_tests {
 
     #[test]
     fn refuses_merging_a_project_into_itself() {
-        let conn = conn_with_projects(&["Atlas"]);
+        let (_dir, conn) = conn_with_projects(&["Atlas"]);
         let err = resolve_merge_pair(&conn, "Atlas", "Atlas").unwrap_err();
         assert!(
             err.to_string().contains("same project"),
@@ -815,7 +813,7 @@ mod merge_project_tests {
     /// a different name — and the one a user is most likely to reach by accident.
     #[test]
     fn refuses_a_self_merge_reached_through_an_alias() {
-        let conn = conn_with_projects(&["Personal Manager"]);
+        let (_dir, conn) = conn_with_projects(&["Personal Manager"]);
         let id = entities::resolve_project(&conn, "Personal Manager", false)
             .unwrap()
             .unwrap();
@@ -829,7 +827,7 @@ mod merge_project_tests {
 
     #[test]
     fn refuses_merging_out_of_the_unsorted_inbox() {
-        let conn = conn_with_projects(&["Unsorted", "Marketing"]);
+        let (_dir, conn) = conn_with_projects(&["Unsorted", "Marketing"]);
         let err = resolve_merge_pair(&conn, "Unsorted", "Marketing").unwrap_err();
         assert!(err.to_string().contains("inbox"), "unexpected error: {err}");
         // Merging INTO Unsorted stays allowed — a deliberate "these belong back in the inbox".
@@ -838,7 +836,7 @@ mod merge_project_tests {
 
     #[test]
     fn refuses_an_unknown_or_blank_project() {
-        let conn = conn_with_projects(&["Marketing"]);
+        let (_dir, conn) = conn_with_projects(&["Marketing"]);
         assert!(resolve_merge_pair(&conn, "Ghost", "Marketing").is_err());
         assert!(resolve_merge_pair(&conn, "Marketing", "Ghost").is_err());
         assert!(resolve_merge_pair(&conn, "   ", "Marketing").is_err());
@@ -848,7 +846,7 @@ mod merge_project_tests {
 
     #[test]
     fn delete_resolves_a_real_project_to_its_canonical() {
-        let conn = conn_with_projects(&["Marketing"]);
+        let (_dir, conn) = conn_with_projects(&["Marketing"]);
         let (id, canonical) = super::resolve_deletable_project(&conn, "Marketing").unwrap();
         assert!(id > 0);
         assert_eq!(canonical, "Marketing");
@@ -858,7 +856,7 @@ mod merge_project_tests {
     /// the user to type, so confirming against the clicked label would be confirming the wrong name.
     #[test]
     fn delete_through_an_alias_reports_the_canonical_name() {
-        let conn = conn_with_projects(&["Personal Manager"]);
+        let (_dir, conn) = conn_with_projects(&["Personal Manager"]);
         let id = entities::resolve_project(&conn, "Personal Manager", false)
             .unwrap()
             .unwrap();
@@ -871,7 +869,7 @@ mod merge_project_tests {
     /// Deleting the inbox would destroy or strand every unreviewed document in it.
     #[test]
     fn refuses_to_delete_the_unsorted_inbox() {
-        let conn = conn_with_projects(&["Unsorted", "Marketing"]);
+        let (_dir, conn) = conn_with_projects(&["Unsorted", "Marketing"]);
         let err = super::resolve_deletable_project(&conn, "Unsorted").unwrap_err();
         assert!(err.to_string().contains("inbox"), "unexpected error: {err}");
         assert!(super::resolve_deletable_project(&conn, "Marketing").is_ok());
@@ -879,7 +877,7 @@ mod merge_project_tests {
 
     #[test]
     fn refuses_to_delete_an_unknown_or_blank_project() {
-        let conn = conn_with_projects(&["Marketing"]);
+        let (_dir, conn) = conn_with_projects(&["Marketing"]);
         assert!(super::resolve_deletable_project(&conn, "Ghost").is_err());
         assert!(super::resolve_deletable_project(&conn, "   ").is_err());
     }

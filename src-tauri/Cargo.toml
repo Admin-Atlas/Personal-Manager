@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.139.5-alpha"
+version = "3.139.6-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -153,9 +153,10 @@ keyring = { version = "3", features = ["windows-native"] }
 # Windows Hello for the optional, opt-in app-lock (a soft UI gate — see applock.rs).
 # Microsoft-maintained bindings; windows-future supplies the `IAsyncOperation::get()` we block on.
 # Held on 0.61 / windows-future 0.2. Since Tauri 2.12 the Tauri stack resolves windows 0.62, and
-# only this and iana-time-zone's windows-core edge keep 0.61. Moving to 0.62 / 0.3, plus
-# `cargo update -p iana-time-zone`, drops ~9 duplicate crates; it is a follow-up that needs live
-# tests of Windows Hello, the AppContainer sandbox and the vault ACL probe.
+# since #877 iana-time-zone is on windows-core 0.62 too, so PM's own two pins (this one and
+# windows-future below) are all that keep the 0.61 set in Cargo.lock. Moving both to 0.62 / 0.3
+# drops 9 duplicate crates; it is a follow-up that needs live tests of Windows Hello, the
+# AppContainer sandbox and the vault ACL probe.
 windows = { version = "0.61", features = [
     "Security_Credentials_UI",
     "Win32_Foundation",
