@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
-import { smartAppControlState, packageManagedLinux } from "./ipc";
+import { smartAppControlState, packageManagedLinux, showMainWindow } from "./ipc";
 import type { SmartAppControlState } from "./types";
 import { evaluateAttemptMarker } from "./updateGate";
 
@@ -27,14 +27,18 @@ import { evaluateAttemptMarker } from "./updateGate";
  * the backend up front whether this is a package install and, if so, skip the download entirely and
  * surface a "reinstall to update" banner pointing at the releases page instead.
  *
- * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, and
- * the updater plugin applies an update by launching it and exiting the process WITHOUT
- * observing whether it launched. So an OS block — Smart App Control (SAC) enforced, or a
- * SmartScreen "Don't run" — silently closes the app and it reopens on the old version, and
- * `install()` never throws (the `catch` below is unreachable on that path). Two guards:
- * (1) we read SAC state up front and, when it's enforcing, warn instead of firing a restart
- * that would no-op; (2) we record the version we're about to install and, if the app reopens
- * still on the old one, flag it next launch instead of silently re-offering the same update.
+ * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, so the OS
+ * can refuse it — Smart App Control (SAC) enforced, a SmartScreen "Don't run", an antivirus
+ * quarantine. The updater plugin (2.11+) applies an update by first running Tauri's
+ * `cleanup_before_exit` — every window hidden, the tray icon dropped, the webview's resources
+ * cleared, this staged update included — then launching the installer and exiting. A refusal
+ * lands one of two ways. If the launch itself fails, `install()` throws into a PM that is still
+ * running but stripped. If the installer launched and was stopped afterwards, PM has already
+ * exited, and it reopens on the old version with no error. Three guards: (1) we read SAC state up
+ * front and, when it's enforcing, warn instead of firing a restart that can't succeed; (2) the
+ * `catch` in `restart` brings the main window back before it shows the failure; (3) we record the
+ * version we're about to install and, if the app reopens still on the old one, flag it next
+ * launch instead of silently re-offering the same update.
  */
 export type UpdateStatus =
   | "idle" // no update, still checking, or check failed (silent)
@@ -53,11 +57,13 @@ export interface AppUpdate {
   /** True once the user clicked "Later" — the banner collapses to a slim chip. */
   dismissed: boolean;
   /** True after an in-place install threw — the banner offers a manual download instead.
-   *  Reachable on macOS (Gatekeeper can refuse the swapped app); on Windows the plugin exits
-   *  the process before it can throw, so the loop marker below covers that case instead. */
+   *  Reachable on macOS (Gatekeeper can refuse the swapped app) and on Windows when the
+   *  installer won't launch. There the plugin has already cleared the staged update, so the
+   *  banner can't offer "Try again" in this session. A block after a successful launch exits
+   *  PM before anything can throw; the loop marker below covers that case. */
   installFailed: boolean;
-  /** Windows Smart App Control state. When "enforced", a restart would be silently blocked,
-   *  so the banner warns and explains how to proceed rather than offering it. */
+  /** Windows Smart App Control state. When "enforced", a restart would be blocked, so the
+   *  banner warns and explains how to proceed rather than offering it. */
   sac: SmartAppControlState;
   /** True when a prior install attempt silently didn't apply (the app reopened on the old
    *  version and the feed is re-offering the same update) — the banner warns instead of
@@ -193,9 +199,10 @@ export function useUpdater(): AppUpdate {
         // Keep the last-known state.
       }
       if (current === "enforced") {
-        // Do NOT call install(): under SAC-enforced the plugin would launch the unsigned
-        // installer, get silently blocked, and exit(0) — closing PM with no signal and no
-        // update. Leave the app running; the banner explains that SAC must be turned off.
+        // Do NOT call install(): the unsigned installer can't run under SAC enforcement, and
+        // the plugin strips PM (every window hidden, the tray gone) before it launches it. At
+        // best that ends in the catch below, at worst in PM closing with no signal and no
+        // update. Leave the app running untouched; the banner explains that SAC must be turned off.
         return;
       }
 
@@ -203,8 +210,9 @@ export function useUpdater(): AppUpdate {
       setInstallFailed(false);
       try {
         // Record the version we're about to install so that, if the app reopens still on the
-        // old version (a silent OS block we can't catch inside install()), the next launch
-        // warns instead of silently re-offering the same update.
+        // old version (the installer launched, so the plugin exited, and then it didn't apply —
+        // nothing install() can report), the next launch warns instead of silently re-offering
+        // the same update.
         if (update.version) {
           try {
             localStorage.setItem(ATTEMPT_KEY, update.version);
@@ -215,8 +223,18 @@ export function useUpdater(): AppUpdate {
         await update.install();
         await relaunch();
       } catch {
-        // The in-place update threw (reachable on macOS — Gatekeeper can refuse the swapped
-        // bundle). We got a real signal, so clear the marker and offer a manual download.
+        // The in-place update threw: macOS (Gatekeeper can refuse the swapped bundle), or
+        // Windows when the installer wouldn't launch. On Windows the plugin has ALREADY run
+        // Tauri's cleanup_before_exit by now, so every window is hidden. Show the main window
+        // FIRST or the banner below renders where nobody can see it, and with the tray gone
+        // there would be no way back to it. A failure to show must not mask the install
+        // failure, so it is swallowed.
+        try {
+          await showMainWindow();
+        } catch {
+          // Still report the failed install below.
+        }
+        // We got a real signal, so clear the marker and offer a manual download.
         try {
           localStorage.removeItem(ATTEMPT_KEY);
         } catch {

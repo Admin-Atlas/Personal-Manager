@@ -1424,9 +1424,10 @@ export const destroyBriefingWindow = () => invoke<void>("destroy_briefing_window
  *  `briefing://closed` so the setting follows — see {@link onBriefingWindowClosed}. */
 export const closeBriefingWindow = () => invoke<void>("close_briefing_window");
 
-/** Bring PM's main window to the front — the briefing window's "Open PM" button. A PM command, not
- *  `@tauri-apps/api/window`: that is `plugin:`-prefixed and ACL-gated, and the briefing webview's
- *  capability grants only dragging and event listen/unlisten. */
+/** Bring PM's main window to the front — the briefing window's "Open PM" button, and the updater's
+ *  failed-install path (the Windows plugin hides every window before the installer launch fails).
+ *  A PM command, not `@tauri-apps/api/window`: that is `plugin:`-prefixed and ACL-gated, and the
+ *  briefing webview's capability grants only dragging and event listen/unlisten. */
 export const showMainWindow = () => invoke<void>("show_main_window");
 
 /** Subscribe to `briefing://closed` (the event name is `tray.rs`'s `BRIEFING_CLOSED_EVENT`) — the

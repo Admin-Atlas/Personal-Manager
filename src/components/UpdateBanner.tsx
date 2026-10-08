@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { PLATFORM, type SetupPlatform } from "../lib/setupGuide";
 import type { AppUpdate } from "../lib/useUpdater";
 import { Button } from "./ui";
 
@@ -11,11 +12,20 @@ import { Button } from "./ui";
  *
  * Failure surfaces two ways. On Windows, Smart App Control (when enforced) blocks our
  * unsigned installer with no override, so we detect that up front and explain how to proceed
- * rather than firing a restart that would silently close the app and reopen on the old version.
- * Otherwise, if an install threw (macOS Gatekeeper) or a prior attempt silently didn't apply,
- * we point the user at a manual download.
+ * rather than firing a restart that can't succeed. Otherwise, if an install threw (macOS
+ * Gatekeeper, or Windows refusing to launch the installer) or a prior attempt silently didn't
+ * apply, we point the user at a manual download. A throw on Windows can't be retried in the
+ * same session — the plugin cleared the staged update before the launch failed — so that banner
+ * says to reopen PM instead of offering "Try again".
  */
-export function UpdateBanner({ update }: { update: AppUpdate }) {
+export function UpdateBanner({
+  update,
+  platform = PLATFORM,
+}: {
+  update: AppUpdate;
+  /** The running OS — a prop only so tests can pick one; App passes nothing. */
+  platform?: SetupPlatform;
+}) {
   if (update.status !== "ready" && update.status !== "installing") return null;
 
   const shell =
@@ -75,9 +85,15 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
   }
 
   const sacBlocked = update.sac === "enforced";
-  // A restart threw (macOS) or a prior attempt silently didn't apply (a non-SAC Windows block,
-  // e.g. SmartScreen "Don't run") — a manual download is the way forward in both.
+  // A restart threw (macOS, or Windows when the installer wouldn't launch) or a prior attempt
+  // silently didn't apply (a Windows block after the installer launched, once PM had exited) —
+  // a manual download is the way forward in both.
   const installFailed = !sacBlocked && (update.installFailed || update.blockedByPriorAttempt);
+  // Can a restart work in THIS session? Not after an install threw on Windows: before the launch
+  // failed, the updater plugin cleared the staged update (and hid every window, dropped the tray),
+  // so only a fresh PM can download it again. A prior attempt's silent block stays retryable —
+  // this session downloaded the update afresh.
+  const retryable = !(update.installFailed && platform === "windows");
 
   // After "Later", collapse to a slim, always-reachable chip so the staged update isn't lost
   // for the session — the user can still restart (or retry once SAC is off) whenever they like.
@@ -87,13 +103,26 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
         <span>
           {sacBlocked
             ? `${label} paused — Smart App Control is on`
-            : installFailed
-              ? `${label} couldn't install`
-              : `${label} ready`}
+            : !retryable
+              ? `${label} couldn't install — reopen PM to try again`
+              : installFailed
+                ? `${label} couldn't install`
+                : `${label} ready`}
         </span>
-        <Button variant="tertiary" size="sm" onClick={update.restart}>
-          {sacBlocked ? "Try again" : "Restart to update"}
-        </Button>
+        {retryable ? (
+          <Button variant="tertiary" size="sm" onClick={update.restart}>
+            {sacBlocked ? "Try again" : "Restart to update"}
+          </Button>
+        ) : (
+          <a
+            href={update.releasesUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-ink underline underline-offset-2 hover:text-ink2"
+          >
+            Get it
+          </a>
+        )}
       </div>
     );
   }
@@ -121,13 +150,16 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
   }
 
   // The in-place update couldn't apply — point the user at a manual download from the releases
-  // page instead of silently looping a failing restart.
+  // page instead of silently looping a failing restart. When this session can't retry, say how to
+  // get a fresh attempt instead of offering a "Try again" that would only fail again.
   if (installFailed) {
     return (
       <div className={shell}>
         <span>
           Couldn&apos;t install the update automatically
           {update.version ? ` (version ${update.version})` : ""}.
+          {!retryable &&
+            " Close PM and open it again to retry, or download it from the releases page."}
         </span>
         <span className={actions}>
           <a
@@ -138,9 +170,15 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
           >
             Download it manually
           </a>
-          <Button variant="tertiary" size="sm" onClick={update.restart}>
-            Try again
-          </Button>
+          {retryable ? (
+            <Button variant="tertiary" size="sm" onClick={update.restart}>
+              Try again
+            </Button>
+          ) : (
+            <Button variant="tertiary" size="sm" onClick={update.dismiss}>
+              Later
+            </Button>
+          )}
         </span>
       </div>
     );
