@@ -277,8 +277,8 @@ function kTokens(n: number): string {
  * Matched on the config, never the tag: the pick is judged at the context PM sizes it for (32k, or
  * less for a model made for less, better_fit.rs `pick_context`) and the cards at the model's trained
  * one, so the pick's own file is often on a rung here at a longer context and a compressed cache —
- * the dev laptop's gemma 4 12b, its pick before speed counted on a card, was Q3_K_M at 32k on f16 as
- * the pick, and Q3_K_M at 64k on q8_0 as the card's GPU rung.
+ * the dev laptop's pick, gemma 4 12b, is Q3_K_M at 32k on f16, and the same Q3_K_M file at 64k on
+ * q8_0 is the card's GPU rung.
  *
  * The reason is the one that really separates them. When a rung has the pick's file, or the pick is
  * the highest-quality build at its own context (`rung: "quality"`), it is the context; otherwise it
@@ -345,7 +345,7 @@ function NumbersGuide() {
     ],
     [
       "Speed",
-      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement on this computer. On a graphics card PM divides the card's memory speed by how much of the model it reads for each token, worked out from the model file, and scales that by how fast eight models really ran on one laptop graphics card PM tested: there it came within 20% of each, though that card was held back by its power settings at the time, so yours may well be faster. A long conversation replies slower than a fresh one. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
+      "How fast replies stream, in tokens a second (a token is roughly three-quarters of a word). It's an estimate, not a measurement on this computer. On a graphics card PM divides the card's memory speed by how much of the model it reads for each token, worked out from the model file, and scales that by how fast ten builds of eight models really ran on one laptop graphics card PM tested: there it came within about 12% of all but one of them, and within about a quarter of that one (gemma 3 4b, which ran slower than PM expected). That laptop runs its card on a reduced power budget for most replies, so on a desktop card, or a laptop that keeps its card at full power, replies may well come faster than this: at full power, that laptop's own card was about 1.2 to 1.4 times as fast. A long conversation replies slower than a fresh one. From system memory it's a rough guide in either direction, and on chips that share memory with the processor PM doesn't estimate it yet.",
     ],
     [
       "Memory",

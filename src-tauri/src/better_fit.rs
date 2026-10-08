@@ -300,13 +300,13 @@ pub const CHAT_REPLY_SECS: f64 = 10.0;
 /// [`CHAT_REPLY_SECS`], 30 tokens a second.
 ///
 /// Silent reading runs at about 5 tokens a second, so this streams about six times faster than
-/// anyone reads, and 300 tokens in 10 seconds is the usual attention limit. On the dev laptop's card
-/// the measured models split cleanly around it: gemma 4 12b at 28.3 falls below; Qwen3.5 9B (42.9),
-/// Qwen2.5 7B (45.1) and Llama 3.1 8B (47.0) are above. Of the floors weighed (25, 30, 35 and 40) it
-/// is the highest that keeps the pick at 7B or larger on cards of 8 GB and up from 240 GB/s; 35
-/// drops the 8 GB RTX 4060 Laptop (256 GB/s) to a 4B. Slower cards do drop: on the 8 GB RTX 3050 and
-/// Radeon RX 6600 (224 GB/s) no build of a 7B or larger clears it — Qwen2.5 7B Q4_K_M, the quickest,
-/// is 28.7 there — so they get Qwen3.5 4B.
+/// anyone reads, and 300 tokens in 10 seconds is the usual attention limit. On the dev laptop's card,
+/// in the capped regime most of its replies run in, every model measured clears it, gemma 4 12b only
+/// just, at 32.3. Of the floors weighed (25, 30, 35 and 40) it is the highest that keeps the pick at
+/// 7B or larger on every 8 GB card PM lists: it does so on cards of 8 GB and up from 208 GB/s, and 35
+/// drops the 8 GB RTX 3060 (240 GB/s), the RTX 3050 and the Radeon RX 6600 (224 GB/s) to Qwen3.5 4B.
+/// Slower cards do drop: below 208 GB/s no build of a 7B or larger clears it — Qwen2.5 7B Q4_K_M,
+/// the quickest, is 29.4 at 206.
 ///
 /// A gate on PM's estimate ([`fit::gpu_tokens_per_sec`]), never a sort key, and never a measured
 /// speed: the pick must be the same before and after the download.
@@ -438,7 +438,7 @@ pub fn judge(spec: &fit::ModelSpec, hw: &fit::FitHardware, context: u32) -> Judg
 ///
 /// Built from the quick builds alone, the way [`system_config`] is off the card, so it steps down
 /// to a smaller build of the same model before turning the model away. Stepping down a quant is not
-/// always quicker under the estimate — gemma 4 12b is 29.4 at Q3_K_M and 30.2 at Q4_K_M on the dev
+/// always quicker under the estimate — gemma 4 12b is 32.4 at Q3_K_M and 33.7 at Q4_K_M on the dev
 /// laptop — so this takes the best build that clears the floor, wherever it sits. The estimate
 /// depends on the quant and the card only, never on memory, so more free memory, VRAM or bandwidth
 /// can only widen what is left.
@@ -1570,8 +1570,8 @@ mod tests {
         }
     }
 
-    /// A 12B whose one build fits an 8 GB card and is estimated at 24.2 tok/s on 384 GB/s, and a
-    /// 9B whose one build is estimated at 43.3 there.
+    /// A 12B whose one build fits an 8 GB card and is estimated at 26.5 tok/s on 384 GB/s, and a
+    /// 9B whose one build is estimated at 47.8 there.
     fn big() -> fit::ModelSpec {
         model(11.91, vec![build(fit::Quant::Q3_K_M, 5.5, 0.0, 6.0e9)])
     }
@@ -1615,7 +1615,7 @@ mod tests {
         assert!(!quick_enough_for_chat(29.44), "shows as 29");
         assert!(
             !quick_enough_for_chat(29.4),
-            "gemma 4 12b on the dev laptop"
+            "gemma 4 12b on the dev laptop under the 02-10 fit"
         );
         assert!(quick_enough_for_chat(42.7));
     }
@@ -1627,7 +1627,7 @@ mod tests {
         let j = judge(&big(), &hw, 8192);
         assert!(j.config.is_none() && j.too_slow_for_chat && !j.too_slow);
         let on_card = j.on_card.clone().expect("it fits the card");
-        assert_eq!(on_card.est_tokens_per_sec, Some(24.2));
+        assert_eq!(on_card.est_tokens_per_sec, Some(26.5));
         assert_eq!(j.rung, Rung::Quality, "no config, no rung");
 
         let pool = [
@@ -1642,7 +1642,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(repo, "mid");
-                assert_eq!(fit.est_tokens_per_sec, Some(43.3));
+                assert_eq!(fit.est_tokens_per_sec, Some(47.8));
                 // Named with its build on the card and that build's own estimate.
                 assert_eq!(
                     passed_over,
@@ -1650,7 +1650,7 @@ mod tests {
                         repo: "big".to_string(),
                         display_name: "big".to_string(),
                         quant: fit::Quant::Q3_K_M,
-                        est_tokens_per_sec: 24.2,
+                        est_tokens_per_sec: 26.5,
                         have: None,
                     })
                 );
@@ -1661,12 +1661,12 @@ mod tests {
 
     #[test]
     fn on_a_card_a_quicker_build_of_the_same_model_still_counts() {
-        // Both builds fit the card; the larger is estimated at 26.9, the smaller at 43.3. The model
+        // Both builds fit the card; the larger is estimated at 26.6, the smaller at 47.8. The model
         // stays, at the smaller build, rather than being turned away for its larger one.
         let spec = model(
             11.91,
             vec![
-                build(fit::Quant::Q4_K_M, 5.6, 8.0e9, 0.0),
+                build(fit::Quant::Q4_K_M, 5.6, 9.0e9, 0.0),
                 build(fit::Quant::Q3_K_M, 5.0, 2.0e9, 2.0e9),
             ],
         );
@@ -1674,11 +1674,11 @@ mod tests {
         let j = judge(&spec, &hw, 8192);
         let config = j.config.expect("the Q3_K_M is quick enough");
         assert_eq!(config.quant, Some(fit::Quant::Q3_K_M));
-        assert_eq!(config.est_tokens_per_sec, Some(43.3));
+        assert_eq!(config.est_tokens_per_sec, Some(47.8));
         assert_eq!(j.rung, Rung::Chat);
         let on_card = j.on_card.expect("the Q4_K_M fits the card");
         assert_eq!(on_card.quant, Some(fit::Quant::Q4_K_M));
-        assert_eq!(on_card.est_tokens_per_sec, Some(26.9));
+        assert_eq!(on_card.est_tokens_per_sec, Some(26.6));
         assert!(!j.too_slow_for_chat);
     }
 
@@ -1690,7 +1690,7 @@ mod tests {
         let spec = model(
             11.91,
             vec![
-                build(fit::Quant::Q4_K_M, 5.6, 8.0e9, 0.0),
+                build(fit::Quant::Q4_K_M, 5.6, 9.0e9, 0.0),
                 build(fit::Quant::Q3_K_M, 5.0, 2.0e9, 2.0e9),
             ],
         );
@@ -1699,11 +1699,11 @@ mod tests {
         let ram = what_fits(&fit::fit(&spec, &at(384.0)));
         let resident = what_fits(&judge(&spec, &at(384.0), 8192).on_card.unwrap());
         for (bandwidth, picked) in [
-            // Q4_K_M at 42.0: the best build on the card is quick enough.
+            // Q4_K_M at 41.6: the best build on the card is quick enough.
             (600.0, Some(fit::Quant::Q4_K_M)),
-            // Q4_K_M at 26.9, Q3_K_M at 43.3: a quicker build steps in.
+            // Q4_K_M at 26.6, Q3_K_M at 47.8: a quicker build steps in.
             (384.0, Some(fit::Quant::Q3_K_M)),
-            // Q3_K_M at 11.3: nothing is.
+            // Q3_K_M at 12.4: nothing is.
             (100.0, None),
         ] {
             let hw = at(bandwidth);
@@ -1718,7 +1718,7 @@ mod tests {
 
     #[test]
     fn the_chat_floor_applies_on_the_graphics_card_only() {
-        // 3 GB a token: 18.6 tok/s on a 100 GB/s card, under the chat floor, and 13.3 from system
+        // 3 GB a token: 20.8 tok/s on a 100 GB/s card, under the chat floor, and 13.3 from system
         // memory, over the background floor.
         let spec = model(7.0, vec![build(fit::Quant::Q4_K_M, 4.0, 3.0e9, 0.0)]);
         let j = judge(&spec, &card(8.0, 100.0, 20.0), 8192);
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[test]
     fn a_card_where_nothing_is_quick_enough_says_so() {
-        // 20 GB/s: even a 1B is 8.6 tok/s on it. Something else would run from system memory, and
+        // 20 GB/s: even a 1B is 9.6 tok/s on it. Something else would run from system memory, and
         // the small one would be fine there too — but the reason is the speed, not the card's room,
         // so there is no "some would run, several times slower" fallback to offer.
         let hw = card(8.0, 20.0, 20.0);

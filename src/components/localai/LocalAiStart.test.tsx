@@ -832,6 +832,8 @@ describe("the pick's reason says at which context it fits", () => {
 });
 
 describe("the pick names the larger model it passed over for speed", () => {
+  // A near miss for the code path: gemma 4 12b at 29.4, the dev laptop's figure for it before the
+  // 07-10-2026 re-fit. PM puts it at 32.4 there now, and it is that laptop's pick.
   const GEMMA4 = "unsloth/gemma-4-12b-it-GGUF";
   const LINE =
     "gemma 4 12b it is larger and also fits your graphics card, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat. It's under All models if you'd rather have the larger model.";

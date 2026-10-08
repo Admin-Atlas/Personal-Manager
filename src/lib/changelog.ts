@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.2-alpha",
+    date: "2026-10-08",
+    highlights: [
+      "PM’s speed estimates for graphics cards have been measured again. Last time, the laptop PM tunes them on had a fault holding its graphics card back; with that fixed, ten builds of eight models were timed again, and PM now expects replies on a graphics card to come about a tenth faster than it did. On some computers that lets PM’s pick step up to a larger model that is still quick enough for chat — on that laptop, gemma 4 12b rather than Qwen 3.5 9B. The speed notes in Settings › Local AI now say how close the estimate came, and that a graphics card running at full power may well be faster still.",
+    ],
+  },
+  {
     version: "3.139.1-alpha",
     date: "2026-10-07",
     highlights: [

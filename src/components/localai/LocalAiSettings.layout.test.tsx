@@ -608,9 +608,9 @@ describe("All models", () => {
   });
 
   it("says where PM's pick is when it is a file neither row offers", async () => {
-    // The dev laptop with 10 GB free: the card's one row is Q6_K at 7.38 GB, and the pick is Q5_K_M
-    // at 6.63 GB — the config that keeps the room PM leaves free on the card. Only the band line says
-    // so, and nothing tested it.
+    // Qwen2.5 7B as the pick on a card like the dev laptop's, with 10 GB free: the card's one row is
+    // Q6_K at 7.38 GB, and the pick is Q5_K_M at 6.63 GB — the config that keeps the room PM leaves
+    // free on the card. Only the band line says so, and nothing tested it.
     getLocalLlmConfig.mockResolvedValue(cfg());
     const q6 = `hf.co/${QWEN}:Q6_K`;
     localModelRecommendations.mockResolvedValue(
@@ -644,10 +644,10 @@ describe("All models", () => {
   describe("PM's pick is matched to a row by its config, not its tag", () => {
     // The pick is judged at the context PM sizes it for (32k at most) and the cards at the model's
     // trained one, so the pick's own file is often on a row here run another way. The dev laptop
-    // (7.96 GB card, 20 GB free, an empty Ollama) as it was judged before speed counted on a card:
-    // the pick was gemma 4 12b as Q3_K_M at 32768 on f16, 6.93 GB; the card's "Fastest on GPU" row
-    // is the same Q3_K_M file at 65536 on q8_0, 6.74 GB, its context halved from 262144 — the same
-    // tag, a different config. The payload's shape is what these pin, not which model wins.
+    // (7.96 GB card, 20 GB free, an empty Ollama): the pick is gemma 4 12b as Q3_K_M at 32768 on f16,
+    // 6.93 GB; the card's "Fastest on GPU" row is the same Q3_K_M file at 65536 on q8_0, 6.74 GB, its
+    // context halved from 262144 — the same tag, a different config. The payload's shape is what
+    // these pin, not which model wins.
     const GEMMA4 = "unsloth/gemma-4-12b-it-GGUF";
     const Q3 = `hf.co/${GEMMA4}:Q3_K_M`;
     const gemma4 = (over: Partial<LocalRecommendation> = {}) =>

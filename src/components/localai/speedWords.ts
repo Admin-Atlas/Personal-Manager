@@ -5,11 +5,16 @@
 //
 // The figure is an estimate, not a measurement on this computer (fit.rs, `tokens_per_sec`): memory
 // bandwidth divided by the bytes the model file says each token reads. On a discrete graphics card
-// that is scaled by how fast eight models really ran on one laptop card PM tested, where it came
-// within 20% of each — a card held back by its power settings at the time, so a healthy one likely
-// runs faster. From system RAM it rests on a typical bandwidth and can be wrong either way. Every
-// figure says "about"; on memory shared with the processor PM puts no number on it at all. No "~"
-// anywhere: the copy says how far to trust the figure in words, beside it.
+// that is scaled by how fast ten builds of eight models really ran on one laptop card PM tested
+// (07-10-2026),
+// where it came within -10.9% to +23.0% of each (leave-one-out 8.4% mean, 26.6% worst): within 12%
+// of all but gemma 3 4b, whose figure was 23% too high. That card spends most replies, a chat reply
+// from idle among them, on a reduced power budget (a fixed 1552 MHz), and the figure is fitted
+// there; when it got its full power it ran 1.19-1.38x faster, so a desktop card, or a laptop that
+// keeps its card at full power, may well beat the figure. From system RAM it rests on a typical
+// bandwidth and can be wrong either way. Every figure says "about"; on memory shared with the
+// processor PM puts no number on it at all. No "~" anywhere: the copy says how far to trust the
+// figure in words, beside it.
 
 import type { LocalChatSpeed, LocalFitResult, LocalHardware } from "../../lib/types";
 
@@ -61,12 +66,12 @@ export function speedLong(
       const bw = hw?.gpu_bandwidth_gbps;
       return `PM's estimate, not a measurement on this computer: your graphics card's published memory speed${
         bw != null ? ` (${Math.round(bw)} GB/s)` : ""
-      }, scaled by how fast eight models really ran on one laptop graphics card PM tested — there, it came within 20% of each. That card was held back by its power settings at the time, so yours may well be faster.${suffix}`;
+      }, scaled by how fast ten builds of eight models really ran on one laptop graphics card PM tested — there, it came within about a quarter of each, and within about 12% of all but one. That laptop runs its card on a reduced power budget for most replies, so on a desktop card, or a laptop that keeps its card at full power, replies may well come faster than this: at full power, that laptop's own card was about 1.2 to 1.4 times as fast.${suffix}`;
     }
     case "gpu_typical":
       // Said on its own (a machine has one basis), so it names the scaling rather than pointing at
       // the published-speed sentence for it.
-      return `PM doesn't recognise your graphics card, so this assumes a typical memory speed (400 GB/s), scaled by how fast eight models really ran on one laptop graphics card PM tested. Your card's memory speed could be half that, or double.${suffix}`;
+      return `PM doesn't recognise your graphics card, so this assumes a typical memory speed (400 GB/s), scaled by how fast ten builds of eight models really ran on one laptop graphics card PM tested. Your card's memory speed could be half that, or double.${suffix}`;
     case "system":
       return "From a typical memory speed (40 GB/s), not measured on this computer — a rough guide in either direction.";
     case "shared":

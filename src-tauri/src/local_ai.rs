@@ -3616,8 +3616,8 @@ pub struct InstalledModel {
     ///
     /// The ground for saying why a job's model is not the pick when [`better_fit::PassedOver`] does
     /// not name it, because that is only the largest model larger than the pick: most often a heavier
-    /// build of the pick's own model — a Qwen3.5 9B Q8_0 is 23.9 on a 12 GB card at 360 GB/s, where
-    /// the pick is its Q6_K at 30.5.
+    /// build of the pick's own model — a gemma 4 12b Q5_K_M is 26.8 on a 12 GB card at 360 GB/s,
+    /// where the pick is its Q4_K_M at 31.6.
     pub under_chat_floor_tps: Option<f64>,
 }
 
@@ -4534,6 +4534,12 @@ mod tests {
         card(7.96, Some(384.0), free)
     }
 
+    /// An 8 GB card at 256 GB/s, the RTX 4060 Laptop's published speed: where the pick is Qwen3.5
+    /// 9B at Q3_K_M, and gemma 4 12b fits the card but is too slow for chat on it.
+    fn rtx_4060_laptop(free: f64) -> fit::FitHardware {
+        card(8.0, Some(256.0), free)
+    }
+
     fn no_gpu(free: f64) -> fit::FitHardware {
         fit::FitHardware {
             available_ram_gb: free,
@@ -4605,10 +4611,9 @@ mod tests {
     fn on_the_dev_laptop_the_pick_is_the_largest_model_quick_enough_for_chat() {
         // The redesign's headline case, at four amounts of free RAM. Sized from each model's own
         // attention geometry and judged at the 32768 PM runs it at, the largest model that fits the
-        // 7.96 GB card with the reserve kept is gemma 4 12b at Q3_K_M — but PM estimates it at 29.4
-        // tok/s there (measured 28.3), under the 30 the chat floor asks, and its other builds are
-        // too large for the card. So the pick is the next largest, Qwen3.5 9B at Q3_K_M, at 42.7
-        // (measured 42.9), and the card names gemma 4 12b as passed over for speed.
+        // 7.96 GB card with the reserve kept is gemma 4 12b at Q3_K_M, and PM estimates it at 32.4
+        // tok/s there (measured 32.3 in the card's capped regime), over the 30 the chat floor asks.
+        // So it is the pick, and as nothing larger fits the card, nothing is passed over for speed.
         for free in [10.0, 13.4, 20.0, 24.0] {
             match pick_on(&laptop(free)) {
                 Pick::Catalogue {
@@ -4622,25 +4627,21 @@ mod tests {
                     passed_over,
                     ..
                 } => {
-                    assert_eq!(repo, QWEN35_9B, "{free} GB");
+                    assert_eq!(repo, GEMMA4_12B, "{free} GB");
                     assert_eq!(rung, Rung::Gpu, "{free} GB");
-                    assert_eq!(tag, format!("hf.co/{QWEN35_9B}:Q3_K_M"), "{free} GB");
+                    assert_eq!(tag, format!("hf.co/{GEMMA4_12B}:Q3_K_M"), "{free} GB");
                     assert_eq!(fit.quant, Some(fit::Quant::Q3_K_M), "{free} GB");
                     assert_eq!(fit.context, Some(32768), "{free} GB");
                     assert_eq!(fit.kv, fit::KvCache::F16, "{free} GB");
-                    assert_eq!(fit.est_memory_gb, Some(6.76), "{free} GB");
+                    assert_eq!(fit.est_memory_gb, Some(6.93), "{free} GB");
                     assert_eq!(fit.verdict, fit::Verdict::Tight, "{free} GB");
-                    assert_eq!(fit.est_tokens_per_sec, Some(42.7), "{free} GB");
+                    assert_eq!(fit.est_tokens_per_sec, Some(32.4), "{free} GB");
                     assert_eq!(fit.speed_basis, Some(fit::SpeedBasis::GpuPublished));
                     // Weights plus the vision projector Ollama pulls with them.
-                    assert!((download_gb - 5.21).abs() < 1e-9, "{download_gb}");
+                    assert!((download_gb - 5.46).abs() < 1e-9, "{download_gb}");
                     assert_eq!(basis, PickBasis::Gpu);
                     assert_eq!(also_have, None);
-                    let po = passed_over.expect("gemma 4 12b is passed over for speed");
-                    assert_eq!(po.repo, GEMMA4_12B, "{free} GB");
-                    assert_eq!(po.quant, fit::Quant::Q3_K_M, "{free} GB");
-                    assert_eq!(po.est_tokens_per_sec, 29.4, "{free} GB");
-                    assert_eq!(po.have, None, "{free} GB");
+                    assert_eq!(passed_over, None, "{free} GB");
                 }
                 other => panic!("{free} GB: expected a catalogue pick, got {other:?}"),
             }
@@ -4659,6 +4660,64 @@ mod tests {
             card.fit.context,
             Some(262144),
             "the card keeps its trained context"
+        );
+    }
+
+    #[test]
+    fn on_the_dev_laptop_the_pick_clears_the_chat_floor_with_room_to_spare() {
+        // gemma 4 12b Q3_K_M is not a pick the rounding lets through: its 32.4 is 8% over the 30 the
+        // floor asks, the four Q3_K_M builds timed on this card came within 2.2% of their estimates,
+        // and the 32.3 it was measured at in the card's capped regime clears the floor too.
+        let floor = better_fit::chat_floor_tps();
+        let measured = 32.3;
+        assert!(better_fit::quick_enough_for_chat(measured));
+        for free in [10.0, 13.4, 20.0, 24.0] {
+            let p = pick_on(&laptop(free));
+            let Pick::Catalogue {
+                repo,
+                fit,
+                passed_over,
+                ..
+            } = &p
+            else {
+                panic!("{free} GB: expected a catalogue pick, got {p:?}");
+            };
+            assert_eq!(repo, GEMMA4_12B, "{free} GB");
+            let tps = fit.est_tokens_per_sec.unwrap();
+            assert!(tps >= floor * 1.05, "{free} GB: {tps} against {floor}");
+            assert!((tps / measured - 1.0).abs() < 0.01, "{free} GB: {tps}");
+            assert_eq!(passed_over, &None, "{free} GB");
+        }
+        // Wherever a model is passed over for speed, it is under the floor and the pick is over it.
+        let mut named = 0;
+        for hw in [
+            laptop(20.0),
+            card(6.0, Some(192.0), 12.0),
+            rtx_4060_laptop(20.0),
+            card(12.0, Some(360.0), 24.0),
+            card(16.0, Some(288.0), 32.0),
+            card(8.0, Some(224.0), 20.0),
+            card(8.0, Some(240.0), 20.0),
+        ] {
+            if let Pick::Catalogue {
+                fit, passed_over, ..
+            } = pick_on(&hw)
+            {
+                assert!(better_fit::quick_enough_for_chat(
+                    fit.est_tokens_per_sec.unwrap()
+                ));
+                if let Some(po) = passed_over {
+                    named += 1;
+                    assert!(
+                        !better_fit::quick_enough_for_chat(po.est_tokens_per_sec),
+                        "{hw:?}: {po:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            named >= 4,
+            "the sweep must name passed-over models ({named})"
         );
     }
 
@@ -4685,18 +4744,18 @@ mod tests {
             );
             assert_ne!(repo, e.repo);
         }
-        assert_eq!(repo, QWEN35_9B);
+        assert_eq!(repo, GEMMA4_12B);
     }
 
     #[test]
     fn serving_the_picks_own_file_makes_it_the_model_you_already_have() {
-        // The manifest total Hugging Face serves for this tag (model + projector + template +
-        // params layers, read 02-10), which is what Ollama's `/api/tags` reports once it is pulled.
-        let id = format!("hf.co/{QWEN35_9B}:Q3_K_M");
+        // The dev laptop's pick, gemma 4 12b at Q3_K_M, served by its Ollama: its weights, its
+        // projector and the small layers Ollama pulls with them, as `/api/tags` sizes them.
+        let id = format!("hf.co/{GEMMA4_12B}:Q3_K_M");
         let hw = laptop(20.0);
         let s = size_for_machine(
             &hw,
-            vec![served(&id, 5_591_809_824, "Q3_K_M", 8.95)],
+            vec![served(&id, 5_868_989_011, "Q3_K_M", 11.91)],
             &[],
             Some("http://127.0.0.1:11434"),
             &[],
@@ -4712,11 +4771,12 @@ mod tests {
                 ..
             } => {
                 assert_eq!(got, &id);
-                assert_eq!(repo, QWEN35_9B);
+                assert_eq!(repo, GEMMA4_12B);
                 assert!(served);
                 assert!(measured, "it is the very file PM sized");
                 assert_eq!(fit.quant, Some(fit::Quant::Q3_K_M));
-                assert_eq!(fit.est_memory_gb, Some(6.76));
+                assert_eq!(fit.est_memory_gb, Some(6.93));
+                assert_eq!(fit.est_tokens_per_sec, Some(32.4));
                 assert_eq!(*basis, PickBasis::Gpu);
             }
             other => panic!("expected the served model, got {other:?}"),
@@ -4724,13 +4784,13 @@ mod tests {
     }
 
     #[test]
-    fn on_the_dev_laptop_a_served_gemma_4_12b_is_passed_over_for_speed() {
-        // The model the dev laptop's pick used to be, served by its Ollama: it fits the card, and
-        // PM estimates it at 29.4 tok/s there, under the chat floor. So it is neither the pick nor a
-        // copy named beside it — the pick card names it as passed over, quoting the user's own file.
+    fn on_an_rtx_4060_laptop_a_served_gemma_4_12b_is_passed_over_for_speed() {
+        // The dev laptop's pick, served on a slower card: it fits the 8 GB card, and PM estimates it
+        // at 21.6 tok/s there, under the chat floor. So it is neither the pick nor a copy named
+        // beside it — the pick card names it as passed over, quoting the user's own file.
         let id = format!("hf.co/{GEMMA4_12B}:Q3_K_M");
         let s = size_for_machine(
-            &laptop(20.0),
+            &rtx_4060_laptop(20.0),
             vec![served(&id, 5_868_989_011, "Q3_K_M", 11.91)],
             &[],
             Some("http://127.0.0.1:11434"),
@@ -4752,7 +4812,8 @@ mod tests {
                 let po = passed_over.as_ref().expect("gemma 4 12b is passed over");
                 assert_eq!(po.repo, GEMMA4_12B);
                 assert_eq!(po.quant, fit::Quant::Q3_K_M);
-                assert_eq!(po.est_tokens_per_sec, 29.4);
+                assert_eq!(po.est_tokens_per_sec, 21.6);
+                assert!(!better_fit::quick_enough_for_chat(po.est_tokens_per_sec));
                 let have = po.have.as_ref().expect("the user's own copy");
                 assert_eq!(have.id, id);
                 assert!(have.served);
@@ -4765,10 +4826,10 @@ mod tests {
     fn a_served_build_too_slow_for_chat_says_so_on_its_row() {
         // A 12 GB card at 360 GB/s (an RTX 3060 12 GB) and an Ollama serving Qwen3.5 9B at Q8_0 —
         // the catalogue's file and its projector — with a role on it. That build fits the card, but
-        // PM estimates it at 23.9 tok/s there (8.44 GB a token at 1.787 a byte), under the chat
-        // floor, so the pick is a quicker build of the same model, the Q6_K at 30.5. Not larger
-        // than the pick, it is never passed over — that names Qwen2.5 14B — so the row is the only
-        // place the card can learn why the model a job runs on is not the pick.
+        // PM estimates it at 26.6 tok/s there (8.44 GB a token at 1.602 a byte), under the chat
+        // floor, and the pick is gemma 4 12b at Q4_K_M, at 31.6. Not larger than the pick, the
+        // served build is never passed over — that names Qwen2.5 14B — so the row is the only place
+        // the card can learn why the model a job runs on is not the pick.
         let id = format!("hf.co/{QWEN35_9B}:Q8_0");
         let bytes = ((8.87 + 0.86) * 1_073_741_824.0_f64).round() as u64;
         let probe = || served(&id, bytes, "Q8_0", 8.95);
@@ -4793,9 +4854,9 @@ mod tests {
                 passed_over,
                 ..
             } => {
-                assert_eq!(repo, QWEN35_9B);
-                assert_eq!(fit.quant, Some(fit::Quant::Q6_K));
-                assert_eq!(fit.est_tokens_per_sec, Some(30.5));
+                assert_eq!(repo, GEMMA4_12B);
+                assert_eq!(fit.quant, Some(fit::Quant::Q4_K_M));
+                assert_eq!(fit.est_tokens_per_sec, Some(31.6));
                 assert_eq!(also_have, &None, "not a copy the pick could use");
                 let po = passed_over.as_ref().expect("Qwen2.5 14B is passed over");
                 assert_eq!(po.repo, "bartowski/Qwen2.5-14B-Instruct-GGUF");
@@ -4804,37 +4865,45 @@ mod tests {
             other => panic!("expected a catalogue pick, got {other:?}"),
         }
         let row = &s.installed[0];
-        assert_eq!(row.under_chat_floor_tps, Some(23.9));
+        assert_eq!(row.under_chat_floor_tps, Some(26.6));
         assert_eq!(
             serde_json::to_value(row).unwrap()["under_chat_floor_tps"],
-            23.9
+            26.6
         );
 
-        // The same gap one size up: gemma 4 12b Q4_K_M is larger than the pick and fits the card,
-        // at 28.3, but Qwen2.5 14B is larger still, so it is the one passed over.
-        let gemma = format!("hf.co/{GEMMA4_12B}:Q4_K_M");
-        let bytes = ((6.63 + 0.16) * 1_073_741_824.0_f64).round() as u64;
+        // The same gap in the pick's own model: gemma 4 12b Q5_K_M fits the card, at 26.8, so the
+        // pick is a quicker build of it. Not larger than the pick, it is not passed over either.
+        let gemma = format!("hf.co/{GEMMA4_12B}:Q5_K_M");
+        let bytes = ((7.84 + 0.16) * 1_073_741_824.0_f64).round() as u64;
         let s = size(
-            served(&gemma, bytes, "Q4_K_M", 11.91),
+            served(&gemma, bytes, "Q5_K_M", 11.91),
             "http://127.0.0.1:11434",
         );
         match &s.pick {
             Pick::Catalogue {
-                repo, passed_over, ..
+                repo,
+                fit,
+                passed_over,
+                ..
             } => {
-                assert_eq!(repo, QWEN35_9B);
+                assert_eq!(repo, GEMMA4_12B);
+                assert_eq!(fit.quant, Some(fit::Quant::Q4_K_M));
                 let po = passed_over.as_ref().expect("Qwen2.5 14B is passed over");
                 assert_eq!(po.repo, "bartowski/Qwen2.5-14B-Instruct-GGUF");
                 assert_eq!(po.have, None);
             }
             other => panic!("expected a catalogue pick, got {other:?}"),
         }
-        assert_eq!(s.installed[0].under_chat_floor_tps, Some(28.3));
+        assert_eq!(s.installed[0].under_chat_floor_tps, Some(26.8));
 
         // The pick's own build, served: quick enough, so there is nothing to say.
-        let q6 = format!("hf.co/{QWEN35_9B}:Q6_K");
-        let quick = ((6.95 + 0.86) * 1_073_741_824.0_f64).round() as u64;
-        let row = &size(served(&q6, quick, "Q6_K", 8.95), "http://127.0.0.1:11434").installed[0];
+        let q4 = format!("hf.co/{GEMMA4_12B}:Q4_K_M");
+        let quick = ((6.63 + 0.16) * 1_073_741_824.0_f64).round() as u64;
+        let row = &size(
+            served(&q4, quick, "Q4_K_M", 11.91),
+            "http://127.0.0.1:11434",
+        )
+        .installed[0];
         assert_eq!(row.under_chat_floor_tps, None);
         assert_eq!(
             serde_json::to_value(row).unwrap()["under_chat_floor_tps"],
@@ -4903,12 +4972,12 @@ mod tests {
     }
 
     #[test]
-    fn the_chat_floor_keeps_a_7b_or_larger_on_cards_of_8_gb_and_up_from_240_gb_s() {
+    fn the_chat_floor_keeps_a_7b_or_larger_on_cards_of_8_gb_and_up_from_208_gb_s() {
         // What `better_fit::chat_floor_tps` claims for itself, against the committed catalogue: on
-        // any card of 8 GB or more from 240 GB/s, the pick is a 7B or larger...
+        // any card of 8 GB or more from 208 GB/s, the pick is a 7B or larger...
         for vram in [8.0, 10.0, 12.0, 16.0, 24.0] {
-            for step in 0..=43 {
-                let bandwidth = 240.0 + f64::from(step) * 20.0;
+            for step in 0..=45 {
+                let bandwidth = 208.0 + f64::from(step) * 20.0;
                 let p = pick_on(&card(vram, Some(bandwidth), 64.0));
                 let (repo, ..) = catalogue_pick(&p);
                 assert!(
@@ -4917,19 +4986,23 @@ mod tests {
                 );
             }
         }
-        // ...and below that it is not. The 8 GB cards PM lists at 224 GB/s get Qwen3.5 4B: no build
-        // of a 7B or larger clears 30 there, and the quickest, Qwen2.5 7B Q4_K_M, is 28.7.
+        // ...and below that it is not: at 206 GB/s no build of a 7B or larger clears 30, and the
+        // quickest, Qwen2.5 7B Q4_K_M, is 29.4.
+        let p = pick_on(&card(8.0, Some(206.0), 20.0));
+        assert_eq!(catalogue_pick(&p).0, "unsloth/Qwen3.5-4B-GGUF");
+        // So every 8 GB card PM lists keeps a 7B or larger: the slowest, the RTX 3050 and the Radeon
+        // RX 6600 at 224 GB/s, get Qwen2.5 7B, and the 8 GB RTX 3060 at 240 gets Qwen3.5 9B.
         for name in ["NVIDIA GeForce RTX 3050", "AMD Radeon RX 6600"] {
             let bandwidth = hardware::gpu_bandwidth_gbps(name, Some(8.0));
             assert_eq!(bandwidth, Some(224.0), "{name}");
             let p = pick_on(&card(8.0, bandwidth, 20.0));
-            assert_eq!(catalogue_pick(&p).0, "unsloth/Qwen3.5-4B-GGUF", "{name}");
+            assert_eq!(catalogue_pick(&p).0, QWEN_7B, "{name}");
         }
         let rtx_3060 = hardware::gpu_bandwidth_gbps("NVIDIA GeForce RTX 3060", Some(8.0));
         assert_eq!(rtx_3060, Some(240.0));
         assert_eq!(
             catalogue_pick(&pick_on(&card(8.0, rtx_3060, 20.0))).0,
-            QWEN_7B
+            QWEN35_9B
         );
         let spec = local_catalog::entry_to_spec(entry(QWEN_7B));
         let q4 = spec
@@ -4940,10 +5013,11 @@ mod tests {
         let at = |bandwidth| {
             fit::gpu_tokens_per_sec(&spec, q4, &card(8.0, Some(bandwidth), 20.0)).unwrap()
         };
-        assert!((at(224.0) - 28.7).abs() < 0.05, "{}", at(224.0));
-        assert!(!better_fit::quick_enough_for_chat(at(224.0)));
-        assert!((at(240.0) - 30.7).abs() < 0.05, "{}", at(240.0));
-        assert!(better_fit::quick_enough_for_chat(at(240.0)));
+        assert!((at(206.0) - 29.4).abs() < 0.05, "{}", at(206.0));
+        assert!(!better_fit::quick_enough_for_chat(at(206.0)));
+        assert!((at(208.0) - 29.7).abs() < 0.05, "{}", at(208.0));
+        assert!(better_fit::quick_enough_for_chat(at(208.0)));
+        assert!((at(224.0) - 32.0).abs() < 0.05, "{}", at(224.0));
     }
 
     #[test]
@@ -5009,13 +5083,13 @@ mod tests {
         assert_eq!(fit.kv, fit::KvCache::F16);
         assert_eq!(fit.est_memory_gb, Some(6.61));
         assert_eq!(fit.verdict, fit::Verdict::Tight);
-        // 7.6 × 1.15 = 8.74 is short of Qwen3.5 9B's 8.95, so it is named beside the pick.
+        // 7.6 × 1.15 = 8.74 is well short of gemma 4 12b's 11.91, so it is named beside the pick.
         assert_eq!(also_have_of(&s.pick), Some("qwen2.5:latest"));
     }
 
     #[test]
     fn a_smaller_model_you_have_is_named_beside_the_pick_rather_than_chosen() {
-        // gemma 3 4b fits the card too, but 3.88 × 1.15 is well short of Qwen3.5 9B's 8.95.
+        // gemma 3 4b fits the card too, but 3.88 × 1.15 is well short of gemma 4 12b's 11.91.
         let s = size_for_machine(
             &laptop(20.0),
             vec![served("gemma3:4b", 3_338_801_804, "Q4_K_M", 4.3)],
@@ -5027,7 +5101,7 @@ mod tests {
             Pick::Catalogue {
                 repo, also_have, ..
             } => {
-                assert_eq!(repo, QWEN35_9B);
+                assert_eq!(repo, GEMMA4_12B);
                 assert_eq!(
                     also_have.as_ref(),
                     Some(&OwnedRef {
@@ -5053,14 +5127,14 @@ mod tests {
         );
         let s = size_for_machine(&laptop(20.0), Vec::new(), &[file], None, &[]);
         assert_eq!(s.on_disk.len(), 1, "the card itself is still listed");
-        assert_eq!(catalogue_pick(&s.pick).0, QWEN35_9B);
+        assert_eq!(catalogue_pick(&s.pick).0, GEMMA4_12B);
         assert_eq!(also_have_of(&s.pick), None);
     }
 
     #[test]
     fn a_file_on_disk_counts_only_for_a_server_that_could_serve_it() {
         // An LM Studio download that fits the card at 32k with an f16 cache. 7.62 × 1.15 = 8.76 is
-        // short of Qwen3.5 9B's 8.95, so where it counts it is named beside the pick.
+        // well short of gemma 4 12b's 11.91, so where it counts it is named beside the pick.
         let file = on_disk_file(
             "lmstudio-community/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
             DiskSource::LmStudio,
@@ -5370,7 +5444,7 @@ mod tests {
         let qwen = format!("hf.co/{QWEN_7B}:Q5_K_M");
         let s = better_fit_suggestion(&laptop(24.0), &[], Some(qwen.clone()), Some(qwen))
             .expect("the pick is larger than what runs");
-        assert_eq!(s.repo, QWEN35_9B);
+        assert_eq!(s.repo, GEMMA4_12B);
 
         // No card and 16 GB free, both roles on gemma 2 2b: the pick is the gemma 4 MoE at Q3_K_M,
         // quick enough from RAM for background work. Judged at its trained 262144 tokens it was a
@@ -5386,22 +5460,21 @@ mod tests {
 
     #[test]
     fn on_the_dev_laptop_the_notice_names_the_pick_at_every_amount_of_free_ram() {
-        // Both roles on Qwen2.5 7B Q5_K_M, and the pick is Qwen3.5 9B, 8.95B against 7.62B — past
-        // the notice's 15% (7.62 × 1.15 = 8.76). Judged on each model's trained-context fit, the
-        // notice was silent at 10 GB free and at 13.4 (a Tight against the 7B's Comfortable), so it
-        // disagreed with the pick card there. gemma 4 12b, larger still, is too slow for chat on this
-        // card, so the notice no more names it than the pick does.
+        // Both roles on Qwen2.5 7B Q5_K_M, and the pick is gemma 4 12b, 11.91B against 7.62B —
+        // past the notice's 15% (7.62 × 1.15 = 8.76). Judged on each model's trained-context fit,
+        // the notice was silent at 10 GB free and at 13.4 back when the pick here was Qwen3.5 9B (a
+        // Tight against the 7B's Comfortable), so it disagreed with the pick card there.
         let qwen = format!("hf.co/{QWEN_7B}:Q5_K_M");
-        assert!(entry(QWEN35_9B).parameters_b >= entry(QWEN_7B).parameters_b * 1.15);
+        assert!(entry(GEMMA4_12B).parameters_b >= entry(QWEN_7B).parameters_b * 1.15);
         for free in [10.0, 13.4, 20.0, 24.0] {
             let hw = laptop(free);
-            assert_eq!(catalogue_pick(&pick_on(&hw)).0, QWEN35_9B, "{free} GB");
+            assert_eq!(catalogue_pick(&pick_on(&hw)).0, GEMMA4_12B, "{free} GB");
             // With and without the served Q5_K_M counted as a copy the user has: it fits the card,
             // so on a real Ollama it is one.
             for copies in [Vec::new(), vec![QWEN_7B.to_string()]] {
                 let s = better_fit_suggestion(&hw, &copies, Some(qwen.clone()), Some(qwen.clone()))
                     .unwrap_or_else(|| panic!("{free} GB, {copies:?}: the notice is silent"));
-                assert_eq!(s.repo, QWEN35_9B, "{free} GB, {copies:?}");
+                assert_eq!(s.repo, GEMMA4_12B, "{free} GB, {copies:?}");
                 assert!(!s.already_downloaded, "{free} GB, {copies:?}");
             }
         }
@@ -5415,8 +5488,8 @@ mod tests {
         );
         assert_eq!(trained.verdict, fit::Verdict::HalvedContext);
         let s = better_fit_suggestion(&laptop(10.0), &[], Some(llama.clone()), Some(llama))
-            .expect("the pick is a 9B");
-        assert_eq!(s.repo, QWEN35_9B);
+            .expect("the pick is a 12B");
+        assert_eq!(s.repo, GEMMA4_12B);
     }
 
     #[test]
@@ -5626,10 +5699,11 @@ mod tests {
 
     #[test]
     fn already_on_this_device_means_a_copy_the_pick_could_use() {
-        // A role on gemma 3 4b, and the notice's suggestion is the pick, Qwen3.5 9B. An LM Studio
-        // Q8_0 of it sits on disk under an Ollama on 11434: a file that server cannot load, and at
-        // 8.87 GB one that would not fit the card if it could. Matched by repo alone, the notice
-        // called PM's pick "already on this device" right above a pick card offering its download.
+        // On an RTX 4060 Laptop, where the pick is Qwen3.5 9B and gemma 4 12b is too slow for chat:
+        // a role on gemma 3 4b, and the notice's suggestion is the pick. An LM Studio Q8_0 of it
+        // sits on disk under an Ollama on 11434: a file that server cannot load, and at 8.87 GB one
+        // that would not fit the card if it could. Matched by repo alone, the notice called PM's
+        // pick "already on this device" right above a pick card offering its download.
         let gemma = "gemma3:4b".to_string();
         let lm_studio = |repo: &str, file: &str, quant: &str, gb: f64| {
             on_disk_file(
@@ -5642,7 +5716,7 @@ mod tests {
         let qwen = |quant: &str, gb: f64| lm_studio(QWEN35_9B, "Qwen3.5-9B", quant, gb);
         let pick_with = |url: &str, file: DiskModel| {
             size_for_machine(
-                &laptop(20.0),
+                &rtx_4060_laptop(20.0),
                 vec![served(&gemma, 3_338_801_804, "Q4_K_M", 4.3)],
                 &[file],
                 Some(url),
@@ -5653,7 +5727,7 @@ mod tests {
         let usable = |url: &str, file: DiskModel| notice_copy(&pick_with(url, file));
         let notice = |copies: &[String]| {
             better_fit_suggestion(
-                &laptop(20.0),
+                &rtx_4060_laptop(20.0),
                 copies,
                 Some(gemma.clone()),
                 Some(gemma.clone()),
@@ -5850,48 +5924,48 @@ mod tests {
                 KV_Q8,
                 4.99,
                 Tight,
-                30.6,
+                34.1,
                 Rung::Gpu,
-                (QWEN_7B, Q3_K_M, 24.2),
+                (QWEN_7B, Q3_K_M, 26.7),
             ),
             (
                 "8 GB card at 256, 20 free",
-                card(8.0, Some(256.0), 20.0),
-                "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                rtx_4060_laptop(20.0),
+                QWEN35_9B,
                 Q3_K_M,
                 32768,
-                KV_Q8,
-                6.37,
+                KV_F16,
+                6.76,
                 Tight,
-                30.5,
+                31.4,
                 Rung::Gpu,
-                (GEMMA4_12B, Q3_K_M, 19.6),
+                (GEMMA4_12B, Q3_K_M, 21.6),
             ),
             (
                 "12 GB card at 360, 24 free",
                 card(12.0, Some(360.0), 24.0),
-                QWEN35_9B,
-                Q6_K,
+                GEMMA4_12B,
+                Q4_K_M,
                 32768,
                 KV_F16,
-                9.36,
+                8.26,
                 Comfortable,
-                30.5,
+                31.6,
                 Rung::Chat,
-                ("bartowski/Qwen2.5-14B-Instruct-GGUF", Q3_K_M, 23.1),
+                ("bartowski/Qwen2.5-14B-Instruct-GGUF", Q3_K_M, 25.5),
             ),
             (
                 "16 GB card at 288, 32 free",
                 card(16.0, Some(288.0), 32.0),
                 QWEN35_9B,
-                Q4_K_M,
+                Q5_K_M,
                 32768,
                 KV_F16,
-                7.7,
+                8.54,
                 Comfortable,
-                31.6,
+                30.6,
                 Rung::Chat,
-                ("unsloth/gemma-4-26B-A4B-it-GGUF", Q3_K_M, 24.1),
+                ("unsloth/gemma-4-26B-A4B-it-GGUF", Q3_K_M, 26.7),
             ),
         ] {
             match pick_on(&hw) {
@@ -5928,7 +6002,7 @@ mod tests {
         match pick_on(&card(24.0, Some(1008.0), 48.0)) {
             Pick::Catalogue { fit, .. } => {
                 assert_eq!(fit.verdict, fit::Verdict::Tight);
-                assert_eq!(fit.est_tokens_per_sec, Some(107.4));
+                assert_eq!(fit.est_tokens_per_sec, Some(119.8));
             }
             other => panic!("expected a catalogue pick, got {other:?}"),
         }
