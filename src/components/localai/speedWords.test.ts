@@ -63,14 +63,15 @@ describe("speedShort", () => {
 });
 
 describe("speedLong", () => {
-  it("names the card's published speed, how close PM's tests came, and that the card was held back", () => {
+  it("names the card's published speed, how close PM's tests came, and the power budget they ran on", () => {
+    // The re-fit of 07-10-2026: ten builds of eight models, every figure within about a quarter (-10.9% to +23.0%)
+    // and all but gemma 3 4b within 12%, on a card capped to a reduced power budget for most replies
+    // — at full power it ran 1.19-1.38x faster, so the sentence says a card at full power is often
+    // faster, and by how much on that one.
     const text = speedLong(fit("gpu_published"), HW);
-    expect(text).toMatch(
-      /^PM's estimate, not a measurement on this computer: your graphics card's published memory speed \(384 GB\/s\), scaled by/,
+    expect(text).toBe(
+      "PM's estimate, not a measurement on this computer: your graphics card's published memory speed (384 GB/s), scaled by how fast ten builds of eight models really ran on one laptop graphics card PM tested — there, it came within about a quarter of each, and within about 12% of all but one. That laptop runs its card on a reduced power budget for most replies, so on a desktop card, or a laptop that keeps its card at full power, replies may well come faster than this: at full power, that laptop's own card was about 1.2 to 1.4 times as fast.",
     );
-    expect(text).toContain("(384 GB/s)");
-    expect(text).toContain("within 20% of each");
-    expect(text).toContain("held back by its power settings");
     // No bandwidth figure, no bracket.
     expect(speedLong(fit("gpu_published"), { gpu_bandwidth_gbps: null })).not.toMatch(/GB\/s/);
   });
@@ -88,7 +89,7 @@ describe("speedLong", () => {
 
   it("says a typical speed is a guess either way", () => {
     expect(speedLong(fit("gpu_typical"), HW)).toBe(
-      "PM doesn't recognise your graphics card, so this assumes a typical memory speed (400 GB/s), scaled by how fast eight models really ran on one laptop graphics card PM tested. Your card's memory speed could be half that, or double.",
+      "PM doesn't recognise your graphics card, so this assumes a typical memory speed (400 GB/s), scaled by how fast ten builds of eight models really ran on one laptop graphics card PM tested. Your card's memory speed could be half that, or double.",
     );
     expect(speedLong(fit("system"), HW)).toMatch(/rough guide in either direction/);
   });
@@ -100,7 +101,7 @@ describe("speedLong", () => {
       const text = speedLong(fit("gpu_typical"), HW, { moe }) ?? "";
       expect(text).not.toMatch(/the same way/);
       expect(text).toContain(
-        "scaled by how fast eight models really ran on one laptop graphics card PM tested",
+        "scaled by how fast ten builds of eight models really ran on one laptop graphics card PM tested",
       );
     }
   });
@@ -124,6 +125,13 @@ describe("the speed copy, everywhere", () => {
       expect(s).not.toMatch(/\bceilings?\b/i);
       expect(s).not.toContain("~");
     }
+  });
+
+  it("never repeats what the run of 02-10-2026 claimed", () => {
+    // Eight models, 20%, and a card held back by its power settings at the time: the 07-10-2026
+    // re-fit replaced all three, on every basis and in the list's own line.
+    for (const s of everything())
+      expect(s).not.toMatch(/how fast eight models really ran|within 20%|held back/);
   });
 
   it("says the list's figures are estimates, not measurements on this computer", () => {

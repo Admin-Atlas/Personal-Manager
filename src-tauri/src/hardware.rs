@@ -1854,7 +1854,7 @@ mod tests {
         // `fit::gpu_fit` offers a card config as the faster rung only where the card's estimate
         // beats system memory's. For a dense model that must hold on every card PM lists, or a
         // listed card could lose a rung it plainly has: the worst case is a build whose every byte
-        // is slow to unpack, on the slowest card — 124 / 2.647 = 46.8 against 40 a byte.
+        // is slow to unpack, on the slowest card — 124 / 2.415 = 51.3 against 40 a byte.
         let cand = crate::fit::QuantCandidate {
             quant: crate::fit::Quant::Q3_K_M,
             weight_gb: 3.5,

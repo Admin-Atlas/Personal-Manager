@@ -49,8 +49,10 @@ const GEMMA4_TAG = `hf.co/${GEMMA4}:Q3_K_M`;
 /** The backend's chat floor (better_fit.rs `chat_speed`). */
 const SPEED: LocalChatSpeed = { floor_tps: 30, reply_tokens: 300, reply_secs: 10 };
 
-/** The dev laptop's passed-over model (spec §3): gemma 4 12b at Q3_K_M, estimated at 29.4 on the
- *  card. `have`: the user's own copy of it, by its served id. */
+/** A larger model passed over for speed, by a whisker: gemma 4 12b at Q3_K_M, estimated at 29.4 on
+ *  the card — the dev laptop's figure for it before the 07-10-2026 re-fit (DECISIONS.md, 2026-10-02, #851). Since then PM
+ *  puts it at 32.4 there, over the floor, and it is that laptop's pick; this keeps the near miss for
+ *  the code path. `have`: the user's own copy of it, by its served id. */
 const passedOver = (over: Partial<LocalPassedOver> = {}): LocalPassedOver => ({
   repo: GEMMA4,
   display_name: "gemma 4 12b it",
@@ -506,8 +508,8 @@ describe("the lines about models the user already has", () => {
 
   it("says why a build too slow for chat isn't the pick, when passed_over can't", () => {
     // A heavier build of the pick's own model: never "larger", so passed_over never names it. The
-    // backend's estimate for the user's build (23.9 on a 12 GB card at 360 GB/s for Qwen3.5 9B Q8_0)
-    // is the reason, and the pick is the same model's quicker build.
+    // backend's estimate for the user's build (`under_chat_floor_tps`) is the reason, and the pick is
+    // the same model's quicker build.
     const pick = catalogue({ fit: fit({ est_tokens_per_sec: 30.5 }) });
     const same = recs({
       installed: [installed("qwen2.5:7b-instruct-q8_0", QWEN, {}, true, false, false, 23.9)],
@@ -547,8 +549,8 @@ describe("the lines about models the user already has", () => {
   });
 
   it("says a model in use was passed over for speed, and how fast the pick should be", () => {
-    // The dev laptop with its served gemma 4 12b bound: it fits the card, so the only reason it isn't
-    // the pick is the chat floor — not a size the 15% line could compare.
+    // The near miss's own copy, served and bound: it fits the card, so the only reason it isn't the
+    // pick is the chat floor — not a size the 15% line could compare.
     const r = recs({ installed: [installed(GEMMA4_TAG, GEMMA4)] });
     const pick = catalogue({ passed_over: passedOver({ have: HAVE_GEMMA4 }) });
     expect(inUseLine(pick, GEMMA4_TAG, r, HERE)).toBe(
@@ -573,7 +575,8 @@ describe("the lines about models the user already has", () => {
 
 describe("passedOverLine — the larger model PM passed over for speed", () => {
   it("names it, how fast PM expects it to be, and where to find it", () => {
-    // Bobby's laptop, from the spec: the pick is Qwen3.5 9B, and gemma 4 12b is 2% under the floor.
+    // The near miss: gemma 4 12b 2% under the floor, as the dev laptop had it before the re-fit, when
+    // its pick was Qwen3.5 9B.
     expect(passedOverLine(catalogue({ passed_over: passedOver() }), recs(), null, HERE)).toBe(
       "gemma 4 12b it is larger and also fits your graphics card, but PM expects it to reply at about 29 tok/s here — under the 30 tok/s it wants for chat. It's under All models if you'd rather have the larger model.",
     );

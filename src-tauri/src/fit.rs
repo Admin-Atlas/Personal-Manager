@@ -77,21 +77,32 @@ const SYSTEM_BANDWIDTH_GBPS: f64 = 40.0;
 const GPU_BANDWIDTH_FALLBACK_GBPS: f64 = 400.0;
 
 /// What an ordinary decode byte costs on a discrete card, in bytes of its published bandwidth: those
-/// bytes streamed at 1 / 1.787 = 56.0% of it. One half of a two-parameter fit, with
-/// [`GPU_SLOW_BYTE_COST`], on the eight models timed on the dev laptop ([`tokens_per_sec`] has the
-/// table), whose card was software power-capped throughout — so a healthy card beats it, which is the
-/// safe direction.
+/// bytes stream at 1 / 1.602 = 62.4% of it. One half of a two-parameter fit, with
+/// [`GPU_SLOW_BYTE_COST`], on ten builds of eight models timed on the dev laptop
+/// ([`tokens_per_sec`] has the table), in the regime its card runs most replies in.
 ///
-/// Written as the fitted costs, never as rounded efficiencies: 0.56 and 0.38 put gemma 4 12b Q3_K_M
-/// at 29.5 on that laptop, which prints as 30 and clears the chat floor its measured 28.3 does not.
-/// CALIBRATE: re-fit both on an uncapped run.
-const GPU_BYTE_COST: f64 = 1.787;
+/// That card has two. Capped, it holds a fixed 1552 MHz at 41-61 W, under a software power cap well
+/// inside its 115 W limit; boosted, after about 20 seconds of continuous load, it runs at about
+/// 2.7 GHz and 100-115 W, 1.19-1.38x faster. A reply of a few paragraphs from idle is over before
+/// the boost, so the capped fit is what most replies get on that laptop, and it is the safe
+/// direction elsewhere: a card that holds its full power beats it. The 20 seconds held through
+/// CPU turbo off, an nvidia-powerd restart and a re-sent platform profile (08-10). Fitted on the
+/// boosted runs instead, the costs come out at 1.282 and 1.688. The 02-10 fit, 1.787 and 2.647, was
+/// made while a failed power service held the card to about 50 W and its memory clock to 9001 MHz
+/// rather than 12001.
+///
+/// Written as the fitted costs, never as rounded efficiencies: 62% and 41% put Qwen3.5 9B Q3_K_M
+/// at 29.2 on an 8 GB RTX 3060 (240 GB/s), which prints as 29 and misses the chat floor that the
+/// fitted costs' 29.5 clears. CALIBRATE: every point is from one laptop card; no desktop card has
+/// been timed.
+const GPU_BYTE_COST: f64 = 1.602;
 
 /// What a byte in a type slow to unpack costs on a discrete card (the generator's
-/// `SLOW_TENSOR_TYPES`, [`Quant::unpacks_slowly`]): 1 / 2.647 = 37.8% of the published bandwidth.
-/// Fitted on the three Q3_K_M points, so it is Q3_K's cost; the other slow types are assumed to
-/// share it, unmeasured. CALIBRATE with [`GPU_BYTE_COST`].
-const GPU_SLOW_BYTE_COST: f64 = 2.647;
+/// `SLOW_TENSOR_TYPES`, [`Quant::unpacks_slowly`]): 1 / 2.415 = 41.4% of the published bandwidth.
+/// Fitted with [`GPU_BYTE_COST`] on the same capped runs, where the four Q3_K_M points carry it, so
+/// it is Q3_K's cost; the other slow types are assumed to share it, unmeasured. CALIBRATE with
+/// [`GPU_BYTE_COST`].
+const GPU_SLOW_BYTE_COST: f64 = 2.415;
 
 /// A mixture of experts on a card is estimated at half what its decode bytes alone say. From one
 /// published report, not a PM measurement: Qwen3.6 35B A3B at about 120 tok/s on an RTX 4090, where
@@ -399,10 +410,11 @@ pub enum Verdict {
 
 /// Where a speed estimate's bandwidth figure came from, so the UI can say how far to trust it. Every
 /// path divides a bandwidth by the bytes a decode step reads, and on a card charges those bytes at
-/// costs fitted on eight models timed on one power-capped laptop card ([`tokens_per_sec`]): an
-/// estimate on every path, never a bound. The bandwidth is a published spec on one path, a typical
-/// figure on two, and on shared memory a number PM does not stand behind at all. On the card the
-/// figure is compared against the chat floor, off it against the background floor.
+/// costs fitted on ten builds of eight models timed on one laptop card in its capped regime
+/// ([`tokens_per_sec`]): an estimate on every path, never a bound. The bandwidth is a published spec
+/// on one path, a typical figure on two, and on shared memory a number PM does not stand behind at
+/// all. On the card the figure is compared against the chat floor, off it against the background
+/// floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeedBasis {
@@ -503,27 +515,31 @@ fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32, kv: KvCache) 
 /// it came from. `None` when there are no decode bytes (a spec with no active parameters).
 ///
 /// An estimate, not a bound. On a discrete card it is a two-parameter fit ([`GPU_BYTE_COST`],
-/// [`GPU_SLOW_BYTE_COST`]) on eight models timed on the dev laptop — RTX 5060 Laptop GPU, 384 GB/s,
-/// Ollama 0.33, q8_0 cache, 32k context, fully on the card, thinking off, 02-10-2026 — where it came
-/// within −11% to +15% of each (leave-one-out 8.2% mean, 18.6% worst):
+/// [`GPU_SLOW_BYTE_COST`]) on ten builds of eight models timed on the dev laptop — RTX 5060 Laptop
+/// GPU, 384 GB/s, Ollama 0.33, q8_0 cache, flash attention, 32k context, fully on the card, thinking
+/// off, 07-10-2026 — where it came within −10.9% to +23.0% of each, and within 12% of all but gemma 3 4b
+/// (leave-one-out 8.4% mean, 26.6% worst). Measured is the median of each model's capped runs:
 ///
 /// | Model, quant         | Estimate | Measured |
 /// |----------------------|----------|----------|
-/// | Llama 3.2 1B Q8_0    | 163.6    | 184.8    |
-/// | Llama 3.2 3B Q6_K    | 81.5     | 78.5     |
-/// | Qwen3.5 4B Q6_K      | 61.1     | 56.8     |
-/// | gemma 3 4b Q4_K_M    | 86.5     | 75.0     |
-/// | Qwen2.5 7B Q5_K_M    | 42.4     | 45.1     |
-/// | Llama 3.1 8B Q3_K_M  | 45.7     | 47.0     |
-/// | Qwen3.5 9B Q3_K_M    | 42.7     | 42.9     |
-/// | gemma 4 12b Q3_K_M   | 29.4     | 28.3     |
+/// | Llama 3.2 1B Q8_0    | 182.5    | 196.5    |
+/// | Llama 3.2 3B Q6_K    | 90.9     | 86.0     |
+/// | Qwen3.5 4B Q6_K      | 68.2     | 61.0     |
+/// | gemma 3 4b Q4_K_M    | 96.5     | 78.5     |
+/// | Qwen2.5 7B Q3_K_M    | 53.4     | 52.3     |
+/// | Qwen2.5 7B Q4_K_M    | 54.8     | 58.8     |
+/// | Qwen2.5 7B Q5_K_M    | 47.3     | 53.1     |
+/// | Llama 3.1 8B Q3_K_M  | 50.5     | 51.4     |
+/// | Qwen3.5 9B Q3_K_M    | 47.2     | 47.5     |
+/// | gemma 4 12b Q3_K_M   | 32.4     | 32.3     |
 ///
-/// All eight points are capped ones: the card was software power-capped throughout
-/// (`clocks_event_reasons` 0x4, 47-53 W of 115 W), and uncapped on 29-08 it ran Qwen2.5 7B and gemma
-/// 3 4b about 1.4x faster. So a healthy card beats the estimate, the safe direction. On the card it
-/// is compared against the chat floor (`better_fit::quick_enough_for_chat`); off it, the system figure
-/// is compared against the background floor. PM claims no tolerance for an unrecognised card, shared
-/// memory or system RAM.
+/// All ten are capped points, the regime short runs and a chat reply from idle land in
+/// ([`GPU_BYTE_COST`] has both). Boosted, the same card ran six of them 1.19-1.38x faster — gemma
+/// 4 12b Q3_K_M at 42.5 — so a card that holds its full power beats the estimate, the safe
+/// direction. Phi 3.5 mini Q4_K_M and Qwen3.5 9B Q4_K_M are left out: at 32k,
+/// Ollama put part of each off the card. On the card the estimate is compared against the chat floor
+/// (`better_fit::quick_enough_for_chat`); off it, the system figure is compared against the
+/// background floor. PM claims no tolerance for an unrecognised card, shared memory or system RAM.
 fn tokens_per_sec(
     spec: &ModelSpec,
     cand: &QuantCandidate,
@@ -1845,43 +1861,57 @@ mod tests {
     }
 
     #[test]
-    fn the_gpu_estimate_comes_within_twenty_percent_of_the_eight_models_timed_on_the_dev_laptop() {
-        // RTX 5060 Laptop GPU at 384 GB/s, Ollama 0.33, q8_0 cache, 32k, fully on the card, thinking
-        // off, 02-10-2026, with the card software power-capped throughout. Each estimate is pinned
-        // to the decimal `tokens_per_sec`'s table prints, from the catalogue's own decode bytes.
+    fn the_gpu_estimate_comes_within_a_quarter_of_the_ten_builds_timed_on_the_dev_laptop() {
+        // RTX 5060 Laptop GPU at 384 GB/s, Ollama 0.33, q8_0 cache, flash attention, 32k, fully on
+        // the card, thinking off, 07-10-2026, each measured figure the median of that model's capped
+        // runs. Each estimate is pinned to the decimal `tokens_per_sec`'s table prints, from the
+        // catalogue's own decode bytes.
         let card = FitHardware {
             gpu_bandwidth_gbps: Some(384.0),
             ..gpu(20.0, 7.96)
         };
+        let gemma_3 = "ggml-org/gemma-3-4b-it-GGUF";
         for (repo, quant, estimate, measured) in [
             (
                 "bartowski/Llama-3.2-1B-Instruct-GGUF",
                 Quant::Q8_0,
-                163.6,
-                184.8,
+                182.5,
+                196.5,
             ),
             (
                 "bartowski/Llama-3.2-3B-Instruct-GGUF",
                 Quant::Q6_K,
-                81.5,
-                78.5,
+                90.9,
+                86.0,
             ),
-            ("unsloth/Qwen3.5-4B-GGUF", Quant::Q6_K, 61.1, 56.8),
-            ("ggml-org/gemma-3-4b-it-GGUF", Quant::Q4_K_M, 86.5, 75.0),
+            ("unsloth/Qwen3.5-4B-GGUF", Quant::Q6_K, 68.2, 61.0),
+            (gemma_3, Quant::Q4_K_M, 96.5, 78.5),
+            (
+                "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                Quant::Q3_K_M,
+                53.4,
+                52.3,
+            ),
+            (
+                "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                Quant::Q4_K_M,
+                54.8,
+                58.8,
+            ),
             (
                 "bartowski/Qwen2.5-7B-Instruct-GGUF",
                 Quant::Q5_K_M,
-                42.4,
-                45.1,
+                47.3,
+                53.1,
             ),
             (
                 "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
                 Quant::Q3_K_M,
-                45.7,
-                47.0,
+                50.5,
+                51.4,
             ),
-            ("unsloth/Qwen3.5-9B-GGUF", Quant::Q3_K_M, 42.7, 42.9),
-            ("unsloth/gemma-4-12b-it-GGUF", Quant::Q3_K_M, 29.4, 28.3),
+            ("unsloth/Qwen3.5-9B-GGUF", Quant::Q3_K_M, 47.2, 47.5),
+            ("unsloth/gemma-4-12b-it-GGUF", Quant::Q3_K_M, 32.4, 32.3),
         ] {
             let (spec, cand) = catalogue_build(repo, quant);
             assert!(
@@ -1890,28 +1920,46 @@ mod tests {
             );
             let tps = gpu_tokens_per_sec(&spec, &cand, &card).unwrap();
             assert_eq!(round1(tps), estimate, "{repo} {quant:?}");
+            let error = (tps / measured - 1.0).abs();
             assert!(
-                (tps / measured - 1.0).abs() <= 0.20,
+                error <= 0.25,
+                "{repo} {quant:?}: {tps:.1} against a measured {measured}"
+            );
+            // gemma 3 4b is the one outlier, over-estimated by 23%; every other model is within 12%.
+            assert!(
+                repo == gemma_3 || error <= 0.12,
                 "{repo} {quant:?}: {tps:.1} against a measured {measured}"
             );
         }
 
-        // The pair that decides the dev laptop's pick: gemma 4 12b shows 29, under the chat floor's
-        // 30, and Qwen3.5 9B 43. The costs are the fitted 1.787 and 2.647 on purpose — rounded to
-        // 56% and 38% efficiencies, gemma 4 12b comes out at 29.5, which shows as 30 and passes.
+        // The pair the dev laptop's pick turns on: gemma 4 12b shows 32, over the chat floor's 30,
+        // and Qwen3.5 9B 47.
         let (gemma, gemma_q3) = catalogue_build("unsloth/gemma-4-12b-it-GGUF", Quant::Q3_K_M);
         let (qwen, qwen_q3) = catalogue_build("unsloth/Qwen3.5-9B-GGUF", Quant::Q3_K_M);
-        let gemma_tps = gpu_tokens_per_sec(&gemma, &gemma_q3, &card).unwrap();
-        assert_eq!(shown_tps(gemma_tps), 29.0);
+        assert_eq!(
+            shown_tps(gpu_tokens_per_sec(&gemma, &gemma_q3, &card).unwrap()),
+            32.0
+        );
         assert_eq!(
             shown_tps(gpu_tokens_per_sec(&qwen, &qwen_q3, &card).unwrap()),
-            43.0
+            47.0
         );
-        let d = gemma_q3.decode.unwrap();
-        let rounded = 384e9 / (d.fast / 0.56 + d.slow / 0.38);
+
+        // The costs are the fitted 1.602 and 2.415 on purpose. On an 8 GB RTX 3060 (240 GB/s)
+        // Qwen3.5 9B Q3_K_M comes out at 29.5, which shows as 30 and passes; rounded to 62% and 41%
+        // efficiencies it is 29.2, which shows as 29 and does not.
+        let rtx_3060 = FitHardware {
+            gpu_bandwidth_gbps: Some(240.0),
+            ..gpu(20.0, 8.0)
+        };
+        let fitted = gpu_tokens_per_sec(&qwen, &qwen_q3, &rtx_3060).unwrap();
+        assert_eq!(round1(fitted), 29.5);
+        assert_eq!(shown_tps(fitted), 30.0);
+        let d = qwen_q3.decode.unwrap();
+        let rounded = 240e9 / (d.fast / 0.62 + d.slow / 0.41);
         assert_eq!(
             round1(rounded),
-            29.5,
+            29.2,
             "the rounding trap the constants avoid"
         );
     }
@@ -1940,7 +1988,7 @@ mod tests {
         let (slow_spec, slow) = decoded(Architecture::Dense, 0.0, 4e9);
         let on_card = |spec, cand| gpu_tokens_per_sec(spec, cand, &card).unwrap();
         assert!(
-            (on_card(&fast_spec, &fast) / on_card(&slow_spec, &slow) - 2.647 / 1.787).abs() < EPS
+            (on_card(&fast_spec, &fast) / on_card(&slow_spec, &slow) - 2.415 / 1.602).abs() < EPS
         );
         // From system memory a byte is a byte: the costs were fitted on a card.
         assert_eq!(
@@ -2006,10 +2054,10 @@ mod tests {
         assert!((system - 4.95).abs() < 0.01);
         // On the card, at the fitted costs.
         let q4 = gpu_tokens_per_sec(&spec, &build(Quant::Q4_K_M), &card).unwrap();
-        assert!((q4 - 384.0 / (7.62 * 0.61 * 1.787)).abs() < EPS, "{q4}");
+        assert!((q4 - 384.0 / (7.62 * 0.61 * 1.602)).abs() < EPS, "{q4}");
         let q3 = gpu_tokens_per_sec(&spec, &build(Quant::Q3_K_M), &card).unwrap();
         assert!(
-            (q3 - 384.0 / (7.62 * 0.49 * (0.5 * 1.787 + 0.5 * 2.647))).abs() < EPS,
+            (q3 - 384.0 / (7.62 * 0.49 * (0.5 * 1.602 + 0.5 * 2.415))).abs() < EPS,
             "{q3}"
         );
         // A spec with no active parameters has no bytes, so no figure at all.
@@ -2156,9 +2204,9 @@ mod tests {
         // over the 5.93 GiB this very config was measured holding on that card.
         assert_eq!(g.est_memory_gb, Some(6.5));
         assert_eq!(g.speed_basis, Some(SpeedBasis::GpuPublished));
-        // Measured at 45.1 on that card, capped, on 02-10 (and about 64 uncapped on 29-08). The old
-        // "up to" figure was 71.0.
-        assert_eq!(g.est_tokens_per_sec, Some(42.4));
+        // Measured at 53.1 on that card in its capped regime on 07-10, and 63.4 when it boosted. The
+        // old "up to" figure was 71.0.
+        assert_eq!(g.est_tokens_per_sec, Some(47.3));
 
         // The two guards `gpu_fit` opens with, and a RAM verdict that already refused.
         let shared = FitHardware {

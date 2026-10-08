@@ -1450,7 +1450,7 @@ describe("speed on the model list", () => {
 
   it("explains a mixture of experts' figure the way PM works it out on a card", async () => {
     // fit.rs halves a MoE's card figure (`MOE_GPU_FACTOR`), so gemma 4 26B A4B (3.82B active) shows
-    // about 32 at 384 GB/s where a dense 4B shows about 80. A guide saying a MoE "runs at the speed of
+    // about 36 at 384 GB/s where a dense 4B (Qwen3.5 4B Q4_K_M) shows about 88. A guide saying a MoE "runs at the speed of
     // that small active part" would be contradicted by the card right beside it.
     const card: LocalRecommendation = {
       repo: "unsloth/gemma-4-26B-A4B-it-GGUF",
@@ -1478,7 +1478,7 @@ describe("speed on the model list", () => {
         context: 32768,
         kv: "f16",
         est_memory_gb: 13.2,
-        est_tokens_per_sec: 32.1,
+        est_tokens_per_sec: 35.6,
         speed_basis: "gpu_published",
         notes: [],
       },
@@ -1487,7 +1487,7 @@ describe("speed on the model list", () => {
     localModelRecommendations.mockResolvedValue({ ...recs(), curated: [card] });
     const { container } = await loaded();
     const models = container.querySelector("#sec-localai-models") as HTMLElement;
-    expect(models.textContent).toContain("about 32 tok/s");
+    expect(models.textContent).toContain("about 36 tok/s");
     expect(models.textContent).toContain("3.82B active");
     const term = Array.from(models.querySelectorAll("dt")).find((dt) =>
       dt.textContent?.startsWith("MoE (mixture of experts)"),
@@ -1498,6 +1498,26 @@ describe("speed on the model list", () => {
     );
     expect(entry).toContain("quicker than an ordinary model of its full size");
     expect(entry).not.toMatch(/runs at the speed of/);
+  });
+
+  it("says how far to trust a card's figure the way the re-fit found it", async () => {
+    // The 07-10-2026 re-fit: ten builds of eight models, all but gemma 3 4b within 12% and that one within about a
+    // quarter (its figure 23% too high), on a laptop card capped to a reduced power budget for most
+    // replies and 1.19-1.38x faster at full power. The guide says it at more length than the pick
+    // card's sentence (speedWords.ts), and must not keep the 02-10-2026 run's eight models and 20%.
+    const { container } = await loaded();
+    const models = container.querySelector("#sec-localai-models") as HTMLElement;
+    const term = Array.from(models.querySelectorAll("dt")).find((dt) =>
+      dt.textContent?.startsWith("Speed:"),
+    );
+    const entry = term?.nextElementSibling?.textContent ?? "";
+    expect(entry).toContain(
+      "scales that by how fast ten builds of eight models really ran on one laptop graphics card PM tested: there it came within about 12% of all but one of them, and within about a quarter of that one (gemma 3 4b, which ran slower than PM expected).",
+    );
+    expect(entry).toContain(
+      "That laptop runs its card on a reduced power budget for most replies, so on a desktop card, or a laptop that keeps its card at full power, replies may well come faster than this: at full power, that laptop's own card was about 1.2 to 1.4 times as fast.",
+    );
+    expect(entry).not.toMatch(/how fast eight models really ran|within 20%|held back/);
   });
 });
 
