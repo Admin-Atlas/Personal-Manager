@@ -241,6 +241,58 @@ def _fastembed_cache_dir():
     return os.path.join(_MODELS_DIR, "fastembed") if _MODELS_DIR else None
 
 
+def _adopt_case_variant_cache(cache_dir, repo):
+    """Rename a cached copy of `repo` whose folder differs only in letter case to the exact name
+    huggingface_hub looks for, so a model already on disk is found instead of downloaded again.
+
+    fastembed 0.8.1 spells the default embedder's source `Qdrant/bge-small-en-v1.5-onnx-Q` where
+    0.8.0 spelled it `qdrant/bge-small-en-v1.5-onnx-q`: the same repo (the Hub ignores case) and
+    byte-identical files, but the cache folder is named from the spelling, and Linux filesystems are
+    case-sensitive. After the upgrade the worker missed its cache and the fetcher downloaded 67 MB
+    it already had — or, offline, could not, and embedding stopped until the machine was online
+    again. Windows and macOS (case-insensitive by default) find the old folder under the new name
+    and return at the first check.
+
+    Runs in the fetcher, which can write the model root; the worker sees it read-only. A failed
+    rename is ignored, and the fetcher then downloads exactly as it did before."""
+    if not cache_dir or not repo:
+        return
+    want = "models--" + repo.replace("/", "--")
+    if os.path.exists(os.path.join(cache_dir, want)):
+        return
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return
+    for name in names:
+        if name.lower() == want.lower():
+            try:
+                os.rename(os.path.join(cache_dir, name), os.path.join(cache_dir, want))
+            except OSError:
+                pass
+            return
+
+
+def _adopt_fastembed_cache(kind, model, custom):
+    """Find the repo fastembed will read `model` from (the custom spec's, else the bundled model's
+    own description) and adopt any case-variant copy of it already in the cache. Best-effort and
+    never raises: the download that follows is the fallback."""
+    try:
+        if kind == "rerank":
+            from fastembed.rerank.cross_encoder import TextCrossEncoder as cls
+        else:
+            from fastembed import TextEmbedding as cls
+        repo = (custom or {}).get("hf")
+        if not repo:
+            for desc in cls.list_supported_models():
+                if str(desc.get("model", "")).lower() == str(model).lower():
+                    repo = (desc.get("sources") or {}).get("hf")
+                    break
+        _adopt_case_variant_cache(_fastembed_cache_dir(), repo)
+    except Exception:
+        pass
+
+
 def _rapidocr_model_dir():
     """rapidocr's detection/recognition model dir under the shared model root, or None (rapidocr's
     own default) when PM_MODELS_DIR is unset.
@@ -1947,9 +1999,11 @@ def _ensure_model(method, params):
     model = params.get("model") or EMBED_MODEL
     custom = params.get("custom")
     if method in ("embed", "count_tokens"):
+        _adopt_fastembed_cache("embed", model, custom)
         get_embedder(model, custom)
         get_tokenizer(model, custom)
     elif method == "rerank":
+        _adopt_fastembed_cache("rerank", params.get("model"), custom)
         get_reranker(params.get("model"), custom)
     elif method == "transcribe":
         get_whisper(params.get("model_dir"))

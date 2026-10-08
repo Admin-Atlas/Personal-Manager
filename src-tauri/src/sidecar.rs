@@ -2607,9 +2607,6 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 ))]
 const SELFTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Whether a sidecar reply is the offline worker signalling a model isn't downloaded yet (as opposed
-/// to a genuine failure) — the trigger for a fetch-and-retry (issue #286). Pure, so it unit-tests the
-/// classification without a live child.
 /// What the network-allowed `--fetch` helper is given for `method`.
 ///
 /// The fetcher is the ONE child that keeps a socket, so it must never receive anything derived from
@@ -2625,6 +2622,9 @@ fn fetch_params<'a>(method: &str, params: &'a Value) -> &'a Value {
     }
 }
 
+/// Whether a sidecar reply is the offline worker signalling a model isn't downloaded yet (as opposed
+/// to a genuine failure) — the trigger for a fetch-and-retry (issue #286). Pure, so it unit-tests the
+/// classification without a live child.
 fn is_model_not_cached(reply: &Value) -> bool {
     reply["ok"].as_bool() != Some(true) && reply["error_kind"].as_str() == Some("model_not_cached")
 }

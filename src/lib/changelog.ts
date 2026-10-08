@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.7-alpha",
+    date: "2026-10-08",
+    highlights: [
+      "On Linux, PM keeps using the search model it has already downloaded when it updates, instead of fetching the same 67 MB again. The newer version of the part of PM that makes your files searchable looks for the model under a slightly different name, so PM now finds the copy you already have and carries on — even with no internet connection, where before searching and adding files would have waited until you were back online.",
+      "Under-the-hood tidying: one of the tests PM runs on its own code wrote 5 GB of empty files to check how big a model is. It now checks the same thing without writing them, so it no longer fills a developer’s memory. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.139.6-alpha",
     date: "2026-10-08",
     highlights: [
@@ -35,7 +43,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     date: "2026-10-08",
     highlights: [
       "The part of PM that reads your files moves up a version, and two things it got wrong are fixed. A large text file — a long JSON export or notes file — with an accented letter or a dash far into it is read properly again, instead of being marked as one PM can’t read. And if part of PM’s file reader is missing, PM now keeps your PDFs waiting until it’s fixed, instead of quietly skipping them for good. Underlined text in Word documents is now marked as underlined when PM reads it.",
-      "The part of PM that makes your files searchable moves up a version too. On Linux it downloads its small search model once more (about 67 MB) the first time it runs after this update.",
+      "The part of PM that makes your files searchable moves up a version too.",
     ],
   },
   {

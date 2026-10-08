@@ -1102,29 +1102,23 @@ mod tests {
     #[test]
     fn a_projector_is_reported_beside_the_weights_not_inside_them() {
         // GiB-scale fixtures on purpose: `bytes_to_gb` rounds to 2dp, so KiB-scale files would both
-        // round to 0.00 and the assertion would pass whatever the code did.
+        // round to 0.00 and the assertion would pass whatever the code did. They are SPARSE: the
+        // scan reads only `metadata().len()`, and writing real zeros cost 5 GiB of disk — of RAM
+        // where /tmp is tmpfs (Fedora's default), plus a 2 GiB buffer on the heap. A run killed
+        // mid-test leaked the lot, and a second run beside it ran a laptop out of memory.
         let gib = 1_073_741_824u64;
+        let sparse = |path: std::path::PathBuf, len: u64| {
+            std::fs::File::create(path).unwrap().set_len(len).unwrap();
+        };
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let folder = tmp.path().join("models");
         std::fs::create_dir_all(home.join("empty")).unwrap();
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(
-            folder.join("gemma-3-4b-it-Q4_K_M.gguf"),
-            vec![0u8; (2 * gib) as usize],
-        )
-        .unwrap();
-        std::fs::write(
-            folder.join("mmproj-model-f16.gguf"),
-            vec![0u8; gib as usize],
-        )
-        .unwrap();
+        sparse(folder.join("gemma-3-4b-it-Q4_K_M.gguf"), 2 * gib);
+        sparse(folder.join("mmproj-model-f16.gguf"), gib);
         // A second precision of the same projector: present on disk, never loaded alongside.
-        std::fs::write(
-            folder.join("mmproj-model-f32.gguf"),
-            vec![0u8; (2 * gib) as usize],
-        )
-        .unwrap();
+        sparse(folder.join("mmproj-model-f32.gguf"), 2 * gib);
 
         let scan = scan(&home, Some(&folder));
         assert_eq!(scan.models.len(), 1, "projectors are not models");

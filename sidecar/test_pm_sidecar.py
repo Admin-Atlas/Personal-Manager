@@ -435,6 +435,90 @@ class OcrOfflineContractTest(unittest.TestCase):
         self.assertEqual(len(captured["downloads"]), 1)
 
 
+def _case_sensitive(path):
+    """Whether the filesystem holding `path` tells `a` from `A` (Linux: yes; Windows and macOS by
+    default: no). The case-variant cache only exists on the first kind."""
+    probe = os.path.join(path, "case-probe")
+    open(probe, "w").close()
+    try:
+        return not os.path.exists(os.path.join(path, "CASE-PROBE"))
+    finally:
+        os.remove(probe)
+
+
+class FastembedCacheCaseTest(unittest.TestCase):
+    """fastembed 0.8.1 respelled the default embedder's source repo in a different letter case, so
+    on Linux the cache folder 0.8.0 filled no longer matched and the upgraded app downloaded the
+    model again — or, offline, lost embedding entirely. These pin the fetcher adopting the copy it
+    already has."""
+
+    OLD = "models--qdrant--bge-small-en-v1.5-onnx-q"
+    NEW = "models--Qdrant--bge-small-en-v1.5-onnx-Q"
+    REPO = "Qdrant/bge-small-en-v1.5-onnx-Q"
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = self._dir.name
+        if not _case_sensitive(self.root):
+            self._dir.cleanup()
+            self.skipTest("case-insensitive filesystem: the old folder answers to the new name")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _folder(self, name):
+        os.makedirs(os.path.join(self.root, name, "snapshots"))
+
+    def test_a_case_variant_folder_is_renamed_to_the_spelling_fastembed_now_asks_for(self):
+        self._folder(self.OLD)
+        S._adopt_case_variant_cache(self.root, self.REPO)
+        self.assertEqual(sorted(os.listdir(self.root)), [self.NEW])
+        self.assertTrue(os.path.isdir(os.path.join(self.root, self.NEW, "snapshots")))
+
+    def test_an_exact_match_is_left_alone_even_beside_a_variant(self):
+        # A machine that already downloaded the new spelling keeps both: the old folder may still
+        # belong to an older PM build sharing this data dir, so it is not this code's to remove.
+        self._folder(self.OLD)
+        self._folder(self.NEW)
+        S._adopt_case_variant_cache(self.root, self.REPO)
+        self.assertEqual(sorted(os.listdir(self.root)), sorted([self.OLD, self.NEW]))
+
+    def test_nothing_to_adopt_is_a_no_op(self):
+        self._folder("models--Xenova--ms-marco-MiniLM-L-6-v2")
+        S._adopt_case_variant_cache(self.root, self.REPO)
+        S._adopt_case_variant_cache(os.path.join(self.root, "missing"), self.REPO)
+        S._adopt_case_variant_cache(None, self.REPO)
+        S._adopt_case_variant_cache(self.root, None)
+        self.assertEqual(os.listdir(self.root), ["models--Xenova--ms-marco-MiniLM-L-6-v2"])
+
+    def test_the_fetcher_adopts_before_it_loads_and_so_never_downloads(self):
+        # fastembed checks its cache before the network, so the folder must carry the new name by
+        # the time the loader runs. Fake fastembed: the real one is absent in CI.
+        cache = os.path.join(self.root, "fastembed")
+        os.makedirs(os.path.join(cache, self.OLD))
+        fake = types.ModuleType("fastembed")
+
+        class TextEmbedding:
+            @staticmethod
+            def list_supported_models():
+                return [{"model": "BAAI/bge-small-en-v1.5", "sources": {"hf": self.REPO}}]
+
+        fake.TextEmbedding = TextEmbedding
+        seen = {}
+
+        def loader(model, custom):
+            seen["adopted"] = os.path.isdir(os.path.join(cache, self.NEW))
+
+        with (
+            mock.patch.dict(sys.modules, {"fastembed": fake}),
+            mock.patch.object(S, "_MODELS_DIR", self.root),
+            mock.patch.object(S, "get_embedder", loader),
+            mock.patch.object(S, "get_tokenizer", lambda model, custom: None),
+        ):
+            S._ensure_model("embed", {})
+        self.assertTrue(seen["adopted"])
+
+
 class SpreadsheetTest(unittest.TestCase):
     """The dedicated spreadsheet processor that bypasses MarkItDown. The type heuristic and the CSV
     path are pure/stdlib, so they run in CI; the .xlsx reader needs openpyxl and is skipped where it
