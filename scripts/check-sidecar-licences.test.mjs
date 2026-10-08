@@ -13,11 +13,11 @@
 //
 // Importing the module does not run the gate — entry-point guard at the bottom of it.
 
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { lockedPackages, scan, LOCKS, LICENCES_FILE } from "./check-sidecar-licences.mjs";
 
@@ -31,9 +31,16 @@ function lock(pins) {
     .join("\n");
 }
 
+// Every fixture tree is removed after its test, so a run leaves nothing behind in the temp folder.
+const roots = [];
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 /** A throwaway tree holding the three locks and a licences file. */
 function fixture({ base, ocr = [], tsne = [], packages }) {
   const root = mkdtempSync(join(tmpdir(), "pm-licences-"));
+  roots.push(root);
   mkdirSync(join(root, "sidecar"));
   writeFileSync(join(root, LOCKS[0]), lock(base));
   writeFileSync(join(root, LOCKS[1]), lock(ocr));

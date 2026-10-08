@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The failed-install path. On Windows the updater plugin (2.11+) hides every window and drops the
-// tray BEFORE it finds out the installer won't launch, then throws into a PM that is still running.
+// The failed-install path. On Windows the updater plugin hides every window and drops the tray
+// BEFORE it finds out the installer won't launch, then (since 2.11) throws into a PM that is still
+// running.
 // If the hook reported that failure without first bringing the main window back, the banner would
 // render into a hidden window and PM would sit there with nothing on screen and no tray icon. So:
 // the window is shown first, the failure is only reported after, and a failure to show never hides

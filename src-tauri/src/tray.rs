@@ -332,8 +332,8 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
 ///
 /// The setting alone is not enough: the icon has to still exist, because it is the only way back to
 /// a hidden window and the only place Quit lives. It can be gone while PM runs. On Windows the
-/// updater plugin (2.11+) runs Tauri's `cleanup_before_exit` before it launches the installer, which
-/// drops every tray icon, and then returns an error instead of exiting if the launch fails. A close
+/// updater plugin runs Tauri's `cleanup_before_exit` before it launches the installer, which drops
+/// every tray icon, and since 2.11 it returns an error instead of exiting if the launch fails. A close
 /// that hid the window after that would leave PM running with nothing on screen and nothing to
 /// click, so it quits instead.
 fn close_hides(tray_enabled: bool, tray_alive: bool) -> bool {

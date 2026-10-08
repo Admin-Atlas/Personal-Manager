@@ -27,18 +27,18 @@ import { evaluateAttemptMarker } from "./updateGate";
  * the backend up front whether this is a package install and, if so, skip the download entirely and
  * surface a "reinstall to update" banner pointing at the releases page instead.
  *
- * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, so the OS
- * can refuse it — Smart App Control (SAC) enforced, a SmartScreen "Don't run", an antivirus
- * quarantine. The updater plugin (2.11+) applies an update by first running Tauri's
- * `cleanup_before_exit` — every window hidden, the tray icon dropped, the webview's resources
- * cleared, this staged update included — then launching the installer and exiting. A refusal
- * lands one of two ways. If the launch itself fails, `install()` throws into a PM that is still
- * running but stripped. If the installer launched and was stopped afterwards, PM has already
- * exited, and it reopens on the old version with no error. Three guards: (1) we read SAC state up
- * front and, when it's enforcing, warn instead of firing a restart that can't succeed; (2) the
- * `catch` in `restart` brings the main window back before it shows the failure; (3) we record the
- * version we're about to install and, if the app reopens still on the old one, flag it next
- * launch instead of silently re-offering the same update.
+ * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, so the OS can
+ * refuse it — Smart App Control (SAC) enforced, a SmartScreen "Don't run", an antivirus quarantine.
+ * The updater plugin applies an update by first running Tauri's `cleanup_before_exit` — every
+ * window hidden, the tray icon dropped, the webview's resources cleared, this staged update
+ * included — then launching the installer and exiting. A refusal lands one of two ways. If the
+ * launch itself fails, `install()` throws (since 2.11; up to 2.10 the plugin exited regardless)
+ * into a PM that is still running but stripped. If the installer launched and was stopped
+ * afterwards, PM has already exited, and it reopens on the old version with no error. Three guards:
+ * (1) we read SAC state up front and, when it's enforcing, warn instead of firing a restart that
+ * can't succeed; (2) the `catch` in `restart` brings the main window back before it shows the
+ * failure; (3) we record the version we're about to install and, if the app reopens still on the
+ * old one, flag it next launch instead of silently re-offering the same update.
  */
 export type UpdateStatus =
   | "idle" // no update, still checking, or check failed (silent)
