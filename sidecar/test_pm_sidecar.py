@@ -768,7 +768,8 @@ class ProtocolTest(unittest.TestCase):
 
 
 def _fake_markitdown():
-    """A stand-in `markitdown` package carrying the real 0.1.6 exception hierarchy.
+    """A stand-in `markitdown` package carrying the real exception hierarchy (unchanged 0.1.6 to
+    0.1.8), including `FileConversionException`'s `attempts` — the shape `_convert` really raises.
 
     Injected rather than skipped-on-absent because the thing under test is a CLASSIFICATION, and
     classification is exactly what breaks silently: the real package is not installed in CI, and a
@@ -796,8 +797,20 @@ def _fake_markitdown():
     class UnsupportedFormatException(MarkItDownException):
         pass
 
+    class FailedConversionAttempt:
+        """The real one: the converter that failed, and the `sys.exc_info()` of its failure."""
+
+        def __init__(self, converter, exc_info=None):
+            self.converter = converter
+            self.exc_info = exc_info
+
     class FileConversionException(MarkItDownException):
-        pass
+        """The real signature. `_convert` raises ONE of these when every converter that accepted
+        the file failed, with a `FailedConversionAttempt` per failure in `attempts`."""
+
+        def __init__(self, message=None, attempts=None):
+            self.attempts = attempts
+            super().__init__(message or "File conversion failed.")
 
     class MissingDependencyException(MarkItDownException):
         pass
@@ -825,10 +838,25 @@ def _fake_markitdown():
     pkg.StreamInfo = StreamInfo
     pkg.MarkItDownException = MarkItDownException
     pkg.UnsupportedFormatException = UnsupportedFormatException
+    pkg.FailedConversionAttempt = FailedConversionAttempt
     pkg.FileConversionException = FileConversionException
     pkg.MissingDependencyException = MissingDependencyException
     pkg.MarkItDown = MarkItDown
     return pkg
+
+
+def _wrapped(pkg, *causes):
+    """What markitdown's `_convert` really raises once every converter that accepted the file has
+    failed: ONE `FileConversionException`, each failure's `sys.exc_info()` held in `attempts`.
+    Each cause is genuinely raised and caught so its `exc_info` is the real triple."""
+    attempts = []
+    for cause in causes:
+        try:
+            raise cause
+        except Exception:
+            attempt = pkg.FailedConversionAttempt(converter=object(), exc_info=sys.exc_info())
+            attempts.append(attempt)
+    return pkg.FileConversionException(attempts=attempts)
 
 
 class ConvertVerdictTest(unittest.TestCase):
@@ -870,13 +898,38 @@ class ConvertVerdictTest(unittest.TestCase):
             OSError(28, "No space left on device"),
             # A MarkItDownException, but about the ENVIRONMENT, not the file: this format needs
             # an optional package the venv lacks. Skipping would lose every file of that type.
-            # Same package instance, so this really is caught by the `except MissingDependency`
-            # arm and re-raised — not merely unmatched.
+            # Same package instance, so this really is recognised as a missing dependency and
+            # re-raised — unmatched, it would have fallen into the verdict arm as Unconvertible.
             self.pkg.MissingDependencyException("PdfConverter requires pdfminer.six"),
         ):
             with self.assertRaises(Exception) as caught:
                 self._convert(raises=exc)
             self.assertNotIsInstance(caught.exception, S.Unconvertible, repr(exc))
+
+    def test_a_wrapped_missing_dependency_is_not_a_verdict(self):
+        # The shape the library actually produces: converters raise MissingDependencyException
+        # from `convert()`, and `_convert` wraps it in a FileConversionException. A bare
+        # `except MissingDependencyException:` never saw it, so a half-installed venv marked every
+        # PDF Unconvertible and the cursor moved past them for good.
+        missing = self.pkg.MissingDependencyException("PdfConverter requires pdfminer.six")
+        for exc in (
+            _wrapped(self.pkg, missing),
+            # Beside another converter's ordinary refusal it still wins: repairing the engine
+            # may well let the file convert, so skipping it would be a guess.
+            _wrapped(self.pkg, ValueError("not a zip file"), missing),
+        ):
+            self.pkg._calls.clear()
+            with self.assertRaises(Exception) as caught:
+                self._convert(path="/pm/test/doc.pdf", raises=exc)
+            self.assertNotIsInstance(caught.exception, S.Unconvertible)
+            self.assertIs(caught.exception, exc, "re-raised as-is, so main reports it untagged")
+            self.assertEqual(self.pkg._calls, [None], "a missing dependency earns no retry")
+
+    def test_a_wrapped_refusal_is_still_a_verdict(self):
+        # The negative control for the unwrapping: an ordinary converter failure in `attempts`
+        # stays a skip, exactly as an unwrapped FileConversionException does.
+        with self.assertRaises(S.Unconvertible):
+            self._convert(raises=_wrapped(self.pkg, ValueError("not a zip file")))
 
     def test_a_failed_lazy_import_is_not_a_verdict(self):
         # The import lives in get_markitdown(), OUTSIDE do_convert's try — the case that actually
@@ -936,23 +989,26 @@ class ConvertVerdictWireTest(unittest.TestCase):
 
 
 def _ascii_decode_error():
-    """The real shape of the failure: MarkItDown labelled the file `ascii` from its first 4 KB."""
+    """The real shape of the failure: MarkItDown labelled the file `ascii` from its charset sample
+    (the first 4 KB up to 0.1.7, the first 64 KB from 0.1.8)."""
     return UnicodeDecodeError("ascii", b"\xe2\x80\x94", 0, 1, "ordinal not in range(128)")
 
 
 class ConvertCharsetRetryTest(unittest.TestCase):
-    """A charset guessed from 4 KB must not condemn the other 23.
+    """A charset guessed from a sample must not condemn the rest of the file.
 
-    MarkItDown reads `file_stream.read(4096)` to guess a charset, then hands that one guess to
-    every converter, which decode the WHOLE file with it. A 27 KB JSON file whose first 4 KB is
-    plain ASCII is therefore labelled `ascii`, and one em dash further in raises
-    `UnicodeDecodeError` — out of `accepts()`, the sniffing pass, which MarkItDown guards against
-    `NotImplementedError` and nothing else. So the *notebook* converter declining to sniff took
-    down the plain-text converter that would have read the file.
+    MarkItDown guesses a charset from a sample — `file_stream.read(4096)` up to 0.1.7, 64 KB from
+    0.1.8 — then hands that one guess to every converter, which decode the WHOLE file with it. A
+    file whose sample is plain ASCII is therefore labelled `ascii`, and one em dash further in
+    raises `UnicodeDecodeError`. Up to 0.1.7 it came out of `accepts()`, the *notebook* converter's
+    sniff, which MarkItDown guards against `NotImplementedError` and nothing else, so it escaped
+    bare. From 0.1.8 that sniff swallows `ValueError`, the plain-text converter's `convert()` is
+    what fails, and the error arrives WRAPPED in a FileConversionException's `attempts`. Both
+    shapes are pinned here; the wrapped one is the only one 0.1.8 produces.
 
-    Observed live on 2026-08-20 against a real library, repeating every time the file came round.
-    It escaped `do_convert` untagged, so Rust read it as an engine fault and re-offered the item
-    forever instead of moving the cursor past it.
+    Observed live on 2026-08-20 against a real library (0.1.7, a 27 KB JSON file, the bare
+    shape), repeating every time the file came round. It escaped `do_convert` untagged, so Rust
+    read it as an engine fault and re-offered the item forever instead of moving the cursor past it.
     """
 
     def setUp(self):
@@ -980,6 +1036,52 @@ class ConvertCharsetRetryTest(unittest.TestCase):
         self.assertIsNone(self.pkg._calls[0], "the first pass must keep the detected charset")
         self.assertEqual(self.pkg._calls[1].charset, "utf-8")
 
+    def test_a_wrapped_charset_misguess_is_retried_too(self):
+        # markitdown 0.1.8's shape. Matching only a bare UnicodeDecodeError made every file over
+        # 64 KB with a late non-ASCII byte permanently Unconvertible.
+        result = self._convert(raises=[_wrapped(self.pkg, _ascii_decode_error()), None])
+        self.assertEqual(result["markdown"], "hello")
+        self.assertEqual(len(self.pkg._calls), 2, "expected exactly one retry")
+        self.assertIsNone(self.pkg._calls[0], "the first pass must keep the detected charset")
+        self.assertEqual(self.pkg._calls[1].charset, "utf-8")
+
+    def test_a_wrapped_misguess_that_fails_again_is_a_verdict(self):
+        wrapped = _wrapped(self.pkg, _ascii_decode_error())
+        with self.assertRaises(S.Unconvertible):
+            self._convert(raises=[wrapped, wrapped])
+        self.assertEqual(len(self.pkg._calls), 2)
+
+    def test_a_wrapped_non_decode_failure_earns_no_retry(self):
+        # `ValueError` on purpose: UnicodeDecodeError IS a ValueError, so this pins that the check
+        # is for a decode failure specifically and not the family it belongs to.
+        with self.assertRaises(S.Unconvertible):
+            self._convert(raises=_wrapped(self.pkg, ValueError("not a zip file")))
+        self.assertEqual(self.pkg._calls, [None])
+
+    def test_the_misguess_check_reads_every_shape_without_the_package(self):
+        # Duck-typed on `attempts` / `exc_info`, so it needs no markitdown. `exc_info` may be None
+        # (the real FileConversionException message handles that case), and `attempts` may be.
+        class _Attempt:
+            def __init__(self, exc_info):
+                self.exc_info = exc_info
+
+        class _Wrapper(Exception):
+            def __init__(self, attempts):
+                self.attempts = attempts
+
+        decode = _ascii_decode_error()
+        self.assertTrue(S._is_charset_misguess(decode))
+        self.assertTrue(S._is_charset_misguess(_Wrapper([_Attempt((type(decode), decode, None))])))
+        self.assertTrue(
+            S._is_charset_misguess(
+                _Wrapper([_Attempt(None), _Attempt((type(decode), decode, None))])
+            ),
+            "any attempt counts, not just the first",
+        )
+        self.assertFalse(S._is_charset_misguess(ValueError("not a zip file")))
+        self.assertFalse(S._is_charset_misguess(_Wrapper(None)))
+        self.assertFalse(S._is_charset_misguess(_Wrapper([_Attempt(None)])))
+
     def test_a_file_in_some_other_encoding_is_a_verdict_not_an_engine_fault(self):
         # ASCII is a strict subset of UTF-8, so a file that fails BOTH is genuinely unreadable.
         # It must carry the `unconvertible` marker: untagged is what pinned the cursor.
@@ -995,11 +1097,15 @@ class ConvertCharsetRetryTest(unittest.TestCase):
         self.assertEqual(self.pkg._calls, [None])
 
     def test_a_broken_engine_is_still_not_retried_into_a_verdict(self):
-        # MissingDependencyException stays account-fatal, retry or no retry.
-        with self.assertRaises(Exception) as caught:
-            self._convert(raises=self.pkg.MissingDependencyException("needs pdfminer.six"))
-        self.assertNotIsInstance(caught.exception, S.Unconvertible)
-        self.assertEqual(self.pkg._calls, [None])
+        # MissingDependencyException stays account-fatal, retry or no retry — bare, and wrapped the
+        # way the library really raises it.
+        missing = self.pkg.MissingDependencyException("needs pdfminer.six")
+        for exc in (missing, _wrapped(self.pkg, missing)):
+            self.pkg._calls.clear()
+            with self.assertRaises(Exception) as caught:
+                self._convert(raises=exc)
+            self.assertNotIsInstance(caught.exception, S.Unconvertible)
+            self.assertEqual(self.pkg._calls, [None])
 
     def test_the_helper_alone_is_pure_and_needs_no_package(self):
         # `convert_local_tolerating_charset` takes the StreamInfo class rather than importing it,

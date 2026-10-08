@@ -194,15 +194,14 @@
       "note": "Classifier says MIT only; the LICENSE file is MIT plus the PSF licence covering the CPython code it backports."
     },
     "fastembed": {
-      "versions": ["0.8.0"],
+      "versions": ["0.8.1"],
       "licence": "Apache-2.0",
-      "stamp": "c59dba56cf64f87e21e886e1bb16e031",
+      "stamp": "3e84b2213e1fc1c05c4f4b57aa0d0a74",
       "evidence": {
         "expression": null,
-        "license": "Apache License",
-        "classifiers": ["License :: Other/Proprietary License"]
-      },
-      "note": "Classifies itself \"License :: Other/Proprietary License\", which is simply wrong — its LICENSE is the Apache-2.0 text, matching the `license: \"Apache License\"` field."
+        "license": "Apache-2.0",
+        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+      }
     },
     "faster-whisper": {
       "versions": ["1.2.1"],
@@ -379,9 +378,9 @@
       "note": "Classifier only; the project's LICENSE is the MIT text."
     },
     "markitdown": {
-      "versions": ["0.1.7"],
+      "versions": ["0.1.8"],
       "licence": "MIT",
-      "stamp": "24792a57dcb7e80d042821cf48e6fdd5",
+      "stamp": "667d44e36f6fd04f474f8e934b61c8f7",
       "evidence": {
         "expression": "MIT",
         "license": null,

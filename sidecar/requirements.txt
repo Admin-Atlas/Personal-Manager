@@ -1,6 +1,10 @@
-# PM document sidecar dependencies. Pinned so the managed venv is reproducible
-# and a change here invalidates the `.ready` marker (the Rust side hashes this
-# file). Keep this list minimal — it is installed on the user's machine.
+# PM document sidecar dependencies: the top-level pins a human edits. This file
+# is NOT what installs. `just lock-regen` resolves it into the hash-pinned
+# requirements.lock, which pip installs with `--require-hashes` and which the
+# Rust side hashes for the `.ready` marker (sidecar.rs `lock_hash`). A change
+# here therefore reaches a user's venv only through the regenerated lock, and
+# `just requirements-lock` fails if you forget to regenerate it.
+# Keep this list minimal — it is installed on the user's machine.
 #
 #   markitdown     — convert PDFs, Office docs, HTML, images (OCR), CSV/JSON to Markdown
 #   fastembed      — local on-device ONNX embeddings (BAAI/bge-small-en-v1.5, 384-d)
@@ -15,6 +19,13 @@
 # system ffmpeg is needed; it shares onnxruntime/tokenizers/numpy with fastembed
 # (they co-resolve to single versions — verified on the user's Python 3.14). The
 # base.en weights (~145 MB) download once on first use, like the embedding model.
+#
+#   av<19 — a tripwire, not a pin (the lock pins the exact version). faster-whisper
+#     1.2.1 calls `av.open(..., metadata_errors="ignore")` and PyAV 19 removed that
+#     parameter, so every transcription would raise TypeError. faster-whisper itself
+#     asks only for `av>=11`, so without this bound the next `just lock-regen`
+#     resolves PyAV 19 and nothing offline notices. Remove it once a faster-whisper
+#     release includes SYSTRAN/faster-whisper#1495 (merged, unreleased at 1.2.1).
 #
 # Photo OCR (rapidocr + pi-heif) is an OPTIONAL component, NOT listed here —
 # like the t-SNE reducer, it installs on demand and is removable from Settings, so
@@ -39,9 +50,10 @@
 #     whatever the resolver happens to pick.
 #   defusedxml — hardens the stdlib XML parser (openpyxl's fallback) against entity-expansion / XXE
 #     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
-markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.7
-fastembed==0.8.0
+markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.8
+fastembed==0.8.1
 faster-whisper==1.2.1
+av<19
 openpyxl==3.1.5
 pillow==12.3.0
 defusedxml==0.7.1

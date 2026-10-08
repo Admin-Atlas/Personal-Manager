@@ -10,11 +10,12 @@
 // trustworthy enough to normalise automatically, and this is not a hypothetical — across the 80
 // packages in the three locks:
 //
-//   • pillow-heif declares `BSD-3-Clause` and simultaneously classifies itself GPLv2
+//   • pi-heif declares `BSD-3-Clause` and simultaneously classifies itself LGPLv3 (pillow-heif,
+//     which it replaced, did the same with GPLv2)
 //   • numpy, scipy and pandas paste their entire licence text into the one-line `license` field
-//   • fsspec, tokenizers and loguru declare nothing at all and have only a classifier
+//   • tokenizers and loguru declare nothing at all and have only a classifier; fsspec has neither
 //   • "BSD License" is a classifier; it does not say two-clause or three
-//   • fastembed (Apache-2.0) classifies itself "Other/Proprietary License"
+//   • fastembed (Apache-2.0) classified itself "Other/Proprietary License" up to 0.8.0
 //
 // A normaliser fed that would be guessing, and a wrong guess in a licence file reads as
 // compliance. So this script only ever GATHERS: it records the raw upstream evidence, and a human

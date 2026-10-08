@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.5-alpha",
+    date: "2026-10-08",
+    highlights: [
+      "The part of PM that reads your files moves up a version, and two things it got wrong are fixed. A large text file — a long JSON export or notes file — with an accented letter or a dash far into it is read properly again, instead of being marked as one PM can’t read. And if part of PM’s file reader is missing, PM now keeps your PDFs waiting until it’s fixed, instead of quietly skipping them for good. Underlined text in Word documents is now marked as underlined when PM reads it.",
+      "The part of PM that makes your files searchable moves up a version too. On Linux it downloads its small search model once more (about 67 MB) the first time it runs after this update.",
+    ],
+  },
+  {
     version: "3.139.4-alpha",
     date: "2026-10-08",
     highlights: [
