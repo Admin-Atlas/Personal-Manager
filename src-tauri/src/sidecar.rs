@@ -37,7 +37,7 @@ use crate::registry::{ModelEntry, Pooling, Source};
 /// fastembed's `ModelSource` accepts only `hf` or `url` and rejects a description with neither, so a
 /// disk-resident model still needs one — but it is never fetched: passing `specific_model_path` at
 /// construction short-circuits resolution before any source is consulted (verified against
-/// fastembed 0.8.0, `common/model_management.py`). The placeholder is deliberately not a real repo,
+/// fastembed 0.8.1, `common/model_management.py`). The placeholder is deliberately not a real repo,
 /// so that if the short-circuit ever regressed the failure would be an immediate 404 on a
 /// nonexistent name rather than a silent download of somebody else's weights.
 const LOCAL_MODEL_SOURCE: &str = "pm-local/not-a-hub-model";
@@ -2648,7 +2648,7 @@ fn request_timeout(method: &str) -> std::time::Duration {
     }
 }
 
-/// markitdown 0.1.6 (see requirements.txt) needs Python >= 3.10, so the venv's
+/// markitdown (pinned in requirements.txt) needs Python >= 3.10, so the venv's
 /// base interpreter must too.
 const MIN_PYTHON: (u32, u32) = (3, 10);
 

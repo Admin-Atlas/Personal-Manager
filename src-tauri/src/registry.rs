@@ -131,7 +131,7 @@ const BGE_SMALL_EN: ModelEntry = ModelEntry {
 /// pooling, L2-normalized, asymmetric `query: ` / `passage: ` prefixes applied in Rust by
 /// [`apply_prefix`]), just wider.
 //
-// Native support CONFIRMED: fastembed 0.8.0's `list_supported_models()` lists
+// Native support CONFIRMED: fastembed 0.8.1's `list_supported_models()` lists
 // `intfloat/multilingual-e5-large` (and not e5-small, which is why PR 2 needed a custom export), so
 // `model_file: None` is correct — fastembed downloads + loads it directly. The remaining hardware
 // verification is narrower (the first live 1024 exercise): that the download embeds at 1024-d with

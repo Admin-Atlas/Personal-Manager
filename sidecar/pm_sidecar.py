@@ -321,13 +321,14 @@ def _load_model(build):
     """Construct a model, converting ANY failure in OFFLINE mode into ModelNotCached so Rust runs
     the network-allowed `--fetch` helper and retries. Treating every offline construction failure as
     "not downloaded yet" is deliberate: the exception differs by library and version. faster-whisper
-    surfaces huggingface_hub's `LocalEntryNotFoundError`, but fastembed 0.8.0 swallows the offline
+    surfaces huggingface_hub's `LocalEntryNotFoundError`, but fastembed 0.8.1 swallows the offline
     error and raises a bare `ValueError("Could not load model ... from any source")` (verified
-    against the pinned venv), so matching specific types/messages would silently break first-use
-    ingest on a wording change. In offline mode the only recovery for ANY load failure is for the
-    fetcher (with the network) to obtain the model and retry, which also self-heals a corrupt cache;
-    if it still fails, `request()` fetches once then surfaces the real error. In the FETCHER itself
-    (`_OFFLINE` False) this is a passthrough: a genuine download error must surface as-is."""
+    against the 0.8.0 venv; unchanged in 0.8.1's source), so matching specific types/messages
+    would silently break first-use ingest on a wording change. In offline mode the only recovery
+    for ANY load failure is for the fetcher (with the network) to obtain the model and retry, which
+    also self-heals a corrupt cache; if it still fails, `request()` fetches once then surfaces the
+    real error. In the FETCHER itself (`_OFFLINE` False) this is a passthrough: a genuine download
+    error must surface as-is."""
     if not _OFFLINE:
         return build()
     try:
@@ -362,7 +363,7 @@ def _local_path_kwargs(spec):
     A locally-trained model (the Stage-4 learned reranker) has no Hugging Face repo to fetch from.
     fastembed's `ModelSource` requires an `hf` or `url` regardless, so Rust registers a deliberate
     placeholder — but `specific_model_path` short-circuits resolution before any source is consulted
-    (fastembed 0.8.0, `common/model_management.py`), so the placeholder is never fetched. Loading
+    (fastembed 0.8.1, `common/model_management.py`), so the placeholder is never fetched. Loading
     still honours the offline posture: nothing here reaches the network either way.
     """
     path = (spec or {}).get("local_path")
@@ -821,20 +822,53 @@ def do_file_properties(params):
     return read_document_properties(path)
 
 
+def _conversion_failures(exc):
+    """`exc` itself, then the exception behind each converter attempt MarkItDown wrapped into it.
+
+    When every converter that accepted a file then failed, MarkItDown's `_convert` raises ONE
+    `FileConversionException` whose `attempts` list holds a `FailedConversionAttempt` per converter,
+    each with the `sys.exc_info()` of its failure. The real cause is therefore one level down, and a
+    plain `except SomeError:` never sees it. Duck-typed (`attempts`, `exc_info`) so it reads both
+    the wrapped shape and a bare exception, and so the tests need no markitdown."""
+    yield exc
+    for attempt in getattr(exc, "attempts", None) or ():
+        info = getattr(attempt, "exc_info", None)
+        if info and len(info) > 1 and info[1] is not None:
+            yield info[1]
+
+
+def _is_charset_misguess(exc):
+    """True when the conversion failed because a converter could not DECODE the file — raised
+    bare, or wrapped as one of a `FileConversionException`'s attempts."""
+    return any(isinstance(e, UnicodeDecodeError) for e in _conversion_failures(exc))
+
+
+def _is_missing_dependency(exc, missing_dependency_cls):
+    """True when a converter that accepted the file failed for want of an optional package — raised
+    bare, or wrapped as one of a `FileConversionException`'s attempts. The class is passed in for
+    the same reason `stream_info_cls` is below: markitdown is a lazy import."""
+    return any(isinstance(e, missing_dependency_cls) for e in _conversion_failures(exc))
+
+
 def convert_local_tolerating_charset(engine, path, stream_info_cls):
     """`engine.convert_local(path)`, retried once as UTF-8 if the first pass could not decode.
 
-    MarkItDown guesses a file's charset from its **first 4 KB** (`_get_stream_info_guesses` reads
-    `file_stream.read(4096)` and hands it to `charset_normalizer`), then gives that one guess to
-    every converter, each of which decodes the WHOLE file with it. So a file whose opening 4 KB
-    happens to be plain ASCII is labelled `ascii`, and a single accented character further in
-    raises `UnicodeDecodeError`.
+    MarkItDown guesses a file's charset from a **64 KB sample** (`_get_stream_info_guesses` hands
+    `_read_charset_sample`'s first 65536 bytes to `charset_normalizer`; it was the first 4 KB before
+    markitdown 0.1.8), then gives that one guess to every converter, each of which decodes the WHOLE
+    file with it. So a file whose opening 64 KB happens to be plain ASCII is labelled `ascii`, and a
+    single accented character further in raises `UnicodeDecodeError`.
 
-    That would merely lose one converter, except the raise comes out of `accepts()` — the sniffing
-    pass — and MarkItDown's `_convert` guards `accepts()` against `NotImplementedError` and nothing
-    else. One converter declining to sniff therefore takes down the converters that would have
-    succeeded: a 27 KB JSON file with an em dash in it is refused by the *notebook* converter's
-    sniff, and never reaches the plain-text one.
+    Where that raise lands depends on the version, which is why the check is on the CAUSE rather
+    than on where it was thrown:
+      * Up to 0.1.7 it came out of `accepts()` — the *notebook* converter's sniff — which `_convert`
+        guards against `NotImplementedError` and nothing else, so it escaped bare and took down the
+        plain-text converter that would have succeeded.
+      * From 0.1.8 that sniff swallows `ValueError` (which `UnicodeDecodeError` is), so the
+        plain-text converter's `convert()` is what fails. `_convert` catches that and, with no
+        converter left, raises a `FileConversionException` carrying it in `attempts` — the shape a
+        bare `except UnicodeDecodeError` never matches, which would make every such file
+        permanently Unconvertible.
 
     Retrying as UTF-8 is safe rather than optimistic: **ASCII is a strict subset of UTF-8**, so
     re-reading can only widen what decodes — it cannot corrupt a file the first pass would have
@@ -846,7 +880,9 @@ def convert_local_tolerating_charset(engine, path, stream_info_cls):
     """
     try:
         return engine.convert_local(path)
-    except UnicodeDecodeError:
+    except Exception as exc:
+        if not _is_charset_misguess(exc):
+            raise
         return engine.convert_local(path, stream_info=stream_info_cls(charset="utf-8"))
 
 
@@ -879,17 +915,24 @@ def do_convert(params):
     # unreachable by construction rather than by luck.
     try:
         result = convert_local_tolerating_charset(engine, path, StreamInfo)
-    except MissingDependencyException:
-        # A MarkItDownException, but NOT a verdict on the file: this format needs an optional
-        # package the venv is missing. Repairing the engine fixes it, so let it stay account-fatal
-        # rather than skipping every file of that type forever.
-        raise
     except (MarkItDownException, UnicodeDecodeError) as exc:
+        if _is_missing_dependency(exc, MissingDependencyException):
+            # A MarkItDownException, but NOT a verdict on the file: this format needs an optional
+            # package the venv is missing. Repairing the engine fixes it, so let it stay
+            # account-fatal rather than skipping every file of that type forever.
+            #
+            # Checked through `attempts`, not with its own `except` clause: converters raise it
+            # from `convert()`, so it always arrives WRAPPED in a `FileConversionException`. The
+            # bare `except MissingDependencyException:` this replaced never matched what the
+            # library raises, so a half-installed venv marked every PDF Unconvertible and moved
+            # the cursor past it.
+            raise
         # UnsupportedFormatException / FileConversionException: the engine read this file and
         # refused it. Retrying forever is what pins the account, so this one is a skip.
         #
-        # A `UnicodeDecodeError` arriving here has already survived the UTF-8 retry above, so the
-        # file really is in some encoding the engine cannot read — a verdict, not a broken engine.
+        # A `UnicodeDecodeError` arriving here (bare, or wrapped in a FileConversionException's
+        # attempts) has already survived the UTF-8 retry above, so the file really is in some
+        # encoding the engine cannot read — a verdict, not a broken engine.
         # Before it was listed here it escaped to `main`'s catch-all and came back WITHOUT
         # `error_kind`, which Rust reads as an engine fault: the item was retried forever and the
         # delta cursor never moved past it.
