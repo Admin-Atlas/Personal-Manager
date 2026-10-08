@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.4-alpha",
+    date: "2026-10-08",
+    highlights: [
+      "If Windows won’t start an update’s installer, PM now comes back into view and tells you, instead of disappearing. Before, PM just closed, and the next time you opened it you were still on the old version with nothing to say why. Now its window comes back with a note that the update didn’t go in and what to do next: close PM and open it again to retry, or download the update from the releases page. Getting ready to install takes PM’s tray icon away, so until you reopen PM, closing it quits it rather than hiding it where you couldn’t get back to it.",
+      "The part of PM that installs updates moves up a few versions too. On a Mac, an update that fails partway now leaves your current copy of PM where it was, instead of deleting it.",
+    ],
+  },
+  {
     version: "3.139.3-alpha",
     date: "2026-10-08",
     highlights: [

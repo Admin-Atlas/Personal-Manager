@@ -4,9 +4,10 @@
 // Pure decision for the auto-updater's "did a previous install attempt silently fail?" marker.
 //
 // On Windows the updater plugin applies an update by launching the installer and exiting the
-// process without observing whether it launched, so an OS-level block (Smart App Control, or a
-// SmartScreen "Don't run") tears the app down with no error and it reopens on the OLD version.
-// The download-and-fail then repeats every launch with no signal. To break that, `useUpdater`
+// process. It does notice a launch that fails outright (install() throws, and `useUpdater`
+// handles it), but anything that stops the installer once it is running happens after PM has
+// exited: the app reopens on the OLD version with no error, and the download-and-fail then
+// repeats every launch with no signal. To break that, `useUpdater`
 // records the version it is about to install, and on the next launch compares that marker
 // against the version now running and the version the feed is offering. This module is that
 // comparison, kept pure so it can be unit-tested without Tauri/localStorage.

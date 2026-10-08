@@ -223,7 +223,9 @@ pub fn set_tray_enabled(app: &AppHandle, enabled: bool) -> Result<()> {
 /// `show` + `unminimize` FIRST because with the tray on, closing the main window only hides it, so a
 /// caller must bring it back rather than focus something invisible. The one definition of "open PM",
 /// shared by the tray menu, the second-launch handler, and the briefing window's own button — it was
-/// written out three times before, which is two chances for the order to drift.
+/// written out three times before, which is two chances for the order to drift. The updater's
+/// failed-install path calls it too, through the same command: on Windows the plugin hides every
+/// window before it finds out the installer won't launch.
 ///
 /// A pure lookup: it never builds a window, so it is safe to call from a sync command. Building one
 /// (`WebviewWindowBuilder::build`) deadlocks on Windows outside `setup()`.
@@ -295,7 +297,8 @@ fn wire_tray(app: &AppHandle) -> Result<()> {
 /// With the tray ON, closing the main window HIDES it and PM keeps running in the tray (Quit lives
 /// in the tray menu) — the standard tray-app contract, and the only way the icon can outlive the
 /// window. With the tray OFF, close QUITS exactly as it always has, so a user who never opts in sees
-/// no behaviour change at all.
+/// no behaviour change at all. "On" means switched on AND the icon still exists — see
+/// [`close_hides`] for when it doesn't.
 ///
 /// That last part needs saying explicitly rather than falling through to Tauri's default. Tauri exits
 /// when every window is *destroyed*, and the briefing window refuses to be destroyed (it hides — it's
@@ -316,11 +319,38 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
         return;
     }
     if window.label() == "main" {
-        if tray_enabled(app) {
+        if close_hides(tray_enabled(app), app.tray_by_id(TRAY_ID).is_some()) {
             api.prevent_close();
             let _ = window.hide();
         } else {
             app.exit(0);
         }
+    }
+}
+
+/// Whether closing the main window HIDES it (PM stays in the tray) rather than quitting.
+///
+/// The setting alone is not enough: the icon has to still exist, because it is the only way back to
+/// a hidden window and the only place Quit lives. It can be gone while PM runs. On Windows the
+/// updater plugin (2.11+) runs Tauri's `cleanup_before_exit` before it launches the installer, which
+/// drops every tray icon, and then returns an error instead of exiting if the launch fails. A close
+/// that hid the window after that would leave PM running with nothing on screen and nothing to
+/// click, so it quits instead.
+fn close_hides(tray_enabled: bool, tray_alive: bool) -> bool {
+    tray_enabled && tray_alive
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_hides_only_with_the_tray_on_and_still_there() {
+        assert!(close_hides(true, true));
+        // The updater's failed Windows install has dropped the icon: hiding would strand PM.
+        assert!(!close_hides(true, false));
+        // Tray off: close quits, whether or not the (hidden) icon object exists.
+        assert!(!close_hides(false, true));
+        assert!(!close_hides(false, false));
     }
 }
