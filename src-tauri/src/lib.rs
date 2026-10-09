@@ -13,6 +13,7 @@ mod blocking;
 mod briefing;
 mod calendar;
 mod calendar_editing;
+mod calendar_write;
 mod chat;
 mod chat_index;
 mod chat_prefs;

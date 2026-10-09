@@ -1484,6 +1484,25 @@ fn clip(s: &str, max: usize) -> String {
         .collect()
 }
 
+/// A title as the mirror stores it, so a fresh copy from Google compares like with like against a
+/// row the user saw (the delete check, `calendar_write::patch`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands in C4, the write commands")
+)]
+pub(crate) fn mirrored_summary(s: &str) -> String {
+    clip(s, MAX_SUMMARY_CHARS)
+}
+
+/// A location as the mirror stores it (see [`mirrored_summary`]).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands in C4, the write commands")
+)]
+pub(crate) fn mirrored_location(s: &str) -> String {
+    clip(s, MAX_LOCATION_CHARS)
+}
+
 /// The `settings` key prefix for a calendar's last-mirrored event-set hash (F-49).
 const CALENDAR_EVENTS_HASH_PREFIX: &str = "calendar_events_hash:";
 
