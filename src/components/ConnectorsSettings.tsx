@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
+import type { GoogleGrantOutcome } from "../lib/googleGrantNote";
 import { Button, Collapsible, SectionInfo, SectionLabel, SegmentedControl, SettingRow } from "./ui";
 import { clearJustJoinedVault, justJoinedVault } from "../lib/joinedVault";
 import { CalendarConnection } from "./CalendarConnection";
@@ -121,6 +122,9 @@ function ThisDevice() {
 function GoogleProvider() {
   const [configured, setConfigured] = useState(false);
   const [signal, setSignal] = useState(0);
+  // The last Google disconnect's "PM kept its access because…" note. Held here, not in either section,
+  // because Calendar and Drive share one grant: an action in either must replace the other's note.
+  const [grantOutcome, setGrantOutcome] = useState<GoogleGrantOutcome | null>(null);
 
   const refreshConfigured = useCallback(async () => {
     try {
@@ -150,9 +154,19 @@ function GoogleProvider() {
       <GoogleCredentialBlock configured={configured} onChange={onClientChange} />
       {configured && <GoogleMultiAccountHelp />}
       <Divider />
-      <CalendarConnection provider="google" refreshSignal={signal} />
+      <CalendarConnection
+        provider="google"
+        refreshSignal={signal}
+        grantOutcome={grantOutcome}
+        onGrantOutcome={setGrantOutcome}
+      />
       <Divider />
-      <CloudDriveConnection provider="google" refreshSignal={signal} />
+      <CloudDriveConnection
+        provider="google"
+        refreshSignal={signal}
+        grantOutcome={grantOutcome}
+        onGrantOutcome={setGrantOutcome}
+      />
       <Divider />
       <ComingSoonRow name="Gmail" />
     </ConnectorGroup>

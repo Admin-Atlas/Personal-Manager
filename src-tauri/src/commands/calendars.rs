@@ -19,6 +19,7 @@ use crate::{briefing, drive, flags, microsoft, outlook_calendar, secrets, AppSta
 
 use super::shared::own_client;
 use super::shared::resolve_zone;
+use super::shared::{google_grant_users, release_plan, GoogleDisconnect, GoogleUse};
 use super::vaults::require_vault_owner;
 
 // --- personal assistant: calendar (multi-provider, read-only — cards 6A/6B) ---
@@ -176,15 +177,28 @@ pub async fn connect_google_calendar_account(
 }
 
 /// Disconnect one Google Calendar account: drop its registry source (cascading its calendars +
-/// mirrored events) and forget its token plus any per-account (Advanced-Protection) client.
+/// mirrored events) and forget its token. The grant at Google and any per-account
+/// (Advanced-Protection) client are released only when no other PM feature still uses the account
+/// ([`release_plan`]); the result names the features that kept them.
 #[tauri::command]
 pub async fn disconnect_google_calendar_account(
+    app: AppHandle,
     state: State<'_, AppState>,
     email: String,
-) -> Result<()> {
-    // L-3: sever the grant at Google's end BEFORE forgetting the local token (best-effort, like wipe).
-    if let Ok(Some(blob)) = secrets::get_google_token_for(&google_calendar_token_key(&email)) {
-        let _ = google::revoke(blob.expose()).await;
+) -> Result<GoogleDisconnect> {
+    require_vault_owner(&app)?;
+    // Read the account's users under a short lock, released before the revoke's await (rule #4).
+    let plan = {
+        let conn = state.conn()?;
+        release_plan(&google_grant_users(&conn, &email)?, GoogleUse::Calendar)
+    };
+    // L-3: sever the grant at Google's end BEFORE forgetting the local token (best-effort, like
+    // wipe) — but only when Calendar is the account's last user. Google revokes the whole grant, so
+    // revoking here while Drive or backup still sign in as this account would cut them off too.
+    if plan.revoke {
+        if let Ok(Some(blob)) = secrets::get_google_token_for(&google_calendar_token_key(&email)) {
+            let _ = google::revoke(blob.expose()).await;
+        }
     }
     let conn = state.conn()?;
     // Clear the OAuth token FIRST and propagate a real failure (a locked keychain): dropping the DB
@@ -192,8 +206,14 @@ pub async fn disconnect_google_calendar_account(
     // `secrets::delete` treats a missing entry as success, so a returned Err is a genuine failure.
     secrets::clear_google_token_for(&google_calendar_token_key(&email))?;
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
-    secrets::clear_google_client_for_account(&email).ok(); // per-AP client; absent for shared-client accounts
-    Ok(())
+    if plan.forget_account_client {
+        // Per-AP client; absent for shared-client accounts. Kept while Drive or backup still
+        // refresh through it.
+        secrets::clear_google_client_for_account(&email).ok();
+    }
+    Ok(GoogleDisconnect {
+        kept_for: plan.kept_for,
+    })
 }
 
 /// One-time, online: lift an existing single-account Google Calendar connection (the legacy fixed
@@ -277,7 +297,12 @@ pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::Calend
 
 /// Disconnect one Outlook calendar account.
 #[tauri::command]
-pub fn disconnect_outlook_calendar(state: State<'_, AppState>, email: String) -> Result<()> {
+pub fn disconnect_outlook_calendar(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<()> {
+    require_vault_owner(&app)?;
     let conn = state.conn()?;
     // Clear the token first and propagate a real failure, then drop the source (see the Google
     // sibling): removing the DB row before an un-clearable token would orphan the token.

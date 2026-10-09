@@ -26,6 +26,7 @@ import type {
   DriveAccount,
   DriveStatus,
   DriveSyncState,
+  GoogleDisconnect,
   OneDriveAccount,
   OneDriveStatus,
   OneDriveSyncState,
@@ -39,6 +40,8 @@ import { SyncReport } from "./SyncReport";
 import { ConnectorItemRow } from "./ConnectorItemRow";
 import { SharedDrivesManager } from "./DriveSharedDrives";
 import { OneDriveFolders } from "./OneDriveFolders";
+import type { GoogleGrantOutcome } from "../lib/googleGrantNote";
+import { GoogleGrantNote } from "./GoogleGrantNote";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
 /** Microsoft's app-access management page. Microsoft has no programmatic token revocation (unlike
@@ -75,7 +78,8 @@ interface CloudDriveMeta {
   needsFirstSync: ReactNode;
   status: () => Promise<DriveStatus | OneDriveStatus>;
   connect: () => Promise<unknown>;
-  disconnect: (email: string) => Promise<void>;
+  /** Google names the features that kept its access alive; Microsoft has nothing to report. */
+  disconnect: (email: string) => Promise<GoogleDisconnect | void>;
   sync: (target: string | null) => Promise<unknown>;
   /** Re-index ONE account from scratch — forget its delta cursor, then sync. */
   reindex: (email: string) => Promise<unknown>;
@@ -199,13 +203,20 @@ const CLOUD_DRIVE_META: Record<CloudProvider, CloudDriveMeta> = {
  * independent — its own sign-in, sync cursor, and indexed items. `refreshSignal` is bumped by the parent
  * group when the shared client is saved/cleared, so this refetches its status. `provider` is fixed for
  * the component's lifetime (the two groups render two separate instances).
+ *
+ * Google only: `grantOutcome` / `onGrantOutcome` lift the "PM kept its access because…" note to the
+ * Google group (see {@link "./CalendarConnection"}); every action here clears it.
  */
 export function CloudDriveConnection({
   provider,
   refreshSignal = 0,
+  grantOutcome = null,
+  onGrantOutcome,
 }: {
   provider: CloudProvider;
   refreshSignal?: number;
+  grantOutcome?: GoogleGrantOutcome | null;
+  onGrantOutcome?: (outcome: GoogleGrantOutcome | null) => void;
 }) {
   const meta = CLOUD_DRIVE_META[provider];
   const [status, setStatus] = useState<DriveStatus | OneDriveStatus | null>(null);
@@ -227,6 +238,16 @@ export function CloudDriveConnection({
     onSettled: () => refreshRef.current(),
   });
   const { busy, error, setError, syncing, target: syncTarget, queued, report, progress } = ds;
+  // Every action starts by clearing the group's grant note: a reconnect, a sync or a Sheets re-grant
+  // makes "Disconnected …" stale.
+  const runAction = (label: string, fn: () => Promise<void>) => {
+    onGrantOutcome?.(null);
+    return ds.run(label, fn);
+  };
+  const syncAction = (...args: Parameters<typeof ds.sync>) => {
+    onGrantOutcome?.(null);
+    return ds.sync(...args);
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -245,7 +266,7 @@ export function CloudDriveConnection({
   }, [refresh, refreshSignal]);
 
   const connect = () =>
-    ds.run("connect", async () => {
+    runAction("connect", async () => {
       await meta.connect();
       await refresh();
       // No auto-sync: the account lands "not synced yet" so you can choose its scope first and then
@@ -253,8 +274,9 @@ export function CloudDriveConnection({
     });
 
   const disconnect = (email: string) =>
-    ds.run("disconnect", async () => {
-      await meta.disconnect(email);
+    runAction("disconnect", async () => {
+      const out = await meta.disconnect(email);
+      if (out) onGrantOutcome?.({ service: "drive", email, keptFor: out.kept_for });
       await refresh();
     });
 
@@ -267,7 +289,7 @@ export function CloudDriveConnection({
   // Still not `ds.run`: that sets `busy` and disables the whole connector for what is a detached
   // sync, not a short blocking action.
   const reindex = (email: string) => {
-    ds.sync(email, () => meta.reindex(email));
+    syncAction(email, () => meta.reindex(email));
   };
 
   const configured = status?.oauth_client_configured ?? false;
@@ -328,7 +350,7 @@ export function CloudDriveConnection({
                     // Sync stays clickable for accounts *not* currently syncing, so you can queue one
                     // mid-index; only the syncing row and in-flight connect/disconnect block it.
                     syncDisabled={syncTarget === a.email || busy != null}
-                    onSync={() => ds.sync(a.email)}
+                    onSync={() => syncAction(a.email)}
                     onReindex={() => setConfirmReindex(a.email)}
                     // Any sync in flight, not just this row's: the backend refuses a re-index while
                     // one is running, because that pass ends by writing a fresh cursor and would
@@ -461,7 +483,10 @@ export function CloudDriveConnection({
               <GoogleOwnProjectConnect
                 service="drive"
                 disabled={busy != null}
-                onConnected={refresh}
+                onConnected={() => {
+                  onGrantOutcome?.(null);
+                  return refresh();
+                }}
               />
             )}
           </div>
@@ -480,6 +505,9 @@ export function CloudDriveConnection({
         <Callout as="p" className="mt-2">
           {error}
         </Callout>
+      )}
+      {provider === "google" && (
+        <GoogleGrantNote outcome={grantOutcome?.service === "drive" ? grantOutcome : null} />
       )}
 
       {/* The connector's standing explanation, folded at the foot so the account list and the
@@ -531,9 +559,19 @@ export function CloudDriveConnection({
         onClose={() => setConfirmEmail(null)}
       >
         <p>
-          This forgets the account&rsquo;s sign-in. Its indexed items are kept and stay findable,
-          but marked &ldquo;source unreachable&rdquo; until you reconnect — they are never deleted.
+          This disconnects the account. Its indexed items are kept and stay findable, but marked
+          &ldquo;source unreachable&rdquo; until you reconnect — they are never deleted.
         </p>
+        {/* Google revokes an app's access to the whole account, so PM only asks it to when nothing
+            else in PM uses the account; the note after the disconnect names what kept it. Backups
+            sign in through this same account's Drive sign-in, so that is kept for them too. */}
+        {provider === "google" && (
+          <p className="mt-2">
+            If Google Calendar or backups still use this account, PM keeps Google&rsquo;s permission
+            (and the sign-in they need) for them and tells you so. Otherwise PM also asks Google to
+            remove its access.
+          </p>
+        )}
         {/* Microsoft alone can't be revoked from inside the app, so PM disconnecting is only half
             the job. This caveat lives here rather than in the connector's SectionInfo: it's the one
             moment it's actionable, and a fold would have made it the only copy — the help registry

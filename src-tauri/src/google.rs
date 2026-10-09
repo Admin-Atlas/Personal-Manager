@@ -80,11 +80,8 @@ fn client_creds() -> Result<(String, Secret)> {
 /// legacy fixed calendar key has no suffix, so it resolves to the shared client.
 fn client_creds_for_key(token_key: &str) -> Result<(String, Secret)> {
     if let Some((_, email)) = token_key.rsplit_once("::") {
-        if let (Some(id), Some(secret)) = (
-            secrets::get_google_client_id_for_account(email)?,
-            secrets::get_google_client_secret_for_account(email)?,
-        ) {
-            return Ok((id, secret));
+        if let Some(own) = secrets::get_google_client_for_account(email)? {
+            return Ok(own);
         }
     }
     client_creds()

@@ -13,12 +13,20 @@ import {
   setCalendarKind,
   syncCalendar,
 } from "../lib/ipc";
-import type { Calendar, CalendarAccount, CalendarOverview, EventKind } from "../lib/types";
+import type {
+  Calendar,
+  CalendarAccount,
+  CalendarOverview,
+  EventKind,
+  GoogleDisconnect,
+} from "../lib/types";
+import type { GoogleGrantOutcome } from "../lib/googleGrantNote";
 import { useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
 import { useBusyRun } from "../lib/useBusyRun";
 import { Button, Callout, ConfirmDialog, Select, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
+import { GoogleGrantNote } from "./GoogleGrantNote";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
 /** Microsoft's app-access management page. Microsoft has no programmatic token revocation (unlike
@@ -39,7 +47,10 @@ const PROVIDER_META: Record<
     sign_in: string;
     blurb: string;
     connect: () => Promise<CalendarAccount>;
-    disconnect: (email: string) => Promise<void>;
+    /** Google names the features that kept its access alive; Microsoft has nothing to report. */
+    disconnect: (email: string) => Promise<GoogleDisconnect | void>;
+    /** What the disconnect confirmation says happens to the sign-in. */
+    disconnectNote: string;
   }
 > = {
   google: {
@@ -49,6 +60,8 @@ const PROVIDER_META: Record<
       "Read-only sign-in with your own Google client. Connect one or more Google accounts; PM powers your agenda, schedule questions in chat, and the “Due soon” status when an event names a project.",
     connect: connectGoogleCalendarAccount,
     disconnect: disconnectGoogleCalendarAccount,
+    disconnectNote:
+      "If Google Drive or backups still use this account, PM keeps Google's permission for them (and the account's own sign-in client, if it has one) and tells you so. Otherwise PM also asks Google to remove its access.",
   },
   microsoft: {
     label: "Outlook Calendar",
@@ -57,6 +70,8 @@ const PROVIDER_META: Record<
       "Read-only sign-in with your Microsoft 365 / Outlook account. Connect one or more accounts; PM powers your agenda, schedule questions in chat, and the “Due soon” status when an event names a project.",
     connect: connectOutlookCalendar,
     disconnect: disconnectOutlookCalendar,
+    disconnectNote:
+      "Your saved credentials are kept, so you can reconnect without re-entering them.",
   },
 };
 
@@ -71,13 +86,21 @@ const PROVIDER_META: Record<
  * calendar picker, Sync, and Disconnect. **Multi-account:** connect several accounts of the same
  * provider; each is independent. `refreshSignal` is bumped by the parent group when the shared client
  * is saved/cleared, so this refetches `calendar_overview`.
+ *
+ * Google only: `grantOutcome` / `onGrantOutcome` lift the "PM kept its access because…" note to the
+ * Google group, which Calendar and Drive share — a later action in EITHER section must replace it, or
+ * one section keeps a note the other's disconnect has made untrue.
  */
 export function CalendarConnection({
   provider,
   refreshSignal = 0,
+  grantOutcome = null,
+  onGrantOutcome,
 }: {
   provider: Provider;
   refreshSignal?: number;
+  grantOutcome?: GoogleGrantOutcome | null;
+  onGrantOutcome?: (outcome: GoogleGrantOutcome | null) => void;
 }) {
   const meta = PROVIDER_META[provider];
   const { devMode } = useDevMode();
@@ -103,6 +126,7 @@ export function CalendarConnection({
   // Each action starts with a clean note line (the shared latch already clears the error).
   function run(label: string, fn: () => Promise<void>) {
     setNote(null);
+    onGrantOutcome?.(null);
     return runBusy(label, fn);
   }
 
@@ -119,6 +143,8 @@ export function CalendarConnection({
   // Post-connect: refresh the account list, kick a first sync, and report the count. Shared by the
   // normal connect and the own-project (Advanced-Protection) connect path below.
   const afterConnect = async () => {
+    // The own-project path calls this directly, outside `run`, so it clears the grant note itself.
+    onGrantOutcome?.(null);
     await refresh();
     const n = await syncCalendar().catch(() => 0);
     setNote(`Connected. Synced ${n} event${n === 1 ? "" : "s"}.`);
@@ -133,7 +159,8 @@ export function CalendarConnection({
 
   const disconnect = (email: string) =>
     run("disconnect", async () => {
-      await meta.disconnect(email);
+      const out = await meta.disconnect(email);
+      if (out) onGrantOutcome?.({ service: "calendar", email, keptFor: out.kept_for });
       await refresh();
     });
 
@@ -289,6 +316,9 @@ export function CalendarConnection({
       )}
 
       {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
+      {provider === "google" && (
+        <GoogleGrantNote outcome={grantOutcome?.service === "calendar" ? grantOutcome : null} />
+      )}
       {provider === "microsoft" && (
         <p className="mt-2 text-xs text-ink4">
           Disconnecting forgets PM&rsquo;s access on this device. Microsoft can&rsquo;t revoke an
@@ -380,8 +410,7 @@ export function CalendarConnection({
         }}
         onClose={() => setConfirmEmail(null)}
       >
-        This signs out of that account and clears its mirrored events. Your saved credentials are
-        kept, so you can reconnect without re-entering them.
+        This signs out of that account and clears its mirrored events. {meta.disconnectNote}
       </ConfirmDialog>
     </div>
   );

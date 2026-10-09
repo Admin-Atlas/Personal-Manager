@@ -651,31 +651,56 @@ pub fn clear_google_client() -> Result<()> {
 const GOOGLE_CLIENT_ID_PREFIX: &str = "google_oauth_client_id::";
 const GOOGLE_CLIENT_SECRET_PREFIX: &str = "google_oauth_client_secret::";
 
-pub fn get_google_client_id_for_account(email: &str) -> Result<Option<String>> {
-    get(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"))
+/// The spellings an account's own client may be stored under, preferred first. New entries are saved
+/// under the lowercased email, because one person must resolve to one client while Calendar lowercases
+/// account emails and Drive keeps Google's casing. An entry saved before that rule may still sit under
+/// the exact spelling its connector used, so reads fall back to it and clears remove both.
+fn own_client_spellings(email: &str) -> Vec<String> {
+    let lower = email.to_lowercase();
+    if lower == email {
+        vec![lower]
+    } else {
+        vec![lower, email.to_string()]
+    }
 }
 
-pub fn get_google_client_secret_for_account(email: &str) -> Result<Option<Secret>> {
-    Ok(get(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"))?.map(Secret::from))
+/// An account's own client (id + secret), or `None` when it uses the shared one. Both halves come
+/// from the same spelling, so a stray half-entry under another spelling can't pair a mismatched id
+/// and secret.
+pub fn get_google_client_for_account(email: &str) -> Result<Option<(String, Secret)>> {
+    for spelling in own_client_spellings(email) {
+        if let (Some(id), Some(secret)) = (
+            get(&format!("{GOOGLE_CLIENT_ID_PREFIX}{spelling}"))?,
+            get(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{spelling}"))?,
+        ) {
+            return Ok(Some((id, Secret::from(secret))));
+        }
+    }
+    Ok(None)
 }
 
-/// Store an account's own client credentials together (overwrites — reconnecting re-sets the same).
+/// Store an account's own client credentials together (overwrites — reconnecting re-sets the same),
+/// under the lowercased email.
 pub fn set_google_client_for_account(
     email: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<()> {
-    set(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"), client_id)?;
+    let lower = email.to_lowercase();
+    set(&format!("{GOOGLE_CLIENT_ID_PREFIX}{lower}"), client_id)?;
     set(
-        &format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"),
+        &format!("{GOOGLE_CLIENT_SECRET_PREFIX}{lower}"),
         client_secret,
     )
 }
 
-/// Forget an account's own client credentials (idempotent).
+/// Forget an account's own client credentials under every spelling (idempotent).
 pub fn clear_google_client_for_account(email: &str) -> Result<()> {
-    delete(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"))?;
-    delete(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"))
+    for spelling in own_client_spellings(email) {
+        delete(&format!("{GOOGLE_CLIENT_ID_PREFIX}{spelling}"))?;
+        delete(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{spelling}"))?;
+    }
+    Ok(())
 }
 
 /// Read a per-service Google OAuth token blob by its keychain key (calendar, or a Drive account).
@@ -960,8 +985,11 @@ fn all_secret_keys(
     let mut keys: Vec<String> = FIXED_KEYS.iter().map(|k| (*k).to_string()).collect();
     keys.extend(token_keys.iter().cloned());
     for email in google_client_emails {
-        keys.push(format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"));
-        keys.push(format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"));
+        // Every spelling the client may sit under: lowercased since 3.139.8, exact before.
+        for spelling in own_client_spellings(email) {
+            keys.push(format!("{GOOGLE_CLIENT_ID_PREFIX}{spelling}"));
+            keys.push(format!("{GOOGLE_CLIENT_SECRET_PREFIX}{spelling}"));
+        }
     }
     for id in vault_ids {
         keys.push(vault_key_entry(id));
@@ -1054,6 +1082,33 @@ mod tests {
             FIXED_KEYS.len() + token_keys.len() + 2 * emails.len() + vaults.len(),
             "one key per fixed + token + (id,secret) per email + vault"
         );
+    }
+
+    /// An account's own client is saved under its lowercased email, but one saved before that rule
+    /// may sit under the exact spelling a connector used; reads fall back to it and a wipe removes
+    /// both.
+    #[test]
+    fn an_own_client_is_found_and_wiped_under_either_spelling() {
+        assert_eq!(
+            own_client_spellings("ap@x.com"),
+            vec!["ap@x.com".to_string()]
+        );
+        assert_eq!(
+            own_client_spellings("Ap@X.com"),
+            vec!["ap@x.com".to_string(), "Ap@X.com".to_string()]
+        );
+        let keys = all_secret_keys(&[], &["Ap@X.com".to_string()], &[]);
+        for key in [
+            "google_oauth_client_id::ap@x.com",
+            "google_oauth_client_secret::ap@x.com",
+            "google_oauth_client_id::Ap@X.com",
+            "google_oauth_client_secret::Ap@X.com",
+        ] {
+            assert!(
+                keys.contains(&key.to_string()),
+                "{key} missing from the wipe list"
+            );
+        }
     }
 
     #[test]
