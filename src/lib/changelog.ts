@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.140.0-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "The first step toward editing your calendars from PM: each Google Calendar account in Connectors has a “Turn on editing…” button. It asks Google to let PM create, change and delete events on that account's calendars. Until you turn it on, PM only reads them, and every other account stays read-only.",
+      "Once editing is on, “Turn off editing” stops PM using it straight away without a trip to Google, and turning it back on is just as quick. If you leave Google's “change events” box unticked, PM says so and the account stays read-only.",
+      "Connecting an account again only asks Google for reading, so it turns that account's editing off, and PM tells you when it does.",
+    ],
+  },
+  {
     version: "3.139.11-alpha",
     date: "2026-10-09",
     highlights: [

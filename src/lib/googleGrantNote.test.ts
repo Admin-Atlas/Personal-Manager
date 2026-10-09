@@ -34,6 +34,29 @@ describe("googleGrantNote", () => {
     );
   });
 
+  // Google keeps the whole grant, so after a Calendar disconnect of an account with editing granted,
+  // the access it keeps can still change that calendar's events.
+  it("says when the access Google keeps includes changing calendar events", () => {
+    const out = googleGrantNote({
+      service: "calendar",
+      email: "me@example.com",
+      keptFor: ["drive"],
+      calendarWrite: true,
+    });
+    expect(out).toContain(
+      "so Google keeps PM's access to it, including the permission to change its calendar events you gave when you turned on editing. To remove",
+    );
+    // Only a Calendar disconnect carries it; a Drive disconnect's note is unchanged.
+    expect(
+      googleGrantNote({
+        service: "drive",
+        email: "me@example.com",
+        keptFor: ["calendar"],
+        calendarWrite: true,
+      }),
+    ).not.toContain("change its calendar events");
+  });
+
   it("joins three features into one list", () => {
     expect(note("drive", ["calendar", "drive", "backup"])).toContain(
       "for Google Calendar, Google Drive and backups, so",

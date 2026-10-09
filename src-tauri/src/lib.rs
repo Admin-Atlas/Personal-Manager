@@ -12,6 +12,7 @@ mod better_fit;
 mod blocking;
 mod briefing;
 mod calendar;
+mod calendar_editing;
 mod chat;
 mod chat_index;
 mod chat_prefs;
@@ -1764,6 +1765,8 @@ pub fn run() {
             commands::set_calendar_kind,
             commands::connect_google_calendar_account,
             commands::disconnect_google_calendar_account,
+            commands::enable_calendar_editing,
+            commands::set_calendar_editing_paused,
             commands::connect_outlook_calendar,
             commands::disconnect_outlook_calendar,
             commands::list_ics_feeds,
@@ -1772,6 +1775,8 @@ pub fn run() {
             commands::set_google_client,
             commands::clear_google_client,
             commands::google_saved_projects,
+            #[cfg(debug_assertions)]
+            commands::dev_google_grant_report,
             commands::sync_calendar,
             commands::list_calendar_events,
             commands::list_all_calendar_events,

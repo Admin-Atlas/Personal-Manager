@@ -14,10 +14,17 @@ off-box; a remote or LAN endpoint receives the requests you route to it, and PM 
 token and chats in the clear to a public address); a launch-time update check against the
 signed release feed (and the download if you accept an update); a one-time first-run download
 of PM's on-device models and Python dependencies (your local model runner, if you use one, fetches
-model weights itself — PM does not); and, only if you configure them, a read-only
-calendar fetch, a read-only sync of the cloud accounts you connect (Google Drive, Google
-Sheets, OneDrive), and encrypted backups to your own cloud. There is no telemetry, analytics,
-or crash reporting. At rest, the **SQLCipher store** (settings, search index) is encrypted with
+model weights itself — PM does not); and, only if you configure them, a calendar fetch
+(read-only unless you turn on editing for a Google account, after which PM also sends the
+event changes you make to Google), a read-only sync of the cloud accounts you connect (Google
+Drive, Google Sheets, OneDrive), and encrypted backups to your own cloud. There is no telemetry,
+analytics, or crash reporting. **Calendar editing raises the stakes of a stolen token:** a Google
+account with editing on holds a token that can create, change and delete events on every
+calendar that account can edit, and send invitations in its name. "Turn off editing" in PM stops
+PM using it at once but doesn't narrow what Google granted. Disconnecting the account removes
+the grant at Google only when nothing else in PM uses that account; while Google Drive or
+backups still do, the calendar write permission stays granted until you remove PM at
+myaccount.google.com/permissions. At rest, the **SQLCipher store** (settings, search index) is encrypted with
 a key held in the OS keychain. The webview's **`localStorage` holds interface state only** — theme
 and accent, panel sizes, view modes, which sections you have folded away — while anything that names
 your content (project names, calendar ids, the cloud accounts you back up to) lives in the encrypted

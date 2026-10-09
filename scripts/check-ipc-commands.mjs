@@ -41,6 +41,10 @@ export const NO_WRAPPER_EXPECTED = new Set([
   // here is how the removed second control finds its way back — see the comment above
   // `setMilestoneStatus` in ipc.ts.
   "set_milestone_state",
+  // Dev builds only, and only for a live test (#884: does Google merge a Drive or backup consent
+  // with the calendar write grant?). It is run from the devtools console, so no screen needs it, and
+  // a wrapper would put a debug-only command name into release code.
+  "dev_google_grant_report",
 ]);
 
 /**
