@@ -83,6 +83,14 @@ struct Target {
     facts: CalendarFacts,
 }
 
+/// Whether an id stays one path segment of its own in a request URL. `Url::path_segments_mut` drops
+/// a "." or ".." segment (and strips tabs and newlines first, so ".\t." becomes ".."), which would
+/// send the write to the calendar's event list, or the calendar itself, instead of the event. Google's
+/// ids never look like that; a corrupt row isn't written through.
+fn is_plain_segment(s: &str) -> bool {
+    !s.is_empty() && !matches!(s, "." | "..") && !s.chars().any(|c| c.is_ascii_control())
+}
+
 /// Resolve a mirror row to its Google calendar and event. A row from an iCal feed or an Outlook
 /// calendar isn't Google OAuth, so it comes back as that reason rather than a target.
 fn resolve_target(
@@ -106,17 +114,21 @@ fn resolve_target(
     let Some(remote_event) = row
         .id
         .strip_prefix(&format!("{}:", row.calendar_id))
-        .filter(|e| !e.is_empty())
+        .filter(|e| is_plain_segment(e))
     else {
         return Ok(Err(ReadOnlyReason::NotGoogle));
     };
+    let remote_calendar = cal.remote_id.clone().unwrap_or_else(|| cal.id.clone());
+    if !is_plain_segment(&remote_calendar) {
+        return Ok(Err(ReadOnlyReason::NotGoogle));
+    }
     let Some(token_key) = secrets::token_key_for("google", "calendar", &email) else {
         return Ok(Err(ReadOnlyReason::NotGoogle));
     };
     Ok(Ok(Target {
         row_id: row.id.clone(),
         calendar_id: row.calendar_id.clone(),
-        remote_calendar: cal.remote_id.clone().unwrap_or_else(|| cal.id.clone()),
+        remote_calendar,
         remote_event: remote_event.to_string(),
         email,
         token_key,
@@ -1112,6 +1124,43 @@ mod tests {
         assert_eq!(target.email, "me@x.com");
         assert_eq!(target.token_key, "google_oauth_token_calendar::me@x.com");
         assert_eq!(target.facts.access_role.as_deref(), Some("owner"));
+    }
+
+    /// An id `Url::path_segments_mut` would drop, or turn into a dot segment, is never written
+    /// through: the request would land on the event list or the calendar instead.
+    #[test]
+    fn an_id_that_isnt_one_url_segment_is_never_written_through() {
+        for bad in [".", "..", ".\t.", "a\nb", ""] {
+            assert!(!is_plain_segment(bad), "{bad:?}");
+        }
+        for good in [
+            "abc_20261012T090000Z",
+            "team#1@group.calendar.google.com",
+            "a.b",
+            "%2e%2e",
+        ] {
+            assert!(is_plain_segment(good), "{good:?}");
+        }
+        // What the guard prevents: url drops the segment, so the write would go to the list.
+        let mut url = reqwest::Url::parse("https://example.com/calendars/c/events").unwrap();
+        url.path_segments_mut().unwrap().extend([".."]);
+        assert_eq!(url.path(), "/calendars/c/events");
+
+        let (_d, conn) = store();
+        let cal = "gcal:me@x.com:primary";
+        add_calendar(&conn, "gcal:me@x.com", "google", cal, Some("primary"));
+        add_event(&conn, cal, "..");
+        assert_eq!(
+            resolve_target(&conn, &format!("{cal}:..")).unwrap(),
+            Err(ReadOnlyReason::NotGoogle)
+        );
+        let odd = "gcal:me@x.com:odd";
+        add_calendar(&conn, "gcal:me@x.com", "google", odd, Some("."));
+        add_event(&conn, odd, "abc");
+        assert_eq!(
+            resolve_target(&conn, &format!("{odd}:abc")).unwrap(),
+            Err(ReadOnlyReason::NotGoogle)
+        );
     }
 
     #[test]

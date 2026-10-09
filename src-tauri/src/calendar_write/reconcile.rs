@@ -137,7 +137,8 @@ impl RecentWrites {
             // A fetch that began before the save can't have seen it: it may only be overlaid.
             let may_settle = fetch_started >= at.mono;
             let row_id = key.1.as_str();
-            let position = rows.iter().position(|r| r.id == row_id);
+            // Judged on the last copy of a repeated id, as that's the one the mirror keeps.
+            let position = rows.iter().rposition(|r| r.id == row_id);
             let settled = match (entry, position) {
                 (Entry::Upsert(saved), Some(i)) => {
                     let fetched = &rows[i];
@@ -146,7 +147,11 @@ impl RecentWrites {
                     let upstream_won =
                         strictly_later(fetched.updated.as_deref(), saved.updated.as_deref());
                     if !(landed || upstream_won) {
-                        rows[i] = (**saved).clone(); // the fetch is older than the save
+                        // The fetch is older than the save. Every copy: a fetch that repeats an id
+                        // would otherwise write the old version back (the mirror keeps the last).
+                        for row in rows.iter_mut().filter(|r| r.id == row_id) {
+                            *row = (**saved).clone();
+                        }
                     }
                     may_settle && (landed || upstream_won)
                 }
@@ -170,7 +175,10 @@ impl RecentWrites {
                     if restored {
                         may_settle // restored or changed in Google after the delete: upstream wins
                     } else {
-                        rows.remove(i); // the fetch still shows the deleted version
+                        // The fetch still shows the deleted version: hide every copy of it. `retain`,
+                        // not `Vec::remove`: CodeQL's generated Rust models read `remove`'s
+                        // bounds-check panic message as a log write of the fetched rows.
+                        rows.retain(|r| r.id != row_id);
                         if !complete {
                             deletes.push(row_id.to_string());
                         }
@@ -396,6 +404,51 @@ mod tests {
         // A complete fetch without it: landed.
         let landed = w.merge("cal", vec![], true, after.mono, after);
         assert!(landed.rows.is_empty());
+        assert!(w.is_empty());
+    }
+
+    /// A fetch that lists an event twice (a page boundary moving under the listing) mustn't let the
+    /// second copy undo the save or the delete: the mirror keeps the last row written for an id.
+    #[test]
+    fn a_repeated_row_in_the_fetch_never_undoes_a_save_or_a_delete() {
+        let (saved, after) = clocks();
+        let mut w = RecentWrites::default();
+        w.record_upsert(row("a", "New title", "\"2\"", T1), saved);
+        let twice = || {
+            vec![
+                row("a", "Old title", "\"1\"", T0),
+                row("b", "Other", "\"1\"", T0),
+                row("a", "Old title", "\"1\"", T0),
+            ]
+        };
+        let merged = w.merge("cal", twice(), true, after.mono, after);
+        assert_eq!(summaries(&merged), vec!["New title", "Other", "New title"]);
+
+        let mut w = RecentWrites::default();
+        w.record_delete("cal", "cal:a", Some("\"1\"".into()), Some(T0.into()), saved);
+        let merged = w.merge("cal", twice(), true, after.mono, after);
+        assert_eq!(summaries(&merged), vec!["Other"]);
+
+        // Copies that differ are judged on the last, the one the mirror keeps: a later change in
+        // Google (or a restore) there wins, as it would for a single copy.
+        let mut w = RecentWrites::default();
+        w.record_upsert(row("a", "New title", "\"2\"", T1), saved);
+        let changed_later = vec![
+            row("a", "Old title", "\"1\"", T0),
+            row("a", "Theirs", "\"3\"", T2),
+        ];
+        let merged = w.merge("cal", changed_later, true, after.mono, after);
+        assert_eq!(merged.rows.last().unwrap().summary, "Theirs");
+        assert!(w.is_empty());
+
+        let mut w = RecentWrites::default();
+        w.record_delete("cal", "cal:a", Some("\"1\"".into()), Some(T0.into()), saved);
+        let restored_later = vec![
+            row("a", "Dentist", "\"1\"", T0),
+            row("a", "Dentist", "\"5\"", T2),
+        ];
+        let merged = w.merge("cal", restored_later, true, after.mono, after);
+        assert_eq!(merged.rows.last().unwrap().etag.as_deref(), Some("\"5\""));
         assert!(w.is_empty());
     }
 
