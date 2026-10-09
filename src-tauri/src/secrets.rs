@@ -645,9 +645,10 @@ pub fn clear_google_client() -> Result<()> {
 /// **Per-account** Google client (id + secret). Most users share the one client above, but a Google
 /// **Advanced Protection** account can't authorize a third-party Cloud project — it must use a client
 /// from a project the account itself owns. So each such account can carry its OWN client, keyed by its
-/// email; the OAuth flow and every later token refresh for that account use it instead of the shared
-/// one (resolved in `google::client_creds_for_key`). Absent → the account falls back to the shared
-/// client. The `::` keeps these distinct from the shared keys (which have no suffix).
+/// email; a sign-in for that account uses it instead of the shared one, and each token then refreshes
+/// through whichever client minted it (`google::client_creds_for_token`). Absent → the account falls
+/// back to the shared client. The `::` keeps these distinct from the shared keys (which have no
+/// suffix).
 const GOOGLE_CLIENT_ID_PREFIX: &str = "google_oauth_client_id::";
 const GOOGLE_CLIENT_SECRET_PREFIX: &str = "google_oauth_client_secret::";
 

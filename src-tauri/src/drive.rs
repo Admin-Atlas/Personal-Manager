@@ -596,9 +596,9 @@ pub fn forget_account(conn: &Connection, email: &str, creds: Credentials) -> Res
     match creds {
         Credentials::Forget => {
             secrets::clear_google_token_for(&account_token_key(email)).ok();
-            // Forget the account's own Cloud-project client too, so reconnecting later with the
-            // shared client isn't silently overridden by stale per-account creds (see
-            // `client_creds_for_key`).
+            // Forget the account's own Cloud-project client too, so a later sign-in for this account
+            // doesn't silently pick up stale per-account creds (see
+            // `google::client_creds_for_account`).
             secrets::clear_google_client_for_account(email).ok();
         }
         Credentials::ForgetTokenKeepClient => {

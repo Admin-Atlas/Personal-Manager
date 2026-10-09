@@ -19,7 +19,10 @@ use crate::{briefing, drive, flags, microsoft, outlook_calendar, secrets, AppSta
 
 use super::shared::own_client;
 use super::shared::resolve_zone;
-use super::shared::{google_grant_users, release_plan, GoogleDisconnect, GoogleUse};
+use super::shared::{
+    google_account_emails, google_grant_token_keys, google_grant_users, pin_existing_grants,
+    release_plan, saved_project_account, wrong_account, GoogleDisconnect, GoogleUse,
+};
 use super::vaults::require_vault_owner;
 
 // --- personal assistant: calendar (multi-provider, read-only — cards 6A/6B) ---
@@ -115,15 +118,19 @@ pub fn set_calendar_quiet(
 
 // --- Google Calendar (OAuth, per-account) ---
 
-/// The core connect flow, shared by the new per-account command and the back-compat `connect_google`:
-/// run consent, learn the account from its primary calendar (id == email), store the token under that
-/// account's key, and register the account + its calendars (all selected by default).
+/// The core connect flow: run consent, learn the account from its primary calendar (id == email),
+/// store the token under that account's key, and register the account + its calendars (all selected
+/// by default). The sign-in uses `own` (a project pasted for this account), else the client already
+/// saved for `saved_account` (an Advanced-Protection account connected to another Google service),
+/// else the shared client.
 async fn do_connect_google_calendar(
     app: &AppHandle,
     own: Option<(String, String)>,
+    saved_account: Option<String>,
 ) -> Result<calendar::CalendarAccount> {
-    let token = match &own {
-        Some((id, secret)) => {
+    let state = app.state::<AppState>();
+    let token = match (&own, &saved_account) {
+        (Some((id, secret)), _) => {
             google::run_consent_with_client(
                 google::CALENDAR_SCOPE,
                 "Google Calendar",
@@ -132,7 +139,11 @@ async fn do_connect_google_calendar(
             )
             .await?
         }
-        None => google::run_consent(google::CALENDAR_SCOPE, "Google Calendar").await?,
+        (None, Some(email)) => {
+            google::run_consent_with_saved_project(email, google::CALENDAR_SCOPE, "Google Calendar")
+                .await?
+        }
+        (None, None) => google::run_consent(google::CALENDAR_SCOPE, "Google Calendar").await?,
     };
     let raw = calendar::fetch_calendar_list_with_token(&token).await?;
     let email = raw
@@ -145,12 +156,18 @@ async fn do_connect_google_calendar(
     // Normalise the account identity (trim + lowercase) so a reconnect that returns a
     // differently-cased address updates the same source/token instead of duplicating it.
     let email = email.trim().to_lowercase();
+    if let Some(expected) = &saved_account {
+        if !expected.eq_ignore_ascii_case(&email) {
+            return Err(wrong_account(expected, &email));
+        }
+    }
     let account = calendar::google_account_id(&email);
     if let Some((id, secret)) = &own {
+        let keys = google_grant_token_keys(&*state.conn()?, &email)?;
+        pin_existing_grants(&keys).await?;
         secrets::set_google_client_for_account(&email, id, secret)?;
     }
     google::save_token(&google_calendar_token_key(&email), &token)?;
-    let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
     let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
@@ -165,15 +182,18 @@ async fn do_connect_google_calendar(
 }
 
 /// Connect a Google Calendar account (multi-account). Optionally signs in with the account's OWN
-/// Cloud project (`client_id`/`client_secret`) — the Advanced-Protection path, mirroring `connect_drive`.
+/// Cloud project (`client_id`/`client_secret`) — the Advanced-Protection path, mirroring `connect_drive`
+/// — or with the project already saved for `account` (from [`google_saved_projects`]).
 #[tauri::command]
 pub async fn connect_google_calendar_account(
     app: AppHandle,
     client_id: Option<String>,
     client_secret: Option<String>,
+    account: Option<String>,
 ) -> Result<calendar::CalendarAccount> {
     require_vault_owner(&app)?;
-    do_connect_google_calendar(&app, own_client(client_id, client_secret)?).await
+    let own = own_client(client_id, client_secret)?;
+    do_connect_google_calendar(&app, own, saved_project_account(account)).await
 }
 
 /// Disconnect one Google Calendar account: drop its registry source (cascading its calendars +
@@ -373,6 +393,29 @@ pub fn set_google_client(app: AppHandle, client_id: String, client_secret: Strin
         ));
     }
     secrets::set_google_client(id, secret)
+}
+
+/// The Google accounts PM already holds an own Cloud project for (Advanced Protection), so connecting
+/// such an account to another Google service can reuse it instead of asking for the project again.
+/// Emails only — never the client id or secret.
+#[tauri::command]
+pub fn google_saved_projects(state: State<'_, AppState>) -> Result<Vec<String>> {
+    let emails = {
+        let conn = state.conn()?;
+        google_account_emails(&conn)?
+    };
+    // One entry per person, in the first spelling whose lookup resolves — that exact string is what
+    // the connect passes back, so it must be one the lookup can find.
+    let mut saved: Vec<String> = Vec::new();
+    for email in emails {
+        if saved.iter().any(|s| s.eq_ignore_ascii_case(&email)) {
+            continue;
+        }
+        if secrets::get_google_client_for_account(&email)?.is_some() {
+            saved.push(email);
+        }
+    }
+    Ok(saved)
 }
 
 /// Forget the Google client credentials. The client is shared by every Google service, so this

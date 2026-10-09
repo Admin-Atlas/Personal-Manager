@@ -20,7 +20,10 @@ use crate::{
 
 use super::archivist::refuse_if_rebuilding;
 use super::shared::own_client;
-use super::shared::{google_grant_users, release_plan, GoogleDisconnect, GoogleUse, GrantRelease};
+use super::shared::{
+    google_grant_token_keys, google_grant_users, pin_existing_grants, release_plan,
+    saved_project_account, wrong_account, GoogleDisconnect, GoogleUse, GrantRelease,
+};
 use super::vaults::require_vault_owner;
 
 // --- Google Drive (index-only connector, board card 4A) ---
@@ -52,27 +55,42 @@ pub async fn connect_drive(
     app: AppHandle,
     client_id: Option<String>,
     client_secret: Option<String>,
+    account: Option<String>,
 ) -> Result<drive::DriveAccount> {
     require_vault_owner(&app)?;
     let own = own_client(client_id, client_secret)?;
+    let saved_account = saved_project_account(account);
+    let state = app.state::<AppState>();
     // Request read-only Drive AND read-only Sheets together (space-joined per OAuth), so the account
     // grants both in one consent. Sheets powers the metadata-only Google Sheets index; an account that
     // last consented before Sheets existed keeps working for Drive and re-grants Sheets on reconnect
     // (`include_granted_scopes=true` unions it). Reconnecting an existing account runs this same flow.
     let scopes = format!("{} {}", google::DRIVE_SCOPE, google::SHEETS_SCOPE);
-    let token = match &own {
-        Some((id, secret)) => {
+    // The sign-in uses a project pasted for this account, else the one already saved for
+    // `saved_account` (an Advanced-Protection account connected to another Google service), else the
+    // shared client.
+    let token = match (&own, &saved_account) {
+        (Some((id, secret)), _) => {
             google::run_consent_with_client(&scopes, "Google Drive", id.clone(), secret.clone())
                 .await?
         }
-        None => google::run_consent(&scopes, "Google Drive").await?,
+        (None, Some(email)) => {
+            google::run_consent_with_saved_project(email, &scopes, "Google Drive").await?
+        }
+        (None, None) => google::run_consent(&scopes, "Google Drive").await?,
     };
     let (email, name) = drive::about_user(&token).await?;
+    if let Some(expected) = &saved_account {
+        if !expected.eq_ignore_ascii_case(&email) {
+            return Err(wrong_account(expected, &email));
+        }
+    }
     if let Some((id, secret)) = &own {
+        let keys = google_grant_token_keys(&*state.conn()?, &email)?;
+        pin_existing_grants(&keys).await?;
         secrets::set_google_client_for_account(&email, id, secret)?;
     }
     google::save_token(&drive::account_token_key(&email), &token)?;
-    let state = app.state::<AppState>();
     let conn = state.conn()?;
     drive::upsert_account(&conn, &email, &name)?;
     drive::list_accounts(&conn)?

@@ -1771,6 +1771,7 @@ pub fn run() {
             commands::remove_ics_feed,
             commands::set_google_client,
             commands::clear_google_client,
+            commands::google_saved_projects,
             commands::sync_calendar,
             commands::list_calendar_events,
             commands::list_all_calendar_events,

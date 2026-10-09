@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.9-alpha",
+    date: "2026-10-09",
+    highlights: [
+      'Google accounts with Advanced Protection no longer need their Cloud project pasted twice. Once one is connected with its own project, "Advanced Protection account? Use its own project" under the Calendar or Drive connect button offers a one-click "Use <account>\'s project" button. Google Drive backups to an account connected to Drive now sign in through that account\'s project too, so an Advanced Protection account can be a backup destination (before, Google turned it away).',
+      "From now on, PM remembers which Google project each sign-in came from and refreshes it through that same project, so an account connected one way for Drive and another way for Calendar keeps working for both. If Drive or Calendar already stopped syncing for an account like that, reconnect it once.",
+    ],
+  },
+  {
     version: "3.139.8-alpha",
     date: "2026-10-09",
     highlights: [
