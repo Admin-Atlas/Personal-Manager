@@ -13,6 +13,7 @@
 mod archivist;
 mod assistant;
 mod backups;
+mod calendar_edit;
 mod calendars;
 mod canon;
 mod connectors;
@@ -32,6 +33,7 @@ mod vaults;
 pub use archivist::*;
 pub use assistant::*;
 pub use backups::*;
+pub use calendar_edit::*;
 pub use calendars::*;
 pub use canon::*;
 pub use connectors::*;

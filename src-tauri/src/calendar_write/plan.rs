@@ -103,6 +103,10 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
 /// so an insert can't go out without one. After an answer that never arrived or a server error, the
 /// caller GETs that id before sending again (rule R2; Google warns it can't always catch a repeated
 /// id at creation), so a retry can't make a second event.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands in C10, creating events")
+)]
 pub fn insert_event(
     calendar: &str,
     id: &str,
@@ -126,6 +130,10 @@ pub fn insert_event(
 
 /// A new event id of PM's choosing: 32 lowercase hex characters, inside Google's allowed alphabet
 /// (base32hex: `0-9` and `a-v`, 5 to 1024 characters).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands in C10, creating events")
+)]
 pub fn client_event_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }

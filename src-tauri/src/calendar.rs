@@ -1300,6 +1300,24 @@ pub fn list_calendars_for_source(conn: &Connection, source_id: &str) -> Result<V
     Ok(rows)
 }
 
+/// One registered calendar by its `calendars.id`, or `None`.
+pub fn calendar_by_id(conn: &Connection, id: &str) -> Result<Option<Calendar>> {
+    conn.query_row(
+        &format!("SELECT {CALENDAR_COLS} WHERE id = ?1"),
+        params![id],
+        calendar_from_row,
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
+/// One mirrored event by its row id, or `None` (read back exactly as [`list_all_events`] does).
+pub fn event_by_id(conn: &Connection, id: &str) -> Result<Option<CalendarEvent>> {
+    Ok(list_events_where(conn, "WHERE id = ?1", params![id])?
+        .into_iter()
+        .next())
+}
+
 /// Drop calendars under `source_id` that are no longer in `keep` (and their events) — an upstream
 /// calendar that was deleted/unshared. `keep` is the set of `calendars.id` still present this sync.
 pub fn prune_calendars_not_in(conn: &Connection, source_id: &str, keep: &[String]) -> Result<()> {
@@ -1485,20 +1503,12 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// A title as the mirror stores it, so a fresh copy from Google compares like with like against a
-/// row the user saw (the delete check, `calendar_write::patch`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C4, the write commands")
-)]
+/// row the user saw (the delete check in the write core's `patch` module).
 pub(crate) fn mirrored_summary(s: &str) -> String {
     clip(s, MAX_SUMMARY_CHARS)
 }
 
 /// A location as the mirror stores it (see [`mirrored_summary`]).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C4, the write commands")
-)]
 pub(crate) fn mirrored_location(s: &str) -> String {
     clip(s, MAX_LOCATION_CHARS)
 }
@@ -1746,10 +1756,6 @@ fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
 /// the save removed. One transaction, so the view never shows half a series. The calendar's F-49
 /// hash is dropped, because the mirror no longer matches the last full fetch and the next sync must
 /// rewrite it rather than skip. A calendar the user has unticked mirrors nothing, so it is left alone.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C4, the write commands")
-)]
 pub(crate) fn apply_write_effect(
     conn: &Connection,
     calendar_id: &str,
@@ -1927,15 +1933,23 @@ pub fn focus_agenda(conn: &Connection, days: i64, zone: chrono_tz::Tz) -> Result
 /// Deliberately NOT filtered by `quiet`: a quiet calendar is kept out of the assistant paths
 /// ([`agenda_query`]) but still shown here on the Calendar tab — that's the whole point of quiet.
 pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
-    let mut stmt = conn.prepare(
+    list_events_where(conn, "ORDER BY start", [])
+}
+
+/// Mirrored events, read whole: `tail` follows `FROM calendar_events` (a WHERE and/or ORDER BY).
+fn list_events_where(
+    conn: &Connection,
+    tail: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<CalendarEvent>> {
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
                 show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
                 visibility, created, updated, etag, event_type, organizer_self, locked, \
                 guests_can_modify, series_id, original_start, color_id, event_label_id \
-         FROM calendar_events \
-         ORDER BY start",
-    )?;
-    let rows = stmt.query_map([], |r| {
+         FROM calendar_events {tail}"
+    ))?;
+    let rows = stmt.query_map(params, |r| {
         let all_day: i64 = r.get(7)?;
         let recurring: i64 = r.get(14)?;
         let attendees_json: Option<String> = r.get(12)?;

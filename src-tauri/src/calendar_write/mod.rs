@@ -17,13 +17,6 @@
 //! diffed against a fresh GET, never the mirror (R1); a change Google made meanwhile is a conflict,
 //! never overwritten (R2); the mirror is only ever written from Google's reply (R3).
 
-// The write commands arrive in C4; until then the core is only exercised by its tests. `expect`, not
-// `allow`, so this line has to go once everything has a caller.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first callers land in C4, the write commands")
-)]
-
 pub mod classify;
 pub mod dto;
 pub mod gate;

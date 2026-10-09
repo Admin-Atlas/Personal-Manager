@@ -17,6 +17,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::calendar_editing::{self, Choice, ConsentVerdict, EditingStatus};
+use crate::calendar_write::dto::ReadOnlyReason;
+use crate::calendar_write::reconcile::Stamp;
 use crate::error::{Error, Result};
 use crate::google;
 use crate::{briefing, drive, flags, microsoft, outlook_calendar, secrets, AppState};
@@ -666,6 +668,8 @@ async fn sync_one_calendar(
     time_max: &str,
     tz: chrono_tz::Tz,
 ) -> Result<(usize, bool)> {
+    // Taken before the fetch: only a fetch that began after a save may settle it (rule R4).
+    let fetch_started = std::time::Instant::now();
     let (events, complete) = match cal.provider.as_str() {
         "google" => {
             let email = calendar::account_email_of(&cal.source_id).ok_or_else(|| {
@@ -709,8 +713,43 @@ async fn sync_one_calendar(
     let n = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    calendar::replace_events(&conn, &cal.id, &events, complete)?;
+    write_fetched_events(
+        &conn,
+        &state.calendar_edit,
+        cal,
+        events,
+        complete,
+        fetch_started,
+    )?;
     Ok((n, complete))
+}
+
+/// Write one calendar's fetch into the mirror, through the saves of the last ten minutes: a fetch
+/// that began before a save can't put the old version back (rule R4). The caller holds the DB lock,
+/// and the recent writes are locked inside it (lock order: the DB, then the recent writes).
+fn write_fetched_events(
+    conn: &rusqlite::Connection,
+    edit: &super::CalendarEditState,
+    cal: &calendar::Calendar,
+    events: Vec<CalendarEvent>,
+    complete: bool,
+    fetch_started: std::time::Instant,
+) -> Result<()> {
+    let mut recent = edit
+        .recent
+        .lock()
+        .map_err(|_| Error::Other("recent writes lock poisoned".into()))?;
+    if recent.is_empty() {
+        drop(recent);
+        return calendar::replace_events(conn, &cal.id, &events, complete);
+    }
+    let merged = recent.merge(&cal.id, events, complete, fetch_started, Stamp::now());
+    drop(recent);
+    calendar::replace_events(conn, &cal.id, &merged.rows, complete)?;
+    if !merged.deletes.is_empty() {
+        calendar::apply_write_effect(conn, &cal.id, &[], &merged.deletes)?;
+    }
+    Ok(())
 }
 
 /// Re-fetch each connected OAuth account's calendar LIST and reconcile the registry before events are
@@ -773,6 +812,10 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
 /// signal is the state, not a toast.
 #[tauri::command]
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
+    // One sync at a time (the Refresh button, the poll): an older fetch finishing after a newer one
+    // has settled a save would show the event as it was before the save (plan A23).
+    let state = app.state::<AppState>();
+    let _single = state.calendar_edit.sync_lock.lock().await;
     let _ = migrate_legacy_google_calendar(&app).await;
     // Pick up calendars created or deleted upstream before syncing events, so a new calendar shows up
     // and a deleted one stops pinning the account 'unreachable' every sync (deletions honoured only on
@@ -899,10 +942,29 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 /// Every mirrored event across the widened window — the read backing the unified calendar view
 /// (card 8). The focus view keeps the narrow forward agenda ([`list_calendar_events`]); this returns
 /// the whole band (previous month included) and the client filters to the visible range.
+///
+/// Each row says whether PM could edit it (`edit_block`), as far as the mirror can tell; the editor
+/// asks Google again when it opens.
 #[tauri::command]
-pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
+pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<ListedEvent>> {
     let conn = state.conn()?;
-    calendar::list_all_events(&conn)
+    let rows = calendar::list_all_events(&conn)?;
+    let blocks = super::calendar_edit::edit_blocks(&conn, &rows)?;
+    Ok(rows
+        .into_iter()
+        .zip(blocks)
+        .map(|(event, edit_block)| ListedEvent { event, edit_block })
+        .collect())
+}
+
+/// A row of the unified calendar view.
+#[derive(Serialize)]
+pub struct ListedEvent {
+    #[serde(flatten)]
+    pub event: CalendarEvent,
+    /// Why nothing about it may change, or `None` when something can, assuming editing is on for
+    /// its account (the view merges each account's real status from `calendar_overview`).
+    pub edit_block: Option<ReadOnlyReason>,
 }
 
 /// The active PM flags anchored on a calendar event's iCal UID — shown in the event detail popup so a
@@ -928,4 +990,108 @@ pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<calendar::
     let conn = state.conn()?;
     let zone = resolve_zone(&conn);
     calendar::focus_agenda(&conn, calendar::AGENDA_DAYS, zone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calendar::CalendarFacts;
+    use std::time::Instant;
+
+    const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const CAL: &str = "gcal:me@x.com:me@x.com";
+
+    fn store() -> (tempfile::TempDir, rusqlite::Connection, calendar::Calendar) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        calendar::upsert_source(
+            &conn,
+            "gcal:me@x.com",
+            "google",
+            Some("me@x.com"),
+            "me@x.com",
+        )
+        .unwrap();
+        let cal = calendar::Calendar {
+            id: CAL.into(),
+            source_id: "gcal:me@x.com".into(),
+            provider: "google".into(),
+            remote_id: Some("me@x.com".into()),
+            name: "Me".into(),
+            color: None,
+            selected: true,
+            is_primary: true,
+            quiet: false,
+            kind: None,
+            facts: CalendarFacts::default(),
+        };
+        calendar::upsert_calendar(&conn, &cal).unwrap();
+        (dir, conn, cal)
+    }
+
+    fn event(id: &str, summary: &str, etag: &str, updated: &str) -> CalendarEvent {
+        CalendarEvent {
+            id: format!("{CAL}:{id}"),
+            calendar_id: CAL.into(),
+            summary: summary.into(),
+            start: "2026-10-12T09:00:00Z".into(),
+            etag: Some(etag.into()),
+            updated: Some(updated.into()),
+            ..Default::default()
+        }
+    }
+
+    fn titles(conn: &rusqlite::Connection) -> Vec<String> {
+        calendar::list_all_events(conn)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.summary)
+            .collect()
+    }
+
+    #[test]
+    fn a_sync_that_began_before_a_save_cant_put_the_old_version_back() {
+        let (_d, conn, cal) = store();
+        let edit = super::super::CalendarEditState::default();
+        let before = Instant::now();
+        let old = event("a", "Dentist", "\"1\"", "2026-10-09T10:00:00Z");
+        write_fetched_events(&conn, &edit, &cal, vec![old.clone()], true, before).unwrap();
+        // The save lands after that sync began.
+        let saved = event("a", "Dentist (moved)", "\"2\"", "2026-10-09T11:00:00Z");
+        edit.recent
+            .lock()
+            .unwrap()
+            .record_upsert(saved.clone(), Stamp::now());
+        // The older fetch finishes now, still showing the old version: the save stays.
+        write_fetched_events(&conn, &edit, &cal, vec![old], true, before).unwrap();
+        assert_eq!(titles(&conn), vec!["Dentist (moved)"]);
+        assert!(
+            !edit.recent.lock().unwrap().is_empty(),
+            "not settled by an older fetch"
+        );
+        // A fetch begun after the save shows it: settled.
+        write_fetched_events(&conn, &edit, &cal, vec![saved], true, Instant::now()).unwrap();
+        assert_eq!(titles(&conn), vec!["Dentist (moved)"]);
+        assert!(edit.recent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_deleted_event_stays_gone_even_from_an_incomplete_fetch() {
+        let (_d, conn, cal) = store();
+        let edit = super::super::CalendarEditState::default();
+        let before = Instant::now();
+        let a = event("a", "Dentist", "\"1\"", "2026-10-09T10:00:00Z");
+        let b = event("b", "Gym", "\"1\"", "2026-10-09T10:00:00Z");
+        write_fetched_events(&conn, &edit, &cal, vec![a.clone(), b.clone()], true, before).unwrap();
+        edit.recent.lock().unwrap().record_delete(
+            CAL,
+            &a.id,
+            a.etag.clone(),
+            a.updated.clone(),
+            Stamp::now(),
+        );
+        // An incomplete fetch only upserts, so the deleted row is removed explicitly.
+        write_fetched_events(&conn, &edit, &cal, vec![a], false, before).unwrap();
+        assert_eq!(titles(&conn), vec!["Gym"]);
+    }
 }

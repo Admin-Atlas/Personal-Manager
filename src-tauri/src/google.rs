@@ -155,7 +155,7 @@ fn client_creds_for_token(token_key: &str, token: &Token) -> Result<(String, Sec
     ) {
         ClientChoice::Own => Ok(own.expect("choose_client only picks Own when one is saved")),
         ClientChoice::Shared => client_creds(),
-        ClientChoice::Gone => Err(Error::Other(
+        ClientChoice::Gone => Err(Error::Reauth(
             "The Google Cloud project this account signed in with is no longer saved in PM — \
              reconnect the account in Settings."
                 .into(),
@@ -427,9 +427,57 @@ pub async fn get_json_with_token(token: &Token, url: &str) -> Result<serde_json:
 /// the default 30s for GETs, the long-transfer client for backup metadata. This is the single home of
 /// Google's authorised-send-with-refresh (promoted from the backup layer's private copy so Drive's
 /// REST plumbing lives once). Never touches the DB, so callers hold no lock across it (rule #4).
+/// Background callers (sync, backup) use this; [`authorized_send_with`] lets a caller someone is
+/// waiting on cap how long it sits out a rate limit.
 pub async fn authorized_send<F>(
     client: &reqwest::Client,
     token_key: &str,
+    build: F,
+) -> Result<reqwest::Response>
+where
+    F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+{
+    authorized_send_with(client, token_key, SendPolicy::BACKGROUND, build).await
+}
+
+/// How an authorised send waits out a 429.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendPolicy {
+    /// The longest `Retry-After` honoured before the one retry.
+    pub max_wait_secs: u64,
+    /// When Google asks for longer: wait the maximum anyway (background), or hand the 429 back at
+    /// once so the caller can say "try again shortly" (someone is waiting on a save).
+    pub give_up_beyond_max: bool,
+}
+
+impl SendPolicy {
+    /// Sync and backup: wait out up to a minute, then retry once.
+    pub const BACKGROUND: SendPolicy = SendPolicy {
+        max_wait_secs: 60,
+        give_up_beyond_max: false,
+    };
+    /// A save the user is watching: at most five seconds, else report the rate limit.
+    pub const INTERACTIVE: SendPolicy = SendPolicy {
+        max_wait_secs: 5,
+        give_up_beyond_max: true,
+    };
+
+    /// How long to wait before the one retry when Google asks for `asked` seconds, or `None` to
+    /// hand the 429 straight back.
+    fn wait_for(self, asked: u64) -> Option<u64> {
+        if asked > self.max_wait_secs && self.give_up_beyond_max {
+            None
+        } else {
+            Some(asked.min(self.max_wait_secs))
+        }
+    }
+}
+
+/// [`authorized_send`] under an explicit [`SendPolicy`].
+pub async fn authorized_send_with<F>(
+    client: &reqwest::Client,
+    token_key: &str,
+    policy: SendPolicy,
     build: F,
 ) -> Result<reqwest::Response>
 where
@@ -444,7 +492,7 @@ where
         // scope downgrade) would otherwise surface a raw provider 401 body. Map it to a clear
         // "reconnect" message instead.
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(Error::Other(
+            return Err(Error::Reauth(
                 "Your Google session has expired — reconnect the account in Settings → Connectors."
                     .into(),
             ));
@@ -457,13 +505,15 @@ where
     // without reading the body, so it isn't retried here; the sync classifies it as retryable via
     // [`crate::drive::is_rate_limited`] and simply re-checks the account next pass (F-26).
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let wait = resp
+        let asked = resp
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(2)
-            .min(60);
+            .unwrap_or(2);
+        let Some(wait) = policy.wait_for(asked) else {
+            return Ok(resp);
+        };
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         let bearer = valid_access_token(token_key).await?;
         resp = build(client, bearer.expose()).send().await?;
@@ -553,7 +603,7 @@ async fn do_refresh(token_key: &str, force: bool) -> Result<Token> {
     let refresh = current
         .refresh_token
         .clone()
-        .ok_or_else(|| Error::Other("Google session expired — reconnect in Settings.".into()))?;
+        .ok_or_else(|| Error::Reauth("Google session expired — reconnect in Settings.".into()))?;
     let (client_id, client_secret) = client_creds_for_token(token_key, &current)?;
     let params = [
         ("grant_type", "refresh_token"),
@@ -562,6 +612,11 @@ async fn do_refresh(token_key: &str, force: bool) -> Result<Token> {
         ("client_secret", client_secret.expose()),
     ];
     let resp = http()?.post(TOKEN_ENDPOINT).form(&params).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = crate::error::truncate_detail(&resp.text().await.unwrap_or_default());
+        return Err(refresh_failure(status, &detail));
+    }
     let mut token = token_from_response(resp).await?;
     if token.refresh_token.is_none() {
         token.refresh_token = Some(refresh);
@@ -582,6 +637,18 @@ async fn do_refresh(token_key: &str, force: bool) -> Result<Token> {
     Ok(token)
 }
 
+/// A refresh the token endpoint refused. 400 (`invalid_grant`: revoked, expired, or minted by a
+/// client PM no longer holds) and 401 can only be fixed by signing in again, so they're
+/// [`Error::Reauth`]; anything else (a 5xx) is a plain failure worth retrying later. The text is the
+/// one every refresh failure has always shown.
+fn refresh_failure(status: reqwest::StatusCode, detail: &str) -> Error {
+    let message = format!("Google sign-in failed ({status}): {detail}");
+    match status.as_u16() {
+        400 | 401 => Error::Reauth(message),
+        _ => Error::Other(message),
+    }
+}
+
 async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     if !resp.status().is_success() {
         let status = resp.status();
@@ -600,11 +667,12 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     })
 }
 
+/// The stored token. No token, or one PM can't read, is a sign-in to redo (`Error::Reauth`).
 fn load_token(token_key: &str) -> Result<Token> {
     let raw = secrets::get_google_token_for(token_key)?
-        .ok_or_else(|| Error::Other("Not connected to Google. Connect in Settings.".into()))?;
+        .ok_or_else(|| Error::Reauth("Not connected to Google. Connect in Settings.".into()))?;
     serde_json::from_str(raw.expose())
-        .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))
+        .map_err(|e| Error::Reauth(format!("stored Google token unreadable: {e}")))
 }
 
 /// Pin a token saved before minting clients were recorded to the client it is refreshing through
@@ -900,5 +968,43 @@ mod tests {
         assert!(json.ends_with(r#","client_id":"own-1"}"#), "{json}");
         let back: Token = serde_json::from_str(&json).unwrap();
         assert_eq!(back.client_id.as_deref(), Some("own-1"));
+    }
+
+    /// A refused refresh reads exactly as before, and is `Reauth` only when signing in again is the
+    /// fix; both serialise to the same bare string the webview always got.
+    #[test]
+    fn a_refused_refresh_keeps_its_text_and_says_whether_to_reconnect() {
+        use reqwest::StatusCode;
+        let detail = r#"{"error":"invalid_grant"}"#;
+        let bad = refresh_failure(StatusCode::BAD_REQUEST, detail);
+        assert!(matches!(bad, Error::Reauth(_)));
+        assert_eq!(
+            bad.to_string(),
+            r#"Google sign-in failed (400 Bad Request): {"error":"invalid_grant"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&bad).unwrap(),
+            serde_json::to_string(&bad.to_string()).unwrap()
+        );
+        assert!(matches!(
+            refresh_failure(StatusCode::UNAUTHORIZED, ""),
+            Error::Reauth(_)
+        ));
+        let busy = refresh_failure(StatusCode::SERVICE_UNAVAILABLE, "try later");
+        assert!(matches!(busy, Error::Other(_)));
+        assert_eq!(
+            busy.to_string(),
+            "Google sign-in failed (503 Service Unavailable): try later"
+        );
+    }
+
+    #[test]
+    fn a_save_someone_is_waiting_on_gives_up_on_a_long_rate_limit() {
+        // Sync and backup wait out what Google asks, up to a minute.
+        assert_eq!(SendPolicy::BACKGROUND.wait_for(2), Some(2));
+        assert_eq!(SendPolicy::BACKGROUND.wait_for(600), Some(60));
+        // A save waits five seconds at most, and otherwise says so at once.
+        assert_eq!(SendPolicy::INTERACTIVE.wait_for(5), Some(5));
+        assert_eq!(SendPolicy::INTERACTIVE.wait_for(6), None);
     }
 }
