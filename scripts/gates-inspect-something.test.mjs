@@ -12,7 +12,8 @@
 // This runs each gate for real against the working tree and holds it to two things: it passes, and
 // it says it looked at something. That is deliberately shallow — it is a floor under all of them,
 // not a substitute for a gate's own tests (`check-ipc-commands.test.mjs`, `check-model-licences`,
-// `check-sidecar-licences`, `check-requirements-lock`, `check-action-pins` each have those).
+// `check-sidecar-licences`, `check-requirements-lock`, `check-action-pins`,
+// `check-calendar-write-fence` each have those).
 //
 // Excluded on purpose: `check-npm-licenses` reads `node_modules`, so it belongs to the frontend job
 // rather than the zero-dependency hygiene set, and the generators/fetchers (`fetch-python`,
@@ -31,6 +32,7 @@ const repoRoot = join(scriptsDir, "..");
 /** The offline, zero-dependency gates that run in pr.yml's `hygiene` job. */
 const GATES = [
   "check-action-pins",
+  "check-calendar-write-fence",
   "check-ci-membership",
   "check-files-in-place",
   "check-ipc-commands",
