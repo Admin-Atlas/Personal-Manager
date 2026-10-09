@@ -26,7 +26,7 @@ import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
 import { Button, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
-import { whenText } from "./whenText";
+import { repeatsText, whenText } from "./whenText";
 
 interface Props {
   event: CalendarEvent;
@@ -258,11 +258,7 @@ export function CalendarEventPopover({
       <div className="flex flex-col gap-2 overflow-y-auto px-3 py-3">
         <Field label="When">
           <div>{whenText(event)}</div>
-          {event.recurring && (
-            <div className="mt-0.5 text-ink4">
-              Repeats{event.recurrence_summary ? ` · ${event.recurrence_summary}` : ""}
-            </div>
-          )}
+          {event.recurring && <div className="mt-0.5 text-ink4">{repeatsText(event)}</div>}
         </Field>
 
         {event.show_as && <Field label="Shows as">{showAsLabel(event.show_as)}</Field>}

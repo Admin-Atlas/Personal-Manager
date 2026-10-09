@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.143.0-alpha"
+version = "3.144.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -110,10 +110,11 @@ open = "5"
 
 # Calendar feed (.ics) parsing — the no-OAuth path (Step 6). chrono/chrono-tz give
 # correct timezone handling for event times; rrule expands recurring events within
-# the agenda window.
+# the agenda window. `exrule`: without it the crate drops an EXRULE with only a log line, and a feed's
+# excluded occurrences show up (ics.rs).
 chrono = "0.4"
 chrono-tz = "0.10"
-rrule = "0.14"
+rrule = { version = "0.14", features = ["exrule"] }
 
 # Local-folder indexing (index-only connector). `file-id` reads a file's OS-stable
 # identity (NTFS FileId on Windows, inode on Unix) so a rename/move keeps the same

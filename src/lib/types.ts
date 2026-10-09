@@ -1502,7 +1502,8 @@ export interface CalendarEvent {
   /** A video-call join link (Meet / Teams). */
   conference_url?: string | null;
   recurring?: boolean;
-  /** A short recurrence summary (the raw RRULE for ICS / Google). */
+  /** How the series repeats, in words ("Weekly on Monday"): iCal rows only, as a Google or Outlook
+   *  occurrence doesn't carry its series' rule. */
   recurrence_summary?: string | null;
   status?: string | null;
   visibility?: string | null;

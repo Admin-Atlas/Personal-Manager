@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.144.0-alpha",
+    date: "2026-10-09",
+    highlights: [
+      'Repeating events from iCal links now say how they repeat in plain words, like "Weekly on Monday" or "Every 2 weeks on Monday and Wednesday, until 31-12-2026", instead of a raw rule like FREQ=WEEKLY;BYDAY=MO.',
+      "An iCal event that repeats but skips some dates by a rule (say, every day except weekends) no longer shows the dates it skips.",
+      "Under the hood, PM can now read and work with repeat rules, the groundwork for editing repeating events in Google Calendar.",
+    ],
+  },
+  {
     version: "3.143.0-alpha",
     date: "2026-10-09",
     highlights: [

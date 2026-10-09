@@ -278,6 +278,28 @@ describe("CalendarEventPopover", () => {
     expect(getByRole("dialog").getAttribute("aria-label")).toBe("Design review");
   });
 
+  // #884 C7: an iCal series says how it repeats; a row still holding a raw rule from before says
+  // only "Repeats", as does one with no summary (every Google occurrence).
+  it.each([
+    ["Weekly on Monday", "Weekly on Monday"],
+    ["FREQ=WEEKLY;BYDAY=MO", "Repeats"],
+    [null, "Repeats"],
+  ])("shows the repeat line for a summary of %s", (summary, expected) => {
+    const { getByRole } = render(
+      <CalendarEventPopover
+        event={calendarEvent({ recurring: true, recurrence_summary: summary })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    const text = getByRole("dialog").textContent ?? "";
+    expect(text).toContain(expected);
+    expect(text).not.toContain("FREQ=");
+  });
+
   // #884: CalendarView passes `editing`; FocusUpcoming doesn't, and must stay as it was.
   it("offers no editing at all without the editing prop", () => {
     const { queryByRole, getByRole } = render(

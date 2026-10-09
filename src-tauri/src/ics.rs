@@ -18,6 +18,7 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz as ChronoTz;
 
 use crate::calendar::{Attendee, CalendarEvent};
+use crate::calendar_recur::{spec::describe_lines, SeriesStart};
 
 /// Defensive caps for a hostile or oversized feed: bound how many VEVENT blocks we
 /// parse and how many expanded occurrences we keep. The 10 MiB body cap (see
@@ -243,7 +244,21 @@ fn expand_vevent(
     });
     let attendees = ics_attendees(block);
     let recurring = block.iter().any(|l| is_prop(l, "RRULE"));
-    let recurrence_summary = find(block, "RRULE").map(str::to_string);
+    let recurrence_summary = if recurring {
+        series_start(start_params, start_val, all_day, tz).map(|start| {
+            let lines: Vec<&String> = block
+                .iter()
+                .filter(|l| {
+                    ["RRULE", "EXRULE", "RDATE", "EXDATE"]
+                        .iter()
+                        .any(|p| is_prop(l, p))
+                })
+                .collect();
+            describe_lines(&lines, &start)
+        })
+    } else {
+        None
+    };
     let status = find(block, "STATUS").map(str::to_string);
     let visibility = find(block, "CLASS").map(str::to_string);
     let created = find(block, "CREATED").map(str::to_string);
@@ -280,7 +295,7 @@ fn expand_vevent(
 }
 
 /// Expand an `RRULE` to its UTC occurrence-starts within the window. Feeds the
-/// DTSTART/RRULE/EXDATE/RDATE lines to `rrule` so it resolves the timezone and DST
+/// DTSTART/RRULE/EXRULE/EXDATE/RDATE lines to `rrule` so it resolves the timezone and DST
 /// itself; a floating DTSTART is first pinned to the user's zone so it doesn't fall
 /// back to the machine's. A parse failure retries with the DTSTART pinned to its
 /// resolved UTC instant (so a DST-ambiguous DTSTART doesn't drop the whole series),
@@ -305,13 +320,23 @@ fn expand_rrule(
         return Vec::new();
     }
 
-    let spec = build_rrule_spec(block, tz);
-    let set = match spec.parse::<rrule::RRuleSet>() {
-        Ok(set) => set,
-        Err(_) => match rrule_spec_utc_fallback(block, tz).and_then(|s| s.parse().ok()) {
-            Some(set) => set,
-            None => return Vec::new(),
-        },
+    // With the block's EXRULEs when they're safe to walk, then without: EXRULEs the crate can't take
+    // (an UNTIL of the wrong type, say) cost the series only the dates they'd exclude, never the
+    // whole series.
+    let exrule_choices: &[bool] = if exrules_are_walkable(block) {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    let Some(set) = exrule_choices.iter().find_map(|&with_exrules| {
+        build_rrule_spec(block, tz, with_exrules)
+            .parse::<rrule::RRuleSet>()
+            .ok()
+            .or_else(|| {
+                rrule_spec_utc_fallback(block, tz, with_exrules).and_then(|s| s.parse().ok())
+            })
+    }) else {
+        return Vec::new();
     };
 
     let after = win_start.with_timezone(&rrule::Tz::UTC);
@@ -343,28 +368,65 @@ fn expand_rrule(
         .collect()
 }
 
-/// True only if the block's `RRULE` uses a day-or-coarser FREQ (DAILY/WEEKLY/MONTHLY/
-/// YEARLY). See `expand_rrule` for why this is an allowlist.
-fn rrule_freq_is_expandable(block: &[String]) -> bool {
-    block.iter().any(|l| {
-        let u = l.to_ascii_uppercase();
-        u.starts_with("RRULE")
-            && ["FREQ=DAILY", "FREQ=WEEKLY", "FREQ=MONTHLY", "FREQ=YEARLY"]
-                .iter()
-                .any(|f| u.contains(f))
-    })
+/// The most RRULE lines, and separately EXRULE lines, a block may hand the crate.
+const MAX_RULE_LINES: usize = 4;
+/// The most start times one rule may make in a day. BYHOUR × BYMINUTE × BYSECOND can make a DAILY rule
+/// as slow to walk as a SECONDLY one (86,400 a day).
+const MAX_TIMES_PER_DAY: usize = 24;
+
+/// Whether one RRULE or EXRULE line is safe to walk from a DTSTART far before the window: a
+/// day-or-coarser FREQ (DAILY/WEEKLY/MONTHLY/YEARLY) making at most [`MAX_TIMES_PER_DAY`] starts a
+/// day. See `expand_rrule` for why this is an allowlist.
+fn rule_is_walkable(line: &str) -> bool {
+    let value = line.split_once(':').map_or("", |(_, v)| v);
+    let part = |name: &str| {
+        value.split(';').find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    };
+    let day_or_coarser = part("FREQ").is_some_and(|f| {
+        ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]
+            .iter()
+            .any(|ok| f.eq_ignore_ascii_case(ok))
+    });
+    let times_per_day = ["BYHOUR", "BYMINUTE", "BYSECOND"]
+        .iter()
+        .fold(1usize, |n, p| {
+            n.saturating_mul(part(p).map_or(1, |v| v.split(',').count()))
+        });
+    day_or_coarser && times_per_day <= MAX_TIMES_PER_DAY
 }
 
-/// The DTSTART/RRULE/EXDATE/RDATE lines joined for `rrule`, pinning a *floating*
-/// DTSTART (timed, no `Z`, no `TZID`) to the user's zone so `rrule` resolves it like
-/// `parse_any` does — not in the machine's local zone.
-fn build_rrule_spec(block: &[String], tz: ChronoTz) -> String {
+/// True only if the block has an `RRULE`, few enough of them, and every one is walkable: a block
+/// pairing a daily rule with a SECONDLY one is the same hang as the SECONDLY one alone.
+fn rrule_freq_is_expandable(block: &[String]) -> bool {
+    let rules: Vec<&String> = block.iter().filter(|l| is_prop(l, "RRULE")).collect();
+    !rules.is_empty() && rules.len() <= MAX_RULE_LINES && rules.iter().all(|l| rule_is_walkable(l))
+}
+
+/// Whether the block has EXRULEs PM can hand the crate: few enough, each walkable. The crate keeps
+/// every date an EXRULE walks past, so an unbounded one is a large allocation as well as a hang.
+fn exrules_are_walkable(block: &[String]) -> bool {
+    let exrules: Vec<&String> = block.iter().filter(|l| is_prop(l, "EXRULE")).collect();
+    !exrules.is_empty()
+        && exrules.len() <= MAX_RULE_LINES
+        && exrules.iter().all(|l| rule_is_walkable(l))
+}
+
+/// The DTSTART/RRULE/EXDATE/RDATE lines joined for `rrule`, and the EXRULEs when `with_exrules`,
+/// pinning a *floating* DTSTART (timed, no `Z`, no `TZID`) to the user's zone so `rrule` resolves it
+/// like `parse_any` does — not in the machine's local zone. EXRULE is honoured because the crate's
+/// `exrule` feature is on; without it the crate dropped the line and the occurrences it excludes
+/// showed up.
+fn build_rrule_spec(block: &[String], tz: ChronoTz, with_exrules: bool) -> String {
     block
         .iter()
         .map(|l| canonical_prop_line(l))
         .filter(|l| {
             is_prop(l, "DTSTART")
                 || is_prop(l, "RRULE")
+                || (with_exrules && is_prop(l, "EXRULE"))
                 || is_prop(l, "EXDATE")
                 || is_prop(l, "RDATE")
         })
@@ -396,7 +458,7 @@ fn pin_floating_dtstart(line: &str, tz: ChronoTz) -> String {
 /// A fallback spec whose DTSTART is pinned to its resolved UTC instant, for the rare
 /// DTSTART that lands in a DST gap and makes the primary parse fail. Loses cross-DST
 /// wall-clock stability but keeps the series instead of dropping it entirely.
-fn rrule_spec_utc_fallback(block: &[String], tz: ChronoTz) -> Option<String> {
+fn rrule_spec_utc_fallback(block: &[String], tz: ChronoTz, with_exrules: bool) -> Option<String> {
     let (params, value) = find_prop(block, "DTSTART")?;
     let all_day =
         param(params, "VALUE") == Some("DATE") || (!value.contains('T') && value.trim().len() == 8);
@@ -409,10 +471,10 @@ fn rrule_spec_utc_fallback(block: &[String], tz: ChronoTz) -> Option<String> {
     } else {
         format!("DTSTART:{}", anchor.format("%Y%m%dT%H%M%SZ"))
     };
-    let rest = block
-        .iter()
-        .map(|l| canonical_prop_line(l))
-        .filter(|l| is_prop(l, "RRULE") || is_prop(l, "EXDATE") || is_prop(l, "RDATE"));
+    let rest = block.iter().map(|l| canonical_prop_line(l)).filter(|l| {
+        ["RRULE", "EXDATE", "RDATE"].iter().any(|p| is_prop(l, p))
+            || (with_exrules && is_prop(l, "EXRULE"))
+    });
     Some(
         std::iter::once(dtstart)
             .chain(rest)
@@ -566,6 +628,29 @@ fn parse_any(
         // lands on the same instant no matter which machine syncs the feed.
         None => resolve_local(tz, naive),
     }
+}
+
+/// A recurring VEVENT's DTSTART as the start its rule repeats from, for describing the rule: a date,
+/// a wall time in its TZID's zone (or the user's, for a floating time or a zone PM doesn't know, as
+/// [`parse_any`] reads it), or a UTC time, which repeats in UTC.
+fn series_start(params: &str, value: &str, all_day: bool, tz: ChronoTz) -> Option<SeriesStart> {
+    let v = value.trim();
+    if all_day {
+        return NaiveDate::parse_from_str(v, "%Y%m%d")
+            .ok()
+            .map(SeriesStart::AllDay);
+    }
+    let (wall, zone) = match v.strip_suffix('Z') {
+        Some(utc) => (utc, ChronoTz::UTC),
+        None => (
+            v,
+            param(params, "TZID")
+                .and_then(|t| t.parse::<ChronoTz>().ok())
+                .unwrap_or(tz),
+        ),
+    };
+    let local = NaiveDateTime::parse_from_str(wall, "%Y%m%dT%H%M%S").ok()?;
+    Some(SeriesStart::Timed { local, zone })
 }
 
 /// The instant an all-day civil date anchors to: NOON in the user's zone, not midnight. A zone
@@ -1190,6 +1275,122 @@ mod tests {
         assert!(events.iter().all(|ev| ev.uid.as_deref() == Some("e")));
         let starts: HashSet<&str> = events.iter().map(|ev| ev.start.as_str()).collect();
         assert_eq!(starts.len(), 5, "occurrences must differ only by start");
+    }
+
+    /// The summary of the first occurrence a one-VEVENT feed expands to, for a user in `tz`.
+    fn summary_of(vevent_lines: &str, tz: ChronoTz) -> Option<String> {
+        let feed = format!("BEGIN:VEVENT\nUID:r\nSUMMARY:Series\n{vevent_lines}\nEND:VEVENT");
+        let s = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2027, 12, 31, 0, 0, 0).unwrap();
+        let events = parse_feed_within(&feed, "f", s, e, tz);
+        events.first().unwrap().recurrence_summary.clone()
+    }
+
+    /// The popover's repeat line reads like Google's ("Weekly on Monday"), never the raw rule.
+    #[test]
+    fn a_series_says_how_it_repeats_in_words() {
+        let london = chrono_tz::Europe::London;
+        assert_eq!(
+            summary_of(
+                "DTSTART;TZID=Europe/London:20261012T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+                london
+            )
+            .as_deref(),
+            Some("Weekly on Monday")
+        );
+        // The rule's implied day comes from the start in its own zone: 09:00 on Tuesday in Auckland
+        // is still Monday in UTC and in London.
+        assert_eq!(
+            summary_of(
+                "DTSTART;TZID=Pacific/Auckland:20261013T090000\nrrule:freq=weekly",
+                london
+            )
+            .as_deref(),
+            Some("Weekly on Tuesday")
+        );
+        // A floating start repeats in the user's zone, and its UNTIL is shown there: 21:00 UTC on
+        // 31-12 is already 10:00 on 01-01 in Auckland, after that day's 09:00.
+        let floating = "DTSTART:20261013T090000\nRRULE:FREQ=DAILY;UNTIL=20261231T210000Z\n\
+                        EXDATE:20261015T090000";
+        assert_eq!(
+            summary_of(floating, chrono_tz::Pacific::Auckland).as_deref(),
+            Some("Daily, until 01-01-2027")
+        );
+        assert_eq!(
+            summary_of(floating, london).as_deref(),
+            Some("Daily, until 31-12-2026")
+        );
+        assert_eq!(
+            summary_of("DTSTART;VALUE=DATE:20261013\nRRULE:FREQ=YEARLY", london).as_deref(),
+            Some("Annually on 13 October")
+        );
+        assert_eq!(
+            summary_of(
+                "DTSTART:20261013T090000Z\nRRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2",
+                london
+            )
+            .as_deref(),
+            Some(crate::calendar_recur::spec::CUSTOM_RULE)
+        );
+        // A one-off event has no summary at all.
+        assert_eq!(summary_of("DTSTART:20261013T090000Z", london), None);
+    }
+
+    /// An EXRULE's occurrences stay out of the calendar (the crate dropped the line before its
+    /// `exrule` feature was turned on). One PM can't walk safely, or that the crate refuses, costs
+    /// only the dates it would exclude, never the series.
+    #[test]
+    fn an_exrule_takes_its_occurrences_out() {
+        let feed = "BEGIN:VEVENT\nUID:x\nSUMMARY:Weekdays\n\
+                    DTSTART:20261005T090000Z\nRRULE:FREQ=DAILY;COUNT=14\n\
+                    EXRULE:FREQ=WEEKLY;BYDAY=SA,SU\nEND:VEVENT";
+        let (s, e) = (
+            Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap(),
+        );
+        let count = |feed: &str| parse_feed_within(feed, "f", s, e, ChronoTz::UTC).len();
+        // 05-10 to 18-10 is two weeks; the four weekend days go.
+        assert_eq!(count(feed), 10);
+        assert!(!parse_feed_within(feed, "f", s, e, ChronoTz::UTC)
+            .iter()
+            .any(|ev| ev.start.starts_with("2026-10-10")));
+        let every_minute = (0..60).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        for unwalkable in [
+            "EXRULE:FREQ=SECONDLY".to_string(),
+            format!("EXRULE:FREQ=DAILY;BYHOUR=0,1,2,3;BYMINUTE={every_minute}"),
+            // A floating UNTIL on a floating start is RFC 5545's own form, and the crate refuses it.
+            "EXRULE:FREQ=WEEKLY;BYDAY=SA,SU;UNTIL=20261231T090000".to_string(),
+        ] {
+            let feed = feed.replace("EXRULE:FREQ=WEEKLY;BYDAY=SA,SU", &unwalkable);
+            let feed = feed.replace("DTSTART:20261005T090000Z", "DTSTART:20261005T090000");
+            assert_eq!(count(&feed), 14, "{unwalkable}");
+        }
+    }
+
+    /// A rule too costly to walk from its start isn't walked, whatever else the block holds.
+    #[test]
+    fn a_rule_making_too_many_starts_is_not_walked() {
+        let (s, e) = (
+            Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap(),
+        );
+        let every_minute = (0..60).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        for rules in [
+            "RRULE:FREQ=DAILY\nRRULE:FREQ=SECONDLY".to_string(),
+            format!("RRULE:FREQ=DAILY;BYMINUTE={every_minute}"),
+        ] {
+            let feed = format!(
+                "BEGIN:VEVENT\nUID:y\nSUMMARY:Busy\nDTSTART:20000101T000000Z\n{rules}\nEND:VEVENT"
+            );
+            assert!(
+                parse_feed_within(&feed, "f", s, e, ChronoTz::UTC).is_empty(),
+                "{rules}"
+            );
+        }
+        // Twice a day is an ordinary rule.
+        let twice = "BEGIN:VEVENT\nUID:z\nSUMMARY:Pills\nDTSTART:20261001T090000Z\n\
+                     RRULE:FREQ=DAILY;BYHOUR=9,21;COUNT=4\nEND:VEVENT";
+        assert_eq!(parse_feed_within(twice, "f", s, e, ChronoTz::UTC).len(), 4);
     }
 
     #[test]
