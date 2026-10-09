@@ -125,8 +125,9 @@ export function GoogleCredentialBlock({
         onClose={() => setConfirmClear(false)}
       >
         This forgets your Google client ID + secret and signs out every connected Google service
-        (Calendar, Drive), clearing its mirrored data. Calendar subscriptions (iCal) are unaffected.
-        You can re-enter the credentials anytime.
+        (Calendar, Drive), clearing its mirrored data. Google Drive backups are turned off and their
+        sign-in is removed; the backups already in your Drive are kept. Calendar subscriptions
+        (iCal) are unaffected. You can re-enter the credentials anytime.
       </ConfirmDialog>
     </div>
   );

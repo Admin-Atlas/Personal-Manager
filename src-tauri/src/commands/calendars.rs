@@ -268,17 +268,19 @@ pub async fn disconnect_google_calendar_account(
     // source before an un-clearable token would orphan the token with no source left to re-clear it.
     // `secrets::delete` treats a missing entry as success, so a returned Err is a genuine failure.
     secrets::clear_google_token_for(&google_calendar_token_key(&email))?;
+    if plan.forget_account_client {
+        // Per-AP client; absent for shared-client accounts. Kept while Drive or backup still
+        // refresh through it. Also before the row, and fatal: when Calendar was the account's last
+        // user, nothing but this row names the account, so a client left behind once it's gone
+        // outlives even Remove PM data (#893).
+        secrets::clear_google_client_for_account(&email)?;
+    }
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
     calendar_editing::set_choice(&conn, &email, None)?;
     // A grant Google keeps still carries the write scope if editing was ever granted; a revoke ends it.
     let calendar_write = !plan.revoke && calendar_editing::write_granted(&conn, &email)?;
     if plan.revoke {
         calendar_editing::forget_write_grant(&conn, &email)?;
-    }
-    if plan.forget_account_client {
-        // Per-AP client; absent for shared-client accounts. Kept while Drive or backup still
-        // refresh through it.
-        secrets::clear_google_client_for_account(&email).ok();
     }
     Ok(GoogleDisconnect {
         kept_for: plan.kept_for,
@@ -625,26 +627,38 @@ pub fn dev_google_grant_report(state: State<'_, AppState>) -> Result<Vec<GrantRe
 ///
 /// Owner-only, like every connector removal: on a shared vault a joiner would drop the owner's rows
 /// while the owner's tokens stayed live in the owner's keychain.
+///
+/// Each account's sign-in is cleared before its row, and a keychain failure stops the clear with
+/// that account still listed. PM finds tokens only through these rows and the backup setting, so a
+/// row dropped over a token that wouldn't clear stranded a live sign-in no disconnect, and not even
+/// "Remove PM data", could reach (#893). Nothing is revoked at Google: this forgets the client on this
+/// device, as before.
 #[tauri::command]
 pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     require_vault_owner(&app)?;
     let conn = state.conn()?;
     for acc in calendar::list_sources(&conn, Some("google"))? {
-        calendar::remove_source(&conn, &acc.id)?;
-        if let Some(email) = acc.email {
-            secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
+        if let Some(email) = &acc.email {
+            secrets::clear_google_token_for(&google_calendar_token_key(email))?;
             // Also drop any per-account (Advanced-Protection) client secret, else it's orphaned in
             // the keychain with no UI path to remove it and a later reconnect reuses the stale creds.
-            secrets::clear_google_client_for_account(&email).ok();
+            secrets::clear_google_client_for_account(email)?;
         }
+        calendar::remove_source(&conn, &acc.id)?;
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     calendar_editing::clear_all(&conn)?;
-    drive::forget_all_accounts(&conn).ok();
+    drive::forget_all_accounts(&conn)?;
+    // A backup-only account has no Drive row, so the loop above never saw its sign-in. Clear it before
+    // the destination below forgets which account it was.
+    if let Some(backup) = crate::backup::schedule::gdrive_account(&conn)? {
+        secrets::clear_google_token_for(&drive::account_token_key(&backup))?;
+        secrets::clear_google_client_for_account(&backup)?;
+    }
     // F-38: the Google-Drive BACKUP destination rides on this same client, so tearing the client down
     // must also disable it — otherwise the schedule keeps `gdrive_enabled` pointed at a now-tokenless
     // account and every scheduled backup fails on it (eprintln-only, invisible on a GUI build).
-    crate::backup::schedule::clear_gdrive_destination(&conn).ok();
+    crate::backup::schedule::clear_gdrive_destination(&conn)?;
     secrets::clear_google_client()?;
     // Drop events for the now-removed Google calendars; selected ICS/Outlook events are kept.
     let active: Vec<String> = calendar::selected_calendars(&conn)?

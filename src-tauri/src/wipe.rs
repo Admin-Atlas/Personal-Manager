@@ -14,9 +14,10 @@
 //!      lock batons, the relocation pointer). Irreversible.
 //!   3. **OS keychain** — every secret under the `org.itsatlas.pm` service (DB key, API keys, backup
 //!      passphrase, all OAuth client creds + per-account tokens, ICS feeds, cached vault keys). When
-//!      selected, PM first **revokes** each Google grant at Google's end; Microsoft has no equivalent
-//!      revoke endpoint for a public desktop client, so its accounts are returned for a "finish at
-//!      account.microsoft.com" link and only the local tokens are deleted.
+//!      selected, PM first **revokes** each Google grant at Google's end — except the account the
+//!      backups go to, whose sign-in is only deleted here (see [`plan_google_tokens`]); Microsoft has
+//!      no equivalent revoke endpoint for a public desktop client. Both kinds of kept access are
+//!      returned for a "finish by hand" link.
 //!   4. **Interface preferences & webview data** — the webview clears its own `localStorage`, then
 //!      this command removes the OS-level store behind it ([`paths::os_app_leftovers`]). On macOS
 //!      that store is a set of real directories the app never owned a handle to
@@ -113,6 +114,9 @@ pub struct WipeReport {
     /// Connected Microsoft account emails — there's no programmatic revoke for PM's public client, so
     /// the UI links the user to account.microsoft.com to finish removing the grant.
     pub microsoft_accounts: Vec<String>,
+    /// The Google account the backups go to, when PM deleted its sign-in but deliberately left its
+    /// grant at Google (see [`plan_google_tokens`]); the UI links to myaccount.google.com.
+    pub google_kept_for_backups: Vec<String>,
     /// Keychain entries actually deleted.
     pub keychain_deleted: usize,
     /// True when the store or keychain was touched, so the running app can no longer function and
@@ -185,12 +189,93 @@ enum Provider {
 struct KeychainWipePlan {
     /// Every per-account OAuth token key to delete (Google + Microsoft).
     token_keys: Vec<String>,
-    /// The Google token keys specifically — their blobs are revoked at Google before deletion.
+    /// The Google token keys to revoke at Google before deletion.
     google_token_keys: Vec<String>,
     /// Google account emails (drive the per-account client id/secret keys for Advanced-Protection).
     google_emails: Vec<String>,
+    /// The backups' account and its token keys, deleted but never revoked ([`plan_google_tokens`]).
+    kept_for_backups: Option<(String, Vec<String>)>,
+    /// Google sign-ins deleted without a revoke because the backups' account couldn't be read; the
+    /// report counts them with the revokes that failed.
+    google_unrevoked: usize,
     /// Ids of vaults whose derived key this profile has cached.
     vault_ids: Vec<String>,
+}
+
+/// The Google account the backups go to, as the wipe managed to read it.
+#[derive(Debug, Clone, Copy)]
+enum BackupAccount<'a> {
+    None,
+    Is(&'a str),
+    /// The setting couldn't be read. Any account might be it, so none is revoked.
+    Unknown,
+}
+
+/// What the wipe does with the Google sign-ins: every token is deleted, and these are revoked first.
+#[derive(Debug, PartialEq, Eq)]
+struct GoogleTokenPlan {
+    /// Revoked at Google, then deleted.
+    revoke: Vec<String>,
+    /// Deleted only: the backups' account, with its token keys.
+    keep: Option<(String, Vec<String>)>,
+    /// Deleted only, because the backups' account is unknown.
+    unrevoked: Vec<String>,
+    /// Every Google account, for the per-account client keys.
+    emails: Vec<String>,
+}
+
+/// Split the Google sign-ins (`(token key, email)` from the connector rows) into the ones the wipe
+/// revokes and the ones it only deletes, given the account the backups go to.
+///
+/// The backups' account is never revoked (#893). Google keeps one grant per account and Cloud
+/// project, so a revoke would also end PM's access on every other computer using that account — a
+/// new laptop being set up to restore, say — and PM's `drive.file` authority over the archives it
+/// uploaded dies with the grant: a fresh sign-in can't change them (#600), and one with only
+/// `drive.file` can't even list them to restore. Turning backups off has never revoked for the same
+/// reason. Every token of that account is spared, the calendar's included, because revoking any one
+/// ends the whole grant. Its sign-in is still deleted here, and the UI says where to remove the
+/// access by hand.
+///
+/// The backups' account is also added when it has no connector row (a backup-only account), which
+/// is how its token used to survive the wipe on Windows and Linux. When the setting can't be read,
+/// nothing is revoked at all: the error must not decide in favour of the revoke that can't be undone.
+/// Pure, so it's table-tested.
+fn plan_google_tokens(mut google: Vec<(String, String)>, backup: BackupAccount) -> GoogleTokenPlan {
+    let emails_of = |google: &[(String, String)]| {
+        let mut emails: Vec<String> = google.iter().map(|(_, e)| e.clone()).collect();
+        emails.sort();
+        emails.dedup();
+        emails
+    };
+    let backup = match backup {
+        BackupAccount::Unknown => {
+            return GoogleTokenPlan {
+                revoke: Vec::new(),
+                keep: None,
+                emails: emails_of(&google),
+                unrevoked: google.into_iter().map(|(k, _)| k).collect(),
+            }
+        }
+        BackupAccount::None => None,
+        BackupAccount::Is(b) => Some(b),
+    };
+    if let Some(backup) = backup {
+        let key = crate::drive::account_token_key(backup);
+        if !google.iter().any(|(k, _)| *k == key) {
+            google.push((key, backup.to_string()));
+        }
+    }
+    let emails = emails_of(&google);
+    let is_backup = |email: &str| backup.is_some_and(|b| b.eq_ignore_ascii_case(email));
+    let (kept, revoke): (Vec<_>, Vec<_>) = google.into_iter().partition(|(_, e)| is_backup(e));
+    GoogleTokenPlan {
+        revoke: revoke.into_iter().map(|(k, _)| k).collect(),
+        keep: backup
+            .filter(|_| !kept.is_empty())
+            .map(|b| (b.to_string(), kept.into_iter().map(|(k, _)| k).collect())),
+        unrevoked: Vec::new(),
+        emails,
+    }
 }
 
 /// Read every connected OAuth account out of `connector_sources` and build its keychain token key
@@ -457,9 +542,14 @@ fn plan_keychain_wipe(
     state: &AppState,
     report: &mut WipeReport,
 ) -> KeychainWipePlan {
-    let accounts = match state.conn() {
-        Ok(conn) => enumerate_oauth_accounts(&conn).unwrap_or_default(),
-        Err(_) => Vec::new(),
+    // An unreadable backup setting stays an error here (`Err`), never "no backups": it decides which
+    // grants may be revoked, and a revoke can't be undone.
+    let (accounts, backup) = match state.conn() {
+        Ok(conn) => (
+            enumerate_oauth_accounts(&conn).unwrap_or_default(),
+            crate::backup::schedule::gdrive_account(&conn),
+        ),
+        Err(_) => (Vec::new(), Ok(None)),
     };
     // Every vault whose key this profile has cached (`vault_key::<id>`) — not just the current
     // one. The keychain can't be enumerated, so a key survives unless the wipe can NAME it, and
@@ -489,15 +579,11 @@ fn plan_keychain_wipe(
             .map(|m| m.vault_id),
     );
 
-    let mut google_token_keys = Vec::new();
+    let mut google = Vec::new();
     let mut microsoft_token_keys = Vec::new();
-    let mut google_emails = Vec::new();
     for a in accounts {
         match a.provider {
-            Provider::Google => {
-                google_emails.push(a.email);
-                google_token_keys.push(a.token_key);
-            }
+            Provider::Google => google.push((a.token_key, a.email)),
             Provider::Microsoft => {
                 if !report.microsoft_accounts.contains(&a.email) {
                     report.microsoft_accounts.push(a.email);
@@ -506,22 +592,49 @@ fn plan_keychain_wipe(
             }
         }
     }
-    google_emails.sort();
-    google_emails.dedup();
+    let google = plan_google_tokens(
+        google,
+        match &backup {
+            Ok(None) => BackupAccount::None,
+            Ok(Some(b)) => BackupAccount::Is(b),
+            Err(_) => BackupAccount::Unknown,
+        },
+    );
 
-    let mut token_keys = google_token_keys.clone();
+    let mut token_keys = google.revoke.clone();
+    if let Some((_, kept)) = &google.keep {
+        token_keys.extend(kept.iter().cloned());
+    }
+    token_keys.extend(google.unrevoked.iter().cloned());
     token_keys.extend(microsoft_token_keys);
 
     KeychainWipePlan {
         token_keys,
-        google_token_keys,
-        google_emails,
+        google_token_keys: google.revoke,
+        google_emails: google.emails,
+        kept_for_backups: google.keep,
+        google_unrevoked: google.unrevoked.len(),
         vault_ids,
     }
 }
 
-/// Revoke each connected Google grant at Google's end, reading the token blobs from the keychain (a
-/// wipe deletes them right after). Runs the revokes concurrently with a short per-call bound so an
+/// Name the backups' account on the finish screen when PM actually held a sign-in for it: the
+/// sign-in is about to be deleted, and its grant at Google is left for the user to remove by hand.
+/// Read before the keychain is wiped.
+fn note_kept_grants(plan: &KeychainWipePlan, report: &mut WipeReport) {
+    let Some((email, keys)) = &plan.kept_for_backups else {
+        return;
+    };
+    if keys
+        .iter()
+        .any(|k| matches!(secrets::get_google_token_for(k), Ok(Some(_))))
+    {
+        report.google_kept_for_backups.push(email.clone());
+    }
+}
+
+/// Revoke the plan's Google grants (every one but the backups' account) at Google's end, reading the
+/// token blobs from the keychain (a wipe deletes them right after). Runs the revokes concurrently with a short per-call bound so an
 /// offline or slow endpoint can't stall the wipe for the HTTP client's full 30s each — the local
 /// token is deleted regardless, so a missed revoke only leaves a grant to tidy at
 /// myaccount.google.com. Tallies successes/failures into `report`.
@@ -1080,9 +1193,14 @@ pub async fn wipe_pm_data(
     }
 
     // --- 3. Keychain secrets, LAST — only now that the store file is gone. Revoke Google grants
-    //        (reading the tokens still in the keychain), then delete every secret. ---
+    //        (reading the tokens still in the keychain), except the backups' account, then delete
+    //        every secret. ---
     if let Some(plan) = keychain_plan {
         revoke_google_grants(&plan, &mut report).await;
+        // Left unrevoked because the backups' account couldn't be read: as far as the user is
+        // concerned, PM's access there is still on, exactly like a revoke that failed.
+        report.google_revoke_failures += plan.google_unrevoked;
+        note_kept_grants(&plan, &mut report);
         report.keychain_deleted =
             secrets::wipe_all_secrets(&plan.token_keys, &plan.google_emails, &plan.vault_ids);
         report.removed.push("Keychain secrets & saved keys".into());
@@ -1592,6 +1710,81 @@ mod tests {
         // An empty account_email never yields a dangling `prefix::` key (filtered in SQL).
         let conn = conn_with_accounts(&[("google", "drive", "")]);
         assert!(enumerate_oauth_accounts(&conn).unwrap().is_empty());
+    }
+
+    // --- Google sign-ins: every one deleted, the backups' account never revoked (#893) ---
+
+    fn cal(email: &str) -> (String, String) {
+        (
+            format!("{}{email}", secrets::GOOGLE_TOKEN_CALENDAR_PREFIX),
+            email.to_string(),
+        )
+    }
+    fn drv(email: &str) -> (String, String) {
+        (crate::drive::account_token_key(email), email.to_string())
+    }
+
+    #[test]
+    fn without_backups_every_google_sign_in_is_revoked() {
+        let plan = plan_google_tokens(vec![cal("a@x.com"), drv("b@x.com")], BackupAccount::None);
+        assert_eq!(plan.revoke, vec![cal("a@x.com").0, drv("b@x.com").0]);
+        assert_eq!(plan.keep, None);
+        assert!(plan.unrevoked.is_empty());
+        assert_eq!(plan.emails, vec!["a@x.com", "b@x.com"]);
+    }
+
+    /// An unreadable backup setting must not decide in favour of the revoke that can't be undone:
+    /// every sign-in is still deleted, none is revoked.
+    #[test]
+    fn an_unknown_backups_account_revokes_nothing() {
+        let plan = plan_google_tokens(vec![cal("a@x.com"), drv("b@x.com")], BackupAccount::Unknown);
+        assert!(plan.revoke.is_empty());
+        assert_eq!(plan.keep, None);
+        assert_eq!(plan.unrevoked, vec![cal("a@x.com").0, drv("b@x.com").0]);
+        assert_eq!(plan.emails, vec!["a@x.com", "b@x.com"]);
+    }
+
+    /// The account the backups go to keeps its grant at Google, its calendar's included (revoking
+    /// any of its tokens ends the whole grant), whatever case either spelling uses.
+    #[test]
+    fn the_backups_account_is_deleted_but_never_revoked() {
+        let plan = plan_google_tokens(
+            vec![cal("Me@x.com"), drv("me@x.com"), cal("other@x.com")],
+            BackupAccount::Is("me@X.com"),
+        );
+        assert_eq!(plan.revoke, vec![cal("other@x.com").0]);
+        let (email, kept) = plan.keep.expect("the backups' account is kept");
+        assert_eq!(email, "me@X.com");
+        // Its connector tokens, plus the backup's own Drive key in the setting's spelling (deleting a
+        // key that isn't there is harmless; missing one strands a sign-in).
+        assert_eq!(
+            kept,
+            vec![cal("Me@x.com").0, drv("me@x.com").0, drv("me@X.com").0]
+        );
+        assert!(plan.emails.contains(&"me@X.com".to_string()));
+    }
+
+    /// A backup-only account has no connector row: its token used to survive the wipe on Windows and
+    /// Linux. It is now deleted (and its own project's client keys with it), still without a revoke.
+    #[test]
+    fn a_backup_only_account_is_found_and_deleted() {
+        let plan = plan_google_tokens(vec![cal("a@x.com")], BackupAccount::Is("backup@x.com"));
+        assert_eq!(plan.revoke, vec![cal("a@x.com").0]);
+        assert_eq!(
+            plan.keep,
+            Some(("backup@x.com".to_string(), vec![drv("backup@x.com").0]))
+        );
+        assert_eq!(plan.emails, vec!["a@x.com", "backup@x.com"]);
+    }
+
+    #[test]
+    fn a_backup_on_a_drive_account_adds_no_second_key() {
+        let plan = plan_google_tokens(vec![drv("me@x.com")], BackupAccount::Is("me@x.com"));
+        assert_eq!(
+            plan.keep,
+            Some(("me@x.com".to_string(), vec![drv("me@x.com").0]))
+        );
+        assert!(plan.revoke.is_empty());
     }
 
     // --- "Start fresh" may delete ONLY a genuine brick, never a transiently-locked healthy vault ---

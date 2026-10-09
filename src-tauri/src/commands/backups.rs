@@ -1397,23 +1397,33 @@ pub async fn backup_gdrive_connect(
 
 /// Stop backing up to Google Drive: disable it and forget the chosen account. The OAuth token is
 /// deleted ONLY if the account isn't also a read connector (otherwise the connector still needs it
-/// — the unioned scope can't be narrowed without a full re-consent, so we leave it in place).
+/// — the unioned scope can't be narrowed without a full re-consent, so we leave it in place). The
+/// account's own (Advanced-Protection) client goes too when backups were its last PM user. Never
+/// revokes: a re-granted `drive.file` couldn't manage the archives the old grant made (#600).
+///
+/// The keychain goes first, and a failure stops here with the account still named in the setting: the
+/// setting is the only thing that names a backup-only account's sign-in, so blanking it first left a
+/// token that a retry, Clear client and Remove PM data could no longer find (#893).
 #[tauri::command]
 pub fn backup_gdrive_disconnect(state: State<'_, AppState>) -> Result<()> {
+    use super::shared::{google_grant_users, release_plan, GoogleUse};
     use crate::backup::schedule::{BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY};
     let conn = state.conn()?;
-    let account =
-        crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?.filter(|s| !s.is_empty());
-    crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false)?;
-    crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, "")?;
-    if let Some(email) = account {
+    if let Some(email) = crate::backup::schedule::gdrive_account(&conn)? {
         let is_read_connector = crate::drive::list_accounts(&conn)?
             .iter()
             .any(|a| a.email.eq_ignore_ascii_case(&email));
         if !is_read_connector {
             secrets::clear_google_token_for(&crate::drive::account_token_key(&email))?;
         }
+        if release_plan(&google_grant_users(&conn, &email)?, GoogleUse::Backup)
+            .forget_account_client
+        {
+            secrets::clear_google_client_for_account(&email)?;
+        }
     }
+    crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false)?;
+    crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, "")?;
     Ok(())
 }
 

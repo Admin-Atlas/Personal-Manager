@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+use crate::backup::schedule::gdrive_account as backup_account;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::settings::TIME_ZONE_KEY;
@@ -98,15 +99,6 @@ fn google_connector_rows(conn: &Connection, email: &str) -> Result<Vec<(String, 
         .query_map(params![email], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
     Ok(rows)
-}
-
-/// The backup account's email exactly as stored, or `None` when backup is off ("" means off).
-fn backup_account(conn: &Connection) -> Result<Option<String>> {
-    Ok(
-        db::get_setting(conn, crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY)?
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty()),
-    )
 }
 
 /// The keychain token keys of every grant `email`'s account holds in PM, each built from the spelling

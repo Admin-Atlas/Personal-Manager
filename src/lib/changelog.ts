@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.144.1-alpha",
+    date: "2026-10-10",
+    highlights: [
+      "“Remove PM data” now also removes the Google sign-in for an account you only use for backups. On Windows and Linux it used to stay in your keychain afterwards, because that account isn't listed under Connectors.",
+      "It also no longer cuts off your Google Drive backups. Removing PM's access to the account your backups go to would end PM's hold on the backups it saved there, on this computer and any other, so restoring one could mean downloading it from Google Drive yourself. PM now deletes its sign-in here and leaves that one permission for you to remove at myaccount.google.com if you want to. The finish screen says so, with the link.",
+      "Clearing your Google sign-in in Connectors now removes a backup-only account's sign-in too, and its confirmation says that Google Drive backups are turned off (the backups already in your Drive stay). If your keychain refuses to let go of a sign-in, PM now stops and keeps that account listed so you can try again, instead of hiding a sign-in it can no longer reach. Disconnecting Google Calendar or Drive and turning off Google Drive backups work the same way.",
+      "Turning off Google Drive backups now also forgets an Advanced Protection account's own Cloud project when nothing else in PM uses that account.",
+      "When PM can't revoke a Google sign-in during “Remove PM data” (say you're offline), the finish screen now says its access is still on at Google and links to where to remove it.",
+    ],
+  },
+  {
     version: "3.144.0-alpha",
     date: "2026-10-09",
     highlights: [
