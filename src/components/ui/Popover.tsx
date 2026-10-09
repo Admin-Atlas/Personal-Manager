@@ -10,6 +10,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNo
 import { createPortal } from "react-dom";
 import { cn } from "./cn";
 import { useRestoreFocus } from "../../lib/useRestoreFocus";
+import { isCoveredByDialog } from "../../lib/useDialogLayer";
 
 /** Breathing room kept between a clipping-escaped panel and the window edge. */
 const MARGIN = 8;
@@ -160,7 +161,13 @@ export function Popover({
       if (!inRoot && !inPanel) close(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close(true);
+      if (e.key !== "Escape") return;
+      // A dialog opened OVER this popover owns the key: leave it alone (and stay open underneath).
+      if (isCoveredByDialog(rootRef.current)) return;
+      // This listens on `document` and a dialog's Escape on `window`, so the key reaches here first.
+      // Stop it: one Escape closes the innermost thing open (the picker), not the dialog around it.
+      e.stopPropagation();
+      close(true);
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);

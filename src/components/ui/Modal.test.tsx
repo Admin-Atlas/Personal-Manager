@@ -16,6 +16,7 @@
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Modal } from "./Modal";
+import { isAnyDialogOpen } from "../../lib/useDialogLayer";
 
 afterEach(cleanup);
 
@@ -148,5 +149,23 @@ describe("Modal", () => {
     expect(queryByRole("dialog")).toBeNull();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // Page-level listeners (the Calendar tab's ←/→/t and its swipe) ask this at event time so they
+  // stand down behind any dialog.
+  it("reports whether any dialog is open, for page-level listeners", () => {
+    expect(isAnyDialogOpen()).toBe(false);
+    const { rerender } = render(
+      <Modal open onClose={noop} label="Settings">
+        <p>body</p>
+      </Modal>,
+    );
+    expect(isAnyDialogOpen()).toBe(true);
+    rerender(
+      <Modal open={false} onClose={noop} label="Settings">
+        <p>body</p>
+      </Modal>,
+    );
+    expect(isAnyDialogOpen()).toBe(false);
   });
 });

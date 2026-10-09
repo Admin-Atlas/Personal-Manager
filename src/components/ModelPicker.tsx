@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listModels } from "../lib/ipc";
+import { isCoveredByDialog } from "../lib/useDialogLayer";
 import type { ModelInfo } from "../lib/types";
 import { Button, Input, Skeleton } from "./ui";
 
@@ -50,7 +51,12 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key !== "Escape") return;
+      // Same rule as the Popover primitive: a dialog opened over this menu owns the key; otherwise
+      // the menu closes and the key stops here, so the Settings dialog around it stays open.
+      if (isCoveredByDialog(rootRef.current)) return;
+      e.stopPropagation();
+      setOpen(false);
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
