@@ -8,7 +8,8 @@ import { Button, Callout, ConfirmDialog, Input } from "./ui";
 
 /**
  * The shared **BYO Microsoft OAuth client** credential block — one Microsoft Entra "Mobile & desktop"
- * app registration the user pastes once and that OneDrive (and any future Microsoft service) reuses.
+ * app registration the user pastes once and that OneDrive and Outlook Calendar (and any future
+ * Microsoft service) reuse.
  * Unlike Google's block this is a **public client**: there is no secret to copy — just the
  * Application (client) ID. It is **provider-level**: `microsoft::has_client()` is a single global
  * flag, so clearing it signs every Microsoft service out.
@@ -38,10 +39,15 @@ export function MicrosoftCredentialBlock({
       await onChange();
     });
 
+  // Refresh the host even when the clear fails part-way (a locked keychain stops it after some
+  // accounts are gone), so both Microsoft sections show what is actually left.
   const clearCreds = () =>
     run("clear", async () => {
-      await clearMicrosoftClient();
-      await onChange();
+      try {
+        await clearMicrosoftClient();
+      } finally {
+        await onChange();
+      }
     });
 
   return (
@@ -56,8 +62,9 @@ export function MicrosoftCredentialBlock({
       </div>
       <p className="mt-1 text-xs text-ink4">
         One Microsoft Entra “Mobile &amp; desktop” app registration, pasted once and shared by every
-        Microsoft service (OneDrive). It’s a desktop app, so there’s <em>no secret</em> — just the
-        client ID; it stays in your keychain. Setting it up connects nothing on its own.
+        Microsoft service (OneDrive and Outlook Calendar). It’s a desktop app, so there’s{" "}
+        <em>no secret</em> — just the client ID; it stays in your keychain. Setting it up connects
+        nothing on its own.
       </p>
 
       {!configured ? (
@@ -112,9 +119,10 @@ export function MicrosoftCredentialBlock({
         }}
         onClose={() => setConfirmClear(false)}
       >
-        This forgets your Microsoft client ID and signs out every connected OneDrive account,
-        clearing its mirrored data. Indexed items are kept and stay findable until then. You can
-        re-enter the client ID anytime.
+        This forgets your Microsoft client ID and signs out every connected OneDrive and Outlook
+        Calendar account — they all sign in through it. OneDrive&rsquo;s indexed items are kept and
+        stay findable; Outlook&rsquo;s mirrored events are cleared. You can re-enter the client ID
+        anytime and reconnect.
       </ConfirmDialog>
     </div>
   );
@@ -143,7 +151,8 @@ function ClientSetupGuide() {
         <span className="text-ink2">
           Accounts in any organizational directory and personal Microsoft accounts
         </span>{" "}
-        — that’s what lets both work/school and personal OneDrive sign in.
+        — that’s what lets both work/school and personal Microsoft accounts sign in to OneDrive and
+        Outlook Calendar.
       </li>
       <li>
         3. Under <span className="text-ink2">Redirect URI</span>, pick platform{" "}
@@ -162,12 +171,13 @@ function ClientSetupGuide() {
       </li>
       <li className="text-ink4">
         If a sign-in fails: <span className="text-ink2">“need admin approval / AADSTS65001”</span>{" "}
-        means a work/school tenant requires an admin to approve{" "}
-        <span className="text-ink2">Files.Read</span> — ask your admin, or use a personal Microsoft
-        account instead. The “unverified app” notice is expected — continue past it. If the browser
-        can’t reach the sign-in page, double-check the redirect URI is exactly{" "}
-        <span className="font-mono text-[0.6875rem] text-ink2">http://127.0.0.1</span> under Mobile
-        &amp; desktop.
+        means a work/school tenant requires an admin to approve the permission —{" "}
+        <span className="text-ink2">Files.Read</span> for OneDrive,{" "}
+        <span className="text-ink2">Calendars.Read</span> for Outlook Calendar — ask your admin, or
+        use a personal Microsoft account instead. The “unverified app” notice is expected — continue
+        past it. If the browser can’t reach the sign-in page, double-check the redirect URI is
+        exactly <span className="font-mono text-[0.6875rem] text-ink2">http://127.0.0.1</span> under
+        Mobile &amp; desktop.
       </li>
     </ol>
   );

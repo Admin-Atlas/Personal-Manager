@@ -155,9 +155,12 @@ pub fn set_state(conn: &Connection, email: &str, state: &str) -> Result<()> {
     Ok(())
 }
 
-/// Disconnect one account: soft-flag its items `unreachable` (kept findable), drop the registry row,
-/// and forget its token. Never hard-deletes the indexed documents.
+/// Disconnect one account: forget its token, then soft-flag its items `unreachable` (kept findable)
+/// and drop the registry row. Never hard-deletes the indexed documents. The token goes FIRST and a
+/// failure (a locked keychain) stops here: dropping the row before an un-clearable token would leave a
+/// live refresh token with no row naming it, which no later disconnect or wipe could find.
 pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
+    secrets::clear_microsoft_token_for(&account_token_key(email))?;
     conn.execute(
         "UPDATE documents SET source_state = 'unreachable' \
          WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
@@ -167,7 +170,6 @@ pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
         "DELETE FROM connector_sources WHERE id = ?1",
         params![account_id(email)],
     )?;
-    secrets::clear_microsoft_token_for(&account_token_key(email)).ok();
     Ok(())
 }
 

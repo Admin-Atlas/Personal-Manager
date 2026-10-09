@@ -247,6 +247,32 @@ export function CalendarConnection({
           Set up <span className="text-ink2">{meta.sign_in}</span> above to connect your calendar.
         </p>
       )}
+      {/* Accounts left from a sign-in that has since been cleared (an older PM cleared the Microsoft
+          client without removing Outlook calendars): they can't sync, and with the list hidden behind
+          `configured` there was no way to remove them. Disconnect needs no client. */}
+      {!configured && accounts.length > 0 && (
+        <>
+          <p className="mt-2 text-xs text-ink3">
+            These accounts were connected with a sign-in that has since been cleared, so they
+            can&rsquo;t sync. Disconnect them here, or set the sign-in up again above.
+          </p>
+          <ul className="mt-2 divide-y divide-rule rounded-[var(--radius)] border border-border">
+            {accounts.map((a) => (
+              <li key={a.id} className="flex items-center justify-between gap-2 px-3 py-2">
+                <span className="truncate text-xs text-ink2">{a.email ?? a.label}</span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setConfirmEmail(a.email)}
+                  disabled={busy != null || a.email == null}
+                >
+                  Disconnect
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
 
       {configured && (
         <>

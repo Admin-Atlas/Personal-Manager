@@ -856,13 +856,20 @@ pub fn set_microsoft_client(app: AppHandle, client_id: String) -> Result<()> {
     secrets::set_microsoft_client(id)
 }
 
-/// Clear the Microsoft client id and sign out every OneDrive account (they all depend on it). Indexed
-/// items are kept but flagged unreachable (never deleted), matching the Google-client clear.
+/// Clear the Microsoft client id and sign out every account that depends on it: each OneDrive account
+/// (indexed items kept but flagged unreachable, never deleted) and each Outlook calendar account (its
+/// calendars and mirrored events dropped, as the Google-client clear does for Google Calendar). An
+/// Outlook account left behind would fail every sync, since it can't refresh without the client.
+/// Each account's token is cleared before its row, and a keychain failure stops the clear with the
+/// remaining accounts still listed, so a retry finishes the job. Owner-only, like every connector
+/// removal: on a shared vault a joiner would drop the owner's rows while the owner's tokens stayed live.
 #[tauri::command]
-pub fn clear_microsoft_client(state: State<'_, AppState>) -> Result<()> {
+pub fn clear_microsoft_client(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    require_vault_owner(&app)?;
     {
         let conn = state.conn()?;
         onedrive::forget_all_accounts(&conn)?;
+        crate::outlook_calendar::remove_all_accounts(&conn, secrets::clear_microsoft_token_for)?;
     }
     secrets::clear_microsoft_client()?;
     state.sync_index_only();
