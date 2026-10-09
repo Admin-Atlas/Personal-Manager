@@ -104,6 +104,30 @@ pub struct CalendarEvent {
     /// Provider create / last-modified timestamps, when supplied.
     pub created: Option<String>,
     pub updated: Option<String>,
+    // --- what editing needs (v57, Google only; Outlook and ICS rows leave them empty) ---
+    /// Google's version stamp. Kept for reconciling a save with the next fetch; never sent to the
+    /// webview, which hands back only PM's own ids.
+    #[serde(skip_serializing)]
+    pub etag: Option<String>,
+    /// default | birthday | fromGmail | focusTime | outOfOffice | workingLocation.
+    pub event_type: Option<String>,
+    /// The organiser is the calendar this copy appears on (Google `organizer.self`), which isn't
+    /// necessarily PM's account: an event organised on a colleague's shared calendar has it too.
+    /// Read it together with the calendar's `access_role`.
+    pub organizer_self: bool,
+    /// A locked copy: Google refuses changes to its summary, description, location, start, end and
+    /// recurrence (an imported or system event). 0 means "not locked", so a row mirrored before v57
+    /// relies on `organizer_self`'s restrictive default until the next sync.
+    pub locked: bool,
+    pub guests_can_modify: bool,
+    /// The recurring event this occurrence belongs to (Google `recurringEventId`).
+    pub series_id: Option<String>,
+    /// Where this occurrence sits in its series, normalised like `start`: its identity once it has
+    /// been moved (Google `originalStartTime`).
+    pub original_start: Option<String>,
+    /// The event's own colour (Google `colorId`, "1"–"11"), and its label.
+    pub color_id: Option<String>,
+    pub event_label_id: Option<String>,
 }
 
 /// The calendar event that made a project "Due soon" — shown on its focus card so
@@ -142,6 +166,32 @@ pub struct RawCalendar {
     /// The calendar's display colour (`backgroundColor`), carried into the registry for the unified
     /// view (card 6B). `None` when Google omits it.
     pub color: Option<String>,
+    /// What editing needs to know about the calendar (v57); see [`CalendarFacts`].
+    pub facts: CalendarFacts,
+}
+
+/// The upstream facts about a calendar that decide what PM may do in it (v57), from `calendarList`.
+/// Empty for Outlook and ICS calendars.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CalendarFacts {
+    /// owner | writer | writerWithoutPrivateAccess | reader | freeBusyReader.
+    pub access_role: Option<String>,
+    /// The calendar's IANA time zone.
+    pub time_zone: Option<String>,
+    /// The notifications a new event gets unless it says otherwise.
+    pub default_reminders: Vec<Reminder>,
+    /// The conference kinds the calendar can add (`hangoutsMeet`, …).
+    pub conference_types: Vec<String>,
+    /// The owner's address. Google sets it only for secondary calendars; a primary calendar's id is
+    /// its owner's address.
+    pub data_owner: Option<String>,
+}
+
+/// One notification: `popup` or `email`, so many minutes before the start.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Reminder {
+    pub method: String,
+    pub minutes: i64,
 }
 
 // --- network (async, DB-free; callers hold no lock across these) ---
@@ -319,10 +369,12 @@ pub fn feed_infos() -> Result<Vec<IcsFeedInfo>> {
 }
 
 /// Validate + normalize a feed's URL, returning a ready-to-store [`IcsFeed`] WITHOUT persisting it.
-/// `provider` tags it (`apple`/`outlook`/`other`, defaulting to `other` when blank). The caller
-/// persists it to the keychain ([`save_new_feed`]) and registers its source/calendar rows
-/// ([`register_feed_source`]) together, so a feed that fails its first sync can be cleanly rolled back.
+/// `provider` tags it (`apple`/`outlook`/`other`, defaulting to `other` when blank; anything else is
+/// refused, see [`feed_provider`]). The caller persists it to the keychain ([`save_new_feed`]) and
+/// registers its source/calendar rows ([`register_feed_source`]) together, so a feed that fails its
+/// first sync can be cleanly rolled back.
 pub fn build_feed(label: &str, url: &str, provider: &str) -> Result<IcsFeed> {
+    let provider = feed_provider(provider)?;
     let raw = url.trim();
     let normalized = match raw.strip_prefix("webcal://") {
         Some(rest) => format!("https://{rest}"),
@@ -337,16 +389,26 @@ pub fn build_feed(label: &str, url: &str, provider: &str) -> Result<IcsFeed> {
     } else {
         label.trim().to_string()
     };
-    let provider = match provider.trim() {
-        "" => "other".to_string(),
-        p => p.to_string(),
-    };
     Ok(IcsFeed {
         id: new_feed_id()?,
         label,
         url,
         provider,
     })
+}
+
+/// A subscription's provider tag, from the webview: only the subscription tags pass. The tag becomes
+/// the source's `provider`, and "google" or "microsoft" there would list a read-only feed among the
+/// OAuth accounts that calendar editing and the sign-in teardowns act on.
+fn feed_provider(provider: &str) -> Result<String> {
+    match provider.trim() {
+        p @ ("apple" | "outlook" | "other") => Ok(p.to_string()),
+        "" => Ok("other".to_string()),
+        other => Err(Error::Other(format!(
+            "Unknown calendar subscription type \"{}\".",
+            clip(other, 40)
+        ))),
+    }
 }
 
 /// Persist a freshly built feed to the keychain list.
@@ -623,11 +685,51 @@ fn parse_calendars(value: &serde_json::Value) -> Vec<RawCalendar> {
                             .get("backgroundColor")
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
+                        facts: calendar_facts(it),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A `calendarList` entry's editing facts (v57). A malformed reminder is skipped, not guessed.
+fn calendar_facts(it: &serde_json::Value) -> CalendarFacts {
+    let text = |key: &str| {
+        it.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    CalendarFacts {
+        access_role: text("accessRole"),
+        time_zone: text("timeZone"),
+        default_reminders: it
+            .get("defaultReminders")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        Some(Reminder {
+                            method: r.get("method")?.as_str()?.to_string(),
+                            minutes: r.get("minutes")?.as_i64()?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        conference_types: it
+            .get("conferenceProperties")
+            .and_then(|c| c.get("allowedConferenceSolutionTypes"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        data_owner: text("dataOwner"),
+    }
 }
 
 /// Google attendees → the shared `Attendee` shape (empty when the event lists none).
@@ -691,96 +793,129 @@ fn google_conference(it: &serde_json::Value) -> Option<String> {
 }
 
 fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEvent> {
-    let Some(items) = value.get("items").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for it in items {
-        if it.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
-            continue;
-        }
-        let Some(event_id) = it
-            .get("id")
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| parse_event(calendar_id, it))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One Google event resource as a mirror row under `calendar_id`, or `None` when it has no place in
+/// the mirror: cancelled (an occurrence deleted from its series arrives that way), missing its id or
+/// start, or a series master. One parser for the list a sync fetches and the single event a save gets
+/// back, so a saved event is mirrored exactly as the next sync would mirror it. The row id is the
+/// event's own id, an occurrence's instance id included (`<series>_<start>`).
+///
+/// A master (it carries the `recurrence` rule and no `recurringEventId`) never becomes a row: the sync
+/// asks for `singleEvents=true` and so only ever mirrors occurrences, and a master's `start` is just
+/// its first occurrence's. A save that touches a series refetches the occurrences instead.
+pub(crate) fn parse_event(calendar_id: &str, it: &serde_json::Value) -> Option<CalendarEvent> {
+    if it.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
+        return None;
+    }
+    if it.get("recurrence").is_some() && it.get("recurringEventId").is_none() {
+        return None;
+    }
+    let event_id = it
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let (start, all_day) = parse_when(it.get("start"))?;
+    let end = parse_when(it.get("end")).map(|(s, _)| s);
+    let text = |key: &str| {
+        it.get(key)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        let Some((start, all_day)) = parse_when(it.get("start")) else {
-            continue;
-        };
-        let end = parse_when(it.get("end")).map(|(s, _)| s);
-        out.push(CalendarEvent {
-            id: format!("{calendar_id}:{event_id}"),
-            calendar_id: calendar_id.to_string(),
-            summary: it
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("(no title)")
-                .to_string(),
-            description: it
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            location: it
-                .get("location")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            start,
-            end,
-            all_day,
-            html_link: it
-                .get("htmlLink")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            uid: it
-                .get("iCalUID")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            // transparency defaults to "opaque" (busy); only "transparent" reads as free.
-            show_as: Some(
-                if it.get("transparency").and_then(|v| v.as_str()) == Some("transparent") {
-                    "free"
-                } else {
-                    "busy"
-                }
-                .to_string(),
-            ),
-            organizer: google_organizer(it),
-            attendees: google_attendees(it),
-            conference_url: google_conference(it),
-            recurring: it.get("recurrence").is_some() || it.get("recurringEventId").is_some(),
-            recurrence_summary: it
-                .get("recurrence")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|r| r.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .filter(|s| !s.is_empty()),
-            status: it
-                .get("status")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            visibility: it
-                .get("visibility")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            created: it
-                .get("created")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            updated: it
-                .get("updated")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        });
-    }
-    out
+            .map(str::to_string)
+    };
+    let flag = |key: &str| it.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(CalendarEvent {
+        id: format!("{calendar_id}:{event_id}"),
+        calendar_id: calendar_id.to_string(),
+        summary: it
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(no title)")
+            .to_string(),
+        description: it
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        location: it
+            .get("location")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        start,
+        end,
+        all_day,
+        html_link: it
+            .get("htmlLink")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        uid: it
+            .get("iCalUID")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        // transparency defaults to "opaque" (busy); only "transparent" reads as free.
+        show_as: Some(
+            if it.get("transparency").and_then(|v| v.as_str()) == Some("transparent") {
+                "free"
+            } else {
+                "busy"
+            }
+            .to_string(),
+        ),
+        organizer: google_organizer(it),
+        attendees: google_attendees(it),
+        conference_url: google_conference(it),
+        recurring: it.get("recurrence").is_some() || it.get("recurringEventId").is_some(),
+        recurrence_summary: it
+            .get("recurrence")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|s| !s.is_empty()),
+        status: it
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        visibility: it
+            .get("visibility")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        created: it
+            .get("created")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        updated: it
+            .get("updated")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        etag: text("etag"),
+        event_type: text("eventType"),
+        organizer_self: it
+            .get("organizer")
+            .and_then(|o| o.get("self"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        locked: flag("locked"),
+        guests_can_modify: flag("guestsCanModify"),
+        series_id: text("recurringEventId"),
+        original_start: parse_when(it.get("originalStartTime")).map(|(s, _)| s),
+        color_id: text("colorId"),
+        event_label_id: text("eventLabelId"),
+    })
 }
 
 /// A Google event start/end node is either `{dateTime}` (timed) or `{date}` (all-day).
@@ -916,6 +1051,9 @@ pub struct Calendar {
     /// cost tokens to be wrong in exactly the ambiguous cases that matter. Events inherit it, and an
     /// individual event may override it (`calendar_events.kind_override`).
     pub kind: Option<String>,
+    /// What editing needs to know (v57), refreshed with the name on every registry refresh.
+    #[serde(flatten)]
+    pub facts: CalendarFacts,
 }
 
 /// A provider-neutral calendar descriptor for registration (a Google `calendarList` item or a Graph
@@ -925,6 +1063,8 @@ pub struct RawCalendarInput {
     pub name: String,
     pub color: Option<String>,
     pub is_primary: bool,
+    /// Google's editing facts; empty for Outlook.
+    pub facts: CalendarFacts,
 }
 
 impl RawCalendar {
@@ -935,6 +1075,7 @@ impl RawCalendar {
             name: self.summary.clone(),
             color: self.color.clone(),
             is_primary: self.primary,
+            facts: self.facts.clone(),
         }
     }
 }
@@ -1055,14 +1196,37 @@ pub fn remove_source(conn: &Connection, id: &str) -> Result<()> {
 }
 
 /// Insert or refresh a calendar row. On conflict it updates the upstream-owned fields
-/// (name/colour/remote id/primary) but PRESERVES the user's `selected` AND `quiet` choices — a
-/// re-sync must not silently re-tick a calendar the user unticked, nor un-quiet one they quieted.
+/// (name/colour/remote id/primary, and the v57 editing facts) but PRESERVES the user's `selected`,
+/// `quiet` and `kind` choices — a re-sync must not silently re-tick a calendar the user unticked, nor
+/// un-quiet one they quieted — and `event_labels`, which a different call fills.
 pub fn upsert_calendar(conn: &Connection, cal: &Calendar) -> Result<()> {
+    let CalendarFacts {
+        access_role,
+        time_zone,
+        default_reminders,
+        conference_types,
+        data_owner,
+    } = &cal.facts;
+    // Empty lists store as NULL, like `attendees`: "Google said none" and "not a Google calendar" read
+    // the same to every consumer.
+    let json_or_null = |empty: bool, json: String| (!empty).then_some(json);
+    let reminders = json_or_null(
+        default_reminders.is_empty(),
+        serde_json::to_string(default_reminders).unwrap_or_default(),
+    );
+    let conferences = json_or_null(
+        conference_types.is_empty(),
+        serde_json::to_string(conference_types).unwrap_or_default(),
+    );
     conn.execute(
-        "INSERT INTO calendars(id, source_id, provider, remote_id, name, color, selected, is_primary, quiet, kind) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+        "INSERT INTO calendars(id, source_id, provider, remote_id, name, color, selected, is_primary, \
+             quiet, kind, access_role, time_zone, default_reminders, conference_types, data_owner) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color, \
-             remote_id = excluded.remote_id, is_primary = excluded.is_primary",
+             remote_id = excluded.remote_id, is_primary = excluded.is_primary, \
+             access_role = excluded.access_role, time_zone = excluded.time_zone, \
+             default_reminders = excluded.default_reminders, \
+             conference_types = excluded.conference_types, data_owner = excluded.data_owner",
         params![
             cal.id,
             cal.source_id,
@@ -1073,66 +1237,56 @@ pub fn upsert_calendar(conn: &Connection, cal: &Calendar) -> Result<()> {
             cal.selected as i64,
             cal.is_primary as i64,
             cal.quiet as i64,
-            cal.kind
+            cal.kind,
+            access_role,
+            time_zone,
+            reminders,
+            conferences,
+            data_owner,
         ],
     )?;
     Ok(())
 }
 
-type CalendarRow = (
-    String,
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    i64,
-    i64,
-    i64,
-    Option<String>,
-);
-
-fn row_to_calendar(r: &rusqlite::Row) -> rusqlite::Result<CalendarRow> {
-    Ok((
-        r.get(0)?,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        r.get(4)?,
-        r.get(5)?,
-        r.get(6)?,
-        r.get(7)?,
-        r.get(8)?,
-        r.get(9)?,
-    ))
-}
-
-fn calendar_from_row(row: CalendarRow) -> Calendar {
-    let (id, source_id, provider, remote_id, name, color, selected, is_primary, quiet, kind) = row;
-    Calendar {
-        id,
-        source_id,
-        provider,
-        remote_id,
-        name,
-        color,
-        selected: selected != 0,
-        is_primary: is_primary != 0,
-        quiet: quiet != 0,
-        kind,
-    }
+fn calendar_from_row(r: &rusqlite::Row) -> rusqlite::Result<Calendar> {
+    let list = |i: usize| -> rusqlite::Result<Option<String>> { r.get(i) };
+    Ok(Calendar {
+        id: r.get(0)?,
+        source_id: r.get(1)?,
+        provider: r.get(2)?,
+        remote_id: r.get(3)?,
+        name: r.get(4)?,
+        color: r.get(5)?,
+        selected: r.get::<_, i64>(6)? != 0,
+        is_primary: r.get::<_, i64>(7)? != 0,
+        quiet: r.get::<_, i64>(8)? != 0,
+        kind: r.get(9)?,
+        facts: CalendarFacts {
+            access_role: r.get(10)?,
+            time_zone: r.get(11)?,
+            // A value that won't parse reads as none, the same as a calendar Google gave none.
+            default_reminders: list(12)?
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            conference_types: list(13)?
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            data_owner: r.get(14)?,
+        },
+    })
 }
 
 const CALENDAR_COLS: &str = "id, source_id, provider, remote_id, name, color, selected, \
-                             is_primary, quiet, kind FROM calendars";
+                             is_primary, quiet, kind, access_role, time_zone, default_reminders, \
+                             conference_types, data_owner FROM calendars";
 
 /// Every registered calendar, across all accounts/subscriptions (for the unified picker + 6B view).
 pub fn list_calendars(conn: &Connection) -> Result<Vec<Calendar>> {
     let mut stmt = conn.prepare(&format!("SELECT {CALENDAR_COLS} ORDER BY provider, name"))?;
-    let rows: Vec<CalendarRow> = stmt
-        .query_map([], row_to_calendar)?
+    let rows = stmt
+        .query_map([], calendar_from_row)?
         .collect::<std::result::Result<_, _>>()?;
-    Ok(rows.into_iter().map(calendar_from_row).collect())
+    Ok(rows)
 }
 
 /// The calendars under one account/subscription (primary first, then by name).
@@ -1140,10 +1294,10 @@ pub fn list_calendars_for_source(conn: &Connection, source_id: &str) -> Result<V
     let mut stmt = conn.prepare(&format!(
         "SELECT {CALENDAR_COLS} WHERE source_id = ?1 ORDER BY is_primary DESC, name"
     ))?;
-    let rows: Vec<CalendarRow> = stmt
-        .query_map(params![source_id], row_to_calendar)?
+    let rows = stmt
+        .query_map(params![source_id], calendar_from_row)?
         .collect::<std::result::Result<_, _>>()?;
-    Ok(rows.into_iter().map(calendar_from_row).collect())
+    Ok(rows)
 }
 
 /// Drop calendars under `source_id` that are no longer in `keep` (and their events) — an upstream
@@ -1276,6 +1430,7 @@ pub fn register_calendars(
                 is_primary: it.is_primary,
                 quiet: false, // new calendars are surfaced to the assistant until the user quiets them
                 kind: None,   // untyped until the user says work or personal (v45)
+                facts: it.facts.clone(),
             },
         )?;
     }
@@ -1301,6 +1456,8 @@ pub fn register_feed_source(conn: &Connection, feed: &IcsFeed) -> Result<()> {
             is_primary: false,
             quiet: false,
             kind: None,
+            // A subscription is read-only whatever the feed says.
+            facts: CalendarFacts::default(),
         },
     )
 }
@@ -1338,29 +1495,72 @@ fn events_hash(events: &[CalendarEvent]) -> String {
     let mut lines: Vec<String> = events
         .iter()
         .map(|e| {
-            // The v40 detail fields are folded in so an edit to any of them (or the one-time gain of
-            // the columns themselves) changes the hash and rewrites the row on the next sync.
-            let attendees = serde_json::to_string(&e.attendees).unwrap_or_default();
+            // Destructured field by field, with no `..`, so a field added to `CalendarEvent` fails to
+            // compile here until it is hashed (or deliberately ignored, like `calendar_id`, which the
+            // per-calendar key already covers). Every stored field is folded in so an edit to any of
+            // them, or the one-time gain of new columns (v40, v57), rewrites the row on the next sync.
+            let CalendarEvent {
+                id,
+                calendar_id: _,
+                summary,
+                description,
+                location,
+                start,
+                end,
+                all_day,
+                html_link,
+                uid,
+                show_as,
+                organizer,
+                attendees,
+                conference_url,
+                recurring,
+                recurrence_summary,
+                status,
+                visibility,
+                created,
+                updated,
+                etag,
+                event_type,
+                organizer_self,
+                locked,
+                guests_can_modify,
+                series_id,
+                original_start,
+                color_id,
+                event_label_id,
+            } = e;
+            let attendees = serde_json::to_string(attendees).unwrap_or_default();
+            let bit = |b: &bool| if *b { "1" } else { "0" };
             [
-                e.id.as_str(),
-                e.summary.as_str(),
-                e.description.as_deref().unwrap_or(""),
-                e.location.as_deref().unwrap_or(""),
-                e.start.as_str(),
-                e.end.as_deref().unwrap_or(""),
-                if e.all_day { "1" } else { "0" },
-                e.html_link.as_deref().unwrap_or(""),
-                e.uid.as_deref().unwrap_or(""),
-                e.show_as.as_deref().unwrap_or(""),
-                e.organizer.as_deref().unwrap_or(""),
+                id.as_str(),
+                summary.as_str(),
+                description.as_deref().unwrap_or(""),
+                location.as_deref().unwrap_or(""),
+                start.as_str(),
+                end.as_deref().unwrap_or(""),
+                bit(all_day),
+                html_link.as_deref().unwrap_or(""),
+                uid.as_deref().unwrap_or(""),
+                show_as.as_deref().unwrap_or(""),
+                organizer.as_deref().unwrap_or(""),
                 attendees.as_str(),
-                e.conference_url.as_deref().unwrap_or(""),
-                if e.recurring { "1" } else { "0" },
-                e.recurrence_summary.as_deref().unwrap_or(""),
-                e.status.as_deref().unwrap_or(""),
-                e.visibility.as_deref().unwrap_or(""),
-                e.created.as_deref().unwrap_or(""),
-                e.updated.as_deref().unwrap_or(""),
+                conference_url.as_deref().unwrap_or(""),
+                bit(recurring),
+                recurrence_summary.as_deref().unwrap_or(""),
+                status.as_deref().unwrap_or(""),
+                visibility.as_deref().unwrap_or(""),
+                created.as_deref().unwrap_or(""),
+                updated.as_deref().unwrap_or(""),
+                etag.as_deref().unwrap_or(""),
+                event_type.as_deref().unwrap_or(""),
+                bit(organizer_self),
+                bit(locked),
+                bit(guests_can_modify),
+                series_id.as_deref().unwrap_or(""),
+                original_start.as_deref().unwrap_or(""),
+                color_id.as_deref().unwrap_or(""),
+                event_label_id.as_deref().unwrap_or(""),
             ]
             .join("\u{1f}")
         })
@@ -1434,50 +1634,132 @@ pub fn replace_events(
 /// Written once so the complete (delete-then-insert) and incomplete (upsert-only) paths of
 /// [`replace_events`] can never drift in what they store.
 fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
-    let summary = clip(&e.summary, MAX_SUMMARY_CHARS);
-    let location = e.location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
-    let description = e
-        .description
+    // Destructured with no `..`, like `events_hash`, so a new field can't be silently left unstored.
+    let CalendarEvent {
+        id,
+        calendar_id,
+        summary,
+        description,
+        location,
+        start,
+        end,
+        all_day,
+        html_link,
+        uid,
+        show_as,
+        organizer,
+        attendees,
+        conference_url,
+        recurring,
+        recurrence_summary,
+        status,
+        visibility,
+        created,
+        updated,
+        etag,
+        event_type,
+        organizer_self,
+        locked,
+        guests_can_modify,
+        series_id,
+        original_start,
+        color_id,
+        event_label_id,
+    } = e;
+    let summary = clip(summary, MAX_SUMMARY_CHARS);
+    let location = location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
+    let description = description
         .as_deref()
         .map(|d| clip(d, MAX_DESCRIPTION_CHARS));
     // Untrusted free-text from the provider — clip like description/location. Attendees are stored
     // as a JSON array (NULL when none), parsed back on read.
-    let organizer = e.organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
-    let recurrence_summary = e
-        .recurrence_summary
+    let organizer = organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
+    let recurrence_summary = recurrence_summary
         .as_deref()
         .map(|r| clip(r, MAX_LOCATION_CHARS));
-    let attendees = (!e.attendees.is_empty())
-        .then(|| serde_json::to_string(&e.attendees).unwrap_or_else(|_| "[]".to_string()));
+    let attendees = (!attendees.is_empty())
+        .then(|| serde_json::to_string(attendees).unwrap_or_else(|_| "[]".to_string()));
     tx.execute(
         "INSERT OR REPLACE INTO calendar_events \
          (id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
           show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
-          visibility, created, updated) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+          visibility, created, updated, etag, event_type, organizer_self, locked, \
+          guests_can_modify, series_id, original_start, color_id, event_label_id) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
+                 ?21,?22,?23,?24,?25,?26,?27,?28,?29)",
         params![
-            e.id,
-            e.calendar_id,
+            id,
+            calendar_id,
             summary,
             description,
             location,
-            e.start,
-            e.end,
-            e.all_day as i64,
-            e.html_link,
-            e.uid,
-            e.show_as,
+            start,
+            end,
+            *all_day as i64,
+            html_link,
+            uid,
+            show_as,
             organizer,
             attendees,
-            e.conference_url,
-            e.recurring as i64,
+            conference_url,
+            *recurring as i64,
             recurrence_summary,
-            e.status,
-            e.visibility,
-            e.created,
-            e.updated,
+            status,
+            visibility,
+            created,
+            updated,
+            etag,
+            event_type,
+            *organizer_self as i64,
+            *locked as i64,
+            *guests_can_modify as i64,
+            series_id,
+            original_start,
+            color_id,
+            event_label_id,
         ],
     )?;
+    Ok(())
+}
+
+/// Write what a save to Google produced into the mirror (#884): `upserts` are rows parsed from
+/// Google's own reply or a fresh fetch ([`parse_event`]), never from the draft; `deletes` are row ids
+/// the save removed. One transaction, so the view never shows half a series. The calendar's F-49
+/// hash is dropped, because the mirror no longer matches the last full fetch and the next sync must
+/// rewrite it rather than skip. A calendar the user has unticked mirrors nothing, so it is left alone.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands in C4, the write commands")
+)]
+pub(crate) fn apply_write_effect(
+    conn: &Connection,
+    calendar_id: &str,
+    upserts: &[CalendarEvent],
+    deletes: &[String],
+) -> Result<()> {
+    let selected: bool = conn
+        .query_row(
+            "SELECT selected FROM calendars WHERE id = ?1",
+            params![calendar_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|s| s != 0);
+    if !selected {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for id in deletes {
+        tx.execute(
+            "DELETE FROM calendar_events WHERE id = ?1 AND calendar_id = ?2",
+            params![id, calendar_id],
+        )?;
+    }
+    for e in upserts.iter().filter(|e| e.calendar_id == calendar_id) {
+        insert_event(&tx, e)?;
+    }
+    tx.commit()?;
+    crate::db::delete_setting(conn, &format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}"))?;
     Ok(())
 }
 
@@ -1629,7 +1911,8 @@ pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
     let mut stmt = conn.prepare(
         "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
                 show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
-                visibility, created, updated \
+                visibility, created, updated, etag, event_type, organizer_self, locked, \
+                guests_can_modify, series_id, original_start, color_id, event_label_id \
          FROM calendar_events \
          ORDER BY start",
     )?;
@@ -1637,7 +1920,17 @@ pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
         let all_day: i64 = r.get(7)?;
         let recurring: i64 = r.get(14)?;
         let attendees_json: Option<String> = r.get(12)?;
+        let bit = |i: usize| r.get::<_, i64>(i).map(|v| v != 0);
         Ok(CalendarEvent {
+            etag: r.get(20)?,
+            event_type: r.get(21)?,
+            organizer_self: bit(22)?,
+            locked: bit(23)?,
+            guests_can_modify: bit(24)?,
+            series_id: r.get(25)?,
+            original_start: r.get(26)?,
+            color_id: r.get(27)?,
+            event_label_id: r.get(28)?,
             id: r.get(0)?,
             calendar_id: r.get(1)?,
             summary: r.get(2)?,
@@ -1956,6 +2249,7 @@ mod tests {
             name: name.into(),
             color: None,
             is_primary: false,
+            facts: CalendarFacts::default(),
         };
         let ids = |conn: &Connection| -> Vec<String> {
             list_calendars_for_source(conn, src)
@@ -2332,6 +2626,7 @@ mod tests {
                 is_primary: true,
                 quiet: false,
                 kind: None,
+                facts: CalendarFacts::default(),
             },
         )
         .unwrap();
@@ -2394,6 +2689,7 @@ mod tests {
                 is_primary: true,
                 quiet: false,
                 kind: None, // a fresh registration carries no typing
+                facts: CalendarFacts::default(),
             },
         )
         .unwrap();
@@ -2416,5 +2712,353 @@ mod tests {
         let (_d, conn) = typing_store();
         assert!(set_calendar_kind(&conn, "cal", Some("hobby")).is_err());
         assert_eq!(event_kind(&conn, "ev").unwrap(), None);
+    }
+
+    // --- v57: what editing needs (#884, C2) ---
+
+    /// An occurrence of a repeating event someone else organises, as `events.list` returns it with
+    /// `singleEvents=true`.
+    fn google_occurrence() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "calendar#event",
+            "etag": "\"3456\"",
+            "id": "abc123_20261012T090000Z",
+            "status": "confirmed",
+            "summary": "Standup",
+            "start": { "dateTime": "2026-10-12T11:00:00+02:00", "timeZone": "Europe/Berlin" },
+            "end": { "dateTime": "2026-10-12T11:15:00+02:00", "timeZone": "Europe/Berlin" },
+            "recurringEventId": "abc123",
+            "originalStartTime": { "dateTime": "2026-10-12T10:00:00+02:00" },
+            "iCalUID": "abc123@google.com",
+            "eventType": "default",
+            "organizer": { "email": "boss@example.com", "self": false },
+            "guestsCanModify": true,
+            "colorId": "7",
+            "eventLabelId": "label-9"
+        })
+    }
+
+    #[test]
+    fn a_google_event_carries_what_editing_needs() {
+        let e = parse_event("cal-1", &google_occurrence()).expect("a live occurrence is mirrored");
+        // The row id is the occurrence's own instance id.
+        assert_eq!(e.id, "cal-1:abc123_20261012T090000Z");
+        assert_eq!(e.etag.as_deref(), Some("\"3456\""));
+        assert_eq!(e.event_type.as_deref(), Some("default"));
+        assert!(!e.organizer_self);
+        assert!(!e.locked);
+        assert!(e.guests_can_modify);
+        assert_eq!(e.series_id.as_deref(), Some("abc123"));
+        // Normalised like `start`, so the two compare as strings.
+        assert_eq!(e.original_start.as_deref(), Some("2026-10-12T08:00:00Z"));
+        assert_eq!(e.start, "2026-10-12T09:00:00Z");
+        assert_eq!(e.color_id.as_deref(), Some("7"));
+        assert_eq!(e.event_label_id.as_deref(), Some("label-9"));
+    }
+
+    #[test]
+    fn a_plain_event_reads_as_can_not_wherever_google_is_silent() {
+        let mut it = google_occurrence();
+        let obj = it.as_object_mut().unwrap();
+        for key in [
+            "etag",
+            "recurringEventId",
+            "originalStartTime",
+            "eventType",
+            "organizer",
+            "guestsCanModify",
+            "colorId",
+            "eventLabelId",
+        ] {
+            obj.remove(key);
+        }
+        obj.insert("id".into(), "solo".into());
+        let e = parse_event("cal-1", &it).unwrap();
+        assert_eq!(
+            (
+                e.etag,
+                e.event_type,
+                e.series_id,
+                e.original_start,
+                e.color_id,
+                e.event_label_id
+            ),
+            (None, None, None, None, None, None)
+        );
+        assert!(!e.organizer_self && !e.locked && !e.guests_can_modify);
+    }
+
+    #[test]
+    fn organiser_self_locked_and_special_types_are_read() {
+        let it = serde_json::json!({
+            "id": "bday", "status": "confirmed", "summary": "Ada's birthday",
+            "start": { "date": "2026-12-10" }, "end": { "date": "2026-12-11" },
+            "eventType": "birthday", "locked": true,
+            "organizer": { "email": "me@example.com", "self": true }
+        });
+        let e = parse_event("cal-1", &it).unwrap();
+        assert!(e.organizer_self);
+        assert!(e.locked);
+        assert_eq!(e.event_type.as_deref(), Some("birthday"));
+        assert!(e.all_day);
+    }
+
+    /// A cancelled occurrence (deleted from its series) and an id-less item have no place in the
+    /// mirror, whichever path parses them.
+    #[test]
+    fn cancelled_and_malformed_events_are_not_mirrored() {
+        let mut cancelled = google_occurrence();
+        cancelled["status"] = "cancelled".into();
+        assert!(parse_event("cal-1", &cancelled).is_none());
+        let mut no_id = google_occurrence();
+        no_id["id"] = "".into();
+        assert!(parse_event("cal-1", &no_id).is_none());
+        let list = serde_json::json!({ "items": [google_occurrence(), cancelled, no_id] });
+        assert_eq!(parse_events("cal-1", &list).len(), 1);
+    }
+
+    /// A series master never becomes a row: its start is only the first occurrence's, and the mirror
+    /// holds occurrences. A save that returns a master must refetch the occurrences instead.
+    #[test]
+    fn a_series_master_is_never_mirrored() {
+        let master = serde_json::json!({
+            "id": "abc123", "status": "confirmed", "summary": "Standup",
+            "start": { "dateTime": "2026-10-05T09:00:00Z" },
+            "end": { "dateTime": "2026-10-05T09:15:00Z" },
+            "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
+        });
+        assert!(parse_event("cal-1", &master).is_none());
+        // An occurrence of it is mirrored as usual.
+        assert!(parse_event("cal-1", &google_occurrence()).is_some());
+    }
+
+    #[test]
+    fn the_etag_never_reaches_the_webview() {
+        let e = parse_event("cal-1", &google_occurrence()).unwrap();
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("etag").is_none(), "{json}");
+        // The other editing facts do go: the editor's gate reads them.
+        for key in [
+            "event_type",
+            "organizer_self",
+            "series_id",
+            "original_start",
+            "color_id",
+        ] {
+            assert!(json.get(key).is_some(), "{key} missing from {json}");
+        }
+    }
+
+    /// F-49: every stored field is in the hash, the v57 ones included, so a change to any of them
+    /// rewrites the row on the next sync instead of being skipped.
+    #[test]
+    fn every_editing_fact_changes_the_hash() {
+        let base = parse_event("cal-1", &google_occurrence()).unwrap();
+        let h0 = events_hash(std::slice::from_ref(&base));
+        type Mutation = fn(&mut CalendarEvent);
+        let mutations: [(&str, Mutation); 9] = [
+            ("etag", |e| e.etag = Some("\"9\"".into())),
+            ("event_type", |e| e.event_type = Some("focusTime".into())),
+            ("organizer_self", |e| e.organizer_self = true),
+            ("locked", |e| e.locked = true),
+            ("guests_can_modify", |e| e.guests_can_modify = false),
+            ("series_id", |e| e.series_id = None),
+            ("original_start", |e| e.original_start = None),
+            ("color_id", |e| e.color_id = Some("2".into())),
+            ("event_label_id", |e| e.event_label_id = None),
+        ];
+        for (field, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(events_hash(&[changed]), h0, "{field} must change the hash");
+        }
+    }
+
+    fn store_with_calendar(selected: bool) -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        upsert_source(
+            &conn,
+            "gcal:me@x.com",
+            "google",
+            Some("me@x.com"),
+            "me@x.com",
+        )
+        .unwrap();
+        upsert_calendar(
+            &conn,
+            &Calendar {
+                id: "cal-1".into(),
+                source_id: "gcal:me@x.com".into(),
+                provider: "google".into(),
+                remote_id: Some("me@x.com".into()),
+                name: "Me".into(),
+                color: None,
+                selected,
+                is_primary: true,
+                quiet: false,
+                kind: None,
+                facts: CalendarFacts::default(),
+            },
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn the_editing_facts_survive_the_mirror_round_trip() {
+        let (_d, conn) = store_with_calendar(true);
+        let e = parse_event("cal-1", &google_occurrence()).unwrap();
+        replace_events(&conn, "cal-1", std::slice::from_ref(&e), true).unwrap();
+        let back = list_all_events(&conn).unwrap();
+        assert_eq!(back.len(), 1);
+        let got = &back[0];
+        assert_eq!(got.etag, e.etag);
+        assert_eq!(got.event_type, e.event_type);
+        assert_eq!(
+            (got.organizer_self, got.locked, got.guests_can_modify),
+            (e.organizer_self, e.locked, e.guests_can_modify)
+        );
+        assert_eq!(got.series_id, e.series_id);
+        assert_eq!(got.original_start, e.original_start);
+        assert_eq!(got.color_id, e.color_id);
+        assert_eq!(got.event_label_id, e.event_label_id);
+        // Read back exactly as stored, so a resync of the same set is skipped (F-49).
+        assert_eq!(events_hash(&back), events_hash(std::slice::from_ref(&e)));
+    }
+
+    #[test]
+    fn calendar_list_facts_are_parsed_and_refreshed_but_user_choices_kept() {
+        let list = serde_json::json!({ "items": [{
+            "id": "team@group.calendar.google.com",
+            "summary": "Team",
+            "accessRole": "writerWithoutPrivateAccess",
+            "timeZone": "Europe/London",
+            "defaultReminders": [
+                { "method": "popup", "minutes": 10 },
+                { "method": "email" },
+                { "method": "email", "minutes": 1440 }
+            ],
+            "conferenceProperties": { "allowedConferenceSolutionTypes": ["hangoutsMeet"] },
+            "dataOwner": "boss@example.com"
+        }]});
+        let raw = parse_calendars(&list);
+        let facts = &raw[0].facts;
+        assert_eq!(
+            facts.access_role.as_deref(),
+            Some("writerWithoutPrivateAccess")
+        );
+        assert_eq!(facts.time_zone.as_deref(), Some("Europe/London"));
+        // The reminder without minutes is skipped, not guessed.
+        assert_eq!(
+            facts.default_reminders,
+            vec![
+                Reminder {
+                    method: "popup".into(),
+                    minutes: 10
+                },
+                Reminder {
+                    method: "email".into(),
+                    minutes: 1440
+                },
+            ]
+        );
+        assert_eq!(facts.conference_types, vec!["hangoutsMeet"]);
+        assert_eq!(facts.data_owner.as_deref(), Some("boss@example.com"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        upsert_source(
+            &conn,
+            "gcal:me@x.com",
+            "google",
+            Some("me@x.com"),
+            "me@x.com",
+        )
+        .unwrap();
+        let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
+        register_calendars(&conn, "gcal:me@x.com", "google", &inputs, true, |_| true).unwrap();
+        let id = "gcal:me@x.com:team@group.calendar.google.com";
+        set_calendar_selected(&conn, id, false).unwrap();
+        set_calendar_quiet(&conn, id, true).unwrap();
+        set_calendar_kind(&conn, id, Some("work")).unwrap();
+        conn.execute(
+            "UPDATE calendars SET event_labels = '[{\"id\":\"l1\"}]' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        // Google changes the role and drops the reminders; the next refresh takes that in, and
+        // leaves the user's choices and the separately-fetched labels alone.
+        let mut changed = inputs;
+        changed[0].facts.access_role = Some("reader".into());
+        changed[0].facts.default_reminders.clear();
+        register_calendars(&conn, "gcal:me@x.com", "google", &changed, true, |_| true).unwrap();
+        let cal = list_calendars(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap();
+        assert_eq!(cal.facts.access_role.as_deref(), Some("reader"));
+        assert!(cal.facts.default_reminders.is_empty());
+        assert_eq!(cal.facts.conference_types, vec!["hangoutsMeet"]);
+        assert!(!cal.selected && cal.quiet);
+        assert_eq!(cal.kind.as_deref(), Some("work"));
+        let labels: Option<String> = conn
+            .query_row(
+                "SELECT event_labels FROM calendars WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(labels.as_deref(), Some("[{\"id\":\"l1\"}]"));
+    }
+
+    #[test]
+    fn a_save_lands_in_the_mirror_and_forces_the_next_full_rewrite() {
+        let (_d, conn) = store_with_calendar(true);
+        let first = parse_event("cal-1", &google_occurrence()).unwrap();
+        replace_events(&conn, "cal-1", std::slice::from_ref(&first), true).unwrap();
+        let hash_key = format!("{CALENDAR_EVENTS_HASH_PREFIX}cal-1");
+        assert!(crate::db::get_setting(&conn, &hash_key).unwrap().is_some());
+
+        let mut saved = first.clone();
+        saved.summary = "Standup (moved)".into();
+        saved.etag = Some("\"3457\"".into());
+        let mut other = first.clone();
+        other.id = "cal-1:new".into();
+        // A row for another calendar is never written through this calendar's effect.
+        let mut stray = first.clone();
+        stray.calendar_id = "cal-2".into();
+        stray.id = "cal-2:x".into();
+        apply_write_effect(&conn, "cal-1", &[saved, other, stray], &[]).unwrap();
+        let rows = list_all_events(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.summary == "Standup (moved)"));
+        assert_eq!(crate::db::get_setting(&conn, &hash_key).unwrap(), None);
+
+        apply_write_effect(&conn, "cal-1", &[], &["cal-1:new".to_string()]).unwrap();
+        assert_eq!(list_all_events(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_save_to_an_unticked_calendar_mirrors_nothing() {
+        let (_d, conn) = store_with_calendar(false);
+        let e = parse_event("cal-1", &google_occurrence()).unwrap();
+        apply_write_effect(&conn, "cal-1", &[e], &[]).unwrap();
+        assert!(list_all_events(&conn).unwrap().is_empty());
+        // An unknown calendar likewise.
+        apply_write_effect(&conn, "nope", &[], &["x".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn a_subscription_can_only_be_tagged_as_a_subscription() {
+        for p in ["apple", "outlook", "other"] {
+            assert_eq!(feed_provider(p).unwrap(), p);
+        }
+        assert_eq!(feed_provider("  ").unwrap(), "other");
+        for p in ["google", "microsoft", "Google", "evil\nline"] {
+            assert!(feed_provider(p).is_err(), "{p:?}");
+        }
     }
 }

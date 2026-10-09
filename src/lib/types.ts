@@ -903,6 +903,24 @@ export interface Calendar {
   quiet: boolean;
   /** Work or personal, or null when untyped. Events inherit this; an event may override it. */
   kind: EventKind | null;
+  // What editing needs to know (v57, Rust `CalendarFacts`), from Google's calendar list. Empty or
+  // null for Outlook and subscriptions.
+  /** owner | writer | writerWithoutPrivateAccess | reader | freeBusyReader. */
+  access_role: string | null;
+  /** The calendar's IANA time zone. */
+  time_zone: string | null;
+  /** Notifications a new event gets unless it says otherwise. */
+  default_reminders: Reminder[];
+  /** Conference kinds the calendar can add (`hangoutsMeet`, …). */
+  conference_types: string[];
+  /** The owner's address; Google sets it only for secondary calendars. */
+  data_owner: string | null;
+}
+
+/** One notification: `popup` or `email`, so many minutes before the start. */
+export interface Reminder {
+  method: string;
+  minutes: number;
 }
 
 /** How an event reads: work or personal (v45). Declared per calendar, inherited by its events. */
@@ -1490,6 +1508,22 @@ export interface CalendarEvent {
   visibility?: string | null;
   created?: string | null;
   updated?: string | null;
+  // What editing needs to know (v57, Google only). The etag never leaves the backend.
+  /** default | birthday | fromGmail | focusTime | outOfOffice | workingLocation. */
+  event_type?: string | null;
+  /** The organiser is the calendar this copy appears on (Google `organizer.self`), not necessarily
+   *  PM's account. Read with the calendar's `access_role`. */
+  organizer_self?: boolean;
+  /** Google refuses changes to its summary, description, location, start, end and recurrence. */
+  locked?: boolean;
+  guests_can_modify?: boolean;
+  /** The repeating event this occurrence belongs to. */
+  series_id?: string | null;
+  /** This occurrence's place in its series (its identity once moved). */
+  original_start?: string | null;
+  /** Google's own colour for the event ("1"–"11"), and its label. */
+  color_id?: string | null;
+  event_label_id?: string | null;
 }
 
 /** A focus-agenda row: a mirrored event plus whether it has already ended. The focus agenda widens

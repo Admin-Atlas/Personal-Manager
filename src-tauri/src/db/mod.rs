@@ -1055,6 +1055,15 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN visibility; \
              ALTER TABLE calendar_events DROP COLUMN created; \
              ALTER TABLE calendar_events DROP COLUMN updated; \
+             ALTER TABLE calendar_events DROP COLUMN etag; \
+             ALTER TABLE calendar_events DROP COLUMN event_type; \
+             ALTER TABLE calendar_events DROP COLUMN organizer_self; \
+             ALTER TABLE calendar_events DROP COLUMN locked; \
+             ALTER TABLE calendar_events DROP COLUMN guests_can_modify; \
+             ALTER TABLE calendar_events DROP COLUMN series_id; \
+             ALTER TABLE calendar_events DROP COLUMN original_start; \
+             ALTER TABLE calendar_events DROP COLUMN color_id; \
+             ALTER TABLE calendar_events DROP COLUMN event_label_id; \
              DROP TABLE document_locations; \
              DROP TABLE doc_layout; \
              DROP TABLE document_proposals; \
@@ -1242,6 +1251,15 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN visibility; \
              ALTER TABLE calendar_events DROP COLUMN created; \
              ALTER TABLE calendar_events DROP COLUMN updated; \
+             ALTER TABLE calendar_events DROP COLUMN etag; \
+             ALTER TABLE calendar_events DROP COLUMN event_type; \
+             ALTER TABLE calendar_events DROP COLUMN organizer_self; \
+             ALTER TABLE calendar_events DROP COLUMN locked; \
+             ALTER TABLE calendar_events DROP COLUMN guests_can_modify; \
+             ALTER TABLE calendar_events DROP COLUMN series_id; \
+             ALTER TABLE calendar_events DROP COLUMN original_start; \
+             ALTER TABLE calendar_events DROP COLUMN color_id; \
+             ALTER TABLE calendar_events DROP COLUMN event_label_id; \
              DROP TABLE document_locations; \
              DROP TABLE doc_layout; \
              DROP TABLE document_proposals; \

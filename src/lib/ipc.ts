@@ -1028,8 +1028,9 @@ export const disconnectOutlookCalendar = (email: string) =>
 /** Subscribed feeds (without their secret URLs). */
 export const listIcsFeeds = () => invoke<IcsFeedInfo[]>("list_ics_feeds");
 
-/** Add an iCal subscription and sync it. `provider` tags it (apple/outlook/google/other). */
-export const addIcsFeed = (label: string, url: string, provider?: string) =>
+/** Add an iCal subscription and sync it. `provider` tags it; the backend refuses any other tag, so a
+ *  subscription can never pass for a signed-in Google or Microsoft account. */
+export const addIcsFeed = (label: string, url: string, provider?: "apple" | "outlook" | "other") =>
   invoke<void>("add_ics_feed", { label, url, provider });
 
 /** Remove a feed and its synced events. */
