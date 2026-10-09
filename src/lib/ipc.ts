@@ -45,6 +45,7 @@ import type {
   Entity,
   Flag,
   FocusRoute,
+  GoogleDisconnect,
   IcsFeedInfo,
   ImageData,
   Importance,
@@ -993,9 +994,10 @@ export const setCalendarKind = (calendarId: string, kind: EventKind | null) =>
 export const connectGoogleCalendarAccount = (clientId?: string, clientSecret?: string) =>
   invoke<CalendarAccount>("connect_google_calendar_account", { clientId, clientSecret });
 
-/** Disconnect one Google Calendar account (by email). */
+/** Disconnect one Google Calendar account (by email). Names the features that still use the account,
+ *  which kept PM's access at Google alive. */
 export const disconnectGoogleCalendarAccount = (email: string) =>
-  invoke<void>("disconnect_google_calendar_account", { email });
+  invoke<GoogleDisconnect>("disconnect_google_calendar_account", { email });
 
 /** Connect an Outlook / Microsoft 365 calendar account (Graph OAuth) — opens the browser. */
 export const connectOutlookCalendar = () => invoke<CalendarAccount>("connect_outlook_calendar");
@@ -1048,8 +1050,10 @@ export const driveStatus = () => invoke<DriveStatus>("drive_status");
 export const connectDrive = (clientId?: string, clientSecret?: string) =>
   invoke<DriveAccount>("connect_drive", { clientId, clientSecret });
 
-/** Disconnect one account: forget its token + flag its items unreachable (kept findable). */
-export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive", { email });
+/** Disconnect one account: forget its token + flag its items unreachable (kept findable). Names the
+ *  features that still use the account, which kept PM's access at Google alive. */
+export const disconnectDrive = (email: string) =>
+  invoke<GoogleDisconnect>("disconnect_drive", { email });
 
 /** Start syncing one account (or all when `email` is null). Runs **detached** in the backend, so it
  *  keeps going if the user leaves Settings — progress arrives via the global `drive://sync` event

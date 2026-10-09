@@ -20,6 +20,7 @@ use crate::{
 
 use super::archivist::refuse_if_rebuilding;
 use super::shared::own_client;
+use super::shared::{google_grant_users, release_plan, GoogleDisconnect, GoogleUse, GrantRelease};
 use super::vaults::require_vault_owner;
 
 // --- Google Drive (index-only connector, board card 4A) ---
@@ -81,40 +82,54 @@ pub async fn connect_drive(
 }
 
 /// Disconnect one Drive account: forget its token and registry row, and soft-flag its indexed items
-/// `unreachable` (kept findable — never a hard delete).
+/// `unreachable` (kept findable — never a hard delete). The grant at Google and any per-account
+/// client are released only when no other PM feature still uses the account ([`release_plan`]); the
+/// result names the features that kept them.
 #[tauri::command]
-pub async fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()> {
-    // The backup destination reuses this account's token key, so revoking here would sever a grant
-    // the user has not asked to give up — and a re-granted `drive.file` is a NEW grant, which cannot
-    // write the archives the old one uploaded. That silently breaks backup retention with a 403 the
-    // next time it runs. Only revoke when nothing else is using the account.
-    let used_for_backup = {
+pub async fn disconnect_drive(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<GoogleDisconnect> {
+    require_vault_owner(&app)?;
+    // Google revokes the whole grant, not one feature's share of it. Revoking while Calendar signs in
+    // as this account would cut Calendar off, and while backup does, it would sever a grant the user
+    // has not asked to give up — a re-granted `drive.file` is a NEW grant, which cannot write the
+    // archives the old one uploaded, so backup retention would silently 403 on its next run. Only
+    // revoke when nothing else is using the account. Read under a short lock, released before the
+    // revoke's await (rule #4).
+    let plan = {
         let conn = state.conn()?;
-        crate::db::get_setting(&conn, crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY)?
-            .is_some_and(|a| a == email)
+        release_plan(&google_grant_users(&conn, &email)?, GoogleUse::Drive)
     };
     // L-3: sever the grant at Google's end BEFORE forgetting the local token — best-effort, exactly
     // like "Remove PM data" (wipe.rs). Revoking the refresh token drops PM from the account's
     // Connected-apps list; without it the grant lingers at Google until the token expires naturally.
-    if !used_for_backup {
+    if plan.revoke {
         if let Ok(Some(blob)) = secrets::get_google_token_for(&drive::account_token_key(&email)) {
             let _ = google::revoke(blob.expose()).await;
         }
     }
     {
         let conn = state.conn()?;
-        drive::forget_account(
-            &conn,
-            &email,
-            if used_for_backup {
-                drive::Credentials::Keep
-            } else {
-                drive::Credentials::Forget
-            },
-        )?;
+        drive::forget_account(&conn, &email, drive_credentials(&plan))?;
     }
     state.sync_index_only();
-    Ok(())
+    Ok(GoogleDisconnect {
+        kept_for: plan.kept_for,
+    })
+}
+
+/// What a Drive disconnect does with the keychain, from its [`release_plan`]: backup signs in through
+/// the Drive token key, so it keeps everything; Calendar only shares the account's own client.
+fn drive_credentials(plan: &GrantRelease) -> drive::Credentials {
+    if plan.keep_own_token {
+        drive::Credentials::Keep
+    } else if plan.forget_account_client {
+        drive::Credentials::Forget
+    } else {
+        drive::Credentials::ForgetTokenKeepClient
+    }
 }
 
 /// The shared drives one connected account can see (`drives.list`) — for the "add shared drives"
@@ -857,7 +872,12 @@ pub async fn connect_onedrive(app: AppHandle) -> Result<onedrive::OneDriveAccoun
 /// Disconnect one OneDrive account: forget its token and registry row, and soft-flag its indexed
 /// items `unreachable` (kept findable — never a hard delete).
 #[tauri::command]
-pub fn disconnect_onedrive(state: State<'_, AppState>, email: String) -> Result<()> {
+pub fn disconnect_onedrive(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<()> {
+    require_vault_owner(&app)?;
     {
         let conn = state.conn()?;
         onedrive::forget_account(&conn, &email)?;
@@ -934,4 +954,30 @@ pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
             });
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use GoogleUse::{Backup, Calendar, Drive};
+
+    fn creds_for(users: &[GoogleUse]) -> drive::Credentials {
+        drive_credentials(&release_plan(&users.iter().copied().collect(), Drive))
+    }
+
+    /// A Drive disconnect keeps the token while backup signs in through it, keeps only the account's
+    /// own client while Calendar refreshes through that, and forgets both as the account's last user.
+    #[test]
+    fn a_drive_disconnect_keeps_what_the_account_still_needs() {
+        assert_eq!(creds_for(&[Drive]), drive::Credentials::Forget);
+        assert_eq!(
+            creds_for(&[Drive, Calendar]),
+            drive::Credentials::ForgetTokenKeepClient
+        );
+        assert_eq!(creds_for(&[Drive, Backup]), drive::Credentials::Keep);
+        assert_eq!(
+            creds_for(&[Drive, Calendar, Backup]),
+            drive::Credentials::Keep
+        );
+    }
 }

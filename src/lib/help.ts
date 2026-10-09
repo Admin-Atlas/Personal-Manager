@@ -365,7 +365,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "connectors-google-client": {
     title: "Google sign-in (one-time setup)",
-    body: "One Google Cloud 'Desktop app' OAuth client — your own, pasted once and shared by every Google service (Calendar, Drive). PM ships no Google secret, so you supply your own; it stays in your keychain. Setting it up connects nothing on its own. If your account uses Advanced Protection, Google blocks this — use a calendar subscription (iCal) instead.",
+    body: "One Google Cloud 'Desktop app' OAuth client — your own, pasted once and shared by every Google service (Calendar, Drive). PM ships no Google secret, so you supply your own; it stays in your keychain. Setting it up connects nothing on its own. An account with Advanced Protection can't use this shared client — connect it with 'Advanced Protection account? Use its own project' under the Calendar or Drive connect button, using a client from a Cloud project that account owns. Disconnecting one Google service never cuts off another that still uses the same account: PM only asks Google to remove its access when nothing else in PM uses that account.",
   },
   "connectors-microsoft-client": {
     title: "Microsoft sign-in (one-time setup)",

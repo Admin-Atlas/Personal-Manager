@@ -198,11 +198,13 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
     })
 }
 
-/// Reject a connector-setup action when the current account doesn't own the (shared) vault. Owner-only
-/// connectors: OAuth tokens live in the per-Windows-account keychain, so a joiner literally cannot sync
-/// an account they connect — gating the setup replaces the opaque "connection fails" with an honest
-/// message. Fails OPEN on a device / legacy vault (no owner recorded) and if the meta can't be read, so
-/// it never blocks the real owner. Windows-only ownership; a no-op everywhere else.
+/// Reject a connector setup or removal when the current account doesn't own the (shared) vault.
+/// Owner-only connectors: OAuth tokens live in the per-Windows-account keychain, so a joiner literally
+/// cannot sync an account they connect — gating the setup replaces the opaque "connection fails" with
+/// an honest message. A joiner's disconnect would drop the shared rows while the owner's token stayed
+/// live and unrevoked in the owner's keychain, with no account left in the list to disconnect it from,
+/// so removal is gated too. Fails OPEN on a device / legacy vault (no owner recorded) and if the meta
+/// can't be read, so it never blocks the real owner. Windows-only ownership; a no-op everywhere else.
 pub(super) fn require_vault_owner(app: &AppHandle) -> Result<()> {
     let is_owner = vault::resolve(app)
         .ok()
@@ -213,8 +215,8 @@ pub(super) fn require_vault_owner(app: &AppHandle) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Other(
-            "Connectors on a shared vault are set up by its owner on this PC. Ask the vault's owner to \
-             connect this account — you'll still see everything they index."
+            "Connectors on a shared vault are set up and removed by its owner on this PC. Ask the \
+             vault's owner to change this connection — you'll still see everything they index."
                 .into(),
         ))
     }

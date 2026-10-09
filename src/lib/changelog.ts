@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.8-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "Disconnecting Google Calendar no longer cuts off Google Drive or your backups on the same account, and the other way round. Google removes an app's access to the whole account at once, so PM now only asks it to when nothing else in PM still uses that account. When something does, PM tells you what, and where to remove its access yourself if you want to. Before, disconnecting one could quietly stop the other from syncing until you signed in again. Accounts that use their own Cloud project (for Advanced Protection) also keep their sign-in details while another PM service still needs them.",
+      "On a vault shared between people on one PC, only the vault's owner can now disconnect a connected account, just as only they can connect one. Before, someone who had joined the vault could remove an account from the list while the owner's sign-in stayed active in the background with no way left to turn it off.",
+    ],
+  },
+  {
     version: "3.139.7-alpha",
     date: "2026-10-08",
     highlights: [

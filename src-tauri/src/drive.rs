@@ -93,7 +93,8 @@ const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 pub const MY_DRIVE_ROOT: &str = "root";
 
 const PROVIDER: &str = "google";
-const SERVICE: &str = "drive";
+/// `connector_sources.service` for a Drive account (read by the shared Google grant check).
+pub(crate) const SERVICE: &str = "drive";
 
 // --- identity / namespacing ---------------------------------------------------------------------
 
@@ -541,6 +542,9 @@ pub fn finalize_or_flag(
 pub enum Credentials {
     /// Clear the token and any per-account client — the normal disconnect.
     Forget,
+    /// Clear the Drive token but keep the per-account client: another Google service on this account
+    /// (Calendar) still refreshes its own token through that client.
+    ForgetTokenKeepClient,
     /// Leave them in the keychain; something else still needs this sign-in.
     Keep,
 }
@@ -589,11 +593,18 @@ pub fn forget_account(conn: &Connection, email: &str, creds: Credentials) -> Res
     for root_id in swm_roots {
         soft_flag_orphaned_swm_root(conn, &root_id)?;
     }
-    if creds == Credentials::Forget {
-        secrets::clear_google_token_for(&account_token_key(email)).ok();
-        // Forget the account's own Cloud-project client too, so reconnecting later with the shared
-        // client isn't silently overridden by stale per-account creds (see `client_creds_for_key`).
-        secrets::clear_google_client_for_account(email).ok();
+    match creds {
+        Credentials::Forget => {
+            secrets::clear_google_token_for(&account_token_key(email)).ok();
+            // Forget the account's own Cloud-project client too, so reconnecting later with the
+            // shared client isn't silently overridden by stale per-account creds (see
+            // `client_creds_for_key`).
+            secrets::clear_google_client_for_account(email).ok();
+        }
+        Credentials::ForgetTokenKeepClient => {
+            secrets::clear_google_token_for(&account_token_key(email)).ok();
+        }
+        Credentials::Keep => {}
     }
     Ok(())
 }

@@ -859,6 +859,17 @@ export type ProjectProposalEvent =
   | { type: "proposed"; project: string; proposal: ProjectProposal }
   | { type: "finished"; proposed: number };
 
+// --- Google grants shared across features ---
+
+/** A PM feature that signs in to a Google account (Rust `commands::shared::GoogleUse`). */
+export type GoogleUse = "calendar" | "drive" | "backup";
+
+/** What a Google Calendar or Drive disconnect returns: the features still using the account, which
+ *  kept PM's access at Google alive. Empty when the disconnect was the last and access was revoked. */
+export interface GoogleDisconnect {
+  kept_for: GoogleUse[];
+}
+
 // --- Personal Assistant: Calendar connectors (multi-provider, read-only — cards 6A/6B) ---
 
 /** A connected calendar account (Google/Outlook) or iCal subscription — one connector source. */
