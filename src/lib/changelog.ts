@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.10-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "Clearing your Microsoft sign-in now signs out your Outlook calendars too, not just OneDrive. Both connect through that one sign-in, so Outlook calendars left behind could no longer sync and showed an error on every refresh. Your iCal subscriptions aren't affected.",
+      "If an earlier version left Outlook calendars behind like that, they now show under Outlook Calendar in Connectors with a Disconnect button, even while the Microsoft sign-in isn't set up.",
+      "On a vault shared between people on one PC, only the vault's owner can clear the Google or Microsoft sign-in, just as only they can disconnect an account.",
+    ],
+  },
+  {
     version: "3.139.9-alpha",
     date: "2026-10-09",
     highlights: [

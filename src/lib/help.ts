@@ -357,7 +357,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-connectors": {
     title: "Connectors",
-    body: "Connect external accounts so PM can find and use what's in them, grouped by provider — Google, Microsoft, Apple. A provider's sign-in is set up once at the top of its group and shared across all of that provider's services (Google: Calendar + Drive; Microsoft: OneDrive). Calendar subscriptions (iCal) need no sign-in and sit in their own section. Every connection is independently opt-in and removable, and nothing cascades or auto-enables. Credentials and tokens live only in your keychain.",
+    body: "Connect external accounts so PM can find and use what's in them, grouped by provider — Google, Microsoft, Apple. A provider's sign-in is set up once at the top of its group and shared across all of that provider's services (Google: Calendar + Drive; Microsoft: OneDrive + Outlook Calendar). Calendar subscriptions (iCal) need no sign-in and sit in their own section. Every connection is independently opt-in and removable, and nothing cascades or auto-enables. Credentials and tokens live only in your keychain.",
   },
   "connectors-google-multiaccount": {
     title: "More than one Google account",
@@ -369,7 +369,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "connectors-microsoft-client": {
     title: "Microsoft sign-in (one-time setup)",
-    body: "One Microsoft (Azure) app registration — your own client id, pasted once and shared by every Microsoft service (OneDrive). PM ships no Microsoft secret and stores none: it's a public client, so you supply only the id and it lives in your keychain. Setting it up connects nothing on its own — you then add each account separately.",
+    body: "One Microsoft (Azure) app registration — your own client id, pasted once and shared by every Microsoft service (OneDrive and Outlook Calendar). PM ships no Microsoft secret and stores none: it's a public client, so you supply only the id and it lives in your keychain. Setting it up connects nothing on its own — you then add each account separately.",
   },
   "connectors-ics": {
     title: "Calendar subscription (iCal)",

@@ -49,6 +49,33 @@ pub fn account_id(email: &str) -> String {
     format!("outlook:{email}")
 }
 
+/// Remove every Outlook (Graph) calendar account — its keychain token via `forget_token`, then its
+/// registry row, calendars and events — returning how many went. Used when the Microsoft client is
+/// cleared: every account signs in through it, so none can refresh any more. iCal subscriptions (even
+/// ones tagged "outlook") have no account and are left alone.
+///
+/// Account by account, token FIRST, and a `forget_token` failure (a locked keychain) stops the run
+/// with that account's row still in place — the same order as `disconnect_outlook_calendar`. Removing
+/// the rows first would strand a live refresh token that no disconnect or wipe could find again.
+/// `forget_token` is a parameter so the order is testable without the real keychain.
+pub fn remove_all_accounts(
+    conn: &rusqlite::Connection,
+    mut forget_token: impl FnMut(&str) -> Result<()>,
+) -> Result<usize> {
+    let mut removed = 0;
+    for account in crate::calendar::list_sources(conn, Some("microsoft"))? {
+        if !account.id.starts_with("outlook:") {
+            continue;
+        }
+        if let Some(email) = &account.email {
+            forget_token(&account_token_key(email))?;
+        }
+        crate::calendar::remove_source(conn, &account.id)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 // --- network (async, DB-free; callers hold no lock across these — rule #4) -----------------------
 
 /// The account a fresh token grants (email + display name), via Graph `/me` — to learn which account
@@ -364,6 +391,100 @@ fn graph_datetime_to_iso(dt: &str, all_day: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clearing the Microsoft client removes every Outlook account (and only those): the Graph rows go
+    /// with their calendars and events, while an iCal feed tagged "outlook" and Google stay.
+    #[test]
+    fn remove_all_accounts_takes_only_outlook_graph_accounts() {
+        use crate::calendar::{list_sources, upsert_source};
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(
+            &dir.path().join("pm.sqlite"),
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        upsert_source(
+            &conn,
+            &account_id("me@x.com"),
+            "microsoft",
+            Some("me@x.com"),
+            "Me",
+        )
+        .unwrap();
+        upsert_source(
+            &conn,
+            &account_id("work@x.com"),
+            "microsoft",
+            Some("work@x.com"),
+            "W",
+        )
+        .unwrap();
+        upsert_source(&conn, "ics:abc", "outlook", None, "Shared feed").unwrap();
+        upsert_source(&conn, "gcal:g@x.com", "google", Some("g@x.com"), "g@x.com").unwrap();
+        conn.execute(
+            "INSERT INTO calendars(id, source_id, provider, remote_id, name) VALUES \
+             ('outlook:me@x.com:c1', 'outlook:me@x.com', 'microsoft', 'c1', 'Cal')",
+            [],
+        )
+        .unwrap();
+
+        let mut forgotten = Vec::new();
+        let removed = remove_all_accounts(&conn, |key| {
+            forgotten.push(key.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(removed, 2);
+        forgotten.sort();
+        assert_eq!(
+            forgotten,
+            vec![
+                account_token_key("me@x.com"),
+                account_token_key("work@x.com")
+            ]
+        );
+        let left: Vec<String> = list_sources(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"ics:abc".to_string()));
+        assert!(left.contains(&"gcal:g@x.com".to_string()));
+        let calendars: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calendars", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calendars, 0, "the removed account's calendars go with it");
+    }
+
+    /// The token goes first and a keychain failure stops the run with that account still listed, so
+    /// a retry finds it — never a live token with no row left to name it.
+    #[test]
+    fn a_token_that_will_not_clear_keeps_its_account() {
+        use crate::calendar::{list_sources, upsert_source};
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(
+            &dir.path().join("pm.sqlite"),
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        upsert_source(
+            &conn,
+            &account_id("me@x.com"),
+            "microsoft",
+            Some("me@x.com"),
+            "Me",
+        )
+        .unwrap();
+        let err = remove_all_accounts(&conn, |_| Err(Error::Other("keychain locked".into())));
+        assert!(err.is_err());
+        let left: Vec<String> = list_sources(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(left, vec![account_id("me@x.com")]);
+    }
 
     #[test]
     fn account_identity_is_namespaced_per_email() {

@@ -20,7 +20,7 @@ import { IcsFeedSubscription } from "./IcsFeedSubscription";
  *
  * Grouped **by provider** (Google / Microsoft / Apple). A provider's BYO-OAuth client is
  * provider-level — one client powers all of that provider's services (Google: Calendar + Drive +
- * future Gmail; Microsoft: OneDrive + future Outlook) — so it's set up **once at the top of the
+ * future Gmail; Microsoft: OneDrive + Outlook Calendar + future Mail) — so it's set up **once at the top of the
  * provider group** (see {@link GoogleProvider} / {@link MicrosoftProvider}), with the multi-account
  * guidance right beside it. Previously the shared client + that guidance were buried inside whichever
  * service you happened to open first (so e.g. a Calendar-first user never saw the Drive-only

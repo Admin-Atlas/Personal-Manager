@@ -421,8 +421,12 @@ pub fn google_saved_projects(state: State<'_, AppState>) -> Result<Vec<String>> 
 /// Forget the Google client credentials. The client is shared by every Google service, so this
 /// invalidates them all: drop each Calendar account + every Drive account and the events/items they
 /// mirror (ICS/Outlook events, which don't depend on this client, are kept).
+///
+/// Owner-only, like every connector removal: on a shared vault a joiner would drop the owner's rows
+/// while the owner's tokens stayed live in the owner's keychain.
 #[tauri::command]
-pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
+pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    require_vault_owner(&app)?;
     let conn = state.conn()?;
     for acc in calendar::list_sources(&conn, Some("google"))? {
         calendar::remove_source(&conn, &acc.id)?;
