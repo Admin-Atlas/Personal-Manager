@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.141.1-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "Under-the-hood groundwork for the event editor: a time picker that works the same on every computer, a time-zone search shared with the calendar's extra time zones, and the checks that catch a time the clocks skip before anything is saved. Nothing you can see changes yet.",
+    ],
+  },
+  {
     version: "3.141.0-alpha",
     date: "2026-10-09",
     highlights: [

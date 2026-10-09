@@ -189,7 +189,7 @@ describe("`text-faint` is decorative, never informational text", () => {
 
 /** JSX elements that count as "this label wraps its control", so implicit association applies. */
 const LABELABLE =
-  /<(input|select|textarea|Input|Select|Textarea|Toggle|SegmentedControl|DateField)[\s/>]/;
+  /<(input|select|textarea|Input|Select|Textarea|Toggle|SegmentedControl|DateField|TimeField)[\s/>]/;
 
 /** The `<label>`'s children — nesting-aware, so an inner `<label>` cannot close the outer one. */
 function elementBody(src: string, afterOpeningTag: number): string {

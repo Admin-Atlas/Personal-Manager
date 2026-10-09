@@ -276,12 +276,20 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
             .to_string()
     };
     let description = text("description");
+    let instant = |node: &Value| {
+        node.get("dateTime")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let all_day = matches!(time, TimeDraft::AllDay { .. });
     Some(EventForEdit {
         summary: text("summary"),
         location: text("location"),
         description_html: patch::description_is_html(&description),
         description,
         time,
+        start_at: (!all_day).then(|| instant(start)).flatten(),
+        end_at: (!all_day).then(|| instant(end)).flatten(),
         show_as: match fresh.get("transparency").and_then(Value::as_str) {
             Some("transparent") => ShowAs::Free,
             _ => ShowAs::Busy,
@@ -1282,6 +1290,11 @@ mod tests {
             (ShowAs::Free, Visibility::Private)
         );
         assert_eq!(e.attachments, vec!["Boarding pass.pdf"]);
+        // Google's exact instants travel alongside, for the editor's pre-save check.
+        assert_eq!(
+            (e.start_at.as_deref(), e.end_at.as_deref()),
+            (Some("2026-07-01T08:00:00Z"), Some("2026-07-01T16:00:00Z"))
+        );
         // A node without a zone reads in the fallback (the calendar's zone).
         let bare = json!({
             "start": { "dateTime": "2026-07-01T08:00:00Z" },
@@ -1300,15 +1313,17 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // All-day: the last day covered, not Google's exclusive end.
+        // All-day: the last day covered, not Google's exclusive end, and no instants.
         let day = json!({ "start": { "date": "2026-10-10" }, "end": { "date": "2026-10-13" } });
+        let e = event_for_edit(&day, "Europe/London").unwrap();
         assert_eq!(
-            event_for_edit(&day, "Europe/London").unwrap().time,
+            e.time,
             TimeDraft::AllDay {
                 first_day: "2026-10-10".into(),
                 last_day: "2026-10-12".into()
             }
         );
+        assert_eq!((e.start_at, e.end_at), (None, None));
     }
 
     #[test]

@@ -223,6 +223,11 @@ pub struct EventForEdit {
     pub description_html: bool,
     /// In the event's own zone(s), as the editor's fields hold them.
     pub time: TimeDraft,
+    /// Google's exact start and end of a timed event (RFC 3339), `None` for an all-day one. `HH:MM`
+    /// can't say which of a repeated hour's two 01:30s a half is; the save keeps Google's own instant
+    /// for a half the user leaves alone, and the editor's pre-save check judges it by these.
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
     pub show_as: ShowAs,
     pub visibility: Visibility,
     /// Attachment titles, listed read-only; PM never sends the attachments field, so it keeps them.

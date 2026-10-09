@@ -51,6 +51,7 @@ export {
   parseCoords,
   formatCoords,
   deviceTimeZone,
+  deviceTimeZoneOrNull,
   coordsFor,
   allTimeZones,
   isValidTimeZone,

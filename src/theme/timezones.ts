@@ -161,10 +161,17 @@ export function formatCoords(coords: Coords): string {
 
 /** The device's IANA time zone (e.g. "Europe/London"), or "UTC" if the runtime can't report one. */
 export function deviceTimeZone(): string {
+  return deviceTimeZoneOrNull() ?? "UTC";
+}
+
+/** The device's IANA time zone, or `null` when the runtime can't report one. For anything that
+ *  WRITES a time (calendar editing, #884): a guessed "UTC" would save the wrong instant without a
+ *  word, so the editor disables its time controls instead (plan rule R6). */
+export function deviceTimeZoneOrNull(): string | null {
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
   } catch {
-    return "UTC";
+    return null;
   }
 }
 
