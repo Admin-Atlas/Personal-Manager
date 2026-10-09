@@ -54,6 +54,12 @@ pub struct Token {
     pub expiry: i64,
     #[serde(default)]
     pub scope: Option<String>,
+    /// The OAuth client that minted this grant. A refresh token only works with the client that
+    /// issued it, and one account can hold grants from both the shared client and its own
+    /// (Advanced-Protection) client, so a refresh picks the client by this id rather than by which
+    /// clients happen to be saved. Absent on tokens saved before 3.139.9; those resolve as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 /// True once the user has pasted a client id + secret.
@@ -74,17 +80,76 @@ fn client_creds() -> Result<(String, Secret)> {
     Ok((id, secret))
 }
 
-/// The OAuth client to use for the account behind a token key — its OWN client if one is stored
-/// (an Advanced-Protection account on its own Cloud project), else the shared client. The account
-/// email is the suffix after `::` in the token key (`google_oauth_token_drive::<email>` etc.); the
-/// legacy fixed calendar key has no suffix, so it resolves to the shared client.
-fn client_creds_for_key(token_key: &str) -> Result<(String, Secret)> {
-    if let Some((_, email)) = token_key.rsplit_once("::") {
-        if let Some(own) = secrets::get_google_client_for_account(email)? {
-            return Ok(own);
+/// Which saved client refreshes a token: the account's own (Advanced-Protection) client, or the
+/// shared one.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientChoice {
+    Own,
+    Shared,
+    /// The token names a client that is no longer saved — refreshing with any other would fail.
+    Gone,
+}
+
+/// Pick the client for a token from the id that minted it (`minted_by`) and the ids of the clients
+/// saved now. A token saved before minting ids were recorded (`None`) keeps the old rule: the
+/// account's own client when it has one, else the shared one. Pure, so every case is table-tested.
+fn choose_client(
+    minted_by: Option<&str>,
+    own_id: Option<&str>,
+    shared_id: Option<&str>,
+) -> ClientChoice {
+    match minted_by {
+        Some(id) if own_id == Some(id) => ClientChoice::Own,
+        Some(id) if shared_id == Some(id) => ClientChoice::Shared,
+        Some(_) => ClientChoice::Gone,
+        None if own_id.is_some() => ClientChoice::Own,
+        None => ClientChoice::Shared,
+    }
+}
+
+/// The OAuth client that refreshes `token` (stored under `token_key`). The account email is the
+/// suffix after `::` in the key (`google_oauth_token_drive::<email>` etc.); the legacy fixed calendar
+/// key has no suffix, so it has no own client.
+fn client_creds_for_token(token_key: &str, token: &Token) -> Result<(String, Secret)> {
+    let own = match token_key.rsplit_once("::") {
+        Some((_, email)) => secrets::get_google_client_for_account(email)?,
+        None => None,
+    };
+    let shared_id = secrets::get_google_client_id()?;
+    match choose_client(
+        token.client_id.as_deref(),
+        own.as_ref().map(|(id, _)| id.as_str()),
+        shared_id.as_deref(),
+    ) {
+        ClientChoice::Own => Ok(own.expect("choose_client only picks Own when one is saved")),
+        ClientChoice::Shared => client_creds(),
+        ClientChoice::Gone => Err(Error::Other(
+            "The Google Cloud project this account signed in with is no longer saved in PM — \
+             reconnect the account in Settings."
+                .into(),
+        )),
+    }
+}
+
+/// The client for a sign-in whose token will be saved under `token_key` (an account's existing key):
+/// the client that minted the token already there, so the new consent widens that same grant
+/// (`include_granted_scopes` only unions scopes within one project) instead of replacing it with a
+/// grant to another project — which would drop the old grant's scopes from the key and leave that
+/// grant live at Google with no token left to revoke it. With no usable token there, the account's
+/// own client when one is saved (an Advanced-Protection account can't use the shared project at
+/// all), else the shared one.
+fn client_creds_for_saving(token_key: &str, email: &str) -> Result<(String, Secret)> {
+    if let Some(raw) = secrets::get_google_token_for(token_key)? {
+        if let Ok(existing) = serde_json::from_str::<Token>(raw.expose()) {
+            if let Ok(creds) = client_creds_for_token(token_key, &existing) {
+                return Ok(creds);
+            }
         }
     }
-    client_creds()
+    match secrets::get_google_client_for_account(email)? {
+        Some(own) => Ok(own),
+        None => client_creds(),
+    }
 }
 
 fn http() -> Result<reqwest::Client> {
@@ -138,7 +203,43 @@ pub async fn revoke(token_json: &str) -> Result<()> {
 /// the caller's job. `success_label` names the connected product on the browser success page.
 /// Errors (no client configured, browser failed, cancelled, timeout) surface to the UI.
 pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
-    run_consent_inner(scope, success_label, client_creds()?).await
+    run_consent_inner(scope, success_label, client_creds()?, None).await
+}
+
+/// As [`run_consent`], for a token PM will save under an account's existing key (`token_key`): signs
+/// in through the client that minted the token already there, else the account's own client, else
+/// the shared one ([`client_creds_for_saving`]), and starts Google's chooser on that account. The
+/// caller still checks which account actually consented — the chooser lets the user pick another.
+pub async fn run_consent_for_key(
+    token_key: &str,
+    email: &str,
+    scope: &str,
+    success_label: &str,
+) -> Result<Token> {
+    run_consent_inner(
+        scope,
+        success_label,
+        client_creds_for_saving(token_key, email)?,
+        Some(email),
+    )
+    .await
+}
+
+/// As [`run_consent`], through the own Cloud project PM already holds for `email` — the one-click
+/// "Use <email>'s project" path, so an Advanced-Protection account never needs its project pasted a
+/// second time. Refuses when no project is saved for the account (it was forgotten since the list was
+/// read): the button promised that project, and the shared one would be blocked or wrong.
+pub async fn run_consent_with_saved_project(
+    email: &str,
+    scope: &str,
+    success_label: &str,
+) -> Result<Token> {
+    let own = secrets::get_google_client_for_account(email)?.ok_or_else(|| {
+        Error::Other(format!(
+            "PM no longer holds a Cloud project for {email}. Paste its Client ID and secret instead."
+        ))
+    })?;
+    run_consent_inner(scope, success_label, own, Some(email)).await
 }
 
 /// As [`run_consent`], but using an account's OWN client (id + secret) supplied explicitly — the path
@@ -154,6 +255,7 @@ pub async fn run_consent_with_client(
         scope,
         success_label,
         (client_id, Secret::from(client_secret)),
+        None,
     )
     .await
 }
@@ -162,6 +264,7 @@ async fn run_consent_inner(
     scope: &str,
     success_label: &str,
     (client_id, client_secret): (String, Secret),
+    login_hint: Option<&str>,
 ) -> Result<Token> {
     let (verifier, challenge) = oauth_loopback::pkce()?;
     let state = oauth_loopback::random_token(16)?;
@@ -172,7 +275,14 @@ async fn run_consent_inner(
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
-    let auth_url = build_auth_url(&client_id, &redirect_uri, &challenge, &state, scope)?;
+    let auth_url = build_auth_url(
+        &client_id,
+        &redirect_uri,
+        &challenge,
+        &state,
+        scope,
+        login_hint,
+    )?;
     open::that(&auth_url)
         .map_err(|e| Error::Other(format!("Couldn't open your browser to sign in: {e}")))?;
 
@@ -185,7 +295,7 @@ async fn run_consent_inner(
     .await
     .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
 
-    let token = exchange_code(
+    let mut token = exchange_code(
         &client_id,
         client_secret.expose(),
         &code,
@@ -193,6 +303,8 @@ async fn run_consent_inner(
         &verifier,
     )
     .await?;
+    // Remember which client minted the grant, so every refresh uses that same client.
+    token.client_id = Some(client_id);
     if token.refresh_token.is_none() {
         // Without offline access we can't refresh; tell the user how to fix it.
         return Err(Error::Other(
@@ -397,13 +509,10 @@ async fn exchange_code(
 /// this keeps the two providers' refresh path identical and avoids a redundant network round-trip).
 /// `force = false` (the proactive path) returns early when the reloaded token is already fresh;
 /// `force = true` (the reactive 401 path) always refreshes, because the token may be revoked, not
-/// merely expired.
-async fn do_refresh(
-    client_id: &str,
-    client_secret: &str,
-    token_key: &str,
-    force: bool,
-) -> Result<Token> {
+/// merely expired. The client is chosen from that reloaded blob too, under the lock: a consent or
+/// [`pin_minting_client`] that re-saved the blob while we waited may have changed which client it
+/// needs, and a refresh token only works with the client that minted it.
+async fn do_refresh(token_key: &str, force: bool) -> Result<Token> {
     let _guard = oauth_loopback::refresh_lock(token_key).await;
     let current = load_token(token_key)?;
     if !force && current.expiry > oauth_loopback::now_unix() + 60 {
@@ -413,11 +522,12 @@ async fn do_refresh(
         .refresh_token
         .clone()
         .ok_or_else(|| Error::Other("Google session expired — reconnect in Settings.".into()))?;
+    let (client_id, client_secret) = client_creds_for_token(token_key, &current)?;
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh.expose()),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.expose()),
     ];
     let resp = http()?.post(TOKEN_ENDPOINT).form(&params).send().await?;
     let mut token = token_from_response(resp).await?;
@@ -431,6 +541,10 @@ async fn do_refresh(
     // previous value is always at least as accurate as dropping it.
     if token.scope.is_none() {
         token.scope = current.scope.clone();
+    }
+    // The minting client never changes across refreshes; a refresh response never carries it.
+    if token.client_id.is_none() {
+        token.client_id = current.client_id.clone();
     }
     save_token(token_key, &token)?;
     Ok(token)
@@ -450,6 +564,7 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
         refresh_token: t.refresh_token.map(Secret::from),
         expiry: oauth_loopback::now_unix() + t.expires_in.unwrap_or(3600),
         scope: t.scope,
+        client_id: None,
     })
 }
 
@@ -458,6 +573,29 @@ fn load_token(token_key: &str) -> Result<Token> {
         .ok_or_else(|| Error::Other("Not connected to Google. Connect in Settings.".into()))?;
     serde_json::from_str(raw.expose())
         .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))
+}
+
+/// Pin a token saved before minting clients were recorded to the client it is refreshing through
+/// NOW — by the same legacy rule [`client_creds_for_token`] applies to its key — so that saving or
+/// replacing an own client for the account next can't redirect it to a client that never minted it.
+/// A token that already names its client, or no token at all, is left alone. Taken under the key's
+/// refresh lock so it can't race a refresh that re-saves the blob. Call it BEFORE the client changes.
+pub async fn pin_legacy_token(token_key: &str) -> Result<()> {
+    let _guard = oauth_loopback::refresh_lock(token_key).await;
+    let Some(raw) = secrets::get_google_token_for(token_key)? else {
+        return Ok(());
+    };
+    let mut token: Token = serde_json::from_str(raw.expose())
+        .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))?;
+    if token.client_id.is_some() {
+        return Ok(());
+    }
+    // No client resolves (none saved at all): the token can't refresh either way, so leave it be.
+    let Ok((client_id, _)) = client_creds_for_token(token_key, &token) else {
+        return Ok(());
+    };
+    token.client_id = Some(client_id);
+    save_token(token_key, &token)
 }
 
 /// Persist a token blob under its service/account keychain key. Public so a connector can save
@@ -473,11 +611,10 @@ pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
 /// uploader's chunked Drive PUT, sent once outside the retry helper — can authorize it and handle a
 /// reactive 401 via [`refresh_now`].
 pub async fn valid_access_token(token_key: &str) -> Result<Secret> {
-    let (client_id, client_secret) = client_creds_for_key(token_key)?;
     let mut token = load_token(token_key)?;
     // Lock-free fast path; `do_refresh` re-checks expiry under the per-key lock before any network call.
     if token.expiry <= oauth_loopback::now_unix() + 60 {
-        token = do_refresh(&client_id, client_secret.expose(), token_key, false).await?;
+        token = do_refresh(token_key, false).await?;
     }
     Ok(token.access_token.clone())
 }
@@ -486,8 +623,7 @@ pub async fn valid_access_token(token_key: &str) -> Result<Secret> {
 /// revoked or expired early (a 401 on a request built with [`valid_access_token`]). Re-persists
 /// the refreshed blob, exactly like the GET path's reactive refresh.
 pub async fn refresh_now(token_key: &str) -> Result<Secret> {
-    let (client_id, client_secret) = client_creds_for_key(token_key)?;
-    let refreshed = do_refresh(&client_id, client_secret.expose(), token_key, true).await?;
+    let refreshed = do_refresh(token_key, true).await?;
     Ok(refreshed.access_token.clone())
 }
 
@@ -514,30 +650,33 @@ pub fn token_has_scope(token_key: &str, scope: &str) -> Result<bool> {
 /// refresh token so PM can stay connected. `select_account` forces Google's account chooser every
 /// time, so connecting a *second* account actually works — without it, Google silently reuses the
 /// browser's signed-in session and re-grants the same account, which is why "Add another account"
-/// could only ever re-link the first one. Pure, so it's unit-tested.
+/// could only ever re-link the first one. `login_hint` (an account PM already knows) starts the
+/// chooser on that account; the user can still pick another. Pure, so it's unit-tested.
 pub fn build_auth_url(
     client_id: &str,
     redirect_uri: &str,
     challenge: &str,
     state: &str,
     scope: &str,
+    login_hint: Option<&str>,
 ) -> Result<String> {
-    let url = reqwest::Url::parse_with_params(
-        AUTH_ENDPOINT,
-        &[
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-            ("response_type", "code"),
-            ("scope", scope),
-            ("code_challenge", challenge),
-            ("code_challenge_method", "S256"),
-            ("state", state),
-            ("access_type", "offline"),
-            ("prompt", "select_account consent"),
-            ("include_granted_scopes", "true"),
-        ],
-    )
-    .map_err(|e| Error::Other(format!("could not build auth URL: {e}")))?;
+    let mut params = vec![
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("response_type", "code"),
+        ("scope", scope),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", state),
+        ("access_type", "offline"),
+        ("prompt", "select_account consent"),
+        ("include_granted_scopes", "true"),
+    ];
+    if let Some(hint) = login_hint {
+        params.push(("login_hint", hint));
+    }
+    let url = reqwest::Url::parse_with_params(AUTH_ENDPOINT, &params)
+        .map_err(|e| Error::Other(format!("could not build auth URL: {e}")))?;
     Ok(url.to_string())
 }
 
@@ -553,9 +692,11 @@ mod tests {
             "chal",
             "state-abc",
             CALENDAR_SCOPE,
+            None,
         )
         .unwrap();
         assert!(url.starts_with(AUTH_ENDPOINT));
+        assert!(!url.contains("login_hint"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("access_type=offline"));
         // The account chooser is forced (space-joined prompt values url-encode the space as `+`),
@@ -565,5 +706,68 @@ mod tests {
         assert!(url.contains("calendar.readonly"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321"));
         assert!(url.contains("state=state-abc"));
+    }
+
+    #[test]
+    fn a_known_account_is_passed_as_the_login_hint() {
+        let url = build_auth_url(
+            "client-123",
+            "http://127.0.0.1:54321",
+            "chal",
+            "state-abc",
+            DRIVE_FILE_SCOPE,
+            Some("ap@example.com"),
+        )
+        .unwrap();
+        assert!(url.contains("login_hint=ap%40example.com"));
+        // The chooser stays forced: the hint only picks where it starts.
+        assert!(url.contains("prompt=select_account+consent"));
+    }
+
+    /// A refresh token only works with the client that minted it, so a token that records its client
+    /// refreshes through exactly that one; a token saved before ids were recorded keeps the old rule.
+    #[test]
+    fn a_token_refreshes_through_the_client_that_minted_it() {
+        use ClientChoice::{Gone, Own, Shared};
+        let cases = [
+            // (minted_by, own saved, shared saved, expected)
+            (Some("own-1"), Some("own-1"), Some("shared-1"), Own),
+            // The case the old rule got wrong: an account with its own client saved, whose token
+            // was minted by the shared client (connected through the normal button).
+            (Some("shared-1"), Some("own-1"), Some("shared-1"), Shared),
+            (Some("shared-1"), None, Some("shared-1"), Shared),
+            // The minting client was cleared or replaced: say so rather than refresh with another.
+            (Some("old-own"), Some("own-2"), Some("shared-1"), Gone),
+            (Some("shared-old"), None, Some("shared-new"), Gone),
+            (Some("own-1"), None, None, Gone),
+            // Tokens from before ids were recorded.
+            (None, Some("own-1"), Some("shared-1"), Own),
+            (None, None, Some("shared-1"), Shared),
+            (None, None, None, Shared),
+        ];
+        for (minted_by, own, shared, want) in cases {
+            assert_eq!(
+                choose_client(minted_by, own, shared),
+                want,
+                "minted_by={minted_by:?} own={own:?} shared={shared:?}"
+            );
+        }
+    }
+
+    /// The keychain blob of a token saved before 3.139.9 has no `client_id`; it must still load, and a
+    /// token without one must save byte-for-byte as before.
+    #[test]
+    fn the_token_blob_round_trips_with_and_without_a_minting_client() {
+        let old = r#"{"access_token":"a","refresh_token":"r","expiry":1,"scope":"s"}"#;
+        let token: Token = serde_json::from_str(old).unwrap();
+        assert_eq!(token.client_id, None);
+        assert_eq!(serde_json::to_string(&token).unwrap(), old);
+
+        let mut minted = token.clone();
+        minted.client_id = Some("own-1".into());
+        let json = serde_json::to_string(&minted).unwrap();
+        assert!(json.ends_with(r#","client_id":"own-1"}"#), "{json}");
+        let back: Token = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.client_id.as_deref(), Some("own-1"));
     }
 }

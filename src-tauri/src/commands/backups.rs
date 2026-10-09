@@ -1364,19 +1364,31 @@ pub async fn backup_gdrive_connect(
     email: Option<String>,
 ) -> Result<GdriveBackupStatus> {
     use crate::backup::schedule::{BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY};
+    let state = app.state::<AppState>();
     // Opens the browser; unions the write scope with any existing read grant on the chosen account.
-    let token = google::run_consent(google::DRIVE_FILE_SCOPE, "Google Drive backup").await?;
+    // The token is saved over the account's Drive key, so a chosen account signs in through the
+    // client that minted the token already there — `include_granted_scopes` only unions within one
+    // project, and another project's token would drop Drive's read scopes — else through the
+    // account's own saved project (an Advanced-Protection account can't use the shared one at all).
+    let token = match email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(chosen) => {
+            google::run_consent_for_key(
+                &crate::drive::account_token_key(chosen),
+                chosen,
+                google::DRIVE_FILE_SCOPE,
+                "Google Drive backup",
+            )
+            .await?
+        }
+        None => google::run_consent(google::DRIVE_FILE_SCOPE, "Google Drive backup").await?,
+    };
     let (learned_email, _name) = crate::drive::about_user(&token).await?;
     if let Some(expected) = &email {
         if !expected.eq_ignore_ascii_case(&learned_email) {
-            return Err(Error::Other(format!(
-                "You chose {expected} for backup but signed in as {learned_email}. \
-                 Pick the same account."
-            )));
+            return Err(super::shared::wrong_account(expected, &learned_email));
         }
     }
     google::save_token(&crate::drive::account_token_key(&learned_email), &token)?;
-    let state = app.state::<AppState>();
     let conn = state.conn()?;
     crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, &learned_email)?;
     crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, true)?;

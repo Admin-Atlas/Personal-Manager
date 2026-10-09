@@ -990,9 +990,14 @@ export const setCalendarKind = (calendarId: string, kind: EventKind | null) =>
 
 /** Connect a Google Calendar account (multi-account) — opens the browser; resolves on sign-in.
  *  Pass an account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection
- *  path); omit both to use the shared group client. */
-export const connectGoogleCalendarAccount = (clientId?: string, clientSecret?: string) =>
-  invoke<CalendarAccount>("connect_google_calendar_account", { clientId, clientSecret });
+ *  path), or `account` to reuse the project already saved for that account (see
+ *  {@link googleSavedProjects}); omit all three to use the shared group client. */
+export const connectGoogleCalendarAccount = (
+  clientId?: string,
+  clientSecret?: string,
+  account?: string,
+) =>
+  invoke<CalendarAccount>("connect_google_calendar_account", { clientId, clientSecret, account });
 
 /** Disconnect one Google Calendar account (by email). Names the features that still use the account,
  *  which kept PM's access at Google alive. */
@@ -1025,6 +1030,10 @@ export const setGoogleClient = (clientId: string, clientSecret: string) =>
 /** Forget the Google client credentials (also disconnects every Google service + clears the mirror). */
 export const clearGoogleClient = () => invoke<void>("clear_google_client");
 
+/** The Google accounts PM already holds an own Cloud project for (Advanced Protection), so another
+ *  Google service can connect them without the project being pasted again. Emails only. */
+export const googleSavedProjects = () => invoke<string[]>("google_saved_projects");
+
 /** Pull events from every selected calendar (all providers) into the local mirror; returns the count. */
 export const syncCalendar = () => invoke<number>("sync_calendar");
 
@@ -1045,10 +1054,11 @@ export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid }
 export const driveStatus = () => invoke<DriveStatus>("drive_status");
 
 /** Connect a Google Drive account — opens the browser; resolves with the connected account. Pass an
- *  account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection path);
- *  omit both to use the shared group client. */
-export const connectDrive = (clientId?: string, clientSecret?: string) =>
-  invoke<DriveAccount>("connect_drive", { clientId, clientSecret });
+ *  account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection path), or
+ *  `account` to reuse the project already saved for that account (see {@link googleSavedProjects});
+ *  omit all three to use the shared group client. */
+export const connectDrive = (clientId?: string, clientSecret?: string, account?: string) =>
+  invoke<DriveAccount>("connect_drive", { clientId, clientSecret, account });
 
 /** Disconnect one account: forget its token + flag its items unreachable (kept findable). Names the
  *  features that still use the account, which kept PM's access at Google alive. */

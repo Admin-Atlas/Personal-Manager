@@ -42,9 +42,10 @@ pub(super) fn own_client(
 // same OAuth client, so they share one grant at Google — and revoking ANY of their tokens removes
 // that whole grant ("Revocation removes all OAuth 2.0 scopes previously granted to a project", per
 // Google's native-app OAuth guide). They also share the account's own client when it has one (an
-// Advanced-Protection account; `google::client_creds_for_key` resolves it from the email suffix of
-// every Google token key). So a disconnect may revoke, or forget that client, only when it is the
-// last PM feature still using the account. Both Google disconnects decide that here, in one place.
+// Advanced-Protection account; every token that client minted refreshes through it, see
+// `google::client_creds_for_token`). So a disconnect may revoke, or forget that client, only when it
+// is the last PM feature still using the account. Both Google disconnects decide that here, in one
+// place.
 
 /// One PM feature that signs in to a Google account. Serialized into [`GoogleDisconnect`], whose
 /// strings the UI's `GoogleUse` union mirrors.
@@ -68,27 +69,114 @@ pub struct GoogleDisconnect {
 /// setting as the user's choice. An empty backup setting means "no backup account" (disconnecting
 /// backup writes `""` rather than deleting the key).
 pub(super) fn google_grant_users(conn: &Connection, email: &str) -> Result<BTreeSet<GoogleUse>> {
-    let mut stmt = conn.prepare(
-        "SELECT service FROM connector_sources \
-         WHERE provider = 'google' AND account_email IS NOT NULL \
-           AND lower(account_email) = lower(?1)",
-    )?;
-    let services: Vec<String> = stmt
-        .query_map(params![email], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    let mut users: BTreeSet<GoogleUse> = services
+    let mut users: BTreeSet<GoogleUse> = google_connector_rows(conn, email)?
         .iter()
-        .filter_map(|s| match s.as_str() {
+        .filter_map(|(s, _)| match s.as_str() {
             crate::calendar::SERVICE => Some(GoogleUse::Calendar),
             crate::drive::SERVICE => Some(GoogleUse::Drive),
             _ => None,
         })
         .collect();
-    let backup = db::get_setting(conn, crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY)?;
-    if backup.is_some_and(|a| !a.is_empty() && a.eq_ignore_ascii_case(email)) {
+    if backup_account(conn)?.is_some_and(|a| a.eq_ignore_ascii_case(email)) {
         users.insert(GoogleUse::Backup);
     }
     Ok(users)
+}
+
+/// The Google connector rows for `email`'s account, as `(service, account_email as stored)`. The
+/// stored spelling matters: each connector builds its keychain token key from it.
+fn google_connector_rows(conn: &Connection, email: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT service, account_email FROM connector_sources \
+         WHERE provider = 'google' AND account_email IS NOT NULL \
+           AND lower(account_email) = lower(?1)",
+    )?;
+    let rows = stmt
+        .query_map(params![email], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// The backup account's email exactly as stored, or `None` when backup is off ("" means off).
+fn backup_account(conn: &Connection) -> Result<Option<String>> {
+    Ok(
+        db::get_setting(conn, crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY)?
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty()),
+    )
+}
+
+/// The keychain token keys of every grant `email`'s account holds in PM, each built from the spelling
+/// its owner saved it under: the connector rows, plus the backup's Drive-key token — which has no
+/// connector row when the account backs up without being a Drive connector (a backup-only first
+/// connect, or a Drive disconnect that kept the token for backup). De-duplicated.
+pub(super) fn google_grant_token_keys(conn: &Connection, email: &str) -> Result<Vec<String>> {
+    let mut keys: Vec<String> = google_connector_rows(conn, email)?
+        .into_iter()
+        .filter_map(|(service, stored)| crate::secrets::token_key_for("google", &service, &stored))
+        .collect();
+    if let Some(backup) = backup_account(conn)?.filter(|b| b.eq_ignore_ascii_case(email)) {
+        keys.push(crate::drive::account_token_key(&backup));
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+/// Before an account's own client is saved (or replaced), pin each grant the account already holds
+/// (`token_keys`, from [`google_grant_token_keys`]) to the client it refreshes through now, so the
+/// new client can't redirect an older token. Per key, by that key's own spelling — the same legacy
+/// rule the refresh applies — not by the connect's email. Only tokens saved before minting clients
+/// were recorded are touched.
+pub(super) async fn pin_existing_grants(token_keys: &[String]) -> Result<()> {
+    for key in token_keys {
+        crate::google::pin_legacy_token(key).await?;
+    }
+    Ok(())
+}
+
+/// Every spelling a Google account PM signs in to is stored under — the connector rows plus the
+/// backup account — de-duplicated exactly, in first-stored order. The candidates for "use the project
+/// already saved for this account". Every spelling is kept, not one per person, because an own client
+/// saved before 3.139.8 sits under exactly the spelling its connector used, and only that spelling's
+/// lookup falls back to it; the caller de-duplicates people after resolving.
+pub(super) fn google_account_emails(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_email FROM connector_sources \
+         WHERE provider = 'google' AND account_email IS NOT NULL ORDER BY created_at",
+    )?;
+    let mut stored: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect();
+    stored.extend(backup_account(conn)?);
+    let mut seen = BTreeSet::new();
+    stored.retain(|e| seen.insert(e.clone()));
+    Ok(stored)
+}
+
+/// The account a connect should sign in as through its saved project: blank means none.
+pub(super) fn saved_project_account(account: Option<String>) -> Option<String> {
+    account
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+}
+
+/// The error for a sign-in that picked a different account in Google's chooser than the one asked for.
+///
+/// PM drops that sign-in without revoking it. With `include_granted_scopes` the token Google returns
+/// may be an EXISTING grant the account already gave this project — on another PM install, say — and
+/// a revoke would end that one too; this device can't tell the two apart, so it leaves the choice to
+/// the user.
+pub(super) fn wrong_account(expected: &str, signed_in_as: &str) -> Error {
+    Error::Other(format!(
+        "You chose {expected} but signed in as {signed_in_as}. Pick the same account in Google's \
+         chooser. PM didn't keep the {signed_in_as} sign-in; if you don't use PM with that \
+         account anywhere, you can remove its access at myaccount.google.com/permissions."
+    ))
 }
 
 /// What one Google disconnect may release, given every feature using the account
@@ -279,6 +367,86 @@ mod tests {
         assert_eq!(
             google_grant_users(&conn, "nobody@example.com").unwrap(),
             set(&[])
+        );
+    }
+
+    /// The candidates for "use the project already saved for this account": each Google account once,
+    /// whichever connector spelled it how, plus the backup account; never Outlook or an iCal feed.
+    #[test]
+    fn google_account_emails_lists_each_google_account_once() {
+        let (_dir, conn) = temp_db();
+        crate::calendar::upsert_source(
+            &conn,
+            &crate::calendar::google_account_id("ap@example.com"),
+            "google",
+            Some("ap@example.com"),
+            "ap@example.com",
+        )
+        .unwrap();
+        crate::drive::upsert_account(&conn, "AP@example.com", "AP").unwrap();
+        crate::calendar::upsert_source(
+            &conn,
+            "outlook:work@example.com",
+            "microsoft",
+            Some("work@example.com"),
+            "Work",
+        )
+        .unwrap();
+        crate::calendar::upsert_source(&conn, "ics:abc", "google", None, "Holidays").unwrap();
+        db::set_setting(
+            &conn,
+            crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY,
+            "Backup@Example.com",
+        )
+        .unwrap();
+        // Every stored spelling, once each: an own client saved before 3.139.8 sits under exactly
+        // one of them, so the caller resolves each before de-duplicating people.
+        assert_eq!(
+            google_account_emails(&conn).unwrap(),
+            vec!["ap@example.com", "AP@example.com", "Backup@Example.com"]
+        );
+
+        // Keychain keys come from each connector's own spelling, since that's what it saved under.
+        assert_eq!(
+            google_grant_token_keys(&conn, "ap@example.com").unwrap(),
+            vec![
+                "google_oauth_token_calendar::ap@example.com".to_string(),
+                "google_oauth_token_drive::AP@example.com".to_string(),
+            ]
+        );
+        // A backup-only account has no connector row; its Drive-key token is still one of its
+        // grants, so saving an own client pins it too.
+        assert_eq!(
+            google_grant_token_keys(&conn, "backup@example.com").unwrap(),
+            vec!["google_oauth_token_drive::Backup@Example.com".to_string()]
+        );
+    }
+
+    /// Backup on an account that is also a Drive connector signs in through the same Drive-key token,
+    /// so it adds no second key.
+    #[test]
+    fn a_backup_on_a_drive_account_adds_no_second_key() {
+        let (_dir, conn) = temp_db();
+        crate::drive::upsert_account(&conn, "me@example.com", "Me").unwrap();
+        db::set_setting(
+            &conn,
+            crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY,
+            "me@example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            google_grant_token_keys(&conn, "me@example.com").unwrap(),
+            vec!["google_oauth_token_drive::me@example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_blank_saved_project_account_means_none() {
+        assert_eq!(saved_project_account(None), None);
+        assert_eq!(saved_project_account(Some("  ".into())), None);
+        assert_eq!(
+            saved_project_account(Some(" ap@example.com ".into())).as_deref(),
+            Some("ap@example.com")
         );
     }
 
