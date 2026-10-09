@@ -34,7 +34,7 @@ export function reasonText(reason: ReadOnlyReason): string {
     case "locked":
       return "Google has locked this event's title, time, place and description.";
     case "html_description":
-      return "This description has formatting, so PM shows it as it is rather than edit it as plain text.";
+      return "This description has formatting, so PM shows its text here and can't change it yet.";
     default:
       return unreachable(reason);
   }

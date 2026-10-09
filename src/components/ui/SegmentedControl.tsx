@@ -31,6 +31,8 @@ interface SegmentedControlBaseProps<T extends string> {
   className?: string;
   id?: string;
   "aria-describedby"?: string;
+  /** Shown but not changeable (a value the user may see and not set). */
+  disabled?: boolean;
 }
 
 export type SegmentedControlProps<T extends string> = SegmentedControlBaseProps<T> &
@@ -49,6 +51,7 @@ export function SegmentedControl<T extends string>({
   id,
   "aria-labelledby": ariaLabelledBy,
   "aria-describedby": ariaDescribedBy,
+  disabled,
 }: SegmentedControlProps<T>) {
   return (
     <div
@@ -70,10 +73,18 @@ export function SegmentedControl<T extends string>({
             type="button"
             title={opt.title}
             aria-pressed={active}
+            disabled={disabled}
             onClick={() => onChange(opt.value)}
             className={cn(
-              "inline-flex min-h-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-2.5 py-1 text-xs transition",
-              active ? "bg-accent text-accent-ink font-medium" : "text-ink3 hover:text-ink",
+              "inline-flex min-h-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-2.5 py-1 text-xs transition disabled:cursor-not-allowed",
+              // Disabled is a colour change, no alpha (as Button): the chosen value stays legible
+              // on a neutral fill, the others step down a tier. Never `faint`: the options are
+              // information (what it could be), not decoration (designGuards).
+              active
+                ? disabled
+                  ? "bg-surface text-ink2 font-medium"
+                  : "bg-accent text-accent-ink font-medium"
+                : "text-ink3 enabled:hover:text-ink disabled:text-ink4",
             )}
           >
             {opt.label}

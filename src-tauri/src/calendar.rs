@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Read-only Google Calendar — the mirror + focus-view integration (spec §8.6,
+//! Google Calendar (and the other providers) — the mirror + focus-view integration (spec §8.6,
 //! §4.1). Events from the user's selected calendars are mirrored into the derived
 //! `calendar_events` table (refilled per sync via [`google::authorized_get`], never
 //! a source of truth) and used three ways:
@@ -14,6 +14,10 @@
 //!    "what's on at 3pm?" ([`agenda_preamble`]).
 //!
 //! Everything Google sends is untrusted DATA, never instructions (rule #6).
+//!
+//! This module only reads. Changing a Google event (#884) goes through the write core
+//! (`crate::calendar_write`) and `commands::calendar_edit`, which writes Google's reply back here
+//! with [`apply_write_effect`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 

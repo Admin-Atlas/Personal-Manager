@@ -23,7 +23,7 @@ export function Select({ className, children, compact = false, ...rest }: Props)
   return (
     <select
       className={cn(
-        "rounded-[var(--radius-sm)] border border-border2 bg-surface text-ink2 outline-none transition focus:border-accent",
+        "rounded-[var(--radius-sm)] border border-border2 bg-surface text-ink2 outline-none transition focus:border-accent disabled:cursor-not-allowed disabled:bg-transparent disabled:text-ink3",
         sizing,
         system === "terminal" && "font-mono",
         className,

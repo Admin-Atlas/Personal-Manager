@@ -26,6 +26,8 @@ interface Props {
   value: string;
   /** Fired with the new ISO value ("" when cleared). Only fires when the value actually changes. */
   onCommit: (iso: string) => void;
+  /** Fired with typed text that couldn't be read as a date, when the field gives up on it. */
+  onReject?: (text: string) => void;
   disabled?: boolean;
   /** Applied to the text input (height, padding, font). */
   className?: string;
@@ -43,6 +45,7 @@ interface Props {
 export function DateField({
   value,
   onCommit,
+  onReject,
   disabled,
   className,
   wrapperClassName,
@@ -73,6 +76,9 @@ export function DateField({
   function commitDraft() {
     const parsed = parseDisplay(draft);
     if (parsed === null) {
+      // Typed text that isn't a date: say so to a caller that wants to know (a form that must not
+      // carry on as if it had been entered), then show the stored value again.
+      if (draft.trim() !== "" && draft !== isoToDisplay(value)) onReject?.(draft);
       setDraft(isoToDisplay(value));
       setInvalid(false);
       return;

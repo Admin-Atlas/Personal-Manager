@@ -47,10 +47,13 @@ interface Props {
 
 /** The popover's editing actions. */
 export interface PopoverEditing {
+  /** Offer Edit (something about the event may change). */
+  canEdit: boolean;
   /** Offer Delete. */
   canDelete: boolean;
-  /** Why the event can't be changed, when it can't; shown as a line under the actions. */
+  /** Why the event can't be changed, or a part of it, when that's so; a line under the actions. */
   reason: string | null;
+  onEdit: () => void;
   onDelete: () => void;
 }
 
@@ -348,11 +351,25 @@ export function CalendarEventPopover({
             Open in Project
           </Button>
         )}
+        {editing?.canEdit && (
+          <Button
+            variant="primary"
+            size="sm"
+            className="ml-auto"
+            onClick={() => {
+              // As Delete below: focus back to the chip, for the editor to return it there.
+              restoreFocus();
+              editing.onEdit();
+            }}
+          >
+            Edit
+          </Button>
+        )}
         {editing?.canDelete && (
           <Button
             variant="danger"
             size="sm"
-            className="ml-auto"
+            className={editing.canEdit ? undefined : "ml-auto"}
             onClick={() => {
               // Back to the event's chip first, so the delete dialog that opens next returns
               // focus there when it closes, rather than to this button, which is about to go.

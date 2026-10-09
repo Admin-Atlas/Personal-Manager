@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.143.0-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "You can now change events on your Google calendars from PM. Open an event on the Calendar tab and choose Edit to change its title, time (all day or not, and a time zone for the start and the end), location, description, whether it shows you as busy, and who can see its details. Only what you change is sent to Google.",
+      "If someone changed the same thing in Google while you were editing, PM doesn't overwrite it: it shows you Google's version and keeps the rest of your changes for you to save again. Closing with unsaved changes asks first.",
+      "Editing works on one-off events you organise without guests, on accounts with editing turned on; any other event says why it can't be changed yet.",
+    ],
+  },
+  {
     version: "3.142.0-alpha",
     date: "2026-10-09",
     highlights: [

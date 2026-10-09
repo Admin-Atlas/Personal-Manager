@@ -290,11 +290,13 @@ describe("CalendarEventPopover", () => {
         onClose={() => {}}
       />,
     );
+    expect(queryByRole("button", { name: "Edit" })).toBeNull();
     expect(queryByRole("button", { name: "Delete" })).toBeNull();
     expect(getByRole("dialog").textContent).not.toContain("PM can");
   });
 
-  it("offers Delete when the event can be deleted, and says why when it can't", () => {
+  it("offers Edit and Delete when the event can change, and says why when it can't", () => {
+    const onEdit = vi.fn();
     const onDelete = vi.fn();
     const { getByRole, rerender, queryByRole, getByText } = render(
       <CalendarEventPopover
@@ -304,11 +306,34 @@ describe("CalendarEventPopover", () => {
         color="#000"
         milestone={null}
         onClose={() => {}}
-        editing={{ canDelete: true, reason: null, onDelete }}
+        editing={{ canEdit: true, canDelete: true, reason: null, onEdit, onDelete }}
       />,
     );
+    fireEvent.click(getByRole("button", { name: "Edit" }));
+    expect(onEdit).toHaveBeenCalledOnce();
     fireEvent.click(getByRole("button", { name: "Delete" }));
     expect(onDelete).toHaveBeenCalledOnce();
+
+    // A locked copy: its busy/free can change, but it can't be deleted, and the line says why.
+    rerender(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+        editing={{
+          canEdit: true,
+          canDelete: false,
+          reason: "Google has locked this event's title, time, place and description.",
+          onEdit,
+          onDelete,
+        }}
+      />,
+    );
+    expect(getByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(queryByRole("button", { name: "Delete" })).toBeNull();
 
     rerender(
       <CalendarEventPopover
@@ -318,9 +343,16 @@ describe("CalendarEventPopover", () => {
         color="#000"
         milestone={null}
         onClose={() => {}}
-        editing={{ canDelete: false, reason: "Someone else organises this event.", onDelete }}
+        editing={{
+          canEdit: false,
+          canDelete: false,
+          reason: "Someone else organises this event.",
+          onEdit,
+          onDelete,
+        }}
       />,
     );
+    expect(queryByRole("button", { name: "Edit" })).toBeNull();
     expect(queryByRole("button", { name: "Delete" })).toBeNull();
     expect(getByText("Someone else organises this event.")).toBeTruthy();
   });

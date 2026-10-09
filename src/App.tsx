@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { CONNECTOR_POLL_MS, shouldIncludeSharedWithMe } from "./lib/connectorPoll";
+import { isAnyDialogOpen } from "./lib/useDialogLayer";
 import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
 import { ProviderChip } from "./components/ProviderChip";
@@ -264,12 +265,13 @@ export default function App() {
   }, []);
 
   // Ctrl/Cmd+K toggles the command palette from anywhere (spec §4 — jump
-  // anywhere in a couple of keystrokes).
+  // anywhere in a couple of keystrokes) — except over another dialog: jumping away would unmount
+  // the view behind it, and with it whatever that dialog held (an event editor's unsaved changes).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        setShowPalette((open) => !open);
+        setShowPalette((open) => (open ? false : !isAnyDialogOpen()));
       }
     }
     window.addEventListener("keydown", onKey);
