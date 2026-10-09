@@ -29,6 +29,29 @@ import { useCallback, useEffect, type RefObject } from "react";
 const openDialogs = new Set<HTMLElement>();
 
 /**
+ * Whether any dialog is open anywhere. For a page-level listener (a view's keyboard shortcuts, a
+ * swipe on its grid) that binds to `window` and would otherwise act on the page *behind* a dialog.
+ * Read it at event time, like the predicate below.
+ */
+export function isAnyDialogOpen(): boolean {
+  return openDialogs.size > 0;
+}
+
+/**
+ * Whether a dialog is open that `el` is NOT inside — i.e. `el` sits behind it. A popover or menu that
+ * claims Escape for itself asks this first: when a dialog was opened over it (the command palette over
+ * an open Panels menu, say), the key belongs to that dialog, not to the hidden popover underneath.
+ * Read at event time.
+ */
+export function isCoveredByDialog(el: Element | null): boolean {
+  if (!el) return false;
+  for (const dialog of openDialogs) {
+    if (!dialog.contains(el)) return true;
+  }
+  return false;
+}
+
+/**
  * Register a dialog while it is open, and get back a predicate for "am I the one the keyboard
  * should be talking to?". Read the predicate at EVENT time, never at render time — the set changes
  * whenever any dialog opens or closes, and a value captured during render is stale by then.

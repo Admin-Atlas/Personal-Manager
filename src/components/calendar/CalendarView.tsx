@@ -42,6 +42,8 @@ import {
   type RangeBounds,
 } from "../../lib/calendarPrefs";
 import { useHorizontalWheelShift } from "../../lib/useHorizontalWheelShift";
+import { calendarNavKey } from "../../lib/calendarNavKey";
+import { isAnyDialogOpen } from "../../lib/useDialogLayer";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import { formatDateLocal } from "../../lib/format";
 import {
@@ -397,19 +399,18 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const onFocusDate = useCallback((d: Date) => setCursor(d), []);
 
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
-  // field is focused or a modifier is held (so app shortcuts and text entry are untouched).
+  // field is focused, a modifier is held (so app shortcuts and text entry are untouched), or a dialog
+  // is open over the tab (see `calendarNavKey`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const t = e.target as HTMLElement | null;
-      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
-      if (e.key === "ArrowLeft") {
+      const nav = calendarNavKey(e, isAnyDialogOpen());
+      if (nav === "prev") {
         e.preventDefault();
         onPrev();
-      } else if (e.key === "ArrowRight") {
+      } else if (nav === "next") {
         e.preventDefault();
         onNext();
-      } else if (e.key === "t" || e.key === "T") {
+      } else if (nav === "today") {
         onToday();
       }
     };

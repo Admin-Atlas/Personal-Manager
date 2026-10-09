@@ -36,6 +36,7 @@
 // horizontal scroller and leaves the event alone.
 import { useCallback, useEffect, useRef } from "react";
 import { accumulateShift, horizontalPixels, isHorizontalGesture, withinRect } from "./wheelShift";
+import { isAnyDialogOpen } from "./useDialogLayer";
 
 /**
  * Step `onShift(±n)` as the user swipes sideways over the element this ref is attached to.
@@ -60,6 +61,12 @@ export function useHorizontalWheelShift(
     const onWheel = (e: WheelEvent) => {
       const el = elRef.current;
       if (!el || !enabledRef.current || !isHorizontalGesture(e)) return;
+      // A dialog open over the grid owns the gesture: the bounding-box claim below would otherwise
+      // page the grid behind it (Modal doesn't portal, so a dialog sits inside the grid's box).
+      if (isAnyDialogOpen()) {
+        carry = 0;
+        return;
+      }
       const target = e.target;
       const owned =
         (target instanceof Node && el.contains(target)) ||

@@ -16,8 +16,9 @@
 // has to hold, and only a class-level assertion can state it.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+import { Modal } from "./Modal";
 import { Popover } from "./Popover";
 
 // jsdom ships no ResizeObserver, and the escape-clipping branch constructs one to re-place the panel
@@ -73,6 +74,65 @@ describe("Popover stacking", () => {
     const panel = open(false);
     expect(panel.className).toContain("absolute");
     expect(zClasses(panel)).toEqual(["z-30"]);
+  });
+
+  // A picker inside a dialog: Popover listens for Escape on `document`, the dialog on `window`, so
+  // without stopping the key one press closed both — the date picker AND the editor around it.
+  it("closes only itself on Escape when it sits inside a dialog", () => {
+    const onDialogClose = vi.fn();
+    render(
+      <Modal open onClose={onDialogClose} label="Edit event">
+        <Popover
+          ariaLabel="Pick a date"
+          trigger={({ toggle }) => (
+            <button type="button" onClick={toggle}>
+              Open
+            </button>
+          )}
+        >
+          <span>panel body</span>
+        </Popover>
+      </Modal>,
+    );
+    fireEvent.click(screen.getByText("Open"));
+    expect(screen.queryByRole("group", { name: "Pick a date" })).not.toBeNull();
+    fireEvent.keyDown(screen.getByText("panel body"), { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Pick a date" })).toBeNull();
+    expect(onDialogClose).not.toHaveBeenCalled();
+    // With the picker closed, the next Escape reaches the dialog.
+    fireEvent.keyDown(screen.getByText("Open"), { key: "Escape" });
+    expect(onDialogClose).toHaveBeenCalledTimes(1);
+  });
+
+  // The other direction: a dialog opened OVER an open popover (Ctrl+K's palette over an open Panels
+  // menu). The key is the dialog's — the hidden popover must not swallow it and pull focus behind.
+  it("leaves Escape to a dialog opened over it", () => {
+    const onDialogClose = vi.fn();
+    function Page({ dialogOpen }: { dialogOpen: boolean }) {
+      return (
+        <>
+          <Popover
+            ariaLabel="Panels"
+            trigger={({ toggle }) => (
+              <button type="button" onClick={toggle}>
+                Panels
+              </button>
+            )}
+          >
+            <span>panel body</span>
+          </Popover>
+          <Modal open={dialogOpen} onClose={onDialogClose} label="Command palette">
+            <input aria-label="Search" />
+          </Modal>
+        </>
+      );
+    }
+    const { rerender } = render(<Page dialogOpen={false} />);
+    fireEvent.click(screen.getByText("Panels"));
+    rerender(<Page dialogOpen />);
+    fireEvent.keyDown(screen.getByLabelText("Search"), { key: "Escape" });
+    expect(onDialogClose).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("group", { name: "Panels" })).not.toBeNull();
   });
 
   it("never emits two z-index utilities", () => {

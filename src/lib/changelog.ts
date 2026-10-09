@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.139.11-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "With Settings or any other window open over the Calendar tab, the ← / → arrow keys and T no longer flip the calendar behind it.",
+      "Pressing Escape in a date picker or menu inside a window now closes just the picker, not the whole window with it.",
+    ],
+  },
+  {
     version: "3.139.10-alpha",
     date: "2026-10-09",
     highlights: [
