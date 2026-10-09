@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { ReadOnlyReason, WriteOutcome } from "../types";
 import {
   conflictFields,
+  deleteText,
   listFields,
   loadText,
   outcomeText,
@@ -57,11 +58,12 @@ describe("edit reasons", () => {
       { outcome: "read_only", reason: "locked" },
       { outcome: "busy" },
       { outcome: "reauth" },
+      { outcome: "unconfirmed" },
       { outcome: "failed", message: "Google didn't accept the change: Invalid start" },
     ];
     for (const o of outcomes) {
       expect(outcomeText(o).text.length).toBeGreaterThan(0);
-      expect(outcomeText(o, "delete").text.length).toBeGreaterThan(0);
+      expect(deleteText(o, "Dentist").text).toContain("“Dentist”");
     }
     // The named fields are the ones the editor will show Google's version of, so the line doesn't
     // promise the user's edits to them survive.
@@ -74,17 +76,32 @@ describe("edit reasons", () => {
     expect(outcomeText({ outcome: "read_only", reason: "locked" }).text).toBe(reasonText("locked"));
   });
 
-  it("speaks of a delete as a delete", () => {
-    // A delete that landed comes back as `saved`.
-    expect(outcomeText({ outcome: "saved", warnings: [] }, "delete").text).toBe("Deleted.");
-    expect(outcomeText({ outcome: "conflict", fields: ["start", "end"] }, "delete").text).toBe(
-      "Not deleted: this event changed in Google since you opened it (the time).",
+  it("speaks of a delete as a delete, naming the event", () => {
+    // A delete that landed comes back as `saved`, and one that found it gone got what it wanted.
+    expect(deleteText({ outcome: "saved", warnings: [] }, "Dentist")).toEqual({
+      tone: "ok",
+      text: "Deleted “Dentist”.",
+    });
+    expect(deleteText({ outcome: "gone" }, "Dentist").tone).toBe("ok");
+    expect(deleteText({ outcome: "conflict", fields: ["start", "end"] }, "Dentist")).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't deleted. It changed in Google since you opened it (the time).",
+    });
+    expect(deleteText({ outcome: "busy" }, " ").text).toBe(
+      "“(no title)” wasn't deleted. Google is busy right now; try again in a moment.",
     );
-    expect(outcomeText({ outcome: "busy" }, "delete").text).toMatch(/nothing was deleted/);
+    // An answer that never arrived is never reported as "wasn't deleted": it may have been.
+    expect(deleteText({ outcome: "unconfirmed" }, "Dentist")).toEqual({
+      tone: "warn",
+      text: "PM lost touch with Google before it could confirm whether “Dentist” was deleted. Refresh the calendar to see.",
+    });
   });
 
   it("explains an editor that couldn't open, and a draft that can't be saved", () => {
-    expect(loadText({ outcome: "gone" })).toBe("This event has been deleted in Google.");
+    // A 404 can also mean the calendar stopped being visible, so "gone" doesn't claim a deletion.
+    expect(loadText({ outcome: "gone" })).toBe(
+      "This event is no longer in Google: it was deleted there, or this account can't see it any more.",
+    );
     expect(loadText({ outcome: "failed", message: "Offline." })).toBe("Offline.");
     expect(problemText({ kind: "gap", half: "start", zone: "Europe/London", time: "01:30" })).toBe(
       "01:30 doesn't happen in Europe/London that night: the clocks skip it. Pick a time outside that hour.",

@@ -90,35 +90,22 @@ export type Tone = "ok" | "warn" | "error";
 
 const REAUTH =
   "Google needs you to sign in again. Reconnect the account in Settings › Connectors, then try again.";
-const GONE = "This event has been deleted in Google.";
+// A 404 doesn't say which: the event was deleted, or the calendar stopped being visible to the account.
+const GONE =
+  "This event is no longer in Google: it was deleted there, or this account can't see it any more.";
 
-/** What a save (`kind: "save"`) or a delete came to, and how it should look. A delete reports
- *  success as `saved` too, so the kind picks the words. A conflict names the fields Google changed;
- *  it promises only that nothing was saved over them (the editor, rebasing onto Google's copy, says
- *  which of the user's changes Google's replaced). */
-export function outcomeText(
-  outcome: WriteOutcome,
-  kind: "save" | "delete" = "save",
-): { tone: Tone; text: string } {
-  const del = kind === "delete";
+/** What a save came to, and how it should look. A conflict names the fields Google changed; it
+ *  promises only that nothing was saved over them (the editor, rebasing onto Google's copy, says
+ *  which of the user's changes Google's replaced). Deletes have their own words: `deleteText`. */
+export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string } {
   switch (outcome.outcome) {
-    case "saved": {
-      const pending = outcome.warnings.includes("mirror_refresh_pending");
-      if (del) {
-        return {
-          tone: "ok",
-          text: pending
-            ? "Deleted from Google. PM's calendar will catch up after the next refresh."
-            : "Deleted.",
-        };
-      }
+    case "saved":
       return {
         tone: "ok",
-        text: pending
+        text: outcome.warnings.includes("mirror_refresh_pending")
           ? "Saved to Google. PM's calendar will show it after the next refresh."
           : "Saved.",
       };
-    }
     case "no_change":
       return { tone: "ok", text: "Nothing to save: Google already has this." };
     case "conflict": {
@@ -126,9 +113,7 @@ export function outcomeText(
       const what = fields.length ? ` (the ${listFields(fields)})` : "";
       return {
         tone: "warn",
-        text: del
-          ? `Not deleted: this event changed in Google since you opened it${what}.`
-          : `This event changed in Google while you were editing${what}. Nothing was saved over it.`,
+        text: `This event changed in Google while you were editing${what}. Nothing was saved over it.`,
       };
     }
     case "gone":
@@ -138,14 +123,63 @@ export function outcomeText(
     case "busy":
       return {
         tone: "warn",
-        text: del
-          ? "Google is busy right now, so nothing was deleted. Try again in a moment."
-          : "Google is busy right now. Try again in a moment; your changes are still here.",
+        text: "Google is busy right now. Try again in a moment; your changes are still here.",
       };
     case "reauth":
       return { tone: "error", text: REAUTH };
+    case "unconfirmed":
+      return {
+        tone: "warn",
+        text: "PM lost touch with Google before it could confirm this save. Refresh the calendar to see whether it went through.",
+      };
     case "failed":
       return { tone: "error", text: outcome.message };
+    default:
+      return unreachable(outcome);
+  }
+}
+
+/** What a delete of the event called `title` came to, as one sentence naming it. A delete that
+ *  lands reports `saved`; one that found the event already gone has what it wanted. */
+export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; text: string } {
+  const t = `“${title.trim() || "(no title)"}”`;
+  const notDeleted = (why: string, tone: Tone = "error") => ({
+    tone,
+    text: `${t} wasn't deleted. ${why}`,
+  });
+  switch (outcome.outcome) {
+    case "saved":
+      return {
+        tone: "ok",
+        text: outcome.warnings.includes("mirror_refresh_pending")
+          ? `Deleted ${t} from Google. PM's calendar will catch up after the next refresh.`
+          : `Deleted ${t}.`,
+      };
+    case "gone":
+      return {
+        tone: "ok",
+        text: `${t} is no longer in Google: it was deleted there, or this account can't see it any more.`,
+      };
+    case "no_change":
+      return notDeleted("Google had nothing to change.", "warn");
+    case "conflict": {
+      const fields = conflictFields(outcome.fields);
+      const what = fields.length ? ` (the ${listFields(fields)})` : "";
+      return notDeleted(`It changed in Google since you opened it${what}.`, "warn");
+    }
+    case "read_only":
+      return notDeleted(reasonText(outcome.reason));
+    case "busy":
+      return notDeleted("Google is busy right now; try again in a moment.", "warn");
+    case "reauth":
+      return notDeleted(REAUTH);
+    case "unconfirmed":
+      return {
+        tone: "warn",
+        text: `PM lost touch with Google before it could confirm whether ${t} was deleted. Refresh the calendar to see.`,
+      };
+    case "failed":
+      return notDeleted(outcome.message);
     default:
       return unreachable(outcome);
   }

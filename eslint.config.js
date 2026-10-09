@@ -33,7 +33,13 @@ const IPC_BOUNDARY = [
 // backs all this with a text check that dynamic imports can't slip past.
 const CALENDAR_WRITES = {
   regex: "(^|/)ipc$",
-  importNames: ["getCalendarEventForEdit", "updateCalendarEvent", "deleteCalendarEvent"],
+  importNames: [
+    "getCalendarEventForEdit",
+    "updateCalendarEvent",
+    "deleteCalendarEvent",
+    "cancelCalendarDelete",
+    "listHeldDeletes",
+  ],
   message: "Calendar edits go only through src/components/calendar/edit/useEventWrites.ts (#884).",
 };
 

@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.142.0-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "You can delete events from your Google calendars in PM. Open an event on the Calendar tab and choose Delete. For a few seconds afterwards you can press Undo, and if you quit PM in that time, nothing is deleted. PM only deletes the event if its title, time and place are still what you saw: if any of them changed in Google meanwhile, PM leaves it and tells you.",
+      "Delete is offered for one-off events you organise without guests, on accounts with editing turned on. For any other event, its details now say why PM can't change it.",
+      "With an event's details open, the ← and → keys no longer page the calendar behind them.",
+    ],
+  },
+  {
     version: "3.141.1-alpha",
     date: "2026-10-09",
     highlights: [

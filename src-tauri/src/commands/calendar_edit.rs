@@ -33,8 +33,9 @@ use crate::calendar::{self, CalendarEvent, CalendarFacts};
 use crate::calendar_editing::{self, EditingStatus};
 use crate::calendar_write::classify::Verdict;
 use crate::calendar_write::dto::{
-    EditLoad, EventForEdit, EventPatchDraft, FieldPermissions, Notify, ReadOnlyReason, SeenSummary,
-    ShowAs, TimeDraft, Visibility, WriteOutcome,
+    DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft, FieldPermissions,
+    HeldDeleteInfo, Notify, ReadOnlyReason, SeenSummary, ShowAs, TimeDraft, Visibility,
+    WriteOutcome,
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
@@ -55,6 +56,8 @@ pub struct CalendarEditState {
     sessions: Mutex<HashMap<String, EditSession>>,
     /// Mirror rows with a write on its way to Google: a second write to the same event is Busy.
     in_flight: Mutex<HashSet<String>>,
+    /// Deletes waiting out their Undo window.
+    held_deletes: HeldDeletes,
     /// One calendar sync at a time, so a fetch that started earlier can never finish after a later
     /// one has settled a save (plan A23). A second caller waits, then runs.
     pub(crate) sync_lock: tokio::sync::Mutex<()>,
@@ -561,11 +564,7 @@ pub async fn update_calendar_event(
                 }
                 Fetched::Event(_) => {}
                 Fetched::Gone => return Ok(land_gone(&app, target, None)),
-                _ => {
-                    return Ok(WriteOutcome::Failed {
-                        message: UNCONFIRMED.into(),
-                    })
-                }
+                _ => return Ok(WriteOutcome::Unconfirmed),
             }
         }
         match reply.verdict {
@@ -584,17 +583,21 @@ pub async fn update_calendar_event(
     Ok(WriteOutcome::Conflict { fields: Vec::new() })
 }
 
-/// Delete an event, only if what the user saw (`seen`, from the row they clicked) is still what
-/// Google holds. A version changed meanwhile is a conflict, never deleted unseen.
+/// Delete an event after an Undo window (plan Q2). The delete is held here in the backend, so it
+/// outlives the Calendar tab unmounting, and `cancel_calendar_delete` within `UNDO` keeps the event.
+/// When the hold ends the delete goes out only if what the user saw (`seen`, from the row they
+/// clicked) is still what Google holds, and `calendar://delete-settled` says how it ended. If PM quits
+/// during the hold, nothing is deleted. Other writes to the event answer Busy meanwhile.
 #[tauri::command]
 pub async fn delete_calendar_event(
     app: AppHandle,
     window: tauri::Window,
     event_id: String,
     seen: SeenSummary,
-) -> Result<WriteOutcome> {
+) -> Result<DeleteStart> {
     require_main_window(&window)?;
     require_owner(&app)?;
+    let refused = |result| Ok(DeleteStart::Refused { result });
     let state = app.state::<AppState>();
     let (target, choice) = {
         let conn = state.conn()?;
@@ -603,44 +606,228 @@ pub async fn delete_calendar_event(
                 let choice = calendar_editing::choice(&conn, &target.email)?;
                 (target, choice)
             }
-            Err(reason) => return Ok(WriteOutcome::ReadOnly { reason }),
+            Err(reason) => return refused(WriteOutcome::ReadOnly { reason }),
         }
     };
-    let Some(_flight) = InFlight::claim(&state.calendar_edit, &target.row_id) else {
-        return Ok(WriteOutcome::Busy);
+    // Said now rather than after the wait; the rest of the gate needs Google's copy, and runs then.
+    if editing_status(choice, &target.token_key) != EditingStatus::On {
+        return refused(WriteOutcome::ReadOnly {
+            reason: ReadOnlyReason::EditingOff,
+        });
+    }
+    let Some(flight) = InFlight::claim(&state.calendar_edit, &target.row_id) else {
+        return refused(WriteOutcome::Busy);
+    };
+    let claim = flight.hand_off(&app);
+    let undo_token = new_session_id();
+    let undone = state.calendar_edit.held_deletes.hold(
+        &undo_token,
+        &event_id,
+        &seen.summary,
+        Instant::now() + UNDO,
+    )?;
+    let (task_app, token) = (app.clone(), undo_token.clone());
+    tauri::async_runtime::spawn(async move {
+        let _claim = claim;
+        let cancelled = tokio::select! {
+            _ = tokio::time::sleep(UNDO) => false,
+            _ = undone => true,
+        };
+        {
+            let state = task_app.state::<AppState>();
+            // Whoever takes the entry decides: an Undo that got there first wins.
+            if cancelled || !state.calendar_edit.held_deletes.take(&token) {
+                return;
+            }
+        }
+        let result = send_delete(&task_app, &target, &seen).await;
+        let _ = task_app.emit_to(
+            "main",
+            "calendar://delete-settled",
+            DeleteSettled {
+                undo_token: token,
+                event_id,
+                result,
+            },
+        );
+    });
+    Ok(DeleteStart::Held {
+        undo_token,
+        undo_seconds: UNDO.as_secs(),
+    })
+}
+
+/// Undo a held delete. `true` when it was still waiting and now won't be sent; `false` when it had
+/// already gone to Google (or never existed), and `calendar://delete-settled` will say how it ended.
+#[tauri::command]
+pub fn cancel_calendar_delete(
+    app: AppHandle,
+    window: tauri::Window,
+    undo_token: String,
+) -> Result<bool> {
+    require_main_window(&window)?;
+    Ok(app
+        .state::<AppState>()
+        .calendar_edit
+        .held_deletes
+        .cancel(&undo_token))
+}
+
+/// How long a delete waits for Undo. One duration everywhere (plan A15).
+const UNDO: Duration = Duration::from_secs(8);
+
+/// Deletes waiting out their Undo window, by the token the webview holds. Whoever removes a token's
+/// entry decides its fate: `cancel` (the delete is kept) or `take` (it goes to Google). Dropping an
+/// entry without sending also wakes its task as undone, which is how quitting abandons them all.
+#[derive(Default)]
+pub(crate) struct HeldDeletes(Mutex<HashMap<String, Held>>);
+
+/// One held delete: how to undo it, and what a reloaded webview needs to show it again.
+struct Held {
+    undo: tokio::sync::oneshot::Sender<()>,
+    event_id: String,
+    summary: String,
+    until: Instant,
+}
+
+impl HeldDeletes {
+    /// Hold the delete of `event_id` under `token` until `until`; the receiver resolves when it is
+    /// undone (or abandoned).
+    fn hold(
+        &self,
+        token: &str,
+        event_id: &str,
+        summary: &str,
+        until: Instant,
+    ) -> Result<tokio::sync::oneshot::Receiver<()>> {
+        let (undo, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .lock()
+            .map_err(|_| Error::Other("held deletes lock poisoned".into()))?
+            .insert(
+                token.to_string(),
+                Held {
+                    undo,
+                    event_id: event_id.to_string(),
+                    summary: summary.to_string(),
+                    until,
+                },
+            );
+        Ok(rx)
+    }
+
+    /// Undo: `true` when the delete was still waiting.
+    fn cancel(&self, token: &str) -> bool {
+        let held = self.0.lock().ok().and_then(|mut held| held.remove(token));
+        held.map(|h| h.undo.send(())).is_some()
+    }
+
+    /// The wait is over: `true` when nothing undid the delete first, so it goes to Google.
+    fn take(&self, token: &str) -> bool {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|mut held| held.remove(token))
+            .is_some()
+    }
+
+    /// PM is quitting: every waiting delete is dropped, so none can be sent during the shutdown
+    /// work that follows (plan Q2: quitting in the window deletes nothing).
+    fn abandon_all(&self) {
+        if let Ok(mut held) = self.0.lock() {
+            held.clear();
+        }
+    }
+
+    /// The deletes still waiting, for a webview that reloaded.
+    fn list(&self) -> Vec<HeldDeleteInfo> {
+        let Ok(held) = self.0.lock() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        held.iter()
+            .map(|(token, h)| HeldDeleteInfo {
+                undo_token: token.clone(),
+                event_id: h.event_id.clone(),
+                summary: h.summary.clone(),
+                seconds_left: h.until.saturating_duration_since(now).as_secs(),
+            })
+            .collect()
+    }
+}
+
+impl CalendarEditState {
+    /// Drop every held delete (see [`HeldDeletes::abandon_all`]).
+    pub(crate) fn abandon_held_deletes(&self) {
+        self.held_deletes.abandon_all();
+    }
+}
+
+/// The deletes still waiting for their Undo window to end, so a webview that reloaded can show them
+/// again (plan A15).
+#[tauri::command]
+pub fn list_held_deletes(app: AppHandle, window: tauri::Window) -> Result<Vec<HeldDeleteInfo>> {
+    require_main_window(&window)?;
+    Ok(app.state::<AppState>().calendar_edit.held_deletes.list())
+}
+
+/// Send a held delete: a fresh copy, the gate, the "is it still what you saw" rule, then a DELETE
+/// guarded by the etag. Editing is read again here, since it may have been turned off while the
+/// delete waited.
+async fn send_delete(app: &AppHandle, target: &Target, seen: &SeenSummary) -> WriteOutcome {
+    let choice = {
+        let state = app.state::<AppState>();
+        let choice = state
+            .conn()
+            .and_then(|conn| calendar_editing::choice(&conn, &target.email));
+        match choice {
+            Ok(choice) => choice,
+            Err(e) => {
+                return WriteOutcome::Failed {
+                    message: e.to_string(),
+                }
+            }
+        }
     };
     let editing = editing_status(choice, &target.token_key);
     for round in 1..=2 {
-        let fresh = match fetch(&target).await {
+        let fresh = match fetch(target).await {
             Fetched::Event(fresh) => fresh,
-            Fetched::Gone => return Ok(land_gone(&app, &target, None)),
-            Fetched::Reauth => return Ok(WriteOutcome::Reauth),
-            Fetched::Busy => return Ok(WriteOutcome::Busy),
-            Fetched::Failed(message) => return Ok(WriteOutcome::Failed { message }),
+            Fetched::Gone => return land_gone(app, target, None),
+            Fetched::Reauth => return WriteOutcome::Reauth,
+            Fetched::Busy => return WriteOutcome::Busy,
+            Fetched::Failed(message) => return WriteOutcome::Failed { message },
         };
         if patch::is_gone(&fresh) {
-            return Ok(land_gone(&app, &target, Some(&fresh)));
+            return land_gone(app, target, Some(&fresh));
         }
         let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
         if !perms.delete {
-            return Ok(WriteOutcome::ReadOnly {
+            return WriteOutcome::ReadOnly {
                 reason: perms
                     .reasons
                     .first()
                     .copied()
                     .unwrap_or(ReadOnlyReason::CalendarReadOnly),
-            });
+            };
         }
-        match patch::delete_still_matches(&seen, &fresh) {
+        match patch::delete_still_matches(seen, &fresh) {
             DeleteCheck::Matches => {}
-            DeleteCheck::Gone => return Ok(land_gone(&app, &target, Some(&fresh))),
-            DeleteCheck::Changed(fields) => return Ok(WriteOutcome::Conflict { fields }),
+            DeleteCheck::Gone => return land_gone(app, target, Some(&fresh)),
+            DeleteCheck::Changed(fields) => {
+                // Show what Google holds now, so the row that comes back is the changed one and a
+                // second delete compares against it rather than conflicting again.
+                if let Some(row) = calendar::parse_event(&target.calendar_id, &fresh) {
+                    let _ = land(app, target, vec![row], Vec::new());
+                }
+                return WriteOutcome::Conflict { fields };
+            }
         }
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
-            return Ok(WriteOutcome::Failed {
+            return WriteOutcome::Failed {
                 message: "Google sent this event without a version stamp, so PM won't delete it."
                     .into(),
-            });
+            };
         };
         let request = plan::delete_event(
             &target.remote_calendar,
@@ -650,43 +837,37 @@ pub async fn delete_calendar_event(
         );
         let reply = match google_io::send(&target.token_key, &request).await {
             Ok(reply) => reply,
-            Err(Error::Reauth(_)) => return Ok(WriteOutcome::Reauth),
+            Err(Error::Reauth(_)) => return WriteOutcome::Reauth,
             // No answer: look. Gone means it landed; still there means it didn't.
             Err(_) => {
-                return Ok(match still_there(&target).await {
-                    Some(false) => land_deleted(&app, &target, &fresh),
+                return match still_there(target).await {
+                    Some(false) => land_deleted(app, target, &fresh),
                     Some(true) => WriteOutcome::Failed {
                         message: "PM lost touch with Google, and the event is still there. \
                                   Nothing was deleted; try again."
                             .into(),
                     },
-                    None => WriteOutcome::Failed {
-                        message: UNCONFIRMED.into(),
-                    },
-                })
+                    None => WriteOutcome::Unconfirmed,
+                }
             }
         };
         // A server error on the way may have been applied (a retry of a delete that landed is
         // answered 412 or 410): look before reporting anything but success.
         if reply.maybe_applied && !matches!(reply.verdict, Verdict::Ok | Verdict::Gone) {
-            match still_there(&target).await {
-                Some(false) => return Ok(land_deleted(&app, &target, &fresh)),
+            match still_there(target).await {
+                Some(false) => return land_deleted(app, target, &fresh),
                 Some(true) => {}
-                None => {
-                    return Ok(WriteOutcome::Failed {
-                        message: UNCONFIRMED.into(),
-                    })
-                }
+                None => return WriteOutcome::Unconfirmed,
             }
         }
         match reply.verdict {
             // 2xx, or already gone: either way it's gone from Google now.
-            Verdict::Ok | Verdict::Gone => return Ok(land_deleted(&app, &target, &fresh)),
+            Verdict::Ok | Verdict::Gone => return land_deleted(app, target, &fresh),
             Verdict::Conflict if round == 1 => continue,
-            verdict => return Ok(outcome_for(verdict, editing)),
+            verdict => return outcome_for(verdict, editing),
         }
     }
-    Ok(WriteOutcome::Conflict { fields: Vec::new() })
+    WriteOutcome::Conflict { fields: Vec::new() }
 }
 
 // --- around the I/O ---
@@ -755,9 +936,7 @@ async fn after_lost_answer(
                       try again."
                 .into(),
         },
-        _ => WriteOutcome::Failed {
-            message: UNCONFIRMED.into(),
-        },
+        _ => WriteOutcome::Unconfirmed,
     }
 }
 
@@ -770,10 +949,6 @@ async fn still_there(target: &Target) -> Option<bool> {
         _ => None,
     }
 }
-
-/// A write whose answer never arrived, and whose result couldn't be checked either.
-const UNCONFIRMED: &str = "PM lost touch with Google before it could confirm this. Refresh the \
-                           calendar to see whether it went through.";
 
 /// What a settled verdict means for the user.
 fn outcome_for(verdict: Verdict, editing: EditingStatus) -> WriteOutcome {
@@ -956,11 +1131,36 @@ impl<'a> InFlight<'a> {
             row_id: row_id.to_string(),
         })
     }
+
+    /// Keep the claim past this command: a held delete's task holds it through the wait and the
+    /// send, so the event answers Busy all that time.
+    fn hand_off(self, app: &AppHandle) -> HeldClaim {
+        // The claim moves into the returned value, so this one must not release it on drop.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        HeldClaim {
+            app: app.clone(),
+            row_id: std::mem::take(&mut this.row_id),
+        }
+    }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         if let Ok(mut rows) = self.edit.in_flight.lock() {
+            rows.remove(&self.row_id);
+        }
+    }
+}
+
+/// A claim that outlives the command that took it ([`InFlight::hand_off`]); released on drop.
+struct HeldClaim {
+    app: AppHandle,
+    row_id: String,
+}
+
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        if let Ok(mut rows) = self.app.state::<AppState>().calendar_edit.in_flight.lock() {
             rows.remove(&self.row_id);
         }
     }
@@ -1226,6 +1426,50 @@ mod tests {
             json!({ "location": "" }).as_object().unwrap(),
         );
         assert!(base.get("location").is_none());
+    }
+
+    /// Undo and the end of the wait race for one entry, and whichever gets it decides.
+    #[test]
+    fn a_held_delete_is_either_undone_or_sent_never_both() {
+        let held = HeldDeletes::default();
+        let until = Instant::now() + UNDO;
+        let mut undone = held.hold("a", "cal:a", "Dentist", until).unwrap();
+        assert!(held.cancel("a"), "still waiting, so undone");
+        assert!(undone.try_recv().is_ok(), "the waiting task hears it");
+        assert!(!held.take("a"), "so the wait's end doesn't send it");
+
+        let _rx = held.hold("b", "cal:b", "Gym", until).unwrap();
+        assert!(held.take("b"), "the wait ended first: it goes to Google");
+        assert!(!held.cancel("b"), "too late to undo");
+
+        assert!(!held.cancel("never-held"));
+    }
+
+    /// Quitting drops every waiting delete: each task wakes as undone, and none can be taken.
+    #[test]
+    fn quitting_abandons_every_held_delete() {
+        let held = HeldDeletes::default();
+        let until = Instant::now() + UNDO;
+        let mut a = held.hold("a", "cal:a", "Dentist", until).unwrap();
+        let _b = held.hold("b", "cal:b", "Gym", until).unwrap();
+        assert_eq!(held.list().len(), 2);
+        let listed = held
+            .list()
+            .into_iter()
+            .find(|h| h.undo_token == "a")
+            .unwrap();
+        assert_eq!(
+            (listed.event_id.as_str(), listed.summary.as_str()),
+            ("cal:a", "Dentist")
+        );
+        assert!(listed.seconds_left <= UNDO.as_secs());
+        held.abandon_all();
+        assert!(
+            a.try_recv().is_err(),
+            "the sender is gone: the task's wait ends as undone"
+        );
+        assert!(!held.take("a") && !held.take("b"));
+        assert!(held.list().is_empty());
     }
 
     #[test]

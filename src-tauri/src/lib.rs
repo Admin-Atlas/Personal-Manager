@@ -1776,6 +1776,8 @@ pub fn run() {
             commands::get_calendar_event_for_edit,
             commands::update_calendar_event,
             commands::delete_calendar_event,
+            commands::cancel_calendar_delete,
+            commands::list_held_deletes,
             commands::connect_outlook_calendar,
             commands::disconnect_outlook_calendar,
             commands::list_ics_feeds,
@@ -1934,6 +1936,11 @@ pub fn run() {
             // narrows the window rather than closing it, and it is deliberately the belt to the
             // braces of clearing the webview's own storage before the directory behind it goes.
             if matches!(event, tauri::RunEvent::Exit) {
+                // First: no calendar delete still in its Undo window may go to Google during the
+                // shutdown work below (it can take seconds), since quitting is meant to cancel it.
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.calendar_edit.abandon_held_deletes();
+                }
                 if paths::data_dir_is_purged() {
                     wipe::final_sweep_after_purge(app);
                 }
