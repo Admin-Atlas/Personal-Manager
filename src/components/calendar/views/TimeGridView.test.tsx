@@ -7,7 +7,7 @@
 // touches (#884), not in the all-day strip: one piece per day, each opening the same event, and only
 // the first a tab stop. All-day events still go to the strip.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 
@@ -86,5 +86,28 @@ describe("TimeGridView", () => {
     ]);
     expect(screen.getByText("all-day")).toBeTruthy();
     expect(screen.getAllByRole("button", { name: "Holiday" })).toHaveLength(1);
+  });
+
+  // Google's look: the fill is the colour the event was given, solid, in that colour's text colour; the
+  // stripe stays its calendar's.
+  it("fills an event given its own colour with it, keeping the calendar's stripe", () => {
+    grid([
+      ev({
+        id: "c",
+        summary: "Coloured",
+        start: "2026-10-12T09:00:00",
+        end: "2026-10-12T10:00:00",
+        color_id: "1",
+      }),
+      ev({ id: "p", summary: "Plain", start: "2026-10-12T11:00:00", end: "2026-10-12T12:00:00" }),
+    ]);
+    const coloured = screen.getByRole("button", { name: /Coloured/ });
+    const plain = screen.getByRole("button", { name: /Plain/ });
+    // (jsdom reports a plain colour in rgb() form.)
+    expect(coloured.style.background).toBe("rgb(121, 134, 203)");
+    expect(coloured.style.borderLeftColor).toBe("rgb(51, 102, 153)");
+    expect(within(coloured).getByText("Coloured").style.color).toBe("rgb(31, 31, 31)");
+    expect(plain.style.background).toContain("#336699 18%");
+    expect(within(plain).getByText("Plain").style.color).toBe("");
   });
 });

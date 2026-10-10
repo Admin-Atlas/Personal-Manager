@@ -175,7 +175,9 @@ Contrast level lifts it, so the text ramp stops at `ink4` and a guard test enfor
 `--accent --accent-text --accent-ink
 --accent-soft`; status `--st-due --st-blocked --st-quick --st-look --st-part --st-track`; type
 `--head --ui --mono`; corners `--radius --radius-sm`. The only documented hex exceptions are the
-GraphView categorical node palette (`src/theme/graphPalette.ts`) and the fixed modal scrim tint.
+GraphView categorical node palette (`src/theme/graphPalette.ts`), the calendar's per-calendar
+colours (`src/theme/sourcePalette.ts`), the colours Google lets you give one event
+and the text colour each carries (`src/theme/eventPalette.ts`), and the fixed modal scrim tint.
 
 **Fonts are self-hosted** (Newsreader / Hanken Grotesk / JetBrains Mono) — bundled, never a
 font CDN (privacy + offline + CSP `default-src 'self'`).
