@@ -90,7 +90,7 @@ pub async fn connect_drive(
         pin_existing_grants(&keys).await?;
         secrets::set_google_client_for_account(&email, id, secret)?;
     }
-    google::save_token(&drive::account_token_key(&email), &token)?;
+    google::save_consented_token(&drive::account_token_key(&email), &token).await?;
     let conn = state.conn()?;
     drive::upsert_account(&conn, &email, &name)?;
     drive::list_accounts(&conn)?
@@ -129,12 +129,20 @@ pub async fn disconnect_drive(
         }
     }
     {
+        // Under the key's refresh lock (taken before the DB guard, never held across an await with
+        // it), so a refresh already in flight can't save its token back after the delete.
+        let _refresh = crate::oauth_loopback::refresh_lock(&drive::account_token_key(&email)).await;
         let conn = state.conn()?;
         drive::forget_account(&conn, &email, drive_credentials(&plan))?;
+        if plan.revoke {
+            // The revoke ended the whole grant, a calendar write scope included.
+            crate::calendar_editing::forget_write_grant(&conn, &email)?;
+        }
     }
     state.sync_index_only();
     Ok(GoogleDisconnect {
         kept_for: plan.kept_for,
+        calendar_write: false,
     })
 }
 

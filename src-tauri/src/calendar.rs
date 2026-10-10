@@ -184,6 +184,28 @@ pub async fn fetch_calendar_list_with_token(token: &google::Token) -> Result<Vec
     Ok(parse_calendars(&value))
 }
 
+/// Which Google account an IN-HAND token signed in as: its primary calendar's id, which is the
+/// account's address, lowercased like every stored calendar account. One small GET
+/// (`calendarList/primary`) instead of the whole list, for a consent that changes an account PM
+/// already knows rather than registering one. Needs the read scope.
+pub async fn fetch_primary_calendar_id_with_token(token: &google::Token) -> Result<String> {
+    let value = google::get_json_with_token(
+        token,
+        &format!("{CALENDAR_API}/users/me/calendarList/primary"),
+    )
+    .await?;
+    primary_calendar_id(&value).ok_or_else(|| {
+        Error::Other("Google didn't return a primary calendar to identify the account.".into())
+    })
+}
+
+/// The account address from a `calendarList/primary` reply, trimmed and lowercased; `None` when the
+/// reply has no usable id.
+fn primary_calendar_id(value: &serde_json::Value) -> Option<String> {
+    let id = value.get("id")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_lowercase())
+}
+
 /// Fetch events from one Google calendar within `[time_min, time_max]` (RFC3339), with recurring
 /// events expanded to single instances and ordered by start. `mirror_calendar_id` is the owning
 /// [`Calendar::id`] the events are stored under; `remote_id` is Google's own calendar id for the API
@@ -1743,6 +1765,29 @@ mod tests {
             uid: None,
             ..Default::default()
         }
+    }
+
+    /// The editing consent learns its account from `calendarList/primary`: the id is the address, and
+    /// it must compare against the stored (lowercased) account however Google cased it.
+    #[test]
+    fn the_primary_calendar_reply_names_the_account() {
+        let reply = serde_json::json!({
+            "kind": "calendar#calendarListEntry",
+            "id": " Someone@Example.com ",
+            "summary": "Someone",
+            "primary": true,
+            "accessRole": "owner"
+        });
+        assert_eq!(
+            primary_calendar_id(&reply).as_deref(),
+            Some("someone@example.com")
+        );
+        assert_eq!(
+            primary_calendar_id(&serde_json::json!({ "id": "  " })),
+            None
+        );
+        assert_eq!(primary_calendar_id(&serde_json::json!({ "id": 7 })), None);
+        assert_eq!(primary_calendar_id(&serde_json::json!({})), None);
     }
 
     #[test]

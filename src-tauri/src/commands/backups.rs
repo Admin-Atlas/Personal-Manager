@@ -1388,7 +1388,7 @@ pub async fn backup_gdrive_connect(
             return Err(super::shared::wrong_account(expected, &learned_email));
         }
     }
-    google::save_token(&crate::drive::account_token_key(&learned_email), &token)?;
+    google::save_consented_token(&crate::drive::account_token_key(&learned_email), &token).await?;
     let conn = state.conn()?;
     crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, &learned_email)?;
     crate::db::set_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, true)?;

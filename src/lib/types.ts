@@ -868,6 +868,9 @@ export type GoogleUse = "calendar" | "drive" | "backup";
  *  kept PM's access at Google alive. Empty when the disconnect was the last and access was revoked. */
 export interface GoogleDisconnect {
   kept_for: GoogleUse[];
+  /** The kept access still lets PM change the account's calendar events (editing was granted once
+   *  and never revoked). Only a Calendar disconnect sets it. */
+  calendar_write: boolean;
 }
 
 // --- Personal Assistant: Calendar connectors (multi-provider, read-only — cards 6A/6B) ---
@@ -921,7 +924,14 @@ export interface CalendarOverview {
   /** The mirrored band end (RFC3339): the unified view shows an "outside synced range" hint when
    *  the user pages after this. */
   mirror_end: string;
+  /** Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`). */
+  editing: Record<string, EditingStatus>;
 }
+
+/** Calendar editing for one Google account (`calendar_editing::EditingStatus`). `paused` is the
+ *  user's own "Turn off editing" in PM (Google still allows it); `needs_consent` means editing was
+ *  turned on but the account's sign-in no longer carries Google's permission to change events. */
+export type EditingStatus = "off" | "on" | "paused" | "needs_consent";
 
 /** A subscribed iCal feed, without its secret URL (for display). `provider` tags it for grouping. */
 export interface IcsFeedInfo {

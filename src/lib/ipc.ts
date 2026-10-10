@@ -42,6 +42,7 @@ import type {
   DuplicateReport,
   DriveStatus,
   DriveSyncState,
+  EditingStatus,
   Entity,
   Flag,
   FocusRoute,
@@ -1003,6 +1004,17 @@ export const connectGoogleCalendarAccount = (
  *  which kept PM's access at Google alive. */
 export const disconnectGoogleCalendarAccount = (email: string) =>
   invoke<GoogleDisconnect>("disconnect_google_calendar_account", { email });
+
+/** Turn on editing for a connected Google Calendar account (by its email as listed) — opens the
+ *  browser for Google's consent. Resolves to the account's status: `"off"` when the "change events"
+ *  box was left unticked. Main window only. */
+export const enableCalendarEditing = (email: string) =>
+  invoke<EditingStatus>("enable_calendar_editing", { email });
+
+/** Switch editing off (`paused`) or back on for an account that has it turned on, without asking
+ *  Google. Main window only. */
+export const setCalendarEditingPaused = (email: string, paused: boolean) =>
+  invoke<EditingStatus>("set_calendar_editing_paused", { email, paused });
 
 /** Connect an Outlook / Microsoft 365 calendar account (Graph OAuth) — opens the browser. */
 export const connectOutlookCalendar = () => invoke<CalendarAccount>("connect_outlook_calendar");

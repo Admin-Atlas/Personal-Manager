@@ -12,6 +12,9 @@ export interface GoogleGrantOutcome {
   service: "calendar" | "drive";
   email: string;
   keptFor: GoogleUse[];
+  /** A Calendar disconnect of an account whose editing was granted: the access Google keeps includes
+   *  permission to change its events, which the note must say. */
+  calendarWrite?: boolean;
 }
 
 const USE_NAME: Record<GoogleUse, string> = {
@@ -37,9 +40,14 @@ function joinNames(names: string[]): string {
  * couldn't manage the backups the old grant made, #600), so "disconnect that too" would be untrue.
  */
 export function googleGrantNote(outcome: GoogleGrantOutcome): string | null {
-  const { service, email, keptFor } = outcome;
+  const { service, email, keptFor, calendarWrite } = outcome;
   if (keptFor.length === 0) return null;
-  const lead = `Disconnected ${email} from ${USE_NAME[service]}. PM still uses this account for ${joinNames(keptFor.map((u) => USE_NAME[u]))}, so Google keeps PM's access to it.`;
+  // Google keeps the whole grant, so the calendar write permission outlives the Calendar disconnect.
+  const including =
+    service === "calendar" && calendarWrite
+      ? ", including the permission to change its calendar events you gave when you turned on editing"
+      : "";
+  const lead = `Disconnected ${email} from ${USE_NAME[service]}. PM still uses this account for ${joinNames(keptFor.map((u) => USE_NAME[u]))}, so Google keeps PM's access to it${including}.`;
   const others = keptFor.filter((u) => u !== "backup").map((u) => USE_NAME[u]);
   if (!keptFor.includes("backup")) {
     return `${lead} To remove PM's access completely, disconnect ${others.length === 1 ? "that" : "those"} too, or remove PM at`;

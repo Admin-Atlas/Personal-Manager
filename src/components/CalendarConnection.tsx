@@ -8,6 +8,8 @@ import {
   connectOutlookCalendar,
   disconnectGoogleCalendarAccount,
   disconnectOutlookCalendar,
+  enableCalendarEditing,
+  setCalendarEditingPaused,
   setCalendarSelected,
   setCalendarQuiet,
   setCalendarKind,
@@ -17,9 +19,11 @@ import type {
   Calendar,
   CalendarAccount,
   CalendarOverview,
+  EditingStatus,
   EventKind,
   GoogleDisconnect,
 } from "../lib/types";
+import { editingTurnedOff } from "../lib/calendarEditing";
 import type { GoogleGrantOutcome } from "../lib/googleGrantNote";
 import { useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
@@ -34,8 +38,8 @@ import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
  *  access is done by the user here (L-3). */
 const MICROSOFT_APPS_URL = "https://account.live.com/consent/Manage";
 
-/** The two read-only OAuth calendar providers. Apple has no desktop OAuth, so it stays a subscription
- *  (see {@link "./IcsFeedSubscription"}). */
+/** The two OAuth calendar providers. Apple has no desktop OAuth, so it stays a (read-only)
+ *  subscription (see {@link "./IcsFeedSubscription"}). */
 type Provider = "google" | "microsoft";
 
 const PROVIDER_META: Record<
@@ -57,11 +61,11 @@ const PROVIDER_META: Record<
     label: "Google Calendar",
     sign_in: "Google sign-in",
     blurb:
-      "Read-only sign-in with your own Google client. Connect one or more Google accounts; PM powers your agenda, schedule questions in chat, and the “Due soon” status when an event names a project.",
+      "Sign in with your own Google client. Connect one or more Google accounts; PM powers your agenda, schedule questions in chat, and the “Due soon” status when an event names a project. PM only reads your calendars unless you turn on editing for an account.",
     connect: connectGoogleCalendarAccount,
     disconnect: disconnectGoogleCalendarAccount,
     disconnectNote:
-      "If Google Drive or backups still use this account, PM keeps Google's permission for them (and the account's own sign-in client, if it has one) and tells you so. Otherwise PM also asks Google to remove its access.",
+      "If Google Drive or backups still use this account, PM keeps Google's permission for them (and the account's own sign-in client, if it has one) and tells you so; if you turned on editing, that permission still covers changing this calendar's events. Otherwise PM also asks Google to remove its access.",
   },
   microsoft: {
     label: "Outlook Calendar",
@@ -76,10 +80,10 @@ const PROVIDER_META: Record<
 };
 
 /**
- * **Calendar connection** (read-only OAuth) — the per-provider account + calendar manager under the
+ * **Calendar connection** (OAuth) — the per-provider account + calendar manager under the
  * Connectors tab's Google / Microsoft groups. Google Calendar and Outlook are near-identical (the only
- * differences are the connect/disconnect commands and a few labels), so one provider-parameterised
- * component serves both rather than two duplicated files.
+ * differences are the connect/disconnect commands, a few labels, and Google's per-account editing
+ * switch), so one provider-parameterised component serves both rather than two duplicated files.
  *
  * The shared, provider-level BYO OAuth client is set up once at the group level (see
  * {@link "./ConnectorsSettings"}). Once it's configured, this offers Connect → browser, a per-account
@@ -109,11 +113,15 @@ export function CalendarConnection({
   const [note, setNote] = useState<string | null>(null);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  // Returns what it read, so an action can compare it with what was on screen before.
+  const refresh = useCallback(async (): Promise<CalendarOverview | null> => {
     try {
-      setOverview(await calendarOverview());
+      const fresh = await calendarOverview();
+      setOverview(fresh);
+      return fresh;
     } catch (e) {
       setError(String(e));
+      return null;
     }
     // setError is a stable useState setter (via useBusyRun) — listed to satisfy exhaustive-deps.
   }, [setError]);
@@ -145,9 +153,20 @@ export function CalendarConnection({
   const afterConnect = async () => {
     // The own-project path calls this directly, outside `run`, so it clears the grant note itself.
     onGrantOutcome?.(null);
-    await refresh();
+    const editingBefore = overview?.editing ?? {};
+    const fresh = await refresh();
     const n = await syncCalendar().catch(() => 0);
-    setNote(`Connected. Synced ${n} event${n === 1 ? "" : "s"}.`);
+    // Connecting again asks Google for reading only, which turns editing off on that account. Say so,
+    // or editing would just quietly be gone.
+    const turnedOff = editingTurnedOff(editingBefore, fresh?.editing ?? {})
+      .map((id) => fresh?.accounts.find((a) => a.id === id)?.email)
+      .filter((e): e is string => e != null);
+    setNote(
+      `Connected. Synced ${n} event${n === 1 ? "" : "s"}.` +
+        (turnedOff.length > 0
+          ? ` Editing is now off for ${turnedOff.join(", ")}, because connecting again only asks Google for reading. Turn it back on under the account.`
+          : ""),
+    );
     await refresh();
   };
 
@@ -160,7 +179,36 @@ export function CalendarConnection({
   const disconnect = (email: string) =>
     run("disconnect", async () => {
       const out = await meta.disconnect(email);
-      if (out) onGrantOutcome?.({ service: "calendar", email, keptFor: out.kept_for });
+      if (out) {
+        // The backend knows whether the kept grant still covers changing events: editing turned off
+        // in PM (or by a read-only reconnect) leaves Google's grant as it was.
+        onGrantOutcome?.({
+          service: "calendar",
+          email,
+          keptFor: out.kept_for,
+          calendarWrite: out.calendar_write,
+        });
+      }
+      await refresh();
+    });
+
+  // Google asks for both permissions; leaving "change events" unticked keeps the account read-only.
+  // The busy label names the account, so only its own button says "Waiting for Google…".
+  const enableEditing = (email: string) =>
+    run(`editing:${email}`, async () => {
+      const status = await enableCalendarEditing(email);
+      setNote(
+        status === "on"
+          ? `Editing is on for ${email}.`
+          : `Google didn't give PM permission to change events (that box was left unticked), so ${email} stays read-only.`,
+      );
+      await refresh();
+    });
+
+  // Switching off is PM's alone: Google keeps the permission, so switching back needs no sign-in.
+  const pauseEditing = (email: string, paused: boolean) =>
+    run(`pause:${email}`, async () => {
+      await setCalendarEditingPaused(email, paused);
       await refresh();
     });
 
@@ -300,6 +348,15 @@ export function CalendarConnection({
                     onSetKind={setKind}
                     onDisconnect={() => setConfirmEmail(a.email)}
                   />
+                  {provider === "google" && a.email != null && (
+                    <EditingControl
+                      email={a.email}
+                      status={overview.editing[a.id] ?? "off"}
+                      busy={busy}
+                      onEnable={enableEditing}
+                      onPause={pauseEditing}
+                    />
+                  )}
                 </li>
               ))}
             </ul>
@@ -554,6 +611,72 @@ function AccountBlock({
       ) : (
         <p className="mt-1 text-xs text-ink4">No calendars found on this account.</p>
       )}
+    </div>
+  );
+}
+
+/** What each editing status says, and the one action it offers. */
+const EDITING_COPY: Record<
+  EditingStatus,
+  { text: string; action: string; enable: boolean; paused?: boolean }
+> = {
+  off: {
+    text: "Read-only. Turn on editing to create, change and delete this account’s events from PM. Google asks you to allow two things: leave both ticked.",
+    action: "Turn on editing…",
+    enable: true,
+  },
+  on: {
+    text: "Editing on: PM can create, change and delete events on this account’s calendars.",
+    action: "Turn off editing",
+    enable: false,
+    paused: true,
+  },
+  paused: {
+    text: "Editing is off in PM. Google still allows it, so turning it back on doesn’t ask you to sign in.",
+    action: "Turn editing back on",
+    enable: false,
+    paused: false,
+  },
+  needs_consent: {
+    text: "Editing is turned on, but Google no longer gives PM permission to change this account’s events.",
+    action: "Ask Google again…",
+    enable: true,
+  },
+};
+
+/** One Google account's editing switch (#884). Off until the user turns it on through Google's
+ *  consent; once on, switching it off and back is PM's alone, with no sign-in. */
+function EditingControl({
+  email,
+  status,
+  busy,
+  onEnable,
+  onPause,
+}: {
+  email: string;
+  status: EditingStatus;
+  busy: string | null;
+  onEnable: (email: string) => void;
+  onPause: (email: string, paused: boolean) => void;
+}) {
+  const copy = EDITING_COPY[status];
+  return (
+    <div
+      className="mt-1.5 flex items-start justify-between gap-2"
+      data-help="settings-calendar-editing"
+    >
+      <p className={`min-w-0 text-xs ${status === "on" ? "text-ink3" : "text-ink4"}`}>
+        {copy.text}
+      </p>
+      <Button
+        size="sm"
+        variant={copy.enable ? "secondary" : "tertiary"}
+        disabled={busy != null}
+        className="shrink-0"
+        onClick={() => (copy.enable ? onEnable(email) : onPause(email, copy.paused ?? false))}
+      >
+        {busy === `editing:${email}` ? "Waiting for Google…" : copy.action}
+      </Button>
     </div>
   );
 }

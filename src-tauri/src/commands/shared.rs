@@ -62,6 +62,9 @@ pub enum GoogleUse {
 #[derive(Debug, Serialize)]
 pub struct GoogleDisconnect {
     pub kept_for: Vec<GoogleUse>,
+    /// The kept grant still lets PM change the account's calendar events: editing was granted once and
+    /// never revoked ([`crate::calendar_editing::write_granted`]). Only a Calendar disconnect sets it.
+    pub calendar_write: bool,
 }
 
 /// Every PM feature currently signed in to `email`'s Google account. Emails match without regard to
@@ -167,10 +170,10 @@ pub(super) fn saved_project_account(account: Option<String>) -> Option<String> {
 
 /// The error for a sign-in that picked a different account in Google's chooser than the one asked for.
 ///
-/// PM drops that sign-in without revoking it. With `include_granted_scopes` the token Google returns
-/// may be an EXISTING grant the account already gave this project — on another PM install, say — and
-/// a revoke would end that one too; this device can't tell the two apart, so it leaves the choice to
-/// the user.
+/// PM drops that sign-in without revoking it. Google keeps one grant per account and project, so the
+/// token it returns belongs to any grant the account already gave this project — on another PM
+/// install, say — and a revoke would end that one too; this device can't tell the two apart, so it
+/// leaves the choice to the user.
 pub(super) fn wrong_account(expected: &str, signed_in_as: &str) -> Error {
     Error::Other(format!(
         "You chose {expected} but signed in as {signed_in_as}. Pick the same account in Google's \
@@ -206,6 +209,27 @@ pub(super) fn release_plan(users: &BTreeSet<GoogleUse>, leaving: GoogleUse) -> G
         forget_account_client: last,
         keep_own_token: leaving == GoogleUse::Drive && kept_for.contains(&GoogleUse::Backup),
         kept_for,
+    }
+}
+
+// --- changes outside PM ---
+
+/// Whether a command called from the window labelled `label` may change something outside PM (a
+/// Google calendar, from #884). Only the main window: PM's commands aren't ACL-gated per window, so
+/// the always-on-top briefing window can call any of them, and a write belongs where its Undo, its
+/// guest prompt and its errors are shown. Pure, so it's tested without a window.
+pub(super) fn caller_may_write(label: &str) -> bool {
+    label == "main"
+}
+
+/// [`caller_may_write`] as a command guard.
+pub(super) fn require_main_window(window: &tauri::Window) -> Result<()> {
+    if caller_may_write(window.label()) {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "Calendar changes can only be made from PM's main window.".into(),
+        ))
     }
 }
 
@@ -247,6 +271,16 @@ mod tests {
 
     fn set(uses: &[GoogleUse]) -> BTreeSet<GoogleUse> {
         uses.iter().copied().collect()
+    }
+
+    /// Writes outside PM come only from the main window; the briefing window (or any window added
+    /// later) is refused by default.
+    #[test]
+    fn only_the_main_window_may_write() {
+        assert!(caller_may_write("main"));
+        for label in [crate::tray::BRIEFING_LABEL, "Main", "main ", ""] {
+            assert!(!caller_may_write(label), "{label:?}");
+        }
     }
 
     /// Every combination of features on an account, for each feature that can disconnect. A disconnect
@@ -468,8 +502,12 @@ mod tests {
     fn google_use_serializes_to_the_strings_the_ui_names() {
         let json = serde_json::to_string(&GoogleDisconnect {
             kept_for: vec![Calendar, Drive, Backup],
+            calendar_write: true,
         })
         .unwrap();
-        assert_eq!(json, r#"{"kept_for":["calendar","drive","backup"]}"#);
+        assert_eq!(
+            json,
+            r#"{"kept_for":["calendar","drive","backup"],"calendar_write":true}"#
+        );
     }
 }

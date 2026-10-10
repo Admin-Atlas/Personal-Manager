@@ -386,7 +386,11 @@ export const HELP: Record<string, HelpEntry> = {
   // never be shown. Both providers now have their own entry.
   "settings-calendar-google": {
     title: "Google Calendar",
-    body: "Read-only Google sign-in with your own OAuth client. Once connected, pick which calendars to mirror so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. For a no-sign-in option, use a calendar subscription (iCal) instead. Tokens live only in your keychain.",
+    body: "Google sign-in with your own OAuth client. Once connected, pick which calendars to mirror so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. PM only reads your calendars unless you turn on editing for an account. For a no-sign-in option, use a calendar subscription (iCal) instead; subscriptions are always read-only. Tokens live only in your keychain.",
+  },
+  "settings-calendar-editing": {
+    title: "Calendar editing",
+    body: "Lets PM create, change and delete events on this Google account's calendars, including calendars shared with you that you can edit. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
   },
   "settings-calendar-microsoft": {
     title: "Outlook Calendar",

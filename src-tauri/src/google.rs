@@ -7,8 +7,9 @@
 //! a **loopback redirect with PKCE** — PM opens the system browser to Google's
 //! consent screen with `redirect_uri=http://127.0.0.1:<ephemeral-port>`, runs a
 //! one-shot local HTTP server to catch the redirect, and exchanges the code for
-//! tokens. Scopes are **read-only** (spec non-goal #4). Access tokens are refreshed
-//! transparently; the token blob lives only in the keychain, never on disk.
+//! tokens. Scopes are read-only except two opt-ins: `drive.file` for encrypted backups and
+//! `calendar.events` for calendar editing, which the user turns on per account. Access tokens are
+//! refreshed transparently; the token blob lives only in the keychain, never on disk.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,8 +20,13 @@ use crate::secrets;
 
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-/// Read-only calendar scope — PM reads events, never writes (spec non-goal #4).
+/// Read-only calendar scope: every calendar connect asks for it, and the mirror syncs through it.
 pub const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.readonly";
+/// Calendar write scope: create, change and delete events on the calendars the account can edit.
+/// Asked for only by the per-account "Turn on editing" consent, always together with
+/// [`CALENDAR_SCOPE`] (see [`calendar_editing_scopes`]); it can't list calendars by itself. Holding it
+/// is not enough to edit: `crate::calendar_editing` also requires the user's own switch.
+pub const CALENDAR_EVENTS_SCOPE: &str = "https://www.googleapis.com/auth/calendar.events";
 /// Read-only Drive scope — PM reads file metadata + content, never writes. The full-read
 /// `drive.readonly` (not `drive.metadata.readonly`) because index-only ingestion needs each
 /// file's body to embed it.
@@ -30,18 +36,44 @@ pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 /// index (never the full grid). Because a refresh token cannot broaden its grant, adding this scope
 /// means every EXISTING Drive account must re-consent to gain it; PM detects who needs it — offline,
 /// no network — with [`token_has_scope`] and surfaces a per-account "Reconnect for Sheets" prompt.
-/// `build_auth_url`'s `include_granted_scopes=true` unions it onto the account's existing Drive grant.
+/// A Drive consent's `include_granted_scopes=true` ([`merges_granted_scopes`]) unions it onto the
+/// account's existing Drive grant.
 pub const SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets.readonly";
-/// The ONLY Google **write** scope PM ever requests — least-privilege, granted just for
-/// encrypted backup. `drive.file` can create and manage only files/folders the app itself
-/// created (PM's "Personal Manager Backups" folder and its `.pmbackup` archives); it can never
-/// touch the user's other Drive content. Requested via a dedicated re-consent (the connector
-/// scopes are read-only), which UNIONS it with any existing `drive.readonly` grant on the account
-/// because `build_auth_url` sets `include_granted_scopes=true`.
+/// The Drive **write** scope, least-privilege, granted just for encrypted backup (PM's one other
+/// Google write scope is [`CALENDAR_EVENTS_SCOPE`]). `drive.file` can create and manage only
+/// files/folders the app itself created (PM's "Personal Manager Backups" folder and its `.pmbackup`
+/// archives); it can never touch the user's other Drive content. Requested via a dedicated
+/// re-consent (the connector scopes are read-only), which UNIONS it with any existing
+/// `drive.readonly` grant on the account because a Drive consent sets `include_granted_scopes=true`
+/// ([`merges_granted_scopes`]).
 pub const DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 /// The keychain key for the Calendar service's token — passed into the per-service token
 /// helpers below (the connector-generic flow takes a key so Drive accounts get their own).
 pub const CALENDAR_TOKEN_KEY: &str = secrets::GOOGLE_TOKEN_CALENDAR;
+
+/// The scope set of the "Turn on editing" consent: read and write, stated in full. Calendar consents
+/// never ask Google to fold in earlier grants ([`merges_granted_scopes`]), so the read scope the mirror
+/// syncs through has to be asked for again by name.
+pub fn calendar_editing_scopes() -> String {
+    format!("{CALENDAR_SCOPE} {CALENDAR_EVENTS_SCOPE}")
+}
+
+/// Whether the space-separated scope set `scopes` (a token's granted `scope`, or a consent request)
+/// contains `wanted`, compared whole so `calendar` never matches `calendar.readonly`.
+pub fn scope_set_has(scopes: &str, wanted: &str) -> bool {
+    scopes.split_ascii_whitespace().any(|s| s == wanted)
+}
+
+/// Whether a consent for `scope` asks Google to fold the account's earlier grants into the new token
+/// (`include_granted_scopes=true`). Drive and backup consents do: a backup's `drive.file` must land on
+/// the same token as the Drive connector's read scopes, because both use one keychain key. Calendar
+/// consents don't. Google calls incremental authorisation unsupported for installed apps, so what a
+/// merge carries is undefined, and a calendar token is what PM would edit with: a read-only reconnect
+/// must not come back holding a write scope nobody asked for this time. They state their whole scope
+/// set instead ([`calendar_editing_scopes`]).
+fn merges_granted_scopes(scope: &str) -> bool {
+    !scope_set_has(scope, CALENDAR_SCOPE) && !scope_set_has(scope, CALENDAR_EVENTS_SCOPE)
+}
 
 /// The stored OAuth token blob (one keychain entry, JSON). `expiry` is Unix seconds.
 /// The bearer/refresh values are [`Secret`], so the derived `Debug` here can never
@@ -510,7 +542,7 @@ async fn exchange_code(
 /// `force = false` (the proactive path) returns early when the reloaded token is already fresh;
 /// `force = true` (the reactive 401 path) always refreshes, because the token may be revoked, not
 /// merely expired. The client is chosen from that reloaded blob too, under the lock: a consent or
-/// [`pin_minting_client`] that re-saved the blob while we waited may have changed which client it
+/// [`pin_legacy_token`] that re-saved the blob while we waited may have changed which client it
 /// needs, and a refresh token only works with the client that minted it.
 async fn do_refresh(token_key: &str, force: bool) -> Result<Token> {
     let _guard = oauth_loopback::refresh_lock(token_key).await;
@@ -605,6 +637,16 @@ pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
     secrets::set_google_token_for(token_key, &json)
 }
 
+/// Save a token a consent just returned, under the key's refresh lock. A refresh already running for
+/// the key (a sync in flight while the browser was open) loaded the OLD blob and re-saves it when its
+/// round-trip ends; saved outside the lock, the new token could land in between and be overwritten by
+/// a refreshed copy of the old one — losing, say, the calendar write scope the user just granted.
+/// Under the lock the save waits for that refresh, and the next one reloads the new blob.
+pub async fn save_consented_token(token_key: &str, token: &Token) -> Result<()> {
+    let _guard = oauth_loopback::refresh_lock(token_key).await;
+    save_token(token_key, token)
+}
+
 /// A currently-valid bearer access token for `token_key`, refreshing proactively if it's within
 /// 60s of expiry (and re-persisting the refreshed blob). The shared [`authorized_send`] uses this for
 /// its proactive refresh; it's also public so callers that stream their OWN request — the backup
@@ -632,16 +674,59 @@ pub async fn refresh_now(token_key: &str) -> Result<Secret> {
 /// write grant yet (so the scheduler skips a Drive push whose grant was never given or was
 /// revoked). A missing token or missing `scope` field reads as "no".
 pub fn token_has_scope(token_key: &str, scope: &str) -> Result<bool> {
+    Ok(token_scope(token_key)?.is_some_and(|granted| scope_set_has(&granted, scope)))
+}
+
+/// Dev builds only: what the stored token for `token_key` was granted, for the grant report a live
+/// test reads (the `dev_google_grant_report` command). Scopes without Google's URL prefix, and
+/// which kind of client minted it; never a token, a client id or a secret. `None` with no token.
+#[cfg(debug_assertions)]
+pub fn grant_summary(token_key: &str) -> Result<Option<(Vec<String>, &'static str)>> {
     let Some(raw) = secrets::get_google_token_for(token_key)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let token: Token = serde_json::from_str(raw.expose())
         .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))?;
-    Ok(token
+    let scopes = token
         .scope
         .as_deref()
-        .map(|s| s.split(' ').any(|granted| granted == scope))
-        .unwrap_or(false))
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .map(|s| {
+            s.trim_start_matches("https://www.googleapis.com/auth/")
+                .to_string()
+        })
+        .collect();
+    let own = match token_key.rsplit_once("::") {
+        Some((_, email)) => secrets::get_google_client_for_account(email)?.map(|(id, _)| id),
+        None => None,
+    };
+    let shared = secrets::get_google_client_id()?;
+    let client = match (
+        token.client_id.as_deref(),
+        choose_client(
+            token.client_id.as_deref(),
+            own.as_deref(),
+            shared.as_deref(),
+        ),
+    ) {
+        (None, _) => "unrecorded",
+        (Some(_), ClientChoice::Own) => "own",
+        (Some(_), ClientChoice::Shared) => "shared",
+        (Some(_), ClientChoice::Gone) => "gone",
+    };
+    Ok(Some((scopes, client)))
+}
+
+/// The granted scope set of the stored token for `token_key`, or `None` when there's no token or it
+/// never recorded one. Read from the keychain, no network.
+pub fn token_scope(token_key: &str) -> Result<Option<String>> {
+    let Some(raw) = secrets::get_google_token_for(token_key)? else {
+        return Ok(None);
+    };
+    let token: Token = serde_json::from_str(raw.expose())
+        .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))?;
+    Ok(token.scope)
 }
 
 // --- auth URL (PKCE + loopback machinery live in `crate::oauth_loopback`) ---
@@ -651,7 +736,9 @@ pub fn token_has_scope(token_key: &str, scope: &str) -> Result<bool> {
 /// time, so connecting a *second* account actually works — without it, Google silently reuses the
 /// browser's signed-in session and re-grants the same account, which is why "Add another account"
 /// could only ever re-link the first one. `login_hint` (an account PM already knows) starts the
-/// chooser on that account; the user can still pick another. Pure, so it's unit-tested.
+/// chooser on that account; the user can still pick another. `include_granted_scopes` follows the
+/// scope set ([`merges_granted_scopes`]), decided here so no consent can ask otherwise. Pure, so it's
+/// unit-tested.
 pub fn build_auth_url(
     client_id: &str,
     redirect_uri: &str,
@@ -660,6 +747,7 @@ pub fn build_auth_url(
     scope: &str,
     login_hint: Option<&str>,
 ) -> Result<String> {
+    let include_granted = merges_granted_scopes(scope);
     let mut params = vec![
         ("client_id", client_id),
         ("redirect_uri", redirect_uri),
@@ -670,7 +758,10 @@ pub fn build_auth_url(
         ("state", state),
         ("access_type", "offline"),
         ("prompt", "select_account consent"),
-        ("include_granted_scopes", "true"),
+        (
+            "include_granted_scopes",
+            if include_granted { "true" } else { "false" },
+        ),
     ];
     if let Some(hint) = login_hint {
         params.push(("login_hint", hint));
@@ -722,6 +813,46 @@ mod tests {
         assert!(url.contains("login_hint=ap%40example.com"));
         // The chooser stays forced: the hint only picks where it starts.
         assert!(url.contains("prompt=select_account+consent"));
+    }
+
+    /// Calendar consents state their whole scope set and never fold in earlier grants, so a read-only
+    /// reconnect can't come back holding the write scope; Drive and backup consents still merge, which
+    /// is how a backup's `drive.file` joins the Drive connector's read scopes on one token.
+    #[test]
+    fn only_calendar_consents_stop_merging_earlier_grants() {
+        let editing = calendar_editing_scopes();
+        let drive = format!("{DRIVE_SCOPE} {SHEETS_SCOPE}");
+        for (scope, merges) in [
+            (CALENDAR_SCOPE, false),
+            (editing.as_str(), false),
+            (drive.as_str(), true),
+            (DRIVE_FILE_SCOPE, true),
+        ] {
+            assert_eq!(merges_granted_scopes(scope), merges, "{scope}");
+            // The URL every consent opens carries it: the builder derives it from the scope.
+            let url = build_auth_url("c", "http://127.0.0.1:1", "x", "s", scope, None).unwrap();
+            assert!(
+                url.contains(&format!("include_granted_scopes={merges}")),
+                "{url}"
+            );
+        }
+        // The editing consent asks for the read scope by name, since nothing merges it in.
+        assert!(scope_set_has(&editing, CALENDAR_SCOPE));
+        assert!(scope_set_has(&editing, CALENDAR_EVENTS_SCOPE));
+    }
+
+    #[test]
+    fn a_scope_set_matches_whole_scopes_only() {
+        let granted = format!("openid {CALENDAR_SCOPE}  {DRIVE_FILE_SCOPE}");
+        assert!(scope_set_has(&granted, CALENDAR_SCOPE));
+        assert!(scope_set_has(&granted, DRIVE_FILE_SCOPE));
+        assert!(!scope_set_has(&granted, CALENDAR_EVENTS_SCOPE));
+        // A prefix of a granted scope is not that scope.
+        assert!(!scope_set_has(
+            &granted,
+            "https://www.googleapis.com/auth/calendar"
+        ));
+        assert!(!scope_set_has("", CALENDAR_SCOPE));
     }
 
     /// A refresh token only works with the client that minted it, so a token that records its client

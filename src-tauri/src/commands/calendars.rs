@@ -1,18 +1,22 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The read-only calendar mirror: Google, Outlook and iCal accounts, their calendars, and
-//! the shared sync pass over every provider.
+//! The calendar mirror: Google, Outlook and iCal accounts, their calendars, and the shared sync
+//! pass over every provider. Read-only, except that a Google account can have editing turned on
+//! ([`enable_calendar_editing`], #884).
 //!
 //! `set_google_client` / `clear_google_client` live here because that is where they sit in
 //! the Google Calendar flow and `clear_google_client` reads calendar rows — but the BYO
 //! OAuth client they manage is ONE client serving Calendar *and* Drive, so a change here
 //! reaches `connectors` and `backup::schedule` too.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
+use crate::calendar_editing::{self, Choice, ConsentVerdict, EditingStatus};
 use crate::error::{Error, Result};
 use crate::google;
 use crate::{briefing, drive, flags, microsoft, outlook_calendar, secrets, AppState};
@@ -21,7 +25,8 @@ use super::shared::own_client;
 use super::shared::resolve_zone;
 use super::shared::{
     google_account_emails, google_grant_token_keys, google_grant_users, pin_existing_grants,
-    release_plan, saved_project_account, wrong_account, GoogleDisconnect, GoogleUse,
+    release_plan, require_main_window, saved_project_account, wrong_account, GoogleDisconnect,
+    GoogleUse,
 };
 use super::vaults::require_vault_owner;
 
@@ -55,6 +60,9 @@ pub struct CalendarOverview {
     /// range" hint rather than a misleadingly-empty grid.
     pub mirror_start: String,
     pub mirror_end: String,
+    /// Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`).
+    /// Computed here only, from the stored choice and the account's calendar token.
+    pub editing: BTreeMap<String, EditingStatus>,
 }
 
 /// The unified calendar state across every provider. Runs the one-time legacy Google migration first
@@ -63,17 +71,43 @@ pub struct CalendarOverview {
 pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     let _ = migrate_legacy_google_calendar(&app).await;
     let state = app.state::<AppState>();
-    let conn = state.conn()?;
-    let (mirror_start, mirror_end) = calendar::time_window(&conn)?;
+    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices) = {
+        let conn = state.conn()?;
+        (
+            calendar::list_sources(&conn, None)?,
+            calendar::list_calendars(&conn)?,
+            calendar::last_sync(&conn)?,
+            calendar::time_window(&conn)?,
+            calendar_editing::choices(&conn)?,
+        )
+    };
+    // Token scopes come from the keychain, read with the DB lock released. Only an account with a
+    // stored choice needs one: without it, editing is off whatever the token holds.
+    let editing = accounts
+        .iter()
+        .filter(|a| a.provider == "google")
+        .filter_map(|a| {
+            let email = a.email.as_deref()?;
+            let choice = calendar_editing::lookup(&choices, email);
+            let scope = choice
+                .and_then(|_| google::token_scope(&google_calendar_token_key(email)).ok())
+                .flatten();
+            Some((
+                a.id.clone(),
+                calendar_editing::status(choice, scope.as_deref()),
+            ))
+        })
+        .collect();
     Ok(CalendarOverview {
         google_client_configured: google::has_client()?,
         microsoft_client_configured: microsoft::has_client()?,
-        accounts: calendar::list_sources(&conn, None)?,
-        calendars: calendar::list_calendars(&conn)?,
-        last_sync: calendar::last_sync(&conn)?,
+        accounts,
+        calendars,
+        last_sync,
         window_days: calendar::AGENDA_DAYS,
         mirror_start,
         mirror_end,
+        editing,
     })
 }
 
@@ -167,9 +201,12 @@ async fn do_connect_google_calendar(
         pin_existing_grants(&keys).await?;
         secrets::set_google_client_for_account(&email, id, secret)?;
     }
-    google::save_token(&google_calendar_token_key(&email), &token)?;
+    google::save_consented_token(&google_calendar_token_key(&email), &token).await?;
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
+    // A read-only connect asked Google for reading only, so it turns editing off even when the
+    // account had it: only the "Turn on editing" consent sets the choice.
+    calendar_editing::set_choice(&conn, &email, None)?;
     let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
     // Connect UPSERTS the (in-hand, single-page) list but never prunes: a reconnect must not delete
     // page-two calendars a prior full sync registered. The first `sync_calendar` reconcile prunes off
@@ -220,12 +257,22 @@ pub async fn disconnect_google_calendar_account(
             let _ = google::revoke(blob.expose()).await;
         }
     }
+    // The key's refresh lock, taken before the DB guard and held through the delete: a refresh already
+    // in flight would otherwise save its token back after the delete, leaving a live sign-in (one that
+    // may carry the calendar write scope) with no account left to disconnect it.
+    let _refresh = crate::oauth_loopback::refresh_lock(&google_calendar_token_key(&email)).await;
     let conn = state.conn()?;
     // Clear the OAuth token FIRST and propagate a real failure (a locked keychain): dropping the DB
     // source before an un-clearable token would orphan the token with no source left to re-clear it.
     // `secrets::delete` treats a missing entry as success, so a returned Err is a genuine failure.
     secrets::clear_google_token_for(&google_calendar_token_key(&email))?;
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
+    calendar_editing::set_choice(&conn, &email, None)?;
+    // A grant Google keeps still carries the write scope if editing was ever granted; a revoke ends it.
+    let calendar_write = !plan.revoke && calendar_editing::write_granted(&conn, &email)?;
+    if plan.revoke {
+        calendar_editing::forget_write_grant(&conn, &email)?;
+    }
     if plan.forget_account_client {
         // Per-AP client; absent for shared-client accounts. Kept while Drive or backup still
         // refresh through it.
@@ -233,7 +280,117 @@ pub async fn disconnect_google_calendar_account(
     }
     Ok(GoogleDisconnect {
         kept_for: plan.kept_for,
+        calendar_write,
     })
+}
+
+/// Turn on editing for one connected Google Calendar account (`email` as the account list spells it):
+/// a consent for reading AND writing, stated in full, through the client that minted the account's
+/// calendar token, with Google's chooser starting on that account. Classified before anything is
+/// saved ([`calendar_editing::classify_consent`]): another account signing in, or the read box
+/// unticked, changes nothing; the write box unticked keeps the fresh (read-only) token and leaves
+/// editing off, which is the status returned.
+#[tauri::command]
+pub async fn enable_calendar_editing(
+    app: AppHandle,
+    window: tauri::Window,
+    email: String,
+) -> Result<EditingStatus> {
+    require_main_window(&window)?;
+    require_vault_owner(&app)?;
+    let email = email.trim().to_string();
+    let account = calendar::google_account_id(&email);
+    let connected = |conn: &rusqlite::Connection| -> Result<bool> {
+        Ok(calendar::list_sources(conn, Some("google"))?
+            .iter()
+            .any(|a| a.id == account))
+    };
+    let state = app.state::<AppState>();
+    if !connected(&*state.conn()?)? {
+        return Err(Error::Other(
+            "Connect this Google Calendar account first.".into(),
+        ));
+    }
+    let token_key = google_calendar_token_key(&email);
+    let token = google::run_consent_for_key(
+        &token_key,
+        &email,
+        &google::calendar_editing_scopes(),
+        "Google Calendar editing",
+    )
+    .await?;
+    let granted = token.scope.clone().unwrap_or_default();
+    // Which account signed in is read through the calendar list, so only with the read scope.
+    let signed_in_as = if google::scope_set_has(&granted, google::CALENDAR_SCOPE) {
+        Some(calendar::fetch_primary_calendar_id_with_token(&token).await?)
+    } else {
+        None
+    };
+    let verdict = calendar_editing::classify_consent(&email, &granted, signed_in_as.as_deref());
+    match verdict {
+        ConsentVerdict::ReadonlyMissing => {
+            return Err(Error::Other(
+                "Google didn't give PM permission to see your calendars, so nothing changed. Try \
+                 again and leave both boxes ticked: PM needs to see your calendars to keep them in \
+                 sync, as well as to change events."
+                    .into(),
+            ))
+        }
+        ConsentVerdict::WrongAccount { signed_in_as } => {
+            return Err(wrong_account(&email, &signed_in_as))
+        }
+        ConsentVerdict::Enabled | ConsentVerdict::WriteDeclined => {}
+    }
+    // Check, save and record as one step: the key's refresh lock (so a refresh in flight can't save the
+    // old token over this one), then the DB guard, which a Disconnect or Clear client holds across its
+    // own delete, so neither can land between the check and the save. Lock order matches
+    // `disconnect_google_calendar_account`: refresh lock, then DB.
+    let _refresh = crate::oauth_loopback::refresh_lock(&token_key).await;
+    let conn = state.conn()?;
+    // Disconnected while Google's page was open: saving now would leave a token no account owns.
+    if !connected(&conn)? {
+        return Err(Error::Other(
+            "This account was disconnected while Google was asking, so PM didn't keep the sign-in."
+                .into(),
+        ));
+    }
+    google::save_token(&token_key, &token)?;
+    if verdict == ConsentVerdict::Enabled {
+        calendar_editing::set_choice(&conn, &email, Some(Choice::On))?;
+        calendar_editing::mark_write_granted(&conn, &email)?;
+        Ok(EditingStatus::On)
+    } else {
+        calendar_editing::set_choice(&conn, &email, None)?;
+        Ok(EditingStatus::Off)
+    }
+}
+
+/// Switch editing off (`paused`) or back on for an account that has it turned on, without asking
+/// Google: the permission stays granted, PM just stops using it. Returns the account's status.
+#[tauri::command]
+pub fn set_calendar_editing_paused(
+    app: AppHandle,
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    email: String,
+    paused: bool,
+) -> Result<EditingStatus> {
+    require_main_window(&window)?;
+    require_vault_owner(&app)?;
+    let choice = if paused { Choice::Paused } else { Choice::On };
+    {
+        let conn = state.conn()?;
+        if calendar_editing::choice(&conn, &email)?.is_none() {
+            return Err(Error::Other(
+                "Editing isn't turned on for this account.".into(),
+            ));
+        }
+        calendar_editing::set_choice(&conn, &email, Some(choice))?;
+    }
+    let scope = google::token_scope(&google_calendar_token_key(&email))
+        .ok()
+        .flatten();
+    Ok(calendar_editing::status(Some(choice), scope.as_deref()))
 }
 
 /// One-time, online: lift an existing single-account Google Calendar connection (the legacy fixed
@@ -418,6 +575,48 @@ pub fn google_saved_projects(state: State<'_, AppState>) -> Result<Vec<String>> 
     Ok(saved)
 }
 
+/// One stored Google token in the dev grant report.
+#[cfg(debug_assertions)]
+#[derive(Serialize)]
+pub struct GrantReportRow {
+    /// The keychain key: which service, and which account.
+    pub token_key: String,
+    /// Granted scopes, without Google's URL prefix (`calendar.readonly`, `drive.file`, …).
+    pub scopes: Vec<String>,
+    /// Which client minted it: `own`, `shared`, `gone` (no longer saved) or `unrecorded`.
+    pub client: &'static str,
+}
+
+/// Dev builds only: what Google granted each stored Google token, for the live tests of how Google
+/// merges an account's grants (#884's L-U: does a Drive or backup consent pick up the calendar write
+/// scope?). Never a token, a client id or a secret. From the devtools console:
+/// `await window.__TAURI_INTERNALS__.invoke("dev_google_grant_report")`.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn dev_google_grant_report(state: State<'_, AppState>) -> Result<Vec<GrantReportRow>> {
+    let keys = {
+        let conn = state.conn()?;
+        let mut keys = Vec::new();
+        for email in google_account_emails(&conn)? {
+            keys.extend(google_grant_token_keys(&conn, &email)?);
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+    let mut rows = Vec::new();
+    for token_key in keys {
+        if let Some((scopes, client)) = google::grant_summary(&token_key)? {
+            rows.push(GrantReportRow {
+                token_key,
+                scopes,
+                client,
+            });
+        }
+    }
+    Ok(rows)
+}
+
 /// Forget the Google client credentials. The client is shared by every Google service, so this
 /// invalidates them all: drop each Calendar account + every Drive account and the events/items they
 /// mirror (ICS/Outlook events, which don't depend on this client, are kept).
@@ -438,6 +637,7 @@ pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result
         }
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
+    calendar_editing::clear_all(&conn)?;
     drive::forget_all_accounts(&conn).ok();
     // F-38: the Google-Drive BACKUP destination rides on this same client, so tearing the client down
     // must also disable it — otherwise the schedule keeps `gdrive_enabled` pointed at a now-tokenless
