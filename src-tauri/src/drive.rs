@@ -560,6 +560,22 @@ pub enum Credentials {
 /// (leaving any still-reachable drive owner-less, to be re-claimed on another account's next sync).
 pub fn forget_account(conn: &Connection, email: &str, creds: Credentials) -> Result<()> {
     let account = account_id(email);
+    // Credentials FIRST, and a keychain failure stops here with the account still listed. Dropping
+    // the row before an un-clearable token would strand a live sign-in that no disconnect, and not
+    // even "Remove PM data", could find again: both find tokens through these rows. A missing entry
+    // counts as cleared, so a retry after a partial failure goes through.
+    match creds {
+        Credentials::Forget => {
+            secrets::clear_google_token_for(&account_token_key(email))?;
+            // Forget the account's own Cloud-project client too, so a later sign-in for this account
+            // doesn't silently pick up stale per-account creds (see `google::client_creds_for_token`).
+            secrets::clear_google_client_for_account(email)?;
+        }
+        Credentials::ForgetTokenKeepClient => {
+            secrets::clear_google_token_for(&account_token_key(email))?;
+        }
+        Credentials::Keep => {}
+    }
     conn.execute(
         "UPDATE documents SET source_state = 'unreachable' \
          WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
@@ -592,19 +608,6 @@ pub fn forget_account(conn: &Connection, email: &str, creds: Credentials) -> Res
     }
     for root_id in swm_roots {
         soft_flag_orphaned_swm_root(conn, &root_id)?;
-    }
-    match creds {
-        Credentials::Forget => {
-            secrets::clear_google_token_for(&account_token_key(email)).ok();
-            // Forget the account's own Cloud-project client too, so a later sign-in for this account
-            // doesn't silently pick up stale per-account creds (see
-            // `google::client_creds_for_account`).
-            secrets::clear_google_client_for_account(email).ok();
-        }
-        Credentials::ForgetTokenKeepClient => {
-            secrets::clear_google_token_for(&account_token_key(email)).ok();
-        }
-        Credentials::Keep => {}
     }
     Ok(())
 }

@@ -117,6 +117,9 @@ export interface WipeReport {
   /** Connected Microsoft account emails — no programmatic revoke, so the user finishes at
    *  account.microsoft.com (the UI links there). */
   microsoftAccounts: string[];
+  /** The Google account the backups go to, when PM deleted its sign-in but left its grant at Google
+   *  so the backups stay restorable; the UI links to myaccount.google.com/permissions. */
+  googleKeptForBackups: string[];
   /** Keychain entries deleted. */
   keychainDeleted: number;
   /** True when the store or keychain was touched, so the app can't keep running and must close. */

@@ -82,6 +82,15 @@ pub fn clear_gdrive_destination(conn: &rusqlite::Connection) -> crate::error::Re
     Ok(())
 }
 
+/// The Google account backups go to, exactly as stored, or `None` when there is none ("" means
+/// none). Set whether or not Drive backups are switched on: the account's grant, and the archives it
+/// made, exist either way.
+pub fn gdrive_account(conn: &rusqlite::Connection) -> crate::error::Result<Option<String>> {
+    Ok(db::get_setting(conn, BACKUP_GDRIVE_ACCOUNT_KEY)?
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty()))
+}
+
 /// Launch catch-up: wait up to `LAUNCH_WAIT_TICKS × LAUNCH_WAIT_SECS` (~5 min) for the vault to
 /// unlock, then run one due-check.
 const LAUNCH_WAIT_TICKS: u32 = 60;

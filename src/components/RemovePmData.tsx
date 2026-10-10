@@ -33,6 +33,7 @@ import {
   wipePmData,
 } from "../lib/ipc";
 import { formatBytes } from "../lib/format";
+import { GOOGLE_PERMISSIONS_URL } from "../lib/googleGrantNote";
 import { beginTeardown } from "../lib/teardown";
 import type { WipeReport } from "../lib/types";
 import { Button, Callout, Dialog, Input } from "./ui";
@@ -111,7 +112,7 @@ const ITEMS: Item[] = [
     detail:
       "The secrets in your OS keychain: your API keys, the database key, the backup passphrase, and the sign-in tokens for connected Google / Microsoft accounts. (Which accounts you connected is recorded in the database above — this removes the keys, not that list.)",
     consequence:
-      "Revokes PM's Google access and forgets every key. Microsoft access is finished separately at account.live.com.",
+      "Forgets every key and revokes PM's Google access, except on the account your backups go to, where PM keeps its permission so you can still restore those backups (you can remove it by hand if you like). Microsoft access is finished by hand at account.live.com. PM links to both.",
     danger: true,
   },
   // This detail is only true while the webview store holds UI STATE and nothing else. It was not:
@@ -153,12 +154,17 @@ export function RemovePmData({ biometricAvailable }: Props) {
   // A full wipe auto-launches the uninstaller and exits — but not past anything the user must still
   // act on. A connected Microsoft account has no programmatic revoke (only its local token is
   // deleted), and this screen is the ONLY place that tells them to finish at account.live.com; an
-  // unreachable Google grant is similar. When either is present, wait for the explicit click.
+  // unreachable Google grant, and the backups' Google account PM deliberately didn't revoke, are
+  // similar. When any is present, wait for the explicit click.
   // A list of things PM could not remove counts too: it names paths the user has to go and delete
   // themselves, and on Windows the auto-launch below would otherwise flash it past them and quit.
+  // Access still on that the user should finish removing, as opposed to notes to read: the backups'
+  // Google permission is kept on purpose, and removing it is their call, not a step to finish.
+  const accessStepRequired =
+    (report?.microsoftAccounts.length ?? 0) > 0 || (report?.googleRevokeFailures ?? 0) > 0;
   const actionRequired =
-    (report?.microsoftAccounts.length ?? 0) > 0 ||
-    (report?.googleRevokeFailures ?? 0) > 0 ||
+    accessStepRequired ||
+    (report?.googleKeptForBackups.length ?? 0) > 0 ||
     (report?.couldNotRemove.length ?? 0) > 0;
   // How this platform finishes removing PM itself. The backend decides — the UI used to assume the
   // Windows answer, which is why a Mac (where there IS no uninstaller) got sent to Windows Settings.
@@ -611,12 +617,45 @@ export function RemovePmData({ biometricAvailable }: Props) {
                 {report.keychainDeleted > 0 && (
                   <p>{report.keychainDeleted} saved key(s) removed from the keychain.</p>
                 )}
-                {report.googleRevoked > 0 && (
-                  <p>
+                {/* Shown when every revoke failed too: that's the case the user most needs to hear. */}
+                {(report.googleRevoked > 0 || report.googleRevokeFailures > 0) && (
+                  <p className={report.googleRevokeFailures > 0 ? "text-st-due" : undefined}>
                     {report.googleRevoked} Google sign-in(s) revoked
-                    {report.googleRevokeFailures > 0
-                      ? ` (${report.googleRevokeFailures} couldn't be reached, but were removed locally)`
-                      : ""}
+                    {report.googleRevokeFailures > 0 ? (
+                      <>
+                        . {report.googleRevokeFailures} couldn&apos;t be revoked, so PM&apos;s
+                        access there is still on at Google (the sign-ins themselves are gone from
+                        this computer). Remove it at{" "}
+                        <a
+                          href={GOOGLE_PERMISSIONS_URL}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="underline hover:brightness-110"
+                        >
+                          myaccount.google.com/permissions
+                        </a>
+                      </>
+                    ) : (
+                      ""
+                    )}
+                    .
+                  </p>
+                )}
+                {report.googleKeptForBackups.length > 0 && (
+                  <p className="text-st-due">
+                    PM removed its sign-in for {report.googleKeptForBackups.join(", ")} from this
+                    computer but left Google&apos;s permission in place, because the backups PM
+                    saved to that Google Drive depend on it. Removing it ends PM&apos;s hold on
+                    those backups on every computer, so restoring one could mean downloading it from
+                    Google Drive yourself. To remove it anyway, go to{" "}
+                    <a
+                      href={GOOGLE_PERMISSIONS_URL}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline hover:brightness-110"
+                    >
+                      myaccount.google.com/permissions
+                    </a>
                     .
                   </p>
                 )}
@@ -687,8 +726,9 @@ export function RemovePmData({ biometricAvailable }: Props) {
                 </p>
               ) : actionRequired ? (
                 <p className="mt-3 text-xs text-ink3">
-                  Your data is gone. Finish the access step noted above first, then choose “Finish
-                  uninstall” to remove PM completely and close it.
+                  {accessStepRequired
+                    ? "Your data is gone. Finish the access step noted above first, then choose “Finish uninstall” to remove PM completely and close it."
+                    : "Your data is gone. Read the notes above, then choose “Finish uninstall” to remove PM completely and close it."}
                 </p>
               ) : (
                 <p className="mt-3 text-xs text-ink4">
