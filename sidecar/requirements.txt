@@ -20,7 +20,7 @@
 # (they co-resolve to single versions — verified on the user's Python 3.14). The
 # base.en weights (~145 MB) download once on first use, like the embedding model.
 #
-#   av<19 — a tripwire, not a pin (the lock pins the exact version). faster-whisper
+#   av<20 — a tripwire, not a pin (the lock pins the exact version). faster-whisper
 #     1.2.1 calls `av.open(..., metadata_errors="ignore")` and PyAV 19 removed that
 #     parameter, so every transcription would raise TypeError. faster-whisper itself
 #     asks only for `av>=11`, so without this bound the next `just lock-regen`
@@ -53,7 +53,7 @@
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.8
 fastembed==0.8.1
 faster-whisper==1.2.1
-av<19
+av<20
 openpyxl==3.1.5
 pillow==12.3.0
 defusedxml==0.7.1
