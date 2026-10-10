@@ -1623,6 +1623,43 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE document_locations ADD COLUMN source_folder_path TEXT;
     ALTER TABLE documents          ADD COLUMN source_folder_path TEXT;
     "#,
+    // v57: what editing a Google event needs to know, read from the same list calls the mirror
+    // already makes (#884, C2). All of it in one migration, because each later one costs three
+    // replay-test edits.
+    //
+    // calendar_events, per event: `etag` (Google's version stamp; never sent to the webview),
+    // `event_type` (default | birthday | fromGmail | focusTime | outOfOffice | workingLocation, which
+    // limit what can change), `organizer_self` (Google `organizer.self`: the organiser is the
+    // calendar this copy is on), `locked` (Google refuses changes to its core fields),
+    // `guests_can_modify`, `series_id` (the recurring event an occurrence belongs to) with
+    // `original_start` (that occurrence's place in the series, its identity once moved), and
+    // `color_id` / `event_label_id` (the event's own colour and label). `organizer_self` and
+    // `guests_can_modify` default to the restrictive 0, so a row mirrored before v57 edits nothing
+    // until the next sync rewrites it (the new fields change its F-49 hash); `locked`'s 0 means "not
+    // locked", which opens nothing `organizer_self` hasn't already closed.
+    //
+    // calendars, per calendar, from `calendarList`: `access_role` (owner | writer |
+    // writerWithoutPrivateAccess | reader | freeBusyReader), `time_zone`, `default_reminders` and
+    // `conference_types` (JSON), `data_owner` (set only for secondary calendars). `event_labels`
+    // (JSON) comes from `calendars.get` in a later layer, so a registry refresh never touches it.
+    // Upstream-owned like `name`; none is a user choice.
+    r#"
+    ALTER TABLE calendar_events ADD COLUMN etag TEXT;
+    ALTER TABLE calendar_events ADD COLUMN event_type TEXT;
+    ALTER TABLE calendar_events ADD COLUMN organizer_self INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE calendar_events ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE calendar_events ADD COLUMN guests_can_modify INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE calendar_events ADD COLUMN series_id TEXT;
+    ALTER TABLE calendar_events ADD COLUMN original_start TEXT;
+    ALTER TABLE calendar_events ADD COLUMN color_id TEXT;
+    ALTER TABLE calendar_events ADD COLUMN event_label_id TEXT;
+    ALTER TABLE calendars ADD COLUMN access_role TEXT;
+    ALTER TABLE calendars ADD COLUMN time_zone TEXT;
+    ALTER TABLE calendars ADD COLUMN default_reminders TEXT;
+    ALTER TABLE calendars ADD COLUMN conference_types TEXT;
+    ALTER TABLE calendars ADD COLUMN data_owner TEXT;
+    ALTER TABLE calendars ADD COLUMN event_labels TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1675,7 +1712,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
         conn.execute_batch(
-            "DROP TABLE document_locations;              ALTER TABLE documents DROP COLUMN source_folder_path; PRAGMA user_version = 53;
+            "DROP TABLE document_locations;              ALTER TABLE documents DROP COLUMN source_folder_path;
+             ALTER TABLE calendar_events DROP COLUMN etag;
+             ALTER TABLE calendar_events DROP COLUMN event_type;
+             ALTER TABLE calendar_events DROP COLUMN organizer_self;
+             ALTER TABLE calendar_events DROP COLUMN locked;
+             ALTER TABLE calendar_events DROP COLUMN guests_can_modify;
+             ALTER TABLE calendar_events DROP COLUMN series_id;
+             ALTER TABLE calendar_events DROP COLUMN original_start;
+             ALTER TABLE calendar_events DROP COLUMN color_id;
+             ALTER TABLE calendar_events DROP COLUMN event_label_id;
+             ALTER TABLE calendars DROP COLUMN access_role;
+             ALTER TABLE calendars DROP COLUMN time_zone;
+             ALTER TABLE calendars DROP COLUMN default_reminders;
+             ALTER TABLE calendars DROP COLUMN conference_types;
+             ALTER TABLE calendars DROP COLUMN data_owner;
+             ALTER TABLE calendars DROP COLUMN event_labels;
+             PRAGMA user_version = 53;
              INSERT INTO documents(vault_path, title, content_hash, project, source_type,
                  source_id, source_state, external_ref, source_content_hash)
              VALUES ('idx://gdrive:a@x.com:f1','A','h1','Unsorted','index_only',
@@ -1755,7 +1808,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 56,
+            version, 57,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1783,7 +1836,8 @@ mod tests {
              whole-library re-tag staging is v48; \
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
              documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54; \n             which file a location points at is v55; \
-             the folder trail above a file is v56)"
+             the folder trail above a file is v56; \
+             what editing a Google event needs to know is v57)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

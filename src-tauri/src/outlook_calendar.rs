@@ -20,7 +20,7 @@
 use chrono::NaiveDateTime;
 use serde_json::Value;
 
-use crate::calendar::{Attendee, CalendarEvent, RawCalendarInput};
+use crate::calendar::{Attendee, CalendarEvent, CalendarFacts, RawCalendarInput};
 use crate::error::{Error, Result};
 use crate::{microsoft, secrets};
 
@@ -189,6 +189,8 @@ fn parse_calendar_list(value: &Value) -> (Vec<RawCalendarInput>, Option<String>)
                         name,
                         color,
                         is_primary,
+                        // Outlook calendars stay read-only until Outlook editing has its own phase.
+                        facts: CalendarFacts::default(),
                     })
                 })
                 .collect()
@@ -370,6 +372,18 @@ fn parse_event(mirror_calendar_id: &str, e: &Value) -> Option<CalendarEvent> {
             .get("lastModifiedDateTime")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // What Google editing needs (v57). Outlook events stay read-only until Outlook editing has
+        // its own phase, so these stay empty; their calendars carry no Google `access_role`, which
+        // the editing gate reads as "can't".
+        etag: None,
+        event_type: None,
+        organizer_self: false,
+        locked: false,
+        guests_can_modify: false,
+        series_id: None,
+        original_start: None,
+        color_id: None,
+        event_label_id: None,
     })
 }
 

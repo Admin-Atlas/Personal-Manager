@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.140.1-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "Under the hood, for calendar editing: PM now keeps a few more facts about your Google calendars and events, such as whether you can edit a calendar, who organises an event, which repeating series it belongs to, and its colour. Nothing looks different yet. The first sync after this update refreshes every calendar once.",
+      "Calendar subscriptions can only be tagged as subscriptions (Apple, Outlook or other), so a subscription can never pass for a signed-in Google or Microsoft account.",
+    ],
+  },
+  {
     version: "3.140.0-alpha",
     date: "2026-10-09",
     highlights: [
