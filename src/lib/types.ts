@@ -1600,6 +1600,10 @@ export interface EventForEdit {
   description: string;
   description_html: boolean;
   time: TimeDraft;
+  /** Google's exact start and end of a timed event (RFC 3339), null for all-day: which of a repeated
+   *  hour's two times an untouched half is, for the pre-save check. */
+  start_at: string | null;
+  end_at: string | null;
   show_as: ShowAs;
   visibility: EventVisibility;
   attachments: string[];

@@ -20,6 +20,7 @@
 
 import { sanitizeBounds, type CalendarRange, type RangeBounds } from "../../lib/calendarPrefs";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
+import { hoursToHM, slots } from "../../lib/calendarEdit/timeSlots";
 import type { Coords } from "../../theme";
 import { cn } from "../ui";
 import { Popover, Select } from "../ui";
@@ -29,20 +30,6 @@ const ITEMS: ReadonlyArray<{ value: CalendarRange; label: string; editable: bool
   { value: "day", label: "Day", editable: true },
   { value: "full", label: "24h", editable: false },
 ];
-
-/** Decimal hour → "HH:MM". 24 renders as "24:00" — end-of-day, which a time input can't express. */
-function hoursToHM(h: number): string {
-  const hh = Math.floor(h);
-  const mm = Math.round((h - hh) * 60);
-  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-}
-
-/** Half-hour slots over [lo, hi] inclusive — the granularity sanitizeBounds' round05 already pins. */
-function slots(lo: number, hi: number): number[] {
-  const out: number[] = [];
-  for (let h = lo; h <= hi + 1e-9; h += 0.5) out.push(Math.round(h * 2) / 2);
-  return out;
-}
 
 /** The narrowest window the geometry accepts, mirroring sanitizeBounds' `endHour - startHour < 1`. */
 const MIN_WINDOW_H = 1;
