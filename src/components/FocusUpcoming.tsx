@@ -25,7 +25,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { AgendaEvent, Calendar, CalendarEvent } from "../lib/types";
-import { listAllCalendarEvents } from "../lib/ipc";
+import { listAllCalendarEvents, onCalendarSynced } from "../lib/ipc";
 import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../lib/calendarGeom";
 import { readHidden, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
@@ -121,10 +121,12 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   }
 
   // Lazily load the full mirror only while the grid is on (List mode needs nothing extra). Refresh on
-  // window focus so an edit made elsewhere shows on return. Keep the last-good set on a read failure.
+  // window focus so an edit made elsewhere shows on return, and when a sync or the ~30 s change check
+  // writes events. Keep the last-good set on a read failure.
   useEffect(() => {
     if (mode !== "week") return;
     let alive = true;
+    let unlisten: (() => void) | null = null;
     const load = () => {
       void listAllCalendarEvents()
         .then((evts) => {
@@ -138,9 +140,16 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
     };
     load();
     window.addEventListener("focus", load);
+    void onCalendarSynced(load)
+      .then((stop) => {
+        if (alive) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {});
     return () => {
       alive = false;
       window.removeEventListener("focus", load);
+      unlisten?.();
     };
   }, [mode]);
 
