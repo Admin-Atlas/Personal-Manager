@@ -378,4 +378,24 @@ describe("CalendarEventPopover", () => {
     expect(queryByRole("button", { name: "Delete" })).toBeNull();
     expect(getByText("Someone else organises this event.")).toBeTruthy();
   });
+
+  // A description is shown line by line: the wrapper's class is what index.css gives `pre-line`
+  // (GFM alone would fold single line breaks into spaces).
+  it("shows a description inside the wrapper that keeps its lines", () => {
+    const { getByText } = render(
+      <CalendarEventPopover
+        event={calendarEvent({ description: "Agenda\n1. intro\n2. demo" })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    const text = getByText(
+      (_, el) =>
+        el?.textContent === "Agenda\n1. intro\n2. demo" && el.tagName === "DIV" && !el.className,
+    );
+    expect(text.closest(".pm-event-desc")).not.toBeNull();
+  });
 });

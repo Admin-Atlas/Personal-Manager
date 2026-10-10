@@ -13,6 +13,8 @@ interface Props {
   /** The day drawn as selected, and the month opened on. Null opens on `today`. */
   selected: Date | null;
   onPick: (d: Date) => void;
+  /** Days that can't be picked (drawn greyed). */
+  isDisabled?: (d: Date) => boolean;
   /** Rendered under the grid — e.g. Today / Clear shortcuts. */
   footer?: React.ReactNode;
 }
@@ -23,7 +25,7 @@ function monthOf(d: Date | null): Date {
   return new Date(base.getFullYear(), base.getMonth(), 1);
 }
 
-export function MonthPicker({ selected, onPick, footer }: Props) {
+export function MonthPicker({ selected, onPick, isDisabled, footer }: Props) {
   const [view, setView] = useState(() => monthOf(selected));
   // Re-open on the selected day's month when the selection changes underneath us (typing a date in
   // the text half of a DateField should move the grid). Keyed on the ISO month so paging away with
@@ -62,6 +64,7 @@ export function MonthPicker({ selected, onPick, footer }: Props) {
         today={new Date()}
         selected={selected}
         onSelectDay={onPick}
+        isDisabled={isDisabled}
         showWeekdays
       />
       {footer}

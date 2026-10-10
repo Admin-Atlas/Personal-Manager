@@ -28,13 +28,21 @@ import type {
   TimeDraft,
 } from "../../../lib/types";
 import {
+  DEFAULT_LENGTH_MS,
   canEdit,
   changedFields,
   checkDraft,
+  endAfterStart,
+  endDateMin,
+  endTimeChoices,
+  endsAfterStart,
+  firstEndOnItsDate,
+  halfInstant,
   rebaseDraft,
   seedDraft,
   toChanges,
   type EditorFields,
+  type EndChoice,
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
@@ -46,7 +54,6 @@ import {
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
-import { wallInstant, wallTimeOf } from "../../../lib/wallTime";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import {
   Button,
@@ -154,6 +161,11 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   const draftRef = useRef<EditorFields | null>(null);
   // Text a date field couldn't read; a save is refused while it stands.
   const badDateRef = useRef<string | null>(null);
+  const [badDate, setBadDateState] = useState<string | null>(null);
+  const setBadDate = (text: string | null) => {
+    badDateRef.current = text;
+    setBadDateState(text);
+  };
   // The event's length, kept while its start moves (and across a start that can't be read).
   const lengthRef = useRef<number | null>(null);
   const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(null);
@@ -226,38 +238,44 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     else onDelete(deleteRow());
   };
 
-  /** The instant one half of a timed draft names: Google's exact one while the half is untouched
-   *  (it may be the second of a repeated hour), else its first occurrence. */
-  function instantOf(half: "start" | "end", t: Timed): number | null {
-    const was = loaded?.base.time.kind === "timed" ? loaded.base.time : null;
-    const same =
-      was &&
-      (half === "start"
-        ? was.start_date === t.start_date &&
-          was.start_time === t.start_time &&
-          was.start_zone === t.start_zone
-        : was.end_date === t.end_date &&
-          was.end_time === t.end_time &&
-          was.end_zone === t.end_zone);
-    const held = half === "start" ? loaded?.event.start_at : loaded?.event.end_at;
-    if (same && held) return Date.parse(held);
-    const at =
-      half === "start"
-        ? wallInstant(t.start_date, t.start_time, t.start_zone)
-        : wallInstant(t.end_date, t.end_time, t.end_zone);
-    return at ? at.getTime() : null;
+  /** The event's length now, kept for the next start move, or the last one it had: a length under a
+   *  minute (an end picked before the start, a 0-minute event Google holds, seconds an app wrote) is
+   *  never carried, so a moved start always gets an end after it. */
+  function lengthOf(t: Timed): number {
+    if (loaded) {
+      const s = halfInstant(loaded.base, t, "start", loaded.event);
+      const e = halfInstant(loaded.base, t, "end", loaded.event);
+      if (s !== null && e !== null && e - s >= 60_000) lengthRef.current = e - s;
+    }
+    return lengthRef.current ?? DEFAULT_LENGTH_MS;
   }
 
   /** Move the start, the end following so the event keeps its length. */
   function moveStart(t: Timed, date: string, time: string): Timed {
-    const s = instantOf("start", t);
-    const e = instantOf("end", t);
-    if (s !== null && e !== null) lengthRef.current = e - s;
+    const length = lengthOf(t);
     const moved = { ...t, start_date: date, start_time: time };
-    const start = wallInstant(date, time, t.start_zone);
-    if (!start || lengthRef.current === null) return moved;
-    const end = wallTimeOf(new Date(start.getTime() + lengthRef.current), t.end_zone);
-    return { ...moved, end_date: end.date, end_time: end.time };
+    return loaded ? endAfterStart(loaded.base, moved, length, loaded.event) : moved;
+  }
+
+  /** A new end date: the end time stays if it still ends the event after its start, else becomes the
+   *  first time on that date that does (or the length's worth after the start, when that whole date
+   *  is over before the start begins). */
+  function moveEndDate(t: Timed, end_date: string): Timed {
+    const moved = { ...t, end_date };
+    if (!loaded || endsAfterStart(loaded.base, moved, loaded.event)) return moved;
+    return (
+      firstEndOnItsDate(loaded.base, moved, loaded.event) ??
+      endAfterStart(loaded.base, moved, lengthOf(t), loaded.event)
+    );
+  }
+
+  /** New zones keep the times on screen as they are; if that puts the end at or before the start,
+   *  the end follows the start by the event's length instead. */
+  function changeZones(t: Timed, start_zone: string, end_zone: string): Timed {
+    const length = lengthOf(t);
+    const moved = { ...t, start_zone, end_zone };
+    if (!loaded || endsAfterStart(loaded.base, moved, loaded.event)) return moved;
+    return endAfterStart(loaded.base, moved, length, loaded.event);
   }
 
   /** Google changed the event on a field this save sends: take its copy, keep the rest. */
@@ -290,16 +308,10 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     commitFocused();
     const current = draftRef.current;
     if (!loaded || !current || saving) return;
-    if (badDateRef.current) {
-      setBanner({
-        tone: "error",
-        text: `“${badDateRef.current}” isn't a date PM can read. Type it as dd-mm-yyyy, or pick it from the calendar.`,
-      });
-      return;
-    }
-    const check = checkDraft(loaded.base, current, loaded.event);
-    if (check.problems.length > 0) {
-      setBanner({ tone: "error", text: check.problems.map(problemText).join(" ") });
+    // What stops this save is already said under When, as it happened; a banner repeating it would
+    // outlive the fix.
+    if (badDateRef.current || checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
+      setBanner(null);
       return;
     }
     const changes = toChanges(loaded.base, current);
@@ -358,6 +370,17 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   const zoneFallback = heldTimed?.start_zone ?? calendar?.time_zone ?? deviceZone;
   const timeEditable = may("time") && !timeOff;
   const dirty = loaded && draft ? changedFields(loaded.base, draft).length > 0 : false;
+  const timed = draft?.time.kind === "timed" ? draft.time : null;
+  // The End list resolves every quarter hour, so it's worked out once per time change.
+  const endChoices = useMemo(
+    () =>
+      loaded && timed ? endTimeChoices(loaded.base, timed, loaded.event, heldTimed?.end_time) : [],
+    [loaded, timed, heldTimed],
+  );
+  const endMin = useMemo(
+    () => (loaded && timed ? endDateMin(loaded.base, timed, loaded.event) : undefined),
+    [loaded, timed],
+  );
 
   return (
     <>
@@ -423,15 +446,17 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             <WhenFields
               draft={draft}
               held={heldTimed}
+              endChoices={endChoices}
+              endMin={endMin}
               disabled={!timeEditable}
               onChange={(time) => {
-                badDateRef.current = null;
+                setBadDate(null);
                 setDraft({ ...draft, time });
               }}
-              onRejectDate={(text) => {
-                badDateRef.current = text;
-              }}
+              onRejectDate={setBadDate}
+              onAcceptDate={() => setBadDate(null)}
               moveStart={moveStart}
+              moveEndDate={moveEndDate}
               onSwitchKind={() =>
                 zoneFallback &&
                 setDraft({ ...draft, time: switchKind(draft.time, loaded.base.time, zoneFallback) })
@@ -457,11 +482,11 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
                     const t = draft.time;
                     setDraft({
                       ...draft,
-                      time: {
-                        ...t,
-                        start_zone: zonePick === "end" ? t.start_zone : zone,
-                        end_zone: zonePick === "start" ? t.end_zone : zone,
-                      },
+                      time: changeZones(
+                        t,
+                        zonePick === "end" ? t.start_zone : zone,
+                        zonePick === "start" ? t.end_zone : zone,
+                      ),
                     });
                     setZonePick(null);
                   }}
@@ -474,6 +499,22 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             {check?.ambiguous.map((half) => (
               <p key={half} className="text-xs text-ink4">
                 {ambiguousText(half)}
+              </p>
+            ))}
+            {/* What would stop the save, shown as it happens rather than only on Save (each sentence
+                once: a start and an end in the same skipped hour say the same thing). */}
+            {[
+              ...new Set([
+                ...(badDate
+                  ? [
+                      `“${badDate}” isn't a date PM can read. Type it as dd-mm-yyyy, or pick it from the calendar.`,
+                    ]
+                  : []),
+                ...(check?.problems.map(problemText) ?? []),
+              ]),
+            ].map((text) => (
+              <p key={text} className="text-xs text-st-due">
+                {text}
               </p>
             ))}
 
@@ -635,10 +676,14 @@ function TextRow({
 function WhenFields({
   draft,
   held,
+  endChoices,
+  endMin,
   disabled,
   onChange,
   onRejectDate,
+  onAcceptDate,
   moveStart,
+  moveEndDate,
   onSwitchKind,
   canSwitchKind,
   onPickZone,
@@ -646,15 +691,30 @@ function WhenFields({
   draft: EditorFields;
   /** Google's timed start and end, kept on offer in the time lists. */
   held: Timed | null;
+  /** The End time list: times after the start, with the event's length. */
+  endChoices: readonly EndChoice[];
+  /** The first day the End date can be. */
+  endMin: string | undefined;
   disabled: boolean;
   onChange: (t: TimeDraft) => void;
+  /** A date field gave up on typed text it couldn't read, and showed its date again. */
   onRejectDate: (text: string) => void;
+  /** A date field holds a date it read (typed, picked, or left as it was). */
+  onAcceptDate: () => void;
   moveStart: (t: Timed, date: string, time: string) => Timed;
+  moveEndDate: (t: Timed, date: string) => Timed;
   onSwitchKind: () => void;
   canSwitchKind: boolean;
   onPickZone: (which: "both" | "start" | "end") => void;
 }) {
   const t = draft.time;
+  // What every date field here shares.
+  const dateProps = {
+    clearable: false,
+    disabled,
+    onReject: onRejectDate,
+    onAccept: onAcceptDate,
+  };
   return (
     <fieldset className="flex flex-col gap-2" disabled={disabled}>
       <legend className="text-sm text-ink2">When</legend>
@@ -670,11 +730,9 @@ function WhenFields({
       {t.kind === "all_day" ? (
         <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
           <DateField
+            {...dateProps}
             ariaLabel="First day"
             value={t.first_day}
-            clearable={false}
-            disabled={disabled}
-            onReject={onRejectDate}
             // Moving the first day moves the whole event; the last day alone changes its length.
             onCommit={(first_day) =>
               onChange({
@@ -686,11 +744,10 @@ function WhenFields({
           />
           <span>to</span>
           <DateField
+            {...dateProps}
             ariaLabel="Last day"
             value={t.last_day}
-            clearable={false}
-            disabled={disabled}
-            onReject={onRejectDate}
+            min={t.first_day}
             onCommit={(last_day) => onChange({ ...t, last_day })}
           />
         </div>
@@ -699,11 +756,9 @@ function WhenFields({
           <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
             <span className="w-10">Starts</span>
             <DateField
+              {...dateProps}
               ariaLabel="Start date"
               value={t.start_date}
-              clearable={false}
-              disabled={disabled}
-              onReject={onRejectDate}
               onCommit={(d) => onChange(moveStart(t, d, t.start_time))}
             />
             <TimeField
@@ -718,18 +773,17 @@ function WhenFields({
           <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
             <span className="w-10">Ends</span>
             <DateField
+              {...dateProps}
               ariaLabel="End date"
               value={t.end_date}
-              clearable={false}
-              disabled={disabled}
-              onReject={onRejectDate}
-              onCommit={(end_date) => onChange({ ...t, end_date })}
+              min={endMin}
+              onCommit={(end_date) => onChange(moveEndDate(t, end_date))}
             />
             <TimeField
               ariaLabel="End time"
               compact
               value={t.end_time}
-              held={held?.end_time}
+              choices={endChoices}
               disabled={disabled}
               onChange={(end_time) => onChange({ ...t, end_time })}
             />

@@ -60,4 +60,24 @@ describe("TimeField", () => {
     // By role, not by label text: an aria-label would win the name and still pass getByLabelText.
     expect(screen.getByRole("combobox", { name: "Ends" })).toBeTruthy();
   });
+
+  it("offers a caller's own list, labelled, with the value always among it", () => {
+    const choices = [
+      { value: "09:15", label: "09:15 (15 mins)" },
+      { value: "09:30", label: "09:30 (30 mins)" },
+    ];
+    const { rerender } = render(
+      <TimeField value="09:30" choices={choices} onChange={() => {}} ariaLabel="Ends" />,
+    );
+    const select = screen.getByLabelText<HTMLSelectElement>("Ends");
+    expect([...select.options].map((o) => o.textContent)).toEqual([
+      "09:15 (15 mins)",
+      "09:30 (30 mins)",
+    ]);
+    expect(select.value).toBe("09:30");
+    // A value the list leaves out is still shown, where it sorts, so the select never drifts.
+    rerender(<TimeField value="08:00" choices={choices} onChange={() => {}} ariaLabel="Ends" />);
+    expect(options(select)).toEqual(["08:00", "09:15", "09:30"]);
+    expect(select.value).toBe("08:00");
+  });
 });

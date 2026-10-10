@@ -19,7 +19,8 @@ import type {
   ShowAs,
   TimeDraft,
 } from "../types";
-import { resolveWallTime } from "../wallTime";
+import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
+import { durationLabel, timeChoices } from "./timeSlots";
 
 /** What the editor's fields hold. */
 export interface EditorFields {
@@ -212,6 +213,153 @@ export function checkDraft(base: EditorFields, draft: EditorFields, held?: HeldT
     problems.push({ kind: "end_before_start" });
   }
   return { problems, ambiguous };
+}
+
+type Timed = Extract<TimeDraft, { kind: "timed" }>;
+
+/** The instant one half of a timed draft names, as a save would read it: Google's exact instant while
+ *  the half is as Google holds it (it may be the second of a repeated hour), else its first
+ *  occurrence. `null` for a time the clocks skip, or one that can't be read. */
+export function halfInstant(
+  base: EditorFields,
+  t: Timed,
+  half: "start" | "end",
+  held?: HeldTimes,
+): number | null {
+  const was = base.time.kind === "timed" ? base.time : null;
+  const [date, time, zone] =
+    half === "start"
+      ? [t.start_date, t.start_time, t.start_zone]
+      : [t.end_date, t.end_time, t.end_zone];
+  const untouched =
+    was !== null &&
+    (half === "start"
+      ? was.start_date === date && was.start_time === time && was.start_zone === zone
+      : was.end_date === date && was.end_time === time && was.end_zone === zone);
+  if (untouched) {
+    const exact = Date.parse((half === "start" ? held?.start_at : held?.end_at) ?? "");
+    if (!Number.isNaN(exact)) return exact;
+  }
+  return wallInstant(date, time, zone)?.getTime() ?? null;
+}
+
+/** One choice in the End time list. */
+export interface EndChoice {
+  value: string;
+  /** The time, with the event's length when it ends on the day it starts: "10:30 (30 mins)". */
+  label: string;
+  /** Whether it ends the event after its start (false only for the current end, kept on offer). */
+  after: boolean;
+}
+
+/** The End time list for a timed draft: only times after the start, each labelled with the length
+ *  the event would have when it ends on the start's day, as Google's own list does. `heldEnd` (the end
+ *  Google holds) is offered like any other time, and the current end always stays in the list even
+ *  when it isn't after the start (a select must hold its value; Google can hold a 0-minute event), so
+ *  the live problem line, not a silently changed field, says what's wrong. A start that can't be read
+ *  (a skipped time) leaves the list unfiltered: the problem is the start's, and is reported there. */
+export function endTimeChoices(
+  base: EditorFields,
+  t: Timed,
+  held?: HeldTimes,
+  heldEnd?: string,
+): EndChoice[] {
+  const all = timeChoices(t.end_time, heldEnd);
+  const start = halfInstant(base, t, "start", held);
+  const startDay = start === null ? null : wallDateOf(start, t.end_zone);
+  if (start === null || startDay === null) {
+    return all.map((hm) => ({ value: hm, label: hm, after: true }));
+  }
+  const sameDay = t.end_date === startDay;
+  const out: EndChoice[] = [];
+  for (const hm of all) {
+    const at = halfInstant(base, { ...t, end_time: hm }, "end", held);
+    if (at !== null && at > start) {
+      out.push({
+        value: hm,
+        label: sameDay ? `${hm} (${durationLabel(at - start)})` : hm,
+        after: true,
+      });
+    } else if (hm === t.end_time) {
+      out.push({ value: hm, label: hm, after: false });
+    }
+  }
+  return out;
+}
+
+/** The date `ms` falls on in `zone`, or `null` for a zone this webview doesn't know. */
+function wallDateOf(ms: number, zone: string): string | null {
+  try {
+    return wallTimeOf(new Date(ms), zone).date;
+  } catch {
+    return null;
+  }
+}
+
+/** The first day the End date can be: the start's day as the END zone reads it, since a start just
+ *  after midnight in London is still the day before in New York. A start too late for any end on
+ *  that day (23:45 or later) makes it the day after: offering that day would let the field show a
+ *  date the event can't end on. */
+export function endDateMin(base: EditorFields, t: Timed, held?: HeldTimes): string {
+  const start = halfInstant(base, t, "start", held);
+  const day = (start === null ? null : wallDateOf(start, t.end_zone)) ?? t.start_date;
+  if (start !== null && firstEndOnItsDate(base, { ...t, end_date: day }, held) === null) {
+    const [y, m, d] = day.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  }
+  return day;
+}
+
+/** The length an event gets when its own can't be kept: a whole hour, as All day switched off gives. */
+export const DEFAULT_LENGTH_MS = 60 * 60_000;
+
+const QUARTER_MS = 15 * 60_000;
+
+/** `t` with its end put `lengthMs` after its start, in the end's zone (unchanged if the start, or
+ *  the end's zone, can't be read). A wall time names whole minutes, and in an hour the clocks pass
+ *  twice it names only the FIRST pass (as every reader, and the backend, resolve it), so an end that
+ *  falls in the second pass would read back an hour early, maybe before the start: it moves on, a
+ *  quarter hour at a time, to the first wall time that reads back where it should (02:00 GMT on the
+ *  night London's clocks go back). The event is a little longer, never shorter. */
+export function endAfterStart(
+  base: EditorFields,
+  t: Timed,
+  lengthMs: number,
+  held?: HeldTimes,
+): Timed {
+  const start = halfInstant(base, t, "start", held);
+  if (start === null) return t;
+  const target = Math.ceil((start + Math.max(lengthMs, 60_000)) / 60_000) * 60_000;
+  try {
+    let at = target;
+    // A fold is at most a few hours long; past that, keep the last try rather than loop.
+    for (let i = 0; i < 16; i++) {
+      const end = wallTimeOf(new Date(at), t.end_zone);
+      const back = wallInstant(end.date, end.time, t.end_zone)?.getTime();
+      if (back === undefined || back >= target || i === 15) {
+        return { ...t, end_date: end.date, end_time: end.time };
+      }
+      at = Math.floor(at / QUARTER_MS) * QUARTER_MS + QUARTER_MS;
+    }
+  } catch {
+    // A zone this webview doesn't know.
+  }
+  return t;
+}
+
+/** The first end on `t`'s own end date that comes after its start: the time that end date can keep.
+ *  `null` when that whole date is over before the start (a start at 23:50 on it). */
+export function firstEndOnItsDate(base: EditorFields, t: Timed, held?: HeldTimes): Timed | null {
+  const first = endTimeChoices(base, t, held).find((c) => c.after);
+  return first ? { ...t, end_time: first.value } : null;
+}
+
+/** Whether a timed draft's end comes after its start (an unreadable half counts as fine here: the
+ *  problem line names it). */
+export function endsAfterStart(base: EditorFields, t: Timed, held?: HeldTimes): boolean {
+  const start = halfInstant(base, t, "start", held);
+  const end = halfInstant(base, t, "end", held);
+  return start === null || end === null || end > start;
 }
 
 /** A draft carried onto Google's newer copy after a conflict. */

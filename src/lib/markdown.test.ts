@@ -8,11 +8,13 @@ import remarkGfm from "remark-gfm";
 import {
   REHYPE_PLUGINS,
   REMARK_PLUGINS,
+  REMARK_PLUGINS_PLAIN_LINES,
   REMARK_PLUGINS_WITH_DASH_LISTS,
   safeUrl,
   SCHEMA,
 } from "./markdown";
 import { remarkDashLists } from "./markdownDashLists";
+import { remarkPlainLines } from "./markdownPlainLines";
 
 // The markdown pipeline is PM's single sanitizing boundary for untrusted, ingested content. These lock
 // the two pure pieces of that boundary so a refactor can't silently weaken it (T-07), plus the SHAPE
@@ -147,6 +149,12 @@ describe("the remark pipeline", () => {
     expect(REMARK_PLUGINS_WITH_DASH_LISTS).toHaveLength(2);
     expect(REMARK_PLUGINS_WITH_DASH_LISTS[0]).toBe(remarkGfm);
     expect(REMARK_PLUGINS_WITH_DASH_LISTS[1]).toBe(remarkDashLists);
+  });
+
+  it("adds the plain-lines parser setting only on the opted-in surface", () => {
+    expect(REMARK_PLUGINS_PLAIN_LINES).toHaveLength(2);
+    expect(REMARK_PLUGINS_PLAIN_LINES[0]).toBe(remarkGfm);
+    expect(REMARK_PLUGINS_PLAIN_LINES[1]).toBe(remarkPlainLines);
   });
 
   it("does not touch the rehype array, whose ORDER is the security property", () => {

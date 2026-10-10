@@ -31,6 +31,8 @@ interface Props {
   today: Date;
   selected?: Date | null;
   onSelectDay?: (d: Date) => void;
+  /** Days that can't be selected: greyed, and their buttons disabled. */
+  isDisabled?: (d: Date) => boolean;
   /** Single-day event marker (soft disc behind the number). */
   hasEvent?: (date: Date) => boolean;
   /** Multi-day spans → thin pills behind the run. */
@@ -52,6 +54,7 @@ export function MiniMonth({
   today,
   selected,
   onSelectDay,
+  isDisabled,
   hasEvent,
   spans,
   showWeekdays,
@@ -140,6 +143,7 @@ export function MiniMonth({
               const isToday = key === todayKey;
               const isSelected = !isToday && key === selectedKey;
               const inMonth = date.getMonth() === month;
+              const off = !!isDisabled?.(date);
               const marked = !isToday && !isSelected && !!hasEvent?.(date);
               const numberEl = (
                 <span
@@ -167,8 +171,13 @@ export function MiniMonth({
                   {onSelectDay ? (
                     <button
                       type="button"
+                      disabled={off}
                       onClick={() => onSelectDay(date)}
-                      className={cn("flex items-center justify-center hover:bg-surface", round)}
+                      className={cn(
+                        "flex items-center justify-center",
+                        off ? "cursor-not-allowed opacity-40" : "hover:bg-surface",
+                        round,
+                      )}
                       aria-label={`${date.toLocaleDateString(undefined, {
                         weekday: "long",
                       })} ${formatDateLocal(date)}`}

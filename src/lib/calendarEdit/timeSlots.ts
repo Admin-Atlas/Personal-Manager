@@ -29,6 +29,21 @@ export function isHM(value: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 }
 
+/** An event's length as Google's end-time list words it: "15 mins", "1 hr", "1.5 hrs", "2.25 hrs".
+ *  Quarter hours read as decimals the way Google writes them; any other length is spelled out
+ *  ("1 hr 10 mins"). Real elapsed time, so a night the clocks change reads true. */
+export function durationLabel(ms: number): string {
+  const mins = Math.round(ms / 60_000);
+  if (mins < 60) return `${mins} ${mins === 1 ? "min" : "mins"}`;
+  if (mins % 15 === 0) {
+    const hrs = mins / 60;
+    return `${hrs} ${hrs === 1 ? "hr" : "hrs"}`;
+  }
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${h} ${h === 1 ? "hr" : "hrs"} ${m} ${m === 1 ? "min" : "mins"}`;
+}
+
 /** The editor's time choices with `value` and `held` (the time Google holds) among them: an event at
  *  09:10 must still show 09:10, and stay pickable after a slip to 09:15, so going back to it sends
  *  nothing. An off-grid time is slotted in where it sorts; anything that isn't `HH:MM` is left out. */

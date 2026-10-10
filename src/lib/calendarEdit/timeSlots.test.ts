@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { hoursToHM, isHM, QUARTER_HOURS, slots, timeChoices } from "./timeSlots";
+import { durationLabel, hoursToHM, isHM, QUARTER_HOURS, slots, timeChoices } from "./timeSlots";
 
 describe("time slots", () => {
   // Pinned as RangeControl had them before the lift: its Work/Day editor reads these.
@@ -45,5 +45,19 @@ describe("time slots", () => {
     expect(isHM("23:59")).toBe(true);
     expect(isHM("24:00")).toBe(false);
     expect(isHM("9:00")).toBe(false);
+  });
+
+  it("words a length as Google's end list does", () => {
+    const min = 60_000;
+    expect(durationLabel(15 * min)).toBe("15 mins");
+    expect(durationLabel(1 * min)).toBe("1 min");
+    expect(durationLabel(45 * min)).toBe("45 mins");
+    expect(durationLabel(60 * min)).toBe("1 hr");
+    expect(durationLabel(75 * min)).toBe("1.25 hrs");
+    expect(durationLabel(90 * min)).toBe("1.5 hrs");
+    expect(durationLabel(120 * min)).toBe("2 hrs");
+    // Off the quarter-hour grid (a time Google holds): spelled out.
+    expect(durationLabel(70 * min)).toBe("1 hr 10 mins");
+    expect(durationLabel(121 * min)).toBe("2 hrs 1 min");
   });
 });

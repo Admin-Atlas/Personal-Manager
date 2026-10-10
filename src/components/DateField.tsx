@@ -28,6 +28,9 @@ interface Props {
   onCommit: (iso: string) => void;
   /** Fired with typed text that couldn't be read as a date, when the field gives up on it. */
   onReject?: (text: string) => void;
+  /** Fired whenever the field ends up holding a date it read, typed or picked, even one equal to
+   *  `value` (when `onCommit` stays quiet): a caller holding an `onReject` can let it go. */
+  onAccept?: () => void;
   disabled?: boolean;
   /** Applied to the text input (height, padding, font). */
   className?: string;
@@ -40,12 +43,17 @@ interface Props {
   id?: string;
   /** Show a Clear shortcut in the popover. Off where the date is mandatory. */
   clearable?: boolean;
+  /** The earliest date allowed (`YYYY-MM-DD`): an earlier one, typed or picked, becomes this one,
+   *  and the picker greys the days before it. The field clamps rather than the caller refusing,
+   *  because a refused value would leave the typed text showing (the sync below follows `value`). */
+  min?: string;
 }
 
 export function DateField({
   value,
   onCommit,
   onReject,
+  onAccept,
   disabled,
   className,
   wrapperClassName,
@@ -54,6 +62,7 @@ export function DateField({
   title,
   id,
   clearable = true,
+  min,
 }: Props) {
   const [draft, setDraft] = useState(() => isoToDisplay(value));
   const [invalid, setInvalid] = useState(false);
@@ -70,12 +79,14 @@ export function DateField({
   }
 
   const selected = isoToDate(value);
+  // ISO dates compare as strings.
+  const atLeastMin = (iso: string) => (min && iso !== "" && iso < min ? min : iso);
 
   /** Parse the draft and push it up. Unparseable text reverts to the stored value rather than
    *  committing junk — but only on blur, never mid-typing. */
   function commitDraft() {
-    const parsed = parseDisplay(draft);
-    if (parsed === null) {
+    const read = parseDisplay(draft);
+    if (read === null) {
       // Typed text that isn't a date: say so to a caller that wants to know (a form that must not
       // carry on as if it had been entered), then show the stored value again.
       if (draft.trim() !== "" && draft !== isoToDisplay(value)) onReject?.(draft);
@@ -83,15 +94,19 @@ export function DateField({
       setInvalid(false);
       return;
     }
+    const parsed = atLeastMin(read);
     setInvalid(false);
     // Normalise what's shown ("4/8" → "04-08-2026") so the field always reads back in one format.
     setDraft(isoToDisplay(parsed));
+    onAccept?.();
     if (parsed !== value) onCommit(parsed);
   }
 
-  function pick(iso: string) {
+  function pick(picked: string) {
+    const iso = atLeastMin(picked);
     setDraft(isoToDisplay(iso));
     setInvalid(false);
+    onAccept?.();
     if (iso !== value) onCommit(iso);
   }
 
@@ -161,6 +176,7 @@ export function DateField({
       {({ close }) => (
         <MonthPicker
           selected={selected}
+          isDisabled={min ? (d) => dateToIso(d) < min : undefined}
           onPick={(d) => {
             pick(dateToIso(d));
             close();

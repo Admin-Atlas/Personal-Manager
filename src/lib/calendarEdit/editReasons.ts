@@ -203,7 +203,7 @@ export function loadText(load: Exclude<EditLoad, { outcome: "ready" }>): string 
 export function problemText(problem: DraftProblem): string {
   switch (problem.kind) {
     case "end_before_start":
-      return "The event ends before it starts.";
+      return "The event has to end after it starts.";
     case "gap":
       return `${problem.time} doesn't happen in ${problem.zone} that night: the clocks skip it. Pick a time outside that hour.`;
     case "unreadable": {

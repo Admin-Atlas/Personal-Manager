@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.144.2-alpha",
+    date: "2026-10-10",
+    highlights: [
+      "When you edit an event, the End time list now starts after the start time and shows how long the event will be, like “10:30 (30 mins)”. The End date can't be set before the day the event starts, and an all-day event's last day can't come before its first.",
+      "Moving the start keeps the event's length, and if you change a time zone in a way that would put the end first, the end moves to keep the event's length. Anything that would stop the event saving, like a time the clocks skip that night, is now shown as soon as you pick it.",
+      "Line breaks in an event's description now show in its details on the Calendar tab, including ones you type in PM and ones from iCal and Outlook calendars. Before, the lines ran together. A description written in Google Calendar's own editor may still show on one line for now. Your calendars refresh once after this update to pick the line breaks up.",
+    ],
+  },
+  {
     version: "3.144.1-alpha",
     date: "2026-10-10",
     highlights: [

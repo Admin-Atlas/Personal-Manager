@@ -129,3 +129,29 @@ describe("the sanitizing boundary, end to end", () => {
     expect(out).toContain("<strong");
   });
 });
+
+// An event's description is plain text typed line by line (`plainLines`): a dashed divider under the
+// dial-in lines of a pasted invite must not turn them into a heading, nor an indented line into code.
+// The default surface keeps reading them as Markdown does.
+describe("plain typed lines (an event's description)", () => {
+  it("reads a divider under text as a divider, not a heading underline", () => {
+    const { container } = render(
+      <Markdown plainLines>{"Meeting ID: 1\nPasscode: 2\n---\nOne tap"}</Markdown>,
+    );
+    expect(container.querySelector("h1, h2")).toBeNull();
+    expect(container.querySelector("hr")).not.toBeNull();
+    expect(container.querySelector("p")?.textContent).toBe("Meeting ID: 1\nPasscode: 2");
+    const equals = render(<Markdown plainLines>{"Notes\n===\nbody"}</Markdown>).container;
+    expect(equals.querySelector("h1, h2")).toBeNull();
+  });
+
+  it("keeps an indented line as text", () => {
+    const { container } = render(<Markdown plainLines>{"Agenda\n\n    item one"}</Markdown>);
+    expect(container.querySelector("pre, code")).toBeNull();
+    expect(container.textContent).toContain("item one");
+  });
+
+  it("leaves the default surface as Markdown reads it", () => {
+    expect(html("Title\n---")).toContain("<h2");
+  });
+});

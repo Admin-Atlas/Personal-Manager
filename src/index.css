@@ -384,9 +384,19 @@ body {
 /* These surfaces previously rendered as `whitespace-pre-wrap`, so a model's single newlines showed
    as line breaks. GFM folds a single newline into a space, which would silently reflow every answer
    the model laid out by hand — `pre-line` keeps those breaks while still collapsing runs of spaces.
-   Scoped here so the document reader keeps CommonMark's folding, as `.pm-note-md` does above. */
+   Scoped here so the document reader keeps CommonMark's folding, as `.pm-note-md` does above.
+   `.pm-event-desc` is an event's description (the calendar pop-up): plain text someone typed line by
+   line, in Google or a feed, which GFM would fold the same way. */
 .pm-inline-md .pm-markdown p,
-.pm-inline-md .pm-markdown li {
+.pm-event-desc .pm-markdown p {
+  white-space: pre-line;
+}
+/* A list item only when it holds nothing but text. A loose item (its text in a <p>) or one holding a
+   nested list carries the "\n" text nodes the Markdown pipeline puts around blocks, which pre-line
+   would paint as empty lines (and white-space inherits into the nested list). A rule of its own, so
+   an engine without :has() drops only this one and falls back to GFM folding. */
+.pm-inline-md .pm-markdown li:not(:has(> p, > ul, > ol, > blockquote, > pre, > table)),
+.pm-event-desc .pm-markdown li:not(:has(> p, > ul, > ol, > blockquote, > pre, > table)) {
   white-space: pre-line;
 }
 /* Citation links, styled as the pre-Markdown `[n]` buttons were: dotted, so they read as a jump to
