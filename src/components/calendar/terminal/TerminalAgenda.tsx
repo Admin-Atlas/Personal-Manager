@@ -3,7 +3,8 @@
 
 // The Terminal system's stand-in for Week / Day / Agenda: a mono `cal` agenda, never a pixel grid.
 // Each day is a `dow DD-MM` header rule (with a `❮ today` marker in accent-text on today) followed by
-// `time ● title` rows, where `●` is the calendar's source colour. Bounded modes (Week/Day) list every
+// `time ● title` rows, where `●` is the calendar's source colour (or the colour the event was given in
+// Google, when it has one). Bounded modes (Week/Day) list every
 // day in the window and print a `·` for empty ones; the open-ended Agenda groups from the anchor day
 // forward and omits empty days. Green (the accent) appears only on today — sources use the palette.
 
@@ -21,6 +22,7 @@ import {
   weekdayShort,
 } from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
+import { eventColour } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 
 interface Props {
@@ -137,7 +139,14 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
                       }
                     >
                       <span className="w-16 shrink-0 text-ink4">{rowTime(ev, row.day)}</span>
-                      <span aria-hidden style={{ color: colorOf(ev.calendar_id) }}>
+                      {/* The event's own colour from Google when it has one, as Google's schedule
+                          view dots it; else its calendar's. */}
+                      <span
+                        aria-hidden
+                        style={{
+                          color: eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id),
+                        }}
+                      >
                         ●
                       </span>
                       {/* Free-height row: wrap rather than clip. Same reasoning as AgendaView —

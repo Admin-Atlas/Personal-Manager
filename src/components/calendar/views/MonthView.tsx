@@ -19,6 +19,7 @@ import {
 } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { scrollBehavior, useDepth } from "../../../theme";
+import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 import { EventChip } from "../parts/EventChip";
 import { SourceDot } from "../parts/SourceDot";
@@ -269,7 +270,8 @@ export function MonthView({
                         {cell.chips.slice(0, MAX_DOTS).map((ev) => (
                           <SourceDot
                             key={ev.id}
-                            color={colorOf(ev.calendar_id)}
+                            // The event's own colour when it has one; the shape stays its calendar's.
+                            color={eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id)}
                             shapeIndex={shapeOf?.(ev.calendar_id)}
                             className="h-2 w-2"
                           />
@@ -287,6 +289,7 @@ export function MonthView({
                             key={ev.id}
                             summary={ev.summary}
                             color={colorOf(ev.calendar_id)}
+                            own={eventColour(ev.color_id)}
                             timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
                             showTime={showMeta}
                             isPast={isEventPast(ev, nowDate)}
@@ -311,6 +314,7 @@ export function MonthView({
               >
                 {week.bands.map((b) => {
                   const color = colorOf(b.ev.calendar_id);
+                  const own = eventColour(b.ev.color_id);
                   const leftPct = (b.startIdx / 7) * 100;
                   const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
                   return (
@@ -320,7 +324,7 @@ export function MonthView({
                         // The band overlay is pointer-events-none so day cells stay clickable; a band
                         // re-enables its own pointer events to open the event popup.
                         "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
-                        onEventClick && "pointer-events-auto cursor-pointer hover:brightness-110",
+                        onEventClick && `pointer-events-auto cursor-pointer ${eventHover(own)}`,
                         isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                       )}
                       style={{
@@ -328,7 +332,7 @@ export function MonthView({
                         left: `${leftPct}%`,
                         width: `${widthPct}%`,
                         height: `${BAND_H - 2}px`,
-                        background: `color-mix(in oklab, ${color} 20%, transparent)`,
+                        background: eventFill(own, color, 20),
                         borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
                         borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
                         borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
@@ -354,12 +358,14 @@ export function MonthView({
                           : undefined
                       }
                     >
-                      <span className="truncate font-head text-ink">
+                      <span className="truncate font-head text-ink" style={inkOn(own)}>
                         {b.continuesLeft ? "‹ " : ""}
                         {/* A timed event across days says when it starts, so it doesn't read as
-                            an all-day one. */}
+                            an all-day one. --ink2: small text on the tint needs it for 4.5:1. */}
                         {!b.ev.all_day && !b.continuesLeft && (
-                          <span className="font-mono text-ink3">{formatClockIso(b.ev.start)} </span>
+                          <span className="font-mono text-ink2" style={inkOn(own)}>
+                            {formatClockIso(b.ev.start)}{" "}
+                          </span>
                         )}
                         {b.ev.summary}
                       </span>

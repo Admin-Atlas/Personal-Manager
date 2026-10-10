@@ -4,8 +4,9 @@
 // The all-day / multi-day strip above the time-grid body. Each band is packed into a stacked lane
 // (calendar-layout.packBands) and positioned by day index across the visible columns, clamped to the
 // window with flat edges where it continues off-screen. Fill/border are the per-source colour mixed
-// into transparency via color-mix (token-safe — no source hex is written here). Renders nothing when
-// no band events fall in range, so the row collapses.
+// into transparency via color-mix (token-safe — no source hex is written here); an event given its own
+// colour in Google fills with that, solid, the border keeping its calendar's. Renders nothing when no
+// band events fall in range, so the row collapses.
 
 import { useMemo } from "react";
 import type { CalendarEvent } from "../../../lib/types";
@@ -18,6 +19,7 @@ import {
   PAST_EVENT_CLASS,
   type BandInput,
 } from "../../../lib/calendar-layout";
+import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 
 interface Props {
@@ -106,6 +108,7 @@ export function AllDayBand({
       <div className="relative flex-1" style={{ height: `${laneCount * LANE_H}px` }}>
         {placed.map((b) => {
           const color = colorOf(b.ev.calendar_id);
+          const own = eventColour(b.ev.color_id);
           const leftPct = (b.startDay / ndays) * 100;
           const widthPct = ((b.endDay - b.startDay + 1) / ndays) * 100;
           const clickable = !!onEventClick;
@@ -115,7 +118,7 @@ export function AllDayBand({
               key={b.ev.id}
               className={cn(
                 "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[1.125rem]",
-                clickable && "cursor-pointer hover:brightness-110",
+                clickable && `cursor-pointer ${eventHover(own)}`,
                 past && PAST_EVENT_CLASS,
               )}
               style={{
@@ -123,7 +126,7 @@ export function AllDayBand({
                 left: `${leftPct}%`,
                 width: `${widthPct}%`,
                 height: `${LANE_H - 2}px`,
-                background: `color-mix(in oklab, ${color} 22%, transparent)`,
+                background: eventFill(own, color, 22),
                 borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
                 borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
                 borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
@@ -150,7 +153,7 @@ export function AllDayBand({
                   : undefined
               }
             >
-              <span className="truncate font-head text-ink">
+              <span className="truncate font-head text-ink" style={inkOn(own)}>
                 {b.continuesLeft ? "‹ " : ""}
                 {b.ev.summary}
               </span>

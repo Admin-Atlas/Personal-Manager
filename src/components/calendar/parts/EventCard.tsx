@@ -7,17 +7,22 @@
 // source colour mixed into the surface via color-mix (token-safe — no source hex written here), so a
 // timed block reads as its calendar's colour like the all-day bands do, instead of a flat neutral that
 // vanished into the grid. Opaque-over-surface (not …, transparent) on purpose: timed cards overlap and
-// sit over the today-column tint, where a translucent fill goes muddy. Meta reveals with depth AND
-// available height (a 20px sliver has no room for a time line); a past event is greyed via isPast.
+// sit over the today-column tint, where a translucent fill goes muddy. An event given its own colour in
+// Google is filled with that instead, solid, in its own text colour, the stripe keeping its calendar's
+// colour, as Google draws it (`own`). Meta reveals with depth AND available height (a 20px sliver has
+// no room for a time line); a past event is greyed via isPast.
 
 import type { CSSProperties } from "react";
 import { cn } from "../../ui";
 import { PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
+import { eventFill, eventHover, inkOn, type EventColour } from "../../../theme/eventPalette";
 
 interface Props {
   summary: string;
   /** The calendar's source colour (categorical palette) — the left rule. */
   color: string;
+  /** The colour the event was given in Google, when it has one: the fill (else the calendar's). */
+  own?: EventColour | null;
   /** Local clock label, e.g. "09:30–10:30", or for an event across days its dates and times. */
   timeLabel: string;
   location: string | null;
@@ -51,6 +56,7 @@ const LOC_MIN_H = 52;
 export function EventCard({
   summary,
   color,
+  own = null,
   timeLabel,
   location,
   topPx,
@@ -71,7 +77,7 @@ export function EventCard({
     left: `calc(${leftPct}% + 1px)`,
     width: `calc(${widthPct}% - 2px)`,
     borderLeftColor: color,
-    background: `color-mix(in oklab, ${color} 18%, var(--surface))`,
+    background: eventFill(own, color, 18, "var(--surface)"),
     // A piece of an event across days runs edge to edge into the next day's piece: square, open
     // ends where it continues (inline, as `cn` doesn't resolve conflicting utilities).
     ...(continuesBefore
@@ -91,7 +97,7 @@ export function EventCard({
     <div
       className={cn(
         "absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] px-1.5 py-0.5",
-        onSelect && "cursor-pointer hover:brightness-110",
+        onSelect && `cursor-pointer ${eventHover(own)}`,
         isPast && PAST_EVENT_CLASS,
       )}
       style={style}
@@ -111,11 +117,23 @@ export function EventCard({
           : undefined
       }
     >
-      <div className="truncate font-head text-[0.6875rem] font-medium leading-tight text-ink">
+      <div
+        className="truncate font-head text-[0.6875rem] font-medium leading-tight text-ink"
+        style={inkOn(own)}
+      >
         {summary}
       </div>
-      {withTime && <div className="truncate font-mono text-[0.5625rem] text-ink4">{timeLabel}</div>}
-      {withLoc && <div className="truncate font-mono text-[0.5625rem] text-ink4">{location}</div>}
+      {/* --ink2, not --ink4: small text on the calendar's tint needs it for 4.5:1. */}
+      {withTime && (
+        <div className="truncate font-mono text-[0.5625rem] text-ink2" style={inkOn(own)}>
+          {timeLabel}
+        </div>
+      )}
+      {withLoc && (
+        <div className="truncate font-mono text-[0.5625rem] text-ink2" style={inkOn(own)}>
+          {location}
+        </div>
+      )}
     </div>
   );
 }

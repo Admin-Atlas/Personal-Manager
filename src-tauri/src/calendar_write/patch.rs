@@ -312,6 +312,7 @@ mod tests {
             "creator": { "email": "me@example.com" },
             "attachments": [{ "fileUrl": "https://drive.google.com/x" }],
             "extendedProperties": { "private": { "k": "v" } },
+            "colorId": "5",
             "eventLabelId": "label-1"
         })
     }
@@ -374,6 +375,9 @@ mod tests {
             "creator",
             "attachments",
             "extendedProperties",
+            // An event's own colour stays as Google holds it: a PATCH that leaves a field out keeps
+            // it (events.patch), so a title save never clears it (live test L-C1).
+            "colorId",
             "eventLabelId",
             "id",
             "etag",

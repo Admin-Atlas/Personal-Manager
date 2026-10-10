@@ -398,4 +398,32 @@ describe("CalendarEventPopover", () => {
     );
     expect(text.closest(".pm-event-desc")).not.toBeNull();
   });
+
+  // The colour an event was given in Google is named, not only shown: the fill's hue alone doesn't
+  // carry it for everyone.
+  it("names the colour an event was given in Google, and says nothing for one without", () => {
+    const { getByText, queryByText, rerender } = render(
+      <CalendarEventPopover
+        event={calendarEvent({ color_id: "1" })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(getByText("Colour")).toBeTruthy();
+    expect(getByText("Lavender")).toBeTruthy();
+    rerender(
+      <CalendarEventPopover
+        event={calendarEvent({ color_id: null })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(queryByText("Colour")).toBeNull();
+  });
 });

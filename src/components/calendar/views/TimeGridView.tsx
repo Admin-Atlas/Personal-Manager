@@ -37,6 +37,7 @@ import { EventCard } from "../parts/EventCard";
 import { NowLine } from "../parts/NowLine";
 import { AllDayBand } from "../parts/AllDayBand";
 import { whenText } from "../parts/whenText";
+import { eventColour } from "../../../theme/eventPalette";
 
 interface Props {
   /** The visible day columns (local midnights), left → right. Day = 1, Week = 7. */
@@ -394,6 +395,7 @@ export function TimeGridView({
                   key={card.ev.id}
                   summary={card.ev.summary}
                   color={colorOf(card.ev.calendar_id)}
+                  own={eventColour(card.ev.color_id)}
                   timeLabel={card.timeLabel}
                   location={card.ev.location}
                   topPx={(card.startMin / 60) * rowH}
