@@ -6,13 +6,14 @@ import {
   addMilestone,
   addPreference,
   calendarOverview,
+  checkGoogleCalendars,
   listCalendarEvents,
   listProjectOverviews,
+  onCalendarSynced,
   proposeProjectMetadata,
   resolveFlag,
   routeFocusInput,
   setProjectMetadata,
-  syncCalendar,
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
 import { MergeProjectDialog } from "./MergeProjectDialog";
@@ -154,6 +155,10 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   // name-matched synced event can still flip a project to "Due soon" — exactly the immediate-then-
   // resync pattern onFlagResolved uses. refreshSeqRef makes the later refresh() win if the immediate
   // and post-sync loads resolve out of order; aliveRef still guards setEvents.
+  //
+  // The calendar step is the cheap change check (#884, F3), not a full sync: every visit to this tab
+  // used to re-download every calendar, iCal feed and calendar list. The app's 15-minute sync and its
+  // ~30 s check keep the mirror fresh, and `calendar://synced` (below) repaints when either lands.
   useEffect(() => {
     void refresh();
     void (async () => {
@@ -161,7 +166,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
         const overview = await calendarOverview();
         if (aliveRef.current) setCalendars(overview.calendars);
         if (overview.accounts.length > 0) {
-          await syncCalendar().catch(() => {});
+          await checkGoogleCalendars().catch(() => {});
           const evts = await listCalendarEvents();
           if (aliveRef.current) {
             setEvents(evts);
@@ -173,6 +178,33 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
         /* connector optional — focus view works without it */
       }
     })();
+  }, []);
+
+  // A sync or the change check wrote events: show them (and the cards they re-derive) without waiting
+  // for a tab switch.
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void onCalendarSynced(() => {
+      void listCalendarEvents()
+        .then((evts) => {
+          if (aliveRef.current) {
+            setEvents(evts);
+            cachedEvents = evts;
+          }
+          return refresh();
+        })
+        .catch(() => {});
+    })
+      .then((stop) => {
+        if (alive) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
   }, []);
 
   const names = useMemo(() => projects.map((p) => p.name), [projects]);

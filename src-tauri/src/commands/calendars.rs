@@ -10,13 +10,15 @@
 //! OAuth client they manage is ONE client serving Calendar *and* Drive, so a change here
 //! reaches `connectors` and `backup::schedule` too.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::calendar_editing::{self, Choice, ConsentVerdict, EditingStatus};
+use crate::calendar_fresh::{Freshness, Plan, Verdict};
 use crate::calendar_write::dto::ReadOnlyReason;
 use crate::calendar_write::reconcile::Stamp;
 use crate::error::{Error, Result};
@@ -670,10 +672,19 @@ pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result
 
 // --- shared sync over every provider ---
 
+/// One calendar's pass, as [`sync_one_calendar`] reports it.
+struct SyncedOne {
+    /// How many events the fetch saw.
+    count: usize,
+    /// The fetch's own verdict on whether it saw the whole calendar; gates the mirror's delete half
+    /// and the caller's state stamp.
+    complete: bool,
+    /// Google's clock when it answered (Google calendars only), for the change check.
+    server_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Pull events from a single selected calendar (provider-dispatched) and write them to the mirror.
-/// Returns `(event count, complete)` — `complete` is the fetch's own verdict on whether it saw the
-/// whole calendar, and gates the mirror's delete half plus the caller's state stamp. Never holds the
-/// DB lock across the fetch (rule #4).
+/// Never holds the DB lock across the fetch (rule #4).
 async fn sync_one_calendar(
     app: &AppHandle,
     cal: &calendar::Calendar,
@@ -681,23 +692,26 @@ async fn sync_one_calendar(
     time_min: &str,
     time_max: &str,
     tz: chrono_tz::Tz,
-) -> Result<(usize, bool)> {
+) -> Result<SyncedOne> {
     // Taken before the fetch: only a fetch that began after a save may settle it (rule R4).
     let fetch_started = std::time::Instant::now();
+    let mut server_time = None;
     let (events, complete) = match cal.provider.as_str() {
         "google" => {
             let email = calendar::account_email_of(&cal.source_id).ok_or_else(|| {
                 Error::Other(format!("bad calendar source id: {}", cal.source_id))
             })?;
             let remote = cal.remote_id.as_deref().unwrap_or(&cal.id);
-            calendar::fetch_events(
+            let fetched = calendar::fetch_events(
                 &google_calendar_token_key(&email),
                 &cal.id,
                 remote,
                 time_min,
                 time_max,
             )
-            .await?
+            .await?;
+            server_time = fetched.server_time;
+            (fetched.events, fetched.complete)
         }
         "microsoft" => {
             let email = calendar::account_email_of(&cal.source_id).ok_or_else(|| {
@@ -724,7 +738,7 @@ async fn sync_one_calendar(
             calendar::sync_feed(feed, time_min, time_max, tz).await?
         }
     };
-    let n = events.len();
+    let count = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     write_fetched_events(
@@ -735,7 +749,11 @@ async fn sync_one_calendar(
         complete,
         fetch_started,
     )?;
-    Ok((n, complete))
+    Ok(SyncedOne {
+        count,
+        complete,
+        server_time,
+    })
 }
 
 /// Write one calendar's fetch into the mirror, through the saves of the last ten minutes: a fetch
@@ -892,17 +910,30 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         })
         .collect();
     let mut results = futures_util::stream::iter(fetches).buffered(CALENDAR_FETCH_CONCURRENCY);
+    // Every calendar whose events this pass wrote, for the views to re-read.
+    let mut written: Vec<String> = Vec::new();
     while let Some((cal, result)) = results.next().await {
+        let google = cal.provider == "google";
         match result {
-            Ok((n, complete)) => {
-                total += n;
-                if complete {
+            Ok(one) => {
+                total += one.count;
+                written.push(cal.id.clone());
+                if one.complete {
                     ok_sources.insert(cal.source_id.clone());
+                    // The change check counts from this fetch on (and a sign-in pause is over).
+                    if google {
+                        note_fresh(&app, |f| {
+                            f.fetched(&cal.id, one.server_time, &[], Instant::now())
+                        });
+                    }
                 } else {
                     partial_sources.insert(cal.source_id.clone());
                 }
             }
             Err(e) => {
+                if google {
+                    note_fresh_failure(&app, &cal.id, &e);
+                }
                 failed_sources.insert(cal.source_id.clone());
                 last_err = Some(e);
             }
@@ -920,6 +951,8 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
             .map(|c| c.id)
             .collect();
         calendar::prune_unselected(&conn, &active_now)?;
+        let selected: HashSet<&str> = active_now.iter().map(String::as_str).collect();
+        note_fresh(&app, |f| f.keep_only(&selected));
         // A source with ANY failed calendar this round is 'unreachable' — check failures FIRST, so
         // a partially-failed account (some calendars ok, some not) isn't stamped a clean 'ok' and
         // hidden from the Connectors warning. A source that failed keeps its last-good events.
@@ -946,11 +979,223 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         // case, a poll that pulled nothing new, costs nothing.
         briefing::nudge(&state);
     }
+    announce_synced(&app, written);
 
     if let Some(e) = last_err {
         return Err(e);
     }
     Ok(total)
+}
+
+/// Update the change check's bookkeeping (a short lock, never held across an await).
+fn note_fresh(app: &AppHandle, update: impl FnOnce(&mut Freshness)) {
+    let state = app.state::<AppState>();
+    let lock = state.calendar_edit.fresh.lock();
+    if let Ok(mut fresh) = lock {
+        update(&mut fresh);
+    }
+}
+
+/// A Google calendar's check or fetch failed: back off if Google refused it, or just try again with
+/// the next check if the request never reached Google (offline: see `Freshness::unreachable`).
+fn note_fresh_failure(app: &AppHandle, calendar_id: &str, e: &Error) {
+    let now = Instant::now();
+    if never_reached_google(e) {
+        note_fresh(app, |f| f.unreachable(calendar_id, now));
+    } else {
+        let sign_in = matches!(e, Error::Reauth(_));
+        note_fresh(app, |f| f.failed(calendar_id, now, sign_in));
+    }
+}
+
+/// Whether a request failed before Google could answer it: no connection, or no answer in time.
+fn never_reached_google(e: &Error) -> bool {
+    matches!(e, Error::Http(h) if h.is_connect() || h.is_timeout())
+}
+
+/// `calendar://synced`: these calendars' events were just written by a sync or a change check, so
+/// an open Calendar or Focus view re-reads them without waiting for a focus change.
+#[derive(Clone, Serialize)]
+struct CalendarSynced {
+    calendar_ids: Vec<String>,
+}
+
+fn announce_synced(app: &AppHandle, calendar_ids: Vec<String>) {
+    if calendar_ids.is_empty() {
+        return;
+    }
+    let _ = app.emit_to("main", "calendar://synced", CalendarSynced { calendar_ids });
+}
+
+/// What a change check did.
+#[derive(Debug, Default, Serialize)]
+pub struct CalendarCheck {
+    /// Google calendars asked about.
+    pub checked: usize,
+    /// Calendars fetched again because something in them changed (their ids).
+    pub fetched: Vec<String>,
+}
+
+/// One calendar's part in a change check.
+enum CheckOutcome {
+    Unchanged,
+    Fetched,
+    Failed,
+}
+
+/// Bring PM's Google calendars up to date cheaply (#884, F3): ask Google, per calendar, what changed
+/// since the last look ([`calendar::check_for_changes`]), and fetch again only the calendars where
+/// something did ([`crate::calendar_fresh`] keeps the books). The webview calls this about every 30 s
+/// while PM's window is on screen; iCal feeds and Outlook stay on the 15-minute full sync.
+///
+/// Never waits behind a sync: one already running is bringing the mirror up to date, so this returns
+/// at once. Checks are at least [`crate::calendar_fresh::MIN_GAP`] apart however often they're asked
+/// for. A calendar that fails waits a while before its next check; one whose account needs signing
+/// in again waits for a full sync.
+#[tauri::command]
+pub async fn check_google_calendars(app: AppHandle) -> Result<CalendarCheck> {
+    let state = app.state::<AppState>();
+    let Ok(_single) = state.calendar_edit.sync_lock.try_lock() else {
+        return Ok(CalendarCheck::default());
+    };
+    let mut go = false;
+    note_fresh(&app, |f| go = f.begin_check(Instant::now()));
+    if !go {
+        return Ok(CalendarCheck::default());
+    }
+    let (calendars, (time_min, time_max), tz) = {
+        let conn = state.conn()?;
+        let selected = calendar::selected_calendars(&conn)?;
+        let ids: HashSet<&str> = selected.iter().map(|c| c.id.as_str()).collect();
+        note_fresh(&app, |f| f.keep_only(&ids));
+        let google: Vec<calendar::Calendar> = selected
+            .into_iter()
+            .filter(|c| c.provider == "google")
+            .collect();
+        (google, calendar::time_window(&conn)?, resolve_zone(&conn))
+    };
+    let no_feeds = std::collections::HashMap::new();
+
+    use futures_util::stream::StreamExt;
+    const CHECK_CONCURRENCY: usize = 3;
+    let checks: Vec<_> = calendars
+        .iter()
+        .map(|cal| {
+            let (app, no_feeds) = (&app, &no_feeds);
+            let (time_min, time_max) = (&time_min, &time_max);
+            async move {
+                let outcome = check_one_calendar(app, cal, no_feeds, time_min, time_max, tz).await;
+                (cal, outcome)
+            }
+        })
+        .collect();
+    let mut results = futures_util::stream::iter(checks).buffered(CHECK_CONCURRENCY);
+    let mut report = CalendarCheck {
+        checked: calendars.len(),
+        fetched: Vec::new(),
+    };
+    let mut fetched_sources: HashSet<String> = HashSet::new();
+    let mut failed_sources: HashSet<String> = HashSet::new();
+    while let Some((cal, outcome)) = results.next().await {
+        match outcome {
+            CheckOutcome::Unchanged => {}
+            CheckOutcome::Fetched => {
+                report.fetched.push(cal.id.clone());
+                fetched_sources.insert(cal.source_id.clone());
+            }
+            CheckOutcome::Failed => {
+                failed_sources.insert(cal.source_id.clone());
+            }
+        }
+    }
+    {
+        let conn = state.conn()?;
+        // As in `sync_calendar`: a calendar unticked or disconnected while this check fetched it
+        // (neither takes the sync lock) mustn't keep what the fetch just wrote.
+        let active_now: Vec<String> = calendar::selected_calendars(&conn)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        calendar::prune_unselected(&conn, &active_now)?;
+        let selected: HashSet<&str> = active_now.iter().map(String::as_str).collect();
+        note_fresh(&app, |f| f.keep_only(&selected));
+        report.fetched.retain(|id| selected.contains(id.as_str()));
+        if !report.fetched.is_empty() {
+            // An account whose changed calendars all came in whole has a fresh "last synced" time,
+            // if it was fine already. Its state stays the full sync's to judge: a check skips a
+            // calendar that is backing off, so it never sees the whole account.
+            for source in fetched_sources.difference(&failed_sources) {
+                calendar::touch_source_synced_if_ok(&conn, source)?;
+            }
+            briefing::nudge(&state);
+        }
+    }
+    announce_synced(&app, report.fetched.clone());
+    Ok(report)
+}
+
+/// One Google calendar's part in [`check_google_calendars`]: check it (or fetch it, if nothing yet
+/// says from when to check), and fetch it again when something changed.
+async fn check_one_calendar(
+    app: &AppHandle,
+    cal: &calendar::Calendar,
+    no_feeds: &std::collections::HashMap<String, calendar::IcsFeed>,
+    time_min: &str,
+    time_max: &str,
+    tz: chrono_tz::Tz,
+) -> CheckOutcome {
+    let mut plan = Plan::Skip;
+    note_fresh(app, |f| plan = f.plan(&cal.id, Instant::now()));
+    let absorb = match plan {
+        Plan::Skip => return CheckOutcome::Unchanged,
+        Plan::Fetch => Vec::new(),
+        Plan::Check(since) => {
+            let Some(email) = calendar::account_email_of(&cal.source_id) else {
+                return CheckOutcome::Unchanged;
+            };
+            let remote = cal.remote_id.as_deref().unwrap_or(&cal.id);
+            match calendar::check_for_changes(&google_calendar_token_key(&email), remote, since)
+                .await
+            {
+                Ok(calendar::Changes::TooOld) => Vec::new(),
+                Ok(calendar::Changes::Listed {
+                    items,
+                    more,
+                    server_time,
+                }) => {
+                    let mut verdict = Verdict::Unchanged;
+                    note_fresh(app, |f| {
+                        verdict = f.checked(&cal.id, &items, more, server_time)
+                    });
+                    if verdict == Verdict::Unchanged {
+                        return CheckOutcome::Unchanged;
+                    }
+                    items
+                }
+                Err(e) => {
+                    note_fresh_failure(app, &cal.id, &e);
+                    return CheckOutcome::Failed;
+                }
+            }
+        }
+    };
+    match sync_one_calendar(app, cal, no_feeds, time_min, time_max, tz).await {
+        Ok(one) if one.complete => {
+            note_fresh(app, |f| {
+                f.fetched(&cal.id, one.server_time, &absorb, Instant::now())
+            });
+            CheckOutcome::Fetched
+        }
+        // Written, but not all of it: the full sync will judge it; meanwhile back off.
+        Ok(_) => {
+            note_fresh(app, |f| f.failed(&cal.id, Instant::now(), false));
+            CheckOutcome::Failed
+        }
+        Err(e) => {
+            note_fresh_failure(app, &cal.id, &e);
+            CheckOutcome::Failed
+        }
+    }
 }
 
 /// Every mirrored event across the widened window — the read backing the unified calendar view

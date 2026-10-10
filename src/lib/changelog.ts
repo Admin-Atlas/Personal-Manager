@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.145.0-alpha",
+    date: "2026-10-10",
+    highlights: [
+      "Changes made in Google Calendar now show in PM within about half a minute while PM is open, with no need to press Refresh. PM asks Google which of your calendars changed and downloads only those, so it stays light on your connection.",
+      "While PM is hidden or in the tray it stops checking, and it catches up as soon as you bring it back. iCal and Outlook calendars still refresh every 15 minutes.",
+      "The Calendar tab and the Focus tab now update as soon as a background refresh brings changes in, instead of waiting until you switched away and back. Opening the Focus tab no longer downloads every calendar again each time.",
+    ],
+  },
+  {
     version: "3.144.3-alpha",
     date: "2026-10-10",
     highlights: [

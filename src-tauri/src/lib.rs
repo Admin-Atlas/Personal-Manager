@@ -13,6 +13,7 @@ mod blocking;
 mod briefing;
 mod calendar;
 mod calendar_editing;
+mod calendar_fresh;
 mod calendar_recur;
 mod calendar_write;
 mod chat;
@@ -1790,6 +1791,7 @@ pub fn run() {
             #[cfg(debug_assertions)]
             commands::dev_google_grant_report,
             commands::sync_calendar,
+            commands::check_google_calendars,
             commands::list_calendar_events,
             commands::list_all_calendar_events,
             commands::event_flags,

@@ -1668,6 +1668,19 @@ export interface CalendarWriteLanded {
   calendar_id: string;
 }
 
+/** The `calendar://synced` event: calendars whose events a sync or a change check just wrote. */
+export interface CalendarSynced {
+  calendar_ids: string[];
+}
+
+/** What a change check of the Google calendars did (`check_google_calendars`). */
+export interface CalendarCheck {
+  /** Google calendars asked about. */
+  checked: number;
+  /** Calendars fetched again because something in them changed. */
+  fetched: string[];
+}
+
 /** A focus-agenda row: a mirrored event plus whether it has already ended. The focus agenda widens
  *  the strict "not yet ended" gate to also list events that finished earlier today (in the user's
  *  zone); `ended` (`end < now`) is true for exactly those, so the view can show them de-emphasised
