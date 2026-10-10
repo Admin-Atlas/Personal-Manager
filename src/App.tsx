@@ -5,8 +5,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { CONNECTOR_POLL_MS, shouldIncludeSharedWithMe } from "./lib/connectorPoll";
 import { nextCheckDelay, shouldCheck } from "./lib/calendarPoll";
+import { isTypingTarget } from "./lib/calendarNavKey";
 import { isAnyDialogOpen } from "./lib/useDialogLayer";
 import { CalendarView } from "./components/calendar/CalendarView";
+import { watchHeldDeletes } from "./components/calendar/edit/useEventWrites";
 import { ChatView } from "./components/ChatView";
 import { ProviderChip } from "./components/ProviderChip";
 import { ThinkingToggle } from "./components/ThinkingToggle";
@@ -56,7 +58,7 @@ import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useExternalLinks } from "./lib/useExternalLinks";
 import { hydrateStoredPrefs } from "./lib/storedPrefs";
-import { useDevMode } from "./lib/capabilities";
+import { isDevBuild, useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
 
 const LAST_SEEN_VERSION_KEY = "pm:lastSeenVersion";
@@ -269,11 +271,23 @@ export default function App() {
   // Ctrl/Cmd+K toggles the command palette from anywhere (spec §4 — jump
   // anywhere in a couple of keystrokes) — except over another dialog: jumping away would unmount
   // the view behind it, and with it whatever that dialog held (an event editor's unsaved changes).
+  //
+  // A dev build also reloads on Ctrl/Cmd+R or F5, as WebView2 does by itself on Windows: Linux's
+  // WebKitGTK has no reload key, and live tests reload (#884). Not over a dialog, for the same reason,
+  // and not while typing in a field: a reload runs no unmount, so a debounced save still waiting (the
+  // Pinboard's, 500 ms after the last key) would be lost.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setShowPalette((open) => (open ? false : !isAnyDialogOpen()));
+      }
+      const reloadKey =
+        (e.key === "F5" && !e.ctrlKey && !e.metaKey && !e.altKey) ||
+        ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "r");
+      if (isDevBuild && reloadKey && !e.repeat && !isAnyDialogOpen() && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        window.location.reload();
       }
     }
     window.addEventListener("keydown", onKey);
@@ -542,6 +556,13 @@ export default function App() {
   useEffect(() => {
     if (aiReady) void refreshReviewCount();
   }, [aiReady, view, refreshReviewCount]);
+
+  // A calendar delete waiting out its Undo when the window reloaded is picked up here, whatever tab
+  // PM opens on (it opens on Focus): otherwise how it ended would only be heard if the Calendar tab
+  // was opened within its Undo window. Its notice waits for that tab, however late (#884).
+  useEffect(() => {
+    if (aiReady) watchHeldDeletes();
+  }, [aiReady]);
 
   // Install the live document-arrival listener once for the whole app, and count the badge up as
   // files land. Mounted here rather than in a view because arrivals keep coming while neither the

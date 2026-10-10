@@ -52,6 +52,18 @@ export function isCoveredByDialog(el: Element | null): boolean {
 }
 
 /**
+ * Whether a dialog is open that isn't part of `root` — one opened over a whole view (Settings, the
+ * command palette) rather than the view's own (the Pinboard's folder overlay). For a view-wide shortcut
+ * that must still work in its own dialogs but stand down under someone else's. Read at event time.
+ */
+export function isDialogOpenOutside(root: Element | null): boolean {
+  for (const dialog of openDialogs) {
+    if (!root || !root.contains(dialog)) return true;
+  }
+  return false;
+}
+
+/**
  * Register a dialog while it is open, and get back a predicate for "am I the one the keyboard
  * should be talking to?". Read the predicate at EVENT time, never at render time — the set changes
  * whenever any dialog opens or closes, and a value captured during render is stale by then.

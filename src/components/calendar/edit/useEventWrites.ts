@@ -71,8 +71,21 @@ function update(next: Partial<State>) {
   for (const notify of subscribers) notify();
 }
 
+/** Done-and-fine notices put while no view was showing them: a delete that settled while PM was on
+ *  another tab, perhaps after a reload. Their {@link NOTICE_MS} starts when a view subscribes, so
+ *  the Calendar tab still says how the delete ended, however late it's opened. */
+const unseen = new Set<WriteNotice>();
+
+function expire(notice: WriteNotice) {
+  setTimeout(() => {
+    if (state.notices.includes(notice)) dismissNotice(notice.id);
+  }, NOTICE_MS);
+}
+
 function subscribe(onChange: () => void) {
   subscribers.add(onChange);
+  for (const notice of unseen) expire(notice);
+  unseen.clear();
   return () => {
     subscribers.delete(onChange);
   };
@@ -81,8 +94,10 @@ function subscribe(onChange: () => void) {
 const quoted = (summary: string) => `“${summary.trim() || "(no title)"}”`;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** Show `notice` (replacing the one with its id, if any). One that is done and fine goes by itself;
- *  the timer only removes the notice it was set for, never a later one under the same id. */
+/** Show `notice` (replacing the one with its id, if any). One that is done and fine goes by itself,
+ *  once a view has shown it; the timer only removes the notice it was set for, never a later one
+ *  under the same id. A delete still held or being sent isn't done, though its notice has lost its
+ *  Undo: that one stays until the delete settles. */
 function put(notice: WriteNotice) {
   const shown = state.notices.some((n) => n.id === notice.id);
   update({
@@ -90,10 +105,10 @@ function put(notice: WriteNotice) {
       ? state.notices.map((n) => (n.id === notice.id ? notice : n))
       : [...state.notices, notice],
   });
-  if (notice.tone === "ok" && !notice.undoToken) {
-    setTimeout(() => {
-      if (state.notices.includes(notice)) dismissNotice(notice.id);
-    }, NOTICE_MS);
+  const inFlight = state.held.some((h) => h.noticeId === notice.id);
+  if (notice.tone === "ok" && !notice.undoToken && !inFlight) {
+    if (subscribers.size > 0) expire(notice);
+    else unseen.add(notice);
   }
 }
 
@@ -143,13 +158,16 @@ function settle(settled: DeleteSettled) {
   put({ id: held.noticeId, ...deleteText(settled.result, held.summary) });
 }
 
-function ensureListening() {
+/** Hear how held deletes end, and pick up any still waiting (a reload emptied this store; the backend
+ *  still knows what it is holding). Once per webview. The app calls it as soon as the vault is open,
+ *  whatever tab it opens on, so a delete that settles before the Calendar tab is visited is still
+ *  heard, and its notice is waiting there; the Calendar tab and a delete call it too. */
+export function watchHeldDeletes() {
   if (listening) return;
   listening = true;
   onCalendarDeleteSettled(settle).catch(() => {
     listening = false;
   });
-  // A reload emptied this store; the backend still knows what it is holding.
   listHeldDeletes()
     .then((waiting) => {
       for (const w of waiting) {
@@ -169,7 +187,7 @@ function ensureListening() {
 
 /** Ask to delete `event`. The backend holds it for an Undo window; the row is hidden meanwhile. */
 export async function startDelete(event: CalendarEvent): Promise<void> {
-  ensureListening();
+  watchHeldDeletes();
   const title = quoted(event.summary);
   try {
     const start = await deleteCalendarEvent(event.id, seenOf(event));
@@ -234,6 +252,26 @@ export async function undoDelete(token: string): Promise<void> {
   }
 }
 
+/** The newest Undo on screen: the last notice still offering one. Notices hold the truth, not the
+ *  held deletes, so a key never undoes what the user can't see (a notice dismissed with ×, or one
+ *  whose window has closed). */
+export function latestUndo(notices: readonly WriteNotice[]): string | null {
+  for (let i = notices.length - 1; i >= 0; i--) {
+    const token = notices[i].undoToken;
+    if (token) return token;
+  }
+  return null;
+}
+
+/** Press the newest Undo on screen (Ctrl+Z on the Calendar tab). Whether there was one to press.
+ *  `undoDelete` takes its button away at once, so pressing again undoes the next newest. */
+export function undoLatest(): boolean {
+  const token = latestUndo(state.notices);
+  if (!token) return false;
+  void undoDelete(token);
+  return true;
+}
+
 /** Open an event for editing: Google's fresh copy, what may change, and the session a save names.
  *  The device zone goes with it only when the webview knows it (never a guessed UTC). */
 export function openForEdit(eventId: string): Promise<EditLoad> {
@@ -268,7 +306,7 @@ export function pruneRemoved(events: readonly CalendarEvent[]) {
 /** The calendar's view of the writes in flight: notices, and the rows to hide (held or removed). */
 export function useEventWrites() {
   // On first use (and after a reload): hear how held deletes end, and pick up any still waiting.
-  useEffect(ensureListening, []);
+  useEffect(watchHeldDeletes, []);
   const snap = useSyncExternalStore(subscribe, () => state);
   const hiddenIds = useMemo(
     () => new Set([...snap.held.map((h) => h.eventId), ...snap.removed]),
@@ -279,6 +317,7 @@ export function useEventWrites() {
     hiddenIds,
     startDelete,
     undoDelete,
+    undoLatest,
     dismissNotice,
     pruneRemoved,
   };

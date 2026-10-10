@@ -767,13 +767,17 @@ impl HeldDeletes {
         }
     }
 
-    /// The deletes still waiting, for a webview that reloaded.
+    /// The deletes still waiting, for a webview that reloaded: the oldest first, as they were made,
+    /// so the notices come back in that order and Ctrl+Z still undoes the newest.
     fn list(&self) -> Vec<HeldDeleteInfo> {
         let Ok(held) = self.0.lock() else {
             return Vec::new();
         };
         let now = Instant::now();
-        held.iter()
+        let mut waiting: Vec<(&String, &Held)> = held.iter().collect();
+        waiting.sort_by_key(|(_, h)| h.until);
+        waiting
+            .into_iter()
             .map(|(token, h)| HeldDeleteInfo {
                 undo_token: token.clone(),
                 event_id: h.event_id.clone(),
@@ -1491,6 +1495,32 @@ mod tests {
         assert!(!held.cancel("b"), "too late to undo");
 
         assert!(!held.cancel("never-held"));
+    }
+
+    /// A reloaded webview gets the waiting deletes oldest first, so their notices come back in the
+    /// order they were made and Ctrl+Z (the newest notice) undoes the newest delete.
+    #[test]
+    fn waiting_deletes_are_listed_oldest_first() {
+        let held = HeldDeletes::default();
+        let now = Instant::now();
+        let tokens = ["n", "c", "x", "a", "q"];
+        // Held newest first, so the list can't come back in the order it was made by luck.
+        let _waiting: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, token)| {
+                held.hold(
+                    token,
+                    "cal:e",
+                    "Event",
+                    now + Duration::from_millis(i as u64 * 10),
+                )
+                .unwrap()
+            })
+            .collect();
+        let listed: Vec<String> = held.list().into_iter().map(|h| h.undo_token).collect();
+        assert_eq!(listed, tokens);
     }
 
     /// Quitting drops every waiting delete: each task wakes as undone, and none can be taken.
