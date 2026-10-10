@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { CONNECTOR_POLL_MS, shouldIncludeSharedWithMe } from "./lib/connectorPoll";
+import { nextCheckDelay, shouldCheck } from "./lib/calendarPoll";
 import { isAnyDialogOpen } from "./lib/useDialogLayer";
 import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
@@ -93,6 +94,7 @@ import {
   setHelpMode,
   startSemanticLayout,
   syncCalendar,
+  checkGoogleCalendars,
   vaultLockStatus,
   vaultStatus,
 } from "./lib/ipc";
@@ -705,6 +707,46 @@ export default function App() {
     const off = onTeardown(() => clearInterval(id));
     return () => {
       clearInterval(id);
+      off();
+    };
+  }, [aiReady]);
+
+  // Between full syncs, changes made in Google show within about half a minute (#884, F3): while the
+  // window is on screen, a cheap check asks Google which calendars changed and fetches only those
+  // (the backend spaces checks out and skips while a sync runs). Hidden or in the tray it pauses;
+  // coming back into view or into focus checks at once. The views re-read on `calendar://synced`.
+  useEffect(() => {
+    if (!aiReady) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+    const check = () => {
+      if (!stopped && shouldCheck(document.visibilityState)) {
+        void checkGoogleCalendars().catch(() => {
+          // A provider being unreachable is surfaced by the full sync, not here.
+        });
+      }
+    };
+    const schedule = () => {
+      timer = setTimeout(() => {
+        check();
+        if (!stopped) schedule();
+      }, nextCheckDelay());
+    };
+    schedule();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") check();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", check);
+    const stop = () => {
+      stopped = true;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", check);
+    };
+    const off = onTeardown(stop);
+    return () => {
+      stop();
       off();
     };
   }, [aiReady]);

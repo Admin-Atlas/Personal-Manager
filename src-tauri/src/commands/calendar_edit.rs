@@ -59,8 +59,12 @@ pub struct CalendarEditState {
     /// Deletes waiting out their Undo window.
     held_deletes: HeldDeletes,
     /// One calendar sync at a time, so a fetch that started earlier can never finish after a later
-    /// one has settled a save (plan A23). A second caller waits, then runs.
+    /// one has settled a save (plan A23). A second caller waits, then runs; the change check
+    /// ([`super::check_google_calendars`]) never waits, it skips.
     pub(crate) sync_lock: tokio::sync::Mutex<()>,
+    /// What the change check knows about each Google calendar (F3). Lock order: the DB, then this;
+    /// never held across an await.
+    pub(crate) fresh: Mutex<crate::calendar_fresh::Freshness>,
 }
 
 /// An open editor: which event, and the copy of it the user saw.

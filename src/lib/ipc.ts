@@ -132,6 +132,8 @@ import type {
   WipeReport,
   WipeSelection,
   CalendarWriteLanded,
+  CalendarCheck,
+  CalendarSynced,
   DeleteSettled,
   DeleteStart,
   EditLoad,
@@ -1058,6 +1060,11 @@ export const googleSavedProjects = () => invoke<string[]>("google_saved_projects
 /** Pull events from every selected calendar (all providers) into the local mirror; returns the count. */
 export const syncCalendar = () => invoke<number>("sync_calendar");
 
+/** Ask Google which of PM's Google calendars changed since the last look, and fetch only those
+ *  again: the cheap check run every ~30 s while PM is on screen. Skips (returns at once) while a
+ *  sync is running, or within 10 s of the last check. */
+export const checkGoogleCalendars = () => invoke<CalendarCheck>("check_google_calendars");
+
 /** Upcoming events in the mirror, for the focus-view agenda. Each carries `ended`: the agenda widens
  *  the strict gate to also list events that finished earlier today so the view can grey them. */
 export const listCalendarEvents = () => invoke<AgendaEvent[]>("list_calendar_events");
@@ -1106,6 +1113,10 @@ export const onCalendarWriteLanded = (
   handler: (landed: CalendarWriteLanded) => void,
 ): Promise<UnlistenFn> =>
   listen<CalendarWriteLanded>("calendar://write-outcome", (e) => handler(e.payload));
+
+/** A sync or a change check wrote the events of these calendars: re-read them. */
+export const onCalendarSynced = (handler: (synced: CalendarSynced) => void): Promise<UnlistenFn> =>
+  listen<CalendarSynced>("calendar://synced", (e) => handler(e.payload));
 
 // --- Google Drive (index-only connector, board card 4A) ---
 

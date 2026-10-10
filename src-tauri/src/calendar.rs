@@ -267,16 +267,25 @@ fn primary_calendar_id(value: &serde_json::Value) -> Option<String> {
 /// [`Calendar::id`] the events are stored under; `remote_id` is Google's own calendar id for the API
 /// path. Authorised with the account's `token_key`.
 ///
-/// Returns `(events, complete)`. `complete` is `false` when the page-run hit the runaway guard, so
-/// [`replace_events`] can withhold its delete half rather than reap the tail we never reached — the
-/// same contract [`register_calendars`] already honours for the calendar LIST (I-09.3).
+/// One Google calendar's events, as [`fetch_events`] read them.
+pub struct GoogleFetch {
+    pub events: Vec<CalendarEvent>,
+    /// `false` when the page-run hit the runaway guard, so [`replace_events`] can withhold its delete
+    /// half rather than reap the tail we never reached — the same contract [`register_calendars`]
+    /// already honours for the calendar LIST (I-09.3).
+    pub complete: bool,
+    /// When Google answered the first page, by Google's clock: every change from then on is in a
+    /// later listing, so the change check can start from it ([`crate::calendar_fresh`]).
+    pub server_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub async fn fetch_events(
     token_key: &str,
     mirror_calendar_id: &str,
     remote_id: &str,
     time_min: &str,
     time_max: &str,
-) -> Result<(Vec<CalendarEvent>, bool)> {
+) -> Result<GoogleFetch> {
     let mut base = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
     base.path_segments_mut()
         .map_err(|_| Error::Other("invalid calendar API base".into()))?
@@ -288,16 +297,41 @@ pub async fn fetch_events(
         .append_pair("timeMax", time_max)
         .append_pair("maxResults", "250");
 
+    // The first page's time: a change made while later pages load is in them or in the next
+    // listing, so the earliest answer is the safe one to count from.
+    let first_answer: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> =
+        std::sync::Mutex::new(None);
     // Follow `nextPageToken` so the wide mirror band isn't silently truncated at one page — over a
     // year a single daily-recurring series alone exceeds 250 expanded instances. `singleEvents` +
     // `orderBy=startTime` keep the pages start-ordered, so appending preserves order.
     let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |page_token| {
         let mut url = base.clone();
+        let first_answer = &first_answer;
         async move {
             if let Some(tok) = &page_token {
                 url.query_pairs_mut().append_pair("pageToken", tok);
             }
-            let value = google::authorized_get(token_key, url.as_str()).await?;
+            let value =
+                match google::authorized_get_dated(
+                    token_key,
+                    url.as_str(),
+                    google::SendPolicy::BACKGROUND,
+                )
+                .await?
+                {
+                    google::Dated::Body { body, server_time } => {
+                        if let Ok(mut first) = first_answer.lock() {
+                            if first.is_none() {
+                                *first = server_time;
+                            }
+                        }
+                        body
+                    }
+                    google::Dated::Gone => return Err(Error::Other(
+                        "Google API request failed (410 Gone): this calendar is no longer there."
+                            .into(),
+                    )),
+                };
             let next = value
                 .get("nextPageToken")
                 .and_then(|v| v.as_str())
@@ -315,7 +349,85 @@ pub async fn fetch_events(
              pages pending; its mirror may be truncated this sync"
         );
     }
-    Ok((out, !truncated))
+    let server_time = first_answer.into_inner().ok().flatten();
+    Ok(GoogleFetch {
+        events: out,
+        complete: !truncated,
+        server_time,
+    })
+}
+
+/// What a change check found ([`check_for_changes`]).
+#[derive(Debug, PartialEq)]
+pub enum Changes {
+    /// The events changed since the asked-about time, as (event id, `updated`) pairs (a recurring
+    /// series by its own id, a changed occurrence by its own), and when Google answered.
+    Listed {
+        items: Vec<(String, String)>,
+        /// More than one page changed: there's no need to read the rest to know.
+        more: bool,
+        server_time: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// The time asked about is too long ago for Google to list changes since: fetch it all.
+    TooOld,
+}
+
+/// The most changes one check reads before it stops counting: any at all means a fetch.
+const CHECK_PAGE: &str = "50";
+
+/// Ask Google which of one calendar's events changed since `since` (by Google's clock): a cheap
+/// listing of ids and timestamps only, deleted events included, so the change check
+/// ([`crate::calendar_fresh`]) fetches only the calendars that did change. No `timeMin`/`timeMax`,
+/// `orderBy` or `singleEvents`: a change outside the mirrored months costs at most one extra fetch,
+/// and one occurrence moved shows as that occurrence's own entry.
+pub async fn check_for_changes(
+    token_key: &str,
+    remote_id: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<Changes> {
+    let url = change_check_url(remote_id, since)?;
+    match google::authorized_get_dated(token_key, url.as_str(), google::SendPolicy::CHECK).await? {
+        google::Dated::Gone => Ok(Changes::TooOld),
+        google::Dated::Body { body, server_time } => Ok(Changes::Listed {
+            items: changed_items(&body),
+            more: body.get("nextPageToken").and_then(|v| v.as_str()).is_some(),
+            server_time,
+        }),
+    }
+}
+
+/// The change check's request (pure, so the parameters are pinned by a test).
+fn change_check_url(remote_id: &str, since: chrono::DateTime<chrono::Utc>) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| Error::Other("invalid calendar API base".into()))?
+        .extend(["calendars", remote_id, "events"]);
+    url.query_pairs_mut()
+        .append_pair(
+            "updatedMin",
+            &since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .append_pair("showDeleted", "true")
+        .append_pair("maxResults", CHECK_PAGE)
+        .append_pair("fields", "items(id,updated),nextPageToken");
+    Ok(url)
+}
+
+/// The (id, updated) pairs of a change listing; an entry missing either is skipped.
+fn changed_items(body: &serde_json::Value) -> Vec<(String, String)> {
+    body.get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    let id = it.get("id")?.as_str()?;
+                    let updated = it.get("updated")?.as_str()?;
+                    Some((id.to_string(), updated.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // --- calendar feeds (.ics — the no-OAuth path) ---
@@ -1172,6 +1284,19 @@ pub fn set_source_synced(conn: &Connection, id: &str) -> Result<()> {
         "UPDATE connector_sources \
          SET last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), state = 'ok' \
          WHERE id = ?1 AND service = ?2",
+        params![id, SERVICE],
+    )?;
+    Ok(())
+}
+
+/// The change check's stamp: a fresh last-synced time for an account that is already `'ok'`. One
+/// the full sync found `'unreachable'` or `'error'` is left for the full sync to clear, since the
+/// check skips a calendar that is backing off and so never sees the whole account.
+pub fn touch_source_synced_if_ok(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE connector_sources \
+         SET last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE id = ?1 AND service = ?2 AND state = 'ok'",
         params![id, SERVICE],
     )?;
     Ok(())
@@ -2392,6 +2517,67 @@ mod tests {
             vec!["gcal:me@x.com:a", "gcal:me@x.com:c"],
             "a complete list prunes the vanished B"
         );
+    }
+
+    /// The change check asks only what changed since Google's time, deleted events included, ids
+    /// and timestamps only; never the full fetch's window, order or expansion, and never a sync token.
+    #[test]
+    fn the_change_check_asks_for_ids_and_times_since_a_moment() {
+        let since = chrono::DateTime::parse_from_rfc3339("2026-10-10T09:59:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let url = change_check_url("team@group.calendar.google.com", since).unwrap();
+        assert_eq!(
+            url.path(),
+            "/calendar/v3/calendars/team@group.calendar.google.com/events"
+        );
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["updatedMin"], "2026-10-10T09:59:00Z");
+        assert_eq!(q["showDeleted"], "true");
+        assert_eq!(q["fields"], "items(id,updated),nextPageToken");
+        for absent in ["timeMin", "timeMax", "orderBy", "singleEvents", "syncToken"] {
+            assert!(!q.contains_key(absent), "{absent}");
+        }
+    }
+
+    /// The change check refreshes an account's "last synced" only while it is fine: a failure the
+    /// full sync found stays until the full sync clears it.
+    #[test]
+    fn a_change_check_never_clears_the_full_syncs_failure() {
+        let (_d, conn) = store_with_calendar(true);
+        let source = || {
+            list_sources(&conn, Some("google"))
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        set_source_state(&conn, "gcal:me@x.com", "unreachable").unwrap();
+        touch_source_synced_if_ok(&conn, "gcal:me@x.com").unwrap();
+        assert_eq!(source().state, "unreachable");
+        assert_eq!(source().last_synced_at, None);
+        set_source_state(&conn, "gcal:me@x.com", "ok").unwrap();
+        touch_source_synced_if_ok(&conn, "gcal:me@x.com").unwrap();
+        assert_eq!(source().state, "ok");
+        assert!(source().last_synced_at.is_some());
+    }
+
+    #[test]
+    fn a_change_listing_reads_as_ids_and_times() {
+        let body = serde_json::json!({ "items": [
+            { "id": "a", "updated": "2026-10-10T10:00:00.000Z" },
+            { "id": "b" },
+            { "updated": "2026-10-10T10:00:00.000Z" },
+            { "id": "c", "updated": "2026-10-10T10:01:00.000Z", "status": "cancelled" },
+        ]});
+        assert_eq!(
+            changed_items(&body),
+            vec![
+                ("a".to_string(), "2026-10-10T10:00:00.000Z".to_string()),
+                ("c".to_string(), "2026-10-10T10:01:00.000Z".to_string()),
+            ]
+        );
+        assert!(changed_items(&serde_json::json!({})).is_empty());
     }
 
     #[test]

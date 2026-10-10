@@ -21,6 +21,7 @@ import {
   getPref,
   listAllCalendarEvents,
   listAllMilestones,
+  onCalendarSynced,
   onCalendarWriteLanded,
   syncCalendar,
 } from "../../lib/ipc";
@@ -326,6 +327,27 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       unlisten?.();
     };
   }, [loadEvents, loadMilestones]);
+
+  // A sync or the ~30 s change check wrote events (a change made in Google, say): re-read, so the
+  // open calendar shows it without waiting for a focus change. The overview too, for "synced".
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void onCalendarSynced(() => {
+      void loadEvents();
+      void loadOverview();
+      void loadMilestones();
+    })
+      .then((stop) => {
+        if (alive) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, [loadEvents, loadOverview, loadMilestones]);
 
   // Initial load, and re-read the mirror when the window regains focus (the app-level poll or another
   // surface may have refreshed it while we were away).

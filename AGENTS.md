@@ -119,6 +119,8 @@ release remain the open post-v1 work.
   - **Connectors & calendar** — `google.rs` / `microsoft.rs` (OAuth loopback-PKCE, BYO creds
     in the keychain), `drive.rs`, `onedrive.rs`, `outlook_calendar.rs`, `localfolder.rs`,
     `calendar.rs` + `ics.rs` (the multi-provider mirror + RFC 5545 parsing);
+    `calendar_fresh.rs` (the ~30 s change check's bookkeeping for Google calendars, pure, kept by
+    Google's clock, never this computer's);
     `calendar_recur/` (repeat rules, pure: read, described, cut for a split; the read and write
     paths share it, and it never lets the `rrule` crate parse or print a rule);
     `calendar_write/` + `commands/calendar_edit.rs` (Google event writes, fenced off from every

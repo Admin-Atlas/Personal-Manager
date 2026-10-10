@@ -355,6 +355,43 @@ pub async fn authorized_get(token_key: &str, url: &str) -> Result<serde_json::Va
     authorized_get_with_keys(token_key, url, None).await
 }
 
+/// A reply to [`authorized_get_dated`].
+#[derive(Debug)]
+pub enum Dated {
+    /// The body, and when Google says it answered (its `Date` header), by Google's own clock.
+    Body {
+        body: serde_json::Value,
+        server_time: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// 410 Gone: for a calendar change check, the asked-about time is too long ago to list changes
+    /// since, and a full fetch is the answer (not a failure).
+    Gone,
+}
+
+/// As [`authorized_get`], for a caller that needs Google's clock (the calendar's change check keeps
+/// its "since" by it, never by this computer's, which can run hours off) or must tell a 410 apart
+/// from a failure. `policy` sets how long a 429 is waited out.
+pub async fn authorized_get_dated(token_key: &str, url: &str, policy: SendPolicy) -> Result<Dated> {
+    let resp = authorized_send_with(&http()?, token_key, policy, |c, bearer| {
+        c.get(url).bearer_auth(bearer)
+    })
+    .await?;
+    if resp.status() == reqwest::StatusCode::GONE {
+        return Ok(Dated::Gone);
+    }
+    let server_time = server_time_of(resp.headers());
+    let body = json_or_err(resp).await?;
+    Ok(Dated::Body { body, server_time })
+}
+
+/// When a reply says it was sent, from its HTTP `Date` header ("Sat, 10 Oct 2026 10:00:00 GMT").
+fn server_time_of(headers: &reqwest::header::HeaderMap) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = headers.get(reqwest::header::DATE)?.to_str().ok()?;
+    chrono::DateTime::parse_from_rfc2822(text)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 /// As [`authorized_get`], plus the Drive `X-Goog-Drive-Resource-Keys` header when `resource_keys` is
 /// `Some` — required to read some LINK-shared items (a "Shared with me" file the user reached via a
 /// link and hasn't opened before). The header value is `fileId/resourceKey` (comma-separated for
@@ -459,6 +496,12 @@ impl SendPolicy {
     /// A save the user is watching: at most five seconds, else report the rate limit.
     pub const INTERACTIVE: SendPolicy = SendPolicy {
         max_wait_secs: 5,
+        give_up_beyond_max: true,
+    };
+    /// The calendar's change check, every half minute: never wait, hand the 429 back, and let the
+    /// check back off (the next one is never far away).
+    pub const CHECK: SendPolicy = SendPolicy {
+        max_wait_secs: 0,
         give_up_beyond_max: true,
     };
 
@@ -1006,5 +1049,24 @@ mod tests {
         // A save waits five seconds at most, and otherwise says so at once.
         assert_eq!(SendPolicy::INTERACTIVE.wait_for(5), Some(5));
         assert_eq!(SendPolicy::INTERACTIVE.wait_for(6), None);
+        // The calendar's change check never waits: the next one is half a minute away.
+        assert_eq!(SendPolicy::CHECK.wait_for(1), None);
+    }
+
+    /// Google's clock comes from the reply's `Date` header, in the HTTP form; anything else is none.
+    #[test]
+    fn the_server_time_is_read_from_the_date_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(server_time_of(&headers), None);
+        headers.insert(
+            reqwest::header::DATE,
+            "Sat, 10 Oct 2026 10:00:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            server_time_of(&headers).map(|t| t.to_rfc3339()),
+            Some("2026-10-10T10:00:00+00:00".to_string())
+        );
+        headers.insert(reqwest::header::DATE, "yesterday".parse().unwrap());
+        assert_eq!(server_time_of(&headers), None);
     }
 }

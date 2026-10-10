@@ -20,9 +20,11 @@
 // picked root and reconciles it, which is real work — so it gets its own, much longer interval, and
 // the frequent passes skip it explicitly.
 
-/** How often the delta-backed corpora are polled. Matches the calendar's cadence deliberately: two
+/** How often the delta-backed corpora are polled. Matches the calendar's full sync deliberately: two
  *  different background rhythms would be harder to reason about than one, and 15 minutes is already
- *  proven acceptable in this app. */
+ *  proven acceptable in this app. (The calendar also has a cheap change check every ~30 s for its
+ *  Google calendars while PM is on screen, see `calendarPoll`: people watch a calendar for changes
+ *  in a way they don't watch a folder.) */
 export const CONNECTOR_POLL_MS = 15 * 60 * 1000;
 
 /** How often the full shared-with-me re-walk runs. */
