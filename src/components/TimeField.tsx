@@ -11,11 +11,19 @@
 // again and nothing is sent. Picking fires `onChange` with the new `HH:MM`; like DateField, the caller
 // receives the value rather than reading its own state back.
 //
+// A caller with its own list (the event editor's End, which offers only times after the start, each
+// with the event's length) passes `choices`; `value` is kept among them whatever they say.
+//
 // It has no name of its own: label it with a wrapping or `htmlFor` `<label>`, `ariaLabelledBy`, or
 // `ariaLabel` (an `aria-label` would override a real label, so none is set by default).
 
 import { timeChoices } from "../lib/calendarEdit/timeSlots";
 import { Select, cn } from "./ui";
+
+export interface TimeChoice {
+  value: string;
+  label: string;
+}
 
 interface Props {
   /** `HH:MM`, 24h. */
@@ -23,6 +31,8 @@ interface Props {
   onChange: (hm: string) => void;
   /** The time Google holds for this field, kept on offer whatever `value` is now. */
   held?: string;
+  /** The list to offer instead of every quarter hour (`held` is then the caller's to include). */
+  choices?: readonly TimeChoice[];
   disabled?: boolean;
   /** The smaller size the calendar's popovers use. */
   compact?: boolean;
@@ -36,6 +46,7 @@ export function TimeField({
   value,
   onChange,
   held,
+  choices,
   disabled,
   compact,
   className,
@@ -43,6 +54,11 @@ export function TimeField({
   ariaLabelledBy,
   id,
 }: Props) {
+  const offered: readonly TimeChoice[] = choices
+    ? choices.some((c) => c.value === value)
+      ? choices
+      : [...choices, { value, label: value }].sort((a, b) => a.value.localeCompare(b.value))
+    : timeChoices(value, held).map((hm) => ({ value: hm, label: hm }));
   return (
     <Select
       id={id}
@@ -54,9 +70,9 @@ export function TimeField({
       onChange={(e) => onChange(e.target.value)}
       className={cn("font-mono", className)}
     >
-      {timeChoices(value, held).map((hm) => (
-        <option key={hm} value={hm}>
-          {hm}
+      {offered.map((c) => (
+        <option key={c.value} value={c.value}>
+          {c.label}
         </option>
       ))}
     </Select>

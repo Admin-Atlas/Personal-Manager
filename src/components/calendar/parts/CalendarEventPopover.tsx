@@ -315,8 +315,8 @@ export function CalendarEventPopover({
         )}
 
         {event.description && (
-          <div className="mt-1 border-t border-border pt-2 text-xs text-ink2">
-            <Markdown>{event.description}</Markdown>
+          <div className="pm-event-desc mt-1 border-t border-border pt-2 text-xs text-ink2">
+            <Markdown plainLines>{event.description}</Markdown>
           </div>
         )}
 
