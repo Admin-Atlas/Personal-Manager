@@ -131,8 +131,12 @@ import type {
   TagSummary,
   WipeReport,
   WipeSelection,
+  CalendarWriteLanded,
+  DeleteSettled,
+  DeleteStart,
   EditLoad,
   EventPatchDraft,
+  HeldDeleteInfo,
   SeenSummary,
   WriteOutcome,
 } from "./types";
@@ -1077,9 +1081,30 @@ export const getCalendarEventForEdit = (eventId: string, deviceZone: string) =>
 export const updateCalendarEvent = (session: string, draft: EventPatchDraft) =>
   invoke<WriteOutcome>("update_calendar_event", { session, draft });
 
-/** Delete a mirrored event, only if Google still holds what the user saw (`seen`). */
+/** Delete a mirrored event after an Undo window held by the backend. It goes to Google when the
+ *  window ends, only if Google still holds what the user saw (`seen`); `onCalendarDeleteSettled`
+ *  reports how it ended. */
 export const deleteCalendarEvent = (eventId: string, seen: SeenSummary) =>
-  invoke<WriteOutcome>("delete_calendar_event", { eventId, seen });
+  invoke<DeleteStart>("delete_calendar_event", { eventId, seen });
+
+/** Undo a held delete: true when it was still waiting (the event is kept). */
+export const cancelCalendarDelete = (undoToken: string) =>
+  invoke<boolean>("cancel_calendar_delete", { undoToken });
+
+/** The deletes still in their Undo window, for a webview that reloaded and lost its own record. */
+export const listHeldDeletes = () => invoke<HeldDeleteInfo[]>("list_held_deletes");
+
+/** A held delete went to Google, and this is what came of it (none for an undone one). */
+export const onCalendarDeleteSettled = (
+  handler: (settled: DeleteSettled) => void,
+): Promise<UnlistenFn> =>
+  listen<DeleteSettled>("calendar://delete-settled", (e) => handler(e.payload));
+
+/** A save or delete changed the mirror of `calendar_id`: re-read the events. */
+export const onCalendarWriteLanded = (
+  handler: (landed: CalendarWriteLanded) => void,
+): Promise<UnlistenFn> =>
+  listen<CalendarWriteLanded>("calendar://write-outcome", (e) => handler(e.payload));
 
 // --- Google Drive (index-only connector, board card 4A) ---
 

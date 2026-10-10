@@ -277,4 +277,51 @@ describe("CalendarEventPopover", () => {
 
     expect(getByRole("dialog").getAttribute("aria-label")).toBe("Design review");
   });
+
+  // #884: CalendarView passes `editing`; FocusUpcoming doesn't, and must stay as it was.
+  it("offers no editing at all without the editing prop", () => {
+    const { queryByRole, getByRole } = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(getByRole("dialog").textContent).not.toContain("PM can");
+  });
+
+  it("offers Delete when the event can be deleted, and says why when it can't", () => {
+    const onDelete = vi.fn();
+    const { getByRole, rerender, queryByRole, getByText } = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+        editing={{ canDelete: true, reason: null, onDelete }}
+      />,
+    );
+    fireEvent.click(getByRole("button", { name: "Delete" }));
+    expect(onDelete).toHaveBeenCalledOnce();
+
+    rerender(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+        editing={{ canDelete: false, reason: "Someone else organises this event.", onDelete }}
+      />,
+    );
+    expect(queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(getByText("Someone else organises this event.")).toBeTruthy();
+  });
 });

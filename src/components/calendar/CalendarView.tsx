@@ -1,16 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The unified, read-only multi-calendar aggregator tab (card 8). Reads the widened mirror
+// The unified multi-calendar aggregator tab (card 8). Reads the widened mirror
 // (listAllCalendarEvents) plus the account/calendar registry (calendarOverview), themes entirely
 // from the global tokens, and colours each source from the categorical source palette. Slate/Editorial
 // render the pixel grids (Day/Week time-grid, Month, Year) + Agenda; Terminal forks to a mono, flat set
 // (a CLI status strip + agenda/tables, never a pixel grid) enumerated explicitly per view so nothing
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
-// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. Synced events are read-only;
-// the only interactive elements are the two first-party overlays — project milestones (click opens
-// their project) and freeform pinboard timeline entries (click opens the Pinboard) — each an all-day
-// event in its own hue, injected here and never written back to any calendar.
+// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. A synced event opens its
+// detail popover, where a Google event PM may change offers Delete (#884; every change goes through
+// `edit/useEventWrites`); everything else stays read-only. The two first-party overlays — project
+// milestones (click opens their project) and freeform pinboard timeline entries (click opens the
+// Pinboard) — are each an all-day event in its own hue, injected here and never written back to any
+// calendar.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -18,9 +20,11 @@ import {
   getPref,
   listAllCalendarEvents,
   listAllMilestones,
+  onCalendarWriteLanded,
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
+import { reasonText } from "../../lib/calendarEdit/editReasons";
 import {
   clampDayCount,
   readCursorDay,
@@ -71,8 +75,12 @@ import {
 } from "../../theme";
 import { Callout, Skeleton } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
-import { CalendarEventPopover } from "./parts/CalendarEventPopover";
+import { CalendarEventPopover, type PopoverEditing } from "./parts/CalendarEventPopover";
+import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
+import { DeleteEventDialog } from "./edit/DeleteEventDialog";
+import { WriteNotices } from "./edit/WriteNotices";
+import { pruneRemoved, useEventWrites } from "./edit/useEventWrites";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -246,6 +254,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       if (!aliveRef.current || seq !== eventsSeqRef.current) return;
       setEvents(evts);
       cachedEvents = evts;
+      pruneRemoved(evts);
       setEventsFailed(false);
     } catch {
       // Keep the last-good events; a read failure is transient. Flag it only when we have nothing to
@@ -294,6 +303,23 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       if (aliveRef.current) setLoading(false);
     }
   }, []);
+
+  // A save or delete (#884) rewrote part of the mirror: re-read the events. The event comes from the
+  // backend, so a delete that settles after a tab switch still refreshes the view it lands on.
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void onCalendarWriteLanded(() => void loadEvents())
+      .then((stop) => {
+        if (alive) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, [loadEvents]);
 
   // Initial load, and re-read the mirror when the window regains focus (the app-level poll or another
   // surface may have refreshed it while we were away).
@@ -398,12 +424,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // scroll. The views guard against re-scrolling on the cursor change they just caused (no loop).
   const onFocusDate = useCallback((d: Date) => setCursor(d), []);
 
+  // Whether the event popover is open: it isn't a Modal, so the dialog registry can't see it, and ←
+  // paging the grid under an open popover leaves it pointing at an event no longer on screen.
+  const popoverOpenRef = useRef(false);
+
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
   // field is focused, a modifier is held (so app shortcuts and text entry are untouched), or a dialog
-  // is open over the tab (see `calendarNavKey`).
+  // or the event popover is open over the tab (see `calendarNavKey`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const nav = calendarNavKey(e, isAnyDialogOpen());
+      const nav = calendarNavKey(e, isAnyDialogOpen() || popoverOpenRef.current);
       if (nav === "prev") {
         e.preventDefault();
         onPrev();
@@ -486,20 +516,56 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [pinboardItems],
   );
 
+  const writes = useEventWrites();
+
+  // What PM may do to a synced event (#884): the row's own block, then its account's editing status.
+  // The list computes `edit_block` assuming editing is on; the overview says whether it is.
+  const editingFor = useCallback(
+    (ev: CalendarEvent): { canDelete: boolean; reason: string | null } => {
+      const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
+      if (ev.edit_block) return { canDelete: false, reason: reasonText(ev.edit_block) };
+      if (cal?.provider !== "google") return { canDelete: false, reason: null };
+      if (overview?.editing[cal.source_id] !== "on") {
+        return { canDelete: false, reason: reasonText("editing_off") };
+      }
+      // A locked copy keeps its busy/free and visibility editable, but Google's delete of one isn't
+      // documented, so PM doesn't offer it (the gate agrees on save).
+      return { canDelete: !ev.locked, reason: ev.locked ? reasonText("locked") : null };
+    },
+    [overview],
+  );
+
   const visibleEvents = useMemo(() => {
     // Filter to visible calendars, THEN dedup the same physical OCCURRENCE mirrored on two of them
-    // (same iCal UID *and* start), keeping the first visible copy — otherwise it renders twice in the
+    // (same iCal UID *and* start), keeping one visible copy — otherwise it renders twice in the
     // grid/agenda. Done after the hide filter so hiding one calendar still shows the copy on the
     // calendar left visible. Keyed on the UID alone this also collapsed every recurring series to one
-    // occurrence across the whole mirror — see `occurrenceKey`, which FocusUpcoming shares.
-    const seen = new Set<string>();
+    // occurrence across the whole mirror — see `occurrenceKey`, which FocusUpcoming shares. The copy
+    // kept is the first, unless a later one can be changed and it can't: an event you organise on
+    // your own calendar beats the invitation copy of it on a shared one.
+    //
+    // A row a delete is hiding takes every copy of its occurrence with it: the same Google event
+    // seen through a second connected account is the same event, and showing that copy instead
+    // would look like the delete hadn't happened.
+    const deleting = new Set(
+      events
+        .filter((e) => writes.hiddenIds.has(e.id))
+        .map(occurrenceKey)
+        .filter((k): k is string => k !== null),
+    );
+    const at = new Map<string, number>();
     const out: CalendarEvent[] = [];
     for (const e of events) {
-      if (hidden.has(e.calendar_id)) continue;
+      if (hidden.has(e.calendar_id) || writes.hiddenIds.has(e.id)) continue;
       const key = occurrenceKey(e);
+      if (key !== null && deleting.has(key)) continue;
       if (key !== null) {
-        if (seen.has(key)) continue;
-        seen.add(key);
+        const i = at.get(key);
+        if (i !== undefined) {
+          if (!editingFor(out[i]).canDelete && editingFor(e).canDelete) out[i] = e;
+          continue;
+        }
+        at.set(key, out.length);
       }
       out.push(e);
     }
@@ -509,10 +575,23 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     if (!hidden.has(MILESTONE_CALENDAR_ID)) out.push(...milestoneEvents);
     if (!hidden.has(PINBOARD_CALENDAR_ID)) out.push(...pinboardEvents);
     return out;
-  }, [events, hidden, milestoneEvents, pinboardEvents]);
+  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor]);
 
   // The event popup that's open, anchored at the clicked element's rect (null = closed).
   const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
+  useEffect(() => {
+    popoverOpenRef.current = eventPopup !== null;
+  }, [eventPopup]);
+  // The event the delete dialog is asking about (null = closed).
+  const [confirmDelete, setConfirmDelete] = useState<CalendarEvent | null>(null);
+  // The popover's editing actions for `ev`. Delete closes the popover and asks first.
+  const popoverEditing = (ev: CalendarEvent): PopoverEditing => ({
+    ...editingFor(ev),
+    onDelete: () => {
+      setEventPopup(null);
+      setConfirmDelete(ev);
+    },
+  });
 
   // Clicking an event: a PM overlay keeps its jump (a milestone opens its project, a freeform pinboard
   // entry opens the Pinboard), while a real synced event opens the in-place detail popup anchored at
@@ -819,8 +898,29 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
                 }
               : undefined
           }
+          editing={popoverEditing(eventPopup.ev)}
         />
       )}
+
+      {/* Dialogs and notices render here, beside the popover and never inside the animated body
+          above: its fade-up uses `transform`, which would reposition anything fixed inside it. */}
+      <DeleteEventDialog
+        event={confirmDelete}
+        calendarName={
+          overview?.calendars.find((c) => c.id === confirmDelete?.calendar_id)?.name ?? null
+        }
+        when={confirmDelete ? whenText(confirmDelete) : ""}
+        onClose={() => setConfirmDelete(null)}
+        onConfirm={(ev) => {
+          setConfirmDelete(null);
+          void writes.startDelete(ev);
+        }}
+      />
+      <WriteNotices
+        notices={writes.notices}
+        onUndo={(token) => void writes.undoDelete(token)}
+        onDismiss={writes.dismissNotice}
+      />
     </div>
   );
 }

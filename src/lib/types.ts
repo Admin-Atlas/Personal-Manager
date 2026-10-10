@@ -1628,7 +1628,34 @@ export type WriteOutcome =
   | { outcome: "read_only"; reason: ReadOnlyReason }
   | { outcome: "busy" }
   | { outcome: "reauth" }
+  /** The answer never arrived and PM couldn't look afterwards: it may or may not have happened. */
+  | { outcome: "unconfirmed" }
   | { outcome: "failed"; message: string };
+
+/** A delete still waiting out its Undo window, for a webview that reloaded. */
+export interface HeldDeleteInfo {
+  undo_token: string;
+  event_id: string;
+  summary: string;
+  seconds_left: number;
+}
+
+/** What asking to delete came to: held for its Undo window (`undo_token` cancels it), or refused. */
+export type DeleteStart =
+  | { outcome: "held"; undo_token: string; undo_seconds: number }
+  | { outcome: "refused"; result: WriteOutcome };
+
+/** The `calendar://delete-settled` event: how a held delete ended at Google. */
+export interface DeleteSettled {
+  undo_token: string;
+  event_id: string;
+  result: WriteOutcome;
+}
+
+/** The `calendar://write-outcome` event: a calendar whose mirror a save or delete just changed. */
+export interface CalendarWriteLanded {
+  calendar_id: string;
+}
 
 /** A focus-agenda row: a mirrored event plus whether it has already ended. The focus agenda widens
  *  the strict "not yet ended" gate to also list events that finished earlier today (in the user's

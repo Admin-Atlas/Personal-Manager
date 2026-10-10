@@ -199,10 +199,45 @@ pub enum WriteOutcome {
     Busy,
     /// Google's sign-in for the account needs renewing.
     Reauth,
+    /// The answer never arrived and PM couldn't look afterwards: it may or may not have happened.
+    Unconfirmed,
     /// Anything else, with Google's message clipped to plain text.
     Failed {
         message: String,
     },
+}
+
+/// What asking to delete came to: held for its Undo window, or refused at once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DeleteStart {
+    /// Waiting `undo_seconds` before it goes to Google; `undo_token` cancels it until then, and
+    /// `calendar://delete-settled` reports how it ended.
+    Held {
+        undo_token: String,
+        undo_seconds: u64,
+    },
+    /// Refused before anything was held (busy, read-only, editing off).
+    Refused { result: WriteOutcome },
+}
+
+/// A delete still waiting out its Undo window, for a webview that reloaded and lost its own record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeldDeleteInfo {
+    pub undo_token: String,
+    pub event_id: String,
+    /// The title the user saw.
+    pub summary: String,
+    pub seconds_left: u64,
+}
+
+/// The `calendar://delete-settled` payload: a held delete went to Google, and this is what came of
+/// it. An undone delete sends none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeleteSettled {
+    pub undo_token: String,
+    pub event_id: String,
+    pub result: WriteOutcome,
 }
 
 /// Saved, but with something the user should know.
@@ -285,6 +320,7 @@ mod tests {
             (WriteOutcome::Gone, r#"{"outcome":"gone"}"#),
             (WriteOutcome::Busy, r#"{"outcome":"busy"}"#),
             (WriteOutcome::Reauth, r#"{"outcome":"reauth"}"#),
+            (WriteOutcome::Unconfirmed, r#"{"outcome":"unconfirmed"}"#),
             (
                 WriteOutcome::Failed {
                     message: "Backend Error".into(),
@@ -295,6 +331,30 @@ mod tests {
             assert_eq!(serde_json::to_string(&outcome).unwrap(), json);
         }
         assert_eq!(Notify::ExternalOnly.as_param(), "externalOnly");
+        assert_eq!(
+            serde_json::to_string(&DeleteStart::Held {
+                undo_token: "t".into(),
+                undo_seconds: 8
+            })
+            .unwrap(),
+            r#"{"outcome":"held","undo_token":"t","undo_seconds":8}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DeleteStart::Refused {
+                result: WriteOutcome::Busy
+            })
+            .unwrap(),
+            r#"{"outcome":"refused","result":{"outcome":"busy"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DeleteSettled {
+                undo_token: "t".into(),
+                event_id: "cal:e".into(),
+                result: WriteOutcome::Gone
+            })
+            .unwrap(),
+            r#"{"undo_token":"t","event_id":"cal:e","result":{"outcome":"gone"}}"#
+        );
         let draft: TimeDraft = serde_json::from_str(
             r#"{"kind":"all_day","first_day":"2026-10-10","last_day":"2026-10-12"}"#,
         )

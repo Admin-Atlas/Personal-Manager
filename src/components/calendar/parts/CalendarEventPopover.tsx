@@ -22,12 +22,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
 import { eventFlags, openUrl } from "../../../lib/ipc";
-import { formatClock, formatDateLocal } from "../../../lib/format";
-import { parseLocal } from "../../../lib/calendar-layout";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
 import { Button, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
+import { whenText } from "./whenText";
 
 interface Props {
   event: CalendarEvent;
@@ -41,27 +40,21 @@ interface Props {
   milestone: Milestone | null;
   onClose: () => void;
   onOpenProject?: (project: string) => void;
+  /** What PM may do to the event (#884). Passed only by CalendarView; without it the popover is
+   *  read-only, as FocusUpcoming shows it. */
+  editing?: PopoverEditing;
+}
+
+/** The popover's editing actions. */
+export interface PopoverEditing {
+  /** Offer Delete. */
+  canDelete: boolean;
+  /** Why the event can't be changed, when it can't; shown as a line under the actions. */
+  reason: string | null;
+  onDelete: () => void;
 }
 
 const MARGIN = 8;
-
-/** A human "when" line: an all-day date (or range), or a date + start–end clock. */
-function whenText(ev: CalendarEvent): string {
-  const start = parseLocal(ev.start, ev.all_day);
-  if (!start) return ev.start;
-  if (ev.all_day) {
-    const end = ev.end ? parseLocal(ev.end, true) : null;
-    // All-day end is exclusive; show a range only when it spans more than the single start day.
-    if (end && end.getTime() - 86_400_000 > start.getTime()) {
-      const last = new Date(end.getTime() - 86_400_000);
-      return `All day · ${formatDateLocal(start)} – ${formatDateLocal(last)}`;
-    }
-    return `All day · ${formatDateLocal(start)}`;
-  }
-  const end = ev.end ? parseLocal(ev.end, false) : null;
-  const clock = end ? `${formatClock(start)}–${formatClock(end)}` : formatClock(start);
-  return `${formatDateLocal(start)} · ${clock}`;
-}
 
 /** busy/free/tentative/oof/elsewhere → a friendly label. */
 function showAsLabel(v: string): string {
@@ -130,6 +123,7 @@ export function CalendarEventPopover({
   milestone,
   onClose,
   onOpenProject,
+  editing,
 }: Props) {
   const { showPower } = useDepth();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -354,7 +348,27 @@ export function CalendarEventPopover({
             Open in Project
           </Button>
         )}
+        {editing?.canDelete && (
+          <Button
+            variant="danger"
+            size="sm"
+            className="ml-auto"
+            onClick={() => {
+              // Back to the event's chip first, so the delete dialog that opens next returns
+              // focus there when it closes, rather than to this button, which is about to go.
+              restoreFocus();
+              editing.onDelete();
+            }}
+          >
+            Delete
+          </Button>
+        )}
       </div>
+      {editing?.reason && (
+        <p className="border-t border-border px-3 py-2 text-[0.6875rem] leading-relaxed text-ink4">
+          {editing.reason}
+        </p>
+      )}
     </div>
   );
 }
