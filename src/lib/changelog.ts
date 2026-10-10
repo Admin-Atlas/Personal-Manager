@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.141.0-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "Under the hood, calendar editing can now reach Google: PM can open one of your own events, save a change to it or delete it, and each time it checks Google's latest copy first, so a change made somewhere else is never overwritten. There's no button for this yet; that comes next.",
+      "Calendar refreshes now run one at a time: pressing Refresh while PM is already syncing waits for that sync to finish instead of racing it.",
+    ],
+  },
+  {
     version: "3.140.2-alpha",
     date: "2026-10-09",
     highlights: [

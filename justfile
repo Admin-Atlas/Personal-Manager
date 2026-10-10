@@ -23,7 +23,7 @@ default:
 # `just ci-membership` asserts BOTH directions of that claim: every member below has a
 # step in pr.yml AND a hook in .pre-commit-config.yaml. The claim used to be prose only,
 # and pre-commit had drifted to 9 of the 13 — missing, of all things, the drift guards.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set ipc-commands script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences model-licences
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set ipc-commands calendar-write-fence script-deps action-pins requirements-lock node-version npm-licenses sidecar-licences model-licences
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test build-frontend clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -205,6 +205,12 @@ sync-set:
 # time that particular screen is opened, which can be a release later.
 ipc-commands:
     node scripts/check-ipc-commands.mjs
+
+# Calendar writes (#884) stay where they were put: the commands, the private Google sender and the
+# write core are named only by the editing module, its registration and the editor's hook, and no
+# module on a model path names any of them or sends an authorised Google request.
+calendar-write-fence:
+    node scripts/check-calendar-write-fence.mjs
 
 # scripts/ stays zero-dependency (INVARIANTS.md I-18): node: builtins and repo-relative paths only,
 # plus a small allowlist of justified exceptions inside the check itself. Not taste — pr.yml's

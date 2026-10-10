@@ -353,6 +353,8 @@ jobs:
         run: just sync-set
       - name: Every ipc.ts command name is one the backend registers
         run: just ipc-commands
+      - name: Calendar writes stay fenced off from every model path
+        run: just calendar-write-fence
       - name: scripts/ stays zero-dependency (allowlisted exceptions only)
         run: just script-deps
       - name: Every workflow `uses:` is SHA-pinned

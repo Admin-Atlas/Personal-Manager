@@ -632,6 +632,10 @@ pub struct AppState {
     /// dead-host circuit breaker, and the per-endpoint context-window cache. In-memory — a restart
     /// re-probes, since the loaded model / window can change across relaunches.
     pub local_ai: local_slot::LocalRuntime,
+    /// Calendar editing (#884): open editors, writes on their way to Google, saves the next sync
+    /// mustn't undo, and the single-flight lock calendar syncs take. In memory; see
+    /// `commands::calendar_edit`.
+    pub calendar_edit: commands::CalendarEditState,
 }
 
 /// The sentence a command gets when it needs the store but the session is closed. Pure
@@ -1471,6 +1475,7 @@ pub fn run() {
                 briefing_refresh: tokio::sync::Mutex::new(()),
                 briefing_dirty: AtomicBool::new(false),
                 local_ai: local_slot::LocalRuntime::default(),
+                calendar_edit: commands::CalendarEditState::default(),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -1768,6 +1773,9 @@ pub fn run() {
             commands::disconnect_google_calendar_account,
             commands::enable_calendar_editing,
             commands::set_calendar_editing_paused,
+            commands::get_calendar_event_for_edit,
+            commands::update_calendar_event,
+            commands::delete_calendar_event,
             commands::connect_outlook_calendar,
             commands::disconnect_outlook_calendar,
             commands::list_ics_feeds,

@@ -353,6 +353,28 @@ scope. These strings are user-visible — a toast, a connector's error field, a 
 own message, it redacts through `error::redact_url` first and never interpolates the
 `reqwest::Error` whole. Nothing re-adds `#[from]` to `Error::Http`.
 
+### I-22 · Calendar writes have one path, and nothing on a model path reaches it — **Enforced**
+
+Changing a Google event (#884) goes through `commands/calendar_edit.rs` and nowhere else: its three
+commands refuse every window but the main one, its private `google_io` is the only code that sends
+a calendar write, and the webview's wrappers are imported only by the editor's hook. No module that
+calls a model names any of it, sends an authorised Google request, or holds a Calendar API URL; no
+other module holds that URL beside anything that could send more than a read; and the write path
+calls no model. `scripts/check-calendar-write-fence.mjs` (`just calendar-write-fence`) and an
+`eslint.config.js` import rule fail the build when any of that slips, and the fence checks its own
+lists of commands and wrappers against calendar_edit.rs, ipc.ts and the ESLint rule.
+
+**Why.** Each step that would let model output edit someone's calendar is small and plausible on its
+own: a chat helper that imports the wrapper "to fix a time", a briefing that calls the command, a
+model path that builds a Calendar URL and sends it with the stored token. None would fail a test.
+PM's model calls also have no tools today, which is the other half of this guarantee.
+
+**Co-signers.** A new write (create, RSVP, a series edit) is a command in `calendar_edit.rs`, added
+to the fence's `WRITE_COMMANDS` and the ESLint rule with its wrapper (the fence fails until it is),
+and sends through `google_io`. AI editing (Stage 4) is a deliberate design of
+its own, with the user approving each change before it is sent, and it changes this entry and the
+fence on purpose rather than routing around them.
+
 ---
 
 ## 6. Build tooling and dependencies

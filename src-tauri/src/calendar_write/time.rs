@@ -127,6 +127,10 @@ pub struct GoogleWhen {
 /// A time draft as Google's `start` and `end`, for a new event. A timed event keeps its own
 /// zone(s): `dateTime` with that zone's offset, plus `timeZone`, so Google shows it as the user set it
 /// and a repeating event follows that zone's daylight saving.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands in C10, creating events")
+)]
 pub fn resolve(draft: &TimeDraft) -> Result<GoogleWhen, TimeError> {
     resolve_against(draft, None, None)
 }
@@ -203,7 +207,8 @@ fn half(
 }
 
 /// The instant a Google start/end `node` holds, when it names wall time `date` `time` (to the
-/// minute) in the same zone `tz`.
+/// minute) in the same zone `tz`. A node with no `timeZone` (an event made through the API, say) is
+/// read in `tz`, the zone the editor showed it in: the same wall time there is the same instant.
 fn held_wall_time(
     node: &Value,
     tz: Tz,
@@ -211,8 +216,10 @@ fn held_wall_time(
     time: NaiveTime,
 ) -> Option<DateTime<FixedOffset>> {
     let at = DateTime::parse_from_rfc3339(node.get("dateTime")?.as_str()?.trim()).ok()?;
-    if parse_zone(node.get("timeZone")?.as_str()?).ok()? != tz {
-        return None;
+    if let Some(zone) = node.get("timeZone").and_then(Value::as_str) {
+        if parse_zone(zone).ok()? != tz {
+            return None;
+        }
     }
     let local = at.with_timezone(&tz);
     (local.date_naive() == date && local.hour() == time.hour() && local.minute() == time.minute())
@@ -444,6 +451,25 @@ mod tests {
         );
         let when =
             resolve_against(&draft, Some(&node("2026-10-24T22:00:00Z")), Some(&end)).unwrap();
+        assert_eq!(when.end, end);
+        assert_eq!(when.start["dateTime"], "2026-10-24T22:30:00+01:00");
+    }
+
+    /// A node Google holds without a zone (made through the API) is shown in the calendar's zone, and
+    /// an untouched one is kept exactly, not re-read as the first of a repeated hour.
+    #[test]
+    fn an_untouched_half_without_a_zone_is_kept_exactly() {
+        let end = json!({ "dateTime": "2026-10-25T01:30:00Z" }); // 01:30 GMT, the second one
+        let draft = timed_draft(
+            "2026-10-24",
+            "22:30",
+            "Europe/London",
+            "2026-10-25",
+            "01:30",
+            "Europe/London",
+        );
+        let start = json!({ "dateTime": "2026-10-24T21:00:00Z" });
+        let when = resolve_against(&draft, Some(&start), Some(&end)).unwrap();
         assert_eq!(when.end, end);
         assert_eq!(when.start["dateTime"], "2026-10-24T22:30:00+01:00");
     }

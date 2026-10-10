@@ -213,6 +213,42 @@ pub enum WriteWarning {
     MirrorRefreshPending,
 }
 
+/// One event as the editor shows it, read from a fresh copy (never the mirror, which clips text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventForEdit {
+    pub summary: String,
+    pub location: String,
+    /// As Google holds it. When `description_html` is set it's formatted, and shown read-only.
+    pub description: String,
+    pub description_html: bool,
+    /// In the event's own zone(s), as the editor's fields hold them.
+    pub time: TimeDraft,
+    pub show_as: ShowAs,
+    pub visibility: Visibility,
+    /// Attachment titles, listed read-only; PM never sends the attachments field, so it keeps them.
+    pub attachments: Vec<String>,
+    /// Google's own page for the event.
+    pub html_link: Option<String>,
+}
+
+/// What opening the editor came to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum EditLoad {
+    /// `session` names this editing session in later saves: the backend keeps the copy it was opened
+    /// on, so the webview never holds an etag or Google's raw event.
+    Ready {
+        session: String,
+        event: Box<EventForEdit>,
+        permissions: FieldPermissions,
+    },
+    Gone,
+    Reauth,
+    Failed {
+        message: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

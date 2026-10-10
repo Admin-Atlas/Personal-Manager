@@ -18,6 +18,10 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "first sent in C10, creating events")
+    )]
     Insert,
     Patch,
     Delete,

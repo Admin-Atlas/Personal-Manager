@@ -131,6 +131,10 @@ import type {
   TagSummary,
   WipeReport,
   WipeSelection,
+  EditLoad,
+  EventPatchDraft,
+  SeenSummary,
+  WriteOutcome,
 } from "./types";
 
 /** A rejected vault command, carrying the backend's classified `VaultFault` so the five
@@ -1060,6 +1064,22 @@ export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_cal
 
 /** The active PM flags anchored on a calendar event's iCal UID — for the event detail popup. */
 export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid });
+
+// Calendar editing (#884). Importable only from src/components/calendar/edit/useEventWrites.ts
+// (eslint.config.js + scripts/check-calendar-write-fence.mjs); every command is main-window only.
+
+/** Open a mirrored event (by its row id) for editing: Google's fresh copy, what may change, and the
+ *  session the save names. `deviceZone` is the webview's IANA zone; there's no UTC fallback. */
+export const getCalendarEventForEdit = (eventId: string, deviceZone: string) =>
+  invoke<EditLoad>("get_calendar_event_for_edit", { eventId, deviceZone });
+
+/** Save the fields the user changed in an open editor. Outcomes come back as data, never thrown. */
+export const updateCalendarEvent = (session: string, draft: EventPatchDraft) =>
+  invoke<WriteOutcome>("update_calendar_event", { session, draft });
+
+/** Delete a mirrored event, only if Google still holds what the user saw (`seen`). */
+export const deleteCalendarEvent = (eventId: string, seen: SeenSummary) =>
+  invoke<WriteOutcome>("delete_calendar_event", { eventId, seen });
 
 // --- Google Drive (index-only connector, board card 4A) ---
 

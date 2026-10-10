@@ -18,6 +18,25 @@ import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
 import prettier from "eslint-config-prettier";
 
+// The backend boundary: see the frontend block below. The package root re-exports `core` too, so
+// `import { core } from "@tauri-apps/api"` is the same door and is shut with it.
+const IPC_MESSAGE = "Call backend commands only through src/lib/ipc.ts (the typed IPC boundary).";
+const IPC_BOUNDARY = [
+  { name: "@tauri-apps/api/core", message: IPC_MESSAGE },
+  { name: "@tauri-apps/api", importNames: ["core"], message: IPC_MESSAGE },
+];
+
+// Calendar editing (#884) changes the user's Google Calendar with their own sign-in, so its
+// wrappers have exactly one importer: the editor's hook. Any screen that changes an event goes
+// through that hook, and nothing else can hold a write. ESLint also refuses `import * as … from
+// ipc` outside it (a namespace could reach them), and `scripts/check-calendar-write-fence.mjs`
+// backs all this with a text check that dynamic imports can't slip past.
+const CALENDAR_WRITES = {
+  regex: "(^|/)ipc$",
+  importNames: ["getCalendarEventForEdit", "updateCalendarEvent", "deleteCalendarEvent"],
+  message: "Calendar edits go only through src/components/calendar/edit/useEventWrites.ts (#884).",
+};
+
 export default tseslint.config(
   // src-tauri/python is the fetched standalone interpreter (a build artifact, like
   // src-tauri/target) — present only on Windows checkouts and full of vendored JS.
@@ -93,18 +112,16 @@ export default tseslint.config(
       // keep the surface auditable. Scoped to the exact path, NOT `@tauri-apps/api/*` — the
       // builtin plugin APIs (api/event, api/app, api/window, api/webview, plugin-*) legitimately
       // cross from ~15 components and must not be caught. ipc.ts itself is exempted below.
-      "no-restricted-imports": [
-        "error",
-        {
-          paths: [
-            {
-              name: "@tauri-apps/api/core",
-              message:
-                "Call backend commands only through src/lib/ipc.ts (the typed IPC boundary).",
-            },
-          ],
-        },
-      ],
+      "no-restricted-imports": ["error", { paths: IPC_BOUNDARY, patterns: [CALENDAR_WRITES] }],
+    },
+  },
+  // The calendar editor's hook is the one importer of the calendar write wrappers. A rule's options
+  // replace rather than merge, so the IPC boundary is restated here, not lost. Tests are exempt:
+  // they mock and drive the wrappers, and ship nowhere.
+  {
+    files: ["src/components/calendar/edit/useEventWrites.ts", "src/**/*.test.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": ["error", { paths: IPC_BOUNDARY }],
     },
   },
   // The one sanctioned caller of @tauri-apps/api/core: ipc.ts wraps invoke/Channel for the

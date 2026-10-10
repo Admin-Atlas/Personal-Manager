@@ -118,6 +118,13 @@ pub enum Error {
     #[error("{}", .0.message)]
     Vault(VaultFault),
 
+    /// A provider sign-in that only signing in again can fix: a refresh token Google refused, no
+    /// token (or an unreadable one), or a token whose Cloud project PM no longer holds. Its own
+    /// variant so a calendar save can say "reconnect" rather than "failed";
+    /// it Displays and serialises exactly as the `Other` string it replaced.
+    #[error("{0}")]
+    Reauth(String),
+
     #[error("{0}")]
     Other(String),
 }

@@ -1524,7 +1524,107 @@ export interface CalendarEvent {
   /** Google's own colour for the event ("1"–"11"), and its label. */
   color_id?: string | null;
   event_label_id?: string | null;
+  /** From the unified-view list only: why nothing about the event may change, or null when something
+   *  can — assuming editing is on for its account (merge `CalendarOverview.editing` for that). The
+   *  editor asks Google again when it opens. */
+  edit_block?: ReadOnlyReason | null;
 }
+
+// --- Calendar editing (#884; mirrors `calendar_write::dto`) ---
+
+/** Why PM won't change an event, or one part of it. */
+export type ReadOnlyReason =
+  | "not_google"
+  | "editing_off"
+  | "calendar_read_only"
+  | "private_event"
+  | "not_organizer"
+  | "recurring"
+  | "has_guests"
+  | "special_type"
+  | "locked"
+  | "html_description";
+
+export type ShowAs = "busy" | "free";
+export type EventVisibility = "default" | "public" | "private" | "confidential";
+
+/** When an event happens, as the editor holds it: wall-clock times in named zones, or whole days.
+ *  Dates are `YYYY-MM-DD`, times `HH:MM`; `last_day` is the last day covered (inclusive). */
+export type TimeDraft =
+  | {
+      kind: "timed";
+      start_date: string;
+      start_time: string;
+      start_zone: string;
+      end_date: string;
+      end_time: string;
+      end_zone: string;
+    }
+  | { kind: "all_day"; first_day: string; last_day: string };
+
+/** The fields the user touched. Omitted or null means untouched; `""` clears location/description. */
+export interface EventPatchDraft {
+  summary?: string | null;
+  location?: string | null;
+  description?: string | null;
+  time?: TimeDraft | null;
+  show_as?: ShowAs | null;
+  visibility?: EventVisibility | null;
+}
+
+/** What the user saw of an event when they chose to delete it, from the row they clicked. */
+export interface SeenSummary {
+  summary: string;
+  start: string;
+  end: string | null;
+  all_day: boolean;
+  location: string | null;
+}
+
+/** What may change on one event, field by field, and why the rest can't. */
+export interface FieldPermissions {
+  summary: boolean;
+  time: boolean;
+  location: boolean;
+  description: boolean;
+  show_as: boolean;
+  visibility: boolean;
+  delete: boolean;
+  reasons: ReadOnlyReason[];
+}
+
+/** One event as the editor shows it, from a fresh copy (never the mirror, which clips text). */
+export interface EventForEdit {
+  summary: string;
+  location: string;
+  description: string;
+  description_html: boolean;
+  time: TimeDraft;
+  show_as: ShowAs;
+  visibility: EventVisibility;
+  attachments: string[];
+  html_link: string | null;
+}
+
+/** What opening the editor came to. `session` names it in later saves. */
+export type EditLoad =
+  | { outcome: "ready"; session: string; event: EventForEdit; permissions: FieldPermissions }
+  | { outcome: "gone" }
+  | { outcome: "reauth" }
+  | { outcome: "failed"; message: string };
+
+export type WriteWarning = "mirror_refresh_pending";
+
+/** What a save came to. `saved` and `no_change` are the successes. */
+export type WriteOutcome =
+  | { outcome: "saved"; warnings: WriteWarning[] }
+  | { outcome: "no_change" }
+  | { outcome: "conflict"; fields: string[] }
+  | { outcome: "gone" }
+  | { outcome: "read_only"; reason: ReadOnlyReason }
+  | { outcome: "busy" }
+  | { outcome: "reauth" }
+  | { outcome: "failed"; message: string };
 
 /** A focus-agenda row: a mirrored event plus whether it has already ended. The focus agenda widens
  *  the strict "not yet ended" gate to also list events that finished earlier today (in the user's

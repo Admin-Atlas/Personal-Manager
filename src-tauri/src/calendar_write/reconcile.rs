@@ -137,7 +137,8 @@ impl RecentWrites {
             // A fetch that began before the save can't have seen it: it may only be overlaid.
             let may_settle = fetch_started >= at.mono;
             let row_id = key.1.as_str();
-            let position = rows.iter().position(|r| r.id == row_id);
+            // Judged on the last copy of a repeated id, as that's the one the mirror keeps.
+            let position = rows.iter().rposition(|r| r.id == row_id);
             let settled = match (entry, position) {
                 (Entry::Upsert(saved), Some(i)) => {
                     let fetched = &rows[i];
@@ -146,15 +147,26 @@ impl RecentWrites {
                     let upstream_won =
                         strictly_later(fetched.updated.as_deref(), saved.updated.as_deref());
                     if !(landed || upstream_won) {
-                        rows[i] = (**saved).clone(); // the fetch is older than the save
+                        // The fetch is older than the save. Every copy: a fetch that repeats an id
+                        // would otherwise write the old version back (the mirror keeps the last).
+                        for row in rows.iter_mut().filter(|r| r.id == row_id) {
+                            *row = (**saved).clone();
+                        }
                     }
                     may_settle && (landed || upstream_won)
                 }
-                // Not in the fetch yet (a new event the list hasn't caught up with, or a fetch that
-                // didn't reach it): show the save.
+                // Missing from a complete fetch that began after the save: deleted in Google since
+                // (or moved out of the window), and upstream wins. Every save here edits an event
+                // that already existed; C10's creates, which a lagging list may not show yet, will
+                // need their own kind of entry. An incomplete or older fetch proves nothing, so it
+                // shows the save.
                 (Entry::Upsert(saved), None) => {
-                    rows.push((**saved).clone());
-                    false
+                    if complete && may_settle {
+                        true
+                    } else {
+                        rows.push((**saved).clone());
+                        false
+                    }
                 }
                 (Entry::Delete { etag, updated }, Some(i)) => {
                     let fetched = &rows[i];
@@ -163,7 +175,10 @@ impl RecentWrites {
                     if restored {
                         may_settle // restored or changed in Google after the delete: upstream wins
                     } else {
-                        rows.remove(i); // the fetch still shows the deleted version
+                        // The fetch still shows the deleted version: hide every copy of it. `retain`,
+                        // not `Vec::remove`: CodeQL's generated Rust models read `remove`'s
+                        // bounds-check panic message as a log write of the fetched rows.
+                        rows.retain(|r| r.id != row_id);
                         if !complete {
                             deletes.push(row_id.to_string());
                         }
@@ -307,18 +322,21 @@ mod tests {
     }
 
     #[test]
-    fn a_new_event_shows_before_the_list_catches_up() {
+    fn a_saved_event_missing_from_a_later_complete_fetch_was_deleted_in_google() {
         let (saved, after) = clocks();
+        let began_before = saved.mono - Duration::from_secs(1);
         let mut w = RecentWrites::default();
-        w.record_upsert(row("new", "Created", "\"1\"", T1), saved);
-        let merged = w.merge(
-            "cal",
-            vec![row("b", "Other", "\"1\"", T0)],
-            true,
-            after.mono,
-            after,
-        );
-        assert_eq!(summaries(&merged), vec!["Other", "Created"]);
+        w.record_upsert(row("a", "Saved", "\"2\"", T1), saved);
+        let others = || vec![row("b", "Other", "\"1\"", T0)];
+        // An older fetch, or one that didn't see the whole calendar, proves nothing: the save shows.
+        let older = w.merge("cal", others(), true, began_before, after);
+        assert_eq!(summaries(&older), vec!["Other", "Saved"]);
+        let partial = w.merge("cal", others(), false, after.mono, after);
+        assert_eq!(summaries(&partial), vec!["Other", "Saved"]);
+        // A complete one that began after the save and lacks it: gone in Google, and settled.
+        let complete = w.merge("cal", others(), true, after.mono, after);
+        assert_eq!(summaries(&complete), vec!["Other"]);
+        assert!(w.is_empty());
     }
 
     /// A fetch that began before the save shows what it shows, but settles nothing: only a fetch that
@@ -386,6 +404,51 @@ mod tests {
         // A complete fetch without it: landed.
         let landed = w.merge("cal", vec![], true, after.mono, after);
         assert!(landed.rows.is_empty());
+        assert!(w.is_empty());
+    }
+
+    /// A fetch that lists an event twice (a page boundary moving under the listing) mustn't let the
+    /// second copy undo the save or the delete: the mirror keeps the last row written for an id.
+    #[test]
+    fn a_repeated_row_in_the_fetch_never_undoes_a_save_or_a_delete() {
+        let (saved, after) = clocks();
+        let mut w = RecentWrites::default();
+        w.record_upsert(row("a", "New title", "\"2\"", T1), saved);
+        let twice = || {
+            vec![
+                row("a", "Old title", "\"1\"", T0),
+                row("b", "Other", "\"1\"", T0),
+                row("a", "Old title", "\"1\"", T0),
+            ]
+        };
+        let merged = w.merge("cal", twice(), true, after.mono, after);
+        assert_eq!(summaries(&merged), vec!["New title", "Other", "New title"]);
+
+        let mut w = RecentWrites::default();
+        w.record_delete("cal", "cal:a", Some("\"1\"".into()), Some(T0.into()), saved);
+        let merged = w.merge("cal", twice(), true, after.mono, after);
+        assert_eq!(summaries(&merged), vec!["Other"]);
+
+        // Copies that differ are judged on the last, the one the mirror keeps: a later change in
+        // Google (or a restore) there wins, as it would for a single copy.
+        let mut w = RecentWrites::default();
+        w.record_upsert(row("a", "New title", "\"2\"", T1), saved);
+        let changed_later = vec![
+            row("a", "Old title", "\"1\"", T0),
+            row("a", "Theirs", "\"3\"", T2),
+        ];
+        let merged = w.merge("cal", changed_later, true, after.mono, after);
+        assert_eq!(merged.rows.last().unwrap().summary, "Theirs");
+        assert!(w.is_empty());
+
+        let mut w = RecentWrites::default();
+        w.record_delete("cal", "cal:a", Some("\"1\"".into()), Some(T0.into()), saved);
+        let restored_later = vec![
+            row("a", "Dentist", "\"1\"", T0),
+            row("a", "Dentist", "\"5\"", T2),
+        ];
+        let merged = w.merge("cal", restored_later, true, after.mono, after);
+        assert_eq!(merged.rows.last().unwrap().etag.as_deref(), Some("\"5\""));
         assert!(w.is_empty());
     }
 
@@ -470,8 +533,10 @@ mod tests {
             mono: saved.mono + Duration::from_secs(60),
             wall: saved.wall - Duration::from_secs(3600),
         };
-        let held = w.merge("cal", vec![], true, back.mono, back);
+        // (An incomplete fetch, so only the clocks could end the hold.)
+        let held = w.merge("cal", vec![], false, back.mono, back);
         assert_eq!(summaries(&held), vec!["Dentist"]);
+        assert!(!w.is_empty());
     }
 
     #[test]

@@ -94,6 +94,12 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: calendar-write-fence
+        name: calendar writes stay fenced off from every model path
+        entry: just calendar-write-fence
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: script-deps
         name: scripts/ stays zero-dependency
         entry: just script-deps
