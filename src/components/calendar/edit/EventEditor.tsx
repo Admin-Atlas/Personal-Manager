@@ -45,6 +45,7 @@ import {
   reasonText,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
+import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import { wallInstant, wallTimeOf } from "../../../lib/wallTime";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import {
@@ -138,16 +139,6 @@ function switchKind(t: TimeDraft, base: TimeDraft, zone: string): TimeDraft {
     end_time: "10:00",
     end_zone: zone,
   };
-}
-
-/** Plain text from a formatted (HTML) description, for showing it: an inert parse (no scripts run,
- *  nothing loads), with line breaks where blocks end. */
-function htmlToText(html: string): string {
-  const doc = new DOMParser().parseFromString(
-    html.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li|h[1-6])>/gi, "\n"),
-    "text/html",
-  );
-  return (doc.body.textContent ?? "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -497,7 +488,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               <div className="flex flex-col gap-1">
                 <span className="text-sm text-ink2">Description</span>
                 <p className="whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
-                  {htmlToText(draft.description)}
+                  {descriptionText(draft.description)}
                 </p>
               </div>
             ) : (

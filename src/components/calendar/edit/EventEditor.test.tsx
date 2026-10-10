@@ -132,6 +132,26 @@ afterEach(() => {
 });
 
 describe("EventEditor", () => {
+  // Google's formatted description shows read-only, as its text: lines where Google breaks them,
+  // escapes decoded once, and nothing of the markup (a script's text included) on screen.
+  it("shows a formatted description as its text", async () => {
+    openForEdit.mockResolvedValue(
+      ready(
+        event({
+          description:
+            "<b>Agenda</b><br><ul><li>One &amp; two</li></ul><script>alert(1)</script>&lt;i&gt;",
+          description_html: true,
+        }),
+      ),
+    );
+    await open();
+    const text = screen.getByText(
+      (_, el) => el?.tagName === "P" && /Agenda/.test(el.textContent ?? ""),
+    );
+    expect(text.textContent).toBe("Agenda\nOne & two\n<i>");
+    expect(text.querySelector("b, i, script")).toBeNull();
+  });
+
   it("sends only what changed, then closes and says so", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
