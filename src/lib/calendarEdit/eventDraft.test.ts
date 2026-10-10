@@ -10,11 +10,18 @@ import {
   canEdit,
   changedFields,
   checkDraft,
+  endAfterStart,
+  endDateMin,
+  endTimeChoices,
+  endsAfterStart,
+  firstEndOnItsDate,
+  halfInstant,
   rebaseDraft,
   seedDraft,
   toChanges,
   type EditorFields,
 } from "./eventDraft";
+import { QUARTER_HOURS } from "./timeSlots";
 
 const timed = (
   start_date: string,
@@ -176,6 +183,156 @@ describe("checking a draft before it is sent", () => {
       half: "start",
       what: "zone",
     });
+  });
+});
+
+type Timed = Extract<TimeDraft, { kind: "timed" }>;
+const asTimed = (t: TimeDraft): Timed => {
+  if (t.kind !== "timed") throw new Error("timed");
+  return t;
+};
+
+describe("the End time list", () => {
+  it("offers only times after the start, with the event's length", () => {
+    const t = asTimed(timed("2026-10-12", "09:00", "2026-10-12", "10:00"));
+    const choices = endTimeChoices(base(), t, event, "10:00");
+    expect(choices[0]).toEqual({ value: "09:15", label: "09:15 (15 mins)", after: true });
+    expect(choices.find((c) => c.value === "10:00")?.label).toBe("10:00 (1 hr)");
+    expect(choices.find((c) => c.value === "10:30")?.label).toBe("10:30 (1.5 hrs)");
+    expect(choices.some((c) => c.value <= "09:00")).toBe(false);
+  });
+
+  it("offers the whole day, unlabelled, when the end is on a later day", () => {
+    const t = asTimed(timed("2026-10-12", "23:00", "2026-10-13", "01:00"));
+    const choices = endTimeChoices(base(), t, event);
+    expect(choices).toHaveLength(96);
+    expect(choices[0]).toEqual({ value: "00:00", label: "00:00", after: true });
+  });
+
+  it("reads the start in the end's zone", () => {
+    // 09:00 London is 04:00 New York: an end at 04:00 there is no later than the start.
+    const t: Timed = {
+      ...asTimed(timed("2026-10-12", "09:00", "2026-10-12", "05:00")),
+      end_zone: "America/New_York",
+    };
+    const choices = endTimeChoices(base(), t, event);
+    expect(choices.some((c) => c.value === "04:00")).toBe(false);
+    expect(choices[0]).toEqual({ value: "04:15", label: "04:15 (15 mins)", after: true });
+  });
+
+  it("keeps the current end on offer, marked, when it isn't after the start", () => {
+    const t = asTimed(timed("2026-10-12", "09:00", "2026-10-12", "08:00"));
+    const choices = endTimeChoices(base(), t, event);
+    expect(choices[0]).toEqual({ value: "08:00", label: "08:00", after: false });
+    expect(choices.filter((c) => !c.after)).toHaveLength(1);
+  });
+
+  it("uses Google's exact instants across the night the clocks go back", () => {
+    // 01:45 BST to 01:15 GMT is a 30-minute event, valid only by Google's held instants.
+    const fold = { ...base(), time: timed("2026-10-25", "01:45", "2026-10-25", "01:15") };
+    const held = { start_at: "2026-10-25T00:45:00Z", end_at: "2026-10-25T01:15:00Z" };
+    const choices = endTimeChoices(fold, asTimed(fold.time), held, "01:15");
+    expect(choices.find((c) => c.value === "01:15")).toEqual({
+      value: "01:15",
+      label: "01:15 (30 mins)",
+      after: true,
+    });
+  });
+
+  it("leaves the list alone when the start is a time the clocks skip", () => {
+    const t = asTimed(timed("2026-03-29", "01:30", "2026-03-29", "03:00"));
+    const choices = endTimeChoices(base(), t, event);
+    expect(choices).toHaveLength(96);
+    expect(choices.every((c) => c.label === c.value)).toBe(true);
+  });
+
+  // Every end the list calls valid saves, and every end that saves is in the list, so the list never
+  // offers what Save refuses or hides what it allows.
+  it("agrees with the save check for every quarter hour", () => {
+    for (const start of ["00:00", "09:00", "23:45"]) {
+      for (const endDate of ["2026-10-11", "2026-10-12", "2026-10-13"]) {
+        const t = asTimed(timed("2026-10-12", start, endDate, "12:00"));
+        const offered = endTimeChoices(base(), t, event);
+        for (const hm of QUARTER_HOURS) {
+          const draft = { ...base(), time: { ...t, end_time: hm } };
+          const saves = !checkDraft(base(), draft, event).problems.some(
+            (p) => p.kind === "end_before_start",
+          );
+          const choice = offered.find((c) => c.value === hm);
+          expect(choice?.after ?? false, `${start} → ${endDate} ${hm}`).toBe(saves);
+        }
+      }
+    }
+  });
+});
+
+describe("keeping the end after the start", () => {
+  it("starts the End date on the start's day, read in the end's zone", () => {
+    const t = asTimed(timed("2026-10-12", "09:00", "2026-10-12", "10:00"));
+    expect(endDateMin(base(), t, event)).toBe("2026-10-12");
+    // 00:30 London on the 12th is still the 11th in New York.
+    const early: Timed = {
+      ...asTimed(timed("2026-10-12", "00:30", "2026-10-12", "02:00")),
+      end_zone: "America/New_York",
+    };
+    expect(endDateMin(base(), early, event)).toBe("2026-10-11");
+  });
+
+  it("puts the end a length after the start, in the end's zone", () => {
+    const t = asTimed(timed("2026-10-12", "23:30", "2026-10-12", "09:00"));
+    expect(endAfterStart(base(), t, 60 * 60_000, event)).toMatchObject({
+      end_date: "2026-10-13",
+      end_time: "00:30",
+    });
+    // A zone this webview doesn't know leaves the draft as it is rather than throwing.
+    expect(endAfterStart(base(), { ...t, end_zone: "Nowhere" }, 60_000, event)).toEqual({
+      ...t,
+      end_zone: "Nowhere",
+    });
+  });
+
+  // 25-10-2026 in London: 01:00-01:59 happens twice. A wall time names only the first pass, so an
+  // end that falls in the second would read back an hour early, maybe before the start.
+  it("never writes an end the night the clocks go back reads as earlier", () => {
+    for (const [start, minutes] of [
+      ["01:45", 30],
+      ["01:00", 60],
+      ["01:30", 45],
+      ["00:45", 90],
+    ] as const) {
+      const t = asTimed(timed("2026-10-25", start, "2026-10-25", "09:00"));
+      const moved = endAfterStart(base(), t, minutes * 60_000, event);
+      expect(endsAfterStart(base(), moved, event), `${start} + ${minutes}m`).toBe(true);
+      // Never shorter than asked, and at most the repeated hour longer.
+      const length =
+        halfInstant(base(), moved, "end", event)! - halfInstant(base(), moved, "start", event)!;
+      expect(length).toBeGreaterThanOrEqual(minutes * 60_000);
+      expect(length).toBeLessThanOrEqual((minutes + 60) * 60_000);
+    }
+    // 01:45 BST (00:45Z) + 30 min is 01:15Z, the GMT pass: the end moves on to 02:00 GMT.
+    const t = asTimed(timed("2026-10-25", "01:45", "2026-10-25", "09:00"));
+    expect(endAfterStart(base(), t, 30 * 60_000, event)).toMatchObject({ end_time: "02:00" });
+  });
+
+  it("treats a length under a minute as a minute", () => {
+    const t = asTimed(timed("2026-10-12", "09:00", "2026-10-12", "08:00"));
+    expect(endAfterStart(base(), t, 20_000, event)).toMatchObject({ end_time: "09:01" });
+  });
+
+  it("starts the End date the day after a start too late for any end on its own day", () => {
+    const late = asTimed(timed("2026-10-12", "23:45", "2026-10-13", "00:45"));
+    expect(endDateMin(base(), late, event)).toBe("2026-10-13");
+    const lateish = asTimed(timed("2026-10-12", "23:30", "2026-10-13", "00:30"));
+    expect(endDateMin(base(), lateish, event)).toBe("2026-10-12");
+  });
+
+  it("finds the first end on the end's own date", () => {
+    const t = asTimed(timed("2026-10-12", "09:00", "2026-10-12", "08:00"));
+    expect(endsAfterStart(base(), t, event)).toBe(false);
+    expect(firstEndOnItsDate(base(), t, event)).toMatchObject({ end_time: "09:15" });
+    // A start at 23:50 leaves nothing on that date.
+    const late = asTimed(timed("2026-10-12", "23:50", "2026-10-12", "08:00"));
+    expect(firstEndOnItsDate(base(), late, event)).toBeNull();
   });
 });
 

@@ -52,7 +52,7 @@ impl fmt::Display for TimeError {
                 "{wall} doesn't happen in {zone}: the clocks skip it that night. Pick a time \
                  outside that hour."
             ),
-            TimeError::EndBeforeStart => write!(f, "The event ends before it starts."),
+            TimeError::EndBeforeStart => write!(f, "The event has to end after it starts."),
         }
     }
 }

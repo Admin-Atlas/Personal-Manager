@@ -32,6 +32,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeExternalLinks from "rehype-external-links";
 
 import { DASH_LIST_CLASS, remarkDashLists } from "./markdownDashLists";
+import { remarkPlainLines } from "./markdownPlainLines";
 
 // Taken from react-markdown's own props rather than importing `unified` directly: `unified` is a
 // transitive dependency, not a declared one, so a type imported from it rides on hoisting.
@@ -107,6 +108,9 @@ export const REHYPE_PLUGINS: RehypePlugins = [
 export const REMARK_PLUGINS: RemarkPlugins = [remarkGfm];
 export const REMARK_PLUGINS_WITH_DASH_LISTS: RemarkPlugins = [remarkGfm, remarkDashLists];
 
+// `remarkPlainLines` is opt-in too, for an event's description (see `markdownPlainLines`).
+export const REMARK_PLUGINS_PLAIN_LINES: RemarkPlugins = [remarkGfm, remarkPlainLines];
+
 /**
  * Render user-authored Markdown through the app's single sanitizing boundary. Element styling lives in
  * the `.pm-markdown` block in `src/index.css` (bound to design tokens — no typography plugin), so this
@@ -114,18 +118,27 @@ export const REMARK_PLUGINS_WITH_DASH_LISTS: RemarkPlugins = [remarkGfm, remarkD
  *
  * `dashLists` opts into the note dialect's second bullet kind (see `markdownDashLists`). Off by
  * default, deliberately: it is a rendering claim about a `+` bullet that only a PM note means.
+ * `plainLines` reads plain typed lines as such (see `remarkPlainLines`): an event's description.
  */
 export function Markdown({
   children,
   dashLists = false,
+  plainLines = false,
 }: {
   children: string;
   dashLists?: boolean;
+  plainLines?: boolean;
 }) {
   return (
     <div className="pm-markdown">
       <ReactMarkdown
-        remarkPlugins={dashLists ? REMARK_PLUGINS_WITH_DASH_LISTS : REMARK_PLUGINS}
+        remarkPlugins={
+          dashLists
+            ? REMARK_PLUGINS_WITH_DASH_LISTS
+            : plainLines
+              ? REMARK_PLUGINS_PLAIN_LINES
+              : REMARK_PLUGINS
+        }
         rehypePlugins={REHYPE_PLUGINS}
         urlTransform={safeUrl}
       >

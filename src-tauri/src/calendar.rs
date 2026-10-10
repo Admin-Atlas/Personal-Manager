@@ -1491,14 +1491,46 @@ const MAX_SUMMARY_CHARS: usize = 300;
 const MAX_LOCATION_CHARS: usize = 300;
 const MAX_DESCRIPTION_CHARS: usize = 2000;
 
-/// Bound *and* single-line untrusted event text on the way into the mirror. Titles/locations/
-/// descriptions are `\n`-joined into the agenda, briefing, and chat, so an embedded CR/LF (or any
-/// control char) could otherwise forge an extra agenda/briefing line (rule #6, M-2). Collapse every
-/// control character to a space — mirroring `ingest::yaml_quote` — before capping length, so both the
-/// short and truncated paths are single-line.
+/// Bound *and* single-line untrusted event text on the way into the mirror. Titles and locations (and
+/// the organiser and repeat summary) are `\n`-joined into the agenda, briefing, and chat, so an
+/// embedded CR/LF (or any control char) could otherwise forge an extra agenda/briefing line (rule #6,
+/// M-2). Collapse every control character to a space — mirroring `ingest::yaml_quote` — before capping
+/// length, so both the short and truncated paths are single-line. The Unicode line and paragraph
+/// separators (U+2028, U+2029) break a line too without being control characters, so they go the
+/// same way.
 fn clip(s: &str, max: usize) -> String {
     s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_line_separator(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(max)
+        .collect()
+}
+
+/// U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR.
+fn is_line_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// A description as the mirror stores it: bounded like [`clip`], but its line breaks kept, since the
+/// event pop-up shows them as the description's lines (#884). `\r\n`, a lone `\r` and the Unicode
+/// line and paragraph separators become `\n`; every other control character (a tab included) becomes
+/// a space. No agenda, briefing or chat line is built from a description, so a break can't forge
+/// one; anything that ever joins descriptions into such text must flatten them at its own boundary
+/// (M-2).
+fn clip_multiline(s: &str, max: usize) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' => '\n',
+            c if is_line_separator(c) => '\n',
+            c if c.is_control() => ' ',
+            c => c,
+        })
         .take(max)
         .collect()
 }
@@ -1596,8 +1628,17 @@ fn events_hash(events: &[CalendarEvent]) -> String {
         })
         .collect();
     lines.sort();
-    crate::ingest::hex_digest(lines.join("\n").as_bytes())
+    let mut text = format!("{MIRROR_FORMAT}\n");
+    text.push_str(&lines.join("\n"));
+    crate::ingest::hex_digest(text.as_bytes())
 }
+
+/// How the mirror stores what it fetches, folded into every [`events_hash`]. The hash is taken over
+/// the fetched events, before they're clipped for storage, so a change to the clipping alone would
+/// otherwise leave every unchanged calendar's rows stored the old way: bumping this makes the next
+/// sync rewrite each calendar once. 2: descriptions keep their line breaks ([`clip_multiline`]), and
+/// titles and places lose U+2028/U+2029 ([`clip`]).
+const MIRROR_FORMAT: &str = "mirror-format:2";
 
 /// Replace one calendar's mirrored events with a freshly fetched set. Skips the delete+reinsert entirely
 /// when the fetched set already matches what's mirrored (F-49): the provider is re-polled every ~15 min,
@@ -1700,7 +1741,7 @@ fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
     let location = location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
     let description = description
         .as_deref()
-        .map(|d| clip(d, MAX_DESCRIPTION_CHARS));
+        .map(|d| clip_multiline(d, MAX_DESCRIPTION_CHARS));
     // Untrusted free-text from the provider — clip like description/location. Attendees are stored
     // as a JSON array (NULL when none), parsed back on read.
     let organizer = organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
@@ -2368,6 +2409,58 @@ mod tests {
             "Lunch  - 20:00 Wire $5000"
         );
         assert_eq!(clip("a\tb", 300), "a b");
+        // The Unicode line and paragraph separators break a line without being control characters.
+        assert_eq!(
+            clip("Lunch\u{2028}- 09:00 Board\u{2029}x", 300),
+            "Lunch - 09:00 Board x"
+        );
+    }
+
+    /// A description keeps its lines (the pop-up shows them), in one line-break form; every other
+    /// control character still becomes a space, and the cap still holds.
+    #[test]
+    fn a_description_keeps_its_line_breaks_and_nothing_else() {
+        assert_eq!(
+            clip_multiline("Agenda\r\n1. intro\r2. demo\u{7}\tend\n", 300),
+            "Agenda\n1. intro\n2. demo  end\n"
+        );
+        assert_eq!(clip_multiline("a\u{2028}b\u{2029}c", 300), "a\nb\nc");
+        assert_eq!(
+            clip_multiline(&"a\n".repeat(2000), MAX_DESCRIPTION_CHARS)
+                .chars()
+                .count(),
+            MAX_DESCRIPTION_CHARS
+        );
+    }
+
+    /// Stored and read back: the description's lines survive the mirror, while a title or a place
+    /// that carries a line break is still one line (M-2: those reach the agenda and the briefing).
+    #[test]
+    fn the_mirror_keeps_a_descriptions_lines_but_flattens_a_title() {
+        let (_d, conn) = store_with_calendar(true);
+        let mut e = ev("1", "Board\nreview", "2026-10-12T09:00:00Z");
+        e.description = Some("Agenda\r\n1. intro\n2. demo".into());
+        e.location = Some("Room 1\nFloor 2".into());
+        replace_events(&conn, "cal-1", std::slice::from_ref(&e), true).unwrap();
+        let back = list_all_events(&conn).unwrap();
+        assert_eq!(
+            back[0].description.as_deref(),
+            Some("Agenda\n1. intro\n2. demo")
+        );
+        assert_eq!(back[0].summary, "Board review");
+        assert_eq!(back[0].location.as_deref(), Some("Room 1 Floor 2"));
+    }
+
+    /// The mirror's format is part of every hash: the hash an older build stored for the same events
+    /// (the plain digest of the event lines, which for no events is the digest of nothing) never
+    /// matches, so each calendar is rewritten once in the new format rather than skipped.
+    #[test]
+    fn the_mirror_format_is_folded_into_the_hash() {
+        assert_ne!(events_hash(&[]), crate::ingest::hex_digest(b""));
+        assert_eq!(
+            events_hash(&[]),
+            crate::ingest::hex_digest(format!("{MIRROR_FORMAT}\n").as_bytes())
+        );
     }
 
     #[test]

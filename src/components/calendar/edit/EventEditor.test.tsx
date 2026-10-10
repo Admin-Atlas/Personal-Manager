@@ -330,6 +330,203 @@ describe("EventEditor", () => {
     expect(screen.getByLabelText<HTMLInputElement>("Title").disabled).toBe(false);
   });
 
+  it("offers only ends after the start, each with the event's length", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    const end = screen.getByLabelText<HTMLSelectElement>("End time");
+    const labels = [...end.options].map((o) => o.textContent);
+    expect(labels[0]).toBe("09:15 (15 mins)");
+    expect(labels).toContain("10:00 (1 hr)");
+    expect(labels).not.toContain("08:00");
+    expect(end.value).toBe("10:00");
+  });
+
+  it("keeps the event's length when the start moves", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", {
+      time: expect.objectContaining({ start_time: "11:00", end_time: "12:00" }),
+    });
+  });
+
+  it("gives a moved start an end after it, even from a 0-minute event", async () => {
+    openForEdit.mockResolvedValue(
+      ready(
+        event({
+          time: { ...event().time, end_time: "09:00" } as EventForEdit["time"],
+          end_at: "2026-10-12T08:00:00Z",
+        }),
+      ),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    // An hour, as All day switched off gives.
+    expect(saveEdit).toHaveBeenCalledWith("s1", {
+      time: expect.objectContaining({ start_time: "11:00", end_time: "12:00" }),
+    });
+  });
+
+  it("moves an end date set before the start up to the start's day", async () => {
+    openForEdit.mockResolvedValue(
+      ready(
+        event({
+          time: {
+            ...event().time,
+            end_date: "2026-10-13",
+            end_time: "08:00",
+          } as EventForEdit["time"],
+          end_at: "2026-10-13T07:00:00Z",
+        }),
+      ),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const endDate = screen.getByLabelText<HTMLInputElement>("End date");
+    endDate.focus();
+    fireEvent.change(endDate, { target: { value: "05-10-2026" } });
+    fireEvent.blur(endDate);
+    // The date can't go before the start's day, and on that day 08:00 is before 09:00, so the end
+    // takes the first time after the start.
+    expect(endDate.value).toBe("12-10-2026");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", {
+      time: expect.objectContaining({ end_date: "2026-10-12", end_time: "09:15" }),
+    });
+  });
+
+  it("keeps the last day of an all-day event on or after its first", async () => {
+    openForEdit.mockResolvedValue(
+      ready(
+        event({
+          time: { kind: "all_day", first_day: "2026-10-15", last_day: "2026-10-16" },
+          start_at: null,
+          end_at: null,
+        }),
+      ),
+    );
+    await open();
+    const last = screen.getByLabelText<HTMLInputElement>("Last day");
+    last.focus();
+    fireEvent.change(last, { target: { value: "10-10-2026" } });
+    fireEvent.blur(last);
+    expect(last.value).toBe("15-10-2026");
+  });
+
+  it("moves the end after the start when a new zone would put it first", async () => {
+    // 09:00 London to 05:00 New York (09:00Z): an hour long. With the start in Los Angeles, 09:00
+    // there is 16:00Z, after that end, so the end follows the start by the hour instead.
+    openForEdit.mockResolvedValue(
+      ready(
+        event({
+          time: {
+            ...event().time,
+            end_time: "05:00",
+            end_zone: "America/New_York",
+          } as EventForEdit["time"],
+          end_at: "2026-10-12T09:00:00Z",
+        }),
+      ),
+    );
+    await open();
+    fireEvent.click(screen.getByRole("button", { name: "Start zone" }));
+    fireEvent.change(screen.getByLabelText("Filter timezones"), {
+      target: { value: "los angeles" },
+    });
+    fireEvent.click(screen.getByTitle("America/Los_Angeles"));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("13:00");
+    expect(screen.queryByText("The event has to end after it starts.")).toBeNull();
+  });
+
+  it("says straight away what would stop the save", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    start.focus();
+    fireEvent.change(start, { target: { value: "29-03-2026" } });
+    fireEvent.blur(start);
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
+    // Before any Save: the clocks skip 01:30 in London that night.
+    expect(screen.getByText(/01:30 doesn't happen in Europe\/London that night/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("says the same problem once, for a start and an end in the same skipped hour", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    start.focus();
+    fireEvent.change(start, { target: { value: "29-03-2026" } });
+    fireEvent.blur(start);
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "01:30" } });
+    expect(screen.getAllByText(/01:30 doesn't happen in Europe\/London that night/)).toHaveLength(
+      1,
+    );
+  });
+
+  it("starts the End date the day after a start too late for any end that day", async () => {
+    openForEdit.mockResolvedValue(
+      ready(
+        event({
+          time: {
+            ...event().time,
+            start_time: "23:45",
+            end_date: "2026-10-13",
+            end_time: "00:45",
+          } as EventForEdit["time"],
+          start_at: "2026-10-12T22:45:00Z",
+          end_at: "2026-10-12T23:45:00Z",
+        }),
+      ),
+    );
+    await open();
+    const endDate = screen.getByLabelText<HTMLInputElement>("End date");
+    endDate.focus();
+    fireEvent.change(endDate, { target: { value: "12-10-2026" } });
+    fireEvent.blur(endDate);
+    // The box and the draft agree: no end on the 12th comes after 23:45.
+    expect(endDate.value).toBe("13-10-2026");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("00:45");
+  });
+
+  it("says at once when a typed date can't be read, until the field holds one again", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    start.focus();
+    fireEvent.change(start, { target: { value: "31-13-2026" } });
+    fireEvent.blur(start);
+    expect(screen.getByText(/“31-13-2026” isn't a date PM can read/)).toBeTruthy();
+    // Back in the field and out again, on the date it shows: that date stands.
+    start.focus();
+    fireEvent.blur(start);
+    expect(screen.queryByText(/isn't a date PM can read/)).toBeNull();
+  });
+
+  it("lets a description have several lines", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const desc = screen.getByLabelText("Description");
+    // Nothing between the field and the window swallows Enter (fireEvent is false if anything
+    // called preventDefault), so the textarea's own line break happens.
+    expect(fireEvent.keyDown(desc, { key: "Enter" })).toBe(true);
+    expect(fireEvent.keyDown(desc, { key: "Enter", shiftKey: true })).toBe(true);
+    fireEvent.change(desc, { target: { value: "line one\nline two" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { description: "line one\nline two" });
+  });
+
   it("says why it couldn't open", async () => {
     openForEdit.mockResolvedValue({ outcome: "reauth" });
     render(
