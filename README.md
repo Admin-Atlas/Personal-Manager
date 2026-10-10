@@ -16,8 +16,9 @@ device or protect with a passphrase and carry between machines. Little leaves yo
 the model API calls that power chat — to your cloud AI provider, or to a local model server you
 run (one on this machine sends nothing off it; a remote or LAN one receives the chats you route to
 it) — a launch-time update check, a one-time first-run download of PM's local models, and — only if
-you set them up — a read-only calendar fetch, a
-read-only sync of any cloud accounts you connect, and encrypted backups to your own cloud.
+you set them up — a calendar fetch (plus the event changes you make, if you turn on editing for a
+Google account), a read-only sync of any cloud accounts you connect, and encrypted backups to your
+own cloud.
 
 This repo is the **application code**. Your personal data is never committed — it lives
 in a separate, machine-local data directory (see [Where your data lives](#where-your-data-lives)).
@@ -72,11 +73,14 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   timeline can become a project's milestones.
 - **A map of your knowledge.** See your documents laid out by meaning — related material
   clusters together — as a navigable map you can explore.
-- **One calendar, never written to.** Gather Google, Outlook and iCal calendars into one
+- **One calendar, changed where it lives.** Gather Google, Outlook and iCal calendars into one
   agenda — Month, Week, Day, Year and Agenda views, extra timezones down the side, and your
   own working hours — with schedule-aware chat answers and an automatic "Due soon" when an
   event names a project. Your milestones and pinboard timelines show alongside as markers you
-  can toggle off. PM only ever reads your calendars; it never writes to them.
+  can toggle off. PM only reads your calendars unless you turn on editing for a Google account;
+  then you can change and delete one-off events you organise without guests. Every change
+  goes straight to Google, and a save never overwrites a field someone changed there in the
+  meantime.
 - **Bring your own model.** Choose your model through OpenRouter — separate chat and
   background models, spend at a glance, and zero-data-retention requested on every call. The
   list offers only models a provider will actually serve on those terms, so a model can't
@@ -281,8 +285,9 @@ machine sends nothing off it; a remote or LAN server receives the chats you rout
 refuses to send a token and chats in the clear to a public address); a check for updates on launch
 (and the download if you accept one); a one-time first-run download of PM's on-device models
 and Python dependencies (your local model runner, if you use one, fetches model weights itself —
-PM does not); and — only if you turn them on — a read-only calendar fetch, a read-only sync of the
-cloud accounts you connect (Google Drive, Google Sheets, OneDrive), and encrypted backups to your
+PM does not); and — only if you turn them on — a calendar fetch (plus the event changes you make,
+if you turn on editing for a Google account), a read-only sync of the cloud accounts you connect
+(Google Drive, Google Sheets, OneDrive), and encrypted backups to your
 chosen cloud (Proton Drive or Google Drive). Nothing else leaves the machine: there is no
 telemetry, analytics, or crash reporting. The repo holds code only — see
 [`SECURITY.md`](SECURITY.md) for the security policy and how to report an issue privately.

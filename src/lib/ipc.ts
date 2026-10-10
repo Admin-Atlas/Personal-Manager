@@ -1073,8 +1073,9 @@ export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid }
 // (eslint.config.js + scripts/check-calendar-write-fence.mjs); every command is main-window only.
 
 /** Open a mirrored event (by its row id) for editing: Google's fresh copy, what may change, and the
- *  session the save names. `deviceZone` is the webview's IANA zone; there's no UTC fallback. */
-export const getCalendarEventForEdit = (eventId: string, deviceZone: string) =>
+ *  session the save names. `deviceZone` is the webview's IANA zone, or null when it can't tell
+ *  (never a guessed UTC). */
+export const getCalendarEventForEdit = (eventId: string, deviceZone: string | null) =>
   invoke<EditLoad>("get_calendar_event_for_edit", { eventId, deviceZone });
 
 /** Save the fields the user changed in an open editor. Outcomes come back as data, never thrown. */

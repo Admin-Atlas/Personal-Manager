@@ -281,6 +281,9 @@ pub enum EditLoad {
         session: String,
         event: Box<EventForEdit>,
         permissions: FieldPermissions,
+        /// What the editor showed, in the mirror's terms, for a delete started from it: the
+        /// fresh copy, not a mirror row that may be older. `None` if it can't be put in those terms.
+        seen: Option<SeenSummary>,
     },
     Gone,
     Reauth,

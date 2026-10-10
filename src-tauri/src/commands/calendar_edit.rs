@@ -373,19 +373,23 @@ fn require_owner(app: &AppHandle) -> Result<()> {
 // --- the commands ---
 
 /// Open an event for editing: a fresh copy from Google, what may change about it, and a session id
-/// for the save. `device_zone` is the webview's IANA zone, required (no UTC fallback, rule R6).
+/// for the save. `device_zone` is the webview's IANA zone, or `None` when it can't tell (no UTC
+/// fallback, rule R6).
 #[tauri::command]
 pub async fn get_calendar_event_for_edit(
     app: AppHandle,
     window: tauri::Window,
     event_id: String,
-    device_zone: String,
+    device_zone: Option<String>,
 ) -> Result<EditLoad> {
     require_main_window(&window)?;
     require_owner(&app)?;
-    let device_zone = match time::parse_device_zone(Some(&device_zone)) {
-        Ok(zone) => zone,
-        Err(e) => {
+    // Optional: an event's times carry their own zones, so the editor can open without knowing this
+    // computer's (its time controls are then off). Given, it has to be a real zone.
+    let device_zone = match device_zone.map(|z| time::parse_device_zone(Some(&z))) {
+        None => None,
+        Some(Ok(zone)) => Some(zone),
+        Some(Err(e)) => {
             return Ok(EditLoad::Failed {
                 message: e.to_string(),
             })
@@ -427,16 +431,22 @@ pub async fn get_calendar_event_for_edit(
         return Ok(EditLoad::Gone);
     }
     let permissions = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
+    // Only for a start or end Google sent without a zone: the calendar's zone, else this computer's.
+    // Never a guessed UTC (rule R6).
     let fallback = target
         .facts
         .time_zone
         .clone()
-        .unwrap_or_else(|| device_zone.name().to_string());
-    let Some(event) = event_for_edit(&fresh, &fallback) else {
+        .or_else(|| device_zone.map(|z| z.name().to_string()));
+    let Some(event) = event_for_edit(&fresh, fallback.as_deref().unwrap_or("")) else {
         return Ok(EditLoad::Failed {
-            message: "Google sent this event without a start or end PM can read.".into(),
+            message: match fallback {
+                Some(_) => "Google sent this event without a start or end PM can read.".into(),
+                None => time::TimeError::NoZone.to_string(),
+            },
         });
     };
+    let seen = seen_of(&target.calendar_id, &fresh);
     let session = new_session_id();
     {
         let mut sessions = state
@@ -458,6 +468,20 @@ pub async fn get_calendar_event_for_edit(
         session,
         event: Box::new(event),
         permissions,
+        seen,
+    })
+}
+
+/// Google's copy as a delete would compare it ([`patch::delete_still_matches`]): `parse_event`'s
+/// start and end, the mirror's clipping of the title and place.
+fn seen_of(calendar_id: &str, fresh: &Value) -> Option<SeenSummary> {
+    let row = calendar::parse_event(calendar_id, fresh)?;
+    Some(SeenSummary {
+        summary: calendar::mirrored_summary(&row.summary),
+        start: row.start,
+        end: row.end,
+        all_day: row.all_day,
+        location: row.location.as_deref().map(calendar::mirrored_location),
     })
 }
 
@@ -1426,6 +1450,26 @@ mod tests {
             json!({ "location": "" }).as_object().unwrap(),
         );
         assert!(base.get("location").is_none());
+    }
+
+    /// A delete started from the editor compares against what the editor showed (Google's fresh
+    /// copy), in the very terms the delete check uses.
+    #[test]
+    fn the_editor_hands_a_delete_what_it_showed() {
+        let fresh = json!({
+            "id": "abc", "summary": "Dentist", "location": "High St",
+            "start": { "dateTime": "2026-10-12T09:00:00+01:00" },
+            "end": { "dateTime": "2026-10-12T10:00:00+01:00" }
+        });
+        let seen = seen_of("cal", &fresh).unwrap();
+        assert_eq!(seen.summary, "Dentist");
+        assert_eq!(seen.location.as_deref(), Some("High St"));
+        assert!(!seen.all_day);
+        assert_eq!(
+            patch::delete_still_matches(&seen, &fresh),
+            DeleteCheck::Matches
+        );
+        assert!(seen_of("cal", &json!({ "id": "abc" })).is_none());
     }
 
     /// Undo and the end of the wait race for one entry, and whichever gets it decides.

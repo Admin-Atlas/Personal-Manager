@@ -15,11 +15,21 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import {
   cancelCalendarDelete,
   deleteCalendarEvent,
+  getCalendarEventForEdit,
   listHeldDeletes,
   onCalendarDeleteSettled,
+  updateCalendarEvent,
 } from "../../../lib/ipc";
-import type { CalendarEvent, DeleteSettled, SeenSummary } from "../../../lib/types";
+import type {
+  CalendarEvent,
+  DeleteSettled,
+  EditLoad,
+  EventPatchDraft,
+  SeenSummary,
+  WriteOutcome,
+} from "../../../lib/types";
 import { deleteText, type Tone } from "../../../lib/calendarEdit/editReasons";
+import { deviceTimeZoneOrNull } from "../../../theme";
 
 /** A line the calendar shows about a write: what happened, and an Undo while one is offered. */
 export interface WriteNotice {
@@ -222,6 +232,29 @@ export async function undoDelete(token: string): Promise<void> {
       text: `Too late to undo: ${quoted(held.summary)} is already being deleted.`,
     });
   }
+}
+
+/** Open an event for editing: Google's fresh copy, what may change, and the session a save names.
+ *  The device zone goes with it only when the webview knows it (never a guessed UTC). */
+export function openForEdit(eventId: string): Promise<EditLoad> {
+  return getCalendarEventForEdit(eventId, deviceTimeZoneOrNull());
+}
+
+/** Save an editor's changes. The outcome comes back as data; the editor explains it. */
+export function saveEdit(session: string, changes: EventPatchDraft): Promise<WriteOutcome> {
+  return updateCalendarEvent(session, changes);
+}
+
+/** A save that landed, said once the editor has closed. */
+export function noteSaved(summary: string, outcome: WriteOutcome) {
+  if (outcome.outcome !== "saved") return;
+  put({
+    id: nextNotice++,
+    tone: "ok",
+    text: outcome.warnings.includes("mirror_refresh_pending")
+      ? `Saved ${quoted(summary)} to Google. PM's calendar will show it after the next refresh.`
+      : `Saved ${quoted(summary)}.`,
+  });
 }
 
 /** A fresh read of the mirror: rows it no longer has needn't be hidden any more. */

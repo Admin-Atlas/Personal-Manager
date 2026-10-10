@@ -8,13 +8,14 @@
 // (a CLI status strip + agenda/tables, never a pixel grid) enumerated explicitly per view so nothing
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
 // on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. A synced event opens its
-// detail popover, where a Google event PM may change offers Delete (#884; every change goes through
-// `edit/useEventWrites`); everything else stays read-only. The two first-party overlays — project
+// detail popover, where a Google event PM may change offers Edit and Delete (#884; every change goes
+// through `edit/useEventWrites`); everything else stays read-only. The two first-party overlays — project
 // milestones (click opens their project) and freeform pinboard timeline entries (click opens the
 // Pinboard) — are each an all-day event in its own hue, injected here and never written back to any
 // calendar.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   calendarOverview,
   getPref,
@@ -79,6 +80,7 @@ import { CalendarEventPopover, type PopoverEditing } from "./parts/CalendarEvent
 import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
+import { EventEditor } from "./edit/EventEditor";
 import { WriteNotices } from "./edit/WriteNotices";
 import { pruneRemoved, useEventWrites } from "./edit/useEventWrites";
 import { AgendaView } from "./views/AgendaView";
@@ -176,8 +178,8 @@ function visibleRange(
 }
 
 interface CalendarViewProps {
-  /** Open a project's page — wired only to the clickable milestone overlay events; the rest of the
-   *  calendar stays read-only. */
+  /** Open a project's page — wired to the milestone overlay events, and to a synced event's linked
+   *  milestone in its details. */
   onOpenProject?: (project: string) => void;
   /** Open the Pinboard tab — wired to the pinboard overlay events, which have no project to open. */
   onOpenPinboard?: () => void;
@@ -309,7 +311,11 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   useEffect(() => {
     let alive = true;
     let unlisten: (() => void) | null = null;
-    void onCalendarWriteLanded(() => void loadEvents())
+    // Milestones too: a linked one takes its date from its event, so moving the event moves it.
+    void onCalendarWriteLanded(() => {
+      void loadEvents();
+      void loadMilestones();
+    })
       .then((stop) => {
         if (alive) unlisten = stop;
         else stop();
@@ -319,7 +325,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       alive = false;
       unlisten?.();
     };
-  }, [loadEvents]);
+  }, [loadEvents, loadMilestones]);
 
   // Initial load, and re-read the mirror when the window regains focus (the app-level poll or another
   // surface may have refreshed it while we were away).
@@ -521,16 +527,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // What PM may do to a synced event (#884): the row's own block, then its account's editing status.
   // The list computes `edit_block` assuming editing is on; the overview says whether it is.
   const editingFor = useCallback(
-    (ev: CalendarEvent): { canDelete: boolean; reason: string | null } => {
+    (ev: CalendarEvent): { canEdit: boolean; canDelete: boolean; reason: string | null } => {
+      const none = (reason: string | null) => ({ canEdit: false, canDelete: false, reason });
       const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
-      if (ev.edit_block) return { canDelete: false, reason: reasonText(ev.edit_block) };
-      if (cal?.provider !== "google") return { canDelete: false, reason: null };
-      if (overview?.editing[cal.source_id] !== "on") {
-        return { canDelete: false, reason: reasonText("editing_off") };
-      }
+      if (ev.edit_block) return none(reasonText(ev.edit_block));
+      if (cal?.provider !== "google") return none(null);
+      if (overview?.editing[cal.source_id] !== "on") return none(reasonText("editing_off"));
       // A locked copy keeps its busy/free and visibility editable, but Google's delete of one isn't
       // documented, so PM doesn't offer it (the gate agrees on save).
-      return { canDelete: !ev.locked, reason: ev.locked ? reasonText("locked") : null };
+      return {
+        canEdit: true,
+        canDelete: !ev.locked,
+        reason: ev.locked ? reasonText("locked") : null,
+      };
     },
     [overview],
   );
@@ -585,8 +594,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // The event the delete dialog is asking about (null = closed).
   const [confirmDelete, setConfirmDelete] = useState<CalendarEvent | null>(null);
   // The popover's editing actions for `ev`. Delete closes the popover and asks first.
+  // The event open in the editor (null = closed).
+  const [editing, setEditing] = useState<CalendarEvent | null>(null);
+  // The address of the account a synced event's calendar belongs to.
+  const accountOf = (ev: CalendarEvent): string | null => {
+    const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
+    return overview?.accounts.find((a) => a.id === cal?.source_id)?.email ?? null;
+  };
   const popoverEditing = (ev: CalendarEvent): PopoverEditing => ({
     ...editingFor(ev),
+    onEdit: () => {
+      setEventPopup(null);
+      setEditing(ev);
+    },
     onDelete: () => {
       setEventPopup(null);
       setConfirmDelete(ev);
@@ -851,7 +871,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           <p className="text-sm text-ink2">No calendars connected yet.</p>
           <p className="max-w-sm text-xs text-ink4">
             Connect a Google, Outlook, or iCal calendar in Settings → Connectors, then it appears
-            here read-only.
+            here.
           </p>
         </div>
       ) : (
@@ -904,6 +924,26 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
       {/* Dialogs and notices render here, beside the popover and never inside the animated body
           above: its fade-up uses `transform`, which would reposition anything fixed inside it. */}
+      {editing && (
+        <EventEditor
+          key={editing.id}
+          row={editing}
+          calendar={overview?.calendars.find((c) => c.id === editing.calendar_id) ?? null}
+          account={accountOf(editing)}
+          milestone={
+            editing.uid
+              ? (milestones.find((m) => m.event_uid && m.event_uid === editing.uid) ?? null)
+              : null
+          }
+          onDelete={(row) => {
+            // Close the editor first so its focus goes back to the event's chip, and the delete
+            // dialog that opens next returns it there too.
+            flushSync(() => setEditing(null));
+            setConfirmDelete(row);
+          }}
+          onClose={() => setEditing(null)}
+        />
+      )}
       <DeleteEventDialog
         event={confirmDelete}
         calendarName={

@@ -33,7 +33,7 @@ the §4.1 taxonomy), project triage (a `projects` table: deadline / size / block
 files beside a chat whose retrieval is confined to that project); **5b**: the
 **command palette** (global quick-jump to any project, file, or conversation, plus
 nav destinations — frontend-only, reusing the existing list commands; Ctrl/Cmd+K).
-**Step 6** is done — **read-only calendar** (spec §8.6): two ways to connect — a
+**Step 6** is done — **read-only calendar** (spec §8.6; editing for Google accounts is epic #884): two ways to connect — a
 private **iCal feed URL** (the default; no sign-in, works under Google Advanced
 Protection) and **Google OAuth** (advanced; BYO "Desktop app" creds, loopback PKCE,
 tokens in the keychain). Both mirror upcoming events, show an Upcoming agenda on the
@@ -59,7 +59,7 @@ Rebuild mechanism, a token-sized structure-aware splitter, multilingual e5-large
 that replaced the Learning-You blob; **chat as a first-class source** (PM's own chats are
 chunked, embedded, indexed and retrievable, with bounded context cost); **index-only
 connectors** for Google Drive, OneDrive and local folders (pointer + embedding, bytes
-fetched live — never imported); a **multi-provider read-only calendar** with a unified
+fetched live — never imported); a **multi-provider calendar** (Google events editable, #884) with a unified
 **Calendar** view tab; **project milestones** and a **structured flag layer**; **encrypted
 portable backups** (Proton Drive / Google Drive); a **semantic memory map**; **spreadsheet**
 and **photo/OCR** ingestion; a **document reader**; a **pinboard**; runtime **developer
@@ -118,8 +118,9 @@ release remain the open post-v1 work.
     `context_budget.rs`.
   - **Connectors & calendar** — `google.rs` / `microsoft.rs` (OAuth loopback-PKCE, BYO creds
     in the keychain), `drive.rs`, `onedrive.rs`, `outlook_calendar.rs`, `localfolder.rs`,
-    `calendar.rs` + `ics.rs` (the read-only multi-provider mirror + RFC 5545 parsing).
-    Everything fetched is untrusted DATA (rule #6).
+    `calendar.rs` + `ics.rs` (the multi-provider mirror + RFC 5545 parsing);
+    `calendar_write/` + `commands/calendar_edit.rs` (Google event writes, fenced off from every
+    model path: INVARIANTS.md I-22). Everything fetched is untrusted DATA (rule #6).
   - **Backup** — `backup/`: portable passphrase-encrypted zstd `.pmbackup`; a
     `destination.rs` enum fans out to the Proton Drive CLI (`proton.rs`) + Google Drive REST
     (`gdrive.rs`); `schedule.rs`.

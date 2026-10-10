@@ -22,7 +22,8 @@ PM is a **local-first desktop app** — a Tauri (Rust) shell around a React + Ty
 UI — with two pillars: **the Archivist** (ingest your files, make them searchable,
 answer grounded questions) and **the Personal Assistant** (a focus view + chat that
 triage your day). Everything runs and stays **on the user's machine**; the only thing
-that leaves is the model API call (and an optional read-only calendar fetch).
+that leaves is the model API call (and, if set up, a calendar fetch plus the event changes you
+make with editing turned on).
 
 Three documents orient you, in order:
 

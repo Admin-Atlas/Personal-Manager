@@ -1612,7 +1612,14 @@ export interface EventForEdit {
 
 /** What opening the editor came to. `session` names it in later saves. */
 export type EditLoad =
-  | { outcome: "ready"; session: string; event: EventForEdit; permissions: FieldPermissions }
+  | {
+      outcome: "ready";
+      session: string;
+      event: EventForEdit;
+      permissions: FieldPermissions;
+      /** What the editor showed, in the mirror's terms, for a delete started from it. */
+      seen: SeenSummary | null;
+    }
   | { outcome: "gone" }
   | { outcome: "reauth" }
   | { outcome: "failed"; message: string };

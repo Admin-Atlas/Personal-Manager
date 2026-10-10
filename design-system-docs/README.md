@@ -164,7 +164,7 @@ Drive it with a single `depth` value; gate optional blocks on it. Don't fork lay
   Slate = cards; Terminal = table. Depth scales it from name+status only → +meta → full table with cost/active.
 - **Project** — file list beside a project-scoped chat thread (two-pane). Treatment per System.
 - **Documents** — ingestion: a drop zone + recent items with type/date/index-state. Rules / cards / mono table per System.
-- **Calendar** — read-only week/agenda. Serif agenda / day cards / mono list per System.
+- **Calendar** — week/agenda; a Google event you organise can be edited from its details. Serif agenda / day cards / mono list per System.
 - **Review** — queue of proposed actions as inline approval cards (Approve / Edit / Dismiss).
 - **Settings** — appearance (System / Accent / Depth / Mode), models & keys (key field → keychain), help-mode toggle. Editorial = ruled sections, Slate = card panel, Terminal = key/value list.
 - **Command palette** (`⌘K`) — overlay with a query line + result rows.

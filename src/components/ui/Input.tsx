@@ -13,7 +13,7 @@ export function Input({ className, ...rest }: ComponentPropsWithRef<"input">) {
   return (
     <input
       className={cn(
-        "w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-sm text-ink2 outline-none transition placeholder:text-ink4 focus:border-accent",
+        "w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-sm text-ink2 outline-none transition placeholder:text-ink4 focus:border-accent disabled:cursor-not-allowed disabled:bg-transparent disabled:text-ink3",
         system === "terminal" && "font-mono caret-[var(--accent-text)]",
         className,
       )}
