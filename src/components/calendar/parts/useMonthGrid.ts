@@ -100,7 +100,13 @@ export function buildWeekRows(
   // Pack every multi-day band ONCE across the whole visible grid so each event keeps a stable lane
   // across weeks (per-week packing let a run jump rows at the week boundary).
   const bandInputs: BandInput[] = [];
-  const bandMeta = new Map<string, { ev: CalendarEvent; gStart: number; gEnd: number }>();
+  // `cutLeft` / `cutRight`: the event runs on past the grid's first or last day. The clamp knows; the
+  // row flags below must too, or a bar on the grid's first row reads as the event's own start (and a
+  // timed one shows its start time there, a day out).
+  const bandMeta = new Map<
+    string,
+    { ev: CalendarEvent; gStart: number; gEnd: number; cutLeft: boolean; cutRight: boolean }
+  >();
   for (const ev of bandEvents) {
     const span = eventDaySpan(ev);
     if (!span) continue;
@@ -111,7 +117,13 @@ export function buildWeekRows(
     );
     if (!clamped) continue;
     bandInputs.push({ id: ev.id, startDay: clamped.startDay, endDay: clamped.endDay });
-    bandMeta.set(ev.id, { ev, gStart: clamped.startDay, gEnd: clamped.endDay });
+    bandMeta.set(ev.id, {
+      ev,
+      gStart: clamped.startDay,
+      gEnd: clamped.endDay,
+      cutLeft: clamped.continuesLeft,
+      cutRight: clamped.continuesRight,
+    });
   }
   const { bands: globalBands } = packBands(bandInputs);
   const laneOf = new Map(globalBands.map((b) => [b.id, b.lane]));
@@ -125,7 +137,7 @@ export function buildWeekRows(
     const bars: MonthBandBar[] = [];
     let laneCount = 0;
 
-    for (const [id, { ev, gStart, gEnd }] of bandMeta) {
+    for (const [id, { ev, gStart, gEnd, cutLeft, cutRight }] of bandMeta) {
       if (gEnd < weekStartIdx || gStart > weekEndIdx) continue; // band doesn't touch this week
       const lane = laneOf.get(id) ?? 0;
       const localStart = Math.max(gStart, weekStartIdx) - weekStartIdx;
@@ -137,8 +149,8 @@ export function buildWeekRows(
           startIdx: localStart,
           endIdx: localEnd,
           lane,
-          continuesLeft: gStart < weekStartIdx,
-          continuesRight: gEnd > weekEndIdx,
+          continuesLeft: gStart < weekStartIdx || cutLeft,
+          continuesRight: gEnd > weekEndIdx || cutRight,
         });
       } else {
         for (let c = localStart; c <= localEnd; c++) hiddenByCol[c]++;

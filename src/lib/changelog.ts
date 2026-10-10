@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.144.3-alpha",
+    date: "2026-10-10",
+    highlights: [
+      "On the Calendar tab's Day and Week views, an event that runs past midnight now fills its hours on every day it covers, from its start to its end, instead of sitting in the all-day strip. The same goes for the Days view on the Focus tab.",
+      "Such an event now also says both dates in its details (like “12-10 22:00 – 13-10 02:00”), shows its start time on its bar in the Month view so it doesn't look like an all-day event, and turns grey as soon as it ends rather than at the end of its last day.",
+      "A one-day all-day event on the night the clocks go back no longer reads as a range of that same day.",
+    ],
+  },
+  {
     version: "3.144.2-alpha",
     date: "2026-10-10",
     highlights: [

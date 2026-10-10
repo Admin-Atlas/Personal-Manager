@@ -6,22 +6,27 @@
 
 import type { CalendarEvent } from "../../../lib/types";
 import { formatClock, formatDateLocal } from "../../../lib/format";
-import { parseLocal } from "../../../lib/calendar-layout";
+import { eventDaySpan, parseLocal } from "../../../lib/calendar-layout";
 
-/** A human "when" line: an all-day date (or range), or a date + start–end clock. */
+/** A human "when" line: an all-day date (or range), a date + start–end clock, or for a timed event
+ *  that runs into another day, both dates ("10-10 22:00 – 11-10 02:00"). One ending at midnight
+ *  keeps its one date, as it fills only its own day. Days are counted in calendar days, so the night
+ *  the clocks go back (a 25-hour day) is still one day. */
 export function whenText(ev: CalendarEvent): string {
   const start = parseLocal(ev.start, ev.all_day);
   if (!start) return ev.start;
+  const span = eventDaySpan(ev);
+  const acrossDays = !!span && span.endDay.getTime() > span.startDay.getTime();
   if (ev.all_day) {
-    const end = ev.end ? parseLocal(ev.end, true) : null;
-    // All-day end is exclusive; show a range only when it spans more than the single start day.
-    if (end && end.getTime() - 86_400_000 > start.getTime()) {
-      const last = new Date(end.getTime() - 86_400_000);
-      return `All day · ${formatDateLocal(start)} – ${formatDateLocal(last)}`;
-    }
-    return `All day · ${formatDateLocal(start)}`;
+    // All-day end is exclusive; `eventDaySpan` gives the last day itself.
+    return acrossDays
+      ? `All day · ${formatDateLocal(span.startDay)} – ${formatDateLocal(span.endDay)}`
+      : `All day · ${formatDateLocal(start)}`;
   }
   const end = ev.end ? parseLocal(ev.end, false) : null;
+  if (end && acrossDays) {
+    return `${formatDateLocal(start)} ${formatClock(start)} – ${formatDateLocal(end)} ${formatClock(end)}`;
+  }
   const clock = end ? `${formatClock(start)}–${formatClock(end)}` : formatClock(start);
   return `${formatDateLocal(start)} · ${clock}`;
 }
