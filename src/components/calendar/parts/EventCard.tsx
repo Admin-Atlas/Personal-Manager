@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// One timed event in the pixel time-grid (Week/Day). Absolutely positioned by the geometry the view
+// One timed event in the pixel time-grid (Week/Day), or one day's piece of an event that runs across
+// days (square and open at the ends where it continues). Absolutely positioned by the geometry the view
 // computes from calendar-layout; the card itself only paints. The fill is a shade of the event's own
 // source colour mixed into the surface via color-mix (token-safe — no source hex written here), so a
 // timed block reads as its calendar's colour like the all-day bands do, instead of a flat neutral that
@@ -17,7 +18,7 @@ interface Props {
   summary: string;
   /** The calendar's source colour (categorical palette) — the left rule. */
   color: string;
-  /** Local clock label, e.g. "09:30". */
+  /** Local clock label, e.g. "09:30–10:30", or for an event across days its dates and times. */
   timeLabel: string;
   location: string | null;
   /** Absolute geometry within the day column. */
@@ -31,6 +32,13 @@ interface Props {
   showLocation: boolean;
   /** The event has fully passed — grey it back so what's done recedes. */
   isPast?: boolean;
+  /** A piece of an event across days: it started on an earlier day (square top) or runs on into
+   *  a later one (square bottom). */
+  continuesBefore?: boolean;
+  continuesAfter?: boolean;
+  /** Whether Tab stops here (default yes). The later pieces of an event across days are still
+   *  clickable, but only its first piece on screen is a tab stop. */
+  tabStop?: boolean;
   /** Open the event's detail popup, anchored at the card's on-screen rect. */
   onSelect?: (anchor: DOMRect) => void;
 }
@@ -52,6 +60,9 @@ export function EventCard({
   showTime,
   showLocation,
   isPast,
+  continuesBefore,
+  continuesAfter,
+  tabStop = true,
   onSelect,
 }: Props) {
   const style: CSSProperties = {
@@ -61,6 +72,14 @@ export function EventCard({
     width: `calc(${widthPct}% - 2px)`,
     borderLeftColor: color,
     background: `color-mix(in oklab, ${color} 18%, var(--surface))`,
+    // A piece of an event across days runs edge to edge into the next day's piece: square, open
+    // ends where it continues (inline, as `cn` doesn't resolve conflicting utilities).
+    ...(continuesBefore
+      ? { borderTopWidth: 0, borderTopLeftRadius: 0, borderTopRightRadius: 0 }
+      : {}),
+    ...(continuesAfter
+      ? { borderBottomWidth: 0, borderBottomLeftRadius: 0, borderBottomRightRadius: 0 }
+      : {}),
   };
   const withTime = showTime && heightPx >= TIME_MIN_H;
   const withLoc = showLocation && !!location && heightPx >= LOC_MIN_H;
@@ -79,7 +98,7 @@ export function EventCard({
       title={summary}
       aria-label={ariaLabel}
       role={onSelect ? "button" : undefined}
-      tabIndex={onSelect ? 0 : undefined}
+      tabIndex={onSelect ? (tabStop ? 0 : -1) : undefined}
       onClick={onSelect ? (e) => onSelect(e.currentTarget.getBoundingClientRect()) : undefined}
       onKeyDown={
         onSelect

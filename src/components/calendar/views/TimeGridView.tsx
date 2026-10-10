@@ -7,9 +7,10 @@
 // Windows WebView2 engine) and non-Retina WebKitGTK (Linux) were unaffected. Timed events are
 // absolutely positioned from
 // minutes-since-local-midnight (DST-tolerant, never an absolute UTC delta) and de-overlapped into
-// equal-width lane columns via calendar-layout. All-day / multi-day events lift into the AllDayBand;
-// timed events crossing midnight are already multi-day, so they lift too. Today's column gets an
-// accent-soft tint and the now-line. Every colour is a token or the passed source colour — no hex.
+// equal-width lane columns via calendar-layout. Only all-day events lift into the AllDayBand: a timed
+// event that runs past midnight fills its hours in every day it touches, one piece per day
+// (`timedSegments`), each opening the same event. Today's column gets an accent-soft tint and the
+// now-line. Every colour is a token or the passed source colour — no hex.
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
@@ -18,13 +19,14 @@ import {
   assignColumns,
   dayKey,
   eventDaySpan,
+  inTimeGridBand,
   isEventPast,
-  isMultiDay,
   minutesFromLocalMidnight,
   parseLocal,
-  timedEndMinutes,
   startOfDay,
+  timedSegments,
   type TimedInput,
+  type TimedSegment,
 } from "../../../lib/calendar-layout";
 import { hourRowHeight } from "../../../lib/calendarGeom";
 import { formatClock } from "../../../lib/format";
@@ -34,6 +36,7 @@ import { ZoneGutter } from "../ZoneGutter";
 import { EventCard } from "../parts/EventCard";
 import { NowLine } from "../parts/NowLine";
 import { AllDayBand } from "../parts/AllDayBand";
+import { whenText } from "../parts/whenText";
 
 interface Props {
   /** The visible day columns (local midnights), left → right. Day = 1, Week = 7. */
@@ -96,7 +99,12 @@ interface CardGeom {
   durMin: number;
   leftPct: number;
   widthPct: number;
+  /** The clock range, or for an event across days its whole when, dates included. */
   timeLabel: string;
+  continuesBefore: boolean;
+  continuesAfter: boolean;
+  /** The event's first piece on screen: the one Tab stops at (a 3-day event is one tab stop). */
+  tabStop: boolean;
 }
 
 interface DayColumn {
@@ -173,10 +181,12 @@ export function TimeGridView({
     setScrollbarW((prev) => (prev === w ? prev : w));
   }, [rowH, bodyHeight]);
 
-  const bandEvents = useMemo(() => events.filter((e) => e.all_day || isMultiDay(e)), [events]);
+  const bandEvents = useMemo(() => events.filter(inTimeGridBand), [events]);
 
-  // The extra-zone gutter labels, computed against the first visible day (one shared axis across a
-  // week — see the DST caveat below). Recomputed only when the zones or the anchor day change.
+  // The extra-zone gutter labels, computed against the first visible day: one shared axis across a
+  // week. The grid's rows are this computer's wall-clock hours, so in a week where either zone
+  // changes its clocks, the labels are an hour out on the days after the change. Recomputed only
+  // when the zones or the anchor day change.
   const refDay = days[0];
   const zoneLabels = useMemo(
     () => zones.map((zone) => ({ zone, labels: refDay ? zoneHourLabels(refDay, zone) : [] })),
@@ -185,48 +195,53 @@ export function TimeGridView({
 
   const columns = useMemo<DayColumn[]>(() => {
     const todayKey = dayKey(startOfDay(new Date()));
-    // Bucket single-day timed events by their local start day.
-    const timedByDay = new Map<string, CalendarEvent[]>();
+    // Each timed event's pieces, by visible day: one per day it touches, so an evening-to-morning
+    // event fills the evening of one column and the morning of the next.
+    const pieces: { ev: CalendarEvent; seg: TimedSegment; first: boolean }[][] = days.map(() => []);
     for (const ev of events) {
-      if (ev.all_day || isMultiDay(ev)) continue;
-      const start = parseLocal(ev.start, false);
-      if (!start) continue;
-      const key = dayKey(startOfDay(start));
-      const list = timedByDay.get(key);
-      if (list) list.push(ev);
-      else timedByDay.set(key, [ev]);
+      if (inTimeGridBand(ev)) continue;
+      timedSegments(ev, days).forEach((seg, i) =>
+        pieces[seg.dayIndex].push({ ev, seg, first: i === 0 }),
+      );
     }
-    return days.map((day) => {
+    return days.map((day, d) => {
       const key = dayKey(day);
-      const dayEvents = timedByDay.get(key) ?? [];
-      const inputs: TimedInput[] = dayEvents.map((ev) => {
-        const start = parseLocal(ev.start, false)!;
-        const end = ev.end ? parseLocal(ev.end, false) : null;
-        const startMin = minutesFromLocalMidnight(start);
-        const endMin = timedEndMinutes(start, end);
-        return { id: ev.id, startMin, endMin };
-      });
+      const dayPieces = pieces[d];
+      // An event has at most one piece a day, so its id still keys its lane.
+      const inputs: TimedInput[] = dayPieces.map(({ ev, seg }) => ({
+        id: ev.id,
+        startMin: seg.startMin,
+        endMin: seg.endMin,
+      }));
       const placed = assignColumns(inputs);
       const laneOf = new Map(placed.map((p) => [p.id, p]));
-      // `inputs[i]` is built from `dayEvents[i]` in the same order, so index straight in — no O(n²)
-      // id scan to recover the row we're already on.
-      const cards: CardGeom[] = dayEvents.map((ev, i) => {
-        const input = inputs[i];
+      const cards: CardGeom[] = dayPieces.map(({ ev, seg, first }) => {
         const info = laneOf.get(ev.id) ?? { lane: 0, lanes: 1 };
         const startD = parseLocal(ev.start, false)!;
         const endD = ev.end ? parseLocal(ev.end, false) : null;
+        const acrossDays = seg.continuesBefore || seg.continuesAfter;
         return {
           ev,
-          startMin: input.startMin,
-          durMin: Math.max(input.endMin - input.startMin, 1),
+          startMin: seg.startMin,
+          durMin: Math.max(seg.endMin - seg.startMin, 1),
           leftPct: (info.lane / info.lanes) * 100,
           widthPct: 100 / info.lanes,
-          // Show start–end (en-dash); fall back to start-only when there's no/invalid end.
-          timeLabel: endD ? `${formatClock(startD)}–${formatClock(endD)}` : formatClock(startD),
+          // Show start–end (en-dash); fall back to start-only when there's no/invalid end. Every
+          // piece of an event across days shows its whole when, dates included ("12-10 09:00 –
+          // 14-10 17:00"): a bare "09:00–17:00" on a middle day filled from midnight to midnight
+          // would read as that day's hours.
+          timeLabel: acrossDays
+            ? whenText(ev)
+            : endD
+              ? `${formatClock(startD)}–${formatClock(endD)}`
+              : formatClock(startD),
+          continuesBefore: seg.continuesBefore,
+          continuesAfter: seg.continuesAfter,
+          tabStop: first,
         };
       });
-      // Total events touching the day (timed + bands overlapping), for the Power count line.
-      let count = dayEvents.length;
+      // Total events touching the day (timed pieces + bands overlapping), for the Power count line.
+      let count = dayPieces.length;
       for (const ev of bandEvents) {
         const span = eventDaySpan(ev);
         if (
@@ -382,12 +397,16 @@ export function TimeGridView({
                   timeLabel={card.timeLabel}
                   location={card.ev.location}
                   topPx={(card.startMin / 60) * rowH}
-                  heightPx={Math.max((card.durMin / 60) * rowH - 3, 14)}
+                  // A piece that runs on to the next day reaches the bottom of this one: no gap.
+                  heightPx={Math.max((card.durMin / 60) * rowH - (card.continuesAfter ? 0 : 3), 14)}
                   leftPct={card.leftPct}
                   widthPct={card.widthPct}
                   showTime={!minimal}
                   showLocation={showPower}
                   isPast={isEventPast(card.ev, nowDate)}
+                  continuesBefore={card.continuesBefore}
+                  continuesAfter={card.continuesAfter}
+                  tabStop={card.tabStop}
                   onSelect={onEventClick ? (rect) => onEventClick(card.ev, rect) : undefined}
                 />
               ))}

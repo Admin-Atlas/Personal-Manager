@@ -42,14 +42,19 @@ interface DayRow {
   items: CalendarEvent[];
 }
 
-/** The row's time cell for `ev` on `day`: `all-day`, a continuation arrow for a multi-day event whose
- *  run started earlier, or the local `HH:MM` on its start day. */
+/** The row's time cell for `ev` on `day`: `all-day`, the local `HH:MM` on its start day, or for a
+ *  timed event whose run started earlier, a continuation arrow, with the time it ends on its last
+ *  day (`→ 02:00`). */
 function rowTime(ev: CalendarEvent, day: Date): string {
   if (ev.all_day) return "all-day";
   const start = new Date(ev.start);
   if (Number.isNaN(start.getTime())) return "";
-  if (dayKey(startOfDay(start)) !== dayKey(day)) return "→";
-  return formatClock(start);
+  if (dayKey(startOfDay(start)) === dayKey(day)) return formatClock(start);
+  const end = ev.end ? new Date(ev.end) : null;
+  const lastDay = eventDaySpan(ev)?.endDay;
+  return end && !Number.isNaN(end.getTime()) && lastDay && dayKey(lastDay) === dayKey(day)
+    ? `→ ${formatClock(end)}`
+    : "→";
 }
 
 export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventClick }: Props) {

@@ -52,4 +52,41 @@ describe("buildWeekRows (continuous stream)", () => {
       }
     }
   });
+
+  // A timed event across midnight is still one bar here (Month keeps bars; only Day/Week fill the
+  // hours). A bar cut off by the grid's own edge must say it continues, or it reads as the event's
+  // start (and Month prints a timed bar's start time there).
+  const timed = (startIso: string, endIso: string) => ({
+    id: "e",
+    calendar_id: "c",
+    summary: "Night shift",
+    description: null,
+    location: null,
+    start: startIso,
+    end: endIso,
+    all_day: false,
+    html_link: null,
+    uid: null,
+  });
+
+  it("keeps a timed event across midnight as a bar, continuing past the grid's edges", () => {
+    // November 2026's grid starts on Mon 26-10; the event began the night before.
+    const gridStart = new Date(2026, 9, 26);
+    const before = buildWeekRows(gridStart, 6, [
+      timed("2026-10-25T22:00:00", "2026-10-26T02:00:00"),
+    ]);
+    expect(before[0].bands).toHaveLength(1);
+    expect(before[0].bands[0].continuesLeft).toBe(true);
+    // And one that runs past the grid's last day (Sun 6-12).
+    const after = buildWeekRows(gridStart, 6, [
+      timed("2026-12-06T22:00:00", "2026-12-07T02:00:00"),
+    ]);
+    expect(after[5].bands[0].continuesRight).toBe(true);
+    // Inside the grid, the ends are its own.
+    const inside = buildWeekRows(gridStart, 6, [
+      timed("2026-11-03T22:00:00", "2026-11-04T02:00:00"),
+    ]);
+    const bar = inside.flatMap((w) => w.bands)[0];
+    expect([bar.continuesLeft, bar.continuesRight]).toEqual([false, false]);
+  });
 });

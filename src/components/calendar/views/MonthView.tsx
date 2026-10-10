@@ -356,6 +356,11 @@ export function MonthView({
                     >
                       <span className="truncate font-head text-ink">
                         {b.continuesLeft ? "‹ " : ""}
+                        {/* A timed event across days says when it starts, so it doesn't read as
+                            an all-day one. */}
+                        {!b.ev.all_day && !b.continuesLeft && (
+                          <span className="font-mono text-ink3">{formatClockIso(b.ev.start)} </span>
+                        )}
                         {b.ev.summary}
                       </span>
                     </div>

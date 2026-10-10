@@ -207,6 +207,10 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                   >
                     <span className="truncate text-ink">
                       {b.continuesLeft ? "‹ " : ""}
+                      {/* A timed event across days says when it starts (not all-day). */}
+                      {!b.ev.all_day && !b.continuesLeft && (
+                        <span className="text-ink3">{formatClockIso(b.ev.start)} </span>
+                      )}
                       {b.ev.summary}
                     </span>
                   </div>

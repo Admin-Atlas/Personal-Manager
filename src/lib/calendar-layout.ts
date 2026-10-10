@@ -203,18 +203,69 @@ export function groupEventsFromDay(events: CalendarEvent[], fromDay: Date): DayG
 }
 
 /** True when an event covers more than one local day (a multi-day all-day event, or a timed event
- *  crossing midnight / longer than a day) — so it belongs in the all-day band, not a time column. */
+ *  crossing midnight / longer than a day). Month, Year and the agendas draw such an event as one bar
+ *  across its days; the time grid draws a timed one hour by hour instead ([`timedSegments`]). */
 export function isMultiDay(ev: CalendarEvent): boolean {
   const span = eventDaySpan(ev);
   return !!span && span.endDay.getTime() > span.startDay.getTime();
 }
 
+/** Whether the time grid (Day/Week) draws an event in its all-day strip rather than in the hours:
+ *  only all-day events. A timed event fills its hours however many days it runs (#884, Bobby: "it
+ *  should block out all of the time from start to finish"), unlike Google, which moves a timed event
+ *  of 24 hours or more up to the all-day row. To follow Google instead, add `|| lasts ≥ 24 h` here. */
+export function inTimeGridBand(ev: CalendarEvent): boolean {
+  return ev.all_day;
+}
+
+/** One day's piece of a timed event in the time grid. */
+export interface TimedSegment {
+  /** Which of the visible days (an index into the `days` passed in). */
+  dayIndex: number;
+  /** Minutes since that day's local midnight (0..1440). */
+  startMin: number;
+  endMin: number;
+  /** The event started on an earlier day, or runs on into a later one. */
+  continuesBefore: boolean;
+  continuesAfter: boolean;
+}
+
+/** The pieces a timed event fills in the time grid, one per visible day it touches: from its start
+ *  to midnight, whole days, then midnight to its end. An event ending at 00:00 stops at the bottom of
+ *  the day before (the rule `eventDaySpan` uses), a missing end is a 30-minute block cut at midnight,
+ *  and an end before the start is a sliver on the start's day, as before. Days outside `days` are
+ *  skipped, so an event lasting months costs no more than the window. All-day events have none. */
+export function timedSegments(ev: CalendarEvent, days: readonly Date[]): TimedSegment[] {
+  if (ev.all_day) return [];
+  const start = parseLocal(ev.start, false);
+  const span = eventDaySpan(ev);
+  if (!start || !span) return [];
+  const end = ev.end ? parseLocal(ev.end, false) : null;
+  const first = span.startDay.getTime();
+  const last = Math.max(span.endDay.getTime(), first);
+  const out: TimedSegment[] = [];
+  days.forEach((day, dayIndex) => {
+    const t = startOfDay(day).getTime();
+    if (t < first || t > last) return;
+    const isFirst = t === first;
+    const isLast = t === last;
+    out.push({
+      dayIndex,
+      startMin: isFirst ? minutesFromLocalMidnight(start) : 0,
+      endMin: isLast ? Math.min(timedEndMinutes(start, end), 1440) : 1440,
+      continuesBefore: !isFirst,
+      continuesAfter: !isLast,
+    });
+  });
+  return out;
+}
+
 /** Whether an event has fully passed as of `now` (device-local) — drives the greyed "past event"
- *  styling. A timed event is past once its end (or its start, if it has no end) is before now; an
- *  all-day / multi-day event is past once its last day is before today. An event happening right now,
- *  or later today, is never past. */
+ *  styling. A timed event is past once its end (or its start, if it has no end) is before now, however
+ *  many days it runs; an all-day event is past once its last day is before today. An event happening
+ *  right now, or later today, is never past. */
 export function isEventPast(ev: CalendarEvent, now: Date): boolean {
-  if (ev.all_day || isMultiDay(ev)) {
+  if (ev.all_day) {
     const span = eventDaySpan(ev);
     return !!span && span.endDay.getTime() < startOfDay(now).getTime();
   }

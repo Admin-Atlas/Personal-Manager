@@ -5,11 +5,15 @@ import { describe, it, expect } from "vitest";
 import {
   dayDiff,
   dayKey,
+  inTimeGridBand,
+  isEventPast,
+  isMultiDay,
   minutesFromLocalMidnight,
   occurrenceKey,
   startOfDay,
   startOfWeek,
   timedEndMinutes,
+  timedSegments,
 } from "./calendar-layout";
 import type { CalendarEvent } from "./types";
 
@@ -96,5 +100,95 @@ describe("startOfWeek — the Monday of the week containing the day", () => {
       expect(dayDiff(start, d)).toBeLessThan(7);
       expect(start.getDay()).toBe(1); // a Monday, every time
     }
+  });
+});
+
+// Timed values without a zone ("…T22:00:00") are read as local time, like the Date constructors above.
+const timedEv = (start: string, end: string | null): CalendarEvent => ({
+  id: "e",
+  calendar_id: "c",
+  summary: "Night shift",
+  description: null,
+  location: null,
+  start,
+  end,
+  all_day: false,
+  html_link: null,
+  uid: null,
+});
+const week = (y: number, m0: number, d: number, n = 7) =>
+  Array.from({ length: n }, (_, i) => new Date(y, m0, d + i));
+
+describe("timedSegments — a timed event fills its hours on every day it touches", () => {
+  it("splits an evening-to-morning event at midnight", () => {
+    const ev = timedEv("2026-10-12T22:00:00", "2026-10-13T02:00:00");
+    expect(timedSegments(ev, week(2026, 9, 12, 2))).toEqual([
+      { dayIndex: 0, startMin: 1320, endMin: 1440, continuesBefore: false, continuesAfter: true },
+      { dayIndex: 1, startMin: 0, endMin: 120, continuesBefore: true, continuesAfter: false },
+    ]);
+  });
+
+  it("fills the whole of every day in between", () => {
+    const ev = timedEv("2026-10-12T09:00:00", "2026-10-14T17:00:00");
+    const segs = timedSegments(ev, week(2026, 9, 12, 3));
+    expect(segs.map((s) => [s.startMin, s.endMin])).toEqual([
+      [540, 1440],
+      [0, 1440],
+      [0, 1020],
+    ]);
+    expect(segs[1]).toMatchObject({ continuesBefore: true, continuesAfter: true });
+  });
+
+  it("keeps an event that ends at midnight to its own day (F-62)", () => {
+    const ev = timedEv("2026-10-12T20:00:00", "2026-10-13T00:00:00");
+    expect(timedSegments(ev, week(2026, 9, 12, 2))).toEqual([
+      { dayIndex: 0, startMin: 1200, endMin: 1440, continuesBefore: false, continuesAfter: false },
+    ]);
+  });
+
+  it("only gives pieces for the days on screen, still marked as continuing", () => {
+    // Runs Sunday to Tuesday; the window is Monday alone.
+    const ev = timedEv("2026-10-11T20:00:00", "2026-10-13T08:00:00");
+    expect(timedSegments(ev, week(2026, 9, 12, 1))).toEqual([
+      { dayIndex: 0, startMin: 0, endMin: 1440, continuesBefore: true, continuesAfter: true },
+    ]);
+    // A months-long event costs only the window.
+    const long = timedEv("2026-01-01T09:00:00", "2026-12-31T09:00:00");
+    expect(timedSegments(long, week(2026, 9, 12))).toHaveLength(7);
+  });
+
+  it("cuts a missing end's 30-minute block at midnight, and keeps an end before the start", () => {
+    expect(timedSegments(timedEv("2026-10-12T23:45:00", null), week(2026, 9, 12, 2))).toEqual([
+      { dayIndex: 0, startMin: 1425, endMin: 1440, continuesBefore: false, continuesAfter: false },
+    ]);
+    const backwards = timedSegments(
+      timedEv("2026-10-12T10:00:00", "2026-10-11T09:00:00"),
+      week(2026, 9, 11, 3),
+    );
+    expect(backwards).toHaveLength(1);
+    expect(backwards[0]).toMatchObject({ dayIndex: 1, startMin: 600 });
+  });
+
+  it("leaves all-day events to the strip", () => {
+    const allDay = { ...timedEv("2026-10-12", "2026-10-14"), all_day: true };
+    expect(timedSegments(allDay, week(2026, 9, 12))).toEqual([]);
+    expect(inTimeGridBand(allDay)).toBe(true);
+    expect(inTimeGridBand(timedEv("2026-10-12T22:00:00", "2026-10-14T02:00:00"))).toBe(false);
+    // Month and the agendas still draw it as one bar across its days.
+    expect(isMultiDay(timedEv("2026-10-12T22:00:00", "2026-10-13T02:00:00"))).toBe(true);
+  });
+});
+
+describe("isEventPast", () => {
+  it("greys a timed event across days once it ends, not at the end of its last day", () => {
+    const ev = timedEv("2026-10-12T22:00:00", "2026-10-13T02:00:00");
+    expect(isEventPast(ev, new Date(2026, 9, 13, 1, 59))).toBe(false);
+    expect(isEventPast(ev, new Date(2026, 9, 13, 2, 1))).toBe(true);
+  });
+
+  it("greys an all-day event only once its last day is over", () => {
+    const ev = { ...timedEv("2026-10-12", "2026-10-14"), all_day: true };
+    expect(isEventPast(ev, new Date(2026, 9, 13, 23, 0))).toBe(false);
+    expect(isEventPast(ev, new Date(2026, 9, 14, 0, 1))).toBe(true);
   });
 });
