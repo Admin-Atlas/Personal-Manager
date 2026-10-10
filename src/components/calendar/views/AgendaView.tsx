@@ -17,6 +17,7 @@ import {
   weekdayShort,
 } from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
+import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 
 interface Props {
@@ -80,15 +81,24 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
             <ul className="flex flex-1 flex-col gap-1">
               {g.items.map((ev) => {
                 const clickable = !!onEventClick;
+                const own = eventColour(ev.color_id);
                 return (
                   <li
                     key={ev.id}
                     className={cn(
                       "flex items-baseline gap-3 border-l-[3px] py-0.5 pl-2.5",
-                      clickable && "cursor-pointer rounded-[var(--radius-sm)] hover:bg-surface",
+                      clickable && "cursor-pointer rounded-[var(--radius-sm)]",
+                      // A filled row's inline background outranks hover:bg-surface, so its fill
+                      // changes brightness instead.
+                      clickable && (own ? eventHover(own) : "hover:bg-surface"),
                       isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                     )}
-                    style={{ borderLeftColor: colorOf(ev.calendar_id) }}
+                    style={{
+                      borderLeftColor: colorOf(ev.calendar_id),
+                      // An event given its own colour in Google is filled with it, solid, in its own
+                      // text colour; the rule stays its calendar's.
+                      background: eventFill(own, colorOf(ev.calendar_id), null),
+                    }}
                     role={clickable ? "button" : undefined}
                     tabIndex={clickable ? 0 : undefined}
                     onClick={
@@ -107,16 +117,20 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                         : undefined
                     }
                   >
-                    <span className="w-14 shrink-0 font-mono text-xs text-ink4">
+                    <span className="w-14 shrink-0 font-mono text-xs text-ink4" style={inkOn(own)}>
                       {eventTime(ev)}
                     </span>
                     {/* Agenda rows have free height, so the name wraps instead of truncating — an
                         ellipsis swallowed most real meeting titles, and the title is what the row
                         is for. The time stays a one-line gutter; the location drops below. */}
                     <div className="min-w-0 flex-1">
-                      <span className="break-words font-head text-sm text-ink">{ev.summary}</span>
+                      <span className="break-words font-head text-sm text-ink" style={inkOn(own)}>
+                        {ev.summary}
+                      </span>
                       {showPower && ev.location && (
-                        <div className="break-words font-mono text-xs text-ink4">{ev.location}</div>
+                        <div className="break-words font-mono text-xs text-ink4" style={inkOn(own)}>
+                          {ev.location}
+                        </div>
                       )}
                     </div>
                   </li>

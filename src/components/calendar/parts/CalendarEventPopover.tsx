@@ -24,6 +24,7 @@ import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/type
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
+import { eventColour } from "../../../theme/eventPalette";
 import { Button, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
 import { repeatsText, whenText } from "./whenText";
@@ -129,6 +130,8 @@ export function CalendarEventPopover({
   editing,
 }: Props) {
   const { showPower } = useDepth();
+  // The colour the event was given in Google, if any.
+  const own = eventColour(event.color_id);
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   const [flags, setFlags] = useState<Flag[]>([]);
@@ -262,6 +265,20 @@ export function CalendarEventPopover({
         </Field>
 
         {event.show_as && <Field label="Shows as">{showAsLabel(event.show_as)}</Field>}
+        {own && (
+          // The colour the event was given in Google, by name: what carries it for anyone who can't
+          // tell the fill's hue (the colour-blind axis doesn't recolour it).
+          <Field label="Colour">
+            <span className="inline-flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className="inline-block h-2.5 w-2.5 shrink-0 rounded-full border border-ink4"
+                style={{ background: own.hex }}
+              />
+              {own.name}
+            </span>
+          </Field>
+        )}
         {event.location && <Field label="Where">{event.location}</Field>}
 
         {event.organizer && <Field label="Organiser">{event.organizer}</Field>}

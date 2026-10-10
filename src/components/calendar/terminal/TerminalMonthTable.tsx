@@ -11,6 +11,7 @@ import type { CalendarEvent } from "../../../lib/types";
 import { dayKey, isEventPast, PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
+import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 import { useMonthGrid } from "../parts/useMonthGrid";
 
@@ -99,7 +100,10 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                           key={ev.id}
                           aria-hidden
                           className="inline-block h-2 w-2 shrink-0 rounded-[var(--radius-sm)]"
-                          style={{ backgroundColor: colorOf(ev.calendar_id) }}
+                          style={{
+                            backgroundColor:
+                              eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id),
+                          }}
                         />
                       ))}
                       {dotsHidden > 0 && (
@@ -110,15 +114,21 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                     <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
                       {cell.chips.slice(0, maxChips).map((ev) => {
                         const clickable = !!onEventClick;
+                        const own = eventColour(ev.color_id);
                         return (
                           <div
                             key={ev.id}
                             className={cn(
                               "flex items-center gap-1 overflow-hidden border-l-2 pl-1 text-[0.6875rem] leading-tight",
-                              clickable && "cursor-pointer hover:brightness-110",
+                              clickable && `cursor-pointer ${eventHover(own)}`,
                               isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                             )}
-                            style={{ borderLeftColor: colorOf(ev.calendar_id) }}
+                            style={{
+                              borderLeftColor: colorOf(ev.calendar_id),
+                              // Only an event given its own colour in Google gets a fill (solid, in
+                              // its own text colour); the rest stay the flat Terminal row.
+                              background: eventFill(own, colorOf(ev.calendar_id), null),
+                            }}
                             title={ev.summary}
                             role={clickable ? "button" : undefined}
                             tabIndex={clickable ? 0 : undefined}
@@ -139,11 +149,16 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                             }
                           >
                             {showMeta && !ev.all_day && formatClockIso(ev.start) && (
-                              <span className="shrink-0 text-[0.5625rem] text-ink4">
+                              <span
+                                className="shrink-0 text-[0.5625rem] text-ink4"
+                                style={inkOn(own)}
+                              >
                                 {formatClockIso(ev.start)}
                               </span>
                             )}
-                            <span className="truncate text-ink">{ev.summary}</span>
+                            <span className="truncate text-ink" style={inkOn(own)}>
+                              {ev.summary}
+                            </span>
                           </div>
                         );
                       })}
@@ -164,6 +179,9 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
             >
               {week.bands.map((b) => {
                 const color = colorOf(b.ev.calendar_id);
+                // An event given its own colour in Google fills with that, solid; the tick stays its
+                // calendar's.
+                const own = eventColour(b.ev.color_id);
                 const leftPct = (b.startIdx / 7) * 100;
                 const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
                 return (
@@ -171,7 +189,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                     key={b.ev.id}
                     className={cn(
                       "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
-                      onEventClick && "pointer-events-auto cursor-pointer hover:brightness-110",
+                      onEventClick && `pointer-events-auto cursor-pointer ${eventHover(own)}`,
                       isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                     )}
                     style={{
@@ -179,7 +197,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                       left: `${leftPct}%`,
                       width: `${widthPct}%`,
                       height: `${BAND_H - 2}px`,
-                      background: `color-mix(in oklab, ${color} 14%, transparent)`,
+                      background: eventFill(own, color, 14),
                       borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
                       borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
                       borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
@@ -205,11 +223,14 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                         : undefined
                     }
                   >
-                    <span className="truncate text-ink">
+                    <span className="truncate text-ink" style={inkOn(own)}>
                       {b.continuesLeft ? "‹ " : ""}
-                      {/* A timed event across days says when it starts (not all-day). */}
+                      {/* A timed event across days says when it starts (not all-day). --ink2: small
+                          text on the tint needs it for 4.5:1. */}
                       {!b.ev.all_day && !b.continuesLeft && (
-                        <span className="text-ink3">{formatClockIso(b.ev.start)} </span>
+                        <span className="text-ink2" style={inkOn(own)}>
+                          {formatClockIso(b.ev.start)}{" "}
+                        </span>
                       )}
                       {b.ev.summary}
                     </span>

@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.146.0-alpha",
+    date: "2026-10-10",
+    highlights: [
+      "An event you've given its own colour in Google Calendar now shows in that colour in PM, the way Google draws it: the colour fills the event, solid, with its text in white or dark so it stays easy to read, and the stripe down its edge keeps its calendar's colour. That's on the Calendar tab's views and the Focus tab's Days view; where an event is drawn as a dot, the dot takes the colour.",
+      "On the Calendar tab, an event's details now name its colour too, like “Colour: Lavender”.",
+      "The small times on calendar events now stand out more against their calendar's colour, so they're easier to read.",
+    ],
+  },
+  {
     version: "3.145.0-alpha",
     date: "2026-10-10",
     highlights: [
