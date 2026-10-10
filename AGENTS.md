@@ -119,6 +119,8 @@ release remain the open post-v1 work.
   - **Connectors & calendar** — `google.rs` / `microsoft.rs` (OAuth loopback-PKCE, BYO creds
     in the keychain), `drive.rs`, `onedrive.rs`, `outlook_calendar.rs`, `localfolder.rs`,
     `calendar.rs` + `ics.rs` (the multi-provider mirror + RFC 5545 parsing);
+    `calendar_recur/` (repeat rules, pure: read, described, cut for a split; the read and write
+    paths share it, and it never lets the `rrule` crate parse or print a rule);
     `calendar_write/` + `commands/calendar_edit.rs` (Google event writes, fenced off from every
     model path: INVARIANTS.md I-22). Everything fetched is untrusted DATA (rule #6).
   - **Backup** — `backup/`: portable passphrase-encrypted zstd `.pmbackup`; a

@@ -99,7 +99,9 @@ pub struct CalendarEvent {
     pub conference_url: Option<String>,
     /// Whether the event is part of a recurring series.
     pub recurring: bool,
-    /// A short human/recurrence-rule summary when available (the raw RRULE for ICS/Google).
+    /// How the series repeats, in words ("Weekly on Monday"), when the row's source says: an iCal
+    /// row's own rule (`calendar_recur::spec::describe_lines`). A Google or Outlook occurrence doesn't
+    /// carry its series' rule, so theirs is `None`.
     pub recurrence_summary: Option<String>,
     /// Provider status (confirmed | tentative). Cancelled events are dropped before the mirror.
     pub status: Option<String>,
@@ -879,17 +881,12 @@ pub(crate) fn parse_event(calendar_id: &str, it: &serde_json::Value) -> Option<C
         organizer: google_organizer(it),
         attendees: google_attendees(it),
         conference_url: google_conference(it),
-        recurring: it.get("recurrence").is_some() || it.get("recurringEventId").is_some(),
-        recurrence_summary: it
-            .get("recurrence")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            })
-            .filter(|s| !s.is_empty()),
+        // An occurrence never carries its series' rule: Google lists occurrences only under
+        // `singleEvents=true`, and they "do not have the recurrence field set" (recurring-events
+        // guide). So a Google row is recurring by its series id and has no summary of its own; the
+        // popover's line for one comes from its master (C9).
+        recurring: it.get("recurringEventId").is_some(),
+        recurrence_summary: None,
         status: it
             .get("status")
             .and_then(|v| v.as_str())
@@ -2791,6 +2788,12 @@ mod tests {
         assert_eq!(e.start, "2026-10-12T09:00:00Z");
         assert_eq!(e.color_id.as_deref(), Some("7"));
         assert_eq!(e.event_label_id.as_deref(), Some("label-9"));
+        // An occurrence is recurring by its series id, and carries no rule to summarise.
+        assert!(e.recurring);
+        assert_eq!(e.recurrence_summary, None);
+        let mut single = google_occurrence();
+        single.as_object_mut().unwrap().remove("recurringEventId");
+        assert!(!parse_event("cal-1", &single).unwrap().recurring);
     }
 
     #[test]

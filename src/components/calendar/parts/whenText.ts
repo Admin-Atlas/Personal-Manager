@@ -25,3 +25,11 @@ export function whenText(ev: CalendarEvent): string {
   const clock = end ? `${formatClock(start)}–${formatClock(end)}` : formatClock(start);
   return `${formatDateLocal(start)} · ${clock}`;
 }
+
+/** How a repeating event repeats, in words ("Weekly on Monday"), or a plain "Repeats" when PM has
+ *  no words for it. Until 3.144 an iCal row held its raw rule ("FREQ=WEEKLY;BYDAY=MO"); one that
+ *  hasn't synced since still does, and reads as a plain "Repeats" until it has. */
+export function repeatsText(ev: CalendarEvent): string {
+  const summary = ev.recurrence_summary?.trim();
+  return summary && !/^(RRULE:)?FREQ=/i.test(summary) ? summary : "Repeats";
+}
