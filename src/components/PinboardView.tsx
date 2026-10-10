@@ -53,6 +53,8 @@ import {
   writeShowPastTimelineItems,
 } from "../lib/pinboard/prefs";
 import { todayIso } from "../lib/dateField";
+import { isDialogOpenOutside } from "../lib/useDialogLayer";
+import { isLetterKey } from "../lib/letterKey";
 import { usePinboard } from "../lib/pinboard/usePinboard";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
@@ -367,12 +369,20 @@ export function PinboardView() {
   // listeners because keydown alone misses the WebView's own Edit ▸ Undo (context menu): `beforeinput`
   // catches the resulting `historyUndo`. `beforeinput` is scoped to the board element so we never
   // interfere with native undo in the rest of the app.
+  //
+  // It stands down under any dialog outside the board surface: Settings or the command palette opened
+  // over this tab, where Ctrl+Z belongs to that dialog's fields (it used to undo the board behind
+  // it), and the board's own delete confirmation, where it undid a change unseen behind the scrim and
+  // the Delete then cleared the redo. The folder overlay is a dialog inside the board surface, so the
+  // board's Undo still works in it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
-      // e.code, not e.key: the physical Z/Y, so a non-QWERTY layout still works (matches formatForKey).
-      const isZ = e.code === "KeyZ";
-      const isY = e.code === "KeyY";
+      if (isDialogOpenOutside(boardRef.current)) return;
+      // The letter the layout types (a German Z sits where QWERTY has Y), falling back to the
+      // physical key on a layout with no Latin letters.
+      const isZ = isLetterKey(e, "z");
+      const isY = isLetterKey(e, "y");
       if (!isZ && !isY) return;
       // Ctrl+Y and Ctrl/Cmd+Shift+Z both redo — Windows and mac conventions respectively, and both
       // are common on Linux.

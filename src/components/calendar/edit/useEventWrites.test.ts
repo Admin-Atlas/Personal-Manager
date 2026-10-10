@@ -122,6 +122,39 @@ describe("a held delete", () => {
     expect(cancelCalendarDelete).toHaveBeenCalledTimes(1);
     expect(hook.result.current.hiddenIds.size).toBe(0);
     expect(hook.result.current.notices).toEqual([{ id: 1, tone: "ok", text: "Kept “Dentist”." }]);
+    // Done and fine, on screen: it goes by itself after 5 s.
+    act(() => {
+      vi.advanceTimersByTime(4_999);
+    });
+    expect(hook.result.current.notices).toHaveLength(1);
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(hook.result.current.notices).toEqual([]);
+  });
+
+  // Past its Undo window a delete is still being sent: its notice stays, however long Google takes.
+  it("keeps a delete's notice up until it settles", async () => {
+    deleteCalendarEvent.mockResolvedValue(held);
+    const { mod, hook, act } = await load();
+    await act(() => mod.startDelete(event));
+    act(() => {
+      vi.advanceTimersByTime(8_000 + 60_000);
+    });
+    expect(hook.result.current.notices).toEqual([
+      { id: 1, tone: "ok", text: "Deleting “Dentist”." },
+    ]);
+    act(() =>
+      settledHandler!({
+        undo_token: "t1",
+        event_id: event.id,
+        result: { outcome: "saved", warnings: [] },
+      }),
+    );
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(hook.result.current.notices).toEqual([]);
   });
 
   it("says so when the Undo came too late, then reports how it ended and shows the row again", async () => {
@@ -196,6 +229,34 @@ describe("a held delete", () => {
     });
   });
 
+  // PM reopens on Focus after a reload: a delete that ends before the Calendar tab is opened still
+  // says how it ended there, and only then starts going by itself.
+  it("keeps how a delete ended until the Calendar tab shows it", async () => {
+    vi.resetModules();
+    const mod = await import("./useEventWrites");
+    const { renderHook, act } = await import("@testing-library/react");
+    listHeldDeletes.mockResolvedValue([
+      { undo_token: "t9", event_id: event.id, summary: "Dentist", seconds_left: 5 },
+    ]);
+    await act(async () => mod.watchHeldDeletes());
+    act(() =>
+      settledHandler!({
+        undo_token: "t9",
+        event_id: event.id,
+        result: { outcome: "saved", warnings: [] },
+      }),
+    );
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    const hook = renderHook(() => mod.useEventWrites());
+    expect(hook.result.current.notices.map((n) => n.text)).toEqual(["Deleted “Dentist”."]);
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(hook.result.current.notices).toEqual([]);
+  });
+
   it("lets a finished notice go by itself, but keeps a failure up", async () => {
     deleteCalendarEvent.mockRejectedValue(
       new Error("Calendar changes can only be made from PM's main window."),
@@ -208,5 +269,71 @@ describe("a held delete", () => {
     expect(hook.result.current.notices).toHaveLength(1);
     act(() => mod.dismissNotice(hook.result.current.notices[0].id));
     expect(hook.result.current.notices).toEqual([]);
+  });
+});
+
+// Ctrl+Z on the Calendar tab presses the newest Undo on screen (#884, F5).
+describe("undoing the newest delete", () => {
+  const second: CalendarEvent = { ...event, id: `${event.id}2`, summary: "Gym" };
+
+  it("undoes the newest first, then the one before, then nothing", async () => {
+    deleteCalendarEvent
+      .mockResolvedValueOnce(held)
+      .mockResolvedValueOnce({ outcome: "held", undo_token: "t2", undo_seconds: 8 });
+    cancelCalendarDelete.mockResolvedValue(true);
+    const { mod, act } = await load();
+    await act(() => mod.startDelete(event));
+    await act(() => mod.startDelete(second));
+    await act(async () => {
+      expect(mod.undoLatest()).toBe(true);
+    });
+    expect(cancelCalendarDelete).toHaveBeenLastCalledWith("t2");
+    await act(async () => {
+      expect(mod.undoLatest()).toBe(true);
+    });
+    expect(cancelCalendarDelete).toHaveBeenLastCalledWith("t1");
+    await act(async () => {
+      expect(mod.undoLatest()).toBe(false);
+    });
+    expect(cancelCalendarDelete).toHaveBeenCalledTimes(2);
+  });
+
+  it("never undoes what isn't on screen: a window that closed, or a notice dismissed", async () => {
+    deleteCalendarEvent.mockResolvedValue(held);
+    const { mod, hook, act } = await load();
+    await act(() => mod.startDelete(event));
+    act(() => mod.dismissNotice(hook.result.current.notices[0].id));
+    expect(mod.undoLatest()).toBe(false);
+    await act(() => mod.startDelete(second));
+    act(() => {
+      vi.advanceTimersByTime(8000);
+    });
+    expect(mod.undoLatest()).toBe(false);
+    expect(cancelCalendarDelete).not.toHaveBeenCalled();
+  });
+
+  it("never sends one undo twice, however fast the key is pressed", async () => {
+    deleteCalendarEvent.mockResolvedValue(held);
+    let answer: (v: boolean) => void = () => {};
+    cancelCalendarDelete.mockReturnValue(new Promise((r) => (answer = r)));
+    const { mod, act } = await load();
+    await act(() => mod.startDelete(event));
+    expect(mod.undoLatest()).toBe(true);
+    // Its button is already gone, so a second press finds nothing newer to undo.
+    expect(mod.undoLatest()).toBe(false);
+    await act(async () => answer(true));
+    expect(cancelCalendarDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the newest from the notices", async () => {
+    const { mod } = await load();
+    expect(mod.latestUndo([])).toBeNull();
+    expect(
+      mod.latestUndo([
+        { id: 1, tone: "ok", text: "a", undoToken: "old" },
+        { id: 2, tone: "ok", text: "b", undoToken: "new" },
+        { id: 3, tone: "ok", text: "Saved." },
+      ]),
+    ).toBe("new");
   });
 });

@@ -167,6 +167,39 @@ describe("CalendarEventPopover", () => {
     expect(document.activeElement).toBe(opener);
   });
 
+  // CalendarView's Ctrl+Z closes the panel when it brings an event back (#884, F5): focus comes back
+  // to the chip from the panel, but someone already back in the grid is left where they are.
+  it("hands focus back when closed from outside, only if it was in the panel", () => {
+    const opener = chip("Design review");
+    opener.focus();
+    const onClose = vi.fn();
+    const closeRef = { current: null as (() => void) | null };
+    const props = {
+      event: calendarEvent(),
+      anchor: rect(100),
+      calendar: null,
+      color: "#000",
+      milestone: null,
+      onClose,
+      closeRef,
+    };
+
+    const view = render(<CalendarEventPopover {...props} />);
+    expect(view.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    closeRef.current!();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(opener);
+    view.unmount();
+    expect(closeRef.current).toBeNull();
+
+    render(<CalendarEventPopover {...props} />);
+    const elsewhere = chip("Standup");
+    elsewhere.focus();
+    closeRef.current!();
+    expect(onClose).toHaveBeenCalledTimes(2);
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
   it("re-points at the NEW chip when the panel is re-used without closing", () => {
     // The keyboard path: activating another chip with Enter swaps `event`/`anchor` on the mounted
     // instance rather than unmounting it (the mouse path closes first, via the outside-mousedown

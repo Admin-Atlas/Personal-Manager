@@ -48,7 +48,7 @@ import {
   type RangeBounds,
 } from "../../lib/calendarPrefs";
 import { useHorizontalWheelShift } from "../../lib/useHorizontalWheelShift";
-import { calendarNavKey } from "../../lib/calendarNavKey";
+import { calendarNavKey, calendarUndoKey } from "../../lib/calendarNavKey";
 import { isAnyDialogOpen } from "../../lib/useDialogLayer";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import { formatDateLocal } from "../../lib/format";
@@ -83,7 +83,7 @@ import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
 import { EventEditor } from "./edit/EventEditor";
 import { WriteNotices } from "./edit/WriteNotices";
-import { pruneRemoved, useEventWrites } from "./edit/useEventWrites";
+import { pruneRemoved, undoLatest, useEventWrites } from "./edit/useEventWrites";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -455,12 +455,31 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // Whether the event popover is open: it isn't a Modal, so the dialog registry can't see it, and ←
   // paging the grid under an open popover leaves it pointing at an event no longer on screen.
   const popoverOpenRef = useRef(false);
+  // The event popup that's open, anchored at the clicked element's rect (null = closed).
+  const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
+  useEffect(() => {
+    popoverOpenRef.current = eventPopup !== null;
+  }, [eventPopup]);
+  // The popover's own close, which hands focus back as its Escape does (it fills this in).
+  const popoverCloseRef = useRef<(() => void) | null>(null);
 
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
   // field is focused, a modifier is held (so app shortcuts and text entry are untouched), or a dialog
-  // or the event popover is open over the tab (see `calendarNavKey`).
+  // or the event popover is open over the tab (see `calendarNavKey`). Ctrl/Cmd+Z is the delete's Undo
+  // (`calendarUndoKey`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Ctrl/Cmd+Z presses the newest Undo on screen (a delete still waiting). Unlike the arrows it
+      // works with an event's details open (the pop-up has no fields), and closes them: the event
+      // coming back reflows the grid, and the pop-up stays pinned where it was opened. A press with
+      // nothing to undo is left alone.
+      if (calendarUndoKey(e, isAnyDialogOpen())) {
+        if (undoLatest()) {
+          e.preventDefault();
+          if (popoverOpenRef.current) (popoverCloseRef.current ?? (() => setEventPopup(null)))();
+        }
+        return;
+      }
       const nav = calendarNavKey(e, isAnyDialogOpen() || popoverOpenRef.current);
       if (nav === "prev") {
         e.preventDefault();
@@ -608,11 +627,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return out;
   }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor]);
 
-  // The event popup that's open, anchored at the clicked element's rect (null = closed).
-  const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
-  useEffect(() => {
-    popoverOpenRef.current = eventPopup !== null;
-  }, [eventPopup]);
   // The event the delete dialog is asking about (null = closed).
   const [confirmDelete, setConfirmDelete] = useState<CalendarEvent | null>(null);
   // The popover's editing actions for `ev`. Delete closes the popover and asks first.
@@ -932,6 +946,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               : null
           }
           onClose={() => setEventPopup(null)}
+          closeRef={popoverCloseRef}
           onOpenProject={
             onOpenProject
               ? (p) => {
