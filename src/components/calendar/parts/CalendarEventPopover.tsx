@@ -19,7 +19,15 @@
 // first-party overlays, milestones and pinboard entries, straight to their own destination on click),
 // so that button pointed at the Pinboard from every event that had nothing to do with it.
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type ReactNode,
+} from "react";
 import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
@@ -44,6 +52,9 @@ interface Props {
   /** What PM may do to the event (#884). Passed only by CalendarView; without it the popover is
    *  read-only, as FocusUpcoming shows it. */
   editing?: PopoverEditing;
+  /** Filled with a way to close the panel from outside it (CalendarView's Ctrl+Z), handing focus
+   *  back as Escape does. */
+  closeRef?: MutableRefObject<(() => void) | null>;
 }
 
 /** The popover's editing actions. */
@@ -128,6 +139,7 @@ export function CalendarEventPopover({
   onClose,
   onOpenProject,
   editing,
+  closeRef,
 }: Props) {
   const { showPower } = useDepth();
   // The colour the event was given in Google, if any.
@@ -172,6 +184,20 @@ export function CalendarEventPopover({
     restoreFocus();
     onClose();
   }, [restoreFocus, onClose]);
+
+  // Closed from outside (Ctrl+Z bringing an event back reflows the grid under the panel): focus goes
+  // back to the chip if it was in the panel, which is about to go; if it's already back in the grid,
+  // it stays where it is.
+  useEffect(() => {
+    if (!closeRef) return;
+    closeRef.current = () => {
+      if (panelRef.current?.contains(document.activeElement)) restoreFocus();
+      onClose();
+    };
+    return () => {
+      closeRef.current = null;
+    };
+  }, [closeRef, restoreFocus, onClose]);
 
   // Move focus onto the panel once it has been PLACED. Keyed on `pos`, which is only set after the
   // measuring layout effect above: until then the panel is `visibility: hidden`, and a hidden

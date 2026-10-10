@@ -3,11 +3,15 @@
 
 // The calendar's notices about its own writes (#884): "Deleting “Dentist”. Undo", then how it ended.
 // They float over the grid, bottom centre, like the reader's notice, so each mixes its tone into
-// `--bg` (see Callout) rather than letting the events behind show through.
+// `--bg` (see Callout) rather than letting the events behind show through. The newest Undo is also
+// Ctrl+Z (⌘Z on a Mac), which its tooltip says.
 
-import { Button, Callout, TONE_MIX, TONE_TOKEN, type Tone as CalloutTone } from "../../ui";
+import { IS_MAC } from "../../../lib/setupGuide";
+import { Button, Callout, TONE_MIX, TONE_TOKEN, Tooltip, type Tone as CalloutTone } from "../../ui";
 import type { Tone } from "../../../lib/calendarEdit/editReasons";
-import type { WriteNotice } from "./useEventWrites";
+import { latestUndo, type WriteNotice } from "./useEventWrites";
+
+const UNDO_KEY = IS_MAC ? "⌘Z" : "Ctrl+Z";
 
 const CALLOUT_TONE: Record<Tone, CalloutTone> = {
   ok: "info",
@@ -23,6 +27,7 @@ interface Props {
 
 export function WriteNotices({ notices, onUndo, onDismiss }: Props) {
   if (notices.length === 0) return null;
+  const newest = latestUndo(notices);
   return (
     <div className="fixed bottom-4 left-1/2 z-50 flex w-max max-w-md -translate-x-1/2 flex-col gap-2">
       {notices.map((n) => {
@@ -41,15 +46,22 @@ export function WriteNotices({ notices, onUndo, onDismiss }: Props) {
           >
             <span>{n.text}</span>
             <span className="flex shrink-0 items-center gap-2">
+              {/* Every Undo is the same Tooltip > Button, so when the newest goes and an older one
+                  becomes it, only its label changes: a focused button isn't swapped for a new one. */}
               {n.undoToken && (
-                <Button
-                  variant="secondary"
-                  size="xs"
-                  aria-label={n.undoLabel}
-                  onClick={() => onUndo(n.undoToken!)}
+                <Tooltip
+                  label={n.undoToken === newest ? `Undo · ${UNDO_KEY}` : (n.undoLabel ?? "Undo")}
                 >
-                  Undo
-                </Button>
+                  <Button
+                    variant="secondary"
+                    size="xs"
+                    aria-label={n.undoLabel}
+                    aria-keyshortcuts={n.undoToken === newest ? "Control+Z Meta+Z" : undefined}
+                    onClick={() => onUndo(n.undoToken!)}
+                  >
+                    Undo
+                  </Button>
+                </Tooltip>
               )}
               <button
                 type="button"

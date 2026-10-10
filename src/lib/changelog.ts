@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.0-alpha",
+    date: "2026-10-10",
+    highlights: [
+      "After you delete an event on the Calendar tab, Ctrl+Z (⌘Z on a Mac) undoes it while the “Deleting…” notice still offers Undo. With two waiting, it undoes the newest first. In a text box, Ctrl+Z still undoes your typing.",
+      "If PM's window reloads while a delete is waiting, the Calendar tab still offers its Undo while it lasts, and says how the delete ended however late you open the tab. Before, you only heard about it if you opened the Calendar tab within the few seconds the Undo lasts.",
+      "On the Pinboard, Ctrl+Z typed into Settings or the command palette no longer undoes the last change to your board behind it.",
+    ],
+  },
+  {
     version: "3.146.0-alpha",
     date: "2026-10-10",
     highlights: [
