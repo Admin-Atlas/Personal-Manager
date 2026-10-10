@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.140.2-alpha",
+    date: "2026-10-09",
+    highlights: [
+      "Under-the-hood groundwork for calendar editing: the rules for what PM may change about an event, how a time is read around the clocks changing, and what to do when an event changed in Google while you were editing it. Nothing you can see changes yet.",
+    ],
+  },
+  {
     version: "3.140.1-alpha",
     date: "2026-10-09",
     highlights: [
