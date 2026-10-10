@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.2-alpha",
+    date: "2026-10-14",
+    highlights: [
+      "Once you've told PM you're ready for an event, so its “prepare ahead” reminder leaves the daily briefing, moving it no longer brings the reminder back, whether you move it in PM or in Google. That's a one-off event, or one occurrence of a repeating event in Google or in a subscribed iCal calendar. A repeating event still reminds you about each of its other occurrences, and a meeting you'd marked as happening today comes back on the day it's put off to.",
+      "In a subscribed iCal calendar, an occurrence of a repeating event that was changed on its own (moved, or renamed) now says it repeats, like the rest of its series.",
+      "Under-the-hood: the library PM uses for its secure connections picked up this week's security fixes.",
+    ],
+  },
+  {
     version: "3.147.1-alpha",
     date: "2026-10-12",
     highlights: [

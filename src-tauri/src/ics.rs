@@ -243,8 +243,24 @@ fn expand_vevent(
         })
     });
     let attendees = ics_attendees(block);
-    let recurring = block.iter().any(|l| is_prop(l, "RRULE"));
-    let recurrence_summary = if recurring {
+    let has_rrule = block.iter().any(|l| is_prop(l, "RRULE"));
+    // A RECURRENCE-ID block is one occurrence of a series edited on its own (RFC 5545): still part of
+    // the series, so it says "Repeats". Its RECURRENCE-ID is the start the occurrence had in the
+    // series, kept as its `original_start` like Google's originalStartTime, in the value space the
+    // series' own starts are stored in: the flag layer knows a moved occurrence by it (#884, F6).
+    let recurrence_id = find_prop(block, "RECURRENCE-ID");
+    let recurring = has_rrule || recurrence_id.is_some();
+    let original_start = recurrence_id.and_then(|(params, value)| {
+        let date_only = param(params, "VALUE") == Some("DATE")
+            || (!value.contains('T') && value.trim().len() == 8);
+        let at = parse_any(value, param(params, "TZID"), date_only, tz)?;
+        Some(if date_only {
+            at.with_timezone(&tz).format("%Y-%m-%d").to_string()
+        } else {
+            at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        })
+    });
+    let recurrence_summary = if has_rrule {
         series_start(start_params, start_val, all_day, tz).map(|start| {
             let lines: Vec<&String> = block
                 .iter()
@@ -284,6 +300,10 @@ fn expand_vevent(
             ev.organizer = organizer.clone();
             ev.attendees = attendees.clone();
             ev.recurring = recurring;
+            // A RECURRENCE-ID names one occurrence, the block's own DTSTART. Any further starts an
+            // RRULE in the same block expands ("this and following") are their own occurrences,
+            // known by their starts.
+            ev.original_start = original_start.clone().filter(|_| s == start_anchor);
             ev.recurrence_summary = recurrence_summary.clone();
             ev.status = status.clone();
             ev.visibility = visibility.clone();
@@ -1071,6 +1091,78 @@ mod tests {
         assert_eq!(events.len(), 5);
         assert!(!events.iter().any(|ev| ev.start == "2026-06-08T10:00:00Z"));
         assert!(events.iter().any(|ev| ev.start == "2026-06-08T14:00:00Z"));
+    }
+
+    /// A moved occurrence is still part of its series (#884, F6): it repeats, though its own block
+    /// has no RRULE to describe how, so it has no summary of its own; and it keeps the start it had
+    /// in the series, written as the series' own starts are.
+    #[test]
+    fn a_recurrence_id_override_is_a_recurring_occurrence() {
+        let feed = "BEGIN:VEVENT\nUID:s3\nSUMMARY:Weekly\n\
+                    DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s3\nRECURRENCE-ID:20260608T100000Z\n\
+                    SUMMARY:Weekly (moved)\nDTSTART:20260608T140000Z\n\
+                    DTEND:20260608T143000Z\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:once\nSUMMARY:Once\n\
+                    DTSTART:20260610T100000Z\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        let moved = events
+            .iter()
+            .find(|ev| ev.start == "2026-06-08T14:00:00Z")
+            .unwrap();
+        assert!(moved.recurring);
+        assert_eq!(moved.recurrence_summary, None);
+        assert_eq!(
+            moved.original_start.as_deref(),
+            Some("2026-06-08T10:00:00Z")
+        );
+        let master = events
+            .iter()
+            .find(|ev| ev.start == "2026-06-15T10:00:00Z")
+            .unwrap();
+        assert!(master.recurring && master.recurrence_summary.is_some());
+        assert_eq!(master.original_start, None);
+        let once = events.iter().find(|ev| ev.summary == "Once").unwrap();
+        assert!(!once.recurring);
+    }
+
+    /// An all-day override's place in the series is its civil date, as the series' starts are.
+    #[test]
+    fn an_all_day_override_keeps_its_date_in_the_series() {
+        let feed = "BEGIN:VEVENT\nUID:d1\nSUMMARY:Bins\n\
+                    DTSTART;VALUE=DATE:20260601\nRRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:d1\nRECURRENCE-ID;VALUE=DATE:20260608\n\
+                    SUMMARY:Bins\nDTSTART;VALUE=DATE:20260609\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let tz: ChronoTz = "Pacific/Auckland".parse().unwrap();
+        let events = parse_feed_within(feed, "f", s, e, tz);
+        let moved = events.iter().find(|ev| ev.start == "2026-06-09").unwrap();
+        assert_eq!(moved.original_start.as_deref(), Some("2026-06-08"));
+        assert!(events.iter().all(|ev| ev.start != "2026-06-08"));
+    }
+
+    /// An override with a rule of its own ("this and following"): only its first occurrence is the
+    /// one its RECURRENCE-ID names; the rest are known by their own starts.
+    #[test]
+    fn only_the_named_occurrence_of_an_override_with_a_rule_keeps_its_place() {
+        let feed = "BEGIN:VEVENT\nUID:s4\nSUMMARY:Weekly\n\
+                    DTSTART:20261005T100000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s4\nRECURRENCE-ID;RANGE=THISANDFUTURE:20261012T100000Z\n\
+                    SUMMARY:Weekly\nDTSTART:20261012T090000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        let at = |start: &str| events.iter().find(|ev| ev.start == start).unwrap();
+        assert_eq!(
+            at("2026-10-12T09:00:00Z").original_start.as_deref(),
+            Some("2026-10-12T10:00:00Z")
+        );
+        assert_eq!(at("2026-10-19T09:00:00Z").original_start, None);
     }
 
     // --- occurrence identity: RECURRENCE-ID overrides and the all-day value space (D8) ---------
