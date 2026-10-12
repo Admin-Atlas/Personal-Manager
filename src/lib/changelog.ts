@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.1-alpha",
+    date: "2026-10-12",
+    highlights: [
+      "Under-the-hood tidying: a handful of small library updates. One of the pieces PM uses to wipe secrets from memory picked up a fix, and the tools that only run while PM is being built, tested or checked moved up a step. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.147.0-alpha",
     date: "2026-10-10",
     highlights: [
