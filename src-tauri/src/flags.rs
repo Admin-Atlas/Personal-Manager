@@ -124,8 +124,8 @@ pub struct Flag {
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
-    /// The specific occurrence this flag is about (a timed event's start), so a resolved prep on one
-    /// occurrence of a recurring event doesn't annotate another. `None` for a milestone flag (already
+    /// The specific occurrence this flag is about, so a resolved prep on one occurrence of a recurring
+    /// event doesn't annotate another (see [`occurrence_of`]). `None` for a milestone flag (already
     /// per-instance) or a row written before this column existed.
     pub instance_at: Option<String>,
 }
@@ -140,9 +140,9 @@ pub struct DraftFlag {
     pub threshold: Option<String>,
     pub artifact_ptr: Option<String>,
     pub artifact_url: Option<String>,
-    /// The occurrence this flag is about — a calendar event's start (F-18), so a resolved tombstone for
-    /// one occurrence of a recurring series (which shares one iCal UID) can be aged out when a strictly
-    /// later occurrence comes due. `None` for milestone flags: their anchor is already per-instance.
+    /// The occurrence this flag is about ([`occurrence_of`], F-18), so a resolved tombstone for one
+    /// occurrence of a recurring series (which shares one iCal UID) can be aged out when a later
+    /// occurrence comes due. `None` for milestone flags (their anchor is already per-instance).
     pub instance_at: Option<String>,
 }
 
@@ -737,6 +737,20 @@ const DETECT_EVENT_WINDOW_DAYS: i64 = 7;
 pub struct Detection {
     pub drafts: Vec<DraftFlag>,
     pub skipped_no_uid: usize,
+    /// For each calendar anchor (uid) a draft names, the occurrence it's about as it is now, which
+    /// [`detect_and_store`] needs and doesn't persist.
+    pub occurrences: HashMap<String, Occurrence>,
+}
+
+/// The occurrence a calendar draft is about, as it is now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Occurrence {
+    /// Where it is now (its start), which an older build used as its key.
+    pub start: String,
+    /// Whether the event is a series: a one-off has no other occurrence its flag could be about.
+    pub series: bool,
+    /// The calendar it was read from: only that calendar's rows say where the event was before.
+    pub calendar_id: String,
 }
 
 /// Derive the flag set the current state implies — PURE, so it unit-tests without a DB or clock
@@ -794,10 +808,10 @@ pub fn detect(
     }
 
     // Calendar-anchored: collapse each uid to its soonest upcoming instance, then classify once. We keep
-    // that instance's START alongside its day-delta (F-18): it becomes the flag's `instance_at`, the key
-    // that lets a resolved tombstone for one occurrence of a recurring series be aged out when a strictly
-    // later occurrence comes due.
-    let mut soonest: HashMap<&str, (f64, &str)> = HashMap::new();
+    // that instance alongside its day-delta (F-18, [`occurrence_of`]): its identity becomes the flag's
+    // `instance_at`, the key that lets a resolved tombstone for one occurrence of a recurring series be
+    // aged out when a later occurrence comes due, and not when the same one is merely moved.
+    let mut soonest: HashMap<&str, (f64, &CalendarEvent)> = HashMap::new();
     for e in events {
         let Some(uid) = e.uid.as_deref() else {
             out.skipped_no_uid += 1;
@@ -817,12 +831,12 @@ pub fn detect(
             .entry(uid)
             .and_modify(|cur| {
                 if days < cur.0 {
-                    *cur = (days, e.start.as_str());
+                    *cur = (days, e);
                 }
             })
-            .or_insert((days, e.start.as_str()));
+            .or_insert((days, e));
     }
-    for (uid, (days, start)) in soonest {
+    for (uid, (days, e)) in soonest {
         let flag_type = if days <= 0.0 {
             TYPE_HAPPENING_TODAY
         } else if days <= default_threshold_days(TYPE_PREPARE_AHEAD) {
@@ -830,12 +844,21 @@ pub fn detect(
         } else {
             continue; // beyond the prepare-ahead lead — still just an agenda item
         };
+        let (key, series) = occurrence_of(e);
         out.drafts.push(draft_flag(
             ANCHOR_CALENDAR,
             uid,
             flag_type,
-            Some(start.to_string()),
+            Some(key.to_string()),
         ));
+        out.occurrences.insert(
+            uid.to_string(),
+            Occurrence {
+                start: e.start.clone(),
+                series,
+                calendar_id: e.calendar_id.clone(),
+            },
+        );
     }
 
     out.drafts.sort_by(|a, b| {
@@ -844,8 +867,132 @@ pub fn detect(
     out
 }
 
+/// Which occurrence of a calendar event a flag is about, and whether the event is a series, so a prep
+/// you've cleared stays cleared when its event moves (#884, F6; decided with Bobby 2026-10-10, plan
+/// Q15).
+///
+/// - A series occurrence that says where it sits in the series is keyed by that, which moving it
+///   doesn't change: Google's `originalStartTime`, or an iCal override's `RECURRENCE-ID`.
+/// - Anything else is keyed by its start. When a one-off moves, [`detect_and_store`] finds its old
+///   start gone from its calendar and moves its flags' key along with it.
+/// - An Outlook occurrence, or a whole series moved, gets new keys, so its prep can come back.
+fn occurrence_of(e: &CalendarEvent) -> (&str, bool) {
+    if let Some(original) = e.original_start.as_deref() {
+        return (original, true);
+    }
+    (e.start.as_str(), e.recurring || e.series_id.is_some())
+}
+
+/// Whether `calendar_id` (or any calendar, for `None`) still has an event of `uid` at `key` (its
+/// key, or its start): one that's over (the mirror keeps the past month), still to come, or moved
+/// there.
+fn mirrored_at(conn: &Connection, calendar_id: Option<&str>, uid: &str, key: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_events WHERE uid = ?1 \
+           AND (?3 IS NULL OR calendar_id = ?3) \
+           AND (COALESCE(original_start, start) = ?2 OR start = ?2))",
+        params![uid, key, calendar_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Whether `key` is some occurrence of `uid`'s place in the series on `calendar_id` (its
+/// `original_start`), so a key equal to it names that occurrence, wherever it now sits.
+fn placed_at(conn: &Connection, calendar_id: &str, uid: &str, key: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_events WHERE calendar_id = ?1 AND uid = ?2 \
+           AND original_start = ?3)",
+        params![calendar_id, uid, key],
+        |r| r.get(0),
+    )?)
+}
+
+/// How far back the mirror reliably holds past events (it keeps the past month).
+const MIRROR_PAST_DAYS: i64 = 28;
+
+/// Whether a one-off's resolved flag keyed `at` (not its current start) is about it, moved; `None`
+/// when the mirror can't tell yet. "Begun" is `at`'s day before today, or today and its time gone by
+/// (an all-day `at` begins with its day).
+///
+/// - Still on the event's own calendar at `at`: another event with the same uid (a feed that reuses
+///   one). While `at` hasn't begun and that calendar's last fetch was incomplete, the row may be the
+///   moved event's old copy left behind (an iCal row's id carries its start): decide after a
+///   complete sync. One that has begun is another event either way, so a feed that's never fetched
+///   whole can't keep a flag waiting.
+/// - Gone from it and not begun: moved. Another calendar's copy (an iCal feed of the same Google
+///   calendar, say) may lag the move, so only the event's own calendar counts.
+/// - Gone from it and begun, but another calendar still has it at `at` and not where it is now: the
+///   two calendars disagree about one event's time, one of them lagging a move (an iCal or "From
+///   URL" copy, or an account that can't sync). Decide once they agree, or once `at`'s day is
+///   before yesterday: a copy lags by hours, and one that's stopped syncing, or another event that
+///   shares the uid, mustn't silence this one for good.
+/// - Gone from it and begun: moved before its old day with no pass in between to see it (put off
+///   past the prepare-ahead lead, or PM closed), as long as no calendar still has it there and it's
+///   within the month the mirror keeps. Only where a Google or Outlook calendar, whose past month PM
+///   fetches, has the event where it is now, and not one of Google's "From URL" calendars: an iCal
+///   feed lists what its publisher likes, and one that lists only what's to come drops each event
+///   once it's under way or over, moved or not (another event with the same uid isn't this one).
+///   Nothing in an iCal mirror shows which kind of feed it is: PM expands a series' past
+///   occurrences itself, and a long event still running is listed either way.
+fn one_off_moved(
+    conn: &Connection,
+    now: &Occurrence,
+    uid: &str,
+    at: &str,
+    today: &str,
+    zone: Tz,
+    now_utc: DateTime<Utc>,
+) -> Result<Option<bool>> {
+    let day = clock::zone_date_of(at, zone);
+    let begun = day.as_str() < today
+        || (day.as_str() == today
+            && DateTime::parse_from_rfc3339(at).map_or(true, |t| t <= now_utc));
+    if mirrored_at(conn, Some(&now.calendar_id), uid, at)? {
+        return Ok(
+            if begun || calendar::mirror_is_whole(conn, &now.calendar_id)? {
+                Some(false)
+            } else {
+                None
+            },
+        );
+    }
+    if !begun {
+        return Ok(Some(true));
+    }
+    let days_back = |n: i64| {
+        chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d")
+            .map(|t| (t - ChronoDuration::days(n)).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| today.to_string())
+    };
+    if day.as_str() >= days_back(1).as_str()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM calendar_events o WHERE o.uid = ?1 AND o.calendar_id <> ?2 \
+               AND (COALESCE(o.original_start, o.start) = ?3 OR o.start = ?3) \
+               AND NOT EXISTS(SELECT 1 FROM calendar_events n WHERE n.calendar_id = o.calendar_id \
+                                AND n.uid = ?1 AND n.start = ?4))",
+            params![uid, now.calendar_id, at, now.start],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        return Ok(None);
+    }
+    let keeps_past: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_events e JOIN calendars c ON c.id = e.calendar_id \
+           WHERE e.uid = ?1 AND e.start = ?2 AND c.provider IN ('google', 'microsoft') \
+             AND COALESCE(c.remote_id, '') NOT LIKE '%@import.calendar.google.com')",
+        params![uid, now.start],
+        |r| r.get(0),
+    )?;
+    if !keeps_past {
+        return Ok(Some(false));
+    }
+    Ok(Some(
+        day.as_str() >= days_back(MIRROR_PAST_DAYS).as_str() && !mirrored_at(conn, None, uid, at)?,
+    ))
+}
+
 /// A detection-proposed draft: an `active` flag with no artifact pointer yet. `instance_at` is the
-/// occurrence the flag is about (F-18) — the event start for calendar flags, `None` for milestone flags.
+/// occurrence the flag is about ([`occurrence_of`], F-18); `None` for a milestone flag.
 fn draft_flag(
     anchor_kind: &str,
     anchor: &str,
@@ -894,6 +1041,19 @@ pub fn detect_and_store(
     today: &str,
     zone: Tz,
 ) -> Result<DetectionSummary> {
+    detect_and_store_at(conn, projects, events, today, zone, Utc::now())
+}
+
+/// [`detect_and_store`] at `now_utc`, the instant `today` is the user's date of: whether an event
+/// earlier today has begun is read against it.
+fn detect_and_store_at(
+    conn: &Connection,
+    projects: &[ProjectOverview],
+    events: &[CalendarEvent],
+    today: &str,
+    zone: Tz,
+    now_utc: DateTime<Utc>,
+) -> Result<DetectionSummary> {
     let det = detect(projects, events, today, zone);
     let emitted: HashSet<(String, String, String)> = det
         .drafts
@@ -902,27 +1062,97 @@ pub fn detect_and_store(
         .collect();
 
     let tx = conn.unchecked_transaction()?;
-    // F-18: age out a resolved CALENDAR tombstone once detection is proposing a STRICTLY LATER
-    // occurrence of the same series. A recurring event shares one iCal UID, so resolving one occurrence
-    // must not suppress the next; the stored `instance_at` lets us tell "same occurrence, still upcoming"
-    // (keep suppressed — the draft's start equals the tombstone's) from "a new, later occurrence"
-    // (re-fire). Runs BEFORE the upsert so the freed `(anchor, type)` key is then re-inserted as a fresh
-    // active flag. Scoped to calendar + non-NULL stored instance_at, so milestone flags (per-instance
-    // anchors) and pre-v33 rows (NULL) are never re-fired.
+    // The occurrence each calendar draft is about: its key, and where it is now.
+    let calendar_drafts: Vec<(&DraftFlag, &str, &Occurrence)> = det
+        .drafts
+        .iter()
+        .filter(|d| d.anchor_kind == ANCHOR_CALENDAR)
+        .filter_map(|d| {
+            Some((
+                d,
+                d.instance_at.as_deref()?,
+                det.occurrences.get(&d.anchor)?,
+            ))
+        })
+        .collect();
+
+    // Each resolved flag on a draft's anchor is about the draft's occurrence, or another one; which
+    // decides whether it still holds (#884 F6, F-18). It's the same occurrence when its key is the
+    // draft's (a series occurrence keyed by its place in the series keeps its key when moved), or the
+    // occurrence's current start (what an older build keyed it by, so no migration), or, for a
+    // one-off, when the start it names has gone from the event's calendar: the one-off moved, as it
+    // has nothing else to be ([`one_off_moved`]). The same occurrence's flag takes the draft's key,
+    // every type, so the briefing still pairs a cleared prep with the day's "happening today" (it
+    // matches on the key). Any other key is another occurrence: one that's over, sooner or later, a
+    // cancelled one, or a series occurrence that got a new key (an Outlook occurrence moved, a whole
+    // series moved). It doesn't hold the draft's type down: its flag is aged out and the draft's
+    // occurrence reminds. So a cleared prep stays cleared when its event moves, and a series still
+    // reminds for each occurrence.
+    //
+    // "Happening today" is about the day, though: one resolved on an earlier day than its event now
+    // falls on gives way too (a meeting put off to Thursday is happening on Thursday). Runs BEFORE
+    // the upsert so a freed `(anchor, type)` key is then re-inserted as a fresh active flag. A NULL
+    // key (milestone flags, pre-v33 rows) is never touched.
     let mut aged = 0usize;
-    for d in &det.drafts {
-        if d.anchor_kind != ANCHOR_CALENDAR {
-            continue;
-        }
-        let Some(instance_at) = &d.instance_at else {
-            continue;
+    for &(d, key, now) in &calendar_drafts {
+        let resolved: Vec<(i64, String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, type, instance_at, resolved_at FROM flags \
+                 WHERE anchor_kind = ?1 AND anchor = ?2 AND state = 'resolved' \
+                   AND instance_at IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map(params![d.anchor_kind, d.anchor], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
         };
-        aged += tx.execute(
-            "DELETE FROM flags \
-             WHERE anchor_kind = ?1 AND anchor = ?2 AND type = ?3 \
-               AND state = 'resolved' AND instance_at IS NOT NULL AND instance_at < ?4",
-            params![d.anchor_kind, d.anchor, d.r#type, instance_at],
-        )?;
+        for (id, flag_type, at, resolved_at) in resolved {
+            // A "happening today" resolved on an earlier day than the draft's event now falls on.
+            let put_off = flag_type == TYPE_HAPPENING_TODAY
+                && d.r#type == TYPE_HAPPENING_TODAY
+                && resolved_at.is_some_and(|r| {
+                    clock::zone_date_of(&r, zone) < clock::zone_date_of(&now.start, zone)
+                });
+            if at != key {
+                // An older build's key for this occurrence was its start; unless that's another
+                // occurrence's place in the series (two occurrences swapped), it's this one's.
+                let same = if at == now.start && !placed_at(&tx, &now.calendar_id, &d.anchor, &at)?
+                {
+                    Some(true)
+                } else if now.series {
+                    Some(false)
+                } else {
+                    one_off_moved(&tx, now, &d.anchor, &at, today, zone, now_utc)?
+                };
+                match same {
+                    Some(true) => {
+                        tx.execute(
+                            "UPDATE flags SET instance_at = ?2 WHERE id = ?1",
+                            params![id, key],
+                        )?;
+                    }
+                    Some(false) => {
+                        if flag_type == d.r#type {
+                            aged += tx.execute("DELETE FROM flags WHERE id = ?1", params![id])?;
+                        }
+                        continue;
+                    }
+                    // The mirror can't tell yet: leave it be, unless it's put off (which either
+                    // answer would age out).
+                    None => {
+                        if put_off {
+                            aged += tx.execute("DELETE FROM flags WHERE id = ?1", params![id])?;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if put_off {
+                aged += tx.execute("DELETE FROM flags WHERE id = ?1", params![id])?;
+            }
+        }
     }
     for d in &det.drafts {
         upsert_active(&tx, d)?;
@@ -1415,14 +1645,854 @@ mod tests {
         assert!(f10.user_confirmed);
     }
 
+    /// One occurrence of a Google series: its place in the series (`originalStartTime`) is where it
+    /// was before any move, `start` where it is now.
+    fn series_event(uid: &str, original: &str, start: &str) -> CalendarEvent {
+        CalendarEvent {
+            recurring: true,
+            series_id: Some(format!("{uid}-series")),
+            original_start: Some(original.into()),
+            ..cal_event(Some(uid), start)
+        }
+    }
+
+    /// Resolve the active prepare-ahead flag on `uid` (the user says they're ready).
+    fn resolve_prep(conn: &Connection, uid: &str) {
+        let f = list_active(conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == uid && f.r#type == TYPE_PREPARE_AHEAD)
+            .expect("a prepare-ahead flag to resolve");
+        resolve(conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
+    }
+
+    fn active_on(conn: &Connection, uid: &str) -> usize {
+        list_active(conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.anchor == uid)
+            .count()
+    }
+
+    /// Q15 (#884, F6): a one-off event you've said you're ready for stays cleared when it moves, a
+    /// day later or an hour earlier. Before, moving it later looked like a new occurrence.
+    #[test]
+    fn a_cleared_prep_stays_cleared_when_its_one_off_event_moves() {
+        let (_dir, conn) = open_test_db();
+        let at = |start: &str| vec![cal_event(Some("uid-review"), start)];
+        detect_and_store(&conn, &[], &at("2026-07-05T09:00:00Z"), TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-review");
+        for moved in ["2026-07-06T15:00:00Z", "2026-07-04T08:00:00Z"] {
+            let s = detect_and_store(&conn, &[], &at(moved), TODAY, Tz::UTC).unwrap();
+            assert_eq!(s.aged, 0, "moved to {moved}");
+            assert_eq!(active_on(&conn, "uid-review"), 0, "moved to {moved}");
+        }
+    }
+
+    /// One occurrence of a Google series moved: still the same occurrence, so still cleared. The
+    /// next occurrence, later in the series, still brings its own reminder.
+    #[test]
+    fn a_moved_series_occurrence_stays_cleared_and_the_next_one_still_reminds() {
+        let (_dir, conn) = open_test_db();
+        let first = "2026-07-05T09:00:00Z";
+        let e = vec![series_event("uid-weekly", first, first)];
+        detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-weekly");
+        // Moved a day later: the same occurrence.
+        let moved = vec![series_event("uid-weekly", first, "2026-07-06T09:00:00Z")];
+        let s = detect_and_store(&conn, &[], &moved, TODAY, Tz::UTC).unwrap();
+        assert_eq!(s.aged, 0);
+        assert_eq!(active_on(&conn, "uid-weekly"), 0);
+        // The next occurrence comes due: a new reminder.
+        let next = "2026-07-06T10:00:00Z";
+        let s = detect_and_store(
+            &conn,
+            &[],
+            &[series_event("uid-weekly", next, next)],
+            TODAY,
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!(s.aged, 1);
+        assert_eq!(active_on(&conn, "uid-weekly"), 1);
+    }
+
+    /// The key the resolved flags on `uid` carry.
+    fn resolved_keys(conn: &Connection, uid: &str) -> Vec<Option<String>> {
+        let mut stmt = conn
+            .prepare("SELECT instance_at FROM flags WHERE anchor = ?1 AND state = 'resolved'")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![uid], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// A one-off's key follows it when it moves (a tombstone an older build wrote included), so the
+    /// briefing still pairs the cleared prep with the day's "happening today".
+    #[test]
+    fn an_older_start_keyed_tombstone_on_a_one_off_stays_cleared() {
+        let (_dir, conn) = open_test_db();
+        let start = "2026-07-05T09:00:00Z";
+        detect_and_store(
+            &conn,
+            &[],
+            &[cal_event(Some("uid-x"), start)],
+            TODAY,
+            Tz::UTC,
+        )
+        .unwrap();
+        resolve_prep(&conn, "uid-x");
+        conn.execute(
+            "UPDATE flags SET instance_at = ?1 WHERE anchor = 'uid-x'",
+            params![start],
+        )
+        .unwrap();
+        let later = vec![cal_event(Some("uid-x"), "2026-07-06T09:00:00Z")];
+        let s = detect_and_store(&conn, &[], &later, TODAY, Tz::UTC).unwrap();
+        assert_eq!(s.aged, 0);
+        assert_eq!(active_on(&conn, "uid-x"), 0);
+        assert_eq!(
+            resolved_keys(&conn, "uid-x"),
+            [Some("2026-07-06T09:00:00Z".to_string())]
+        );
+    }
+
+    /// An older build's key for a Google occurrence moved earlier was its (moved) start, before the
+    /// occurrence's place in the series. It's rekeyed, not mistaken for an earlier occurrence.
+    #[test]
+    fn an_older_start_keyed_tombstone_on_a_moved_occurrence_stays_cleared() {
+        let (_dir, conn) = open_test_db();
+        let original = "2026-07-06T09:00:00Z";
+        let moved = "2026-07-04T09:00:00Z";
+        let e = vec![series_event("uid-w", original, moved)];
+        detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-w");
+        conn.execute(
+            "UPDATE flags SET instance_at = ?1 WHERE anchor = 'uid-w'",
+            params![moved],
+        )
+        .unwrap();
+        let s = detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
+        assert_eq!(s.aged, 0);
+        assert_eq!(active_on(&conn, "uid-w"), 0);
+        assert_eq!(resolved_keys(&conn, "uid-w"), [Some(original.to_string())]);
+    }
+
+    /// A one-off made repeating: its cleared occurrence gives way when a later one comes due.
+    #[test]
+    fn a_one_off_made_repeating_reminds_about_its_next_occurrence() {
+        let (_dir, conn) = open_test_db();
+        let e = vec![cal_event(Some("uid-o"), "2026-07-04T09:00:00Z")];
+        detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-o");
+        let next = "2026-07-05T09:00:00Z";
+        let s = detect_and_store(
+            &conn,
+            &[],
+            &[series_event("uid-o", next, next)],
+            TODAY,
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!(s.aged, 1);
+        assert_eq!(active_on(&conn, "uid-o"), 1);
+    }
+
+    /// A one-off made repeating from the meeting you cleared: that meeting is still the one you
+    /// cleared.
+    #[test]
+    fn a_one_off_made_repeating_from_itself_stays_cleared() {
+        let (_dir, conn) = open_test_db();
+        let at = "2026-07-04T09:00:00Z";
+        detect_and_store(&conn, &[], &[cal_event(Some("uid-o"), at)], TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-o");
+        let e = vec![series_event("uid-o", at, at)];
+        let s = detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-o")), (0, 0));
+    }
+
+    /// Places in a Google series and the days they fall on can come in different orders. Tue/Thu
+    /// series; this Thursday's meeting is moved to Monday and its prep cleared. Once Monday's is done,
+    /// Tuesday's reminds you, though Tuesday's place in the series comes before Thursday's.
+    #[test]
+    fn an_occurrence_moved_ahead_of_its_neighbour_lets_the_neighbour_remind() {
+        let (_dir, conn) = open_test_db();
+        let tue = series_event("uid-tt", "2026-07-07T10:00:00Z", "2026-07-07T10:00:00Z");
+        let moved_thu = series_event("uid-tt", "2026-07-09T10:00:00Z", "2026-07-06T10:00:00Z");
+        detect_and_store(&conn, &[], &[moved_thu, tue.clone()], TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-tt");
+        // Monday's meeting is over: the agenda has only Tuesday's.
+        let s = detect_and_store(&conn, &[], &[tue], "2026-07-06", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-tt")), (1, 1));
+    }
+
+    /// "Happening today" is about the day: one you cleared comes back when the meeting is put off to
+    /// another day, but not on the second day of an event that runs over two.
+    #[test]
+    fn a_cleared_happening_today_comes_back_on_the_day_the_event_moves_to() {
+        let (_dir, conn) = open_test_db();
+        let resolve_today = |uid: &str| {
+            let f = list_active(&conn, Some(ANCHOR_CALENDAR))
+                .unwrap()
+                .into_iter()
+                .find(|f| f.anchor == uid && f.r#type == TYPE_HAPPENING_TODAY)
+                .unwrap();
+            resolve(&conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
+            conn.execute(
+                "UPDATE flags SET resolved_at = '2026-07-03T12:00:00.000Z' WHERE id = ?1",
+                params![f.id],
+            )
+            .unwrap();
+        };
+        let two_days = CalendarEvent {
+            end: Some("2026-07-04T17:00:00Z".into()),
+            ..cal_event(Some("uid-2d"), "2026-07-03T09:00:00Z")
+        };
+        let events = vec![
+            cal_event(Some("uid-m"), "2026-07-03T15:00:00Z"),
+            two_days.clone(),
+        ];
+        detect_and_store(&conn, &[], &events, TODAY, Tz::UTC).unwrap();
+        resolve_today("uid-m");
+        resolve_today("uid-2d");
+
+        let put_off = cal_event(Some("uid-m"), "2026-07-06T15:00:00Z");
+        detect_and_store(
+            &conn,
+            &[],
+            &[put_off.clone(), two_days.clone()],
+            "2026-07-04",
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!(active_on(&conn, "uid-2d"), 0, "day two of the same event");
+        let s = detect_and_store(&conn, &[], &[put_off], "2026-07-06", Tz::UTC).unwrap();
+        assert_eq!(s.aged, 1);
+        let back = list_active(&conn, Some(ANCHOR_CALENDAR)).unwrap();
+        assert!(back
+            .iter()
+            .any(|f| f.anchor == "uid-m" && f.r#type == TYPE_HAPPENING_TODAY));
+    }
+
+    /// An iCal occurrence moved on its own is an override that names its place in the series
+    /// (RECURRENCE-ID, kept as `original_start`): it keeps its cleared prep and its key, so the
+    /// briefing still says "you're prepared" on the day.
+    #[test]
+    fn a_moved_ical_occurrence_keeps_its_cleared_prep_and_key() {
+        let (_dir, conn) = open_test_db();
+        let at9 = "2026-07-05T09:00:00Z";
+        let ical = CalendarEvent {
+            recurring: true,
+            ..cal_event(Some("uid-i"), at9)
+        };
+        detect_and_store(&conn, &[], &[ical], TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-i");
+        for moved in ["2026-07-05T14:00:00Z", "2026-07-06T09:00:00Z"] {
+            let over = CalendarEvent {
+                recurring: true,
+                original_start: Some(at9.into()),
+                ..cal_event(Some("uid-i"), moved)
+            };
+            let s = detect_and_store(&conn, &[], &[over], TODAY, Tz::UTC).unwrap();
+            assert_eq!(
+                (s.aged, active_on(&conn, "uid-i")),
+                (0, 0),
+                "moved to {moved}"
+            );
+        }
+        assert_eq!(resolved_keys(&conn, "uid-i"), [Some(at9.to_string())]);
+    }
+
+    /// A twice-daily series whose 09:00 is cancelled: 15:00 is its own occurrence, and reminds.
+    #[test]
+    fn a_cancelled_occurrence_lets_the_same_days_next_remind() {
+        let (_dir, conn) = open_test_db();
+        let ical = |start: &str| CalendarEvent {
+            recurring: true,
+            ..cal_event(Some("uid-c"), start)
+        };
+        let (at9, at15) = ("2026-07-05T09:00:00Z", "2026-07-05T15:00:00Z");
+        mirror(&conn, &[ical(at9), ical(at15)]);
+        detect_and_store(&conn, &[], &[ical(at9), ical(at15)], TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-c");
+        mirror(&conn, &[ical(at15)]);
+        let s = detect_and_store(&conn, &[], &[ical(at15)], TODAY, Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-c")), (1, 1));
+    }
+
+    /// A one-off on two calendars (a Google calendar and its iCal feed, say), moved on one while the
+    /// other still has it where it was: the copy that lags isn't taken for a second event.
+    #[test]
+    fn a_moved_one_off_stays_cleared_while_another_calendars_copy_lags() {
+        let (_dir, conn) = open_test_db();
+        let on = |calendar: &str, start: &str| CalendarEvent {
+            id: format!("{calendar}:{start}"),
+            calendar_id: calendar.into(),
+            ..cal_event(Some("uid-x2"), start)
+        };
+        let (fri, thu) = ("2026-07-10T10:00:00Z", "2026-07-09T10:00:00Z");
+        calendar::replace_events(&conn, "g", &[on("g", fri)], true).unwrap();
+        calendar::replace_events(&conn, "f", &[on("f", fri)], true).unwrap();
+        detect_and_store(
+            &conn,
+            &[],
+            &[on("g", fri), on("f", fri)],
+            "2026-07-07",
+            Tz::UTC,
+        )
+        .unwrap();
+        resolve_prep(&conn, "uid-x2");
+        // Moved to Thursday on Google; the feed still says Friday.
+        calendar::replace_events(&conn, "g", &[on("g", thu)], true).unwrap();
+        let s = detect_and_store(
+            &conn,
+            &[],
+            &[on("g", thu), on("f", fri)],
+            "2026-07-07",
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-x2")), (0, 0));
+        assert_eq!(resolved_keys(&conn, "uid-x2"), [Some(thu.to_string())]);
+        // Thursday's meeting is over and the feed still says Friday: the stale copy is the only one
+        // to come, which isn't taken for a new event while the two calendars disagree.
+        let s = detect_and_store_at(
+            &conn,
+            &[],
+            &[on("f", fri)],
+            "2026-07-09",
+            Tz::UTC,
+            utc("2026-07-09T12:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-x2")), (0, 0));
+    }
+
+    /// Register calendar "c" (the one [`mirror`] fills) as `provider`'s, under its `remote_id`.
+    fn calendar_c(conn: &Connection, provider: &str, remote_id: &str) {
+        calendar::upsert_source(conn, "src-c", provider, None, "C").unwrap();
+        conn.execute(
+            "INSERT INTO calendars(id, source_id, provider, remote_id, name) \
+             VALUES ('c', 'src-c', ?1, ?2, 'C')",
+            params![provider, remote_id],
+        )
+        .unwrap();
+    }
+
+    /// A one-off put off past the prepare-ahead lead: no pass sees it between its old day and its
+    /// new one coming due, by when the old day is past. On a Google (or Outlook) calendar, whose past
+    /// month PM fetches, its cleared prep stays cleared.
+    #[test]
+    fn a_one_off_put_off_past_the_lead_stays_cleared() {
+        let (_dir, conn) = open_test_db();
+        calendar_c(&conn, "google", "work@example.com");
+        let (fri, next_fri) = ("2026-07-10T10:00:00Z", "2026-07-17T10:00:00Z");
+        mirror(&conn, &[cal_event(Some("uid-pp"), fri)]);
+        let e = vec![cal_event(Some("uid-pp"), fri)];
+        detect_and_store(&conn, &[], &e, "2026-07-07", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-pp");
+        mirror(&conn, &[cal_event(Some("uid-pp"), next_fri)]);
+        let e = vec![cal_event(Some("uid-pp"), next_fri)];
+        let s = detect_and_store(&conn, &[], &e, "2026-07-14", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-pp")), (0, 0));
+        assert_eq!(resolved_keys(&conn, "uid-pp"), [Some(next_fri.to_string())]);
+    }
+
+    /// An iCal feed that lists only what's to come, and gives two one-offs a week apart one UID: once
+    /// the first is over it's dropped, which isn't taken for it having moved onto the second. Not even
+    /// when the mirror has past rows the feed didn't keep: a series' past occurrences (PM expands
+    /// them) or a long event still running.
+    #[test]
+    fn an_upcoming_only_feed_dropping_a_past_one_off_isnt_a_move() {
+        for (provider, remote_id) in [
+            ("other", "c"),
+            // The same feed subscribed in Google ("From URL"): Google holds only what it lists.
+            ("google", "abc123@import.calendar.google.com"),
+        ] {
+            upcoming_only_feed_drops_a_past_one_off(provider, remote_id);
+        }
+    }
+
+    fn upcoming_only_feed_drops_a_past_one_off(provider: &str, remote_id: &str) {
+        let (_dir, conn) = open_test_db();
+        calendar_c(&conn, provider, remote_id);
+        let (mon, next_mon) = (
+            cal_event(Some("uid-r"), "2026-07-06T10:00:00Z"),
+            cal_event(Some("uid-r"), "2026-07-13T10:00:00Z"),
+        );
+        let weekly = CalendarEvent {
+            recurring: true,
+            ..cal_event(Some("uid-w"), "2026-06-29T09:00:00Z")
+        };
+        let term = CalendarEvent {
+            all_day: true,
+            end: Some("2026-08-31".into()),
+            ..cal_event(Some("uid-t"), "2026-06-01")
+        };
+        let past = [weekly, term];
+        mirror(
+            &conn,
+            &[&past[..], &[mon.clone(), next_mon.clone()]].concat(),
+        );
+        detect_and_store(&conn, &[], &[mon, next_mon.clone()], "2026-07-04", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-r");
+        mirror(
+            &conn,
+            &[&past[..], std::slice::from_ref(&next_mon)].concat(),
+        );
+        let s = detect_and_store(&conn, &[], &[next_mon], "2026-07-10", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-r")), (1, 1));
+    }
+
+    /// The same feed drops Monday's event once it's under way: later that same day, it isn't taken
+    /// for having moved onto Wednesday's.
+    #[test]
+    fn an_upcoming_only_feed_dropping_todays_begun_one_off_isnt_a_move() {
+        let (_dir, conn) = open_test_db();
+        calendar_c(&conn, "other", "c");
+        let (mon, wed) = (
+            cal_event(Some("uid-d"), "2026-07-06T10:00:00Z"),
+            cal_event(Some("uid-d"), "2026-07-08T10:00:00Z"),
+        );
+        mirror(&conn, &[mon.clone(), wed.clone()]);
+        detect_and_store(&conn, &[], &[mon, wed.clone()], "2026-07-04", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-d");
+        mirror(&conn, std::slice::from_ref(&wed));
+        let s = detect_and_store_at(
+            &conn,
+            &[],
+            &[wed],
+            "2026-07-06",
+            Tz::UTC,
+            utc("2026-07-06T11:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-d")), (1, 1));
+    }
+
+    /// The same feed on a second calendar that's stopped syncing (a source that fails keeps its
+    /// last-good events): it still has Monday's event and never gets Friday's. That looks like the
+    /// two calendars disagreeing about one event, but only for a day, so Friday's still reminds.
+    #[test]
+    fn a_frozen_copy_on_another_calendar_doesnt_silence_the_next_event_for_good() {
+        let (_dir, conn) = open_test_db();
+        calendar_c(&conn, "other", "c");
+        let (mon, fri) = (
+            cal_event(Some("uid-fz"), "2026-07-06T10:00:00Z"),
+            cal_event(Some("uid-fz"), "2026-07-10T10:00:00Z"),
+        );
+        let frozen = CalendarEvent {
+            id: "d:mon".into(),
+            calendar_id: "d".into(),
+            ..mon.clone()
+        };
+        calendar::replace_events(&conn, "d", &[frozen], true).unwrap();
+        mirror(&conn, &[mon.clone(), fri.clone()]);
+        detect_and_store(&conn, &[], &[mon, fri.clone()], "2026-07-04", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-fz");
+        mirror(&conn, std::slice::from_ref(&fri));
+        let s = detect_and_store(
+            &conn,
+            &[],
+            std::slice::from_ref(&fri),
+            "2026-07-07",
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-fz")), (0, 0));
+        let s = detect_and_store(&conn, &[], &[fri], "2026-07-08", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-fz")), (1, 1));
+    }
+
+    fn utc(at: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Resolve the active "happening today" on `uid` (the user says it's dealt with), at `when`.
+    fn resolve_today_at(conn: &Connection, uid: &str, when: &str) {
+        let f = list_active(conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == uid && f.r#type == TYPE_HAPPENING_TODAY)
+            .expect("a happening-today flag to resolve");
+        resolve(conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
+        conn.execute(
+            "UPDATE flags SET resolved_at = ?2 WHERE id = ?1",
+            params![f.id, when],
+        )
+        .unwrap();
+    }
+
+    fn today_active_on(conn: &Connection, uid: &str) -> bool {
+        list_active(conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .iter()
+            .any(|f| f.anchor == uid && f.r#type == TYPE_HAPPENING_TODAY)
+    }
+
+    /// An iCal one-off moved before its time, on its own day: its old time is gone from the feed but
+    /// hasn't begun, so it moved, and its cleared prep stays cleared. Once that time has passed, a
+    /// feed dropping it says nothing either way, so the reminder returns (the iCal residual).
+    #[test]
+    fn a_one_off_moved_before_its_time_on_its_day_stays_cleared() {
+        for (clock, cleared) in [
+            ("2026-07-06T11:00:00Z", true),
+            ("2026-07-06T16:00:00Z", false),
+        ] {
+            let (_dir, conn) = open_test_db();
+            calendar_c(&conn, "other", "c");
+            let (mon, tue) = ("2026-07-06T15:00:00Z", "2026-07-07T15:00:00Z");
+            mirror(&conn, &[cal_event(Some("uid-sd"), mon)]);
+            detect_and_store(
+                &conn,
+                &[],
+                &[cal_event(Some("uid-sd"), mon)],
+                "2026-07-04",
+                Tz::UTC,
+            )
+            .unwrap();
+            resolve_prep(&conn, "uid-sd");
+            mirror(&conn, &[cal_event(Some("uid-sd"), tue)]);
+            let e = vec![cal_event(Some("uid-sd"), tue)];
+            let s = detect_and_store_at(&conn, &[], &e, "2026-07-06", Tz::UTC, utc(clock)).unwrap();
+            let expect = if cleared { (0, 0) } else { (1, 1) };
+            assert_eq!((s.aged, active_on(&conn, "uid-sd")), expect, "at {clock}");
+        }
+    }
+
+    /// A Google occurrence whose "happening today" you cleared, put off to another day: it keeps its
+    /// key (its place in the series), and only the day tells it's happening again on the new one.
+    #[test]
+    fn a_cleared_happening_today_on_a_put_off_occurrence_comes_back() {
+        let (_dir, conn) = open_test_db();
+        let mon = "2026-07-06T15:00:00Z";
+        let on_mon = series_event("uid-po", mon, mon);
+        detect_and_store(&conn, &[], &[on_mon], "2026-07-06", Tz::UTC).unwrap();
+        resolve_today_at(&conn, "uid-po", "2026-07-06T09:00:00.000Z");
+        let on_thu = series_event("uid-po", mon, "2026-07-09T15:00:00Z");
+        detect_and_store(
+            &conn,
+            &[],
+            std::slice::from_ref(&on_thu),
+            "2026-07-07",
+            Tz::UTC,
+        )
+        .unwrap();
+        assert!(!today_active_on(&conn, "uid-po"), "not before its new day");
+        let s = detect_and_store(&conn, &[], &[on_thu], "2026-07-09", Tz::UTC).unwrap();
+        assert_eq!(s.aged, 1);
+        assert!(today_active_on(&conn, "uid-po"));
+    }
+
+    /// A Google one-off cleared as happening today in the morning, put off to tomorrow before its
+    /// time: the flag moves with it, and it's happening today again tomorrow.
+    #[test]
+    fn a_cleared_happening_today_on_a_put_off_one_off_comes_back() {
+        let (_dir, conn) = open_test_db();
+        calendar_c(&conn, "google", "work@example.com");
+        let (thu, fri) = ("2026-07-09T15:00:00Z", "2026-07-10T15:00:00Z");
+        mirror(&conn, &[cal_event(Some("uid-pf"), thu)]);
+        let e = vec![cal_event(Some("uid-pf"), thu)];
+        detect_and_store_at(
+            &conn,
+            &[],
+            &e,
+            "2026-07-09",
+            Tz::UTC,
+            utc("2026-07-09T08:00:00Z"),
+        )
+        .unwrap();
+        resolve_today_at(&conn, "uid-pf", "2026-07-09T08:30:00.000Z");
+        mirror(&conn, &[cal_event(Some("uid-pf"), fri)]);
+        let e = vec![cal_event(Some("uid-pf"), fri)];
+        detect_and_store_at(
+            &conn,
+            &[],
+            &e,
+            "2026-07-09",
+            Tz::UTC,
+            utc("2026-07-09T10:00:00Z"),
+        )
+        .unwrap();
+        assert!(!today_active_on(&conn, "uid-pf"), "not before its new day");
+        assert_eq!(
+            list_resolved_keys(&conn, "uid-pf", TYPE_HAPPENING_TODAY),
+            [Some(fri.to_string())]
+        );
+        let s = detect_and_store_at(
+            &conn,
+            &[],
+            &e,
+            "2026-07-10",
+            Tz::UTC,
+            utc("2026-07-10T09:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(s.aged, 1);
+        assert!(today_active_on(&conn, "uid-pf"));
+    }
+
+    /// Two Google occurrences swapped: the cleared one's place in the series is now the other one's
+    /// start, which isn't taken for an older build's key for it. The other one reminds.
+    #[test]
+    fn two_swapped_occurrences_each_keep_their_own_flag() {
+        let (_dir, conn) = open_test_db();
+        let (tue, thu) = ("2026-07-07T09:00:00Z", "2026-07-09T09:00:00Z");
+        let (x, y) = (
+            series_event("uid-sw", tue, tue),
+            series_event("uid-sw", thu, thu),
+        );
+        mirror(&conn, &[x.clone(), y.clone()]);
+        detect_and_store(&conn, &[], &[x, y], "2026-07-04", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-sw");
+        let (x, y) = (
+            series_event("uid-sw", tue, thu),
+            series_event("uid-sw", thu, tue),
+        );
+        mirror(&conn, &[y.clone(), x.clone()]);
+        let s = detect_and_store(&conn, &[], &[y, x], "2026-07-04", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-sw")), (1, 1));
+    }
+
+    /// A feed that's never fetched whole keeps a past event's row for good: that's another event,
+    /// not one to wait on, and a "happening today" put off to another day still comes back.
+    #[test]
+    fn a_never_whole_feed_doesnt_keep_a_flag_waiting() {
+        let (_dir, conn) = open_test_db();
+        let on = |uid: &str, start: &str| CalendarEvent {
+            id: format!("f:{uid}:{start}"),
+            calendar_id: "f".into(),
+            ..cal_event(Some(uid), start)
+        };
+        // Two one-offs on one UID; the first is over, its row kept by fetches that never finish.
+        let (mon, wed) = (
+            on("uid-n", "2026-07-06T10:00:00Z"),
+            on("uid-n", "2026-07-08T10:00:00Z"),
+        );
+        calendar::replace_events(&conn, "f", &[mon.clone(), wed.clone()], false).unwrap();
+        detect_and_store(&conn, &[], &[mon, wed.clone()], "2026-07-04", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-n");
+        let s = detect_and_store(&conn, &[], &[wed], "2026-07-07", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-n")), (1, 1));
+
+        // A meeting cleared as happening today on Thursday, put off to Friday, its Thursday row left.
+        let (thu, fri) = (
+            on("uid-h", "2026-07-09T10:00:00Z"),
+            on("uid-h", "2026-07-10T10:00:00Z"),
+        );
+        calendar::replace_events(&conn, "f", std::slice::from_ref(&thu), false).unwrap();
+        detect_and_store(&conn, &[], &[thu], "2026-07-09", Tz::UTC).unwrap();
+        let f = list_active(&conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == "uid-h")
+            .unwrap();
+        resolve(&conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
+        conn.execute(
+            "UPDATE flags SET resolved_at = '2026-07-09T12:00:00.000Z' WHERE id = ?1",
+            params![f.id],
+        )
+        .unwrap();
+        calendar::replace_events(&conn, "f", std::slice::from_ref(&fri), false).unwrap();
+        let s = detect_and_store(&conn, &[], &[fri], "2026-07-10", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-h")), (1, 1));
+    }
+
+    /// An iCal one-off moved while the feed's fetch was cut short: its old row is left behind (its id
+    /// carries its start), which the flag layer doesn't take for a second event; the next complete
+    /// sync settles it.
+    #[test]
+    fn a_stale_row_from_an_incomplete_fetch_isnt_another_event() {
+        let (_dir, conn) = open_test_db();
+        let on = |start: &str| CalendarEvent {
+            id: format!("f:uid-ic:{start}"),
+            calendar_id: "f".into(),
+            ..cal_event(Some("uid-ic"), start)
+        };
+        let (fri, thu) = ("2026-07-10T10:00:00Z", "2026-07-09T10:00:00Z");
+        calendar::replace_events(&conn, "f", &[on(fri)], true).unwrap();
+        detect_and_store(&conn, &[], &[on(fri)], "2026-07-07", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-ic");
+        calendar::replace_events(&conn, "f", &[on(thu)], false).unwrap();
+        let s = detect_and_store(&conn, &[], &[on(thu)], "2026-07-07", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-ic")), (0, 0));
+        calendar::replace_events(&conn, "f", &[on(thu)], true).unwrap();
+        let s = detect_and_store(&conn, &[], &[on(thu)], "2026-07-07", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-ic")), (0, 0));
+        assert_eq!(resolved_keys(&conn, "uid-ic"), [Some(thu.to_string())]);
+    }
+
+    /// Put `events` in the mirror, as a sync would: what tells an occurrence that's over or still to
+    /// come from one that moved.
+    fn mirror(conn: &Connection, events: &[CalendarEvent]) {
+        calendar::replace_events(conn, "c", events, true).unwrap();
+    }
+
+    /// A twice-daily series: the 09:00 prep you cleared, once 09:00 is over, isn't taken for 15:00's
+    /// (no "you're prepared" for a meeting you didn't prepare for), and a cleared "happening today"
+    /// for 09:00 doesn't silence 15:00's.
+    #[test]
+    fn another_occurrence_the_same_day_is_its_own() {
+        let (_dir, conn) = open_test_db();
+        let ical = |start: &str| CalendarEvent {
+            recurring: true,
+            ..cal_event(Some("uid-2x"), start)
+        };
+        let (at9, at15) = ("2026-07-05T09:00:00Z", "2026-07-05T15:00:00Z");
+        mirror(&conn, &[ical(at9), ical(at15)]);
+        detect_and_store(&conn, &[], &[ical(at9), ical(at15)], TODAY, Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-2x");
+        // On the day, before 09:00: "happening today", cleared too.
+        detect_and_store(&conn, &[], &[ical(at9), ical(at15)], "2026-07-05", Tz::UTC).unwrap();
+        let today = list_active(&conn, Some(ANCHOR_CALENDAR)).unwrap();
+        resolve(&conn, today[0].id, SOURCE_ASSERTION, None, None).unwrap();
+        // After 09:00: only 15:00 is still to come.
+        let s = detect_and_store(&conn, &[], &[ical(at15)], "2026-07-05", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-2x")), (1, 1));
+        let prep: Vec<Option<String>> = list_resolved_keys(&conn, "uid-2x", TYPE_PREPARE_AHEAD);
+        assert_eq!(prep, [Some(at9.to_string())], "09:00's prep stays 09:00's");
+    }
+
+    /// A feed that gives two separate one-off events the same UID: clearing the first one's prep
+    /// doesn't silence the second's.
+    #[test]
+    fn two_one_offs_on_one_uid_each_remind() {
+        let (_dir, conn) = open_test_db();
+        let (mon, wed) = (
+            cal_event(Some("uid-l"), "2026-07-06T10:00:00Z"),
+            cal_event(Some("uid-l"), "2026-07-08T10:00:00Z"),
+        );
+        mirror(&conn, &[mon.clone(), wed.clone()]);
+        detect_and_store(&conn, &[], &[mon, wed.clone()], "2026-07-04", Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-l");
+        let s = detect_and_store(&conn, &[], &[wed], "2026-07-06", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-l")), (1, 1));
+    }
+
+    /// A cleared Google occurrence moved past the next one: the next one still reminds you (only one
+    /// cleared prep can be kept per event, and a missed reminder is worse than a repeated one).
+    #[test]
+    fn a_cleared_occurrence_moved_past_the_next_one_lets_the_next_remind() {
+        let (_dir, conn) = open_test_db();
+        let tue = series_event("uid-p", "2026-07-07T10:00:00Z", "2026-07-07T10:00:00Z");
+        let thu_on_mon = series_event("uid-p", "2026-07-09T10:00:00Z", "2026-07-06T10:00:00Z");
+        mirror(&conn, &[thu_on_mon.clone(), tue.clone()]);
+        detect_and_store(
+            &conn,
+            &[],
+            &[thu_on_mon, tue.clone()],
+            "2026-07-04",
+            Tz::UTC,
+        )
+        .unwrap();
+        resolve_prep(&conn, "uid-p");
+        let thu_on_fri = series_event("uid-p", "2026-07-09T10:00:00Z", "2026-07-10T10:00:00Z");
+        mirror(&conn, &[tue.clone(), thu_on_fri.clone()]);
+        let s = detect_and_store(&conn, &[], &[tue, thu_on_fri], "2026-07-05", Tz::UTC).unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-p")), (1, 1));
+    }
+
+    /// The resolved flags of `flag_type` on `uid`, by key.
+    fn list_resolved_keys(conn: &Connection, uid: &str, flag_type: &str) -> Vec<Option<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT instance_at FROM flags WHERE anchor = ?1 AND type = ?2 \
+                 AND state = 'resolved'",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![uid, flag_type], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// A whole series moved (Google gives each occurrence a new place in the series) is new
+    /// occurrences: the moved one reminds again. Only an occurrence moved on its own keeps its key.
+    #[test]
+    fn a_whole_series_moved_reminds_again() {
+        let (_dir, conn) = open_test_db();
+        let at9 = "2026-07-05T09:00:00Z";
+        detect_and_store(
+            &conn,
+            &[],
+            &[series_event("uid-s", at9, at9)],
+            TODAY,
+            Tz::UTC,
+        )
+        .unwrap();
+        resolve_prep(&conn, "uid-s");
+        let at10 = "2026-07-05T10:00:00Z";
+        let s = detect_and_store(
+            &conn,
+            &[],
+            &[series_event("uid-s", at10, at10)],
+            TODAY,
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!((s.aged, active_on(&conn, "uid-s")), (1, 1));
+    }
+
+    /// Through the mirror, as detection really runs: the agenda read carries the series facts the
+    /// occurrence key comes from. A moved Google occurrence stays cleared; the next one reminds.
+    #[test]
+    fn run_detection_keys_a_mirrored_google_occurrence_by_its_place_in_the_series() {
+        let (_dir, conn) = open_test_db();
+        // One read of the clock, so the days can't shift if the test straddles UTC midnight.
+        let base = chrono::Utc::now().date_naive();
+        let day = |n: i64| {
+            (base + chrono::Duration::days(n))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let at = |n: i64| format!("{}T09:00:00Z", day(n));
+        let occurrence = |original: &str, start: &str| CalendarEvent {
+            id: format!("g:{original}"),
+            calendar_id: "g".into(),
+            end: Some(start.replace("T09", "T10")),
+            ..series_event("uid-m", original, start)
+        };
+        calendar::replace_events(&conn, "g", &[occurrence(&at(2), &at(2))], true).unwrap();
+        run_detection(&conn, &day(0), Tz::UTC).unwrap();
+        resolve_prep(&conn, "uid-m");
+
+        calendar::replace_events(&conn, "g", &[occurrence(&at(2), &at(3))], true).unwrap();
+        let s = run_detection(&conn, &day(0), Tz::UTC).unwrap();
+        assert_eq!(
+            (s.aged, active_on(&conn, "uid-m")),
+            (0, 0),
+            "moved: still cleared"
+        );
+
+        calendar::replace_events(&conn, "g", &[occurrence(&at(9), &at(9))], true).unwrap();
+        let s = run_detection(&conn, &day(7), Tz::UTC).unwrap();
+        assert_eq!(
+            (s.aged, active_on(&conn, "uid-m")),
+            (1, 1),
+            "the next one reminds"
+        );
+    }
+
     /// F-18: a resolved calendar tombstone for one occurrence of a recurring series must NOT suppress a
-    /// strictly later occurrence — the reconcile ages it out so the next recurrence re-fires.
+    /// strictly later occurrence — the reconcile ages it out so the next recurrence re-fires. (A series
+    /// that doesn't say where an occurrence sits, like an iCal feed's, is known by its start.)
     #[test]
     fn detect_and_store_ages_out_a_resolved_tombstone_for_a_later_occurrence() {
         let (_dir, conn) = open_test_db();
+        let ical = |start: &str| CalendarEvent {
+            recurring: true,
+            ..cal_event(Some("uid-daily"), start)
+        };
 
         // Pass 1: a prepare-ahead flag for the daily standup's soonest occurrence (07-05); user preps.
-        let e1 = vec![cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z")];
+        let e1 = vec![ical("2026-07-05T09:00:00Z")];
         detect_and_store(&conn, &[], &e1, TODAY, Tz::UTC).unwrap();
         let f = list_active(&conn, Some(ANCHOR_CALENDAR))
             .unwrap()
@@ -1433,7 +2503,7 @@ mod tests {
 
         // Pass 2: the NEXT occurrence (07-06) comes due. The tombstone is for the earlier occurrence, so
         // it ages out and a fresh active flag re-fires — the bug was that it stayed suppressed forever.
-        let e2 = vec![cal_event(Some("uid-daily"), "2026-07-06T09:00:00Z")];
+        let e2 = vec![ical("2026-07-06T09:00:00Z")];
         let s = detect_and_store(&conn, &[], &e2, TODAY, Tz::UTC).unwrap();
         assert_eq!(s.aged, 1, "the earlier occurrence's tombstone is aged out");
         let refired = list_active(&conn, Some(ANCHOR_CALENDAR))

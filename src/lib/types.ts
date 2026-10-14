@@ -1729,7 +1729,9 @@ export interface Flag {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
-  /** The occurrence this flag is about (a timed event's start); null for a milestone or pre-v33 flag. */
+  /** Which occurrence of a calendar event this flag is about: a series occurrence's place in the
+   *  series when it says so (Google's originalStartTime, an iCal override's RECURRENCE-ID; moving it
+   *  doesn't change it), else its start; null for a milestone or a pre-v33 flag. */
   instance_at: string | null;
 }
 
