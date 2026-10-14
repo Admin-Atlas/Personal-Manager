@@ -294,7 +294,7 @@ exclusion is where an unlicensed file hides). Comment syntax varies by language 
 whatever the file's language spells a comment as. The same gate pins `LICENCE.txt` by SHA-256 and
 checks every platform installer still bundles it: **never edit the FSF licence text.**
 
-**More than one author.** PM now has more than one developer. Copyright is per contributor, so a
+**More than one author.** PM has more than one developer. Copyright is per contributor, so a
 file gains a `SPDX-FileCopyrightText` line for each person with authorship in it — SPDX allows any
 number, one per line:
 
