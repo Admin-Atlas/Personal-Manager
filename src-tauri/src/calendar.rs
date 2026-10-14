@@ -1765,6 +1765,17 @@ fn events_hash(events: &[CalendarEvent]) -> String {
 /// titles and places lose U+2028/U+2029 ([`clip`]).
 const MIRROR_FORMAT: &str = "mirror-format:2";
 
+/// Whether `calendar_id`'s rows were last written by a complete fetch, so a row in them is still on
+/// the calendar. An incomplete fetch only upserts and clears the F-49 hash, so a row it didn't see
+/// (a moved iCal event's old start) may be a stale copy; a PM write clears it too, which only means
+/// waiting for the next complete sync (flags::detect_and_store waits rather than guess).
+pub(crate) fn mirror_is_whole(conn: &Connection, calendar_id: &str) -> Result<bool> {
+    Ok(
+        crate::db::get_setting(conn, &format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}"))?
+            .is_some(),
+    )
+}
+
 /// Replace one calendar's mirrored events with a freshly fetched set. Skips the delete+reinsert entirely
 /// when the fetched set already matches what's mirrored (F-49): the provider is re-polled every ~15 min,
 /// and without this every poll rewrites every row — continuous WAL churn — even when nothing changed.
@@ -1996,23 +2007,26 @@ fn agenda_query(
     let horizon = format!("+{days} days");
     let mut stmt = conn.prepare(
         "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
-                (all_day = 0 AND julianday(COALESCE(end, start)) < julianday('now')) AS ended \
+                (all_day = 0 AND julianday(COALESCE(end, start)) < julianday('now')) AS ended, \
+                recurring, series_id, original_start \
          FROM calendar_events \
          WHERE (CASE WHEN all_day = 1 \
                      THEN date(COALESCE(end, date(start, '+1 day'))) > ?1 \
                      ELSE julianday(COALESCE(end, start)) >= julianday(?2) END) \
            AND julianday(start) <= julianday(?1, ?3) \
            AND calendar_id NOT IN (SELECT id FROM calendars WHERE quiet = 1) \
-         ORDER BY start \
+         ORDER BY start, original_start IS NULL, id \
          LIMIT ?4",
     )?;
     let rows = stmt.query_map(params![today, floor, horizon, limit as i64], |r| {
         let all_day: i64 = r.get(7)?;
         let ended: i64 = r.get(10)?;
+        let recurring: i64 = r.get(11)?;
         Ok(AgendaEvent {
             // The v40 detail fields (show_as/attendees/…) are only surfaced by the Calendar tab's
             // event popup via `list_all_events`; the assistant/focus paths this query feeds don't use
-            // them, so they default to empty here rather than widening this hot query.
+            // them, so they default to empty here rather than widening this hot query. The series
+            // facts are read: flag detection keys an occurrence by them (flags::occurrence_of).
             event: CalendarEvent {
                 id: r.get(0)?,
                 calendar_id: r.get(1)?,
@@ -2024,6 +2038,9 @@ fn agenda_query(
                 all_day: all_day != 0,
                 html_link: r.get(8)?,
                 uid: r.get(9)?,
+                recurring: recurring != 0,
+                series_id: r.get(12)?,
+                original_start: r.get(13)?,
                 ..Default::default()
             },
             ended: ended != 0,
@@ -2034,6 +2051,9 @@ fn agenda_query(
         .map_err(Error::from)?;
     // Dedup the same physical event mirrored on two overlapping calendars, keeping the soonest
     // copy — otherwise the focus agenda, chat preamble, and project name-match all see it twice.
+    // Between copies with the same start, the query's order keeps the one that says its place in the
+    // series (a Google copy over its iCal feed's), then the same one every time: flag detection keys
+    // the occurrence by what the kept copy says (flags::occurrence_of).
     //
     // The key is the OCCURRENCE (uid + start), not the uid alone: every expanded occurrence of a
     // recurring series carries the SERIES uid (`ics::make_event`, Graph `calendarView`), so a
@@ -2917,6 +2937,42 @@ mod tests {
         let rows = agenda_query(&conn, 21, 250, &today, "now").unwrap();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].event.id.as_str(), "a1" | "a2"));
+    }
+
+    /// A moved occurrence mirrored twice (Google's own copy, and its iCal feed's): the agenda always
+    /// keeps the copy that says its place in the series, with the series facts flag detection keys
+    /// the occurrence by (#884, F6), whichever copy was written first.
+    #[test]
+    fn the_agenda_keeps_the_copy_that_knows_its_place_in_the_series() {
+        for ics_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+            let ics = "('a-ics', 'cal-1', 'Standup', datetime('now', '+2 days'), 0, 'w@x', 1, NULL, NULL)";
+            let google = "('z-g', 'cal-2', 'Standup', datetime('now', '+2 days'), 0, 'w@x', 1, \
+                          's1', '2026-07-01T09:00:00Z')";
+            let (first, second) = if ics_first {
+                (ics, google)
+            } else {
+                (google, ics)
+            };
+            // One statement, so both copies read one `now` (two could straddle a second and differ).
+            conn.execute_batch(&format!(
+                "INSERT INTO calendar_events \
+                   (id, calendar_id, summary, start, all_day, uid, recurring, series_id, \
+                    original_start) VALUES {first}, {second};"
+            ))
+            .unwrap();
+            let today: String = conn
+                .query_row("SELECT date('now')", [], |r| r.get(0))
+                .unwrap();
+            let rows = agenda_query(&conn, 21, 250, &today, "now").unwrap();
+            assert_eq!(rows.len(), 1);
+            let e = &rows[0].event;
+            assert_eq!(e.id, "z-g");
+            assert!(e.recurring);
+            assert_eq!(e.series_id.as_deref(), Some("s1"));
+            assert_eq!(e.original_start.as_deref(), Some("2026-07-01T09:00:00Z"));
+        }
     }
 
     // --- v45: work/personal typing --------------------------------------------------------------
