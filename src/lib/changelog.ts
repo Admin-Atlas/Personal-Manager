@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.4-alpha",
+    date: "2026-10-15",
+    highlights: [
+      "Under-the-hood: a developer's test copy of PM no longer makes scheduled backups, so it can't add its backups to yours or clear out your older ones. Nothing changes in the PM you use.",
+    ],
+  },
+  {
     version: "3.147.3-alpha",
     date: "2026-10-14",
     highlights: [

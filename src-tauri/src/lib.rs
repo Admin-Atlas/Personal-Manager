@@ -1528,7 +1528,16 @@ pub fn run() {
             // idle backstop that backs up when due per the user's cadence and trims old archives.
             // Gated on unlocked + idle + Proton connected + an opted-in stored passphrase; a no-op
             // for everyone who hasn't turned it on.
-            backup::schedule::spawn_backup_scheduler(handle.clone());
+            //
+            // Not in a dev build pointed at a data copy (`PM_DATA_DIR`): the copy carries the real
+            // vault's id, schedule and destination, and the keychain (with the destination's
+            // sign-in) is shared, so its backups would land beside the real ones and trim them.
+            // "Back up now" still works, for testing backups on purpose.
+            if paths::data_dir_overridden() {
+                eprintln!("backup: scheduled backups are off (a dev build using PM_DATA_DIR)");
+            } else {
+                backup::schedule::spawn_backup_scheduler(handle.clone());
+            }
 
             // Compact the project activity log daily and prune its raw window (Stage-3 heat log):
             // once a day, when unlocked + idle, roll raw events older than the recent window into
