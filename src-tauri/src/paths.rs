@@ -47,6 +47,12 @@ pub fn data_dir(app: &AppHandle) -> Result<PathBuf> {
     prepare_data_dir(dir, data_dir_is_purged())
 }
 
+/// Whether `PM_DATA_DIR` points this dev build at another data folder, usually a copy of the real
+/// one for a live test. Always false in a release build.
+pub fn data_dir_overridden() -> bool {
+    dev_override("PM_DATA_DIR").is_some()
+}
+
 /// Set once a full "remove PM completely" has taken the data directory away.
 ///
 /// Creating the folder on every [`data_dir`] call is exactly right for the whole life of a normal
