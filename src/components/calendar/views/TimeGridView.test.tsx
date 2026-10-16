@@ -8,7 +8,7 @@
 // the first a tab stop. All-day events still go to the strip.
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
@@ -109,5 +109,134 @@ describe("TimeGridView", () => {
     expect(within(coloured).getByText("Coloured").style.color).toBe("rgb(31, 31, 31)");
     expect(plain.style.background).toContain("#336699 18%");
     expect(within(plain).getByText("Plain").style.color).toBe("");
+  });
+});
+
+// A sideways swipe moves the window a day at a time, and every step used to snap the hours back to
+// the window's start: scroll down to the evening, swipe, and you were at 08:00 again.
+describe("TimeGridView — where the hours are scrolled to", () => {
+  const BODY_H = 480;
+  let restore: (() => void) | null = null;
+  beforeAll(() => {
+    // jsdom lays nothing out, so give the body a height for the grid to frame its window in. jsdom
+    // defines clientHeight on Element, so that is where it is stubbed and put back.
+    const d = Object.getOwnPropertyDescriptor(Element.prototype, "clientHeight");
+    Object.defineProperty(Element.prototype, "clientHeight", {
+      configurable: true,
+      get: () => BODY_H,
+    });
+    restore = () => {
+      if (d) Object.defineProperty(Element.prototype, "clientHeight", d);
+    };
+  });
+  afterAll(() => restore?.());
+
+  /** The grid on 12-10 + `first`, framing `startHour` to `endHour`; `custom` when the user set it. */
+  const view = (
+    first: number,
+    range: "work" | "day",
+    {
+      startHour = 8,
+      endHour = startHour + 10,
+      custom = false,
+    }: { startHour?: number; endHour?: number; custom?: boolean } = {},
+  ) => (
+    <TimeGridView
+      days={[new Date(2026, 9, first), new Date(2026, 9, first + 1)]}
+      events={[]}
+      colorOf={() => "#336699"}
+      range={range}
+      bounds={{ startHour, endHour }}
+      customBounds={custom ? { startHour, endHour } : undefined}
+      zones={[]}
+      onZonesChange={() => {}}
+      allowZones={false}
+      now={new Date(2026, 9, 1)}
+    />
+  );
+
+  /** The rendered grid's scroll body. */
+  const bodyOf = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>(".overflow-y-auto")!;
+
+  /** Scroll as the user does: the offset, then the scroll event an engine fires for it. */
+  const scrollTo = (body: HTMLElement, top: number) => {
+    body.scrollTop = top;
+    fireEvent.scroll(body);
+  };
+
+  /** Make `body` keep its offset as an engine does: clamped to the grid's height when written, and
+   *  again when read after the grid has shrunk. */
+  function clampLikeAnEngine(body: HTMLElement) {
+    const max = () => parseFloat((body.firstElementChild as HTMLElement).style.height) - BODY_H;
+    const clamp = (v: number) => Math.max(0, Math.min(v, max()));
+    let top = body.scrollTop;
+    Object.defineProperty(body, "scrollTop", {
+      configurable: true,
+      get: () => clamp(top),
+      set: (v: number) => {
+        top = clamp(v);
+      },
+    });
+  }
+
+  it("frames the window once, then keeps your place as the days move", () => {
+    const { container, rerender } = render(view(12, "work"));
+    const body = bodyOf(container);
+    // Framed on its start: 8 hours of 48px rows (480px over a 10-hour window).
+    expect(body.scrollTop).toBe(8 * 48);
+    scrollTo(body, 900); // the user scrolls down to the evening
+    rerender(view(13, "work")); // a swipe: one day on
+    expect(body.scrollTop).toBe(900);
+    rerender(view(5, "work")); // ‹ a week back
+    expect(body.scrollTop).toBe(900);
+  });
+
+  it("keeps your place when the Day range's sunrise hour moves with the date", () => {
+    const { container, rerender } = render(view(12, "day", { startHour: 7 }));
+    const body = bodyOf(container);
+    scrollTo(body, 900);
+    rerender(view(13, "day", { startHour: 8 })); // a later sunrise, the same 10-hour day
+    expect(body.scrollTop).toBe(900);
+  });
+
+  it("keeps the hour at the top when the rows grow", () => {
+    // A shorter day (an earlier sunset) makes taller rows: 18:45 stays at the top.
+    const { container, rerender } = render(view(12, "day"));
+    const body = bodyOf(container);
+    scrollTo(body, 900); // 18.75 hours of 48px rows
+    rerender(view(13, "day", { endHour: 16 })); // 480px over 8 hours: 60px rows
+    expect(body.scrollTop).toBe(18.75 * 60);
+  });
+
+  it("keeps the hour at the top when the rows shrink, though the engine clamps the offset", () => {
+    // 60px rows (8 hours in 480px), scrolled to 15:00. A longer day makes 40px rows, a 960px grid
+    // that can scroll only to 12:00; by the time the grid knows, the offset already reads 480px.
+    // Rescaling that would land on 08:00; the hour the user was at gives 15:00, held at 12:00.
+    const { container, rerender } = render(view(12, "day", { endHour: 16 }));
+    const body = bodyOf(container);
+    clampLikeAnEngine(body);
+    scrollTo(body, 15 * 60);
+    rerender(view(13, "day", { endHour: 20 }));
+    expect(body.scrollTop).toBe(12 * 40);
+    // The engine reports the clamp as a scroll; it's the grid's, so 15:00 is still the hour meant,
+    // and back on the shorter day it's at the top again.
+    fireEvent.scroll(body);
+    rerender(view(12, "day", { endHour: 16 }));
+    expect(body.scrollTop).toBe(15 * 60);
+  });
+
+  it("re-frames when the range, or the hours you set for it, change", () => {
+    const { container, rerender } = render(view(12, "work"));
+    const body = bodyOf(container);
+    scrollTo(body, 900);
+    rerender(view(12, "day"));
+    expect(body.scrollTop).toBe(8 * 48);
+    scrollTo(body, 900);
+    rerender(view(12, "day", { startHour: 6, custom: true }));
+    expect(body.scrollTop).toBe(6 * 48);
+    scrollTo(body, 900);
+    rerender(view(12, "day", { startHour: 6, endHour: 14, custom: true })); // only the end
+    expect(body.scrollTop).toBe(6 * 60);
   });
 });

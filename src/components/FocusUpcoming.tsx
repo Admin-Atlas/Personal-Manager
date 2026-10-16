@@ -86,14 +86,18 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   // component state (not persisted) so the window never jumps under you mid-session, and "Upcoming"
   // always opens on today.
   const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()));
-  // The swipe target for the days grid — the hook listens on the window and hit-tests this box, so
-  // this ref only ever has to say WHICH element the gesture belongs to.
-  const gridRef = useHorizontalWheelShift((d) => setAnchor((a) => addDays(a, d)), mode === "week");
   const [allEvents, setAllEvents] = useState<CalendarEvent[]>(() => cachedAllEvents);
   // The open detail popup, anchored at the clicked row/card (null = closed). Same component and same
   // behaviour as the Calendar tab — but with none of its overlay routing, because this card injects
   // no milestone/pinboard pseudo-events, so every event here is a real synced one.
   const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
+  // The swipe target for the days grid — the hook listens on the window and hit-tests this box, so
+  // this ref only ever has to say WHICH element the gesture belongs to. Not while the popup is open:
+  // moving the days would leave it pinned beside an event no longer on screen.
+  const gridRef = useHorizontalWheelShift(
+    (d) => setAnchor((a) => addDays(a, d)),
+    mode === "week" && eventPopup === null,
+  );
   const onEventClick = (ev: CalendarEvent, anchor: DOMRect) => setEventPopup({ ev, anchor });
 
   function changeMode(next: FocusUpcomingMode) {
@@ -293,6 +297,7 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
               colorOf={colorOf}
               range={range}
               bounds={visibleBounds}
+              customBounds={bounds[range]}
               zones={[]}
               onZonesChange={NOOP}
               allowZones={false}

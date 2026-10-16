@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.7-alpha",
+    date: "2026-10-16",
+    highlights: [
+      "Swiping sideways across the calendar now moves it one day per swipe, never more. A quick flick could jump three days at once, and a long swipe kept on going; now a swipe moves one day, and a flick back straight away undoes it. The calendar also keeps your place: if you've scrolled down to the evening, moving to another day leaves you there instead of jumping back to the start of your Work or Day hours. And a swipe no longer moves the days out from under an event's details while they're open. The same goes for the Upcoming grid on the Focus tab.",
+    ],
+  },
+  {
     version: "3.147.6-alpha",
     date: "2026-10-16",
     highlights: [

@@ -49,6 +49,11 @@ interface Props {
   /** The visible-hour window this range frames (start/end in decimal hours). The grid still spans a
    *  scrollable full 24h — these only set the initial framing/scroll and the row scale. */
   bounds: RangeBounds;
+  /** The hours the user set for this range, when they set them. The grid re-frames on these (and on
+   *  the range), never on a default that moves with the date: the Day range follows sunrise and
+   *  sunset, so framing on `bounds` would yank the hours back whenever a swipe crossed a sunrise
+   *  hour. */
+  customBounds?: RangeBounds;
   /** Up to 2 extra IANA zones to show as gutter columns beside the local time. */
   zones: string[];
   /** Add/remove an extra gutter zone — the corner control lives in the header row's gutter cell. */
@@ -121,6 +126,7 @@ export function TimeGridView({
   colorOf,
   range,
   bounds,
+  customBounds,
   zones,
   onZonesChange,
   allowZones = true,
@@ -259,20 +265,51 @@ export function TimeGridView({
     // rowH) doesn't re-run lane packing — the pixel multiply happens at render.
   }, [days, events, bandEvents]);
 
-  // Auto-scroll to the range's window start ONCE per range/week (after the body is measured), not on
+  // Auto-scroll to the range's window start ONCE per range (after the body is measured), not on
   // every resize — a resize only changes rowH, and re-running this would yank a scrolled-away user
-  // back to the window start.
-  const firstDayMs = days[0]?.getTime() ?? 0;
-  // Include the start bound so editing a range's hours re-frames the scroll to the new start.
-  const scrollKey = `${range}:${bounds.startHour}:${firstDayMs}`;
+  // back to the window start. Nor on moving to other days, by swipe or ‹ ›: a key holding the first
+  // visible day snapped a scrolled grid back to the window start on every step. Moving through the
+  // days keeps your place in the hours, as Google Calendar's does. Setting the range's own hours
+  // re-frames to them.
+  const scrollKey = customBounds
+    ? `${range}:${customBounds.startHour}-${customBounds.endHour}`
+    : `${range}:auto`;
   const scrolledKeyRef = useRef<string | null>(null);
+  // The hour the user means to have at the top: where they last scrolled it, or where the grid put
+  // it. The grid's own writes may land short of it (the engine clamps an offset past the bottom),
+  // and the scroll event that reports one is the grid's, not the user's: `ownTopRef` is the offset
+  // such a write landed on, so `onScroll` can tell the two apart and keep the hour meant.
+  const topHourRef = useRef<number | null>(null);
+  const ownTopRef = useRef<number | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || bodyHeight === 0) return;
     if (scrolledKeyRef.current === scrollKey) return;
     el.scrollTop = scrollHour * rowH;
+    topHourRef.current = scrollHour;
+    ownTopRef.current = el.scrollTop;
     scrolledKeyRef.current = scrollKey;
   }, [scrollKey, scrollHour, rowH, bodyHeight]);
+
+  // Keep the HOUR at the top, not the pixel, when the rows change height without a re-frame: a
+  // resize, or the Day range's sunrise or sunset moving with the date as the days move (hours you set
+  // re-frame instead). Before paint, so no frame shows the hours slid. The hour comes from
+  // `topHourRef`, not from `scrollTop` now: by the time this runs the body holds the new rows, and
+  // reading it would give an offset the engine has already clamped to the shorter grid. Held at the
+  // bottom on a long day (more hours, thinner rows, a shorter grid), the hour is still meant, so
+  // moving on to a shorter day restores it.
+  const laidOutRowHRef = useRef(rowH);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const was = laidOutRowHRef.current;
+    laidOutRowHRef.current = rowH;
+    if (el && was !== rowH && scrolledKeyRef.current === scrollKey) {
+      const hour = topHourRef.current ?? el.scrollTop / was;
+      el.scrollTop = hour * rowH;
+      topHourRef.current = hour;
+      ownTopRef.current = el.scrollTop;
+    }
+  }, [rowH, scrollKey]);
 
   const nowMin = minutesFromLocalMidnight(nowDate);
   // Hour rules as one crisp 1px line per hour, each snapped to a whole pixel so it lands on the
@@ -333,7 +370,16 @@ export function TimeGridView({
       />
 
       {/* Scrollable time body */}
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-y-auto"
+        onScroll={(e) => {
+          const top = e.currentTarget.scrollTop;
+          if (top === ownTopRef.current) return; // the grid's own write, reported
+          ownTopRef.current = null;
+          topHourRef.current = top / rowH;
+        }}
+      >
         <div className="flex" style={{ height: `${HOURS * rowH}px` }}>
           {/* Hour gutter — extra zones then the local column (nearest the grid). */}
           <div className="flex shrink-0" style={{ width: `${gutterPx}px` }}>
