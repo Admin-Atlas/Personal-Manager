@@ -78,17 +78,8 @@ pub fn build_patch(
             let was_all_day = fresh.get("start").is_some_and(|s| s.get("date").is_some());
             let (mut start, mut end) = (when.start, when.end);
             if was_all_day != when.all_day {
-                let dropped: &[&str] = if when.all_day {
-                    &["dateTime", "timeZone"]
-                } else {
-                    &["date"]
-                };
                 for node in [&mut start, &mut end] {
-                    if let Some(obj) = node.as_object_mut() {
-                        for key in dropped {
-                            obj.insert((*key).to_string(), Value::Null);
-                        }
-                    }
+                    drop_other_kind(node);
                 }
             }
             body.insert("start".into(), start);
@@ -96,6 +87,22 @@ pub fn build_patch(
         }
     }
     Ok(body)
+}
+
+/// A start or end node sent onto an event of the other kind (timed onto all-day, or back), with the
+/// other kind's keys set to null: `events.patch` merges nested objects, so a key left out would stay.
+pub(crate) fn drop_other_kind(node: &mut Value) {
+    let all_day = node.get("date").is_some_and(|d| !d.is_null());
+    let dropped: &[&str] = if all_day {
+        &["dateTime", "timeZone"]
+    } else {
+        &["date"]
+    };
+    if let Some(obj) = node.as_object_mut() {
+        for key in dropped {
+            obj.insert((*key).to_string(), Value::Null);
+        }
+    }
 }
 
 /// Whether Google's copy is a deleted event (`get` still returns those, details and all, so they can
@@ -260,6 +267,15 @@ fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
             a.and_then(Value::as_str).unwrap_or("default")
                 == b.and_then(Value::as_str).unwrap_or("default")
         }
+        // A list or an object (`recurrence`, `reminders`, `attendees`…) by value: read as text, any two
+        // would be "" and equal, so a changed one would never be a conflict (G4, found by C8's survey;
+        // no field PM sends today is one).
+        _ if [a, b]
+            .iter()
+            .any(|v| v.is_some_and(|v| v.is_array() || v.is_object())) =>
+        {
+            a.filter(|v| !v.is_null()) == b.filter(|v| !v.is_null())
+        }
         _ => a.and_then(Value::as_str).unwrap_or("") == b.and_then(Value::as_str).unwrap_or(""),
     }
 }
@@ -267,7 +283,7 @@ fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
 /// Whether two start (or end) nodes name the same time: the same date for all-day, or the same
 /// instant in the same zone for a timed one (offsets may be written differently). A `null` key, as a
 /// kind-switching PATCH sends, counts as absent.
-fn when_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
+pub(crate) fn when_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
     let key = |node: Option<&Value>, k: &str| -> Option<String> {
         node.and_then(|n| n.get(k))
             .and_then(Value::as_str)
@@ -543,6 +559,32 @@ mod tests {
         let mut etag_only = base.clone();
         etag_only["etag"] = "\"102\"".into();
         assert_eq!(update_check(&base, &etag_only, &body), UpdateCheck::Proceed);
+    }
+
+    /// C8b review R7: a list or an object is compared by value, a null as absent; never as text,
+    /// which would read any two as equal.
+    #[test]
+    fn a_list_or_an_object_conflicts_by_value() {
+        let base = fresh();
+        let body: Map<String, Value> = [(
+            "reminders".to_string(),
+            serde_json::json!({ "useDefault": true }),
+        )]
+        .into_iter()
+        .collect();
+        let mut own = base.clone();
+        own["reminders"] = serde_json::json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 5 }] });
+        assert_eq!(
+            update_check(&base, &own, &body),
+            UpdateCheck::Conflict(vec!["reminders".into()])
+        );
+        let mut nulled = base.clone();
+        nulled["reminders"] = Value::Null;
+        let mut absent = base.clone();
+        if let Some(obj) = absent.as_object_mut() {
+            obj.retain(|k, _| k != "reminders");
+        }
+        assert_eq!(update_check(&nulled, &absent, &body), UpdateCheck::Proceed);
     }
 
     /// R2: a fresh `status: cancelled` is gone, for a save as for a delete, even though `get` still

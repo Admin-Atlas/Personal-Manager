@@ -39,6 +39,7 @@ use crate::calendar_write::dto::{
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
+use crate::calendar_write::plan::is_plain_segment;
 use crate::calendar_write::reconcile::{RecentWrites, Stamp};
 use crate::calendar_write::{plan, time};
 use crate::error::{Error, Result};
@@ -88,14 +89,6 @@ struct Target {
     email: String,
     token_key: String,
     facts: CalendarFacts,
-}
-
-/// Whether an id stays one path segment of its own in a request URL. `Url::path_segments_mut` drops
-/// a "." or ".." segment (and strips tabs and newlines first, so ".\t." becomes ".."), which would
-/// send the write to the calendar's event list, or the calendar itself, instead of the event. Google's
-/// ids never look like that; a corrupt row isn't written through.
-fn is_plain_segment(s: &str) -> bool {
-    !s.is_empty() && !matches!(s, "." | "..") && !s.chars().any(|c| c.is_ascii_control())
 }
 
 /// Resolve a mirror row to its Google calendar and event. A row from an iCal feed or an Outlook

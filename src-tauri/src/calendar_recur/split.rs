@@ -41,7 +41,10 @@ pub struct Cut {
 /// `events.instances`, cancelled ones in, RDATE-only ones out), so a rule with a COUNT needs it.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C8, the series planners")
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
 )]
 pub fn truncate_recurrence<S: AsRef<str>>(
     lines: &[S],
@@ -130,7 +133,10 @@ pub fn truncate_recurrence<S: AsRef<str>>(
 /// [`super::remap::retime`] moves it from here.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C8, the series planners")
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
 )]
 pub fn tail_recurrence<S: AsRef<str>>(
     lines: &[S],
@@ -154,7 +160,10 @@ pub fn tail_recurrence<S: AsRef<str>>(
 /// `events.instances`): at least one, or the series had already ended.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C8, the series planners")
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
 )]
 pub fn remaining_count(count: u32, before: u32) -> Result<u32, RecurError> {
     count

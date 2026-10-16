@@ -60,7 +60,12 @@ impl Stamp {
 #[derive(Clone)]
 enum Entry {
     /// Saved: Google's reply, as a row. Boxed so a delete entry doesn't carry a whole row's space.
-    Upsert(Box<CalendarEvent>),
+    /// `created`: the row is new (a split's new series), so a list that doesn't show it yet may only
+    /// be lagging, not proof it was deleted.
+    Upsert {
+        row: Box<CalendarEvent>,
+        created: bool,
+    },
     /// Deleted: the version that was deleted.
     Delete {
         etag: Option<String>,
@@ -84,11 +89,43 @@ pub struct Merged {
 }
 
 impl RecentWrites {
-    /// Remember a saved row (Google's reply, parsed).
+    /// Remember a saved row (Google's reply, parsed). A row PM created moments ago keeps that
+    /// tolerance through a later save of it (RC17).
     pub fn record_upsert(&mut self, row: CalendarEvent, at: Stamp) {
+        let key = (row.calendar_id.clone(), row.id.clone());
+        let created = matches!(
+            self.entries.get(&key),
+            Some((Entry::Upsert { created: true, .. }, _))
+        );
+        self.entries.insert(
+            key,
+            (
+                Entry::Upsert {
+                    row: Box::new(row),
+                    created,
+                },
+                at,
+            ),
+        );
+    }
+
+    /// Remember a row PM just created (a split's new series, found in a re-fetch). Until a fetch shows
+    /// it or ten minutes pass, a fetch without it doesn't take it off the screen: Google's list can
+    /// lag behind a new event, and a missing row isn't proof it was deleted.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "first caller lands in C9, splitting a series")
+    )]
+    pub fn record_create(&mut self, row: CalendarEvent, at: Stamp) {
         self.entries.insert(
             (row.calendar_id.clone(), row.id.clone()),
-            (Entry::Upsert(Box::new(row)), at),
+            (
+                Entry::Upsert {
+                    row: Box::new(row),
+                    created: true,
+                },
+                at,
+            ),
         );
     }
 
@@ -140,7 +177,7 @@ impl RecentWrites {
             // Judged on the last copy of a repeated id, as that's the one the mirror keeps.
             let position = rows.iter().rposition(|r| r.id == row_id);
             let settled = match (entry, position) {
-                (Entry::Upsert(saved), Some(i)) => {
+                (Entry::Upsert { row: saved, .. }, Some(i)) => {
                     let fetched = &rows[i];
                     let landed = fetched.etag.is_some() && fetched.etag == saved.etag;
                     // Changed in Google after the save: upstream wins, whenever the fetch began.
@@ -156,12 +193,17 @@ impl RecentWrites {
                     may_settle && (landed || upstream_won)
                 }
                 // Missing from a complete fetch that began after the save: deleted in Google since
-                // (or moved out of the window), and upstream wins. Every save here edits an event
-                // that already existed; C10's creates, which a lagging list may not show yet, will
-                // need their own kind of entry. An incomplete or older fetch proves nothing, so it
-                // shows the save.
-                (Entry::Upsert(saved), None) => {
-                    if complete && may_settle {
+                // (or moved out of the window), and upstream wins. Not for a row PM created: a list
+                // can lag behind a new event, so it stays on screen until a fetch shows it or the
+                // entry expires. An incomplete or older fetch proves nothing, so it shows the save.
+                (
+                    Entry::Upsert {
+                        row: saved,
+                        created,
+                    },
+                    None,
+                ) => {
+                    if complete && may_settle && !created {
                         true
                     } else {
                         rows.push((**saved).clone());
@@ -336,6 +378,40 @@ mod tests {
         // A complete one that began after the save and lacks it: gone in Google, and settled.
         let complete = w.merge("cal", others(), true, after.mono, after);
         assert_eq!(summaries(&complete), vec!["Other"]);
+        assert!(w.is_empty());
+    }
+
+    /// A row PM just created (a split's new series) isn't taken off the screen by a complete fetch
+    /// that doesn't list it yet; a fetch that shows it settles it. A later save of the same row keeps
+    /// that tolerance (RC17).
+    #[test]
+    fn a_created_row_outlasts_a_list_that_lags() {
+        let (saved, after) = clocks();
+        let others = || vec![row("b", "Other", "\"1\"", T0)];
+        let mut w = RecentWrites::default();
+        w.record_create(row("t", "New series", "\"1\"", T1), saved);
+        let lagging = w.merge("cal", others(), true, after.mono, after);
+        assert_eq!(summaries(&lagging), vec!["Other", "New series"]);
+        assert!(!w.is_empty());
+        w.record_upsert(row("t", "New series, renamed", "\"2\"", T2), saved);
+        let still = w.merge("cal", others(), true, after.mono, after);
+        assert_eq!(summaries(&still), vec!["Other", "New series, renamed"]);
+        let shows = w.merge(
+            "cal",
+            vec![row("t", "New series, renamed", "\"2\"", T2)],
+            true,
+            after.mono,
+            after,
+        );
+        assert_eq!(summaries(&shows), vec!["New series, renamed"]);
+        assert!(w.is_empty());
+        // C8b review R7: only a row first recorded as created keeps that tolerance. A save over a
+        // recorded delete is a plain save, which a complete fetch without it settles as deleted.
+        let mut w = RecentWrites::default();
+        w.record_delete("cal", "cal:t", Some("\"1\"".into()), Some(T1.into()), saved);
+        w.record_upsert(row("t", "Back again", "\"2\"", T2), saved);
+        let gone = w.merge("cal", others(), true, after.mono, after);
+        assert_eq!(summaries(&gone), vec!["Other"]);
         assert!(w.is_empty());
     }
 
