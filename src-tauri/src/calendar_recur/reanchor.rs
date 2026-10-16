@@ -25,7 +25,9 @@ pub enum DayMap {
     Same,
     /// Every occurrence moves this many days (DAILY).
     Days(i64),
-    /// Occurrences on `from` move `days` (within their week); the rest stay (WEEKLY).
+    /// Occurrences on `from` move `days`, into another week too; the rest stay (WEEKLY). With other
+    /// days in the rule, `Collision` and `Crosses` keep `days` under a week; a one-day rule's
+    /// occurrences all move alike, by any number of days.
     Weekday { from: Weekday, days: i64 },
     /// Every occurrence moves to this day of its own month (MONTHLY by the day of the month).
     MonthDay(u32),
@@ -68,6 +70,8 @@ pub enum ReanchorError {
     Collision(Weekday),
     /// The move passes another day the series repeats on, which would then be lost or doubled.
     Crosses(Weekday),
+    /// The series repeats on several days every two weeks or more, and the move takes one of them
+    /// into another of the weeks the rule counts (from its WKST, which needn't be the week PM draws).
     CrossWeek,
     CrossMonth,
     CrossYear,
@@ -94,7 +98,8 @@ impl fmt::Display for ReanchorError {
             ),
             ReanchorError::CrossWeek => write!(
                 f,
-                "That moves it into another week, which PM can't carry to every occurrence."
+                "The series repeats on several days every few weeks, and that move would change \
+                 which weeks one of them repeats in."
             ),
             ReanchorError::CrossMonth => write!(
                 f,
@@ -216,8 +221,17 @@ pub fn reanchor(
             if facts.by_month_day.is_some() || !facts.by_month.is_empty() {
                 return Err(ReanchorError::NotDerivable);
             }
+            // Which week a day falls in matters only to a rule on several days every two weeks or
+            // more (RFC 5545 §3.3.10, WKST): moving one of those days across the week's start changes
+            // which weeks it falls in. Any other weekly rule crosses it like any other day, so
+            // "every Sunday" dragged to Monday becomes "every Monday" (Bobby, 16-10-2026: "i dont see
+            // why there should be a limitation"). Every occurrence on the moved day moves the same
+            // days, and the series' start with them when it falls on that day.
             let wkst = facts.week_start.unwrap_or(Weekday::Mon);
-            if week_start(from, wkst) != week_start(to, wkst) {
+            if facts.interval > 1
+                && facts.by_day.len() > 1
+                && week_start(from, wkst) != week_start(to, wkst)
+            {
                 return Err(ReanchorError::CrossWeek);
             }
             let map = DayMap::Weekday {
@@ -233,7 +247,16 @@ pub fn reanchor(
                 .iter()
                 .position(|d| d.weekday == from.weekday())
                 .ok_or(ReanchorError::NotDerivable)?;
-            if facts.by_day.iter().any(|d| d.weekday == to.weekday()) {
+            // The series' OTHER days: the moving one may land on its own weekday a week or more
+            // away, and passes its own next occurrence on the way, which moves along with it.
+            let others = |day: Weekday| {
+                facts
+                    .by_day
+                    .iter()
+                    .enumerate()
+                    .any(|(i, b)| i != at && b.weekday == day)
+            };
+            if others(to.weekday()) {
                 return Err(ReanchorError::Collision(to.weekday()));
             }
             let (low, high) = (from.min(to), from.max(to));
@@ -241,7 +264,7 @@ pub fn reanchor(
                 .iter_days()
                 .skip(1)
                 .take_while(|d| *d < high)
-                .find(|d| facts.by_day.iter().any(|b| b.weekday == d.weekday()))
+                .find(|d| others(d.weekday()))
             {
                 return Err(ReanchorError::Crosses(between.weekday()));
             }
@@ -454,30 +477,112 @@ mod tests {
             ),
             Err(ReanchorError::Crosses(Weekday::Wed))
         );
-        // Into another week: +8 days, and Sunday → Monday with the week starting on Monday.
+        // A week or more on, the moving day still may not pass or land on another of its days.
+        assert_eq!(
+            moved(mo_we, day(2026, 10, 12), day(2026, 10, 20)),
+            Err(ReanchorError::Crosses(Weekday::Wed))
+        );
+        // Several days every two weeks: which week a day falls in decides the weeks it repeats in,
+        // so moving one across the week's start (Monday by default) is refused…
+        let fortnight = "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,SU";
+        assert_eq!(
+            moved(fortnight, day(2026, 10, 18), day(2026, 10, 19)),
+            Err(ReanchorError::CrossWeek)
+        );
+        // …while one within its week moves as any other.
+        assert_eq!(
+            moved(fortnight, day(2026, 10, 18), day(2026, 10, 17))
+                .unwrap()
+                .0,
+            "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,SA"
+        );
+        // The weeks start where the rule's WKST says (Google writes WKST=SU on such rules): with
+        // Sunday-start weeks, Sunday → Monday stays in its week…
+        assert_eq!(
+            moved(
+                "RRULE:FREQ=WEEKLY;WKST=SU;INTERVAL=2;BYDAY=TU,SU",
+                day(2026, 10, 18),
+                day(2026, 10, 19)
+            )
+            .unwrap()
+            .0,
+            "RRULE:FREQ=WEEKLY;WKST=SU;INTERVAL=2;BYDAY=TU,MO"
+        );
+        // …and Saturday → Sunday crosses into the next.
+        assert_eq!(
+            moved(
+                "RRULE:FREQ=WEEKLY;WKST=SU;INTERVAL=2;BYDAY=TU,SA",
+                day(2026, 10, 24),
+                day(2026, 10, 25)
+            ),
+            Err(ReanchorError::CrossWeek)
+        );
+    }
+
+    /// Bobby, 16-10-2026: "every Sunday" dragged to Monday should become "every Monday", not be
+    /// refused for crossing into the next week. Only a rule on several days every two weeks or more
+    /// cares which week a day is in (the test above).
+    #[test]
+    fn a_weekly_day_crosses_into_another_week() {
+        let sunday_to_monday = |rule: &str| moved(rule, day(2026, 10, 18), day(2026, 10, 19));
+        // Sunday → Monday, with the week starting on Monday: every Sunday becomes every Monday.
+        assert_eq!(
+            sunday_to_monday("RRULE:FREQ=WEEKLY;BYDAY=SU"),
+            Ok((
+                "RRULE:FREQ=WEEKLY;BYDAY=MO".into(),
+                DayMap::Weekday {
+                    from: Weekday::Sun,
+                    days: 1
+                }
+            ))
+        );
+        // Every two weeks on one day: the series' start moves with it, so the fortnights do too.
+        assert_eq!(
+            sunday_to_monday("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=SU")
+                .unwrap()
+                .0,
+            "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"
+        );
+        // Several days every week: every week has all of them, so the week's start can't matter.
+        assert_eq!(
+            sunday_to_monday("RRULE:FREQ=WEEKLY;BYDAY=TU,SU").unwrap().0,
+            "RRULE:FREQ=WEEKLY;BYDAY=TU,MO"
+        );
+        // And the other way, Monday back to Sunday.
+        assert_eq!(
+            moved(
+                "RRULE:FREQ=WEEKLY;BYDAY=MO",
+                day(2026, 10, 19),
+                day(2026, 10, 18)
+            )
+            .unwrap()
+            .0,
+            "RRULE:FREQ=WEEKLY;BYDAY=SU"
+        );
+        // A week and a day on: every Monday becomes every Tuesday, each a week and a day later.
+        let (rule, map) = moved(
+            "RRULE:FREQ=WEEKLY;BYDAY=MO",
+            day(2026, 10, 12),
+            day(2026, 10, 20),
+        )
+        .unwrap();
+        assert_eq!(rule, "RRULE:FREQ=WEEKLY;BYDAY=TU");
+        assert_eq!(map.day_of(day(2026, 10, 26)), Some(day(2026, 11, 3)));
+        // Exactly a week on: the same day, so the rule stays and every occurrence moves a week.
         assert_eq!(
             moved(
                 "RRULE:FREQ=WEEKLY;BYDAY=MO",
                 day(2026, 10, 12),
-                day(2026, 10, 20)
-            ),
-            Err(ReanchorError::CrossWeek)
-        );
-        assert_eq!(
-            moved(
-                "RRULE:FREQ=WEEKLY;BYDAY=SU",
-                day(2026, 10, 18),
                 day(2026, 10, 19)
             ),
-            Err(ReanchorError::CrossWeek)
+            Ok((
+                "RRULE:FREQ=WEEKLY;BYDAY=MO".into(),
+                DayMap::Weekday {
+                    from: Weekday::Mon,
+                    days: 7
+                }
+            ))
         );
-        // …but the same move is within one week when the week starts on Sunday.
-        assert!(moved(
-            "RRULE:FREQ=WEEKLY;WKST=SU;BYDAY=SU",
-            day(2026, 10, 18),
-            day(2026, 10, 19)
-        )
-        .is_ok());
     }
 
     #[test]

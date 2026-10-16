@@ -396,8 +396,10 @@ fn until_candidates(
     Ok(unique)
 }
 
-/// How many days a move can carry one occurrence before an earlier one: within its week or its month
-/// when only some of the rule's days move, never when every occurrence moves alike.
+/// How many days a move can carry one occurrence before an earlier one: under a week when only some
+/// of a weekly rule's days move (`Crosses` stops the moving day short of the rule's next other day),
+/// within its month for "the nth weekday", never when every occurrence moves alike (a one-day weekly
+/// rule moves all its occurrences the same days, however many, so 7 is only conservative there).
 fn reorder_days(day: DayMap) -> i64 {
     match day {
         DayMap::Weekday { .. } => 7,
@@ -685,15 +687,78 @@ mod tests {
                 chrono::Weekday::Wed
             )))
         );
+        // Several days every two weeks, one of them moved across the week's start.
         assert_eq!(
             all(
-                &["RRULE:FREQ=WEEKLY;BYDAY=MO"],
-                start,
-                at("2026-10-12T09:00:00+01:00"),
-                at("2026-10-20T09:00:00+01:00")
+                &["RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,SU"],
+                timed(2026, 10, 4, 10, 0, London),
+                at("2026-10-18T10:00:00+01:00"),
+                at("2026-10-19T10:00:00+01:00")
             ),
             Err(RetimeError::Reanchor(ReanchorError::CrossWeek))
         );
+    }
+
+    /// Bobby, 16-10-2026: "every Sunday" dragged to Monday becomes "every Monday", its start and
+    /// its cancelled Sundays with it, proved occurrence by occurrence like any other move.
+    #[test]
+    fn a_sunday_series_moved_to_monday_becomes_a_monday_series() {
+        let sunday = timed(2026, 10, 4, 10, 0, London);
+        let (from, to) = (
+            at("2026-10-18T10:00:00+01:00"),
+            at("2026-10-19T10:00:00+01:00"),
+        );
+        let moved = all(
+            &[
+                "RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=10",
+                "EXDATE;TZID=Europe/London:20261025T100000",
+            ],
+            sunday,
+            from,
+            to,
+        )
+        .unwrap();
+        assert_eq!(moved.start, timed(2026, 10, 5, 10, 0, London));
+        assert_eq!(
+            moved.lines,
+            [
+                "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10",
+                "EXDATE;TZID=Europe/London:20261026T100000",
+            ]
+        );
+        assert_eq!(
+            moved.remap.day,
+            DayMap::Weekday {
+                from: chrono::Weekday::Sun,
+                days: 1
+            }
+        );
+        // Every two weeks on Sunday: the fortnights move with the start.
+        let fortnight = all(&["RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=SU"], sunday, from, to).unwrap();
+        assert_eq!(fortnight.start, timed(2026, 10, 5, 10, 0, London));
+        assert_eq!(fortnight.lines, ["RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"]);
+        assert_eq!(
+            fortnight.moved(at("2026-11-01T10:00:00Z")),
+            Ok(Some(at("2026-11-02T10:00:00Z")))
+        );
+        // Tuesdays and Sundays every week: the Sundays become Mondays, the Tuesdays stay.
+        let both = all(&["RRULE:FREQ=WEEKLY;BYDAY=TU,SU"], sunday, from, to).unwrap();
+        assert_eq!(both.start, timed(2026, 10, 5, 10, 0, London));
+        assert_eq!(both.lines, ["RRULE:FREQ=WEEKLY;BYDAY=TU,MO"]);
+        assert_eq!(
+            both.moved(at("2026-10-27T10:00:00Z")),
+            Ok(Some(at("2026-10-27T10:00:00Z")))
+        );
+        // A week and a day on: every Monday becomes every Tuesday, a week and a day later.
+        let further = all(
+            &["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+            timed(2026, 10, 5, 9, 0, London),
+            at("2026-10-12T09:00:00+01:00"),
+            at("2026-10-20T09:00:00+01:00"),
+        )
+        .unwrap();
+        assert_eq!(further.start, timed(2026, 10, 13, 9, 0, London));
+        assert_eq!(further.lines, ["RRULE:FREQ=WEEKLY;BYDAY=TU"]);
     }
 
     #[test]

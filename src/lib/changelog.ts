@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.8-alpha",
+    date: "2026-10-16",
+    highlights: [
+      "Under the hood, a fix to the groundwork for changing repeating events in Google Calendar: moving an occurrence of a weekly event into the next week, like an every-Sunday event dragged to Monday, now turns it into an every-Monday event when you choose “all events”, instead of being refused. An event that repeats on several days every two weeks or more still can't move one of them into another of its weeks, since that would change which weeks it falls in. Nothing you can see changes yet.",
+    ],
+  },
+  {
     version: "3.147.7-alpha",
     date: "2026-10-16",
     highlights: [
