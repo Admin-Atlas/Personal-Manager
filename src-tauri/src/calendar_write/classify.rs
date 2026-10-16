@@ -20,7 +20,7 @@ pub enum Method {
     Get,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "first sent in C10, creating events")
+        expect(dead_code, reason = "first sent in C9, splitting a series")
     )]
     Insert,
     Patch,

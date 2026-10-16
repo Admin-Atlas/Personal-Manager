@@ -45,6 +45,14 @@ fn url(segments: &[&str], query: &[(&str, &str)]) -> String {
     url.to_string()
 }
 
+/// Whether an id stays one path segment of its own in a request URL. `Url::path_segments_mut` drops
+/// a "." or ".." segment (and strips tabs and newlines first, so ".\t." becomes ".."), which would
+/// send the write to the calendar's event list, or the calendar itself, instead of the event. Google's
+/// ids never look like that; a corrupt row, or a corrupt reply, isn't written through.
+pub fn is_plain_segment(s: &str) -> bool {
+    !s.is_empty() && !matches!(s, "." | "..") && !s.chars().any(|c| c.is_ascii_control())
+}
+
 fn write_query(notify: Notify, flags: VersionFlags) -> Vec<(&'static str, &'static str)> {
     let mut query = vec![("sendUpdates", notify.as_param())];
     if flags.conference {
@@ -105,7 +113,7 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
 /// id at creation), so a retry can't make a second event.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C10, creating events")
+    expect(dead_code, reason = "first caller lands in C9, splitting a series")
 )]
 pub fn insert_event(
     calendar: &str,
@@ -132,7 +140,7 @@ pub fn insert_event(
 /// (base32hex: `0-9` and `a-v`, 5 to 1024 characters).
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C10, creating events")
+    expect(dead_code, reason = "first caller lands in C9, splitting a series")
 )]
 pub fn client_event_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()

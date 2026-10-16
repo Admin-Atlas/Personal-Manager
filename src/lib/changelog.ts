@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.6-alpha",
+    date: "2026-10-16",
+    highlights: [
+      "Under the hood, the next piece of groundwork for changing repeating events in Google Calendar: for “this event”, “this and following” and “all events”, PM can now work out exactly which changes to send to Google and in what order, how to tell each one landed, and how to put things back if one didn't. Nothing you can see changes yet.",
+    ],
+  },
+  {
     version: "3.147.5-alpha",
     date: "2026-10-16",
     highlights: [

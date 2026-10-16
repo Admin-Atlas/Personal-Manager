@@ -12,6 +12,8 @@
 //! - [`classify`]: what Google's answer means, and whether one retry is safe.
 //! - [`plan`]: the requests themselves, ids percent-encoded and `sendUpdates` always explicit.
 //! - [`reconcile`]: keeping a just-saved event on screen until a sync shows it.
+//! - [`series`]: changing a repeating event, its occurrence, the rest of it from one on, or all of
+//!   it, as ordered writes with their checks and compensations.
 //!
 //! The rules it rests on are in `docs/calendar-full-editing-plan-2026-10-09.md` §3: every edit is
 //! diffed against a fresh GET, never the mirror (R1); a change Google made meanwhile is a conflict,
@@ -23,4 +25,5 @@ pub mod gate;
 pub mod patch;
 pub mod plan;
 pub mod reconcile;
+pub mod series;
 pub mod time;

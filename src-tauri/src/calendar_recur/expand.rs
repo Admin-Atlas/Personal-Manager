@@ -161,7 +161,10 @@ pub fn occurrences_before(
 /// doesn't, among others) it refuses to split rather than guess.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C8, the series planners")
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
 )]
 pub fn crate_agrees(facts: &RuleFacts, start: &SeriesStart, at: Point, google_before: u32) -> bool {
     occurrences_before(facts, start, at) == Ok(google_before)
@@ -289,6 +292,27 @@ pub fn occurrences_from(
         out.len() < max
     })?;
     Ok(out)
+}
+
+/// The rule's last occurrence before `at` that `kept` keeps (one not deleted, say), if any: the last a
+/// series cut just before `at` still shows.
+pub fn last_before(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+    at: Point,
+    kept: impl Fn(&Point) -> bool,
+) -> Result<Option<Point>, RecurError> {
+    same_kind(start, &at)?;
+    let zone = start.zone();
+    let mut last = None;
+    walk(facts, start, |p| {
+        let before = p.cmp_in(&at, zone) == Ordering::Less;
+        if before && kept(&p) {
+            last = Some(p);
+        }
+        before
+    })?;
+    Ok(last)
 }
 
 /// The series' first occurrence on or after `start` under `spec`: "Weekly on Monday and Wednesday"
@@ -552,6 +576,38 @@ mod tests {
                 3
             ),
             Err(RecurError::CannotCount)
+        );
+    }
+
+    /// What a series cut before an occurrence keeps last (C8b review ADV-9).
+    #[test]
+    fn the_last_occurrence_before_a_point() {
+        let mondays = facts("RRULE:FREQ=WEEKLY;BYDAY=MO");
+        let start = london(2026, 10, 5, 9);
+        let any = |_: &Point| true;
+        assert_eq!(
+            last_before(&mondays, &start, at("2026-10-19T08:00:00Z"), any),
+            Ok(Some(at("2026-10-12T09:00:00+01:00")))
+        );
+        // Between two occurrences, and before the first.
+        assert_eq!(
+            last_before(&mondays, &start, at("2026-10-14T12:00:00Z"), any),
+            Ok(Some(at("2026-10-12T09:00:00+01:00")))
+        );
+        assert_eq!(
+            last_before(&mondays, &start, at("2026-10-05T08:00:00Z"), any),
+            Ok(None)
+        );
+        // One the caller doesn't keep (deleted) is passed over for the one before.
+        let deleted = at("2026-10-12T09:00:00+01:00");
+        assert_eq!(
+            last_before(&mondays, &start, at("2026-10-19T08:00:00Z"), |p| *p
+                != deleted),
+            Ok(Some(at("2026-10-05T09:00:00+01:00")))
+        );
+        assert_eq!(
+            last_before(&mondays, &start, Point::Day(day(2026, 10, 19)), any),
+            Err(RecurError::Mismatch)
         );
     }
 
