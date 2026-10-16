@@ -65,7 +65,9 @@ pub fn truncate_recurrence<S: AsRef<str>>(
         Ordering::Greater => {}
     }
     if let Some(end) = facts.until {
-        let end = end.point(None, start).ok_or(RecurError::CannotCount)?;
+        // Placed as the walk places it, so the cut and the walk agree on whether `at` is the series'
+        // (C8a fix review).
+        let end = super::expand::until_point(end, start).ok_or(RecurError::CannotCount)?;
         if end.cmp_in(&at, zone) == Ordering::Less {
             return Err(RecurError::Ended);
         }
@@ -124,7 +126,8 @@ pub fn truncate_recurrence<S: AsRef<str>>(
 
 /// The rest of a split series' `recurrence`, unchanged in rule: the original rule with its COUNT set
 /// to `remaining` (from [`remaining_count`]) or its UNTIL kept, then the values
-/// [`truncate_recurrence`] moved. A new rule, and EXDATEs shifted by a change of time, are C8's.
+/// [`truncate_recurrence`] moved. When the rest also moves to a new time or day,
+/// [`super::remap::retime`] moves it from here.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "first caller lands in C8, the series planners")
@@ -258,6 +261,21 @@ mod tests {
         assert_eq!(
             truncate_recurrence(&by_count, &start, split, None),
             Err(RecurError::CannotCount)
+        );
+        // A wall-clock UNTIL in the hour the clocks repeat is its later pass, as the walk reads it:
+        // 25-10's 01:45 (its first pass, 00:45Z) is still the series', and can be split at.
+        assert_eq!(
+            cut(
+                &["RRULE:FREQ=DAILY;UNTIL=20261025T013000"],
+                &SeriesStart::Timed {
+                    local: day(2026, 10, 20).and_hms_opt(1, 45, 0).unwrap(),
+                    zone: London,
+                },
+                at("2026-10-25T00:45:00Z"),
+                None
+            )
+            .lines,
+            ["RRULE:FREQ=DAILY;UNTIL=20261025T004459Z"]
         );
     }
 

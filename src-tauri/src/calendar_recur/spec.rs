@@ -509,7 +509,7 @@ fn weekdays_sorted(days: &[Weekday]) -> Vec<Weekday> {
     days
 }
 
-fn days_in_month(day: NaiveDate) -> u32 {
+pub(crate) fn days_in_month(day: NaiveDate) -> u32 {
     let next = match day.month() {
         12 => NaiveDate::from_ymd_opt(day.year() + 1, 1, 1),
         m => NaiveDate::from_ymd_opt(day.year(), m + 1, 1),

@@ -11,6 +11,9 @@
 //!   own canonical form, and put into words.
 //! - [`expand`]: occurrence maths through the `rrule` crate.
 //! - [`split`]: ending a series just before one occurrence, and what the rest of it needs.
+//! - [`reanchor`]: what a rule becomes when one of its occurrences moves to another day.
+//! - [`remap`]: moving a whole series by one occurrence, its start, end and EXDATEs with it, proved
+//!   occurrence by occurrence.
 //!
 //! Three traps in rrule 0.14 shape this module (each read in the crate's source):
 //! - Its `Display` adds BYHOUR, BYMINUTE and BYSECOND to every rule, so a rule it prints pins the
@@ -22,6 +25,8 @@
 
 pub mod expand;
 pub mod lines;
+pub mod reanchor;
+pub mod remap;
 pub mod spec;
 pub mod split;
 
