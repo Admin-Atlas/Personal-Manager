@@ -431,6 +431,133 @@ pub fn series_rule(lines: &[Line]) -> Result<(&Rule, RuleFacts), TextOnly> {
     Ok((rule, rule.facts()?))
 }
 
+/// Whether two `recurrence` arrays say the same thing, however each is written: in any order, with
+/// EXDATE and RDATE values in any zone or spread over any number of lines, a rule's parts in any order
+/// and its lists sorted any way, `+2TU` or `2TU`, the defaults (`INTERVAL=1`, `WKST=MO`) written out or
+/// not. A line PM can't read compares by its text.
+///
+/// A save reads Google's reply with this to tell a change Google ignored (it answers 200 and keeps
+/// the old UNTIL, a reported fault) from one it applied. Mistaking an applied cut for an ignored one
+/// would undo the rest of a split and lose occurrences, so values are compared as the moments they
+/// name, never as text that Google may write back differently.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
+)]
+pub fn same_recurrence<S: AsRef<str>, T: AsRef<str>>(
+    a: &[S],
+    b: &[T],
+    start: &SeriesStart,
+) -> bool {
+    meaning(&parse(a), start) == meaning(&parse(b), start)
+}
+
+/// What Google's reply to a change of `recurrence` shows, compared by meaning ([`same_recurrence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// The reply holds what was sent.
+    Yes,
+    /// The reply still holds exactly what was there before: Google answered 200 and kept it (a
+    /// reported fault with UNTIL). The only verdict that may undo the steps before it.
+    No,
+    /// Neither: PM can't tell what Google did, so nothing is undone on the strength of it.
+    Unknown,
+}
+
+/// Judge Google's `reply` to a change from `old` to `sent`. `start` places dates and UNTILs; any
+/// start in the series' zone and of its kind will do.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
+)]
+pub fn recurrence_verdict<S: AsRef<str>, T: AsRef<str>, U: AsRef<str>>(
+    sent: &[S],
+    old: &[T],
+    reply: &[U],
+    start: &SeriesStart,
+) -> Applied {
+    if same_recurrence(sent, reply, start) {
+        Applied::Yes
+    } else if same_recurrence(old, reply, start) {
+        Applied::No
+    } else {
+        Applied::Unknown
+    }
+}
+
+/// A `recurrence` array reduced to what it means, every part sortable so order drops out.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Meaning {
+    rules: Vec<Vec<(String, String)>>,
+    exdates: std::collections::BTreeSet<String>,
+    rdates: std::collections::BTreeSet<String>,
+    text: Vec<String>,
+}
+
+fn meaning(lines: &[Line], start: &SeriesStart) -> Meaning {
+    let mut m = Meaning::default();
+    let key = |p: Point| match p {
+        Point::At(t) => t.format("%Y%m%dT%H%M%SZ").to_string(),
+        Point::Day(d) => d.format("%Y%m%d").to_string(),
+    };
+    for line in lines {
+        match &line.kind {
+            Kind::Rule(rule) => {
+                let mut parts: Vec<(String, String)> = rule
+                    .parts
+                    .iter()
+                    .filter(|(k, v)| {
+                        !matches!((k.as_str(), v.as_str()), ("INTERVAL", "1") | ("WKST", "MO"))
+                    })
+                    .map(|(k, v)| {
+                        let v = match k.as_str() {
+                            // Placed exactly as the walk places it, so two UNTILs that end the
+                            // series at the same moment are the same (C8a review V4).
+                            "UNTIL" => Stamp::parse(v)
+                                .and_then(|s| super::expand::until_point(s, start))
+                                .map(key)
+                                .unwrap_or_else(|| v.clone()),
+                            _ => {
+                                let mut items: Vec<&str> = v
+                                    .split(',')
+                                    .map(|i| i.trim().trim_start_matches('+'))
+                                    .collect();
+                                items.sort_unstable();
+                                items.join(",")
+                            }
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect();
+                parts.sort();
+                m.rules.push(parts);
+            }
+            Kind::ExDate(dates) | Kind::RDate(dates) => {
+                let placed: Option<Vec<String>> = dates
+                    .values
+                    .iter()
+                    .map(|v| dates.point(v, start).map(key))
+                    .collect();
+                match (placed, &line.kind) {
+                    (Some(points), Kind::ExDate(_)) => m.exdates.extend(points),
+                    (Some(points), _) => m.rdates.extend(points),
+                    (None, _) => m.text.push(line.raw.trim().to_ascii_uppercase()),
+                }
+            }
+            Kind::ExRule | Kind::Unreadable => m.text.push(line.raw.trim().to_ascii_uppercase()),
+        }
+    }
+    m.rules.sort();
+    m.text.sort();
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +719,185 @@ mod tests {
         let plus = shape(&["RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=+2TU"]).unwrap();
         assert_eq!(plus.by_day[0].text(), "2TU");
         assert_eq!(plus.by_month, vec![10]);
+    }
+
+    /// T11: Google may write a `recurrence` back in another order or with its values in another
+    /// form; what counts is what it means.
+    #[test]
+    fn two_recurrences_are_the_same_when_they_mean_the_same() {
+        let start = SeriesStart::Timed {
+            local: NaiveDate::from_ymd_opt(2026, 10, 5)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            zone: chrono_tz::Europe::London,
+        };
+        let sent = [
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261012T075959Z",
+            "EXDATE;TZID=Europe/London:20261007T090000",
+        ];
+        let same = |reply: &[&str]| same_recurrence(&sent, reply, &start);
+        assert!(same(&sent));
+        // Lines reordered, parts reordered, a list reordered, INTERVAL=1 spelt out, lower case.
+        assert!(same(&[
+            "exdate;tzid=Europe/London:20261007T090000",
+            "RRULE:INTERVAL=1;BYDAY=WE,MO;FREQ=WEEKLY;UNTIL=20261012T075959Z",
+        ]));
+        // The EXDATE in UTC, the UNTIL as the same moment in the series' wall time.
+        assert!(same(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261012T085959",
+            "EXDATE:20261007T080000Z",
+        ]));
+        // Two values on one line or one on each.
+        assert!(same_recurrence(
+            &[
+                "RRULE:FREQ=DAILY",
+                "EXDATE:20261007T080000Z,20261008T080000Z"
+            ],
+            &[
+                "RRULE:FREQ=DAILY",
+                "EXDATE:20261008T080000Z",
+                "EXDATE:20261007T080000Z"
+            ],
+            &start
+        ));
+        // The old UNTIL kept (the reported silent 200), an EXDATE gone, another rule part.
+        assert!(!same(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+            "EXDATE;TZID=Europe/London:20261007T090000",
+        ]));
+        assert!(!same(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261012T075959Z"
+        ]));
+        assert!(!same(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261012T075959Z;INTERVAL=2",
+            "EXDATE;TZID=Europe/London:20261007T090000",
+        ]));
+        // An EXDATE turned into an RDATE isn't the same thing.
+        assert!(!same(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261012T075959Z",
+            "RDATE;TZID=Europe/London:20261007T090000",
+        ]));
+        // The default week start written out, and a "+" on a numbered day.
+        assert!(same_recurrence(
+            &["RRULE:FREQ=MONTHLY;BYDAY=2TU"],
+            &["RRULE:FREQ=MONTHLY;WKST=MO;BYDAY=+2TU"],
+            &start
+        ));
+        assert!(!same_recurrence(
+            &["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"],
+            &["RRULE:FREQ=WEEKLY;WKST=SU;BYDAY=MO,WE"],
+            &start
+        ));
+        // C8a review V4: an UNTIL is placed as the walk places it. A date on a timed series ends
+        // that day in the series' zone; a wall time in the repeated hour is its later pass.
+        assert!(same_recurrence(
+            &["RRULE:FREQ=DAILY;UNTIL=20261012"],
+            &["RRULE:FREQ=DAILY;UNTIL=20261012T225959Z"],
+            &start
+        ));
+        let small_hours = SeriesStart::Timed {
+            local: NaiveDate::from_ymd_opt(2026, 10, 20)
+                .unwrap()
+                .and_hms_opt(1, 45, 0)
+                .unwrap(),
+            zone: chrono_tz::Europe::London,
+        };
+        let wall = ["RRULE:FREQ=DAILY;UNTIL=20261025T013000"];
+        assert!(same_recurrence(
+            &wall,
+            &["RRULE:FREQ=DAILY;UNTIL=20261025T013000Z"],
+            &small_hours
+        ));
+        assert!(!same_recurrence(
+            &wall,
+            &["RRULE:FREQ=DAILY;UNTIL=20261025T003000Z"],
+            &small_hours
+        ));
+        // V5: on an all-day series a date, a UTC time and a wall time name the same day.
+        let all_day = SeriesStart::AllDay(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap());
+        assert!(same_recurrence(
+            &["RRULE:FREQ=DAILY", "EXDATE;VALUE=DATE:20261012"],
+            &["RRULE:FREQ=DAILY", "EXDATE:20261012T000000Z"],
+            &all_day
+        ));
+        assert!(same_recurrence(
+            &["RRULE:FREQ=DAILY;UNTIL=20261012"],
+            &["RRULE:FREQ=DAILY;UNTIL=20261012T000000Z"],
+            &all_day
+        ));
+        // RDATEs pool across lines and zones as EXDATEs do.
+        assert!(same_recurrence(
+            &[
+                "RRULE:FREQ=DAILY",
+                "RDATE:20261007T080000Z,20261008T080000Z"
+            ],
+            &[
+                "RRULE:FREQ=DAILY",
+                "RDATE:20261008T080000Z",
+                "RDATE;TZID=Europe/London:20261007T090000"
+            ],
+            &start
+        ));
+        // Lines PM can't read compare as their text; another COUNT is another rule.
+        assert!(same_recurrence(
+            &["RRULE:FREQ=DAILY", "EXRULE:FREQ=WEEKLY;BYDAY=SA"],
+            &["exrule:freq=weekly;byday=sa", "RRULE:FREQ=DAILY"],
+            &start
+        ));
+        assert!(!same_recurrence(
+            &["RRULE:FREQ=DAILY", "X-PART:A"],
+            &["RRULE:FREQ=DAILY", "X-PART:B"],
+            &start
+        ));
+        assert!(!same_recurrence(
+            &["RRULE:FREQ=DAILY;COUNT=5"],
+            &["RRULE:FREQ=DAILY;COUNT=6"],
+            &start
+        ));
+    }
+
+    /// T11, RM10: only a reply that still holds the old recurrence proves the change wasn't made.
+    #[test]
+    fn a_reply_is_applied_ignored_or_unknown() {
+        let start = SeriesStart::Timed {
+            local: NaiveDate::from_ymd_opt(2026, 10, 5)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            zone: chrono_tz::Europe::London,
+        };
+        let old = ["RRULE:FREQ=WEEKLY;BYDAY=MO"];
+        let cut = ["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261012T075959Z"];
+        let verdict = |reply: &[&str]| recurrence_verdict(&cut, &old, reply, &start);
+        assert_eq!(verdict(&cut), Applied::Yes);
+        assert_eq!(
+            verdict(&["RRULE:UNTIL=20261012T085959;FREQ=WEEKLY;BYDAY=MO"]),
+            Applied::Yes
+        );
+        assert_eq!(verdict(&old), Applied::No);
+        assert_eq!(
+            verdict(&["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261005T075959Z"]),
+            Applied::Unknown
+        );
+        assert_eq!(verdict(&[]), Applied::Unknown);
+        // C8a review V5: a change whose rule means what was there (an "all events" time change
+        // with nothing to move in the rule) is applied when the reply holds it, never ignored.
+        assert_eq!(
+            recurrence_verdict(&old, &old, &["RRULE:BYDAY=MO;FREQ=WEEKLY"], &start),
+            Applied::Yes
+        );
+        // An all-day split sends a date UNTIL.
+        let all_day = SeriesStart::AllDay(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap());
+        let day_cut = ["RRULE:FREQ=DAILY;UNTIL=20261011"];
+        let daily = ["RRULE:FREQ=DAILY"];
+        assert_eq!(
+            recurrence_verdict(&day_cut, &daily, &day_cut, &all_day),
+            Applied::Yes
+        );
+        assert_eq!(
+            recurrence_verdict(&day_cut, &daily, &daily, &all_day),
+            Applied::No
+        );
     }
 }

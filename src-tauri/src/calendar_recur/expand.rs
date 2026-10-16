@@ -7,10 +7,15 @@
 //!
 //! Only the rule goes in. A COUNT counts the starts the rule makes, excluded ones included (RFC 5545
 //! §3.8.5.3), and nothing here needs EXDATEs or RDATEs.
+//!
+//! A timed series is walked by its days, then each day's start placed at the series' wall time as
+//! RFC 5545 reads it ([`walk`]). The crate, given a zone, drops an occurrence on a day whose midnight
+//! the clocks skip (Cairo, Santiago, Havana…) and miscounts a COUNT after it; Google keeps it, an hour
+//! on. Walking days in UTC, where none is ever skipped, gives Google's occurrences everywhere.
 
 use std::cmp::Ordering;
 
-use chrono::{DateTime, Month, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Month, NaiveDate, NaiveTime, TimeZone, Utc};
 use rrule::{Frequency, NWeekday, RRule, RRuleSet};
 
 use super::lines::{self, Freq, RuleFacts, Stamp};
@@ -72,8 +77,9 @@ fn crate_set(facts: &RuleFacts, start: &SeriesStart) -> Option<RRuleSet> {
 }
 
 /// An UNTIL as an instant. A day is inclusive: an all-day series' midnight that day (it repeats in
-/// UTC), a timed series' last second of it.
-fn until_instant(until: Stamp, start: &SeriesStart) -> Option<DateTime<Utc>> {
+/// UTC), a timed series' last second of it. The one reading of an UNTIL everything shares: the walk,
+/// a moved series' new end, and comparing two rules.
+pub(crate) fn until_instant(until: Stamp, start: &SeriesStart) -> Option<DateTime<Utc>> {
     match (until, start) {
         (Stamp::Utc(t), _) => Some(Utc.from_utc_datetime(&t)),
         (Stamp::Wall(t), SeriesStart::AllDay(_)) => Some(Utc.from_utc_datetime(&t)),
@@ -90,12 +96,13 @@ fn until_instant(until: Stamp, start: &SeriesStart) -> Option<DateTime<Utc>> {
     }
 }
 
-/// A crate occurrence as a point in the series.
-fn point_of(occurrence: DateTime<rrule::Tz>, start: &SeriesStart) -> Point {
-    match start {
-        SeriesStart::AllDay(_) => Point::Day(occurrence.date_naive()),
-        SeriesStart::Timed { .. } => Point::At(occurrence.with_timezone(&Utc)),
-    }
+/// An UNTIL as a point of the series: a day for an all-day series, an instant for a timed one.
+pub(crate) fn until_point(until: Stamp, start: &SeriesStart) -> Option<Point> {
+    let at = until_instant(until, start)?;
+    Some(match start {
+        SeriesStart::AllDay(_) => Point::Day(at.date_naive()),
+        SeriesStart::Timed { .. } => Point::At(at),
+    })
 }
 
 /// Every start the one rule in `lines` makes from `start`, for tests that compare expansions.
@@ -103,40 +110,48 @@ fn point_of(occurrence: DateTime<rrule::Tz>, start: &SeriesStart) -> Point {
 pub(super) fn starts<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Vec<Point> {
     let parsed = lines::parse(lines);
     let (_, facts) = lines::series_rule(&parsed).unwrap();
-    let set = crate_set(&facts, start).unwrap();
-    (&set)
-        .into_iter()
-        .take(1_000)
-        .map(|o| point_of(o, start))
-        .collect()
+    let mut out = Vec::new();
+    walk(&facts, start, |p| {
+        out.push(p);
+        out.len() < 1_000
+    })
+    .unwrap();
+    out
 }
 
 /// How many of the rule's starts come before `at`, when `at` is itself one of them. Anything else,
 /// an occurrence the rule doesn't make or one past its end, is [`RecurError::CannotCount`].
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C8, the series planners")
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
 )]
 pub fn occurrences_before(
     facts: &RuleFacts,
     start: &SeriesStart,
     at: Point,
 ) -> Result<u32, RecurError> {
-    match (start, at) {
-        (SeriesStart::Timed { .. }, Point::At(_)) | (SeriesStart::AllDay(_), Point::Day(_)) => {}
-        _ => return Err(RecurError::Mismatch),
-    }
-    let set = crate_set(facts, start).ok_or(RecurError::CannotCount)?;
+    same_kind(start, &at)?;
     let zone = start.zone();
-    let mut before = 0;
-    for occurrence in &set {
-        match point_of(occurrence, start).cmp_in(&at, zone) {
-            Ordering::Less if before < WALK_LIMIT => before += 1,
-            Ordering::Equal => return Ok(before),
-            _ => break,
+    let (mut before, mut found) = (0, false);
+    walk(facts, start, |p| match p.cmp_in(&at, zone) {
+        Ordering::Less => {
+            before += 1;
+            before < WALK_LIMIT
         }
+        Ordering::Equal => {
+            found = true;
+            false
+        }
+        Ordering::Greater => false,
+    })?;
+    if found {
+        Ok(before)
+    } else {
+        Err(RecurError::CannotCount)
     }
-    Err(RecurError::CannotCount)
 }
 
 /// Whether the crate puts `at` where Google does. `google_before` is how many of the series'
@@ -150,6 +165,130 @@ pub fn occurrences_before(
 )]
 pub fn crate_agrees(facts: &RuleFacts, start: &SeriesStart, at: Point, google_before: u32) -> bool {
     occurrences_before(facts, start, at) == Ok(google_before)
+}
+
+/// How far a walk that asks "is this one of them?" goes from a series' start: a daily series begun in
+/// 2012 has already made 5,400 by 2026, and a walk is cheap.
+const MEMBERSHIP_LIMIT: u32 = 100_000;
+
+/// The rule's occurrences from `start`, in order, until `step` says stop. [`RecurError::CannotCount`]
+/// when the crate can't build the rule (a start the clocks skip) or the walk passes
+/// [`MEMBERSHIP_LIMIT`] without being told to stop.
+///
+/// A timed series runs its rule over days (the crate in UTC, where no day is skipped), then places
+/// each day's start at the series' wall time as RFC 5545 reads it ([`rfc_instant`]): a time the clocks
+/// skip lands with the offset from before the jump, a repeated one on its first pass. That is where
+/// Google puts it, and where the crate puts it too except on a day whose midnight the clocks skip,
+/// which the crate drops. An UNTIL then bounds the placed instants, inclusive.
+fn walk(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+    mut step: impl FnMut(Point) -> bool,
+) -> Result<(), RecurError> {
+    let (days, place): (SeriesStart, Box<dyn Fn(NaiveDate) -> Option<Point>>) = match *start {
+        SeriesStart::AllDay(day) => (SeriesStart::AllDay(day), Box::new(|d| Some(Point::Day(d)))),
+        SeriesStart::Timed { local, zone } => {
+            // A series can't start in a skipped hour (Google and the crate disagree there).
+            first_instant(zone, local).ok_or(RecurError::CannotCount)?;
+            let time = local.time();
+            (
+                SeriesStart::AllDay(local.date()),
+                Box::new(move |d: NaiveDate| rfc_instant(zone, d.and_time(time)).map(Point::At)),
+            )
+        }
+    };
+    let until = match (facts.until, start) {
+        (Some(u), SeriesStart::Timed { .. }) => {
+            Some(until_point(u, start).ok_or(RecurError::CannotCount)?)
+        }
+        _ => None,
+    };
+    let by_days = match start {
+        SeriesStart::Timed { .. } => RuleFacts {
+            until: None,
+            ..facts.clone()
+        },
+        SeriesStart::AllDay(_) => facts.clone(),
+    };
+    let set = crate_set(&by_days, &days).ok_or(RecurError::CannotCount)?;
+    let zone = start.zone();
+    for (seen, occurrence) in (&set).into_iter().enumerate() {
+        if seen as u32 >= MEMBERSHIP_LIMIT {
+            return Err(RecurError::CannotCount);
+        }
+        let p = place(occurrence.date_naive()).ok_or(RecurError::CannotCount)?;
+        if until.is_some_and(|u| p.cmp_in(&u, zone) == Ordering::Greater) {
+            return Ok(());
+        }
+        if !step(p) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn same_kind(start: &SeriesStart, at: &Point) -> Result<(), RecurError> {
+    match (start, at) {
+        (SeriesStart::Timed { .. }, Point::At(_)) | (SeriesStart::AllDay(_), Point::Day(_)) => {
+            Ok(())
+        }
+        _ => Err(RecurError::Mismatch),
+    }
+}
+
+/// Whether the rule makes an occurrence exactly at `at`. A carried EXDATE that isn't one any more
+/// excludes nothing, and Google refuses an EXDATE that "doesn't point to a valid instance".
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
+)]
+pub fn is_occurrence(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+    at: Point,
+) -> Result<bool, RecurError> {
+    same_kind(start, &at)?;
+    let zone = start.zone();
+    let mut found = false;
+    walk(facts, start, |p| match p.cmp_in(&at, zone) {
+        Ordering::Less => true,
+        Ordering::Equal => {
+            found = true;
+            false
+        }
+        Ordering::Greater => false,
+    })?;
+    Ok(found)
+}
+
+/// The rule's occurrences from `from` on (inclusive), at most `max` of them: what a moved series is
+/// checked against, occurrence for occurrence.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "first caller lands in C9, editing repeating events"
+    )
+)]
+pub fn occurrences_from(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+    from: Point,
+    max: usize,
+) -> Result<Vec<Point>, RecurError> {
+    same_kind(start, &from)?;
+    let zone = start.zone();
+    let mut out = Vec::new();
+    walk(facts, start, |p| {
+        if p.cmp_in(&from, zone) != Ordering::Less {
+            out.push(p);
+        }
+        out.len() < max
+    })?;
+    Ok(out)
 }
 
 /// The series' first occurrence on or after `start` under `spec`: "Weekly on Monday and Wednesday"
@@ -322,12 +461,170 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn whether_the_rule_makes_an_occurrence_at_a_point() {
+        let mon_wed = facts("RRULE:FREQ=WEEKLY;BYDAY=MO,WE");
+        let start = london(2026, 10, 5, 9);
+        assert_eq!(
+            is_occurrence(&mon_wed, &start, at("2026-10-14T09:00:00+01:00")),
+            Ok(true)
+        );
+        // The right day at the wrong time, and a day the rule skips.
+        assert_eq!(
+            is_occurrence(&mon_wed, &start, at("2026-10-14T10:00:00+01:00")),
+            Ok(false)
+        );
+        assert_eq!(
+            is_occurrence(&mon_wed, &start, at("2026-10-15T09:00:00+01:00")),
+            Ok(false)
+        );
+        // After the clocks go back, 09:00 on the wall is an hour later in UTC.
+        assert_eq!(
+            is_occurrence(&mon_wed, &start, at("2026-10-26T09:00:00Z")),
+            Ok(true)
+        );
+        // Past the end of a COUNT, and before the start.
+        let two = facts("RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=2");
+        assert_eq!(
+            is_occurrence(&two, &start, at("2026-10-12T09:00:00+01:00")),
+            Ok(false)
+        );
+        assert_eq!(
+            is_occurrence(&mon_wed, &start, at("2026-09-28T09:00:00+01:00")),
+            Ok(false)
+        );
+        assert_eq!(
+            is_occurrence(&mon_wed, &start, Point::Day(day(2026, 10, 14))),
+            Err(RecurError::Mismatch)
+        );
+        let yearly = facts("RRULE:FREQ=YEARLY");
+        let leap = SeriesStart::AllDay(day(2028, 2, 29));
+        assert_eq!(
+            is_occurrence(&yearly, &leap, Point::Day(day(2032, 2, 29))),
+            Ok(true)
+        );
+        assert_eq!(
+            is_occurrence(&yearly, &leap, Point::Day(day(2029, 2, 28))),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn occurrences_from_a_point() {
+        let second_wed = facts("RRULE:FREQ=MONTHLY;BYDAY=2WE;COUNT=3");
+        let start = london(2026, 9, 9, 9);
+        assert_eq!(
+            occurrences_from(&second_wed, &start, at("2026-10-01T00:00:00Z"), 10),
+            Ok(vec![
+                at("2026-10-14T09:00:00+01:00"),
+                at("2026-11-11T09:00:00Z")
+            ])
+        );
+        assert_eq!(
+            occurrences_from(&second_wed, &start, at("2026-09-09T08:00:00Z"), 1),
+            Ok(vec![at("2026-09-09T09:00:00+01:00")])
+        );
+        // An UNTIL bounds the placed instants, its own included.
+        let until = facts("RRULE:FREQ=DAILY;UNTIL=20261003T080000Z");
+        assert_eq!(
+            occurrences_from(
+                &until,
+                &london(2026, 10, 1, 9),
+                at("2026-10-01T00:00:00Z"),
+                10
+            ),
+            Ok(vec![
+                at("2026-10-01T08:00:00Z"),
+                at("2026-10-02T08:00:00Z"),
+                at("2026-10-03T08:00:00Z")
+            ])
+        );
+        // A start the clocks skip can't be walked from.
+        let gap = SeriesStart::Timed {
+            local: day(2026, 3, 29).and_hms_opt(1, 30, 0).unwrap(),
+            zone: London,
+        };
+        assert_eq!(
+            occurrences_from(
+                &facts("RRULE:FREQ=DAILY"),
+                &gap,
+                at("2026-04-01T00:00:00Z"),
+                3
+            ),
+            Err(RecurError::CannotCount)
+        );
+    }
+
+    /// RM15, C8a review: on Friday 30-04-2027 Cairo's clocks go from 00:00 to 01:00. The crate drops a
+    /// 00:30 occurrence that day and counts on past it; Google keeps it, at 01:30 summer time (RFC 5545
+    /// reads a skipped time with the offset from before the jump). So does the day walk.
+    #[test]
+    fn a_day_whose_midnight_the_clocks_skip_keeps_its_occurrence() {
+        let cairo = chrono_tz::Africa::Cairo;
+        let start = SeriesStart::Timed {
+            local: day(2027, 4, 27).and_hms_opt(0, 30, 0).unwrap(),
+            zone: cairo,
+        };
+        let on = |d: u32, m: u32| {
+            Point::At(rfc_instant(cairo, day(2027, m, d).and_hms_opt(0, 30, 0).unwrap()).unwrap())
+        };
+        let five = facts("RRULE:FREQ=DAILY;COUNT=5");
+        assert_eq!(on(30, 4), at("2027-04-29T22:30:00Z"));
+        assert_eq!(is_occurrence(&five, &start, on(30, 4)), Ok(true));
+        // Five occurrences end on 01-05, not 02-05.
+        assert_eq!(is_occurrence(&five, &start, on(1, 5)), Ok(true));
+        assert_eq!(is_occurrence(&five, &start, on(2, 5)), Ok(false));
+        assert_eq!(occurrences_before(&five, &start, on(1, 5)), Ok(4));
+        // A Sunday the clocks change at midnight in Santiago, on a Monday rule: simply not one of them.
+        let santiago = chrono_tz::America::Santiago;
+        let mondays = SeriesStart::Timed {
+            local: day(2027, 8, 2).and_hms_opt(9, 0, 0).unwrap(),
+            zone: santiago,
+        };
+        let sunday = Point::At(
+            rfc_instant(santiago, day(2027, 9, 5).and_hms_opt(9, 0, 0).unwrap()).unwrap(),
+        );
+        assert_eq!(
+            is_occurrence(&facts("RRULE:FREQ=WEEKLY;BYDAY=MO"), &mondays, sunday),
+            Ok(false)
+        );
+        // Havana repeats 00:00-01:00 on 07-11-2027: the first 00:30 is the occurrence.
+        let havana = chrono_tz::America::Havana;
+        let nightly = SeriesStart::Timed {
+            local: day(2027, 11, 1).and_hms_opt(0, 30, 0).unwrap(),
+            zone: havana,
+        };
+        let first_pass = havana
+            .from_local_datetime(&day(2027, 11, 7).and_hms_opt(0, 30, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            is_occurrence(&facts("RRULE:FREQ=DAILY"), &nightly, Point::At(first_pass)),
+            Ok(true)
+        );
+    }
+
     /// An impossible rule ends the walk instead of spinning.
     #[test]
     fn a_rule_with_no_occurrence_is_not_a_hang() {
         let never = facts("RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30");
         assert_eq!(
             occurrences_before(&never, &london(2026, 10, 1, 9), at("2027-02-28T09:00:00Z")),
+            Err(RecurError::CannotCount)
+        );
+    }
+
+    /// A walk stops at its limit (a daily series reaches 100,000 in 2299) and says it can't tell,
+    /// rather than run on (C8a fix review).
+    #[test]
+    fn a_walk_past_its_limit_cant_tell() {
+        assert_eq!(
+            is_occurrence(
+                &facts("RRULE:FREQ=DAILY"),
+                &london(2026, 1, 1, 9),
+                at("2300-01-01T09:00:00Z")
+            ),
             Err(RecurError::CannotCount)
         );
     }
