@@ -523,9 +523,13 @@ pub enum SeriesWarning {
     ExceptionsMayReset(u32),
     /// The series' first occurrence moves.
     StartMoved { from: NaiveDate, to: NaiveDate },
-    /// The day the series repeats on moves, as the occurrence at `from` moves to `to`: measured from
+    /// The days the series falls on move, as the occurrence at `from` moves to `to`: measured from
     /// where the occurrence first was, so retiming one that was already moved on its own moves the
-    /// series' day too (AS2a).
+    /// series' days too (AS2a). Raised for any move to another day, whatever the rule, a move of
+    /// whole weeks included. C9 words it from the rule and both dates: the new weekday, day of the
+    /// month or date where the rule names one ("every Sunday → every Monday?"), and how far every
+    /// occurrence moves wherever that is a week or more (a one-day weekly rule may move a week and a
+    /// day) or the rule names no day (daily). A split raises no `StartMoved`, so this is all it says.
     RepeatDayChanges { from: NaiveDate, to: NaiveDate },
     /// Every occurrence gets this occurrence's length.
     LengthChanges,
@@ -2719,6 +2723,29 @@ mod tests {
             .warnings
             .iter()
             .any(|w| matches!(w, SeriesWarning::RepeatDayChanges { .. })));
+    }
+
+    /// A one-day weekly series moved a whole week, now allowed (16-10): it keeps its weekday, and
+    /// every occurrence still moves a week, so both warnings are raised, for C9 to word as "every
+    /// occurrence a week later" rather than "every Monday → every Monday". The rest of a split, which
+    /// has no start-moved warning, is told the same.
+    #[test]
+    fn a_whole_week_on_says_every_occurrence_moves() {
+        let case = Case::new(weekly(), monday_19());
+        let a_week = SeriesWarning::RepeatDayChanges {
+            from: NaiveDate::from_ymd_opt(2026, 10, 19).unwrap(),
+            to: NaiveDate::from_ymd_opt(2026, 10, 26).unwrap(),
+        };
+        let all = case.edit(Scope::All, at("09:00", "2026-10-26")).unwrap();
+        assert!(all.warnings.contains(&SeriesWarning::StartMoved {
+            from: NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+            to: NaiveDate::from_ymd_opt(2026, 10, 12).unwrap()
+        }));
+        assert!(all.warnings.contains(&a_week));
+        let following = case
+            .edit(Scope::Following, at("09:00", "2026-10-26"))
+            .unwrap();
+        assert!(following.warnings.contains(&a_week));
     }
 
     #[test]
