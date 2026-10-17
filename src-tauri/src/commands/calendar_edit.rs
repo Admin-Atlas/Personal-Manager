@@ -7059,6 +7059,13 @@ mod tests {
         }
     }
 
+    /// The claim a held delete of Monday 19-10 keeps through its wait and its send, as the shell's
+    /// handed-off claim does.
+    fn held_claim(host: &TestHost) -> InFlight<'_> {
+        let keys = [series_key(CALENDAR, "abc"), target(&monday_19()).row_id];
+        InFlight::claim_all(&host.edit, &keys).unwrap()
+    }
+
     /// Review round 2: the held series delete's end of wait. An Undo first sends nothing; the wait
     /// first takes the entry, so a late Undo is told it's too late and the delete goes; editing
     /// turned off meanwhile stops it; an entry gone (PM quitting) sends nothing.
@@ -7079,21 +7086,27 @@ mod tests {
                 .unwrap()
         };
 
-        // Undone first.
-        let host = TestHost::holding(&october());
-        let held = planned(&host).await;
-        let _rx = hold(&host);
-        assert!(host.edit.held_deletes.cancel("t"));
-        let silent = Script::new(Vec::new());
-        assert_eq!(
-            finish_held_series_delete(&silent, &*host, &target, &held, true).await,
-            None
-        );
-        silent.asked_all();
+        // Undone first, with editing on or off: nothing is sent and nothing is said.
+        for editing in [EditingStatus::On, EditingStatus::Paused] {
+            let host = TestHost::holding(&october());
+            let held = planned(&host).await;
+            let _claim = held_claim(&host);
+            let _rx = hold(&host);
+            *host.editing.lock().unwrap() = editing;
+            assert!(host.edit.held_deletes.cancel("t"));
+            let silent = Script::new(Vec::new());
+            assert_eq!(
+                finish_held_series_delete(&silent, &*host, &target, &held, true).await,
+                None,
+                "{editing:?}"
+            );
+            silent.asked_all();
+        }
 
-        // The wait first: an Undo during the send is too late, and the delete goes.
+        // The wait first: an Undo during the send is too late, and the delete goes, under the claim.
         let host = TestHost::holding(&october());
         let held = planned(&host).await;
+        let _claim = held_claim(&host);
         let _rx = hold(&host);
         let undoing = Arc::clone(&host);
         let mut steps = october_reads();
@@ -7116,9 +7129,11 @@ mod tests {
         assert!(host.edit.held_deletes.list().is_empty());
         assert!(host.ids().is_empty());
 
-        // Editing turned off during the wait.
+        // Editing turned off during the wait: the entry is taken all the same (a reloaded webview
+        // mustn't get it back), and nothing is sent.
         let host = TestHost::holding(&october());
         let held = planned(&host).await;
+        let _claim = held_claim(&host);
         let _rx = hold(&host);
         *host.editing.lock().unwrap() = EditingStatus::Paused;
         let silent = Script::new(Vec::new());
@@ -7129,11 +7144,13 @@ mod tests {
             })
         );
         silent.asked_all();
+        assert!(host.edit.held_deletes.list().is_empty());
         assert_eq!(host.ids(), ids_of(rows_of(&october())));
 
         // Its entry dropped (PM quitting): nothing goes.
         let host = TestHost::holding(&october());
         let held = planned(&host).await;
+        let _claim = held_claim(&host);
         let _rx = hold(&host);
         host.edit.abandon_held_deletes();
         let silent = Script::new(Vec::new());
@@ -7193,6 +7210,21 @@ mod tests {
                 },
                 false,
             ),
+            // A server error, then the retry refused (a first copy that landed late makes it a
+            // 412): look, and gone means it landed.
+            (
+                vec![
+                    delete(Scripted::Reply {
+                        status: 412,
+                        body: None,
+                        date: None,
+                        maybe_applied: true,
+                    }),
+                    Step::status("/events/solo", "", 404),
+                ],
+                saved(),
+                true,
+            ),
         ];
         for (answers, expected, removed) in cases {
             let host = TestHost::holding(std::slice::from_ref(&event));
@@ -7206,6 +7238,21 @@ mod tests {
                 .unwrap();
             assert_eq!(row.is_none(), removed, "{expected:?}");
         }
+        // Editing turned off during the Undo wait: read again at the send, so nothing goes.
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        *host.editing.lock().unwrap() = EditingStatus::Paused;
+        let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
+        assert_eq!(
+            send_delete(&script, &*host, &target, &seen).await,
+            WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::EditingOff
+            }
+        );
+        script.asked_all();
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap();
+        assert!(row.is_some());
     }
 
     /// A one-event save whose answer never came looks: holding the change, it landed; not, it didn't.
@@ -7241,6 +7288,36 @@ mod tests {
                 vec![patch(Scripted::Unsent(Unsent::SignIn))],
                 WriteOutcome::Reauth,
                 "Dentist",
+            ),
+            // A server error, then the retry refused: look first. Holding the change, it landed;
+            // not, the 412 gets its one fresh round, and that copy lands.
+            (
+                vec![
+                    patch(Scripted::Reply {
+                        status: 412,
+                        body: None,
+                        date: None,
+                        maybe_applied: true,
+                    }),
+                    Step::get("/events/solo", "", renamed.clone()),
+                ],
+                saved(),
+                "Retro",
+            ),
+            (
+                vec![
+                    patch(Scripted::Reply {
+                        status: 412,
+                        body: None,
+                        date: None,
+                        maybe_applied: true,
+                    }),
+                    Step::get("/events/solo", "", event.clone()),
+                    Step::get("/events/solo", "", event.clone()),
+                    patch(Scripted::Json(renamed.clone())),
+                ],
+                saved(),
+                "Retro",
             ),
         ];
         for (answers, expected, title_now) in cases {
