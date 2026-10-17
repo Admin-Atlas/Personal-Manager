@@ -645,56 +645,78 @@ pub async fn update_calendar_event(
         };
         return Ok(save_series(&ctx, &session, open, draft, scope.into(), choice.as_deref()).await);
     }
-    let Some(_flight) = InFlight::claim(&state.calendar_edit, &open.target.row_id) else {
-        return Ok(WriteOutcome::Busy);
+    let token_key = open.target.token_key.clone();
+    Ok(save_event(
+        &GoogleWire(&token_key),
+        &app,
+        &session,
+        &open,
+        &draft,
+        editing,
+    )
+    .await)
+}
+
+/// [`update_calendar_event`] for one event, past its shell: Google through `wire`, the mirror and
+/// the claims through `host`.
+async fn save_event<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    session: &str,
+    open: &EditSession,
+    draft: &EventPatchDraft,
+    editing: EditingStatus,
+) -> WriteOutcome {
+    let Some(_flight) = InFlight::claim(host.edit(), &open.target.row_id) else {
+        return WriteOutcome::Busy;
     };
     let target = &open.target;
 
     // At most two rounds: a 412 means the event changed between our GET and our PATCH, and gets one
     // fresh look (R2); a second 412 is a conflict.
     for round in 1..=2 {
-        let fresh = match fetch(target).await {
+        let fresh = match get(wire, &target.remote_calendar, &target.remote_event).await {
             Fetched::Event(fresh) => fresh,
-            Fetched::Gone => return Ok(land_gone(&app, target, None)),
-            Fetched::Reauth => return Ok(WriteOutcome::Reauth),
-            Fetched::Busy => return Ok(WriteOutcome::Busy),
-            Fetched::Failed(message) => return Ok(WriteOutcome::Failed { message }),
+            Fetched::Gone => return land_gone(host, target, None),
+            Fetched::Reauth => return WriteOutcome::Reauth,
+            Fetched::Busy => return WriteOutcome::Busy,
+            Fetched::Failed(message) => return WriteOutcome::Failed { message },
         };
         if patch::is_gone(&fresh) {
-            return Ok(land_gone(&app, target, Some(&fresh)));
+            return land_gone(host, target, Some(&fresh));
         }
         let facts = facts_from_fresh(&fresh, &target.facts, editing);
         let perms = gate::edit_rights(&facts);
-        if let Some(reason) = refused_field(&perms, &draft) {
-            return Ok(WriteOutcome::ReadOnly { reason });
+        if let Some(reason) = refused_field(&perms, draft) {
+            return WriteOutcome::ReadOnly { reason };
         }
-        let body = match patch::build_patch(&fresh, &draft) {
+        let body = match patch::build_patch(&fresh, draft) {
             Ok(body) => body,
             Err(e) => {
-                return Ok(WriteOutcome::Failed {
+                return WriteOutcome::Failed {
                     message: e.to_string(),
-                })
+                }
             }
         };
         if body.is_empty() {
-            return Ok(WriteOutcome::NoChange);
+            return WriteOutcome::NoChange;
         }
         // Fail closed: a single-event save sends nothing beyond the fields it may change.
         if body.keys().any(|k| !patch::PATCHABLE.contains(&k.as_str())) {
-            return Ok(WriteOutcome::Failed {
+            return WriteOutcome::Failed {
                 message: "PM built a change it isn't allowed to send, so nothing was saved.".into(),
-            });
+            };
         }
         match patch::update_check(&open.base, &fresh, &body) {
             UpdateCheck::Proceed => {}
-            UpdateCheck::Gone => return Ok(land_gone(&app, target, Some(&fresh))),
-            UpdateCheck::Conflict(fields) => return Ok(WriteOutcome::Conflict { fields }),
+            UpdateCheck::Gone => return land_gone(host, target, Some(&fresh)),
+            UpdateCheck::Conflict(fields) => return WriteOutcome::Conflict { fields },
         }
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
-            return Ok(WriteOutcome::Failed {
+            return WriteOutcome::Failed {
                 message: "Google sent this event without a version stamp, so PM won't change it."
                     .into(),
-            });
+            };
         };
         // R7: nobody to email while events with guests stay read-only (C12 adds the choice).
         let request = plan::patch_event(
@@ -705,41 +727,41 @@ pub async fn update_calendar_event(
             Notify::None,
             plan::VersionFlags::default(),
         );
-        let reply = match google_io::send(&target.token_key, &request).await {
+        let reply = match wire.send(&request).await {
             Ok(reply) => reply,
-            Err(google_io::NoAnswer::Unsent { why, .. }) => return Ok(unsent_outcome(why)),
+            Err(google_io::NoAnswer::Unsent { why, .. }) => return unsent_outcome(why),
             // No answer, or a sign-in refused after a server error: it may or may not have landed.
             // Look before saying either (review H1).
             Err(google_io::NoAnswer::Lost { .. }) => {
-                return Ok(after_lost_answer(&app, target, &session, &body).await)
+                return after_lost_answer(wire, host, target, session, &body).await
             }
         };
         // A server error on the way may have been applied, whatever the last answer says (a retry
         // of a copy that landed is answered 412): look before reporting anything but success.
         if reply.maybe_applied && reply.verdict != Verdict::Ok {
-            match fetch(target).await {
+            match get(wire, &target.remote_calendar, &target.remote_event).await {
                 Fetched::Event(now) if patch::already_applied(&now, &body) => {
-                    return Ok(land_saved(&app, target, &session, now, &body));
+                    return land_saved(host, target, session, now, &body);
                 }
                 Fetched::Event(_) => {}
-                Fetched::Gone => return Ok(land_gone(&app, target, None)),
-                _ => return Ok(WriteOutcome::Unconfirmed),
+                Fetched::Gone => return land_gone(host, target, None),
+                _ => return WriteOutcome::Unconfirmed,
             }
         }
         match reply.verdict {
             Verdict::Ok => {
-                return Ok(match serde_json::from_str::<Value>(&reply.body) {
-                    Ok(saved) => land_saved(&app, target, &session, saved, &body),
+                return match serde_json::from_str::<Value>(&reply.body) {
+                    Ok(saved) => land_saved(host, target, session, saved, &body),
                     // Saved, but the reply wasn't JSON: the next sync will show it.
-                    Err(_) => saved_pending(&app, target),
-                });
+                    Err(_) => saved_pending(host, target),
+                };
             }
             Verdict::Conflict if round == 1 => continue,
-            Verdict::Gone => return Ok(land_gone(&app, target, None)),
-            verdict => return Ok(outcome_for(verdict, editing)),
+            Verdict::Gone => return land_gone(host, target, None),
+            verdict => return outcome_for(verdict, editing),
         }
     }
-    Ok(WriteOutcome::Conflict { fields: Vec::new() })
+    WriteOutcome::Conflict { fields: Vec::new() }
 }
 
 /// Delete an event after an Undo window (plan Q2). The delete is held here in the backend, so it
@@ -832,7 +854,7 @@ pub async fn delete_calendar_event(
                 return;
             }
         }
-        let result = send_delete(&task_app, &target, &seen).await;
+        let result = send_delete(&GoogleWire(&target.token_key), &task_app, &target, &seen).await;
         let _ = task_app.emit_to(
             "main",
             "calendar://delete-settled",
@@ -976,32 +998,30 @@ pub fn list_held_deletes(app: AppHandle, window: tauri::Window) -> Result<Vec<He
 /// Send a held delete: a fresh copy, the gate, the "is it still what you saw" rule, then a DELETE
 /// guarded by the etag. Editing is read again here, since it may have been turned off while the
 /// delete waited.
-async fn send_delete(app: &AppHandle, target: &Target, seen: &SeenSummary) -> WriteOutcome {
-    let choice = {
-        let state = app.state::<AppState>();
-        let choice = state
-            .conn()
-            .and_then(|conn| calendar_editing::choice(&conn, &target.email));
-        match choice {
-            Ok(choice) => choice,
-            Err(e) => {
-                return WriteOutcome::Failed {
-                    message: e.to_string(),
-                }
+async fn send_delete<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    seen: &SeenSummary,
+) -> WriteOutcome {
+    let editing = match host.editing(target) {
+        Ok(editing) => editing,
+        Err(e) => {
+            return WriteOutcome::Failed {
+                message: e.to_string(),
             }
         }
     };
-    let editing = editing_status(choice, &target.token_key);
     for round in 1..=2 {
-        let fresh = match fetch(target).await {
+        let fresh = match get(wire, &target.remote_calendar, &target.remote_event).await {
             Fetched::Event(fresh) => fresh,
-            Fetched::Gone => return land_gone(app, target, None),
+            Fetched::Gone => return land_gone(host, target, None),
             Fetched::Reauth => return WriteOutcome::Reauth,
             Fetched::Busy => return WriteOutcome::Busy,
             Fetched::Failed(message) => return WriteOutcome::Failed { message },
         };
         if patch::is_gone(&fresh) {
-            return land_gone(app, target, Some(&fresh));
+            return land_gone(host, target, Some(&fresh));
         }
         let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
         if !perms.delete {
@@ -1015,12 +1035,12 @@ async fn send_delete(app: &AppHandle, target: &Target, seen: &SeenSummary) -> Wr
         }
         match patch::delete_still_matches(seen, &fresh) {
             DeleteCheck::Matches => {}
-            DeleteCheck::Gone => return land_gone(app, target, Some(&fresh)),
+            DeleteCheck::Gone => return land_gone(host, target, Some(&fresh)),
             DeleteCheck::Changed(fields) => {
                 // Show what Google holds now, so the row that comes back is the changed one and a
                 // second delete compares against it rather than conflicting again.
                 if let Some(row) = calendar::parse_event(&target.calendar_id, &fresh) {
-                    let _ = land(app, target, vec![row], Vec::new());
+                    let _ = land(host, target, vec![row], Vec::new());
                 }
                 return WriteOutcome::Conflict { fields };
             }
@@ -1037,14 +1057,14 @@ async fn send_delete(app: &AppHandle, target: &Target, seen: &SeenSummary) -> Wr
             etag,
             Notify::None,
         );
-        let reply = match google_io::send(&target.token_key, &request).await {
+        let reply = match wire.send(&request).await {
             Ok(reply) => reply,
             Err(google_io::NoAnswer::Unsent { why, .. }) => return unsent_outcome(why),
             // No answer, or a sign-in refused after a server error: look. Gone means it landed;
             // still there means it didn't (review H1).
             Err(google_io::NoAnswer::Lost { .. }) => {
-                return match still_there(target).await {
-                    Some(false) => land_deleted(app, target, &fresh),
+                return match still_there(wire, target).await {
+                    Some(false) => land_deleted(host, target, &fresh),
                     Some(true) => WriteOutcome::Failed {
                         message: "PM lost touch with Google, and the event is still there. \
                                   Nothing was deleted; try again."
@@ -1057,15 +1077,15 @@ async fn send_delete(app: &AppHandle, target: &Target, seen: &SeenSummary) -> Wr
         // A server error on the way may have been applied (a retry of a delete that landed is
         // answered 412 or 410): look before reporting anything but success.
         if reply.maybe_applied && !matches!(reply.verdict, Verdict::Ok | Verdict::Gone) {
-            match still_there(target).await {
-                Some(false) => return land_deleted(app, target, &fresh),
+            match still_there(wire, target).await {
+                Some(false) => return land_deleted(host, target, &fresh),
                 Some(true) => {}
                 None => return WriteOutcome::Unconfirmed,
             }
         }
         match reply.verdict {
             // 2xx, or already gone: either way it's gone from Google now.
-            Verdict::Ok | Verdict::Gone => return land_deleted(app, target, &fresh),
+            Verdict::Ok | Verdict::Gone => return land_deleted(host, target, &fresh),
             Verdict::Conflict if round == 1 => continue,
             verdict => return outcome_for(verdict, editing),
         }
@@ -2013,7 +2033,8 @@ async fn land_series<W: Wire, H: Host>(
             ..
         } => {
             if plan.scope == Scope::This {
-                return land_gone(host, target, None);
+                // At the version planned from, so a restore after it shows.
+                return land_gone(host, target, Some(planning.instance.json()));
             }
             // The series itself is gone: every row of it goes, no older than its last copies.
             let floor = diff::floor_of(series_moments(planning).iter().map(String::as_str));
@@ -2407,54 +2428,34 @@ async fn start_series_delete(
         Instant::now() + UNDO,
     )?;
     let hidden = held.hidden.clone();
-    let (task_app, token) = (app.clone(), undo_token.clone());
+    let held = HeldSeriesDelete {
+        token: undo_token.clone(),
+        event_id,
+        seen,
+        scope,
+        plan: held,
+    };
+    let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _claim = claim;
-        let cancelled = tokio::select! {
+        let undone = tokio::select! {
             _ = tokio::time::sleep(UNDO) => false,
             _ = undone => true,
         };
-        {
-            let state = task_app.state::<AppState>();
-            // Whoever takes the entry decides: an Undo that got there first wins.
-            if cancelled || !state.calendar_edit.held_deletes.take(&token) {
-                return;
-            }
-        }
-        // Editing may have been turned off during the wait.
-        let editing = match editing_now(&task_app, &target) {
-            Ok(editing) => editing,
-            Err(result) => {
-                let _ = task_app.emit_to(
-                    "main",
-                    "calendar://delete-settled",
-                    DeleteSettled {
-                        undo_token: token,
-                        event_id,
-                        result,
-                    },
-                );
-                return;
-            }
-        };
         let wire = GoogleWire(&target.token_key);
-        let ctx = SeriesWrite {
-            wire: &wire,
-            host: &task_app,
-            target: &target,
-            editing,
-            missing_ok: cfg!(debug_assertions),
-        };
-        let result = send_held_series_delete(&ctx, &event_id, &seen, scope, &held).await;
-        let _ = task_app.emit_to(
-            "main",
-            "calendar://delete-settled",
-            DeleteSettled {
-                undo_token: token,
-                event_id,
-                result,
-            },
-        );
+        if let Some(result) =
+            finish_held_series_delete(&wire, &task_app, &target, &held, undone).await
+        {
+            let _ = task_app.emit_to(
+                "main",
+                "calendar://delete-settled",
+                DeleteSettled {
+                    undo_token: held.token.clone(),
+                    event_id: held.event_id.clone(),
+                    result,
+                },
+            );
+        }
     });
     Ok(DeleteStart::Held {
         undo_token,
@@ -2463,19 +2464,52 @@ async fn start_series_delete(
     })
 }
 
+/// A series delete waiting out its Undo window: its token there, the row and what the user saw of
+/// it, the scope, and the plan chosen.
+struct HeldSeriesDelete {
+    token: String,
+    event_id: String,
+    seen: SeenSummary,
+    scope: Scope,
+    plan: HeldPlan,
+}
+
+/// A held series delete at the end of its wait (`undone`: an Undo ended it). Whoever takes its entry
+/// decides, so an Undo that got there first wins; then editing is read again, since it may have
+/// been turned off meanwhile, and the delete is planned again and sent. `None`: undone, nothing
+/// sent and nothing to say.
+async fn finish_held_series_delete<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    held: &HeldSeriesDelete,
+    undone: bool,
+) -> Option<WriteOutcome> {
+    if undone || !host.edit().held_deletes.take(&held.token) {
+        return None;
+    }
+    let editing = match editing_now(host, target) {
+        Ok(editing) => editing,
+        Err(result) => return Some(result),
+    };
+    let ctx = SeriesWrite {
+        wire,
+        host,
+        target,
+        editing,
+        missing_ok: cfg!(debug_assertions),
+    };
+    Some(send_held_series_delete(&ctx, &held.event_id, &held.seen, held.scope, &held.plan).await)
+}
+
 /// The account's editing status now, for a send after a wait.
 fn editing_now(
-    app: &AppHandle,
+    host: &impl Host,
     target: &Target,
 ) -> std::result::Result<EditingStatus, WriteOutcome> {
-    let choice = app
-        .state::<AppState>()
-        .conn()
-        .and_then(|conn| calendar_editing::choice(&conn, &target.email))
-        .map_err(|e| WriteOutcome::Failed {
-            message: e.to_string(),
-        })?;
-    let editing = editing_status(choice, &target.token_key);
+    let editing = host.editing(target).map_err(|e| WriteOutcome::Failed {
+        message: e.to_string(),
+    })?;
     if editing != EditingStatus::On {
         return Err(WriteOutcome::ReadOnly {
             reason: ReadOnlyReason::EditingOff,
@@ -2904,15 +2938,16 @@ const QUOTA: &str = "This Google account has reached one of Google Calendar's us
                      within a day.";
 
 /// A save whose answer never arrived: GET the event and see whether it landed.
-async fn after_lost_answer(
-    app: &AppHandle,
+async fn after_lost_answer<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
     target: &Target,
     session: &str,
     body: &serde_json::Map<String, Value>,
 ) -> WriteOutcome {
-    match fetch(target).await {
+    match get(wire, &target.remote_calendar, &target.remote_event).await {
         Fetched::Event(now) if patch::already_applied(&now, body) => {
-            land_saved(app, target, session, now, body)
+            land_saved(host, target, session, now, body)
         }
         Fetched::Event(_) => WriteOutcome::Failed {
             message: "PM lost touch with Google, and your change isn't there. Nothing was saved; \
@@ -2925,8 +2960,8 @@ async fn after_lost_answer(
 
 /// After a delete whose answer can't be trusted: whether the event is still in Google, or `None`
 /// when PM couldn't look.
-async fn still_there(target: &Target) -> Option<bool> {
-    match fetch(target).await {
+async fn still_there<W: Wire>(wire: &W, target: &Target) -> Option<bool> {
+    match get(wire, &target.remote_calendar, &target.remote_event).await {
         Fetched::Gone => Some(false),
         Fetched::Event(now) => Some(!patch::is_gone(&now)),
         _ => None,
@@ -3002,6 +3037,12 @@ trait Host: Sync {
     /// The mirror's part in a series write. Its window follows the clock, so the tests fix it here.
     fn mirror(&self, calendar_id: &str) -> Result<MirrorFacts> {
         self.with_conn(|conn| MirrorFacts::read(conn, calendar_id))
+    }
+    /// The account's editing status now: its stored choice, then its token's scope (a keychain read,
+    /// with the DB lock let go first; the tests set it instead).
+    fn editing(&self, target: &Target) -> Result<EditingStatus> {
+        let choice = self.with_conn(|conn| calendar_editing::choice(conn, &target.email))?;
+        Ok(editing_status(choice, &target.token_key))
     }
 }
 
@@ -5356,6 +5397,8 @@ mod tests {
         db: Mutex<Connection>,
         edit: CalendarEditState,
         told: Mutex<Vec<String>>,
+        /// The account's editing status, never read from the keychain here.
+        editing: Mutex<EditingStatus>,
         _dir: tempfile::TempDir,
     }
 
@@ -5375,6 +5418,7 @@ mod tests {
                 db: Mutex::new(conn),
                 edit: CalendarEditState::default(),
                 told: Mutex::new(Vec::new()),
+                editing: Mutex::new(EditingStatus::On),
                 _dir: dir,
             })
         }
@@ -5445,6 +5489,10 @@ mod tests {
                 series_ids,
                 window: mirror(&[]).window,
             })
+        }
+
+        fn editing(&self, _target: &Target) -> Result<EditingStatus> {
+            Ok(*self.editing.lock().unwrap())
         }
     }
 
@@ -6851,6 +6899,374 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Gone);
         assert!(host.ids().is_empty());
         assert_eq!(host.told(), ["cal"]);
+    }
+
+    /// Review round 2: a "this and following" delete floors what it removes at the cut's own
+    /// `updated`, so a sync already running that lists an occurrence it cancelled, at the version
+    /// changed in Google since the last sync, can't bring it back.
+    #[tokio::test]
+    async fn a_cut_delete_floors_its_removals_at_the_cuts_reply() {
+        let mut events = october();
+        events.push(off_site());
+        let host = TestHost::holding(&events);
+        let changed = with(
+            written(
+                &off_site(),
+                &[("summary", json!("Off-site (room 2)"))],
+                "\"o1\"",
+            ),
+            "updated",
+            json!("2026-10-17T11:00:00.000Z"),
+        );
+        let reads_now = || {
+            reads(
+                &monday_19(),
+                &weekly(),
+                vec![weekly(), changed.clone()],
+                vec![monday_19(), plain("2026-10-26T09:00:00Z"), changed.clone()],
+            )
+        };
+        let cancelled = written(&changed, &[("status", json!("cancelled"))], "\"o2\"");
+        let mut steps = reads_now();
+        steps.extend(reads_now());
+        steps.extend([
+            series_patch(Scripted::Json(cut_series(vec![changed.clone()]))),
+            Step::write(
+                Method::Patch,
+                "/events/abc_20261102T090000Z",
+                "\"o1\"",
+                Scripted::Json(cancelled.clone()),
+            ),
+            refetch_read(Scripted::Json(page(
+                vec![october()[0].clone(), cancelled],
+                None,
+            ))),
+        ]);
+        let script = Script::new(steps);
+        let before = Instant::now();
+        let outcome = held_delete(&host, &script, &monday_19(), Scope::Following).await;
+        script.asked_all();
+        assert_eq!(outcome, saved());
+        assert_eq!(host.ids(), ["cal:abc_20261012T080000Z"]);
+        let row = "cal:abc_20261102T090000Z".to_string();
+        assert!(!ids_of(host.synced(std::slice::from_ref(&changed), before)).contains(&row));
+        let later = with(
+            with(changed, "etag", json!("\"o3\"")),
+            "updated",
+            json!("2026-10-17T12:00:01.000Z"),
+        );
+        assert!(ids_of(host.synced(&[later], Instant::now())).contains(&row));
+    }
+
+    /// Review round 2: a whole-series delete proved without a reply (a lost answer, then a 404) is
+    /// floored at the series' copies alone, so each occurrence changed on its own counts.
+    #[tokio::test]
+    async fn a_series_delete_proved_without_a_reply_is_floored_at_its_changed_occurrences() {
+        let host = TestHost::holding(&october());
+        let demo = written(
+            &plain("2026-10-26T09:00:00Z"),
+            &[("summary", json!("Demo"))],
+            "\"d2\"",
+        );
+        let reads_now = || {
+            reads(
+                &monday_19(),
+                &weekly(),
+                vec![weekly(), demo.clone()],
+                vec![monday_19(), demo.clone()],
+            )
+        };
+        let mut steps = reads_now();
+        steps.extend(reads_now());
+        steps.extend([
+            Step::write(
+                Method::Delete,
+                "/events/abc",
+                "\"m1\"",
+                Scripted::Lost { retried: false },
+            ),
+            Step::status("/events/abc", "", 404),
+            refetch_read(Scripted::Status(410)),
+        ]);
+        let script = Script::new(steps);
+        let before = Instant::now();
+        assert_eq!(
+            held_delete(&host, &script, &monday_19(), Scope::All).await,
+            saved()
+        );
+        script.asked_all();
+        assert!(host.ids().is_empty());
+        assert!(host.synced(&[demo], before).is_empty());
+    }
+
+    /// Review round 2: a "this event" edit that meets its occurrence gone takes that row alone off,
+    /// at the version planned from; the series is still there, and so is the editor.
+    #[tokio::test]
+    async fn a_this_edit_that_meets_its_occurrence_gone_takes_only_that_row() {
+        let host = TestHost::holding(&october());
+        let instance = monday_19();
+        let mut steps = october_reads();
+        steps.push(Step::write(
+            Method::Patch,
+            "/events/abc_20261019T080000Z",
+            instance["etag"].as_str().unwrap(),
+            Scripted::Status(404),
+        ));
+        let script = Script::new(steps);
+        let (outcome, session) = save(
+            &host,
+            &script,
+            &instance,
+            &weekly(),
+            title("Retro"),
+            Scope::This,
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(outcome, WriteOutcome::Gone);
+        assert_eq!(
+            host.ids(),
+            ["cal:abc_20261012T080000Z", "cal:abc_20261026T090000Z"]
+        );
+        assert_eq!(host.told(), ["cal"]);
+        assert!(open_session(&host.edit, &session).unwrap().is_some());
+        // Restored in Google afterwards, under another etag: it shows again.
+        let restored = with(
+            with(instance, "etag", json!("\"r9\"")),
+            "updated",
+            json!("2026-10-17T12:00:00.000Z"),
+        );
+        let shown = ids_of(host.synced(&[restored], Instant::now()));
+        assert!(shown.contains(&"cal:abc_20261019T080000Z".to_string()));
+    }
+
+    /// An "all events" delete of Monday 19-10, planned in `host` and held under the token "t".
+    async fn planned(host: &TestHost) -> HeldSeriesDelete {
+        let instance = monday_19();
+        let target = target(&instance);
+        let seen = seen_by_user(&fresh_event(instance));
+        let script = Script::new(october_reads());
+        let ctx = writer(&script, host, &target);
+        let (_, plan) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None)
+            .await
+            .unwrap();
+        HeldSeriesDelete {
+            token: "t".into(),
+            event_id: target.row_id,
+            seen,
+            scope: Scope::All,
+            plan,
+        }
+    }
+
+    /// Review round 2: the held series delete's end of wait. An Undo first sends nothing; the wait
+    /// first takes the entry, so a late Undo is told it's too late and the delete goes; editing
+    /// turned off meanwhile stops it; an entry gone (PM quitting) sends nothing.
+    #[tokio::test]
+    async fn a_held_series_delete_ends_its_wait_as_whoever_took_it_says() {
+        let instance = monday_19();
+        let target = target(&instance);
+        let hold = |host: &TestHost| {
+            host.edit
+                .held_deletes
+                .hold(
+                    "t",
+                    &target.row_id,
+                    "Standup",
+                    Vec::new(),
+                    Instant::now() + UNDO,
+                )
+                .unwrap()
+        };
+
+        // Undone first.
+        let host = TestHost::holding(&october());
+        let held = planned(&host).await;
+        let _rx = hold(&host);
+        assert!(host.edit.held_deletes.cancel("t"));
+        let silent = Script::new(Vec::new());
+        assert_eq!(
+            finish_held_series_delete(&silent, &*host, &target, &held, true).await,
+            None
+        );
+        silent.asked_all();
+
+        // The wait first: an Undo during the send is too late, and the delete goes.
+        let host = TestHost::holding(&october());
+        let held = planned(&host).await;
+        let _rx = hold(&host);
+        let undoing = Arc::clone(&host);
+        let mut steps = october_reads();
+        steps[0] = instance_read(&instance).then(move || {
+            assert!(!undoing.edit.held_deletes.cancel("t"), "too late to undo");
+        });
+        steps.push(Step::write(
+            Method::Delete,
+            "/events/abc",
+            "\"m1\"",
+            Scripted::Status(204),
+        ));
+        steps.push(refetch_read(Scripted::Status(410)));
+        let script = Script::new(steps);
+        assert_eq!(
+            finish_held_series_delete(&script, &*host, &target, &held, false).await,
+            Some(saved())
+        );
+        script.asked_all();
+        assert!(host.edit.held_deletes.list().is_empty());
+        assert!(host.ids().is_empty());
+
+        // Editing turned off during the wait.
+        let host = TestHost::holding(&october());
+        let held = planned(&host).await;
+        let _rx = hold(&host);
+        *host.editing.lock().unwrap() = EditingStatus::Paused;
+        let silent = Script::new(Vec::new());
+        assert_eq!(
+            finish_held_series_delete(&silent, &*host, &target, &held, false).await,
+            Some(WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::EditingOff
+            })
+        );
+        silent.asked_all();
+        assert_eq!(host.ids(), ids_of(rows_of(&october())));
+
+        // Its entry dropped (PM quitting): nothing goes.
+        let host = TestHost::holding(&october());
+        let held = planned(&host).await;
+        let _rx = hold(&host);
+        host.edit.abandon_held_deletes();
+        let silent = Script::new(Vec::new());
+        assert_eq!(
+            finish_held_series_delete(&silent, &*host, &target, &held, false).await,
+            None
+        );
+        silent.asked_all();
+    }
+
+    // --- one event, unscoped (review round 2: H1's routing through the shells' own paths) ---
+
+    fn dentist() -> Value {
+        json!({
+            "id": "solo", "etag": "\"s1\"", "summary": "Dentist", "status": "confirmed",
+            "updated": "2026-10-01T10:00:00.000Z",
+            "organizer": { "self": true },
+            "start": { "dateTime": "2026-10-12T09:00:00+01:00" },
+            "end": { "dateTime": "2026-10-12T10:00:00+01:00" }
+        })
+    }
+
+    /// A one-event delete whose answer never came looks: gone means it landed, still there means
+    /// it didn't; one never sent says why and doesn't look.
+    #[tokio::test]
+    async fn an_unscoped_delete_looks_after_a_lost_answer_and_not_after_an_unsent_one() {
+        let event = dentist();
+        let target = target(&event);
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let delete =
+            |answer: Scripted| Step::write(Method::Delete, "/events/solo", "\"s1\"", answer);
+        let cases = [
+            (
+                vec![
+                    delete(Scripted::Lost { retried: false }),
+                    Step::status("/events/solo", "", 404),
+                ],
+                saved(),
+                true,
+            ),
+            (
+                vec![
+                    delete(Scripted::Lost { retried: true }),
+                    Step::get("/events/solo", "", event.clone()),
+                ],
+                WriteOutcome::Failed {
+                    message: "PM lost touch with Google, and the event is still there. \
+                              Nothing was deleted; try again."
+                        .into(),
+                },
+                false,
+            ),
+            (
+                vec![delete(Scripted::Unsent(Unsent::Offline))],
+                WriteOutcome::Failed {
+                    message: OFFLINE.into(),
+                },
+                false,
+            ),
+        ];
+        for (answers, expected, removed) in cases {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let mut steps = vec![Step::get("/events/solo", "", event.clone())];
+            steps.extend(answers);
+            let script = Script::new(steps);
+            assert_eq!(send_delete(&script, &*host, &target, &seen).await, expected);
+            script.asked_all();
+            let row = host
+                .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+                .unwrap();
+            assert_eq!(row.is_none(), removed, "{expected:?}");
+        }
+    }
+
+    /// A one-event save whose answer never came looks: holding the change, it landed; not, it didn't.
+    /// One never sent says why and doesn't look.
+    #[tokio::test]
+    async fn an_unscoped_save_looks_after_a_lost_answer_and_not_after_an_unsent_one() {
+        let event = dentist();
+        let target = target(&event);
+        let patch = |answer: Scripted| Step::write(Method::Patch, "/events/solo", "\"s1\"", answer);
+        let renamed = retitled(&event, "\"s2\"");
+        let cases = [
+            (
+                vec![
+                    patch(Scripted::Lost { retried: false }),
+                    Step::get("/events/solo", "", renamed.clone()),
+                ],
+                saved(),
+                "Retro",
+            ),
+            (
+                vec![
+                    patch(Scripted::Lost { retried: false }),
+                    Step::get("/events/solo", "", event.clone()),
+                ],
+                WriteOutcome::Failed {
+                    message: "PM lost touch with Google, and your change isn't there. Nothing \
+                              was saved; try again."
+                        .into(),
+                },
+                "Dentist",
+            ),
+            (
+                vec![patch(Scripted::Unsent(Unsent::SignIn))],
+                WriteOutcome::Reauth,
+                "Dentist",
+            ),
+        ];
+        for (answers, expected, title_now) in cases {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+            let open = open_session(&host.edit, &session).unwrap().unwrap();
+            let mut steps = vec![Step::get("/events/solo", "", event.clone())];
+            steps.extend(answers);
+            let script = Script::new(steps);
+            let outcome = save_event(
+                &script,
+                &*host,
+                &session,
+                &open,
+                &title("Retro"),
+                EditingStatus::On,
+            )
+            .await;
+            script.asked_all();
+            assert_eq!(outcome, expected);
+            let row = host
+                .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.summary, title_now, "{expected:?}");
+        }
     }
 
     // --- the sender's folds (review H1, L6) ---
