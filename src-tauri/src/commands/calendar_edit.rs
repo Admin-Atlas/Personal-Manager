@@ -33,6 +33,7 @@ use crate::calendar::{self, CalendarEvent, CalendarFacts};
 use crate::calendar_editing::{self, EditingStatus};
 use crate::calendar_recur::lines;
 use crate::calendar_recur::spec::{day_phrase, describe_lines};
+use crate::calendar_recur::Point;
 use crate::calendar_write::classify::Verdict;
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
@@ -49,7 +50,7 @@ use crate::calendar_write::series::plan::{
 };
 use crate::calendar_write::series::scope::{is_first, scope_options, Change, Row, Scope};
 use crate::calendar_write::series::{
-    text_only, Exceptions, FreshEvent, Listing, Master, SeriesRefusal,
+    guests_on, original_of, text_only, Exceptions, FreshEvent, Listing, Master, SeriesRefusal,
 };
 use crate::calendar_write::{plan, time};
 use crate::error::{Error, Result};
@@ -94,6 +95,32 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 
 /// Lapsed after hours open, or PM restarted since it was opened.
 const SESSION_ENDED: &str = "This editor's session has ended. Open the event again.";
+
+/// Keep a new editor's copies (the event, and an occurrence's series) under a fresh session id, and
+/// let lapsed sessions go.
+fn keep_session(
+    edit: &CalendarEditState,
+    target: Target,
+    base: Value,
+    master: Option<Value>,
+) -> Result<String> {
+    let session = new_session_id();
+    let mut sessions = edit
+        .sessions
+        .lock()
+        .map_err(|_| Error::Other("editor sessions lock poisoned".into()))?;
+    sessions.retain(|_, s| s.opened.elapsed() < SESSION_TTL);
+    sessions.insert(
+        session.clone(),
+        EditSession {
+            target,
+            base,
+            master,
+            opened: Instant::now(),
+        },
+    );
+    Ok(session)
+}
 
 /// The open editor `session` names, unless it has lapsed.
 fn open_session(edit: &CalendarEditState, session: &str) -> Result<Option<EditSession>> {
@@ -454,12 +481,12 @@ pub async fn get_calendar_event_for_edit(
         land_gone(&app, &target, Some(&fresh));
         return Ok(EditLoad::Gone);
     }
-    let permissions = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
     // An occurrence's series as it is now, kept with the session for "all events" and "this and
     // following". Only needed for those, so a series PM can't fetch or read leaves the editor open,
     // and those choices say they can't go ahead.
-    let master = open_master(&GoogleWire(&target.token_key), &target, &fresh).await;
+    let (fresh, master) = open_series(&GoogleWire(&target.token_key), &target, fresh).await;
     let series = master.as_ref().and_then(|m| series_info(&fresh, m));
+    let permissions = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
     // Only for a start or end Google sent without a zone: the calendar's zone, else this computer's.
     // Never a guessed UTC (rule R6).
     let fallback = target
@@ -476,24 +503,7 @@ pub async fn get_calendar_event_for_edit(
         });
     };
     let seen = seen_of(&target.calendar_id, &fresh);
-    let session = new_session_id();
-    {
-        let mut sessions = state
-            .calendar_edit
-            .sessions
-            .lock()
-            .map_err(|_| Error::Other("editor sessions lock poisoned".into()))?;
-        sessions.retain(|_, s| s.opened.elapsed() < SESSION_TTL);
-        sessions.insert(
-            session.clone(),
-            EditSession {
-                target,
-                base: fresh,
-                master,
-                opened: Instant::now(),
-            },
-        );
-    }
+    let session = keep_session(&state.calendar_edit, target, fresh, master)?;
     Ok(EditLoad::Ready {
         session,
         event: Box::new(event),
@@ -501,6 +511,21 @@ pub async fn get_calendar_event_for_edit(
         seen,
         series,
     })
+}
+
+/// The occurrence `fresh` as the editor opens it, and its series to keep. The occurrence is read
+/// again after the series, so the editor's copy is always the later one: a change to the series
+/// between the two reads shows in the occurrence but not in the kept series, and so meets a save of
+/// "all events" as a conflict instead of slipping past it (R2). Without that second read, the series
+/// isn't kept.
+async fn open_series<W: Wire>(wire: &W, target: &Target, fresh: Value) -> (Value, Option<Value>) {
+    let Some(master) = open_master(wire, target, &fresh).await else {
+        return (fresh, None);
+    };
+    match get(wire, &target.remote_calendar, &target.remote_event).await {
+        Fetched::Event(again) if !patch::is_gone(&again) => (again, Some(master)),
+        _ => (fresh, None),
+    }
 }
 
 /// The series of the occurrence `fresh`, as Google holds it now, or `None` for a one-off or a series
@@ -957,6 +982,10 @@ const GUESTS_ALLOWED: bool = false;
 const EXCEPTION_PAGES: usize = 10;
 const OCCURRENCE_PAGES: usize = 20;
 
+/// What the cross-check reads of each occurrence in the window ([`Exceptions::cross_checked`]).
+const WINDOW_FIELDS: &str = "nextPageToken,items(id,status,recurringEventId,originalStartTime,\
+                             start,end,summary,attendees(email,self,optional),attendeesOmitted)";
+
 /// What a change to a repeating occurrence offers: "This event", "This and following" and "All
 /// events", each planned now against Google's copies, so the dialog shows what each would do, or why
 /// it can't (DS12). Only reads go to Google. `ChoiceRequest::Edit` names an open editor and its
@@ -1044,6 +1073,9 @@ struct Series {
     counted: Option<Listing>,
     /// Another part of it was split off earlier: in Google (`_R`) or by PM (`pmSplitOf`).
     sibling: bool,
+    /// Where the occurrences in the window with guests of their own sit (the series has none, or it
+    /// was refused): read from Google's occurrences, so one the listing lacks still counts.
+    guests: Vec<Point>,
     /// For the dev report: whether the listing ran to its end before the cross-check, and the
     /// occurrences it was checked against.
     #[cfg(debug_assertions)]
@@ -1053,11 +1085,15 @@ struct Series {
 }
 
 /// The series of the occurrence `fresh`, read through `wire`: `Ok(None)` for a one-off.
+/// `whole` reads the window's occurrences whole (the dev report's comparisons need every field);
+/// otherwise only what the cross-check reads, so a long description can't push a page past the
+/// reply cap.
 async fn gather<W: Wire>(
     wire: &W,
     target: &Target,
     fresh: &Value,
     mirror: &MirrorFacts,
+    whole: bool,
 ) -> std::result::Result<Option<Series>, WriteOutcome> {
     let Some(master_id) = fresh.get("recurringEventId").and_then(Value::as_str) else {
         // A one-off, or a row that has since become a series' master in Google (a rule added there):
@@ -1117,11 +1153,13 @@ async fn gather<W: Wire>(
     let window = list_pages(
         wire,
         |page: Option<&str>| {
-            let mut query = vec![
-                ("timeMin", time_min),
-                ("timeMax", time_max),
-                ("maxResults", "250"),
-            ];
+            let mut query = vec![("timeMin", time_min), ("timeMax", time_max)];
+            if whole {
+                query.push(("maxResults", "100"));
+            } else {
+                query.push(("maxResults", "250"));
+                query.push(("fields", WINDOW_FIELDS));
+            }
             query.extend(page.map(|p| ("pageToken", p)));
             plan::instances(calendar, master_id, &query)
         },
@@ -1132,6 +1170,13 @@ async fn gather<W: Wire>(
         items: window.items,
         complete: window.complete,
     };
+    let guests: Vec<Point> = window
+        .items
+        .iter()
+        .filter(|i| i.get("recurringEventId").and_then(Value::as_str) == Some(master_id))
+        .filter(|i| i.get("status").and_then(Value::as_str) != Some("cancelled") && guests_on(i))
+        .filter_map(original_of)
+        .collect();
     #[cfg(debug_assertions)]
     let listing_complete = listed.complete;
     let exceptions = Exceptions::sorted(listed.items, listed.complete).cross_checked(
@@ -1164,11 +1209,14 @@ async fn gather<W: Wire>(
     } else {
         None
     };
+    // Google names the later part of its own split `<id>_R<date>`, so a master with that id is one,
+    // whether or not the earlier part is still in the mirror's window.
     let base = |id: &str| id.split("_R").next().unwrap_or(id).to_string();
-    let sibling = mirror
-        .series_ids
-        .iter()
-        .any(|id| *id != master.id && base(id) == base(&master.id))
+    let sibling = master.id.contains("_R")
+        || mirror
+            .series_ids
+            .iter()
+            .any(|id| *id != master.id && base(id) == base(&master.id))
         || master_fresh
             .json()
             .pointer("/extendedProperties/private/pmSplitOf")
@@ -1179,6 +1227,7 @@ async fn gather<W: Wire>(
         exceptions,
         counted,
         sibling,
+        guests,
         #[cfg(debug_assertions)]
         listing_complete,
         #[cfg(debug_assertions)]
@@ -1230,7 +1279,7 @@ async fn choices<W: Wire>(
             DeleteCheck::Changed(fields) => return refused(WriteOutcome::Conflict { fields }),
         }
     }
-    let series = match gather(wire, target, &fresh, mirror).await {
+    let series = match gather(wire, target, &fresh, mirror, false).await {
         Ok(Some(series)) => series,
         Ok(None) => return SeriesChoices::NotRepeating,
         Err(result) => return refused(result),
@@ -1314,7 +1363,7 @@ async fn choices<W: Wire>(
                 plan_series_delete(scope, &input, seen, Notify::None)
             }
         };
-        scope_row(planned, scope, &bind, &series)
+        scope_row(planned, scope, &bind, &series, original_of(instance.json()))
     };
     SeriesChoices::Ready {
         this: row(options.this, Scope::This),
@@ -1323,18 +1372,40 @@ async fn choices<W: Wire>(
     }
 }
 
-/// A row as the dialog shows it: the plan's warnings and its token, or why there's none.
+/// A row as the dialog shows it: the plan's warnings and its token, or why there's none. `picked` is
+/// where the occurrence chosen sits in the series.
 fn scope_row(
     planned: std::result::Result<SeriesPlan, NotPlanned>,
     asked: Scope,
     bind: &str,
     series: &Series,
+    picked: Option<Point>,
 ) -> ScopeRow {
     let message = |text: &str| ScopeRow::Refused {
         message: text.into(),
     };
     match planned {
         Ok(plan) => {
+            // The planners refuse to reach an occurrence with guests of its own that the listing
+            // holds; Google's occurrences show one it may lack (a change of text alone runs on an
+            // incomplete listing), so reaching that is refused here alike.
+            let zone = series.master.start.zone();
+            let from = match plan.scope {
+                Scope::This => None,
+                Scope::Following => Some(picked),
+                Scope::All => Some(None),
+            };
+            let reached = from.and_then(|from| {
+                series
+                    .guests
+                    .iter()
+                    .find(|at| from.is_none_or(|from| !at.cmp_in(&from, zone).is_lt()))
+            });
+            if let Some(at) = reached {
+                return ScopeRow::Refused {
+                    message: SeriesRefusal::GuestsElsewhere(at.day_in(zone)).to_string(),
+                };
+            }
             let warnings = plan
                 .warnings
                 .iter()
@@ -1467,7 +1538,7 @@ pub async fn dev_series_report(
         .await
         .event()
         .map_err(failed)?;
-    let series = gather(&wire, &target, &fresh, &mirror)
+    let series = gather(&wire, &target, &fresh, &mirror, true)
         .await
         .map_err(failed)?
         .ok_or_else(|| Error::Other("That event doesn't repeat.".into()))?;
@@ -1476,8 +1547,7 @@ pub async fn dev_series_report(
 
 #[cfg(debug_assertions)]
 fn series_report(series: &Series) -> SeriesReport {
-    use crate::calendar_recur::Point;
-    use crate::calendar_write::series::{classify_instance, original_of, InstanceKind};
+    use crate::calendar_write::series::{classify_instance, InstanceKind};
     let (master, master_json) = (&series.master, series.master_fresh.json());
     let zone = master.start.zone();
     let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
@@ -2564,10 +2634,12 @@ mod tests {
                 .get(i)
                 .unwrap_or_else(|| panic!("request {i} wasn't scripted: {}", plan.url));
             let (path, query) = plan.url.split_once('?').unwrap_or((&plan.url, ""));
+            // On Google's id for the calendar, never the mirror's; every part of the query asked for.
+            let on = format!("/calendar/v3/calendars/{CALENDAR}{}", step.path);
             assert!(
                 plan.method == Method::Get
-                    && path.ends_with(&step.path)
-                    && query.contains(step.query),
+                    && path.ends_with(&on)
+                    && step.query.split(' ').all(|part| query.contains(part)),
                 "request {i} was {:?} {}, not {}?{}",
                 plan.method,
                 plan.url,
@@ -2647,10 +2719,14 @@ mod tests {
         ]
     }
 
+    /// The cross-check's read of the occurrences in the mirror's window: only the fields it uses.
     fn window_read(window: Vec<Value>) -> Step {
         Step::get(
             "/events/abc/instances",
-            "timeMin=2026-09-01",
+            "showDeleted=true timeMin=2026-09-01T00%3A00%3A00Z timeMax=2027-11-01T00%3A00%3A00Z \
+             maxResults=250 fields=nextPageToken%2Citems%28id%2Cstatus%2CrecurringEventId%2C\
+             originalStartTime%2Cstart%2Cend%2Csummary%2Cattendees%28email%2Cself%2Coptional%29%2C\
+             attendeesOmitted%29",
             page(window, None),
         )
     }
@@ -2681,7 +2757,7 @@ mod tests {
         series: &[&str],
     ) -> (ScopeRow, ScopeRow, ScopeRow) {
         let target = target(instance);
-        match choices(
+        let got = choices(
             script,
             &target,
             EditingStatus::On,
@@ -2689,8 +2765,9 @@ mod tests {
             &request,
             opened,
         )
-        .await
-        {
+        .await;
+        script.finished();
+        match got {
             SeriesChoices::Ready {
                 this,
                 following,
@@ -2698,6 +2775,30 @@ mod tests {
             } => (this, following, all),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The choices when the gate or the series refuses before any row: `steps` must all be asked.
+    async fn refused(
+        steps: Vec<Step>,
+        instance: &Value,
+        editing: EditingStatus,
+        role: &str,
+        request: ChoiceRequest,
+    ) -> SeriesChoices {
+        let script = Script::new(steps);
+        let mut on = target(instance);
+        on.facts.access_role = Some(role.into());
+        let got = choices(
+            &script,
+            &on,
+            editing,
+            &mirror(&["abc"]),
+            &request,
+            Some((instance, None)),
+        )
+        .await;
+        script.finished();
+        got
     }
 
     fn warnings(row: &ScopeRow) -> &[SeriesWarningDto] {
@@ -3337,14 +3438,13 @@ mod tests {
             moved_19.clone(),
             retitled.clone(),
         ];
-        let window = vec![retitled, moved_19, instance.clone(), gone_2];
-        let script = Script::new(series_reads(&series, listed, window));
-        let series = gather(&script, &target(&instance), &instance, &mirror(&["abc"]))
-            .await
-            .unwrap()
-            .unwrap();
-        script.finished();
-        let report = series_report(&series);
+        let window = vec![
+            with(retitled, "updated", json!("2026-10-06T08:00:00.000Z")),
+            moved_19,
+            instance.clone(),
+            gone_2,
+        ];
+        let report = report_of(&series, listed, window).await;
         let kinds: Vec<(&str, &str)> = report
             .exceptions
             .iter()
@@ -3363,9 +3463,11 @@ mod tests {
             (
                 report.instances,
                 report.instances_cancelled,
-                report.modified_in_instances
+                report.modified_in_instances,
+                // The cancelled one has no `updated`, and the retitled one its own.
+                report.instances_updated_like_master
             ),
-            (4, 1, 2)
+            (4, 1, 2, 2)
         );
         assert_eq!(report.list_etag_matches_get, Some(true));
         assert!(report.fields_missing_vs_master.is_empty());
@@ -3373,5 +3475,349 @@ mod tests {
         for secret in ["Standup", "Daily notes", "abc", "example.com", "m1"] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
+
+        // Each assumption broken: an occurrence lacking a field its series has, the listing's copy
+        // of the master at another etag, and a listing that ran to its end yet lacks a change.
+        let placed = with(weekly(), "location", json!("Room 1"));
+        let older = with(placed.clone(), "etag", json!("\"m0\""));
+        let retitled = with(
+            plain("2026-10-12T09:00:00+01:00"),
+            "summary",
+            json!("Standup (room 4)"),
+        );
+        let report = report_of(&placed, vec![older], vec![retitled, instance]).await;
+        assert!(report.listing_complete && !report.cross_checked);
+        assert_eq!(report.list_etag_matches_get, Some(false));
+        assert_eq!(report.fields_missing_vs_master, ["location"]);
+    }
+
+    /// The dev report of `series`, listed by iCal UID as `listed` with `window` its occurrences, read
+    /// whole.
+    #[cfg(debug_assertions)]
+    async fn report_of(series: &Value, listed: Vec<Value>, window: Vec<Value>) -> SeriesReport {
+        let instance = plain("2026-10-26T09:00:00Z");
+        let script = Script::new(vec![
+            Step::get("/events/abc", "", series.clone()),
+            Step::get("/events", "iCalUID=abc%40google.com", page(listed, None)),
+            Step::get(
+                "/events/abc/instances",
+                "timeMin=2026-09-01 maxResults=100",
+                page(window, None),
+            ),
+        ]);
+        let gathered = gather(
+            &script,
+            &target(&instance),
+            &instance,
+            &mirror(&["abc"]),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        script.finished();
+        assert!(!script.sent()[2].url.contains("fields="));
+        series_report(&gathered)
+    }
+
+    /// Opening an occurrence reads it again after its series, keeps both with the session, and the
+    /// choices read them back from there. Without that second read, no series is kept.
+    #[tokio::test]
+    async fn opening_reads_the_occurrence_after_its_series_and_keeps_both() {
+        let (series, instance) = (weekly(), monday_19());
+        let later = with(instance.clone(), "summary", json!("Standup v2"));
+        let script = Script::new(vec![
+            Step::get("/events/abc", "", series.clone()),
+            instance_read(&later),
+        ]);
+        let (base, master) = open_series(&script, &target(&instance), instance.clone()).await;
+        script.finished();
+        assert_eq!(base, later);
+        assert_eq!(master.as_ref(), Some(&series));
+        let edit = CalendarEditState::default();
+        let id = keep_session(&edit, target(&instance), base, master).unwrap();
+        let open = open_session(&edit, &id).unwrap().unwrap();
+        assert_eq!((open.base, open.master), (later, Some(series.clone())));
+        assert_eq!(open.target, target(&instance));
+        assert!(open_session(&edit, "not-a-session").unwrap().is_none());
+        let script = Script::new(vec![
+            Step::get("/events/abc", "", series),
+            Step::status("/events/abc_20261019T080000Z", "", 503),
+        ]);
+        let (base, master) = open_series(&script, &target(&instance), instance.clone()).await;
+        script.finished();
+        assert_eq!((base, master), (instance, None));
+    }
+
+    /// C9 design review L13: the series the editor opened counts only if it's the one Google holds
+    /// for this occurrence; otherwise the rows that need it say so.
+    #[tokio::test]
+    async fn the_editors_series_counts_only_if_its_the_one_google_holds() {
+        let (series, instance) = (weekly(), monday_19());
+        let elsewhere = with(series.clone(), "id", json!("xyz"));
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone()],
+            vec![instance.clone()],
+        ));
+        let (this, following, all) = ask(
+            &script,
+            &instance,
+            edit(title("Retro")),
+            Some((&instance, Some(&elsewhere))),
+            &["abc"],
+        )
+        .await;
+        assert!(matches!(this, ScopeRow::Offered { .. }));
+        let no_base = ScopeRow::Refused {
+            message: SeriesRefusal::NoBase.to_string(),
+        };
+        assert_eq!((following, all), (no_base.clone(), no_base));
+    }
+
+    /// The gate runs on Google's copy of the occurrence before any row, all of it but the stand-in
+    /// for this very choice.
+    #[tokio::test]
+    async fn the_gate_refuses_before_any_row() {
+        let instance = monday_19();
+        let read_only = |reason| SeriesChoices::Refused {
+            result: WriteOutcome::ReadOnly { reason },
+        };
+        let only = |event: &Value| vec![instance_read(event)];
+        for editing in [
+            EditingStatus::Off,
+            EditingStatus::Paused,
+            EditingStatus::NeedsConsent,
+        ] {
+            assert_eq!(
+                refused(
+                    only(&instance),
+                    &instance,
+                    editing,
+                    "owner",
+                    edit(title("Retro"))
+                )
+                .await,
+                read_only(ReadOnlyReason::EditingOff)
+            );
+        }
+        let delete = ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(instance.clone())),
+        };
+        assert_eq!(
+            refused(
+                only(&instance),
+                &instance,
+                EditingStatus::On,
+                "reader",
+                delete
+            )
+            .await,
+            read_only(ReadOnlyReason::CalendarReadOnly)
+        );
+        let formatted = with(instance.clone(), "description", json!("<b>Notes</b>"));
+        let notes = EventPatchDraft {
+            description: Some("Notes".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            refused(
+                only(&formatted),
+                &formatted,
+                EditingStatus::On,
+                "owner",
+                edit(notes)
+            )
+            .await,
+            read_only(ReadOnlyReason::HtmlDescription)
+        );
+        let invitation = with(
+            instance.clone(),
+            "organizer",
+            json!({ "email": "boss@example.com" }),
+        );
+        assert_eq!(
+            refused(
+                only(&invitation),
+                &invitation,
+                EditingStatus::On,
+                "owner",
+                edit(title("Retro"))
+            )
+            .await,
+            read_only(ReadOnlyReason::NotOrganizer)
+        );
+    }
+
+    /// Until C12, a row that would reach an occurrence with guests of its own is refused: listed by
+    /// iCal UID (the planners) or only in Google's occurrences (here), and only from where it
+    /// reaches. "This event" on another occurrence is still offered.
+    #[tokio::test]
+    async fn guests_on_another_occurrence_hold_back_the_rows_that_reach_it() {
+        let (series, instance) = (weekly(), monday_19());
+        let invited = |at: &str| {
+            with(
+                plain(at),
+                "attendees",
+                json!([{ "email": "a@example.com", "responseStatus": "needsAction" }]),
+            )
+        };
+        let opened = Some((&instance, Some(&series)));
+        let held = |day: &str| ScopeRow::Refused {
+            message: format!(
+                "The occurrence on {day} has guests of its own, and PM can't change events with \
+                 guests yet. Choose \"This event\" to change only this one."
+            ),
+        };
+        let later = invited("2026-10-26T09:00:00Z");
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone(), later.clone()],
+            vec![instance.clone(), later.clone()],
+        ));
+        let (this, following, all) =
+            ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
+        assert!(matches!(this, ScopeRow::Offered { .. }));
+        assert_eq!(
+            (&following, &all),
+            (&held("26-10-2026"), &held("26-10-2026"))
+        );
+        let delete = || ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(instance.clone())),
+        };
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone(), later.clone()],
+            vec![instance.clone(), later.clone()],
+        ));
+        let (this, following, all) = ask(&script, &instance, delete(), None, &["abc"]).await;
+        assert!(matches!(this, ScopeRow::Offered { .. }));
+        assert_eq!((following, all), (held("26-10-2026"), held("26-10-2026")));
+        // Before the occurrence picked: "this and following" doesn't reach it.
+        let earlier = invited("2026-10-12T09:00:00+01:00");
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone(), earlier.clone()],
+            vec![earlier.clone(), instance.clone()],
+        ));
+        let (_, following, all) =
+            ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
+        assert!(matches!(following, ScopeRow::Offered { .. }));
+        assert_eq!(all, held("12-10-2026"));
+        // Missing from the listing: the cross-check refuses the split, and the change of text to
+        // every occurrence, which doesn't need the listing whole, meets it in Google's occurrences.
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone()],
+            vec![instance.clone(), later],
+        ));
+        let (_, following, all) =
+            ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
+        assert_eq!(following, incomplete());
+        assert_eq!(all, held("26-10-2026"));
+    }
+
+    /// When PM couldn't see every occurrence changed on its own, a change to all of them says
+    /// "some" may keep or lose their changes, even with none seen; otherwise it gives the count.
+    #[tokio::test]
+    async fn a_change_to_every_occurrence_says_some_when_the_listing_is_short() {
+        let (series, instance) = (weekly(), monday_19());
+        let opened = Some((&instance, Some(&series)));
+        let script = Script::new(vec![
+            instance_read(&instance),
+            Step::get("/events/abc", "", series.clone()),
+            Step::get(
+                "/events",
+                "iCalUID=abc%40google.com",
+                page(vec![series.clone()], Some("p2")),
+            ),
+            Step::status("/events", "pageToken=p2", 500),
+            window_read(vec![instance.clone()]),
+        ]);
+        let (_, _, all) = ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
+        assert_eq!(
+            warnings(&all),
+            [SeriesWarningDto::ExceptionsMayReset {
+                count: 0,
+                complete: false
+            }]
+        );
+        let retitled = with(
+            plain("2026-10-26T09:00:00Z"),
+            "summary",
+            json!("Standup (room 4)"),
+        );
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone(), retitled.clone()],
+            vec![instance.clone(), retitled],
+        ));
+        let (_, _, all) = ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
+        assert_eq!(
+            warnings(&all),
+            [SeriesWarningDto::ExceptionsMayReset {
+                count: 1,
+                complete: true
+            }]
+        );
+    }
+
+    /// DS16: a part split off earlier is said however PM knows it: Google's `_R` in the series' own
+    /// id (its earlier part may have left the mirror's window), or PM's own note on it.
+    #[tokio::test]
+    async fn a_split_part_says_so_however_pm_knows() {
+        let delete = |instance: &Value| ChoiceRequest::Delete {
+            event_id: format!("cal:{}", instance["id"].as_str().unwrap()),
+            seen: seen_by_user(&fresh_event(instance.clone())),
+        };
+        let part = "abc_R20261019T080000";
+        let series = with(weekly(), "id", json!(part));
+        let instance = with(
+            plain("2026-10-26T09:00:00Z"),
+            "recurringEventId",
+            json!(part),
+        );
+        let script = Script::new(vec![
+            instance_read(&instance),
+            Step::get(&format!("/events/{part}"), "", series.clone()),
+            Step::get(
+                "/events",
+                "iCalUID=abc%40google.com",
+                page(vec![series.clone()], None),
+            ),
+            Step::get(
+                &format!("/events/{part}/instances"),
+                "timeMin=2026-09-01",
+                page(vec![instance.clone()], None),
+            ),
+        ]);
+        let (this, following, all) =
+            ask(&script, &instance, delete(&instance), None, &[part]).await;
+        assert!(warnings(&this).is_empty());
+        assert_eq!(warnings(&following), [SeriesWarningDto::SplitSibling]);
+        assert_eq!(warnings(&all), [SeriesWarningDto::SplitSibling]);
+        let tail = with(
+            weekly(),
+            "extendedProperties",
+            json!({ "private": { "pmSplitOf": "older" } }),
+        );
+        let instance = monday_19();
+        let script = Script::new(reads(
+            &instance,
+            &tail,
+            vec![tail.clone()],
+            vec![instance.clone()],
+        ));
+        let (_, following, all) = ask(&script, &instance, delete(&instance), None, &["abc"]).await;
+        assert_eq!(warnings(&following), [SeriesWarningDto::SplitSibling]);
+        assert_eq!(warnings(&all), [SeriesWarningDto::SplitSibling]);
     }
 }

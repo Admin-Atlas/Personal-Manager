@@ -97,12 +97,15 @@ impl Exceptions {
         let own = |item: &&Value| {
             item.get("recurringEventId").and_then(Value::as_str) == Some(master.id.as_str())
         };
-        let listed: Vec<Point> = self
+        let mut listed: Vec<Point> = self
             .items
             .iter()
             .filter(own)
             .filter_map(original_of)
             .collect();
+        // A date the rule itself leaves out (an EXDATE) is no stored exception, whether or not
+        // Google lists it as a cancelled occurrence.
+        listed.extend(excluded(&master.recurrence, &master.start));
         let missed = window
             .items
             .iter()
@@ -447,8 +450,9 @@ pub fn classify_instance(master_json: &Value, master: &Master, instance: &Value)
 }
 
 /// Whether an occurrence is changed on its own in a way nothing can be mistaken for: cancelled, at a
-/// time of its own, or retitled. The other fields lean on [`same_field`]'s unprobed defaults, and a
-/// false alarm in [`Exceptions::cross_checked`] refuses a good plan.
+/// time of its own, retitled, or with guests where its series has none. The other fields lean on
+/// [`same_field`]'s unprobed defaults, and a false alarm in [`Exceptions::cross_checked`] refuses a
+/// good plan.
 fn plainly_changed(master_json: &Value, master: &Master, instance: &Value) -> bool {
     instance.get("status").and_then(Value::as_str) == Some("cancelled")
         || !same_time(master, instance)
@@ -457,6 +461,31 @@ fn plainly_changed(master_json: &Value, master: &Master, instance: &Value) -> bo
             instance.get("summary"),
             master_json.get("summary"),
         )
+        || (guests_on(instance) && !guests_on(master_json))
+}
+
+/// Whether an event has guests besides the user, or a guest list Google cut short.
+pub fn guests_on(event: &Value) -> bool {
+    !attendee_set(event.get("attendees")).is_empty()
+        || event.get("attendeesOmitted").and_then(Value::as_bool) == Some(true)
+}
+
+/// The dates a series' own `recurrence` leaves out (its EXDATEs), where each falls in it.
+pub(super) fn excluded(recurrence: &[String], start: &SeriesStart) -> Vec<Point> {
+    lines::parse(recurrence)
+        .iter()
+        .filter_map(|l| match &l.kind {
+            Kind::ExDate(dates) => Some(
+                dates
+                    .values
+                    .iter()
+                    .filter_map(|v| dates.point(v, start))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Whether the instance starts where its series puts it and lasts as long.
@@ -550,6 +579,9 @@ pub enum SeriesRefusal {
     /// An occurrence after the split has guests, attachments, a call, a label or a visibility of its
     /// own.
     CannotCarry(NaiveDate),
+    /// An occurrence the change would reach has guests of its own (until C12 brings Send / Don't
+    /// send).
+    GuestsElsewhere(NaiveDate),
     /// Its visibility applies to every occurrence (Google), so it can't change for one.
     VisibilityIsSeriesWide,
     /// The series already holds this; only this occurrence differs.
@@ -595,6 +627,12 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "The occurrence on {} has its own guests, attachments, video call, label or who can \
                  see it, which PM can't move to the new series.",
+                day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::GuestsElsewhere(day) => write!(
+                f,
+                "The occurrence on {} has guests of its own, and PM can't change events with \
+                 guests yet. Choose \"This event\" to change only this one.",
                 day.format("%d-%m-%Y")
             ),
             SeriesRefusal::VisibilityIsSeriesWide => write!(
@@ -1237,6 +1275,28 @@ mod tests {
                 "{missing}"
             );
         }
+        // A date the rule leaves out (EXDATE) is no stored exception, however Google lists it.
+        let skipped_19 = master(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO",
+            "EXDATE;TZID=Europe/London:20261019T090000",
+        ]);
+        assert!(
+            complete(vec![skipped_19.clone()])
+                .cross_checked(
+                    &skipped_19,
+                    &read(skipped_19.clone()),
+                    &window(vec![cancelled("2026-10-19T09:00:00+01:00")])
+                )
+                .complete
+        );
+        // An occurrence with guests of its own, in a series with none, is changed on its own.
+        let invited = with(
+            plain_12.clone(),
+            "attendees",
+            json!([{ "email": "a@example.com" }]),
+        );
+        assert!(!checked(vec![mj.clone()], vec![invited.clone()]));
+        assert!(checked(vec![mj.clone(), invited.clone()], vec![invited]));
         // Another series' occurrences aren't this one's to account for.
         let theirs = with(moved_19.clone(), "recurringEventId", json!("other"));
         assert!(checked(vec![mj.clone()], vec![theirs]));

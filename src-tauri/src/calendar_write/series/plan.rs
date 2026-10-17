@@ -59,7 +59,7 @@ use chrono_tz::Tz;
 use serde_json::{json, Map, Value};
 
 use crate::calendar_recur::expand::{is_occurrence, last_before};
-use crate::calendar_recur::lines::{self, recurrence_verdict, same_recurrence, Applied, Kind};
+use crate::calendar_recur::lines::{self, recurrence_verdict, same_recurrence, Applied};
 use crate::calendar_recur::reanchor::DayMap;
 use crate::calendar_recur::remap::{exdate_lines, retime, RetimeError, Retimed};
 use crate::calendar_recur::split::{
@@ -79,8 +79,8 @@ use super::super::time;
 use super::diff::{Expect, Removes, SeriesDiff};
 use super::scope::{is_first, zones_changed, Scope};
 use super::{
-    attendee_set, classify_instance, google_before, original_of, point_of, Exceptions, FreshEvent,
-    InstanceKind, Length, Listing, Master, SeriesRefusal,
+    attendee_set, classify_instance, excluded, google_before, guests_on, original_of, point_of,
+    Exceptions, FreshEvent, InstanceKind, Length, Listing, Master, SeriesRefusal,
 };
 
 /// Everything a series plan is built from. C9 makes the GETs; nothing here fetches.
@@ -520,7 +520,7 @@ pub enum SeriesWarning {
     /// Another part of this series was split off earlier; Google may treat it as one with this.
     SplitSibling,
     /// This many occurrences were changed on their own; Google may keep or reset their own changes
-    /// (L-R2/L-R3 record which).
+    /// (L-R2/L-R3 record which). Also raised, with the count PM saw, when it couldn't see them all.
     ExceptionsMayReset(u32),
     /// The series' first occurrence moves.
     StartMoved { from: NaiveDate, to: NaiveDate },
@@ -1073,6 +1073,31 @@ fn exceptions_from<'a>(
     Ok(out)
 }
 
+/// Until C12 brings Send / Don't send, a plan that reaches past the occurrence picked mustn't reach
+/// one with guests of its own (the series' own guests are refused in [`prepare`]): Google would
+/// change or cancel it with nobody told, and no choice of who is. `from` is a split's or a cut's
+/// occurrence (only those from it on are reached); `None` for the whole series.
+fn no_guests_from(
+    master: &Master,
+    input: &SeriesInput,
+    from: Option<Point>,
+) -> Result<(), NotPlanned> {
+    if input.guests_allowed {
+        return Ok(());
+    }
+    let zone = master.start.zone();
+    for item in own_exceptions(master, input.exceptions) {
+        if item.get("status").and_then(Value::as_str) == Some("cancelled") || !guests_on(item) {
+            continue;
+        }
+        let at = original_of(item).ok_or(SeriesRefusal::Unreadable)?;
+        if from.is_none_or(|from| !at.cmp_in(&from, zone).is_lt()) {
+            return Err(SeriesRefusal::GuestsElsewhere(at.day_in(zone)).into());
+        }
+    }
+    Ok(())
+}
+
 /// A cleanup cancel of the original's own copy of the occurrence at `original`, which moved to the new
 /// series (or was cut off): done when Google already shows it cancelled or gone; re-sent on a 412
 /// only while nothing it would throw away has changed (DS10).
@@ -1256,26 +1281,38 @@ pub fn plan_series_delete(
             },
             start: master.start,
         }),
-        Scope::All => Ok(whole(warnings)),
-        Scope::Following if is_first(&master, input.fresh.instance) => Ok(whole(warnings)),
+        Scope::All => {
+            no_guests_from(&master, input, None)?;
+            Ok(whole(warnings))
+        }
+        Scope::Following if is_first(&master, input.fresh.instance) => {
+            no_guests_from(&master, input, None)?;
+            Ok(whole(warnings))
+        }
         Scope::Following => match cut_at(&master, input, original)? {
-            None => Ok(whole(warnings)),
-            Some(SplitCut { cut, .. }) => Ok(SeriesPlan {
-                scope,
-                steps: plan_cut_delete(&master, input, original, cut, notify)?,
-                warnings,
-                expect: vec![Expect::EndsBefore {
-                    series: master.id.clone(),
-                    at: original,
-                    left: Vec::new(),
-                }],
-                removes: Removes::From {
-                    series: master.id.clone(),
-                    at: original,
-                    left: Vec::new(),
-                },
-                start: master.start,
-            }),
+            None => {
+                no_guests_from(&master, input, None)?;
+                Ok(whole(warnings))
+            }
+            Some(SplitCut { cut, .. }) => {
+                no_guests_from(&master, input, Some(original))?;
+                Ok(SeriesPlan {
+                    scope,
+                    steps: plan_cut_delete(&master, input, original, cut, notify)?,
+                    warnings,
+                    expect: vec![Expect::EndsBefore {
+                        series: master.id.clone(),
+                        at: original,
+                        left: Vec::new(),
+                    }],
+                    removes: Removes::From {
+                        series: master.id.clone(),
+                        at: original,
+                        left: Vec::new(),
+                    },
+                    start: master.start,
+                })
+            }
         },
     }
 }
@@ -1334,24 +1371,6 @@ fn when_nodes(master: &Master, first: Point, length: Length) -> Result<(Value, V
         }
         _ => Err(RetimeError::KindChange.into()),
     }
-}
-
-/// EXDATE points already in `lines`.
-fn excluded(lines_now: &[String], start: &SeriesStart) -> Vec<Point> {
-    lines::parse(lines_now)
-        .iter()
-        .filter_map(|l| match &l.kind {
-            Kind::ExDate(dates) => Some(
-                dates
-                    .values
-                    .iter()
-                    .filter_map(|v| dates.point(v, start))
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .flatten()
-        .collect()
 }
 
 /// `lines` with an EXDATE added for each cancelled occurrence in `cancelled` (where each now is),
@@ -1508,6 +1527,7 @@ fn plan_all(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
+    no_guests_from(master, input, None)?;
     let text_only = EventPatchDraft {
         time: None,
         ..draft.clone()
@@ -1629,7 +1649,8 @@ fn plan_all(
             )
         })
         .count();
-    if reset > 0 {
+    // A listing PM couldn't see all of may hold more: say "some", even with none seen (C9a-2 review).
+    if reset > 0 || !input.exceptions.complete {
         warnings.push(SeriesWarning::ExceptionsMayReset(
             u32::try_from(reset).unwrap_or(u32::MAX),
         ));
@@ -1741,6 +1762,7 @@ fn plan_split(
         _ => return Err(RetimeError::KindChange.into()),
     };
     let exceptions = exceptions_from(master, input.exceptions, at)?;
+    no_guests_from(master, input, Some(at))?;
     let cancelled: Vec<Point> = exceptions
         .iter()
         .filter(|(item, _)| classify_instance(master_json, master, item) == InstanceKind::Cancelled)
@@ -3643,6 +3665,37 @@ mod tests {
             json!("Standup (room 4)"),
         )]);
         assert_ne!(split(&busier, TAIL).choice_digest("s1"), token);
+    }
+
+    /// Until C12, nothing past the occurrence picked reaches one with guests of its own: not a split
+    /// or a cut from before it, nor anything for every occurrence. "This event" elsewhere, and a split
+    /// after it, still go ahead; with guests allowed (C12), all of them do.
+    #[test]
+    fn an_occurrence_with_guests_of_its_own_holds_back_what_reaches_it() {
+        let invited = with(
+            plain("2026-10-26T09:00:00Z"),
+            "attendees",
+            json!([{ "email": "a@example.com", "responseStatus": "needsAction" }]),
+        );
+        let held = Err(NotPlanned::Refused(SeriesRefusal::GuestsElsewhere(day(
+            2026, 10, 26,
+        ))));
+        let case = Case::new(weekly(), monday_19()).exceptions(vec![invited.clone()]);
+        assert!(case.edit(Scope::This, title("Retro")).is_ok());
+        assert!(case.delete(Scope::This).is_ok());
+        assert_eq!(case.edit(Scope::Following, title("Retro")), held);
+        assert_eq!(case.edit(Scope::All, title("Retro")), held);
+        assert_eq!(case.delete(Scope::Following), held);
+        assert_eq!(case.delete(Scope::All), held);
+        let after =
+            Case::new(weekly(), plain("2026-11-02T09:00:00Z")).exceptions(vec![invited.clone()]);
+        assert!(after.edit(Scope::Following, title("Retro")).is_ok());
+        assert!(after.delete(Scope::Following).is_ok());
+        assert_eq!(after.edit(Scope::All, title("Retro")), held);
+        let allowed = Case::new(weekly(), monday_19())
+            .exceptions(vec![invited])
+            .guests();
+        assert!(allowed.delete(Scope::All).is_ok());
     }
 
     /// A29, C9 design review scope-L1: the rule and start a change leaves, for the question a move to
