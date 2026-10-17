@@ -4,8 +4,15 @@
 # WebKit) stack whose affected code PM never reaches; no fix is reachable until Tauri moves to
 # gtk 0.19 / glib 0.22 or gtk4. Ignoring them keeps `cargo audit` green *and intentional*, so a
 # real advisory still fails the run. See the 2026-06-17 and 2026-10-07 DECISIONS entries.
+#
+# The three zip ids are extract-only flaws fixed in zip 9: PM's zip 4 only writes archives, and the
+# updater's Windows-only extract runs on signature-checked bytes (full reasoning in deny.toml and the
+# 2026-10-17 DECISIONS entry). Drop them once tauri-plugin-updater moves past zip 4.
 [advisories]
 ignore = [
     "RUSTSEC-2024-0429", # glib 0.18 VariantStrIter unsound (gtk-rs stack; API never called)
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (via glib-macros 0.18; build-time only)
+    "RUSTSEC-2026-0367", # zip 4: SUID/SGID bits kept on extract (PM never extracts; updater: signed bytes)
+    "RUSTSEC-2026-0368", # zip 4: extract makes symlinks outside the destination (same)
+    "RUSTSEC-2026-0369", # zip 4: extract applies permissions through symlinks (same)
 ]
