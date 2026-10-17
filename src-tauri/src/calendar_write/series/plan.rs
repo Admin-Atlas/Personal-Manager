@@ -69,7 +69,8 @@ use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
 use super::super::dto::{EventPatchDraft, Notify, ReadOnlyReason, SeenSummary};
 use super::super::patch::{
-    build_patch, delete_still_matches, drop_other_kind, is_gone, update_check, when_eq,
+    build_patch, delete_still_matches, description_is_html, drop_other_kind, is_gone, update_check,
+    when_eq,
 };
 use super::super::patch::{DeleteCheck, UpdateCheck};
 use super::super::plan::{
@@ -520,8 +521,9 @@ pub enum SeriesWarning {
     /// Another part of this series was split off earlier; Google may treat it as one with this.
     SplitSibling,
     /// This many occurrences were changed on their own; Google may keep or reset their own changes
-    /// (L-R2/L-R3 record which). Also raised, with the count PM saw, when it couldn't see them all.
-    ExceptionsMayReset(u32),
+    /// (L-R2/L-R3 record which). `complete` false: PM couldn't see them all, so it's "some", raised
+    /// even with none seen; part of the warning, so a choice's token tells the two apart.
+    ExceptionsMayReset { count: u32, complete: bool },
     /// The series' first occurrence moves.
     StartMoved { from: NaiveDate, to: NaiveDate },
     /// The days the series falls on move, as the occurrence at `from` moves to `to`: measured from
@@ -1076,7 +1078,9 @@ fn exceptions_from<'a>(
 /// Until C12 brings Send / Don't send, a plan that reaches past the occurrence picked mustn't reach
 /// one with guests of its own (the series' own guests are refused in [`prepare`]): Google would
 /// change or cancel it with nobody told, and no choice of who is. `from` is a split's or a cut's
-/// occurrence (only those from it on are reached); `None` for the whole series.
+/// occurrence (only those from it on are reached); `None` for the whole series. Only a complete
+/// listing can show there's none, so an incomplete one refuses too, a change of text included; the
+/// cross-check counts an occurrence with guests the listing lacks against it (C9a-2 review).
 fn no_guests_from(
     master: &Master,
     input: &SeriesInput,
@@ -1084,6 +1088,9 @@ fn no_guests_from(
 ) -> Result<(), NotPlanned> {
     if input.guests_allowed {
         return Ok(());
+    }
+    if !input.exceptions.complete {
+        return Err(SeriesRefusal::Incomplete.into());
     }
     let zone = master.start.zone();
     for item in own_exceptions(master, input.exceptions) {
@@ -1094,6 +1101,19 @@ fn no_guests_from(
         if from.is_none_or(|from| !at.cmp_in(&from, zone).is_lt()) {
             return Err(SeriesRefusal::GuestsElsewhere(at.day_in(zone)).into());
         }
+    }
+    Ok(())
+}
+
+/// The gate reads the occurrence's description; a draft for the series writes the series' own, and
+/// would save a formatted one as plain text (C9 design review L7).
+fn keeps_formatting(master_json: &Value, draft: &EventPatchDraft) -> Result<(), NotPlanned> {
+    let formatted = master_json
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some_and(description_is_html);
+    if formatted && draft.description.is_some() {
+        return Err(SeriesRefusal::FormattedDescription.into());
     }
     Ok(())
 }
@@ -1221,34 +1241,38 @@ pub fn plan_series_delete(
     if input.sibling && scope != Scope::This {
         warnings.push(SeriesWarning::SplitSibling);
     }
-    let whole = |warnings: Vec<SeriesWarning>| SeriesPlan {
-        scope: Scope::All,
-        steps: vec![Step {
-            op: Op::Delete {
-                calendar: input.calendar.to_string(),
-                event: master.id.clone(),
-                etag: master.etag.clone(),
+    // Every arm that deletes the whole series comes through here, guests checked.
+    let whole = |warnings: Vec<SeriesWarning>| -> Result<SeriesPlan, NotPlanned> {
+        no_guests_from(&master, input, None)?;
+        Ok(SeriesPlan {
+            scope: Scope::All,
+            steps: vec![Step {
+                op: Op::Delete {
+                    calendar: input.calendar.to_string(),
+                    event: master.id.clone(),
+                    etag: master.etag.clone(),
+                },
+                notify,
+                stage: Stage::Commit,
+                requires: None,
+                conflict: Recheck::Series {
+                    summary: master_json.get("summary").cloned().unwrap_or(Value::Null),
+                    start: master_json.get("start").cloned().unwrap_or(Value::Null),
+                    recurrence: master.recurrence.clone(),
+                },
+                shows: Shows::Gone,
+                gone_is_done: true,
+                undo: None,
+            }],
+            warnings,
+            expect: vec![Expect::Absent {
+                series: master.id.clone(),
+            }],
+            removes: Removes::Series {
+                series: master.id.clone(),
             },
-            notify,
-            stage: Stage::Commit,
-            requires: None,
-            conflict: Recheck::Series {
-                summary: master_json.get("summary").cloned().unwrap_or(Value::Null),
-                start: master_json.get("start").cloned().unwrap_or(Value::Null),
-                recurrence: master.recurrence.clone(),
-            },
-            shows: Shows::Gone,
-            gone_is_done: true,
-            undo: None,
-        }],
-        warnings,
-        expect: vec![Expect::Absent {
-            series: master.id.clone(),
-        }],
-        removes: Removes::Series {
-            series: master.id.clone(),
-        },
-        start: master.start,
+            start: master.start,
+        })
     };
     match scope {
         Scope::This => Ok(SeriesPlan {
@@ -1281,19 +1305,10 @@ pub fn plan_series_delete(
             },
             start: master.start,
         }),
-        Scope::All => {
-            no_guests_from(&master, input, None)?;
-            Ok(whole(warnings))
-        }
-        Scope::Following if is_first(&master, input.fresh.instance) => {
-            no_guests_from(&master, input, None)?;
-            Ok(whole(warnings))
-        }
+        Scope::All => whole(warnings),
+        Scope::Following if is_first(&master, input.fresh.instance) => whole(warnings),
         Scope::Following => match cut_at(&master, input, original)? {
-            None => {
-                no_guests_from(&master, input, None)?;
-                Ok(whole(warnings))
-            }
+            None => whole(warnings),
             Some(SplitCut { cut, .. }) => {
                 no_guests_from(&master, input, Some(original))?;
                 Ok(SeriesPlan {
@@ -1528,6 +1543,7 @@ fn plan_all(
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     no_guests_from(master, input, None)?;
+    keeps_formatting(master_json, draft)?;
     let text_only = EventPatchDraft {
         time: None,
         ..draft.clone()
@@ -1651,9 +1667,10 @@ fn plan_all(
         .count();
     // A listing PM couldn't see all of may hold more: say "some", even with none seen (C9a-2 review).
     if reset > 0 || !input.exceptions.complete {
-        warnings.push(SeriesWarning::ExceptionsMayReset(
-            u32::try_from(reset).unwrap_or(u32::MAX),
-        ));
+        warnings.push(SeriesWarning::ExceptionsMayReset {
+            count: u32::try_from(reset).unwrap_or(u32::MAX),
+            complete: input.exceptions.complete,
+        });
     }
     let watched: Vec<&str> = watched.iter().map(String::as_str).collect();
     let keys: Vec<&str> = body.keys().map(String::as_str).collect();
@@ -1724,6 +1741,7 @@ fn plan_split(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
+    keeps_formatting(master_json, draft)?;
     // An id PM minted for this plan, never the series' own (C8b review ADV-5).
     if !is_plain_segment(tail_id) || tail_id == master.id {
         return Err(SeriesRefusal::Unreadable.into());
@@ -2686,9 +2704,10 @@ mod tests {
                 if body["start"]["dateTime"] == "2026-10-05T09:00:00+01:00"
         ));
         // The renamed occurrence's time is the series': Google may reset it.
-        assert!(plan
-            .warnings
-            .contains(&SeriesWarning::ExceptionsMayReset(1)));
+        assert!(plan.warnings.contains(&SeriesWarning::ExceptionsMayReset {
+            count: 1,
+            complete: true
+        }));
         // Moving the day too moves the series' start, and says so.
         let tuesdays = case.edit(Scope::All, at("09:00", "2026-10-20")).unwrap();
         assert!(tuesdays.warnings.contains(&SeriesWarning::StartMoved {
@@ -3072,7 +3091,7 @@ mod tests {
         assert!(!plan
             .warnings
             .iter()
-            .any(|w| matches!(w, SeriesWarning::ExceptionsMayReset(_))));
+            .any(|w| matches!(w, SeriesWarning::ExceptionsMayReset { .. })));
     }
 
     /// G7: an end moved into another zone is a zone change for the series rows, as a start is.
@@ -3692,10 +3711,46 @@ mod tests {
         assert!(after.edit(Scope::Following, title("Retro")).is_ok());
         assert!(after.delete(Scope::Following).is_ok());
         assert_eq!(after.edit(Scope::All, title("Retro")), held);
+        // From the first occurrence, "this and following" is every occurrence.
+        let first = Case::new(weekly(), plain("2026-10-05T09:00:00+01:00"))
+            .exceptions(vec![invited.clone()]);
+        assert_eq!(first.delete(Scope::Following), held);
+        assert_eq!(first.edit(Scope::Following, title("Retro")), held);
         let allowed = Case::new(weekly(), monday_19())
             .exceptions(vec![invited])
             .guests();
         assert!(allowed.delete(Scope::All).is_ok());
+    }
+
+    /// Until C12, only a whole listing shows that nothing a plan reaches has guests of its own, so a
+    /// short one refuses even a change of text to every occurrence, and deleting them. With guests
+    /// allowed, the change of text goes ahead and says "some" may keep or lose their changes; the
+    /// warning carries that, so the token tells "some" from a count.
+    #[test]
+    fn a_short_listing_refuses_what_reaches_past_this_occurrence_until_c12() {
+        let mut short = Case::new(weekly(), monday_19());
+        short.exceptions.complete = false;
+        let incomplete = Err(NotPlanned::Refused(SeriesRefusal::Incomplete));
+        assert!(short.edit(Scope::This, title("Retro")).is_ok());
+        assert_eq!(short.edit(Scope::All, title("Retro")), incomplete);
+        assert_eq!(short.delete(Scope::All), incomplete);
+        assert_eq!(short.delete(Scope::Following), incomplete);
+        let mut allowed = Case::new(weekly(), monday_19()).guests();
+        allowed.exceptions.complete = false;
+        let some = allowed.edit(Scope::All, title("Retro")).unwrap();
+        assert_eq!(
+            some.warnings,
+            [SeriesWarning::ExceptionsMayReset {
+                count: 0,
+                complete: false
+            }]
+        );
+        let seen = Case::new(weekly(), monday_19())
+            .guests()
+            .edit(Scope::All, title("Retro"))
+            .unwrap();
+        assert!(seen.warnings.is_empty());
+        assert_ne!(some.choice_digest("s1"), seen.choice_digest("s1"));
     }
 
     /// A29, C9 design review scope-L1: the rule and start a change leaves, for the question a move to

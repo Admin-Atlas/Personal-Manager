@@ -582,6 +582,8 @@ pub enum SeriesRefusal {
     /// An occurrence the change would reach has guests of its own (until C12 brings Send / Don't
     /// send).
     GuestsElsewhere(NaiveDate),
+    /// The series' description is formatted (HTML), and the draft would save it as plain text.
+    FormattedDescription,
     /// Its visibility applies to every occurrence (Google), so it can't change for one.
     VisibilityIsSeriesWide,
     /// The series already holds this; only this occurrence differs.
@@ -634,6 +636,11 @@ impl fmt::Display for SeriesRefusal {
                 "The occurrence on {} has guests of its own, and PM can't change events with \
                  guests yet. Choose \"This event\" to change only this one.",
                 day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::FormattedDescription => write!(
+                f,
+                "This series' description has formatting, which saving it here as plain text \
+                 would remove. Change this occurrence on its own instead."
             ),
             SeriesRefusal::VisibilityIsSeriesWide => write!(
                 f,
