@@ -108,8 +108,8 @@ pub trait Machine {
 /// Where each step of a run ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum End {
-    /// Not landed: never sent, or the step the run stopped on (Google may have taken half of a move
-    /// that was put back, [`Why::PutBack`]).
+    /// Not shown done: never sent, or the step the run stopped on. For [`Ran::Unknown`] that step may
+    /// have landed; for [`Why::PutBack`], Google took half of it and that half was put back.
     NotRun,
     /// Landed. `reply`: Google's copy after it (the step's reply, or a GET that proved it), `None`
     /// for a delete. `date`: the HTTP `Date` of the answer that proved it, when it was the reply.
@@ -235,8 +235,11 @@ struct Copies {
     sent_on: Vec<String>,
     /// A copy may still land: its answer was lost, or it met a server error.
     in_doubt: bool,
-    /// The once-more on the etag Google still shows is spent.
-    resent: bool,
+    /// The etags the once-more has gone out on: once per etag, the sender's own retry after a server
+    /// error counting as it.
+    resent_on: Vec<String>,
+    /// A lost insert was posted again under its id (A9), once.
+    reposted: bool,
     /// The one resend on Google's newer etag after a 412 is spent.
     moved_on: bool,
     /// A copy was answered 2xx.
@@ -333,9 +336,15 @@ impl Run {
             reply: Some(copy.clone()),
             date: None,
         };
+        // The copy has to show what it's offered as, by this plan's own reading of that step.
+        let shows = |step: usize, copy: &Value| plan.verdict(step, Some(copy)) == Applied::Yes;
         match settled {
-            Settled::CutDone { original } if *step == cut => ends[cut] = proved(original),
-            Settled::TailThere { tail } if *step == insert => ends[insert] = proved(tail),
+            Settled::CutDone { original } if *step == cut && shows(cut, original) => {
+                ends[cut] = proved(original);
+            }
+            Settled::TailThere { tail } if *step == insert && shows(insert, tail) => {
+                ends[insert] = proved(tail);
+            }
             _ => return Err(Unfit),
         }
         Run::from(plan, ends)
@@ -524,7 +533,9 @@ impl Run {
         let (verdict, body, date) = match answer {
             Answer::Lost { retried } => {
                 self.copies.in_doubt = true;
-                self.copies.resent |= retried;
+                if retried {
+                    self.once_more_spent();
+                }
                 return Read::Check;
             }
             Answer::Reply {
@@ -538,8 +549,9 @@ impl Run {
                     // The sender re-sends a PATCH or DELETE once after a server error, on the same
                     // If-Match: that was the once-more, unless it was refused before Google read it.
                     // (A rate limit, then a server error, also reads as spent: the safe way round.)
-                    self.copies.resent |=
-                        matches!(method, Method::Patch | Method::Delete) && !refused(&verdict);
+                    if matches!(method, Method::Patch | Method::Delete) && !refused(&verdict) {
+                        self.once_more_spent();
+                    }
                 }
                 (verdict, body, date)
             }
@@ -602,21 +614,31 @@ impl Run {
             Applied::Yes => Read::Done(fresh, None),
             Applied::No => self.not_landed(fresh),
             Applied::Unknown => match &fresh {
-                Some(f) if self.plan.half_applied(self.at, f) => match etag_of(f) {
-                    Some(etag) => Read::Restore(etag),
-                    None => Read::Unknown,
-                },
-                None if self.method() == Method::Insert && !self.copies.resent => Read::LookAgain,
                 // Someone else changed what the step writes, and no copy of it can land: the 412
-                // rule's own proof (plan.rs: "a 412 whose resend is a conflict").
+                // rule's own proof (plan.rs: "a 412 whose resend is a conflict"). Before the
+                // half-move check: a half move that no copy of PM's made is someone else's, never
+                // PM's to put back.
                 Some(f) if self.none_can_land(f) => match self.plan.resend(self.at, f) {
                     Resend::Conflict(fields) => Read::NotDone(Why::Conflict(fields)),
                     Resend::Gone if self.step_gone_is_done() => Read::Done(None, None),
                     Resend::Gone => Read::NotDone(Why::Gone),
                     Resend::Proceed => Read::Unknown,
                 },
+                Some(f) if self.plan.half_applied(self.at, f) => match etag_of(f) {
+                    Some(etag) => Read::Restore(etag),
+                    None => Read::Unknown,
+                },
+                None if self.method() == Method::Insert && !self.copies.reposted => Read::LookAgain,
                 _ => Read::Unknown,
             },
+        }
+    }
+
+    /// The once-more on the etag the last copy went out on is spent (an insert's, under its id).
+    fn once_more_spent(&mut self) {
+        match self.copies.last.as_ref().and_then(|r| r.if_match.clone()) {
+            Some(etag) => self.copies.resent_on.push(etag),
+            None => self.copies.reposted = true,
         }
     }
 
@@ -648,7 +670,7 @@ impl Run {
             // At an etag a copy went out on, what was there proves nothing: a copy still on its way
             // can change it, and a 412 the GET contradicts is no reading at all. Send the same request
             // once more on it; a late first copy makes that a 412, and the next GET shows it landed.
-            return if self.copies.resent {
+            return if self.copies.resent_on.contains(&etag) {
                 Read::Unknown
             } else {
                 Read::Again(etag)
@@ -685,7 +707,7 @@ impl Run {
                 ..
             } => match self.copies.last.clone() {
                 Some(request) => {
-                    self.copies.resent = true;
+                    self.copies.reposted = true;
                     Some(self.send(request))
                 }
                 None => self.apply(Read::Unknown),
@@ -704,7 +726,7 @@ impl Run {
                 let Some(request) = self.copies.last.clone().map(|r| on_etag(r, &etag)) else {
                     return Some(self.stop_unknown());
                 };
-                self.copies.resent = true;
+                self.copies.resent_on.push(etag);
                 Some(self.send(request))
             }
             Read::OnNewer(etag) => {
@@ -712,7 +734,6 @@ impl Run {
                     return Some(self.stop_unknown());
                 };
                 self.copies.in_doubt = false;
-                self.copies.resent = false;
                 self.copies.answered_ok = false;
                 self.copies.moved_on = true;
                 Some(self.send(request))
@@ -1069,7 +1090,7 @@ enum SettlePhase {
     OriginalLook,
     /// The fence write is out.
     Fence,
-    /// A GET of the original after the fence met a 412.
+    /// A GET of the original after the fence met a 412, or a 2xx that left Google at a cut etag.
     OriginalRelook,
     /// A GET of the new series before deleting it is out (`resent`: the delete went once more).
     DeleteLook {
@@ -1980,8 +2001,15 @@ mod tests {
                     sent.iter().filter(|r| r.method == Method::Patch).collect();
                 assert!(cuts.len() <= 4, "{w}/{g}");
                 four += usize::from(cuts.len() == 4);
-                for c in cuts {
-                    assert!(shown.contains(c.if_match.as_ref().unwrap()), "{w}/{g}");
+                for c in &cuts {
+                    let on = c.if_match.as_ref().unwrap();
+                    assert!(shown.contains(on), "{w}/{g}");
+                    // The first copy, or a resend on a newer etag, and one once-more on it.
+                    let per_etag = cuts
+                        .iter()
+                        .filter(|x| x.if_match.as_ref() == Some(on))
+                        .count();
+                    assert!(per_etag <= 2, "{w}/{g}: {per_etag} on {on}");
                 }
             }
         }
@@ -2543,6 +2571,31 @@ mod tests {
         }
     }
 
+    /// Verify-pass finding: every copy of the move was refused with a 412, and someone else has
+    /// half-moved the series since. That half is theirs, never PM's to put back: a conflict, and no
+    /// restore is written over their change.
+    #[test]
+    fn a_half_move_no_copy_made_is_a_conflict_never_put_back() {
+        let (case, plan) = all_to_tuesday();
+        let old = case.master.json().clone();
+        let mut theirs = landed(&old, &plan.steps[0], "\"m5\"");
+        theirs["recurrence"] = old["recurrence"].clone();
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Patch => status(Verdict::Conflict),
+            _ => ok(theirs.clone()),
+        });
+        let Ran::NotDone {
+            why: Why::Conflict(fields),
+            rollback: Rollback::Nothing,
+            ..
+        } = &ran
+        else {
+            panic!("{ran:?}");
+        };
+        assert!(fields.iter().any(|f| f == "start"), "{fields:?}");
+        assert_eq!(sent.iter().filter(|r| r.method == Method::Patch).count(), 1);
+    }
+
     #[test]
     fn never_restore_master_on_a_plain_unknown() {
         let (case, plan) = all_to_tuesday();
@@ -2683,6 +2736,10 @@ mod tests {
         assert!(Run::finish(plan.clone(), &unknown_cut, &cut_done).is_ok());
         for settled in [
             tail_there.clone(),
+            // A copy that doesn't show what it's offered as: the original uncut, a deleted tail.
+            Settled::CutDone {
+                original: case.master.json().clone(),
+            },
             Settled::CutUnproved,
             Settled::CutNotDone,
             Settled::Unknown,
@@ -2698,6 +2755,13 @@ mod tests {
         assert!(Run::finish(plan.clone(), &unknown_insert, &tail_there).is_ok());
         assert_eq!(
             Run::finish(plan.clone(), &unknown_insert, &cut_done).err(),
+            Some(Unfit)
+        );
+        let deleted_tail = Settled::TailThere {
+            tail: with(tail.clone(), "status", json!("cancelled")),
+        };
+        assert_eq!(
+            Run::finish(plan.clone(), &unknown_insert, &deleted_tail).err(),
             Some(Unfit)
         );
         let (refused, _, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
@@ -2821,15 +2885,41 @@ mod tests {
     #[test]
     fn a_fence_that_didnt_move_the_etag_proves_nothing() {
         let (case, plan, ran) = partial(weekly());
+        let tail = tail_of(&plan, "\"t1\"");
         let old = case.master.json().clone();
-        let mut settle = Settle::new(plan, &ran, SettleAction::Remove).unwrap();
+        let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove).unwrap();
         let (settled, sent, _) = drive(&mut settle, |r| match r.method {
-            Method::Get => ok(old.clone()),
-            Method::Patch => ok(old.clone()),
+            // The new series is there to delete: only the fence's etag can stop it.
+            Method::Get if to(r, TAIL) => ok(tail.clone()),
+            Method::Get | Method::Patch => ok(old.clone()),
             _ => panic!("nothing else: {r:?}"),
         });
         assert_eq!(settled, Settled::Unknown);
-        assert!(!sent.iter().any(|r| r.method == Method::Delete));
+        let methods: Vec<Method> = sent.iter().map(|r| r.method).collect();
+        assert_eq!(methods, [Method::Get, Method::Patch, Method::Get]);
+        assert!(to(&sent[0], "abc") && to(&sent[2], "abc"));
+
+        // Looked at again, Google is past every copy of the cut: proved, and the new series goes.
+        let mut gets = 0;
+        let mut settle = Settle::new(plan, &ran, SettleAction::Remove).unwrap();
+        let (settled, sent, _) = drive(&mut settle, |r| match r.method {
+            Method::Get if to(r, TAIL) => ok(tail.clone()),
+            Method::Get => {
+                gets += 1;
+                ok(if gets == 1 {
+                    old.clone()
+                } else {
+                    at_etag(&old, "\"m9\"")
+                })
+            }
+            Method::Patch => ok(old.clone()),
+            Method::Delete => deleted(),
+            Method::Insert => panic!("never an insert"),
+        });
+        assert_eq!(settled, Settled::Removed);
+        let last = sent.last().unwrap();
+        assert!(last.method == Method::Delete && to(last, TAIL));
+        assert_eq!(last.if_match.as_deref(), Some("\"t1\""));
     }
 
     /// Review finding: a copy of the original without an etag can't say which etag Google is at.

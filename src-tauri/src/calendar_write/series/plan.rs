@@ -31,9 +31,10 @@
 //!   "Remove the new series" GETs the original. Showing `old` proves the cut not done only at an etag
 //!   other than the one the cut was sent on (a copy still in flight would fail its If-Match); at the
 //!   same etag, C9 first moves it with a fence write on the cut's If-Match (a PATCH of a private
-//!   property, notify none). A 2xx holding the old rule proves the cut not done; a 412 says only that
-//!   the etag moved, so C9 GETs again and takes the cut's verdict: the cut's rule is done, `old` at an
-//!   etag other than the cut's is proved not done, anything else unknown. Proved not done, the tail
+//!   property, notify none). A 2xx holding the old rule at an etag no copy of the cut went out on
+//!   proves the cut not done; a 412, or a 2xx that left Google at the cut's etag, proves nothing by
+//!   itself, so C9 GETs again and takes the cut's verdict: the cut's rule is done, `old` at an etag
+//!   other than the cut's is proved not done, anything else unknown. Proved not done, the tail
 //!   may be deleted; done offers "Finish", the rest of this same plan from the step after the cut;
 //!   unknown offers neither. Never re-send the cut to settle it: that turns Remove into Finish against
 //!   the user's choice.
