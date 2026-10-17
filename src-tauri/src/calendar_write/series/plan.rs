@@ -630,8 +630,9 @@ const TAIL_FIELDS: &[&str] = &[
 ];
 
 impl SeriesPlan {
-    /// A 412 on step `step`, `fresh` being Google's copy now: send again, or not. Asked only after
-    /// [`SeriesPlan::verdict`] found the step not landed.
+    /// A 412 on step `step`, `fresh` being Google's copy now: send again, or not. Asked only once no
+    /// copy of the step can land: [`SeriesPlan::verdict`] found it not landed, or found neither the
+    /// change nor what was there with every copy refused and Google at an etag none went out on.
     #[cfg_attr(
         not(test),
         expect(
@@ -854,6 +855,9 @@ impl SeriesPlan {
             "transparency" => or(a, "opaque") == or(b, "opaque"),
             "visibility" => or(a, "default") == or(b, "default"),
             "summary" | "description" | "location" | "colorId" => or(a, "") == or(b, ""),
+            // PM's own notes (a fence, a split's) are bookkeeping, not a change anyone made (C9
+            // design review M9).
+            "extendedProperties" => super::without_pm_notes(a) == super::without_pm_notes(b),
             "reminders" => {
                 let d = json!({ "useDefault": true });
                 a.filter(|v| !v.is_null()).unwrap_or(&d) == b.filter(|v| !v.is_null()).unwrap_or(&d)
@@ -2857,6 +2861,37 @@ mod tests {
         assert_eq!(
             case.edit(Scope::Following, title("Retro")),
             Err(NotPlanned::Conflict(vec!["attendees".into()]))
+        );
+    }
+
+    /// C9 design review M9: a fence "Remove the new series" wrote since the editor opened is PM's own
+    /// note, never a change in Google; anyone else's private property still is.
+    #[test]
+    fn pms_own_notes_on_the_series_are_no_conflict() {
+        let mut case = Case::new(weekly(), monday_19());
+        let fenced = with(
+            weekly(),
+            "extendedProperties",
+            json!({ "private": { "pmFence": "d \"m1\"" } }),
+        );
+        // Opened before the fence, planned on Google's copy after it.
+        case.master = fresh(with(fenced, "etag", json!("\"m2\"")));
+        let plan = case.edit(Scope::Following, title("Retro")).unwrap();
+        // And the cut's 412 rule reads a copy without the note the same way.
+        assert_eq!(plan.resend(1, &weekly()), Resend::Proceed);
+        let theirs = with(
+            weekly(),
+            "extendedProperties",
+            json!({ "private": { "pmFence": "d", "app": "x" } }),
+        );
+        assert_eq!(
+            plan.resend(1, &theirs),
+            Resend::Conflict(vec!["extendedProperties".into()])
+        );
+        case.master = fresh(theirs);
+        assert_eq!(
+            case.edit(Scope::Following, title("Retro")),
+            Err(NotPlanned::Conflict(vec!["extendedProperties".into()]))
         );
     }
 
