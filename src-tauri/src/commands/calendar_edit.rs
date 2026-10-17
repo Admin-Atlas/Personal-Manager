@@ -7147,18 +7147,23 @@ mod tests {
         assert!(host.edit.held_deletes.list().is_empty());
         assert_eq!(host.ids(), ids_of(rows_of(&october())));
 
-        // Its entry dropped (PM quitting): nothing goes.
-        let host = TestHost::holding(&october());
-        let held = planned(&host).await;
-        let _claim = held_claim(&host);
-        let _rx = hold(&host);
-        host.edit.abandon_held_deletes();
-        let silent = Script::new(Vec::new());
-        assert_eq!(
-            finish_held_series_delete(&silent, &*host, &target, &held, false).await,
-            None
-        );
-        silent.asked_all();
+        // The wait over but its entry gone first (an Undo that got there, or PM quitting): nothing
+        // goes and nothing is said, editing on or off.
+        for editing in [EditingStatus::On, EditingStatus::Paused] {
+            let host = TestHost::holding(&october());
+            let held = planned(&host).await;
+            let _claim = held_claim(&host);
+            let _rx = hold(&host);
+            *host.editing.lock().unwrap() = editing;
+            host.edit.abandon_held_deletes();
+            let silent = Script::new(Vec::new());
+            assert_eq!(
+                finish_held_series_delete(&silent, &*host, &target, &held, false).await,
+                None,
+                "{editing:?}"
+            );
+            silent.asked_all();
+        }
     }
 
     // --- one event, unscoped (review round 2: H1's routing through the shells' own paths) ---
@@ -7182,6 +7187,7 @@ mod tests {
         let seen = seen_by_user(&fresh_event(event.clone()));
         let delete =
             |answer: Scripted| Step::write(Method::Delete, "/events/solo", "\"s1\"", answer);
+        let moved = written(&event, &[("description", json!("Bring forms"))], "\"s3\"");
         let cases = [
             (
                 vec![
@@ -7225,6 +7231,28 @@ mod tests {
                 saved(),
                 true,
             ),
+            // Still there, changed elsewhere outside what the user saw: the 412 gets its one fresh
+            // round, on Google's new etag.
+            (
+                vec![
+                    delete(Scripted::Reply {
+                        status: 412,
+                        body: None,
+                        date: None,
+                        maybe_applied: true,
+                    }),
+                    Step::get("/events/solo", "", moved.clone()),
+                    Step::get("/events/solo", "", moved.clone()),
+                    Step::write(
+                        Method::Delete,
+                        "/events/solo",
+                        "\"s3\"",
+                        Scripted::Status(204),
+                    ),
+                ],
+                saved(),
+                true,
+            ),
         ];
         for (answers, expected, removed) in cases {
             let host = TestHost::holding(std::slice::from_ref(&event));
@@ -7263,6 +7291,7 @@ mod tests {
         let target = target(&event);
         let patch = |answer: Scripted| Step::write(Method::Patch, "/events/solo", "\"s1\"", answer);
         let renamed = retitled(&event, "\"s2\"");
+        let moved = written(&event, &[("location", json!("Room 2"))], "\"s3\"");
         let cases = [
             (
                 vec![
@@ -7304,6 +7333,8 @@ mod tests {
                 saved(),
                 "Retro",
             ),
+            // (Changed elsewhere meanwhile, in a field this save doesn't send: the fresh round goes
+            // out on Google's new etag.)
             (
                 vec![
                     patch(Scripted::Reply {
@@ -7312,9 +7343,14 @@ mod tests {
                         date: None,
                         maybe_applied: true,
                     }),
-                    Step::get("/events/solo", "", event.clone()),
-                    Step::get("/events/solo", "", event.clone()),
-                    patch(Scripted::Json(renamed.clone())),
+                    Step::get("/events/solo", "", moved.clone()),
+                    Step::get("/events/solo", "", moved.clone()),
+                    Step::write(
+                        Method::Patch,
+                        "/events/solo",
+                        "\"s3\"",
+                        Scripted::Json(renamed.clone()),
+                    ),
                 ],
                 saved(),
                 "Retro",

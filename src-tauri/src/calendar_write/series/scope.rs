@@ -230,6 +230,19 @@ mod tests {
     use super::super::fixtures::*;
     use super::*;
 
+    /// The scope the webview names is the scope a plan is made for, from the wire on.
+    #[test]
+    fn the_scope_sent_is_the_scope_planned() {
+        for (json, scope) in [
+            (r#""this""#, Scope::This),
+            (r#""following""#, Scope::Following),
+            (r#""all""#, Scope::All),
+        ] {
+            let sent: SeriesScope = serde_json::from_str(json).unwrap();
+            assert_eq!(Scope::from(sent), scope, "{json}");
+        }
+    }
+
     fn timed(date: &str, start: &str, end: &str, zone: &str) -> TimeDraft {
         TimeDraft::Timed {
             start_date: date.into(),
