@@ -189,13 +189,6 @@ fn by_day_text(entries: &[ByDay]) -> String {
 /// occurrence lands. `from` must be an occurrence of the rule; the caller checks that, and checks the
 /// result occurrence by occurrence ([`super::remap::retime`]), so a row here only has to be right for
 /// the moves it accepts.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn reanchor(
     rule: &Rule,
     facts: &RuleFacts,

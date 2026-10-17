@@ -39,13 +39,6 @@ pub struct Cut {
 /// cutting it would lengthen the series rather than shorten it. An UNTIL says so itself; a COUNT is
 /// judged by `google_before`, how many of the rule's occurrences Google lists before `at` (A7:
 /// `events.instances`, cancelled ones in, RDATE-only ones out), so a rule with a COUNT needs it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn truncate_recurrence<S: AsRef<str>>(
     lines: &[S],
     start: &SeriesStart,
@@ -131,13 +124,6 @@ pub fn truncate_recurrence<S: AsRef<str>>(
 /// to `remaining` (from [`remaining_count`]) or its UNTIL kept, then the values
 /// [`truncate_recurrence`] moved. When the rest also moves to a new time or day,
 /// [`super::remap::retime`] moves it from here.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn tail_recurrence<S: AsRef<str>>(
     lines: &[S],
     remaining: Option<u32>,
@@ -158,13 +144,6 @@ pub fn tail_recurrence<S: AsRef<str>>(
 
 /// What's left of a COUNT once `before` of its occurrences have gone (Google's number, from
 /// `events.instances`): at least one, or the series had already ended.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn remaining_count(count: u32, before: u32) -> Result<u32, RecurError> {
     count
         .checked_sub(before)

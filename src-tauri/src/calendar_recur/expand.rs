@@ -121,13 +121,6 @@ pub(super) fn starts<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Vec<Poi
 
 /// How many of the rule's starts come before `at`, when `at` is itself one of them. Anything else,
 /// an occurrence the rule doesn't make or one past its end, is [`RecurError::CannotCount`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn occurrences_before(
     facts: &RuleFacts,
     start: &SeriesStart,
@@ -159,13 +152,6 @@ pub fn occurrences_before(
 /// out). PM rebases a COUNT on Google's number and uses this only as a cross-check: when the two
 /// disagree (a master whose start isn't on its own rule, which RFC 5545 counts and the crate
 /// doesn't, among others) it refuses to split rather than guess.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn crate_agrees(facts: &RuleFacts, start: &SeriesStart, at: Point, google_before: u32) -> bool {
     occurrences_before(facts, start, at) == Ok(google_before)
 }
@@ -241,13 +227,6 @@ fn same_kind(start: &SeriesStart, at: &Point) -> Result<(), RecurError> {
 
 /// Whether the rule makes an occurrence exactly at `at`. A carried EXDATE that isn't one any more
 /// excludes nothing, and Google refuses an EXDATE that "doesn't point to a valid instance".
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn is_occurrence(
     facts: &RuleFacts,
     start: &SeriesStart,
@@ -269,13 +248,6 @@ pub fn is_occurrence(
 
 /// The rule's occurrences from `from` on (inclusive), at most `max` of them: what a moved series is
 /// checked against, occurrence for occurrence.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn occurrences_from(
     facts: &RuleFacts,
     start: &SeriesStart,

@@ -46,9 +46,16 @@ export const WRITE_COMMANDS = [
   ["delete_calendar_event", "deleteCalendarEvent"],
   ["cancel_calendar_delete", "cancelCalendarDelete"],
   ["list_held_deletes", "listHeldDeletes"],
+  ["series_choices", "seriesChoices"],
 ];
 export const COMMANDS = WRITE_COMMANDS.map(([command]) => command);
 export const WRAPPERS = WRITE_COMMANDS.map(([, wrapper]) => wrapper);
+
+/** Dev-build commands in the write module, run from the devtools console for live tests (#884's C9a
+ *  probes). They exist only under `#[cfg(debug_assertions)]`, in the module and in their lib.rs
+ *  registration, and have no ipc.ts wrapper at all: a name there would put a debug-only command into
+ *  release code. */
+export const DEV_COMMANDS = ["dev_series_report"];
 
 const EDIT_COMMANDS_RS = "src-tauri/src/commands/calendar_edit.rs";
 const LIB_RS = "src-tauri/src/lib.rs";
@@ -83,7 +90,7 @@ const FORBIDDEN_ON_MODEL_PATH = [
   [/\bgoogle_io\b/, "the calendar write sender"],
   [/\bauthorized_send(_with)?\b/, "an authorised Google request"],
   [/googleapis\.com\/calendar|\bCALENDAR_API\b/, "the Google Calendar API"],
-  ...COMMANDS.map((c) => [new RegExp(`\\b${c}\\b`), `the \`${c}\` command`]),
+  ...[...COMMANDS, ...DEV_COMMANDS].map((c) => [new RegExp(`\\b${c}\\b`), `the \`${c}\` command`]),
 ];
 
 /** A Calendar API URL, and what could send something other than a read with it. */
@@ -124,7 +131,7 @@ export function scan(root) {
   const problems = [];
 
   // 1. Command names: defined and registered in Rust, invoked from ipc.ts (and checked by its
-  //    tests), and nowhere else.
+  //    tests), and nowhere else. A dev command isn't invoked from ipc.ts either.
   for (const command of COMMANDS) {
     const re = new RegExp(`\\b${command}\\b`);
     for (const [path, text] of [...rust, ...web]) {
@@ -134,6 +141,19 @@ export function scan(root) {
         problems.push(
           `${at} names the calendar write command \`${command}\`, which only ${EDIT_COMMANDS_RS}, ` +
             `${LIB_RS} and ${IPC_TS} may`,
+        );
+      }
+    }
+  }
+  for (const command of DEV_COMMANDS) {
+    const re = new RegExp(`\\b${command}\\b`);
+    for (const [path, text] of [...rust, ...web]) {
+      if (path === EDIT_COMMANDS_RS || path === LIB_RS || isTest(path)) continue;
+      const at = where(path, text, re);
+      if (at) {
+        problems.push(
+          `${at} names the dev-build calendar command \`${command}\`, which only ` +
+            `${EDIT_COMMANDS_RS} and ${LIB_RS} may (it has no wrapper; run it from devtools)`,
         );
       }
     }
@@ -229,19 +249,41 @@ export function scan(root) {
     const defined = [
       ...editModule.matchAll(/#\[tauri::command\]\s*pub\s+(?:async\s+)?fn\s+(\w+)/g),
     ].map((m) => m[1]);
-    if (!sameSet(defined, COMMANDS)) {
+    const listed = [...COMMANDS, ...DEV_COMMANDS];
+    if (!sameSet(defined, listed)) {
       problems.push(
         `${EDIT_COMMANDS_RS} defines the commands [${defined.join(", ")}] but this fence lists ` +
-          `[${COMMANDS.join(", ")}]; add a new write command to WRITE_COMMANDS (and its wrapper)`,
+          `[${listed.join(", ")}]; add a new write command to WRITE_COMMANDS (and its wrapper)`,
       );
     }
     // `commands/mod.rs` re-exports the module with a glob, so any other `pub fn` is reachable as
     // `crate::commands::<name>` without naming the module at all.
     for (const m of editModule.matchAll(/^pub\s+(?:async\s+)?fn\s+(\w+)/gm)) {
-      if (!COMMANDS.includes(m[1])) {
+      if (!listed.includes(m[1])) {
         problems.push(
           `${EDIT_COMMANDS_RS}:${lineOf(editModule, m.index)} has a plain \`pub fn ${m[1]}\`, ` +
             `which the commands glob re-exports; make it \`pub(super)\` or narrower`,
+        );
+      }
+    }
+    // A dev command exists only in dev builds, here and where lib.rs registers it.
+    const libRs = sources.get(LIB_RS) ?? "";
+    for (const command of DEV_COMMANDS) {
+      const gated = new RegExp(
+        `#\\[cfg\\(debug_assertions\\)\\]\\s*#\\[tauri::command\\]\\s*pub\\s+(?:async\\s+)?fn\\s+${command}\\b`,
+      );
+      if (defined.includes(command) && !gated.test(editModule)) {
+        problems.push(
+          `${EDIT_COMMANDS_RS} defines the dev command \`${command}\` without ` +
+            `\`#[cfg(debug_assertions)]\` straight before its \`#[tauri::command]\`, so release ` +
+            `builds would have it`,
+        );
+      }
+      const registered = new RegExp(`#\\[cfg\\(debug_assertions\\)\\]\\s*commands::${command}\\b`);
+      if (!registered.test(libRs)) {
+        problems.push(
+          `${LIB_RS} must register the dev command \`${command}\` straight after a ` +
+            `\`#[cfg(debug_assertions)]\``,
         );
       }
     }

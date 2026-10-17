@@ -134,12 +134,14 @@ import type {
   CalendarWriteLanded,
   CalendarCheck,
   CalendarSynced,
+  ChoiceRequest,
   DeleteSettled,
   DeleteStart,
   EditLoad,
   EventPatchDraft,
   HeldDeleteInfo,
   SeenSummary,
+  SeriesChoices,
   WriteOutcome,
 } from "./types";
 
@@ -1101,6 +1103,11 @@ export const cancelCalendarDelete = (undoToken: string) =>
 
 /** The deletes still in their Undo window, for a webview that reloaded and lost its own record. */
 export const listHeldDeletes = () => invoke<HeldDeleteInfo[]>("list_held_deletes");
+
+/** "This event", "This and following" and "All events" for a change to a repeating occurrence, each
+ *  planned against Google's copies now: what it would do, or why it can't. Only reads go to Google. */
+export const seriesChoices = (request: ChoiceRequest) =>
+  invoke<SeriesChoices>("series_choices", { request });
 
 /** A held delete went to Google, and this is what came of it (none for an undone one). */
 export const onCalendarDeleteSettled = (

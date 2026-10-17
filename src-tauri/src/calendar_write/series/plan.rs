@@ -244,7 +244,7 @@ impl Op {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn request(&self, notify: Notify) -> Option<RequestPlan> {
@@ -301,7 +301,7 @@ impl Op {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn carry_request(&self, event: &str, etag: &str, notify: Notify) -> Option<RequestPlan> {
@@ -324,7 +324,7 @@ impl Op {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn fits(&self) -> bool {
@@ -436,7 +436,7 @@ impl Undo {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn request(&self, etag: &str, notify: Notify) -> RequestPlan {
@@ -464,7 +464,7 @@ impl Undo {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn gone_is_done(&self) -> bool {
@@ -478,7 +478,7 @@ impl Undo {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn resend_on(&self, fresh: &Value) -> bool {
@@ -638,7 +638,7 @@ impl SeriesPlan {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn resend(&self, step: usize, fresh: &Value) -> Resend {
@@ -692,7 +692,7 @@ impl SeriesPlan {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn verdict(&self, step: usize, fresh: Option<&Value>) -> Applied {
@@ -734,7 +734,7 @@ impl SeriesPlan {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn half_applied(&self, step: usize, fresh: &Value) -> bool {
@@ -783,7 +783,7 @@ impl SeriesPlan {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn expect_after(&self, skipped: &[usize]) -> Vec<Expect> {
@@ -811,7 +811,7 @@ impl SeriesPlan {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, sending series writes"
         )
     )]
     pub fn removes_for(&self, diff: &SeriesDiff, skipped: &[usize]) -> Removes {
@@ -827,6 +827,56 @@ impl SeriesPlan {
             },
             other => other,
         }
+    }
+
+    /// The token a choice row carries (DS12): a digest of what the plan does (its scope, its
+    /// warnings, and each step's kind, stage and dependency), bound to `bind`, the editor or row it
+    /// was offered for and the draft. Never an etag or the new series' id, which differ from one
+    /// preview to the next. At send the plan is made again and must give the same token, or the user
+    /// is asked again (C9a-3), so what goes to Google is what they chose.
+    pub fn choice_digest(&self, bind: &str) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let mut text = format!("{bind}\u{1f}{:?}", self.scope);
+        for warning in &self.warnings {
+            let _ = write!(text, "\u{1f}{warning:?}");
+        }
+        for step in &self.steps {
+            let kind = match step.op {
+                Op::Insert { .. } => "insert",
+                Op::Patch { .. } => "patch",
+                Op::Cancel { .. } => "cancel",
+                Op::Delete { .. } => "delete",
+                Op::Carry { .. } => "carry",
+            };
+            let _ = write!(text, "\u{1f}{kind} {:?} {:?}", step.stage, step.requires);
+        }
+        hex::encode(&Sha256::digest(text.as_bytes())[..8])
+    }
+
+    /// The rule and start the series repeats by once this change has run, for the question a move
+    /// to another day asks (A29): a split's new series, or the master after "all events". Where the
+    /// change moves only the start, as one to a monthly or yearly rule that names no day does, the
+    /// rule is the master's own, `recurrence` (C9 design review scope-L1). `None` for "this event",
+    /// and for a change to neither.
+    pub fn new_rule(&self, recurrence: &[String]) -> Option<(Vec<String>, SeriesStart)> {
+        if self.scope == Scope::This {
+            return None;
+        }
+        let body = self.steps.iter().find_map(|s| match (&s.op, s.stage) {
+            (Op::Insert { body, .. } | Op::Patch { body, .. }, Stage::Commit) => Some(body),
+            _ => None,
+        })?;
+        let start = match body.get("start") {
+            Some(node) => start_of(node)?,
+            None if body.contains_key("recurrence") => self.start,
+            None => return None,
+        };
+        let lines = match body.get("recurrence") {
+            Some(lines) => lines_of(Some(lines)),
+            None => recurrence.to_vec(),
+        };
+        Some((lines, start))
     }
 
     /// Where the cleanup cancels among `skipped` would have cancelled.
@@ -900,6 +950,21 @@ fn prepare(input: &SeriesInput) -> Result<(Master, Point), NotPlanned> {
 
 fn text(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// A `start` node as a series' start: its day, or its instant in its own zone (A27).
+fn start_of(node: &Value) -> Option<SeriesStart> {
+    if let Some(day) = node.get("date").and_then(Value::as_str) {
+        return NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .ok()
+            .map(SeriesStart::AllDay);
+    }
+    let zone: Tz = node.get("timeZone")?.as_str()?.parse().ok()?;
+    let at = DateTime::parse_from_rfc3339(node.get("dateTime")?.as_str()?.trim()).ok()?;
+    Some(SeriesStart::Timed {
+        local: at.with_timezone(&zone).naive_local(),
+        zone,
+    })
 }
 
 /// A `recurrence` value's lines.
@@ -1113,13 +1178,6 @@ fn cut_step(
 /// Delete the occurrence (`This`), the series from it on (`Following`), or the whole series (`All`)
 /// (T8). `seen` is what the user saw of the occurrence; the delete goes ahead only if that's still
 /// what's there (A8, A15).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn plan_series_delete(
     scope: Scope,
     input: &SeriesInput,
@@ -1372,13 +1430,6 @@ fn changed_since_opened(
 /// (`All`) as `draft` says. `tail_id` is the id a split's new series is inserted under: C9 mints a new
 /// one with `plan::client_event_id` for every new plan, and reuses it only to send this same plan
 /// again (the module's "one plan, one tail id").
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn plan_series_edit(
     scope: Scope,
     input: &SeriesInput,
@@ -3554,6 +3605,102 @@ mod tests {
         assert_eq!(
             body(&plan.steps[1])["recurrence"],
             json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261102T135959Z"])
+        );
+    }
+
+    // --- C9a-2 ---
+
+    /// DS12, C9 design review L3: a choice's token is what the plan does, bound to whom it was
+    /// offered; never the etag it was planned on or the new series' id, which change every preview.
+    #[test]
+    fn a_choice_token_ignores_etags_and_tail_ids() {
+        let split = |case: &Case, tail: &str| {
+            plan_series_edit(
+                Scope::Following,
+                &case.input(),
+                &title("Retro"),
+                tail,
+                Notify::None,
+            )
+            .unwrap()
+        };
+        let case = Case::new(weekly(), monday_19());
+        let token = split(&case, TAIL).choice_digest("s1");
+        assert_eq!(token.len(), 16);
+        let other_tail = split(&case, "fedcba9876543210fedcba9876543210");
+        assert_ne!(other_tail, split(&case, TAIL));
+        assert_eq!(other_tail.choice_digest("s1"), token);
+        let moved_on = Case::new(with(weekly(), "etag", json!("\"m2\"")), monday_19());
+        assert_eq!(split(&moved_on, TAIL).choice_digest("s1"), token);
+        // Offered to another editor, or another plan: another token.
+        assert_ne!(split(&case, TAIL).choice_digest("s2"), token);
+        let all = case.edit(Scope::All, title("Retro")).unwrap();
+        assert_ne!(all.choice_digest("s1"), token);
+        // One more occurrence changed on its own is one more carry: the user is asked again.
+        let busier = Case::new(weekly(), monday_19()).exceptions(vec![with(
+            plain("2026-10-26T09:00:00Z"),
+            "summary",
+            json!("Standup (room 4)"),
+        )]);
+        assert_ne!(split(&busier, TAIL).choice_digest("s1"), token);
+    }
+
+    /// A29, C9 design review scope-L1: the rule and start a change leaves, for the question a move to
+    /// another day asks; the master's rule where the change moves only the start.
+    #[test]
+    fn a_change_says_the_rule_it_leaves() {
+        let case = Case::new(weekly(), monday_19());
+        let tuesdays = case.edit(Scope::All, at("09:00", "2026-10-20")).unwrap();
+        let zone = chrono_tz::Europe::London;
+        let at_nine = |y, m, d| SeriesStart::Timed {
+            local: day(y, m, d).and_hms_opt(9, 0, 0).unwrap(),
+            zone,
+        };
+        let weekly_rule = vec!["RRULE:FREQ=WEEKLY;BYDAY=MO".to_string()];
+        assert_eq!(
+            tuesdays.new_rule(&weekly_rule),
+            Some((
+                vec!["RRULE:FREQ=WEEKLY;BYDAY=TU".to_string()],
+                at_nine(2026, 10, 6)
+            ))
+        );
+        let rest = case
+            .edit(Scope::Following, at("09:00", "2026-10-20"))
+            .unwrap();
+        assert_eq!(
+            rest.new_rule(&weekly_rule),
+            Some((
+                vec!["RRULE:FREQ=WEEKLY;BYDAY=TU".to_string()],
+                at_nine(2026, 10, 20)
+            ))
+        );
+        // A rule that names no day keeps its text when its start moves.
+        let monthly_rule = vec!["RRULE:FREQ=MONTHLY".to_string()];
+        let monthly = master_with(
+            &["RRULE:FREQ=MONTHLY"],
+            "2026-10-05T09:00:00+01:00",
+            "2026-10-05T10:00:00+01:00",
+        );
+        let sixth = Case::new(monthly, plain("2026-11-05T09:00:00Z"))
+            .edit(Scope::All, at("09:00", "2026-11-06"))
+            .unwrap();
+        assert!(!body(&sixth.steps[0]).contains_key("recurrence"));
+        assert_eq!(
+            sixth.new_rule(&monthly_rule),
+            Some((monthly_rule.clone(), at_nine(2026, 10, 6)))
+        );
+        // "This event", and a change of text only, leave the rule alone.
+        assert_eq!(
+            case.edit(Scope::This, at("09:00", "2026-10-20"))
+                .unwrap()
+                .new_rule(&weekly_rule),
+            None
+        );
+        assert_eq!(
+            case.edit(Scope::All, title("Retro"))
+                .unwrap()
+                .new_rule(&weekly_rule),
+            None
         );
     }
 }

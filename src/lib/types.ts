@@ -1623,10 +1623,59 @@ export type EditLoad =
       permissions: FieldPermissions;
       /** What the editor showed, in the mirror's terms, for a delete started from it. */
       seen: SeenSummary | null;
+      /** Its series, when it's an occurrence of one PM could read. */
+      series: SeriesInfo | null;
     }
   | { outcome: "gone" }
   | { outcome: "reauth" }
   | { outcome: "failed"; message: string };
+
+/** An occurrence's series, as the editor shows it. */
+export interface SeriesInfo {
+  /** The series' first occurrence, where "this and following" is every occurrence. */
+  first: boolean;
+  /** How it repeats, as Google Calendar says it ("Weekly on Monday"). */
+  repeats: string;
+}
+
+/** What the choices for a change to a repeating occurrence are asked for: an open editor's draft, or
+ *  a delete of a mirrored row. */
+export type ChoiceRequest =
+  | { kind: "edit"; session: string; draft: EventPatchDraft }
+  | { kind: "delete"; event_id: string; seen: SeenSummary };
+
+/** What the user should know before choosing a row. Dates are `YYYY-MM-DD` in the series' zone. */
+export type SeriesWarning =
+  | { warning: "split_sibling" }
+  /** `complete` false: PM couldn't see every changed occurrence, so "some". */
+  | { warning: "exceptions_may_reset"; count: number; complete: boolean }
+  | { warning: "start_moved"; from: string; to: string }
+  /** `before`/`after`: the days in words ("every Sunday"), null where the rule names none. */
+  | {
+      warning: "repeat_day_changes";
+      from: string;
+      to: string;
+      before: string | null;
+      after: string | null;
+      shift_days: number;
+    }
+  | { warning: "length_changes" }
+  | { warning: "not_carried"; attachments: boolean; conference: boolean; label: boolean }
+  | { warning: "new_identity" };
+
+/** One of "This event", "This and following" and "All events". `token` names the plan in the save. */
+export type ScopeRow =
+  | { row: "offered"; warnings: SeriesWarning[]; token: string }
+  /** "This and following" from the first occurrence: every occurrence, as "All events". */
+  | { row: "as_all"; warnings: SeriesWarning[]; token: string }
+  | { row: "refused"; message: string }
+  | { row: "conflict"; fields: string[] };
+
+/** The three choices for one change to a repeating occurrence, each planned against Google now. */
+export type SeriesChoices =
+  | { outcome: "not_repeating" }
+  | { outcome: "ready"; this: ScopeRow; following: ScopeRow; all: ScopeRow }
+  | { outcome: "refused"; result: WriteOutcome };
 
 export type WriteWarning = "mirror_refresh_pending";
 

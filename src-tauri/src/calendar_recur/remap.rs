@@ -228,13 +228,6 @@ impl Retimed {
 ///
 /// The day moves by what the rule's change implies, measured from the occurrence's original day, so
 /// a dragged exception moves the series by where it came from (T7). The time of day is `new`'s.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn retime<S: AsRef<str>>(
     lines: &[S],
     start: &SeriesStart,
