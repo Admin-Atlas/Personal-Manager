@@ -74,6 +74,19 @@ pub fn get_event(calendar: &str, event: &str) -> RequestPlan {
     }
 }
 
+/// The occurrences of the series `event`, cancelled ones included (`showDeleted`, so a cancel shows as
+/// one and is never mistaken for a lag), narrowed by `query` (`timeMin`, `maxResults`, a page token).
+pub fn instances(calendar: &str, event: &str, query: &[(&str, &str)]) -> RequestPlan {
+    let mut q = vec![("showDeleted", "true")];
+    q.extend_from_slice(query);
+    RequestPlan {
+        method: Method::Get,
+        url: url(&["calendars", calendar, "events", event, "instances"], &q),
+        if_match: None,
+        body: None,
+    }
+}
+
 /// Change the fields in `body`, only if the event is still at `etag`.
 pub fn patch_event(
     calendar: &str,
@@ -167,6 +180,22 @@ mod tests {
             sneaky.url.ends_with("/events/..%2F..%2Fusers%2Fme"),
             "{}",
             sneaky.url
+        );
+    }
+
+    #[test]
+    fn a_series_occurrences_always_include_cancelled_ones() {
+        let p = instances(
+            "me@example.com",
+            "abc",
+            &[("timeMin", "2026-10-18T09:00:00Z"), ("maxResults", "10")],
+        );
+        assert_eq!(p.method, Method::Get);
+        assert_eq!(p.if_match, None);
+        assert_eq!(
+            p.url,
+            "https://www.googleapis.com/calendar/v3/calendars/me@example.com/events/abc/instances\
+             ?showDeleted=true&timeMin=2026-10-18T09%3A00%3A00Z&maxResults=10"
         );
     }
 

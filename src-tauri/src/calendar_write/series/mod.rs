@@ -9,6 +9,7 @@
 //! - [`scope`]: which of the three choices a change can offer.
 //! - [`plan`]: the writes themselves, and the rules for reading their answers.
 //! - [`diff`]: a re-fetch of a series turned into mirror rows added and removed.
+//! - [`run`]: a plan sent step by step, its answers read by the rules in [`plan`] (C9a), with no I/O.
 //!
 //! Everything starts from fresh copies of the event and its series ([`FreshEvent`]), never from the
 //! mirror (rule R1), and a change made in Google since the user opened the event is a conflict,
@@ -23,6 +24,7 @@
 
 pub mod diff;
 pub mod plan;
+pub mod run;
 pub mod scope;
 
 use std::fmt;
@@ -302,8 +304,32 @@ fn same_field(key: &str, instance: Option<&Value>, master: Option<&Value>) -> bo
             let id = |v: Option<&Value>| v.and_then(|c| c.get("conferenceId")).cloned();
             id(instance) == id(master)
         }
+        "extendedProperties" => without_pm_notes(instance) == without_pm_notes(master),
         _ => instance == master,
     }
+}
+
+/// The private notes PM itself puts on a series: which series a new one was split off and by what
+/// plan, and the fence a "Remove the new series" writes (C9). Bookkeeping, not a change anyone made:
+/// an occurrence holding a copy from before one was written isn't changed on its own.
+pub const PM_NOTES: &[&str] = &["pmSplitOf", "pmSplitPlan", "pmFence"];
+
+/// `extendedProperties` without [`PM_NOTES`], an emptied map read as none.
+fn without_pm_notes(v: Option<&Value>) -> Value {
+    let mut out = serde_json::Map::new();
+    for (scope, props) in v.and_then(Value::as_object).into_iter().flatten() {
+        let kept: serde_json::Map<String, Value> = props
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| scope != "private" || !PM_NOTES.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !kept.is_empty() {
+            out.insert(scope.clone(), Value::Object(kept));
+        }
+    }
+    Value::Object(out)
 }
 
 /// Guests as (address, optional), ignoring each one's reply (an RSVP isn't the organiser's change)
@@ -563,7 +589,12 @@ pub fn text_only(master: &Master) -> Option<TextOnly> {
 /// also London).
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use super::plan::{
+        plan_series_delete, plan_series_edit, Fresh, NotPlanned, Opened, SeriesInput, SeriesPlan,
+    };
+    use super::scope::Scope;
     use super::*;
+    use crate::calendar_write::dto::{EventPatchDraft, Notify, SeenSummary, TimeDraft};
     use serde_json::json;
 
     pub const CALENDAR: &str = "me@example.com";
@@ -651,6 +682,119 @@ pub(crate) mod fixtures {
         Exceptions {
             items,
             complete: true,
+        }
+    }
+
+    pub fn point(s: &str) -> Point {
+        Point::At(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc))
+    }
+
+    /// The new series' id in every test plan.
+    pub const TAIL: &str = "0123456789abcdef0123456789abcdef";
+
+    pub fn weekly() -> Value {
+        master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"])
+    }
+
+    pub fn monday_19() -> Value {
+        plain("2026-10-19T09:00:00+01:00")
+    }
+
+    pub fn title(s: &str) -> EventPatchDraft {
+        EventPatchDraft {
+            summary: Some(s.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn at(time: &str, date: &str) -> EventPatchDraft {
+        let end = format!("{:02}:00", time[..2].parse::<u32>().unwrap() + 1);
+        EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: date.into(),
+                start_time: time.into(),
+                start_zone: "Europe/London".into(),
+                end_date: date.into(),
+                end_time: end,
+                end_zone: "Europe/London".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// One series as C9 hands it over: the series, the occurrence picked, and its exceptions.
+    pub struct Case {
+        pub master: FreshEvent,
+        pub instance: FreshEvent,
+        pub opened_instance: FreshEvent,
+        pub opened_master: FreshEvent,
+        pub exceptions: Exceptions,
+        pub instances: Option<Listing>,
+        pub sibling: bool,
+        pub guests_allowed: bool,
+    }
+
+    impl Case {
+        pub fn new(master: Value, instance: Value) -> Case {
+            Case {
+                master: fresh(master.clone()),
+                instance: fresh(instance.clone()),
+                opened_instance: fresh(instance),
+                opened_master: fresh(master),
+                exceptions: complete(Vec::new()),
+                instances: None,
+                sibling: false,
+                guests_allowed: false,
+            }
+        }
+
+        pub fn exceptions(mut self, items: Vec<Value>) -> Case {
+            self.exceptions = complete(items);
+            self
+        }
+
+        /// As C12 will run it, a series with guests allowed.
+        pub fn guests(mut self) -> Case {
+            self.guests_allowed = true;
+            self
+        }
+
+        pub fn input(&self) -> SeriesInput<'_> {
+            SeriesInput {
+                calendar: CALENDAR,
+                opened: Opened {
+                    instance: &self.opened_instance,
+                    master: Some(&self.opened_master),
+                },
+                fresh: Fresh {
+                    instance: &self.instance,
+                    master: &self.master,
+                },
+                exceptions: &self.exceptions,
+                instances: self.instances.as_ref(),
+                sibling: self.sibling,
+                guests_allowed: self.guests_allowed,
+            }
+        }
+
+        pub fn delete(&self, scope: Scope) -> Result<SeriesPlan, NotPlanned> {
+            plan_series_delete(scope, &self.input(), &seen_of(&self.instance), Notify::None)
+        }
+
+        pub fn edit(&self, scope: Scope, draft: EventPatchDraft) -> Result<SeriesPlan, NotPlanned> {
+            plan_series_edit(scope, &self.input(), &draft, TAIL, Notify::None)
+        }
+    }
+
+    /// What the user saw of an occurrence: its mirror row's summary and times.
+    pub fn seen_of(instance: &FreshEvent) -> SeenSummary {
+        let row = crate::calendar::parse_event("", instance.json()).unwrap();
+        SeenSummary {
+            summary: row.summary,
+            start: row.start,
+            end: row.end,
+            all_day: row.all_day,
+            location: row.location,
         }
     }
 }
@@ -851,6 +995,59 @@ mod tests {
             classify_instance(&mj3, &m, &plain("2026-10-26T09:00:00Z")),
             InstanceKind::Plain
         );
+    }
+
+    /// C9 design review M9: a fence or split note PM put on the series since an occurrence was
+    /// stored doesn't make that occurrence read as changed; a property of anyone else's does.
+    #[test]
+    fn pms_own_notes_never_make_an_occurrence_look_changed() {
+        let props = |private: Value| json!({ "private": private, "shared": { "app": "x" } });
+        let mj = with(
+            master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]),
+            "extendedProperties",
+            props(json!({ "other": "1", "pmFence": "f", "pmSplitOf": "a", "pmSplitPlan": "p" })),
+        );
+        let m = read(mj.clone());
+        let older = with(
+            plain("2026-10-26T09:00:00Z"),
+            "extendedProperties",
+            props(json!({ "other": "1" })),
+        );
+        assert_eq!(classify_instance(&mj, &m, &older), InstanceKind::Plain);
+        // Only PM's notes in the private map: emptied, it reads as no private map at all.
+        let bare = with(
+            master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]),
+            "extendedProperties",
+            json!({ "private": { "pmFence": "f" } }),
+        );
+        let bare_instance = with(
+            plain("2026-10-26T09:00:00Z"),
+            "extendedProperties",
+            json!({}),
+        );
+        assert_eq!(
+            classify_instance(&bare, &read(bare.clone()), &bare_instance),
+            InstanceKind::Plain
+        );
+        let theirs = with(
+            plain("2026-10-26T09:00:00Z"),
+            "extendedProperties",
+            props(json!({ "other": "2" })),
+        );
+        assert_eq!(
+            classify_instance(&mj, &m, &theirs),
+            InstanceKind::Modified {
+                carry: vec![],
+                other: vec!["extendedProperties"]
+            }
+        );
+        // A shared property named like a note is someone else's.
+        let shared = with(
+            plain("2026-10-26T09:00:00Z"),
+            "extendedProperties",
+            json!({ "private": { "other": "1" }, "shared": { "app": "x", "pmFence": "f" } }),
+        );
+        assert_ne!(classify_instance(&mj, &m, &shared), InstanceKind::Plain);
     }
 
     /// A7: Google's count of what comes before an occurrence, cancelled ones and EXDATE'd starts

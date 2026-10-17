@@ -31,9 +31,10 @@
 //!   "Remove the new series" GETs the original. Showing `old` proves the cut not done only at an etag
 //!   other than the one the cut was sent on (a copy still in flight would fail its If-Match); at the
 //!   same etag, C9 first moves it with a fence write on the cut's If-Match (a PATCH of a private
-//!   property, notify none). A 2xx holding the old rule proves the cut not done; a 412 says only that
-//!   the etag moved, so C9 GETs again and takes the cut's verdict: the cut's rule is done, `old` at an
-//!   etag other than the cut's is proved not done, anything else unknown. Proved not done, the tail
+//!   property, notify none). A 2xx holding the old rule at an etag no copy of the cut went out on
+//!   proves the cut not done; a 412, or a 2xx that left Google at the cut's etag, proves nothing by
+//!   itself, so C9 GETs again and takes the cut's verdict: the cut's rule is done, `old` at an etag
+//!   other than the cut's is proved not done, anything else unknown. Proved not done, the tail
 //!   may be deleted; done offers "Finish", the rest of this same plan from the step after the cut;
 //!   unknown offers neither. Never re-send the cut to settle it: that turns Remove into Finish against
 //!   the user's choice.
@@ -630,8 +631,9 @@ const TAIL_FIELDS: &[&str] = &[
 ];
 
 impl SeriesPlan {
-    /// A 412 on step `step`, `fresh` being Google's copy now: send again, or not. Asked only after
-    /// [`SeriesPlan::verdict`] found the step not landed.
+    /// A 412 on step `step`, `fresh` being Google's copy now: send again, or not. Asked only once no
+    /// copy of the step can land: [`SeriesPlan::verdict`] found it not landed, or found neither the
+    /// change nor what was there with every copy refused and Google at an etag none went out on.
     #[cfg_attr(
         not(test),
         expect(
@@ -758,6 +760,22 @@ impl SeriesPlan {
         (start_landed && verdict == Applied::No) || (start_kept && verdict == Applied::Yes)
     }
 
+    /// Whether `fresh` holds what step `step`'s [`Undo::RestoreMaster`] puts back: the times and rule
+    /// as they were. Only those: the text the step sent may have landed with them.
+    pub fn restored(&self, step: usize, fresh: &Value) -> bool {
+        let Some(Step {
+            undo: Some(Undo::RestoreMaster { body, .. }),
+            ..
+        }) = self.steps.get(step)
+        else {
+            return false;
+        };
+        !is_gone(fresh)
+            && body
+                .iter()
+                .all(|(k, want)| self.same(k, Some(want), fresh.get(k.as_str())))
+    }
+
     /// What a re-fetch has to show once the run is over, the cleanup cancels in `skipped` (step
     /// indexes) not done: their occurrences are still in Google, so a re-fetch listing them still
     /// shows the write (C8b review R2).
@@ -838,6 +856,9 @@ impl SeriesPlan {
             "transparency" => or(a, "opaque") == or(b, "opaque"),
             "visibility" => or(a, "default") == or(b, "default"),
             "summary" | "description" | "location" | "colorId" => or(a, "") == or(b, ""),
+            // PM's own notes (a fence, a split's) are bookkeeping, not a change anyone made (C9
+            // design review M9).
+            "extendedProperties" => super::without_pm_notes(a) == super::without_pm_notes(b),
             "reminders" => {
                 let d = json!({ "useDefault": true });
                 a.filter(|v| !v.is_null()).unwrap_or(&d) == b.filter(|v| !v.is_null()).unwrap_or(&d)
@@ -1973,120 +1994,8 @@ mod tests {
     use crate::calendar_write::classify::Method;
     use crate::calendar_write::dto::{ShowAs, TimeDraft};
 
-    const TAIL: &str = "0123456789abcdef0123456789abcdef";
-
-    /// One series as C9 would hand it over: the series, the occurrence picked, and its exceptions.
-    struct Case {
-        master: FreshEvent,
-        instance: FreshEvent,
-        opened_instance: FreshEvent,
-        opened_master: FreshEvent,
-        exceptions: Exceptions,
-        instances: Option<Listing>,
-        sibling: bool,
-        guests_allowed: bool,
-    }
-
-    impl Case {
-        fn new(master: Value, instance: Value) -> Case {
-            Case {
-                master: fresh(master.clone()),
-                instance: fresh(instance.clone()),
-                opened_instance: fresh(instance),
-                opened_master: fresh(master),
-                exceptions: complete(Vec::new()),
-                instances: None,
-                sibling: false,
-                guests_allowed: false,
-            }
-        }
-
-        fn exceptions(mut self, items: Vec<Value>) -> Case {
-            self.exceptions = complete(items);
-            self
-        }
-
-        /// As C12 will run it, a series with guests allowed.
-        fn guests(mut self) -> Case {
-            self.guests_allowed = true;
-            self
-        }
-
-        fn input(&self) -> SeriesInput<'_> {
-            SeriesInput {
-                calendar: CALENDAR,
-                opened: Opened {
-                    instance: &self.opened_instance,
-                    master: Some(&self.opened_master),
-                },
-                fresh: Fresh {
-                    instance: &self.instance,
-                    master: &self.master,
-                },
-                exceptions: &self.exceptions,
-                instances: self.instances.as_ref(),
-                sibling: self.sibling,
-                guests_allowed: self.guests_allowed,
-            }
-        }
-
-        fn delete(&self, scope: Scope) -> Result<SeriesPlan, NotPlanned> {
-            plan_series_delete(scope, &self.input(), &seen_of(&self.instance), Notify::None)
-        }
-
-        fn edit(&self, scope: Scope, draft: EventPatchDraft) -> Result<SeriesPlan, NotPlanned> {
-            plan_series_edit(scope, &self.input(), &draft, TAIL, Notify::None)
-        }
-    }
-
-    /// What the user saw of an occurrence: its mirror row's summary and times.
-    fn seen_of(instance: &FreshEvent) -> SeenSummary {
-        let row = crate::calendar::parse_event("", instance.json()).unwrap();
-        SeenSummary {
-            summary: row.summary,
-            start: row.start,
-            end: row.end,
-            all_day: row.all_day,
-            location: row.location,
-        }
-    }
-
-    fn weekly() -> Value {
-        master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"])
-    }
-
-    fn monday_19() -> Value {
-        plain("2026-10-19T09:00:00+01:00")
-    }
-
-    fn title(s: &str) -> EventPatchDraft {
-        EventPatchDraft {
-            summary: Some(s.into()),
-            ..Default::default()
-        }
-    }
-
-    fn at(time: &str, date: &str) -> EventPatchDraft {
-        let end = format!("{:02}:00", time[..2].parse::<u32>().unwrap() + 1);
-        EventPatchDraft {
-            time: Some(TimeDraft::Timed {
-                start_date: date.into(),
-                start_time: time.into(),
-                start_zone: "Europe/London".into(),
-                end_date: date.into(),
-                end_time: end,
-                end_zone: "Europe/London".into(),
-            }),
-            ..Default::default()
-        }
-    }
-
     fn body(step: &Step) -> &Map<String, Value> {
         step.op.body().unwrap()
-    }
-
-    fn point(s: &str) -> Point {
-        Point::At(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc))
     }
 
     // --- T8: deleting ---
@@ -2953,6 +2862,37 @@ mod tests {
         assert_eq!(
             case.edit(Scope::Following, title("Retro")),
             Err(NotPlanned::Conflict(vec!["attendees".into()]))
+        );
+    }
+
+    /// C9 design review M9: a fence "Remove the new series" wrote since the editor opened is PM's own
+    /// note, never a change in Google; anyone else's private property still is.
+    #[test]
+    fn pms_own_notes_on_the_series_are_no_conflict() {
+        let mut case = Case::new(weekly(), monday_19());
+        let fenced = with(
+            weekly(),
+            "extendedProperties",
+            json!({ "private": { "pmFence": "d \"m1\"" } }),
+        );
+        // Opened before the fence, planned on Google's copy after it.
+        case.master = fresh(with(fenced, "etag", json!("\"m2\"")));
+        let plan = case.edit(Scope::Following, title("Retro")).unwrap();
+        // And the cut's 412 rule reads a copy without the note the same way.
+        assert_eq!(plan.resend(1, &weekly()), Resend::Proceed);
+        let theirs = with(
+            weekly(),
+            "extendedProperties",
+            json!({ "private": { "pmFence": "d", "app": "x" } }),
+        );
+        assert_eq!(
+            plan.resend(1, &theirs),
+            Resend::Conflict(vec!["extendedProperties".into()])
+        );
+        case.master = fresh(theirs);
+        assert_eq!(
+            case.edit(Scope::Following, title("Retro")),
+            Err(NotPlanned::Conflict(vec!["extendedProperties".into()]))
         );
     }
 
