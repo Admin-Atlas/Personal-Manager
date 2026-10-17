@@ -20,9 +20,10 @@
 //     silently takes the listener with the detached node;
 //   * a callback ref that RETURNS its cleanup (the React 19 form) fixes the remount, and still
 //     leaves the real one: ownership by DOM ancestry needs the event to keep being dispatched
-//     through a node inside the region. The calendar's day columns are keyed by date, so all of
-//     them are replaced the moment a step lands, and the rest of that gesture is targeted at nodes
-//     that are no longer in the tree. One day, then silence — the reported symptom, twice.
+//     through a node inside the region. The calendar's day columns are keyed by date, so a step
+//     unmounts the column leaving the window, and the rest of a gesture that began over it is
+//     targeted at a node that is no longer in the tree. One day, then silence — the reported
+//     symptom, twice.
 //
 // A window listener installed for the hook's whole lifetime has none of those failure modes: it
 // exists before the region does, it survives every remount underneath it, and it never needs to
@@ -35,11 +36,18 @@
 // also why the two coexist: neither stops propagation, and over a day grid the normaliser finds no
 // horizontal scroller and leaves the event alone.
 import { useCallback, useEffect, useRef } from "react";
-import { accumulateShift, horizontalPixels, isHorizontalGesture, withinRect } from "./wheelShift";
+import {
+  horizontalPixels,
+  isHorizontalGesture,
+  SWIPE_IDLE,
+  swipeStep,
+  withinRect,
+} from "./wheelShift";
 import { isAnyDialogOpen } from "./useDialogLayer";
 
 /**
- * Step `onShift(±n)` as the user swipes sideways over the element this ref is attached to.
+ * Call `onShift(±1)` when a sideways swipe over the element this ref is attached to moves its day:
+ * once per swipe, and once more if a flick back within it undoes that day (see `swipeStep`).
  *
  * `onShift` and `enabled` are held in refs so a caller can pass a fresh closure each render (the
  * normal case — it closes over the current cursor) and can flip `enabled` without re-binding.
@@ -57,14 +65,14 @@ export function useHorizontalWheelShift(
   const elRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    let carry = 0;
+    let swipe = SWIPE_IDLE;
     const onWheel = (e: WheelEvent) => {
       const el = elRef.current;
       if (!el || !enabledRef.current || !isHorizontalGesture(e)) return;
       // A dialog open over the grid owns the gesture: the bounding-box claim below would otherwise
       // page the grid behind it (Modal doesn't portal, so a dialog sits inside the grid's box).
       if (isAnyDialogOpen()) {
-        carry = 0;
+        swipe = SWIPE_IDLE;
         return;
       }
       const target = e.target;
@@ -74,15 +82,19 @@ export function useHorizontalWheelShift(
       if (!owned) {
         // A sideways gesture somewhere else entirely: drop the accumulated travel rather than let
         // it fire on the next, unrelated swipe over the grid.
-        carry = 0;
+        swipe = SWIPE_IDLE;
         return;
       }
-      // Claim the gesture even when it hasn't yet accumulated a whole step: the alternative is that
-      // the first two-thirds of every swipe navigates the app backwards.
+      // Claim the whole swipe, before it has travelled far enough to move a day and after it has
+      // moved one: the alternative is that part of every swipe navigates the app backwards.
       e.preventDefault();
-      const { steps, carry: next } = accumulateShift(carry, horizontalPixels(e));
-      carry = next;
-      if (steps !== 0) shiftRef.current(steps);
+      const r = swipeStep(swipe, {
+        px: horizontalPixels(e),
+        raisedAt: e.timeStamp,
+        seenAt: performance.now(),
+      });
+      swipe = r.state;
+      if (r.step !== 0) shiftRef.current(r.step);
     };
     // CAPTURE, so nothing between the window and the pointer can consume the gesture first.
     window.addEventListener("wheel", onWheel, { passive: false, capture: true });

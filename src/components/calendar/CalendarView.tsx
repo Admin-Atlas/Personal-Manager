@@ -432,13 +432,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     () => setCursor(view === "week" ? startOfWeek(new Date()) : new Date()),
     [view],
   );
-  // One day per step, in the direction of travel: a swipe left (positive deltaX) moves forward.
-  // Both gestures move the cursor and nothing else — `writeCursorDay` below is what remembers it,
-  // and `openOn` decides whether that memory is ever read back.
-  const gridRef = useHorizontalWheelShift(
-    (days) => setCursor((c) => addDays(c, days)),
-    view === "day" || view === "week",
-  );
   const onPickDate = useCallback((d: Date) => setCursor(d), []);
   // Drilling from the Year view: jump to that day and open the Day view.
   const onSelectYearDay = useCallback(
@@ -462,6 +455,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   }, [eventPopup]);
   // The popover's own close, which hands focus back as its Escape does (it fills this in).
   const popoverCloseRef = useRef<(() => void) | null>(null);
+
+  // One day per swipe, in the direction of travel: a swipe left (positive deltaX) moves forward.
+  // Both gestures move the cursor and nothing else — `writeCursorDay` above is what remembers it,
+  // and `openOn` decides whether that memory is ever read back. Not under an open popover, for the
+  // reason ← and → aren't (above).
+  const gridRef = useHorizontalWheelShift(
+    (days) => setCursor((c) => addDays(c, days)),
+    (view === "day" || view === "week") && eventPopup === null,
+  );
 
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
   // field is focused, a modifier is held (so app shortcuts and text entry are untouched), or a dialog
@@ -838,6 +840,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             colorOf={colorOf}
             range={range}
             bounds={activeBounds}
+            customBounds={customBounds[range]}
             zones={zones}
             onZonesChange={onZonesChange}
             now={now}
@@ -914,8 +917,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         // The swipe target. `ref={gridRef}` was missing entirely until now, so the Calendar tab's
         // horizontal swipe had never once fired despite the v3.88.0 notes advertising it here
         // alongside Focus's. Note WHERE this branch sits: it renders only once `overview` has
-        // resolved, and the day columns inside it are keyed by date, so they are all replaced on
-        // every step. `useHorizontalWheelShift` owns neither problem from here — it listens on the
+        // resolved, and the day columns inside it are keyed by date, so a step unmounts the one
+        // leaving the window. `useHorizontalWheelShift` owns neither problem from here — it listens on the
         // window and hit-tests this element's box, so it needs only to be told which box (its
         // header has the two failure modes that shape came from).
         <div ref={gridRef} className="flex min-h-0 flex-1 flex-col">
