@@ -12,9 +12,20 @@
 # to gtk 0.19 / glib 0.22 or gtk4. cargo-deny's "workspace" scope already skips transitive
 # unsound/unmaintained crates, so these record the decision (and keep `cargo audit`, which warns
 # on every crate, quiet). See the 2026-06-17 and 2026-10-07 DECISIONS entries.
+#
+# The three zip ids (published 2026-10) are all about EXTRACTING a hostile archive (SUID bits kept,
+# symlinks out of the destination, permissions applied through symlinks), fixed only in zip 9. PM's
+# own zip 4 only WRITES archives (commands/export.rs); the one extract in the tree is
+# tauri-plugin-updater 2.13.2's, Windows-only, on update bytes it has already checked against the
+# minisign key, and PM's NSIS updates are an .exe it doesn't unzip at all. The updater's latest
+# stable still pins zip 4, so upgrading PM's copy alone would clear nothing. Drop these (and bump
+# zip) once the updater moves past zip 4. See the 2026-10-17 DECISIONS entry.
 ignore = [
   "RUSTSEC-2024-0429", # glib 0.18 VariantStrIter unsound (gtk-rs stack; API never called)
   "RUSTSEC-2024-0370", # proc-macro-error unmaintained (via glib-macros 0.18; build-time only)
+  "RUSTSEC-2026-0367", # zip 4: SUID/SGID bits kept on extract (PM never extracts; updater: signed bytes)
+  "RUSTSEC-2026-0368", # zip 4: extract makes symlinks outside the destination (same)
+  "RUSTSEC-2026-0369", # zip 4: extract applies permissions through symlinks (same)
 ]
 # Only treat unmaintained crates that are OUR direct dependencies as failures;
 # transitive-unmaintained noise (gtk-rs, etc.) is already covered above.

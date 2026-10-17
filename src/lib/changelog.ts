@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.147.9-alpha",
+    date: "2026-10-17",
+    highlights: [
+      "Under-the-hood housekeeping: our dependency safety check now records why three newly published warnings about unpacking zip files don't affect PM. PM only ever writes zip files, and the one place that unpacks them, the Windows updater, checks every update's signature first. Nothing you can see changes.",
+    ],
+  },
+  {
     version: "3.147.8-alpha",
     date: "2026-10-16",
     highlights: [
