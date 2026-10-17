@@ -142,6 +142,7 @@ import type {
   HeldDeleteInfo,
   SeenSummary,
   SeriesChoices,
+  SeriesScope,
   WriteOutcome,
 } from "./types";
 
@@ -1087,15 +1088,25 @@ export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid }
 export const getCalendarEventForEdit = (eventId: string, deviceZone: string | null) =>
   invoke<EditLoad>("get_calendar_event_for_edit", { eventId, deviceZone });
 
-/** Save the fields the user changed in an open editor. Outcomes come back as data, never thrown. */
-export const updateCalendarEvent = (session: string, draft: EventPatchDraft) =>
-  invoke<WriteOutcome>("update_calendar_event", { session, draft });
+/** Save the fields the user changed in an open editor. Outcomes come back as data, never thrown.
+ *  For an occurrence of a repeating event, `scope` says which occurrences and `choice` names the
+ *  plan the user chose (a row's `token` from `seriesChoices`). */
+export const updateCalendarEvent = (
+  session: string,
+  draft: EventPatchDraft,
+  scope: SeriesScope | null = null,
+  choice: string | null = null,
+) => invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice });
 
 /** Delete a mirrored event after an Undo window held by the backend. It goes to Google when the
  *  window ends, only if Google still holds what the user saw (`seen`); `onCalendarDeleteSettled`
- *  reports how it ended. */
-export const deleteCalendarEvent = (eventId: string, seen: SeenSummary) =>
-  invoke<DeleteStart>("delete_calendar_event", { eventId, seen });
+ *  reports how it ended. `scope` and `choice` as for a save. */
+export const deleteCalendarEvent = (
+  eventId: string,
+  seen: SeenSummary,
+  scope: SeriesScope | null = null,
+  choice: string | null = null,
+) => invoke<DeleteStart>("delete_calendar_event", { eventId, seen, scope, choice });
 
 /** Undo a held delete: true when it was still waiting (the event is kept). */
 export const cancelCalendarDelete = (undoToken: string) =>

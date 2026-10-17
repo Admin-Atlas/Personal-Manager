@@ -146,10 +146,6 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
 /// so an insert can't go out without one. After an answer that never arrived or a server error, the
 /// caller GETs that id before sending again (rule R2; Google warns it can't always catch a repeated
 /// id at creation), so a retry can't make a second event.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C9a-3, splitting a series")
-)]
 pub fn insert_event(
     calendar: &str,
     id: &str,
@@ -169,6 +165,13 @@ pub fn insert_event(
         if_match: None,
         body: Some(body),
     }
+}
+
+/// Dev builds only: how every request URL for `calendar` starts (`…/calendars/{id}/`, the id
+/// encoded, so no other calendar's URL starts the same), for the dev allow-list.
+#[cfg(debug_assertions)]
+pub fn calendar_prefix(calendar: &str) -> String {
+    url(&["calendars", calendar, ""], &[])
 }
 
 /// A new event id of PM's choosing: 32 lowercase hex characters, inside Google's allowed alphabet
@@ -215,6 +218,24 @@ mod tests {
             "https://www.googleapis.com/calendar/v3/calendars/me@example.com/events/abc/instances\
              ?showDeleted=true&timeMin=2026-10-18T09%3A00%3A00Z&maxResults=10"
         );
+    }
+
+    /// The dev allow-list matches a request to its calendar by this prefix: never another
+    /// calendar's, even one whose id starts the same.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn calendar_prefix_matches_only_its_own_calendar() {
+        let team = calendar_prefix("team@group.calendar.google.com");
+        assert!(get_event("team@group.calendar.google.com", "e")
+            .url
+            .starts_with(&team));
+        assert!(!get_event("team@group.calendar.google.com.evil", "e")
+            .url
+            .starts_with(&team));
+        // A slash in an id is encoded, so it can't end the calendar's segment early.
+        assert!(!get_event("team/x", "e")
+            .url
+            .starts_with(&calendar_prefix("team")));
     }
 
     #[test]

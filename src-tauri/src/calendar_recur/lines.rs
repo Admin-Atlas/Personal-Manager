@@ -462,13 +462,6 @@ pub enum Applied {
 
 /// Judge Google's `reply` to a change from `old` to `sent`. `start` places dates and UNTILs; any
 /// start in the series' zone and of its kind will do.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9a-3, sending series writes"
-    )
-)]
 pub fn recurrence_verdict<S: AsRef<str>, T: AsRef<str>, U: AsRef<str>>(
     sent: &[S],
     old: &[T],

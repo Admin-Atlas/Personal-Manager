@@ -112,13 +112,6 @@ impl RecentWrites {
     /// Remember a row PM just created (a split's new series, found in a re-fetch). Until a fetch shows
     /// it or ten minutes pass, a fetch without it doesn't take it off the screen: Google's list can
     /// lag behind a new event, and a missing row isn't proof it was deleted.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, landing a series write"
-        )
-    )]
     pub fn record_create(&mut self, row: CalendarEvent, at: Stamp) {
         self.entries.insert(
             (row.calendar_id.clone(), row.id.clone()),

@@ -108,6 +108,16 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
       };
     case "no_change":
       return { tone: "ok", text: "Nothing to save: Google already has this." };
+    case "needs_choice":
+      return {
+        tone: "warn",
+        text: "This repeating event changed since you chose which occurrences to change. Choose again; nothing was saved.",
+      };
+    case "ignored_by_google":
+      return {
+        tone: "warn",
+        text: "Google answered as if it saved this, but kept the event as it was. Nothing changed.",
+      };
     case "conflict": {
       const fields = conflictFields(outcome.fields);
       const what = fields.length ? ` (the ${listFields(fields)})` : "";
@@ -149,6 +159,13 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
   });
   switch (outcome.outcome) {
     case "saved":
+      // Occurrences changed on their own that a "this and following" delete couldn't cancel.
+      if (outcome.warnings.includes("left_on_old_series")) {
+        return {
+          tone: "warn",
+          text: `Deleted ${t} from that day on. Some occurrences changed on their own may still show; check them in Google Calendar.`,
+        };
+      }
       return {
         tone: "ok",
         text: outcome.warnings.includes("mirror_refresh_pending")
@@ -162,6 +179,13 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       };
     case "no_change":
       return notDeleted("Google had nothing to change.", "warn");
+    case "needs_choice":
+      return notDeleted(
+        "It changed since you chose which occurrences to delete. Choose again.",
+        "warn",
+      );
+    case "ignored_by_google":
+      return notDeleted("Google answered as if it deleted it, but kept it.", "warn");
     case "conflict": {
       const fields = conflictFields(outcome.fields);
       const what = fields.length ? ` (the ${listFields(fields)})` : "";

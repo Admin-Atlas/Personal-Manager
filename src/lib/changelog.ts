@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.4-alpha",
+    date: "2026-10-17",
+    highlights: [
+      "Under the hood, PM can now send a change to a repeating event in Google Calendar: to one occurrence, or to all of them, and delete one occurrence, the rest of a series, or all of it. Each change is checked against Google again just before it goes, so nothing changed there meanwhile is overwritten, and PM's calendar shows the result straight away. If Google takes only part of a move, PM puts the series back as it was and tells you. None of this is in the app yet: repeating events stay read-only until the dialog that asks which occurrences you mean.",
+    ],
+  },
+  {
     version: "3.148.3-alpha",
     date: "2026-10-17",
     highlights: [

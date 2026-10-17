@@ -62,10 +62,6 @@ use super::plan::{Op, Recheck, Resend, SeriesPlan, Shows, Stage, Undo};
 
 /// Google's answer to one request the machine asked for, as the command layer read it.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first made in C9a-3, from what Google answered")
-)]
 pub enum Answer {
     /// Google answered. `body`: the reply as JSON, when it is (a 2xx DELETE has none). `date`: its
     /// HTTP `Date`. `maybe_applied`: an attempt of this same request met a server error, the last or
@@ -80,6 +76,21 @@ pub enum Answer {
     /// failed after a copy met a server error. `retried`: the sender had already sent it once more
     /// after a server error.
     Lost { retried: bool },
+    /// Nothing of this copy reached Google, so it can't have landed: no sign-in, a keychain error, a
+    /// connection never made (the sender tells these apart). Proof the step isn't done only while
+    /// no earlier copy of it is in doubt or was answered 2xx (C9a-3a, review L6).
+    Unsent(Unsent),
+}
+
+/// Why a copy never reached Google.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsent {
+    /// The account's sign-in needs renewing.
+    SignIn,
+    /// No connection to Google could be made.
+    Offline,
+    /// Something on this computer (the keychain, the client) stopped it first.
+    Local,
 }
 
 /// What a machine wants done next.
@@ -94,13 +105,6 @@ pub enum Next<T> {
 }
 
 /// A machine the command layer drives: `next`, then `answer` after every `Send`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9a-3, sending series writes"
-    )
-)]
 pub trait Machine {
     type Output;
     fn next(&mut self) -> Next<Self::Output>;
@@ -147,6 +151,8 @@ pub enum Why {
     /// A carry's occurrence never showed on the new series (cleanup steps only, so never in
     /// [`Ran::NotDone`]).
     NotFound,
+    /// Never reached Google ([`Answer::Unsent`]): this copy, with none before it that may land.
+    Unsent(Unsent),
 }
 
 /// What became of the steps before a commit step proved not done.
@@ -190,10 +196,6 @@ impl Ran {
     }
 
     /// The steps left out, for [`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first read in C9a-3, landing a series write")
-    )]
     pub fn skipped(&self) -> Vec<usize> {
         self.ends()
             .iter()
@@ -300,13 +302,6 @@ pub struct Run {
 
 impl Run {
     /// Start a run of `plan`, or refuse it before anything is sent (G5).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn new(plan: SeriesPlan) -> Result<Run, Unfit> {
         let ends = vec![End::NotRun; plan.steps.len()];
         Run::from(plan, ends)
@@ -320,7 +315,7 @@ impl Run {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9a-3, settling a partial split"
+            reason = "first caller lands in C9a-3b, settling a partial split"
         )
     )]
     pub fn finish(plan: SeriesPlan, ran: &Ran, settled: &Settled) -> Result<Run, Unfit> {
@@ -395,10 +390,6 @@ impl Run {
     }
 
     /// The plan being run, for landing its result ([`SeriesPlan::expect_after`]).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first read in C9a-3, landing a series write")
-    )]
     pub fn plan(&self) -> &SeriesPlan {
         &self.plan
     }
@@ -536,6 +527,14 @@ impl Run {
     fn read_write(&mut self, answer: Answer) -> Read {
         let method = self.method();
         let (verdict, body, date) = match answer {
+            // Nothing reached Google: proof, unless a copy before it may still land or was answered.
+            Answer::Unsent(why) => {
+                return if self.copies.in_doubt || self.copies.answered_ok {
+                    Read::Check
+                } else {
+                    Read::NotDone(Why::Unsent(why))
+                };
+            }
             Answer::Lost { retried } => {
                 self.copies.in_doubt = true;
                 if retried {
@@ -1039,7 +1038,7 @@ fn find_occurrence(list: &Value, original: Point) -> Option<(String, String)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first chosen in C9a-3, settling a partial split")
+    expect(dead_code, reason = "first chosen in C9a-3b, settling a partial split")
 )]
 pub enum SettleAction {
     /// Look again: GETs only.
@@ -1129,7 +1128,7 @@ impl Settle {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9a-3, settling a partial split"
+            reason = "first caller lands in C9a-3b, settling a partial split"
         )
     )]
     pub fn new(plan: SeriesPlan, ran: &Ran, action: SettleAction) -> Option<Settle> {
@@ -2056,6 +2055,145 @@ mod tests {
         assert_eq!(runs, 729 * 125);
         // The bound is reached: a resend on the newer etag, and its own once-more.
         assert!(four > 0);
+    }
+
+    /// C9a-3a: a copy that never reached Google is proof only while no copy before it may land.
+    #[test]
+    fn an_unsent_first_copy_is_proof_of_not_done() {
+        let (_, plan) = this_case();
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |_| {
+            Answer::Unsent(Unsent::Offline)
+        });
+        assert_eq!(
+            ran,
+            Ran::NotDone {
+                step: 0,
+                why: Why::Unsent(Unsent::Offline),
+                rollback: Rollback::Nothing,
+                ends: vec![End::NotRun],
+            }
+        );
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn an_unsent_copy_after_one_in_doubt_is_checked_never_proof() {
+        let (case, plan) = this_case();
+        let old = case.instance.json().clone();
+        let mut patches = 0;
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Patch => {
+                patches += 1;
+                if patches == 1 {
+                    lost()
+                } else {
+                    Answer::Unsent(Unsent::SignIn)
+                }
+            }
+            _ => ok(old.clone()),
+        });
+        assert!(matches!(ran, Ran::Unknown { step: 0, .. }), "{ran:?}");
+        let methods: Vec<Method> = sent.iter().map(|r| r.method).collect();
+        assert_eq!(
+            methods,
+            [Method::Patch, Method::Get, Method::Patch, Method::Get]
+        );
+    }
+
+    /// [`no_answer_without_proof_ever_deletes_the_new_series`] with copies that never went: once a
+    /// copy of the cut is in doubt, an unsent one after it proves nothing, however the answers fall.
+    /// (Google at a newer etag is left out: no copy can land there, so an unsent resend on it is the
+    /// proof it should be.)
+    #[test]
+    fn an_unsent_cut_never_deletes_the_new_series_while_a_copy_may_land() {
+        let (case, plan) = split_case(Vec::new());
+        let tail = tail_of(&plan, "\"t1\"");
+        let old = case.master.json().clone();
+        let third_rule = at_etag(
+            &with(old.clone(), "recurrence", json!(["RRULE:FREQ=DAILY"])),
+            "\"m5\"",
+        );
+        let in_doubt = [
+            lost(),
+            Answer::Lost { retried: true },
+            after_5xx(Verdict::ServerError),
+            after_5xx(Verdict::RateLimited),
+            after_5xx(Verdict::Conflict),
+            after_5xx(Verdict::Reauth),
+            status(Verdict::Other(409, "conflict".into())),
+            status(Verdict::Duplicate),
+            Answer::Reply {
+                verdict: Verdict::Ok,
+                body: None,
+                date: None,
+                maybe_applied: false,
+            },
+        ];
+        let mut later = in_doubt.to_vec();
+        later.extend([Unsent::SignIn, Unsent::Offline, Unsent::Local].map(Answer::Unsent));
+        let gets = [
+            ok(old.clone()),
+            lost(),
+            status(Verdict::ServerError),
+            ok(third_rule),
+        ];
+        let mut runs = 0;
+        for first in &in_doubt {
+            for w in 0..later.len().pow(2) {
+                for g in 0..gets.len().pow(3) {
+                    let pick = |n: usize, i: usize, base: usize| (n / base.pow(i as u32)) % base;
+                    let (mut wi, mut gi) = (0, 0);
+                    let (ran, sent, _) =
+                        drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+                            Method::Insert => ok(tail.clone()),
+                            Method::Patch => {
+                                let a = match wi {
+                                    0 => first.clone(),
+                                    1 | 2 => later[pick(w, wi - 1, later.len())].clone(),
+                                    _ => lost(),
+                                };
+                                wi += 1;
+                                a
+                            }
+                            Method::Get => {
+                                let a = if gi < 3 {
+                                    gets[pick(g, gi, gets.len())].clone()
+                                } else {
+                                    lost()
+                                };
+                                gi += 1;
+                                a
+                            }
+                            Method::Delete => deleted(),
+                        });
+                    runs += 1;
+                    assert!(!deletes_the_tail(&sent), "{first:?} {w}/{g}: {sent:?}");
+                    assert!(
+                        matches!(ran, Ran::Unknown { step: 1, .. }),
+                        "{first:?} {w}/{g}: {ran:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(runs, 9 * 144 * 64);
+    }
+
+    #[test]
+    fn an_unsent_cleanup_is_skipped_with_its_dependants() {
+        let (case, plan) = split_case(vec![renamed()]);
+        let tail = tail_of(&plan, "\"t1\"");
+        let cut = landed(case.master.json(), &plan.steps[1], "\"m2\"");
+        let occurrence = json!({ "items": [{ "id": "q1", "etag": "\"q\"", "status": "confirmed",
+            "originalStartTime": { "dateTime": "2026-11-02T09:00:00Z" } }] });
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Insert => ok(tail.clone()),
+            Method::Patch if to(r, "abc") => ok(cut.clone()),
+            Method::Get if r.url.contains("/instances") => ok(occurrence.clone()),
+            _ => Answer::Unsent(Unsent::Local),
+        });
+        assert_eq!(ran.skipped(), vec![2, 3]);
+        assert!(matches!(ran, Ran::Done { .. }));
+        assert!(!sent.iter().any(|r| to(r, "abc_20261102T090000Z")));
     }
 
     /// Review finding: an answer classify can't read, or a 412 the GET contradicts, then Google at
