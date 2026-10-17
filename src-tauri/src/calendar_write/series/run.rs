@@ -33,7 +33,9 @@
 //! - **A resend on Google's newer etag clears the doubt**: the copies before it went out on an older
 //!   etag and can't land any more. At most four requests of a step leave the machine, two per etag on
 //!   at most two etags, each on an etag PM has just seen; with the sender's own retry after a server
-//!   error, up to six copies reach Google, and If-Match lets at most one per etag apply.
+//!   error, up to six copies Google may apply reach it (a copy refused before Google read it, such
+//!   as a rate limit on that retry, doesn't count, and leaves the once-more unspent), and If-Match
+//!   lets at most one per etag apply.
 //! - **A lost insert** is looked for, looked for again after a second, and only then sent again under
 //!   the same id, which Google refuses as a duplicate if the first copy landed (plan amendment A9).
 //!   Its absence alone proves nothing.
@@ -109,7 +111,8 @@ pub trait Machine {
 #[derive(Debug, Clone, PartialEq)]
 pub enum End {
     /// Not shown done: never sent, or the step the run stopped on. For [`Ran::Unknown`] that step may
-    /// have landed; for [`Why::PutBack`], Google took half of it and that half was put back.
+    /// have landed; for [`Why::PutBack`], Google showed half the move (perhaps someone else's) and
+    /// the times and rule were put back, while text sent with them may have stayed.
     NotRun,
     /// Landed. `reply`: Google's copy after it (the step's reply, or a GET that proved it), `None`
     /// for a delete. `date`: the HTTP `Date` of the answer that proved it, when it was the reply.
@@ -136,8 +139,10 @@ pub enum Why {
     Gone,
     /// Refused before anything was applied.
     Refused(Verdict),
-    /// Google took half of a move (the start without the rule, or the rule without the start), and
-    /// the series' times and rule were put back. Only those: text sent with them may have landed.
+    /// Google showed half of a move (the start without the rule, or the rule without the start), and
+    /// the series' times and rule were put back. Only those: text sent with them may have landed. While
+    /// a copy may have landed, PM can't tell its own half move from someone else's (DS8), so this can
+    /// put back another client's half move; with every copy refused it never does ([`Why::Conflict`]).
     PutBack,
     /// A carry's occurrence never showed on the new series (cleanup steps only, so never in
     /// [`Ran::NotDone`]).
@@ -1918,6 +1923,41 @@ mod tests {
         assert!(matches!(ran, Ran::Unknown { step: 1, .. }));
         assert_eq!(sent.iter().filter(|r| r.method == Method::Patch).count(), 1);
         assert!(!deletes_the_tail(&sent));
+    }
+
+    /// The sender's own retry spends the once-more on the etag that copy went out on: after a resend
+    /// on Google's newer etag, that newer one, never the first.
+    #[test]
+    fn the_senders_retry_spends_the_once_more_on_its_own_etag() {
+        for retried in [
+            Answer::Lost { retried: true },
+            after_5xx(Verdict::ServerError),
+        ] {
+            let (case, plan) = split_case(Vec::new());
+            let tail = tail_of(&plan, "\"t1\"");
+            let newer = at_etag(case.master.json(), "\"m7\"");
+            let mut patches = 0;
+            let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+                Method::Insert => ok(tail.clone()),
+                Method::Patch => {
+                    patches += 1;
+                    if patches == 1 {
+                        lost()
+                    } else {
+                        retried.clone()
+                    }
+                }
+                Method::Get => ok(newer.clone()),
+                Method::Delete => deleted(),
+            });
+            assert!(matches!(ran, Ran::Unknown { step: 1, .. }), "{retried:?}");
+            let cuts: Vec<Option<&str>> = sent
+                .iter()
+                .filter(|r| r.method == Method::Patch)
+                .map(|r| r.if_match.as_deref())
+                .collect();
+            assert_eq!(cuts, [Some("\"m1\""), Some("\"m7\"")], "{retried:?}");
+        }
     }
 
     /// plan.rs's first rule, exhaustively for the cut: no script of answers that never proves it not
