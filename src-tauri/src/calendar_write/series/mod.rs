@@ -29,7 +29,7 @@ pub mod scope;
 
 use std::fmt;
 
-use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use chrono_tz::Tz;
 use serde_json::Value;
 
@@ -48,13 +48,6 @@ use super::time::TimeError;
 pub struct FreshEvent(Value);
 
 impl FreshEvent {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9, editing repeating events"
-        )
-    )]
     pub fn from_google(event: Value) -> Self {
         FreshEvent(event)
     }
@@ -66,13 +59,64 @@ impl FreshEvent {
 
 /// Every stored exception of a series (occurrences changed or cancelled on their own), as Google
 /// lists them by iCal UID, and nothing else: never an `instances` listing, which holds every
-/// occurrence and would have a cut cancel each one. `complete` only when the listing ran to its end:
-/// planners that move or cut a series refuse an incomplete one, since an exception they can't see
-/// would be lost or brought back.
+/// occurrence and would have a cut cancel each one. `complete` only when the listing ran to its end
+/// and its cross-check ([`Exceptions::cross_checked`]) found nothing missing: planners that move or
+/// cut a series refuse an incomplete one, since an exception they can't see would be lost or brought
+/// back.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Exceptions {
     pub items: Vec<Value>,
     pub complete: bool,
+}
+
+impl Exceptions {
+    /// A listing's items in series order (by original start, the master, which has none, first), so
+    /// a plan built from them, and the token its choice row carries, doesn't depend on the order
+    /// Google listed them in (C9 design review L3).
+    pub fn sorted(mut items: Vec<Value>, complete: bool) -> Exceptions {
+        items.sort_by_cached_key(|item| {
+            let at = match original_of(item) {
+                None => (0, 0, 0),
+                Some(Point::At(t)) => (1, t.timestamp(), t.timestamp_subsec_nanos()),
+                Some(Point::Day(d)) => (1, d.and_time(NaiveTime::MIN).and_utc().timestamp(), 0),
+            };
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+            (at, id.to_string())
+        });
+        Exceptions { items, complete }
+    }
+
+    /// The listing checked against a stretch of the series' own occurrences: `window` is an
+    /// `instances` listing with cancelled ones. Nothing has proved that a listing by iCal UID holds
+    /// every exception (C9a's probe R0); if it held only some, a split would skip a carry and an
+    /// "all events" move would bring back a deleted occurrence. So an occurrence there that's plainly
+    /// changed on its own (cancelled, moved, resized or retitled) but missing from the listing marks
+    /// it incomplete, as does a window that didn't run to its end, and the planners that move or cut
+    /// the series then refuse (C9 design §0.8, review M3/L4).
+    pub fn cross_checked(mut self, master_json: &Value, master: &Master, window: &Listing) -> Self {
+        let own = |item: &&Value| {
+            item.get("recurringEventId").and_then(Value::as_str) == Some(master.id.as_str())
+        };
+        let mut listed: Vec<Point> = self
+            .items
+            .iter()
+            .filter(own)
+            .filter_map(original_of)
+            .collect();
+        // A date the rule itself leaves out (an EXDATE) is no stored exception, whether or not
+        // Google lists it as a cancelled occurrence.
+        listed.extend(excluded(&master.recurrence, &master.start));
+        let missed = window
+            .items
+            .iter()
+            .filter(own)
+            .filter(|item| plainly_changed(master_json, master, item))
+            .any(|item| original_of(item).is_none_or(|p| !listed.contains(&p)));
+        if missed || !window.complete {
+            self.complete = false;
+        }
+        self
+    }
 }
 
 /// `events.instances` of a series with cancelled ones (`showDeleted`), unwindowed, every page: the
@@ -309,6 +353,26 @@ fn same_field(key: &str, instance: Option<&Value>, master: Option<&Value>) -> bo
     }
 }
 
+/// Dev builds only, for C9a's probe R0: the fields the series has that an uncancelled occurrence in
+/// `instances` lacks. [`same_field`] reads a carried field an occurrence lacks as its default and any
+/// other as the series' (INFERRED: instances list every field their series has), so each field named
+/// here is one that guess got wrong.
+#[cfg(debug_assertions)]
+pub fn fields_missing_vs_master(master_json: &Value, instances: &[Value]) -> Vec<&'static str> {
+    let has = |v: &Value, key: &str| v.get(key).is_some_and(|f| !f.is_null());
+    let uncancelled: Vec<&Value> = instances
+        .iter()
+        .filter(|i| i.get("status").and_then(Value::as_str) != Some("cancelled"))
+        .collect();
+    CARRY
+        .iter()
+        .chain(OTHER)
+        .copied()
+        .filter(|key| *key != "time" && has(master_json, key))
+        .filter(|key| uncancelled.iter().any(|i| !has(i, key)))
+        .collect()
+}
+
 /// The private notes PM itself puts on a series: which series a new one was split off and by what
 /// plan, and the fence a "Remove the new series" writes (C9). Bookkeeping, not a change anyone made:
 /// an occurrence holding a copy from before one was written isn't changed on its own.
@@ -383,6 +447,45 @@ pub fn classify_instance(master_json: &Value, master: &Master, instance: &Value)
     } else {
         InstanceKind::Modified { carry, other }
     }
+}
+
+/// Whether an occurrence is changed on its own in a way nothing can be mistaken for: cancelled, at a
+/// time of its own, retitled, or with guests where its series has none. The other fields lean on
+/// [`same_field`]'s unprobed defaults, and a false alarm in [`Exceptions::cross_checked`] refuses a
+/// good plan.
+fn plainly_changed(master_json: &Value, master: &Master, instance: &Value) -> bool {
+    instance.get("status").and_then(Value::as_str) == Some("cancelled")
+        || !same_time(master, instance)
+        || !same_field(
+            "summary",
+            instance.get("summary"),
+            master_json.get("summary"),
+        )
+        || (guests_on(instance) && !guests_on(master_json))
+}
+
+/// Whether an event has guests besides the user, or a guest list Google cut short.
+pub fn guests_on(event: &Value) -> bool {
+    !attendee_set(event.get("attendees")).is_empty()
+        || event.get("attendeesOmitted").and_then(Value::as_bool) == Some(true)
+}
+
+/// The dates a series' own `recurrence` leaves out (its EXDATEs), where each falls in it.
+pub(super) fn excluded(recurrence: &[String], start: &SeriesStart) -> Vec<Point> {
+    lines::parse(recurrence)
+        .iter()
+        .filter_map(|l| match &l.kind {
+            Kind::ExDate(dates) => Some(
+                dates
+                    .values
+                    .iter()
+                    .filter_map(|v| dates.point(v, start))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Whether the instance starts where its series puts it and lasts as long.
@@ -476,6 +579,11 @@ pub enum SeriesRefusal {
     /// An occurrence after the split has guests, attachments, a call, a label or a visibility of its
     /// own.
     CannotCarry(NaiveDate),
+    /// An occurrence the change would reach has guests of its own (until C12 brings Send / Don't
+    /// send).
+    GuestsElsewhere(NaiveDate),
+    /// The series' description is formatted (HTML), and the draft would save it as plain text.
+    FormattedDescription,
     /// Its visibility applies to every occurrence (Google), so it can't change for one.
     VisibilityIsSeriesWide,
     /// The series already holds this; only this occurrence differs.
@@ -522,6 +630,17 @@ impl fmt::Display for SeriesRefusal {
                 "The occurrence on {} has its own guests, attachments, video call, label or who can \
                  see it, which PM can't move to the new series.",
                 day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::GuestsElsewhere(day) => write!(
+                f,
+                "The occurrence on {} has guests of its own, and PM can't change events with \
+                 guests yet. Choose \"This event\" to change only this one.",
+                day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::FormattedDescription => write!(
+                f,
+                "This series' description has formatting, which saving it here as plain text \
+                 would remove. Change this occurrence on its own instead."
             ),
             SeriesRefusal::VisibilityIsSeriesWide => write!(
                 f,
@@ -573,13 +692,6 @@ impl From<TimeError> for SeriesRefusal {
 }
 
 /// Whether the series' rule is one PM can only show as text.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn text_only(master: &Master) -> Option<TextOnly> {
     lines::series_rule(&lines::parse(&master.recurrence)).err()
 }
@@ -1092,5 +1204,127 @@ mod tests {
             google_before(&m, &short, split),
             Err(RecurError::CannotCount)
         );
+    }
+
+    /// C9 design review L3: however Google orders the listing, a plan sees it in series order.
+    #[test]
+    fn a_listing_is_read_in_series_order() {
+        let mj = master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]);
+        let listed = |items: Vec<Value>| {
+            Exceptions::sorted(items, true)
+                .items
+                .iter()
+                .map(|i| i["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let a = cancelled("2026-10-19T09:00:00+01:00");
+        let b = plain("2026-10-12T09:00:00+01:00");
+        let c = plain("2026-10-26T09:00:00Z");
+        let order = listed(vec![a.clone(), mj.clone(), c.clone(), b.clone()]);
+        assert_eq!(order, listed(vec![c, b, mj, a]));
+        assert_eq!(
+            order,
+            [
+                "abc",
+                "abc_20261012T080000Z",
+                "abc_20261019T080000Z",
+                "abc_20261026T090000Z"
+            ]
+        );
+    }
+
+    /// C9 design §0.8, review M3/L4: an occurrence plainly changed on its own that the listing by
+    /// iCal UID doesn't hold, cancelled ones included, makes it incomplete; so does a window that
+    /// didn't run to its end. One changed in a way only `same_field`'s defaults see doesn't.
+    #[test]
+    fn a_change_the_listing_misses_makes_it_incomplete() {
+        let mj = master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]);
+        let m = read(mj.clone());
+        let moved_19 = moved(
+            "2026-10-19T09:00:00+01:00",
+            "2026-10-20T09:00:00+01:00",
+            "2026-10-20T10:00:00+01:00",
+        );
+        let window = |items: Vec<Value>| Listing {
+            items,
+            complete: true,
+        };
+        let checked = |listed: Vec<Value>, seen: Vec<Value>| {
+            complete(listed)
+                .cross_checked(&mj, &m, &window(seen))
+                .complete
+        };
+        let plain_12 = plain("2026-10-12T09:00:00+01:00");
+        // Everything changed is listed: still complete.
+        assert!(checked(
+            vec![mj.clone(), moved_19.clone()],
+            vec![plain_12.clone(), moved_19.clone()]
+        ));
+        // A moved, a cancelled, a retitled and a resized one the listing lacks.
+        let retitled = with(
+            plain("2026-10-26T09:00:00Z"),
+            "summary",
+            json!("Standup (room 4)"),
+        );
+        let longer = moved(
+            "2026-10-26T09:00:00Z",
+            "2026-10-26T09:00:00Z",
+            "2026-10-26T11:00:00Z",
+        );
+        for missing in [
+            moved_19.clone(),
+            cancelled("2026-10-19T09:00:00+01:00"),
+            retitled,
+            longer,
+        ] {
+            assert!(
+                !checked(vec![mj.clone()], vec![plain_12.clone(), missing.clone()]),
+                "{missing}"
+            );
+        }
+        // A date the rule leaves out (EXDATE) is no stored exception, however Google lists it.
+        let skipped_19 = master(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=MO",
+            "EXDATE;TZID=Europe/London:20261019T090000",
+        ]);
+        assert!(
+            complete(vec![skipped_19.clone()])
+                .cross_checked(
+                    &skipped_19,
+                    &read(skipped_19.clone()),
+                    &window(vec![cancelled("2026-10-19T09:00:00+01:00")])
+                )
+                .complete
+        );
+        // An occurrence with guests of its own, in a series with none, is changed on its own.
+        let invited = with(
+            plain_12.clone(),
+            "attendees",
+            json!([{ "email": "a@example.com" }]),
+        );
+        assert!(!checked(vec![mj.clone()], vec![invited.clone()]));
+        assert!(checked(vec![mj.clone(), invited.clone()], vec![invited]));
+        // Another series' occurrences aren't this one's to account for.
+        let theirs = with(moved_19.clone(), "recurringEventId", json!("other"));
+        assert!(checked(vec![mj.clone()], vec![theirs]));
+        // A description of its own is for the planners' carry; it isn't plain enough to refuse on.
+        let described = with(plain_12.clone(), "description", json!("Own notes"));
+        assert!(checked(vec![mj.clone()], vec![described]));
+        // A window cut short can't vouch for the listing.
+        let short = Listing {
+            items: vec![plain_12],
+            complete: false,
+        };
+        assert!(
+            !complete(vec![mj.clone()])
+                .cross_checked(&mj, &m, &short)
+                .complete
+        );
+        // An incomplete listing stays incomplete.
+        let partial = Exceptions {
+            items: vec![mj.clone()],
+            complete: false,
+        };
+        assert!(!partial.cross_checked(&mj, &m, &window(Vec::new())).complete);
     }
 }

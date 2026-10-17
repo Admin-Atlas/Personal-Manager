@@ -284,12 +284,111 @@ pub enum EditLoad {
         /// What the editor showed, in the mirror's terms, for a delete started from it: the
         /// fresh copy, not a mirror row that may be older. `None` if it can't be put in those terms.
         seen: Option<SeenSummary>,
+        /// Its series, when it's an occurrence of one and PM could read Google's copy of it. The
+        /// session keeps that copy, so "all events" and "this and following" never overwrite a
+        /// change someone made to the series after the editor opened (G9).
+        series: Option<SeriesInfo>,
     },
     Gone,
     Reauth,
     Failed {
         message: String,
     },
+}
+
+/// An occurrence's series, as the editor shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeriesInfo {
+    /// It's the series' first occurrence, where "this and following" is every occurrence.
+    pub first: bool,
+    /// How the series repeats, as Google Calendar says it ("Weekly on Monday").
+    pub repeats: String,
+}
+
+/// What the choices for a change to a repeating occurrence are asked for: an open editor's draft, or
+/// a delete of a mirror row (`seen` is what the user saw of it).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChoiceRequest {
+    Edit {
+        session: String,
+        draft: EventPatchDraft,
+    },
+    Delete {
+        event_id: String,
+        seen: SeenSummary,
+    },
+}
+
+/// "This event", "This and following" and "All events" for one change, each planned against Google's
+/// copies as they are now (DS12): what it would do, or why it can't.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SeriesChoices {
+    /// A one-off event: no choice to make.
+    NotRepeating,
+    Ready {
+        this: ScopeRow,
+        following: ScopeRow,
+        all: ScopeRow,
+    },
+    /// Nothing can be offered: the event is gone, read-only, needs a new sign-in, or Google couldn't
+    /// be asked.
+    Refused { result: WriteOutcome },
+}
+
+/// One of the three choices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "row", rename_all = "snake_case")]
+pub enum ScopeRow {
+    /// It can go ahead. `token` is what the save names to say the user chose this plan; a plan that
+    /// changed since gets asked about again.
+    Offered {
+        warnings: Vec<SeriesWarningDto>,
+        token: String,
+    },
+    /// "This and following" from the series' first occurrence: every occurrence, as "All events".
+    AsAll {
+        warnings: Vec<SeriesWarningDto>,
+        token: String,
+    },
+    /// Not for this change, and why, in words.
+    Refused { message: String },
+    /// Changed in Google since the editor opened, on these fields.
+    Conflict { fields: Vec<String> },
+}
+
+/// What the user should know before choosing a row. Dates are `YYYY-MM-DD` in the series' zone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "warning", rename_all = "snake_case")]
+pub enum SeriesWarningDto {
+    /// Another part of this series was split off earlier; Google may treat it as one with this.
+    SplitSibling,
+    /// This many occurrences were changed on their own; Google may keep or reset their changes.
+    /// `complete` false: PM couldn't see every one, so it's "some".
+    ExceptionsMayReset { count: u32, complete: bool },
+    /// The series' first occurrence moves.
+    StartMoved { from: String, to: String },
+    /// The days the series falls on move, as this occurrence moves from `from` to `to`, by
+    /// `shift_days`. `before` and `after` are those days in words ("every Sunday"), or `None` where
+    /// the rule names no day (a daily series).
+    RepeatDayChanges {
+        from: String,
+        to: String,
+        before: Option<String>,
+        after: Option<String>,
+        shift_days: i64,
+    },
+    /// Every occurrence gets this one's length.
+    LengthChanges,
+    /// The new part of a split doesn't take the series' attachments, video call or label.
+    NotCarried {
+        attachments: bool,
+        conference: bool,
+        label: bool,
+    },
+    /// The new part is a new event in Google: links to the old one stay with the part before.
+    NewIdentity,
 }
 
 #[cfg(test)]
@@ -363,6 +462,84 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(draft, TimeDraft::AllDay { .. }));
+    }
+
+    /// The series choices, in the shapes the webview reads and sends.
+    #[test]
+    fn series_choices_serialise_to_the_strings_the_dialog_names() {
+        let request: ChoiceRequest =
+            serde_json::from_str(r#"{"kind":"edit","session":"s1","draft":{"summary":"Retro"}}"#)
+                .unwrap();
+        assert!(matches!(
+            request,
+            ChoiceRequest::Edit { session, draft } if session == "s1"
+                && draft.summary.as_deref() == Some("Retro")
+        ));
+        let request: ChoiceRequest = serde_json::from_str(
+            r#"{"kind":"delete","event_id":"cal:e","seen":{"summary":"Gym","start":"2026-10-19",
+                "end":null,"all_day":true,"location":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(request, ChoiceRequest::Delete { event_id, .. } if event_id == "cal:e"));
+        let choices = SeriesChoices::Ready {
+            this: ScopeRow::Offered {
+                warnings: Vec::new(),
+                token: "t1".into(),
+            },
+            following: ScopeRow::AsAll {
+                warnings: vec![
+                    SeriesWarningDto::SplitSibling,
+                    SeriesWarningDto::ExceptionsMayReset {
+                        count: 2,
+                        complete: false,
+                    },
+                    SeriesWarningDto::RepeatDayChanges {
+                        from: "2026-10-18".into(),
+                        to: "2026-10-19".into(),
+                        before: Some("every Sunday".into()),
+                        after: None,
+                        shift_days: 1,
+                    },
+                ],
+                token: "t2".into(),
+            },
+            all: ScopeRow::Conflict {
+                fields: vec!["summary".into()],
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&choices).unwrap(),
+            r#"{"outcome":"ready","this":{"row":"offered","warnings":[],"token":"t1"},"following":{"row":"as_all","warnings":[{"warning":"split_sibling"},{"warning":"exceptions_may_reset","count":2,"complete":false},{"warning":"repeat_day_changes","from":"2026-10-18","to":"2026-10-19","before":"every Sunday","after":null,"shift_days":1}],"token":"t2"},"all":{"row":"conflict","fields":["summary"]}}"#
+        );
+        for (choices, json) in [
+            (
+                SeriesChoices::NotRepeating,
+                r#"{"outcome":"not_repeating"}"#,
+            ),
+            (
+                SeriesChoices::Refused {
+                    result: WriteOutcome::Reauth,
+                },
+                r#"{"outcome":"refused","result":{"outcome":"reauth"}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&choices).unwrap(), json);
+        }
+        assert_eq!(
+            serde_json::to_string(&ScopeRow::Refused {
+                message: "No.".into()
+            })
+            .unwrap(),
+            r#"{"row":"refused","message":"No."}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SeriesInfo {
+                first: false,
+                repeats: "Weekly on Monday".into()
+            })
+            .unwrap(),
+            r#"{"first":false,"repeats":"Weekly on Monday"}"#
+        );
     }
 
     #[test]

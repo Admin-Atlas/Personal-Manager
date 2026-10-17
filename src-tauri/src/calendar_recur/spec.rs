@@ -389,19 +389,79 @@ pub fn describe(spec: &RecurrenceSpec, start: &SeriesStart) -> String {
 /// described, or [`CUSTOM_RULE`] for anything outside the editor's set. EXDATEs and RDATEs don't
 /// change the words.
 pub fn describe_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> String {
+    spec_of_lines(lines, start)
+        .map_or_else(|| CUSTOM_RULE.to_string(), |spec| describe(&spec, start))
+}
+
+/// `recurrence` lines' one RRULE as a rule from the editor's set, or `None` for anything else.
+fn spec_of_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<RecurrenceSpec> {
     let lines = lines::parse(lines);
     let mut rules = lines.iter().filter_map(|l| match &l.kind {
         Kind::Rule(rule) => Some(rule),
         _ => None,
     });
-    let spec = match (rules.next(), rules.next()) {
+    match (rules.next(), rules.next()) {
         (Some(rule), None) if !lines.iter().any(|l| l.kind == Kind::ExRule) => rule
             .facts()
             .ok()
             .and_then(|facts| spec_from_rule(&facts, start)),
         _ => None,
+    }
+}
+
+/// The days a series falls on, in words, for the question a move to another day asks (A29: "'Gym'
+/// repeats every Sunday. Change it to repeat every Monday?"): "every Sunday", "every 2 weeks on
+/// Monday and Wednesday", "on day 15 of each month", "on the second Tuesday of each month", "every
+/// 13 October". `None` for a daily series, which names no day, and for a rule outside the editor's
+/// set; the question then says how far every occurrence moves instead.
+pub fn day_phrase<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<String> {
+    let spec = spec_of_lines(lines, start)?;
+    let n = spec.interval;
+    let months = |text: String| match n {
+        1 => format!("{text} of each month"),
+        _ => format!("{text} of every {n} months"),
     };
-    spec.map_or_else(|| CUSTOM_RULE.to_string(), |spec| describe(&spec, start))
+    Some(match &spec.pattern {
+        Pattern::Daily => return None,
+        Pattern::Weekly(days) if n == 1 && weekdays_sorted(days) == WEEKDAYS => {
+            "every weekday (Monday to Friday)".to_string()
+        }
+        Pattern::Weekly(days) => {
+            let names: Vec<&str> = weekdays_sorted(days).into_iter().map(day_name).collect();
+            match n {
+                1 => format!("every {}", and_list(&names)),
+                _ => format!("every {n} weeks on {}", and_list(&names)),
+            }
+        }
+        Pattern::Monthly(MonthlyOn::Day(day)) => months(format!("on day {day}")),
+        Pattern::Monthly(MonthlyOn::Weekday(nth, weekday)) => {
+            months(format!("on the {} {}", nth.word(), day_name(*weekday)))
+        }
+        Pattern::Yearly(YearlyOn::Date) => {
+            let date = start.date();
+            let day = format!("{} {}", date.day(), month_name(date.month()));
+            match n {
+                1 => format!("every {day}"),
+                _ => format!("every {n} years on {day}"),
+            }
+        }
+        Pattern::Yearly(YearlyOn::Weekday {
+            month,
+            nth,
+            weekday,
+        }) => {
+            let day = format!(
+                "on the {} {} of {}",
+                nth.word(),
+                day_name(*weekday),
+                month_name(u32::from(*month))
+            );
+            match n {
+                1 => format!("{day} each year"),
+                _ => format!("{day} every {n} years"),
+            }
+        }
+    })
 }
 
 /// One of the repeat menu's ready-made rules.
@@ -643,6 +703,68 @@ mod tests {
         ] {
             assert_eq!(words(rule, &t), expected, "{rule}");
         }
+    }
+
+    /// A29: the days a series falls on, as a move to another day words its question. A daily series
+    /// names none, nor does a rule outside the set.
+    #[test]
+    fn the_days_a_series_falls_on_in_words() {
+        let t = tuesday();
+        let phrase = |rule: &str| day_phrase(&[rule], &t);
+        for (rule, expected) in [
+            ("RRULE:FREQ=WEEKLY", "every Tuesday"),
+            (
+                "RRULE:FREQ=WEEKLY;BYDAY=WE,MO;UNTIL=20261231T235959Z",
+                "every Monday and Wednesday",
+            ),
+            (
+                "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
+                "every 2 weeks on Tuesday",
+            ),
+            (
+                "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+                "every weekday (Monday to Friday)",
+            ),
+            ("RRULE:FREQ=MONTHLY", "on day 13 of each month"),
+            (
+                "RRULE:FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15",
+                "on day 15 of every 3 months",
+            ),
+            (
+                "RRULE:FREQ=MONTHLY;BYDAY=2TU",
+                "on the second Tuesday of each month",
+            ),
+            ("RRULE:FREQ=YEARLY;COUNT=5", "every 13 October"),
+            (
+                "RRULE:FREQ=YEARLY;INTERVAL=2",
+                "every 2 years on 13 October",
+            ),
+            (
+                "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=2TU",
+                "on the second Tuesday of October each year",
+            ),
+        ] {
+            assert_eq!(phrase(rule).as_deref(), Some(expected), "{rule}");
+        }
+        for rule in [
+            "RRULE:FREQ=DAILY",
+            "RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2",
+            "garbage",
+        ] {
+            assert_eq!(phrase(rule), None, "{rule}");
+        }
+        // EXDATEs don't change the days.
+        assert_eq!(
+            day_phrase(
+                &[
+                    "RRULE:FREQ=WEEKLY;BYDAY=TU",
+                    "EXDATE;TZID=Europe/London:20261020T090000"
+                ],
+                &t
+            )
+            .as_deref(),
+            Some("every Tuesday")
+        );
     }
 
     #[test]

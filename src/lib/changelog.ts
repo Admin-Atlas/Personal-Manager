@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.3-alpha",
+    date: "2026-10-17",
+    highlights: [
+      "Under the hood, more groundwork for changing repeating events in Google Calendar. Before anything is sent, PM can now work out what each of “This event”, “This and following” and “All events” would do, and what you should know first: occurrences you changed on their own, or a series that would move to another day. It holds back a choice when it can't see every occurrence you changed on its own, rather than risk losing one. Opening a repeating event now also reads its series, so a later change can never overwrite one made in Google meanwhile. Nothing you can see changes yet.",
+    ],
+  },
+  {
     version: "3.148.2-alpha",
     date: "2026-10-17",
     highlights: [

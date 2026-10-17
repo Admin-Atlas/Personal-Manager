@@ -111,7 +111,7 @@ impl GoneRow {
     not(test),
     expect(
         dead_code,
-        reason = "first caller lands in C9, editing repeating events"
+        reason = "first caller lands in C9a-3, landing a series write"
     )
 )]
 pub fn floor_of<'a>(moments: impl IntoIterator<Item = &'a str>) -> Option<String> {
@@ -144,7 +144,7 @@ impl Removes {
         not(test),
         expect(
             dead_code,
-            reason = "first caller lands in C9, editing repeating events"
+            reason = "first caller lands in C9a-3, landing a series write"
         )
     )]
     pub fn rows(
@@ -204,7 +204,7 @@ pub struct SeriesDiff {
     not(test),
     expect(
         dead_code,
-        reason = "first caller lands in C9, editing repeating events"
+        reason = "first caller lands in C9a-3, landing a series write"
     )
 )]
 pub fn diff_series(

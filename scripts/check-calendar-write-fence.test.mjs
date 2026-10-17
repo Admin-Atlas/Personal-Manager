@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { scan, WRITE_COMMANDS } from "./check-calendar-write-fence.mjs";
+import { DEV_COMMANDS, scan, WRITE_COMMANDS } from "./check-calendar-write-fence.mjs";
 
 const roots = [];
 afterEach(() => {
@@ -23,13 +23,20 @@ afterEach(() => {
  *  model-path modules for the floor. `extra` adds or replaces files. */
 function fixture(extra = {}) {
   const commands = WRITE_COMMANDS.map(([c]) => `#[tauri::command]\npub async fn ${c}() {}\n`);
+  const devCommands = DEV_COMMANDS.map(
+    (c) => `#[cfg(debug_assertions)]\n#[tauri::command]\npub async fn ${c}() {}\n`,
+  );
   const wrappers = WRITE_COMMANDS.map(
     ([c, w]) => `export const ${w} = (id: string) =>\n  invoke<WriteOutcome>("${c}", { id });\n`,
   );
   const files = {
-    "src-tauri/src/lib.rs": `mod calendar_write;\nmod llm_gateway;\ncommands::update_calendar_event,`,
+    "src-tauri/src/lib.rs":
+      `mod calendar_write;\nmod llm_gateway;\ncommands::update_calendar_event,\n` +
+      DEV_COMMANDS.map(
+        (c) => `            #[cfg(debug_assertions)]\n            commands::${c},\n`,
+      ).join(""),
     "src-tauri/src/commands/calendar_edit.rs":
-      `use crate::calendar_write::plan;\n${commands.join("")}` +
+      `use crate::calendar_write::plan;\n${commands.join("")}${devCommands.join("")}` +
       `pub(super) fn edit_blocks() {}\n` +
       `mod google_io { fn send() { crate::google::authorized_send_with(); } }`,
     "src-tauri/src/calendar_write/plan.rs": `const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";`,
@@ -168,6 +175,42 @@ describe("calendar write fence", () => {
           `export const dismissEvent = () => invoke<WriteOutcome>("delete_calendar_event");\n`,
       }),
     ).toMatch(/invokes "delete_calendar_event" 2 times/);
+  });
+
+  it("keeps a dev command to dev builds, with no wrapper", () => {
+    const module = (dev) =>
+      `use crate::calendar_write::plan;\n` +
+      WRITE_COMMANDS.map(([c]) => `#[tauri::command]\npub async fn ${c}() {}\n`).join("") +
+      dev +
+      `mod google_io {}`;
+    // Built into release builds too.
+    expect(
+      problems({
+        "src-tauri/src/commands/calendar_edit.rs": module(
+          `#[tauri::command]\npub async fn dev_series_report() {}\n`,
+        ),
+      }),
+    ).toMatch(/defines the dev command `dev_series_report` without `#\[cfg\(debug_assertions\)\]`/);
+    // Registered for release builds too.
+    expect(
+      problems({
+        "src-tauri/src/lib.rs": `mod llm_gateway;\ncommands::update_calendar_event,\ncommands::dev_series_report,`,
+      }),
+    ).toMatch(/must register the dev command `dev_series_report` straight after/);
+    // A wrapper, or any other mention, puts a debug-only command into release code.
+    expect(
+      problems({
+        "src/lib/ipc.ts":
+          WRITE_COMMANDS.map(
+            ([c, w]) => `export const ${w} = () => invoke<WriteOutcome>("${c}");\n`,
+          ).join("") + `export const devSeriesReport = () => invoke("dev_series_report");\n`,
+      }),
+    ).toMatch(/ipc\.ts:\d+ names the dev-build calendar command `dev_series_report`/);
+    expect(
+      problems({
+        "src-tauri/src/briefing.rs": `use crate::openrouter::complete;\n// dev_series_report`,
+      }),
+    ).toMatch(/briefing\.rs:2 is on a model path .* names the `dev_series_report` command/);
   });
 
   it("checks its own lists against the code", () => {
