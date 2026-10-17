@@ -1941,6 +1941,15 @@ fn updated_of(copy: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `updated` of the series' copy and of each occurrence listed as changed on its own, which
+/// doesn't move its series' (A29): what a removal of every row of the series is floored at.
+fn series_moments(planning: &Planning) -> Vec<String> {
+    std::iter::once(planning.series.master_fresh.json())
+        .chain(planning.series.exceptions.items.iter())
+        .filter_map(|v| updated_of(Some(v)))
+        .collect()
+}
+
 /// The pauses before the second and third re-fetch of a series that doesn't show the write yet.
 const REFETCH_AGAIN: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
 
@@ -2006,8 +2015,8 @@ async fn land_series<W: Wire, H: Host>(
             if plan.scope == Scope::This {
                 return land_gone(host, target, None);
             }
-            // The series itself is gone: every row of it goes, no newer than its last copy.
-            let floor = updated_of(Some(planning.series.master_fresh.json()));
+            // The series itself is gone: every row of it goes, no older than its last copies.
+            let floor = diff::floor_of(series_moments(planning).iter().map(String::as_str));
             let _ = host.with_conn(|conn| {
                 let before = rows_union(&snapshot, calendar::series_rows(conn, cal, master)?);
                 let gone = Removes::Series {
@@ -2108,13 +2117,9 @@ async fn land_series<W: Wire, H: Host>(
         }
         after
     } else if plan.scope == Scope::All {
-        // A whole series deleted (a 204, no body): no older than the series' copy, each changed
-        // occurrence's, and the answer's own time (A29).
-        let mut moments: Vec<String> = vec![planning.series.master_fresh.json()]
-            .into_iter()
-            .chain(planning.series.exceptions.items.iter())
-            .filter_map(|v| updated_of(Some(v)))
-            .collect();
+        // A whole series deleted (a 204, no body): no older than its copies and the answer's own
+        // time (A29).
+        let mut moments = series_moments(planning);
         moments.extend(updated_of(reply.as_ref()));
         moments.extend(date_floor(date));
         diff::floor_of(moments.iter().map(String::as_str))
@@ -5650,6 +5655,44 @@ mod tests {
         (events, steps)
     }
 
+    /// Google's series after the cut a "this and following" delete from Monday 19-10 sends, the
+    /// series holding `exceptions`.
+    fn cut_series(exceptions: Vec<Value>) -> Value {
+        let plan = Case::new(weekly(), monday_19())
+            .exceptions(exceptions)
+            .delete(Scope::Following)
+            .unwrap();
+        let Op::Patch { body, .. } = &plan.steps[0].op else {
+            panic!("not a cut");
+        };
+        written(
+            &weekly(),
+            &[("recurrence", body["recurrence"].clone())],
+            "\"m2\"",
+        )
+    }
+
+    /// "All events" moved to Tuesday from Monday 19-10, and Google's series holding half of it: the
+    /// new start, the old rule.
+    fn half_way_to_tuesday() -> (EventPatchDraft, Value) {
+        let to_tuesday = at("09:00", "2026-10-20");
+        let plan = Case::new(weekly(), monday_19())
+            .edit(Scope::All, to_tuesday.clone())
+            .unwrap();
+        let Op::Patch { body, .. } = &plan.steps[0].op else {
+            panic!("not a patch");
+        };
+        let half = written(
+            &weekly(),
+            &[
+                ("start", body["start"].clone()),
+                ("end", body["end"].clone()),
+            ],
+            "\"m2\"",
+        );
+        (to_tuesday, half)
+    }
+
     /// §5: "this event" lands Google's reply in its row, no re-fetch, and moves the editor's copy
     /// on for the fields it sent; the editor stays open, the series being as it was.
     #[tokio::test]
@@ -5904,9 +5947,13 @@ mod tests {
         script.asked_all();
         assert!(script.waits().is_empty());
         assert!(host.ids().is_empty());
-        // Listed at Google's answer, it's the version deleted; two seconds on, under another etag,
-        // it was restored since.
-        let at_answer = with(monday_19(), "updated", json!("2026-10-17T12:00:00Z"));
+        // Listed within the second of Google's answer, under another etag, it's still the version
+        // deleted (a `Date` is whole seconds); two seconds on, it was restored since.
+        let at_answer = with(
+            with(monday_19(), "etag", json!("\"x8\"")),
+            "updated",
+            json!("2026-10-17T12:00:00.500Z"),
+        );
         let restored = with(
             with(plain("2026-10-26T09:00:00Z"), "etag", json!("\"x9\"")),
             "updated",
@@ -5941,24 +5988,204 @@ mod tests {
         assert_eq!(host.ids(), ids_of(rows_of(&october())));
     }
 
+    /// Review M7 where it matters: a cut's re-fetch answered 404 isn't "nothing left", which would
+    /// take the rows before the cut off too. Pending, and only the cut's own removals land.
+    #[tokio::test]
+    async fn a_cut_delete_refetch_404_is_pending_never_absent() {
+        let host = TestHost::holding(&october());
+        let mut steps = october_reads();
+        steps.extend(october_reads());
+        steps.push(series_patch(Scripted::Json(cut_series(Vec::new()))));
+        for _ in 0..3 {
+            steps.push(refetch_read(Scripted::Status(404)));
+        }
+        let script = Script::new(steps);
+        let outcome = held_delete(&host, &script, &monday_19(), Scope::Following).await;
+        script.asked_all();
+        assert_eq!(outcome, pending());
+        assert_eq!(script.waits(), REFETCH_AGAIN);
+        assert_eq!(host.ids(), ["cal:abc_20261012T080000Z"]);
+        let shown = ids_of(host.synced(&october(), Instant::now()));
+        assert_eq!(shown, ["cal:abc_20261012T080000Z"]);
+    }
+
+    /// Critique 3: a "this event" cancel proved without a reply (a lost answer, then a 404) is
+    /// floored at Google's copy, which may be newer than the mirror's; one answered 404 directly, at
+    /// a second after its `Date`.
+    #[tokio::test]
+    async fn a_this_delete_proved_without_a_reply_is_floored_at_googles_copy() {
+        // Changed in Google since the last sync, outside what the user saw.
+        let newer = written(
+            &monday_19(),
+            &[("description", json!("New notes"))],
+            "\"i9\"",
+        );
+        let reads_of = || {
+            reads(
+                &newer,
+                &weekly(),
+                vec![weekly(), newer.clone()],
+                vec![newer.clone()],
+            )
+        };
+        let id = "/events/abc_20261019T080000Z";
+        let date = chrono::DateTime::parse_from_rfc3339("2026-10-17T13:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cases = [
+            (
+                vec![
+                    Step::write(
+                        Method::Patch,
+                        id,
+                        "\"i9\"",
+                        Scripted::Lost { retried: false },
+                    ),
+                    Step::status(id, "", 404),
+                ],
+                SAVED_AT,
+                "2026-10-17T12:00:01.000Z",
+            ),
+            (
+                vec![Step::write(
+                    Method::Patch,
+                    id,
+                    "\"i9\"",
+                    Scripted::Reply {
+                        status: 404,
+                        body: None,
+                        date: Some(date),
+                        maybe_applied: false,
+                    },
+                )],
+                "2026-10-17T13:00:00.500Z",
+                "2026-10-17T13:00:02.000Z",
+            ),
+        ];
+        for (cancel, hidden_at, back_at) in cases {
+            let host = TestHost::holding(&october());
+            let before = Instant::now();
+            let mut steps = reads_of();
+            steps.extend(reads_of());
+            steps.extend(cancel);
+            let script = Script::new(steps);
+            assert_eq!(
+                held_delete(&host, &script, &newer, Scope::This).await,
+                saved()
+            );
+            script.asked_all();
+            let row = "cal:abc_20261019T080000Z".to_string();
+            assert!(!host.ids().contains(&row));
+            let listed = |updated: &str, etag: &str| {
+                with(
+                    with(newer.clone(), "updated", json!(updated)),
+                    "etag",
+                    json!(etag),
+                )
+            };
+            let hidden = ids_of(host.synced(&[listed(hidden_at, "\"j1\"")], before));
+            assert!(!hidden.contains(&row), "{hidden_at}");
+            let back = ids_of(host.synced(&[listed(back_at, "\"j2\"")], Instant::now()));
+            assert!(back.contains(&row), "{back_at}");
+        }
+    }
+
+    /// Review findings 5 and A29: a series gone when "all events" reaches it takes every row off,
+    /// each no older than the occurrences changed on their own, which don't move the series'
+    /// `updated`, so a sync already running can't bring one back.
+    #[tokio::test]
+    async fn a_gone_series_is_floored_at_its_changed_occurrences() {
+        let host = TestHost::holding(&october());
+        let demo = written(
+            &plain("2026-10-26T09:00:00Z"),
+            &[("summary", json!("Demo"))],
+            "\"d2\"",
+        );
+        let mut steps = reads(
+            &monday_19(),
+            &weekly(),
+            vec![weekly(), demo.clone()],
+            vec![monday_19(), demo.clone()],
+        );
+        steps.push(series_patch(Scripted::Status(404)));
+        let script = Script::new(steps);
+        let before = Instant::now();
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            title("Retro"),
+            Scope::All,
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(outcome, WriteOutcome::Gone);
+        assert!(host.ids().is_empty());
+        assert!(host.synced(&[demo], before).is_empty());
+    }
+
+    /// Critique 7: a move whose answers prove nothing may have landed in part (the new start
+    /// without the rule), so it says to check Google, never only to refresh: lost twice, or its
+    /// put-back lost.
+    #[tokio::test]
+    async fn an_unknown_retime_says_it_may_have_moved_partly() {
+        let (to_tuesday, half) = half_way_to_tuesday();
+        let look = || Step::get("/events/abc", "", weekly());
+        let cases = [
+            (
+                at("10:00", "2026-10-19"),
+                vec![
+                    series_patch(Scripted::Lost { retried: false }),
+                    look(),
+                    series_patch(Scripted::Lost { retried: false }),
+                    look(),
+                ],
+            ),
+            (
+                to_tuesday,
+                vec![
+                    series_patch(Scripted::Reply {
+                        status: 500,
+                        body: None,
+                        date: None,
+                        maybe_applied: true,
+                    }),
+                    Step::get("/events/abc", "", half),
+                    Step::write(
+                        Method::Patch,
+                        "/events/abc",
+                        "\"m2\"",
+                        Scripted::Lost { retried: false },
+                    ),
+                ],
+            ),
+        ];
+        for (draft, answers) in cases {
+            let host = TestHost::holding(&october());
+            let mut steps = october_reads();
+            steps.extend(answers);
+            let script = Script::new(steps);
+            let (outcome, _) =
+                save(&host, &script, &monday_19(), &weekly(), draft, Scope::All).await;
+            script.asked_all();
+            assert_eq!(
+                outcome,
+                WriteOutcome::Failed {
+                    message: RETIME_UNSURE.into()
+                }
+            );
+            assert!(host.nothing_recorded() && host.hash_dropped());
+        }
+    }
+
     /// §2.3: "this and following" without a new series cuts the series, then cancels the stored
     /// occurrences after the cut. One changed in Google since is left, said, and its row stays.
     #[tokio::test]
     async fn a_following_delete_cuts_then_cancels_and_reports_what_it_left() {
         let (events, reads_now) = with_off_site();
         let host = TestHost::holding(&events);
-        let plan = Case::new(weekly(), monday_19())
-            .exceptions(vec![off_site()])
-            .delete(Scope::Following)
-            .unwrap();
-        let Op::Patch { body, .. } = &plan.steps[0].op else {
-            panic!("not a cut");
-        };
-        let cut = written(
-            &weekly(),
-            &[("recurrence", body["recurrence"].clone())],
-            "\"m2\"",
-        );
+        let cut = cut_series(vec![off_site()]);
         let moved_on = written(
             &off_site(),
             &[("summary", json!("Off-site (room 2)"))],
@@ -6008,21 +6235,7 @@ mod tests {
     async fn a_half_landed_retime_is_put_back_and_says_so() {
         let host = TestHost::holding(&october());
         let (series, instance) = (weekly(), monday_19());
-        let to_tuesday = at("09:00", "2026-10-20");
-        let plan = Case::new(series.clone(), instance.clone())
-            .edit(Scope::All, to_tuesday.clone())
-            .unwrap();
-        let Op::Patch { body, .. } = &plan.steps[0].op else {
-            panic!("not a patch");
-        };
-        let half = written(
-            &series,
-            &[
-                ("start", body["start"].clone()),
-                ("end", body["end"].clone()),
-            ],
-            "\"m2\"",
-        );
+        let (to_tuesday, half) = half_way_to_tuesday();
         let mut steps = october_reads();
         steps.extend([
             series_patch(Scripted::Reply {
@@ -6372,36 +6585,48 @@ mod tests {
             "iCalUID",
             json!("xyz@google.com"),
         );
-        let script = Script::new(vec![
-            instance_read(&elsewhere),
-            Step::get("/events/xyz", "", other.clone()),
-            Step::get(
-                "/events",
-                "iCalUID=xyz%40google.com",
-                page(vec![other], None),
-            ),
-            Step::get(
-                "/events/xyz/instances",
-                "timeMin=2026-09-01",
-                page(vec![elsewhere], None),
-            ),
-        ]);
-        let (outcome, _) = save(
-            &host,
-            &script,
-            &instance,
-            &series,
-            title("Retro"),
+        let reads_now = || {
+            Script::new(vec![
+                instance_read(&elsewhere),
+                Step::get("/events/xyz", "", other.clone()),
+                Step::get(
+                    "/events",
+                    "iCalUID=xyz%40google.com",
+                    page(vec![other.clone()], None),
+                ),
+                Step::get(
+                    "/events/xyz/instances",
+                    "timeMin=2026-09-01",
+                    page(vec![elsewhere.clone()], None),
+                ),
+            ])
+        };
+        let no_base = WriteOutcome::Failed {
+            message: SeriesRefusal::NoBase.to_string(),
+        };
+        // An edit claimed the series the editor opened. "This event" needs no opened series, so
+        // only the claim's own check stands between it and a PATCH.
+        for scope in [Scope::This, Scope::All] {
+            let script = reads_now();
+            let (outcome, _) =
+                save(&host, &script, &instance, &series, title("Retro"), scope).await;
+            script.finished();
+            assert_eq!(outcome, no_base, "{scope:?}");
+        }
+        // A delete claimed the series its mirror row names.
+        let script = reads_now();
+        let target = target(&instance);
+        let seen = seen_by_user(&fresh_event(elsewhere.clone()));
+        let planned = plan_held_delete(
+            &writer(&script, &host, &target),
+            &target.row_id,
+            &seen,
             Scope::All,
+            None,
         )
         .await;
         script.finished();
-        assert_eq!(
-            outcome,
-            WriteOutcome::Failed {
-                message: SeriesRefusal::NoBase.to_string()
-            }
-        );
+        assert_eq!(planned.err(), Some(no_base));
     }
 
     /// The decision for C9a-3a: "this and following" past the first occurrence makes a new series,
