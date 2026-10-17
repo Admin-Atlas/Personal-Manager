@@ -22,7 +22,15 @@ import {
   type MapLayoutMode,
 } from "../../lib/mapPrefs";
 import { focusViewPrefsAreDefault, resetFocusViewPrefs } from "../../lib/focusPrefs";
-import { readOpenOn, writeOpenOn } from "../../lib/calendarPrefs";
+import {
+  readOpenOn,
+  readSwipeDays,
+  SWIPE_DAYS_MAX,
+  SWIPE_DAYS_MIN,
+  writeOpenOn,
+  writeSwipeDays,
+  type SwipeDays,
+} from "../../lib/calendarPrefs";
 import {
   chatSectionsAreDefault,
   resetChatSections,
@@ -106,6 +114,9 @@ export function GeneralSettings() {
   // Where the Calendar tab opens. Stored as a mode string; surfaced as a plain on/off because
   // "today" is the default and "where I left it" is the opt-in.
   const [openOnLast, setOpenOnLast] = useState(() => readOpenOn() === "last");
+  // How far a sideways swipe moves the day grids. Seeded once: this is its only writer, and the grids
+  // read the pref at each swipe (`swipeDays`), so nothing needs telling when it changes.
+  const [swipe, setSwipe] = useState<SwipeDays>(readSwipeDays);
   // Where the briefing shows, beyond the Focus tab. Both off by default. SUBSCRIBED, not read once:
   // the always-on-top window can be dismissed from its own ✕ or by the tray going off, and both of
   // those write the pref from outside this component (see the briefing://closed listener in App).
@@ -269,6 +280,7 @@ export function GeneralSettings() {
   }, []);
   const focusIsDefault = briefingIsDefault && focusViewDefault;
   const helpIsDefault = !help.enabled;
+  const calendarIsDefault = !openOnLast && swipe === SWIPE_DAYS_MIN;
   // The Chats-tab sidebar folds, same story as the Focus prefs above: the control lives beside what
   // it changes (one control, one home) and only the RESET lives here, so this needs the same live
   // subscription rather than a read at mount. There is no Chats section on this tab to hang a
@@ -289,6 +301,7 @@ export function GeneralSettings() {
     mapIsDefault &&
     confirmDeleteIsDefault &&
     focusIsDefault &&
+    calendarIsDefault &&
     chatSectionsDefault &&
     helpIsDefault;
 
@@ -313,11 +326,18 @@ export function GeneralSettings() {
     resetBriefingPrefs();
     void setBriefingWindowVisible(false).catch(() => {});
   }
+  function resetCalendar() {
+    setOpenOnLast(false);
+    writeOpenOn("today");
+    setSwipe(SWIPE_DAYS_MIN);
+    writeSwipeDays(SWIPE_DAYS_MIN);
+  }
   function resetGeneral() {
     resetAppearance();
     resetMap();
     resetConfirmDelete();
     resetFocus();
+    resetCalendar();
     resetChatSections(); // the Chats-tab sidebar folds, back to density-derived
     resetShowThinking(); // the chat Thinking toggle, back to off
     setChatSectionsDefault(true);
@@ -539,6 +559,33 @@ export function GeneralSettings() {
                 writeOpenOn(v ? "last" : "today");
               }}
             />
+          )}
+        </SettingRow>
+        <SettingRow
+          label="A sideways swipe moves the calendar"
+          helpId="settings-calendar-swipe-days"
+        >
+          {(a11y) => (
+            <Select
+              {...a11y}
+              value={String(swipe)}
+              onChange={(e) => {
+                const raw = e.currentTarget.value;
+                const next: SwipeDays = raw === "view" ? "view" : Number(raw);
+                setSwipe(next);
+                writeSwipeDays(next);
+              }}
+            >
+              {Array.from({ length: SWIPE_DAYS_MAX - SWIPE_DAYS_MIN + 1 }, (_, i) => {
+                const n = SWIPE_DAYS_MIN + i;
+                return (
+                  <option key={n} value={n}>
+                    {n === 1 ? "1 day" : `${n} days`}
+                  </option>
+                );
+              })}
+              <option value="view">All the days on screen</option>
+            </Select>
           )}
         </SettingRow>
         <SettingRow label="Models in use" helpId="settings-models-footer">
@@ -805,8 +852,9 @@ export function GeneralSettings() {
           <>
             Restores appearance (System, Mode, Accent, Depth, Location), the memory-map view, the
             pinboard delete confirmation, the Focus tab (which panels it shows and where the
-            briefing appears), the Chats sidebar's folds, the chat Thinking button (back to off),
-            and help mode to their defaults. Your time zone is left as-is.
+            briefing appears), where the Calendar opens and how far a swipe moves it, the Chats
+            sidebar's folds, the chat Thinking button (back to off), and help mode to their
+            defaults. Your time zone is left as-is.
           </>
         }
       />

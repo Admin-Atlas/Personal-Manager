@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.0-alpha",
+    date: "2026-10-17",
+    highlights: [
+      "You can now choose how far a sideways swipe moves the calendar. In Settings › General, next to where the Calendar opens, pick anything from 1 day to 7, or all the days on screen to move a whole page at a time. It applies to the Calendar's Week and Day views and to the Upcoming grid on the Focus tab. One day is still the default, and a flick straight back still undoes a swipe, however far it went.",
+    ],
+  },
+  {
     version: "3.147.9-alpha",
     date: "2026-10-17",
     highlights: [

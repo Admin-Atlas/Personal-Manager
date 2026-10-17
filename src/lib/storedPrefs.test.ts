@@ -21,6 +21,7 @@ import {
   readDayCount,
   readHidden,
   readOpenOn,
+  readSwipeDays,
   readRange,
   readRangeBounds,
   readRosterOpen,
@@ -215,8 +216,8 @@ describe("the backup dismissal prefix scan", () => {
 });
 
 describe("what deliberately stays in localStorage", () => {
-  it("moves only pm.calendar.hidden — the other eight calendar keys are untouched", async () => {
-    // calendarPrefs holds nine keys and exactly ONE is user content (a calendar id is routinely the
+  it("moves only pm.calendar.hidden — the other nine calendar keys are untouched", async () => {
+    // calendarPrefs holds ten keys and exactly ONE is user content (a calendar id is routinely the
     // account's email). The rest are view state, and dragging them behind an IPC round trip would be
     // against the decision this change implements, not for it.
     const stays: Record<string, string> = {
@@ -230,6 +231,7 @@ describe("what deliberately stays in localStorage", () => {
       // The borderline call, decided deliberately: a date the user was looking at is view position,
       // not user content.
       "pm.calendar.cursor": "2026-07-31",
+      "pm.calendar.swipeDays": "view",
     };
     for (const [k, v] of Object.entries(stays)) localStorage.setItem(k, v);
     localStorage.setItem("pm.calendar.hidden", JSON.stringify(["a@example.com"]));
@@ -249,6 +251,7 @@ describe("what deliberately stays in localStorage", () => {
     expect(readDayCount()).toBe(3);
     expect(readOpenOn()).toBe("last");
     expect(readCursorDay()?.getDate()).toBe(31);
+    expect(readSwipeDays()).toBe("view");
     // The one that moved reads from the store instead.
     expect([...readHidden()]).toEqual(["a@example.com"]);
   });

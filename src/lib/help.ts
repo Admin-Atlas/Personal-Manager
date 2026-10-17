@@ -130,6 +130,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Calendar opens where you left it",
     body: "By default the Calendar tab opens on today, whichever date you were looking at last time. Turn this on to have it reopen exactly where you left it instead. Either way, the Today button always brings you back — and in Week view it re-snaps to the ordinary Monday-to-Sunday week, which is how you undo a sideways swipe.",
   },
+  "settings-calendar-swipe-days": {
+    title: "A sideways swipe moves the calendar",
+    body: "How far one sideways swipe on a trackpad (or a tilt of the mouse wheel) moves the Calendar's Week and Day views and the Focus tab's Upcoming days. One day is the default. Pick up to 7, or 'All the days on screen' to move a whole page at a time: a week in Week view, or as many days as the Day view or Upcoming is showing. However far it moves, a quick flick straight back undoes it. The ‹ › buttons don't change: on the Calendar tab they still move a whole page, and on the Focus tab one day.",
+  },
   "settings-models-footer": {
     title: "Models in use",
     body: "Show or hide the small block at the bottom of the sidebar naming the models currently doing your chat and background work. It follows your preset by default — on for Standard and Power, off for Minimal — and this switch overrides that in either direction, so you can keep an eye on which model is answering even on a pared-back setup, or put it away on a busy one. It is a readout only: hiding it changes nothing about which model runs, and clicking it is still the quickest way into the model settings when it is shown.",
