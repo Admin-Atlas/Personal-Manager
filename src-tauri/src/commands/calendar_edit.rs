@@ -1259,6 +1259,16 @@ async fn choices<W: Wire>(
     opened: Option<(&Value, Option<&Value>)>,
 ) -> SeriesChoices {
     let refused = |result| SeriesChoices::Refused { result };
+    // An edit is checked against what the user opened, never against Google's copies alone.
+    let opened = match (request, opened) {
+        (ChoiceRequest::Edit { .. }, None) => {
+            return refused(WriteOutcome::Failed {
+                message: SESSION_ENDED.into(),
+            })
+        }
+        (ChoiceRequest::Edit { .. }, Some(opened)) => Some(opened),
+        (ChoiceRequest::Delete { .. }, _) => None,
+    };
     let fresh = match get(wire, &target.remote_calendar, &target.remote_event)
         .await
         .event()
@@ -2708,37 +2718,49 @@ mod tests {
         )
     }
 
-    /// `event` cut down to [`WINDOW_FIELDS`]' shape.
+    /// `event` as Google answers [`WINDOW_FIELDS`]: only what its `items(...)` selects, read from the
+    /// constant itself, so a field dropped from the mask is dropped from every fixture too.
     fn masked(event: &Value) -> Value {
-        let mut kept = serde_json::Map::new();
-        for key in [
-            "id",
-            "status",
-            "recurringEventId",
-            "originalStartTime",
-            "start",
-            "end",
-            "summary",
-            "attendeesOmitted",
-        ] {
-            if let Some(v) = event.get(key) {
-                kept.insert(key.into(), v.clone());
+        let items = WINDOW_FIELDS
+            .split_once("items(")
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .expect("WINDOW_FIELDS selects items(...)");
+        keep(event, items)
+    }
+
+    /// `value` with only the fields `selector` names (`a,b(c,d)`): an object's own, and each of an
+    /// array's.
+    fn keep(value: &Value, selector: &str) -> Value {
+        if let Some(list) = value.as_array() {
+            return Value::from(list.iter().map(|v| keep(v, selector)).collect::<Vec<_>>());
+        }
+        let mut parts = Vec::new();
+        let (mut depth, mut part) = (0, String::new());
+        for c in selector.chars().chain([',']) {
+            match c {
+                ',' if depth == 0 => parts.push(std::mem::take(&mut part)),
+                '(' | ')' => {
+                    depth += if c == '(' { 1 } else { -1 };
+                    part.push(c);
+                }
+                _ => part.push(c),
             }
         }
-        if let Some(guests) = event.get("attendees").and_then(Value::as_array) {
-            let guests: Vec<Value> = guests
-                .iter()
-                .map(|g| {
-                    let mut kept = serde_json::Map::new();
-                    for key in ["email", "self", "optional"] {
-                        if let Some(v) = g.get(key) {
-                            kept.insert(key.into(), v.clone());
-                        }
-                    }
-                    Value::Object(kept)
-                })
-                .collect();
-            kept.insert("attendees".into(), Value::from(guests));
+        let mut kept = serde_json::Map::new();
+        for part in parts {
+            let (name, inner) = match part.split_once('(') {
+                Some((name, rest)) => {
+                    (name.to_string(), rest.strip_suffix(')').map(str::to_string))
+                }
+                None => (part, None),
+            };
+            if let Some(v) = value.get(&name) {
+                let v = match &inner {
+                    Some(inner) => keep(v, inner),
+                    None => v.clone(),
+                };
+                kept.insert(name, v);
+            }
         }
         Value::Object(kept)
     }
@@ -3029,7 +3051,8 @@ mod tests {
 
     /// C9 design §0.8, review M3/L4: an occurrence moved or cancelled on its own that the listing by
     /// iCal UID misses refuses a split, and an "all events" move, which would otherwise lose or bring
-    /// it back.
+    /// it back. (Until C12 the guests rule refuses them first, a change of text to every occurrence
+    /// too; plan.rs tests each guard on its own with guests allowed.)
     #[tokio::test]
     async fn a_moved_occurrence_the_listing_misses_refuses_incomplete() {
         let series = weekly();
@@ -3540,10 +3563,12 @@ mod tests {
     #[tokio::test]
     async fn the_editor_keeps_its_series_and_the_choices_check_against_it() {
         let (series, instance) = (weekly(), monday_19());
+        // Moved to another room between the first read and the second: the editor shows the later.
+        let later = with(instance.clone(), "location", json!("Room 4"));
         let edit_state = CalendarEditState::default();
         let script = Script::new(vec![
             Step::get("/events/abc", "", series.clone()),
-            instance_read(&instance),
+            instance_read(&later),
         ]);
         let load = open_editor(
             &script,
@@ -3559,15 +3584,17 @@ mod tests {
         let EditLoad::Ready {
             session,
             series: info,
+            event,
             ..
         } = load
         else {
             panic!("{load:?}");
         };
         assert_eq!(info.map(|i| i.repeats), Some("Weekly on Monday".into()));
+        assert_eq!(event.location, "Room 4");
         let open = open_session(&edit_state, &session).unwrap().unwrap();
         assert_eq!(open.target, target(&instance));
-        assert_eq!(open.opened(), (&instance, Some(&series)));
+        assert_eq!(open.opened(), (&later, Some(&series)));
         assert!(open_session(&edit_state, "not-a-session")
             .unwrap()
             .is_none());
@@ -3648,6 +3675,32 @@ mod tests {
             message: SeriesRefusal::NoBase.to_string(),
         };
         assert_eq!((following, all), (no_base.clone(), no_base));
+    }
+
+    /// An edit without the copies the user opened is never planned against Google's alone: nothing
+    /// is read, and the editor is asked to open again.
+    #[tokio::test]
+    async fn an_edit_without_its_opened_copies_is_refused() {
+        let instance = monday_19();
+        let script = Script::new(Vec::new());
+        let got = choices(
+            &script,
+            &target(&instance),
+            EditingStatus::On,
+            &mirror(&["abc"]),
+            &edit(title("Retro")),
+            None,
+        )
+        .await;
+        script.finished();
+        assert_eq!(
+            got,
+            SeriesChoices::Refused {
+                result: WriteOutcome::Failed {
+                    message: SESSION_ENDED.into()
+                }
+            }
+        );
     }
 
     /// The gate runs on Google's copy of the occurrence before any row, all of it but the stand-in

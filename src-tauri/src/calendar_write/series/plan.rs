@@ -3751,6 +3751,55 @@ mod tests {
             .unwrap();
         assert!(seen.warnings.is_empty());
         assert_ne!(some.choice_digest("s1"), seen.choice_digest("s1"));
+        // The same count, seen whole or not: two tokens.
+        let retitled = with(
+            plain("2026-10-26T09:00:00Z"),
+            "summary",
+            json!("Standup (room 4)"),
+        );
+        let whole = Case::new(weekly(), monday_19())
+            .exceptions(vec![retitled])
+            .guests();
+        let mut part = Case::new(weekly(), monday_19()).guests();
+        part.exceptions = Exceptions {
+            items: whole.exceptions.items.clone(),
+            complete: false,
+        };
+        let (whole, part) = (
+            whole.edit(Scope::All, title("Retro")).unwrap(),
+            part.edit(Scope::All, title("Retro")).unwrap(),
+        );
+        assert_eq!(
+            (&whole.warnings[..], &part.warnings[..]),
+            (
+                &[SeriesWarning::ExceptionsMayReset {
+                    count: 1,
+                    complete: true
+                }][..],
+                &[SeriesWarning::ExceptionsMayReset {
+                    count: 1,
+                    complete: false
+                }][..]
+            )
+        );
+        assert_ne!(whole.choice_digest("s1"), part.choice_digest("s1"));
+    }
+
+    /// With guests allowed (C12), the guests rule no longer refuses a short listing, and the guards
+    /// that need it whole still do: a cut, a split, and a move of every occurrence.
+    #[test]
+    fn a_short_listing_still_refuses_cuts_splits_and_moves_with_guests_allowed() {
+        let mut short = Case::new(weekly(), monday_19()).guests();
+        short.exceptions.complete = false;
+        let incomplete = Err(NotPlanned::Refused(SeriesRefusal::Incomplete));
+        assert_eq!(short.delete(Scope::Following), incomplete);
+        assert_eq!(short.edit(Scope::Following, title("Retro")), incomplete);
+        assert_eq!(
+            short.edit(Scope::All, at("09:00", "2026-10-20")),
+            incomplete
+        );
+        // Deleting every occurrence needs none of them seen.
+        assert!(short.delete(Scope::All).is_ok());
     }
 
     /// A29, C9 design review scope-L1: the rule and start a change leaves, for the question a move to
