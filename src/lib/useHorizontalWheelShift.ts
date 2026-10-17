@@ -46,14 +46,16 @@ import {
 import { isAnyDialogOpen } from "./useDialogLayer";
 
 /**
- * Call `onShift(±1)` when a sideways swipe over the element this ref is attached to moves its day:
- * once per swipe, and once more if a flick back within it undoes that day (see `swipeStep`).
+ * Call `onShift(±1)` when a sideways swipe over the element this ref is attached to takes a step:
+ * once per swipe, and once more if a flick back within it undoes that step (see `swipeStep`). The
+ * caller decides how many days a step moves (`calendarPrefs.swipeDays`, one unless Settings says
+ * otherwise).
  *
  * `onShift` and `enabled` are held in refs so a caller can pass a fresh closure each render (the
  * normal case — it closes over the current cursor) and can flip `enabled` without re-binding.
  */
 export function useHorizontalWheelShift(
-  onShift: (days: number) => void,
+  onShift: (dir: number) => void,
   enabled = true,
 ): (el: HTMLElement | null) => void {
   const shiftRef = useRef(onShift);
@@ -85,8 +87,8 @@ export function useHorizontalWheelShift(
         swipe = SWIPE_IDLE;
         return;
       }
-      // Claim the whole swipe, before it has travelled far enough to move a day and after it has
-      // moved one: the alternative is that part of every swipe navigates the app backwards.
+      // Claim the whole swipe, before it has travelled far enough to take its step and after it has
+      // taken it: the alternative is that part of every swipe navigates the app backwards.
       e.preventDefault();
       const r = swipeStep(swipe, {
         px: horizontalPixels(e),

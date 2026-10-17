@@ -28,7 +28,7 @@ import type { AgendaEvent, Calendar, CalendarEvent } from "../lib/types";
 import { listAllCalendarEvents, onCalendarSynced } from "../lib/ipc";
 import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../lib/calendarGeom";
-import { readHidden, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
+import { readHidden, swipeDays, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
 import { addDays, dayKey, occurrenceKey, startOfDay } from "../lib/calendar-layout";
 import { sourceColors, useTheme, useUserTime } from "../theme";
 import { formatEventWhen } from "../lib/format";
@@ -93,9 +93,10 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
   // The swipe target for the days grid — the hook listens on the window and hit-tests this box, so
   // this ref only ever has to say WHICH element the gesture belongs to. Not while the popup is open:
-  // moving the days would leave it pinned beside an event no longer on screen.
+  // moving the days would leave it pinned beside an event no longer on screen. A swipe moves as many
+  // days as Settings chooses for the calendar (`swipeDays`), which ‹ / › don't: they nudge one.
   const gridRef = useHorizontalWheelShift(
-    (d) => setAnchor((a) => addDays(a, d)),
+    (dir) => setAnchor((a) => addDays(a, dir * swipeDays(days))),
     mode === "week" && eventPopup === null,
   );
   const onEventClick = (ev: CalendarEvent, anchor: DOMRect) => setEventPopup({ ev, anchor });
@@ -234,7 +235,8 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
       ) : (
         // The days strip isn't a scroll container — it renders a window of N days chosen by state —
         // so the app-wide wheel normaliser can do nothing here and a trackpad swipe did nothing at
-        // all. Same helper the Calendar tab's grid uses, so the gesture means one day in both.
+        // all. Same helper the Calendar tab's grid uses, so a swipe moves the same distance in both
+        // (Settings' `swipeDays`).
         <div ref={gridRef}>
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-ink3">
             <div className="flex items-center gap-1">

@@ -9,11 +9,12 @@
 // overflow, finds none, and correctly leaves the event alone. A trackpad swipe over either simply
 // did nothing, with no indication that sideways was even a direction that meant something.
 //
-// A wheel event is not one step, and neither is a pixel count: ONE SWIPE IS ONE DAY. A trackpad
+// A wheel event is not one step, and neither is a pixel count: ONE SWIPE IS ONE STEP. A trackpad
 // emits a stream of small deltas for a single flick and a notched mouse wheel one large one, so
-// this accumulates pixels until the threshold is crossed, moves a day, and then ignores further
-// travel the same way until the travel pauses (a deliberate flick back undoes the day: see
-// `swipeStep`). An earlier version stepped a day per 55px, up to three per
+// this accumulates pixels until the threshold is crossed, takes a step, and then ignores further
+// travel the same way until the travel pauses (a deliberate flick back undoes the step: see
+// `swipeStep`). A step is a day unless Settings chooses more (`calendarPrefs.swipeDays`, applied
+// by the callers). An earlier version stepped a day per 55px, up to three per
 // event: one flick on Bobby's trackpad jumped three days, and the dates flickered through each
 // step as the swipe ran on (Bobby, 16-10-2026: "change the sidescroll 3 days to 1 day jump").
 // One shared, tested helper rather than the two subtly different versions the calendar and the
@@ -100,7 +101,8 @@ export interface SwipeState {
 export const SWIPE_IDLE: SwipeState = { carry: 0, dir: 0, raisedAt: -Infinity, seenAt: -Infinity };
 
 /**
- * Fold one sideways event into the swipe, and say how many days to move now: -1, 0 or 1.
+ * Fold one sideways event into the swipe, and say which way to step now: -1, 0 or 1 (a step is a
+ * day here; the callers scale it by `calendarPrefs.swipeDays`).
  *
  * Once the swipe has moved its day, travel on the same way moves nothing more, however far it
  * runs. Travel back gathers, and moves a day back at TWICE the threshold, so a deliberate flick back

@@ -57,8 +57,8 @@ export function writeView(view: CalendarViewMode): void {
  *  The ONE key in this module that is user content, not view state: a Google/Outlook calendar id is
  *  routinely the account's email address. It therefore lives in the encrypted `settings` table under
  *  `calendar_ui` (see storedPrefs.ts) while the other nine keys here — view, range, roster fold,
- *  zones, bounds, day count, openOn and the cursor — stay in localStorage, which is
- *  what they are for. */
+ *  zones, bounds, day count, openOn, the cursor and the swipe distance — stay in localStorage, which
+ *  is what they are for. */
 export function readHidden(): Set<string> {
   const arr = readStored(PREF_KEY).hidden;
   if (Array.isArray(arr)) {
@@ -302,6 +302,47 @@ export function writeOpenOn(mode: CalendarOpenOn): void {
   } catch {
     // Best-effort.
   }
+}
+
+// --- how far a sideways swipe moves --------------------------------------------------------------
+
+const SWIPE_DAYS_KEY = "pm.calendar.swipeDays";
+
+/** How far one sideways swipe moves a day grid: a number of days, or `"view"` for as many days as
+ *  are on screen (a week in Week view, the day count in Day view, the Focus tab's Upcoming days).
+ *  Bobby, 17-10-2026: "can we add something in settings for choosing how many days side scroll
+ *  should scroll at once". */
+export type SwipeDays = number | "view";
+
+export const SWIPE_DAYS_MIN = 1;
+export const SWIPE_DAYS_MAX = 7;
+
+/** Defaults to one day, what a swipe has moved since #721 (one flick used to jump three). */
+export function readSwipeDays(): SwipeDays {
+  try {
+    const raw = localStorage.getItem(SWIPE_DAYS_KEY);
+    if (raw === "view") return "view";
+    const n = Number(raw);
+    if (raw && Number.isInteger(n) && n >= SWIPE_DAYS_MIN && n <= SWIPE_DAYS_MAX) return n;
+  } catch {
+    // Unavailable — fall through to the default.
+  }
+  return SWIPE_DAYS_MIN;
+}
+
+export function writeSwipeDays(d: SwipeDays): void {
+  try {
+    localStorage.setItem(SWIPE_DAYS_KEY, String(d));
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** How many days one swipe moves a grid showing `shown` days. Read at the moment of the swipe, not
+ *  at mount: Settings opens as an overlay over the still-mounted calendar, so a value read once would
+ *  ignore a change made there until the tab remounted. */
+export function swipeDays(shown: number, pref: SwipeDays = readSwipeDays()): number {
+  return pref === "view" ? Math.max(1, shown) : pref;
 }
 
 /** The cursor day, stored as `YYYY-MM-DD`. Written on every move regardless of the `openOn` setting

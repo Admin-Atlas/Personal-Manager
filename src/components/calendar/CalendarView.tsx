@@ -37,6 +37,7 @@ import {
   readRangeBounds,
   readView,
   readZones,
+  swipeDays,
   writeCursorDay,
   writeDayCount,
   writeRange,
@@ -115,7 +116,7 @@ function windowDays(view: CalendarViewMode, dayCount: number): number {
 
 /** Step the cursor by one period in the current view's units. The day grids move by a WHOLE
  *  window — 7 for Week, N for an N-day Day view — so the arrows page rather than nudge; the
- *  sideways swipe is what moves a single day. */
+ *  sideways swipe moves as many days as Settings chooses, one unless changed (`swipeDays`). */
 function stepCursor(view: CalendarViewMode, cur: Date, dir: number, dayCount: number): Date {
   switch (view) {
     case "day":
@@ -456,12 +457,12 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // The popover's own close, which hands focus back as its Escape does (it fills this in).
   const popoverCloseRef = useRef<(() => void) | null>(null);
 
-  // One day per swipe, in the direction of travel: a swipe left (positive deltaX) moves forward.
-  // Both gestures move the cursor and nothing else — `writeCursorDay` above is what remembers it,
-  // and `openOn` decides whether that memory is ever read back. Not under an open popover, for the
-  // reason ← and → aren't (above).
+  // One step per swipe, in the direction of travel: a swipe left (positive deltaX) moves forward, by
+  // the days Settings chooses (`swipeDays`, read at the swipe). Both gestures move the cursor and
+  // nothing else — `writeCursorDay` above is what remembers it, and `openOn` decides whether that
+  // memory is ever read back. Not under an open popover, for the reason ← and → aren't (above).
   const gridRef = useHorizontalWheelShift(
-    (days) => setCursor((c) => addDays(c, days)),
+    (dir) => setCursor((c) => addDays(c, dir * swipeDays(windowDays(view, dayCount)))),
     (view === "day" || view === "week") && eventPopup === null,
   );
 
