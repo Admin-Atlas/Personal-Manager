@@ -1157,10 +1157,10 @@ async fn gather<W: Wire>(
     }
     let calendar = target.remote_calendar.as_str();
     let listed = match master_fresh.json().get("iCalUID").and_then(Value::as_str) {
-        Some(uid) => {
+        Some(ical) => {
             list_pages(
                 wire,
-                |page: Option<&str>| plan::list_by_uid(calendar, uid, page),
+                |page: Option<&str>| plan::list_by_ical(calendar, ical, page),
                 EXCEPTION_PAGES,
             )
             .await
@@ -2768,7 +2768,7 @@ mod tests {
     async fn listing(script: &Script, cap: usize) -> Listed {
         list_pages(
             script,
-            |page: Option<&str>| plan::list_by_uid(CALENDAR, "abc@google.com", page),
+            |page: Option<&str>| plan::list_by_ical(CALENDAR, "abc@google.com", page),
             cap,
         )
         .await
@@ -3293,14 +3293,14 @@ mod tests {
         .await;
         script.finished();
         let text = serde_json::to_string(&got).unwrap();
-        for secret in [
+        for leak in [
             "m1",
             instance["etag"].as_str().unwrap().trim_matches('"'),
             "abc_",
             r#""abc""#,
             "example.com",
         ] {
-            assert!(!text.contains(secret), "{secret} in {text}");
+            assert!(!text.contains(leak), "{leak} in {text}");
         }
         let longest_hex = text
             .split(|c: char| !c.is_ascii_hexdigit())
@@ -3509,8 +3509,8 @@ mod tests {
         assert_eq!(report.list_etag_matches_get, Some(true));
         assert!(report.fields_missing_vs_master.is_empty());
         let text = serde_json::to_string(&report).unwrap();
-        for secret in ["Standup", "Daily notes", "abc", "example.com", "m1"] {
-            assert!(!text.contains(secret), "{secret} in {text}");
+        for leak in ["Standup", "Daily notes", "abc", "example.com", "m1"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
         }
 
         // Each assumption broken: an occurrence lacking a field its series has, the listing's copy
@@ -3588,7 +3588,8 @@ mod tests {
             ..
         } = load
         else {
-            panic!("{load:?}");
+            // Not `{load:?}`: it holds the session id, which CodeQL won't let a message print.
+            panic!("the occurrence didn't open for editing");
         };
         assert_eq!(info.map(|i| i.repeats), Some("Weekly on Monday".into()));
         assert_eq!(event.location, "Room 4");

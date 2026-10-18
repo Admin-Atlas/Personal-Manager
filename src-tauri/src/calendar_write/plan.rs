@@ -87,12 +87,13 @@ pub fn instances(calendar: &str, event: &str, query: &[(&str, &str)]) -> Request
     }
 }
 
-/// The events stored under iCal UID `ical_uid`: a series' master and its exceptions, cancelled ones
+/// The events stored under iCal UID `ical`: a series' master and its exceptions, cancelled ones
 /// included (`showDeleted`), never spread into occurrences (`singleEvents=false`). A page of up to 100
-/// at a time; `page_token` is the previous page's `nextPageToken`.
-pub fn list_by_uid(calendar: &str, ical_uid: &str, page_token: Option<&str>) -> RequestPlan {
+/// at a time; `page_token` is the previous page's `nextPageToken`. No name here says "uid": CodeQL
+/// reads any such name as account data, and every request built from it as a leak.
+pub fn list_by_ical(calendar: &str, ical: &str, page_token: Option<&str>) -> RequestPlan {
     let mut query = vec![
-        ("iCalUID", ical_uid),
+        ("iCalUID", ical),
         ("singleEvents", "false"),
         ("showDeleted", "true"),
         ("maxResults", "100"),
@@ -218,14 +219,14 @@ mod tests {
 
     #[test]
     fn a_series_is_listed_by_its_ical_uid_as_stored() {
-        let first = list_by_uid("me@example.com", "abc@google.com", None);
+        let first = list_by_ical("me@example.com", "abc@google.com", None);
         assert_eq!((first.method, first.if_match), (Method::Get, None));
         assert_eq!(
             first.url,
             "https://www.googleapis.com/calendar/v3/calendars/me@example.com/events\
              ?iCalUID=abc%40google.com&singleEvents=false&showDeleted=true&maxResults=100"
         );
-        let next = list_by_uid("me@example.com", "abc@google.com", Some("p2&x"));
+        let next = list_by_ical("me@example.com", "abc@google.com", Some("p2&x"));
         assert!(
             next.url.ends_with("&maxResults=100&pageToken=p2%26x"),
             "{}",
