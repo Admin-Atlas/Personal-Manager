@@ -70,7 +70,8 @@ use super::shared::require_main_window;
 use super::vaults::require_vault_owner;
 
 /// What editing keeps in memory, in [`AppState`]. Lock order everywhere: the DB, then `recent`;
-/// `partials` and `in_flight` are each taken alone, never with the DB or another of these held.
+/// `partials`, `splitting` and `in_flight` are each taken alone, never with the DB or another of these
+/// held.
 #[derive(Default)]
 pub struct CalendarEditState {
     /// Saves of the last ten minutes, laid over each sync's fetch (rule R4).
@@ -84,6 +85,9 @@ pub struct CalendarEditState {
     /// "This and following" changes PM couldn't finish, by the token the webview names them with.
     /// No time limit: one lives until it's settled, or PM quits (C9 design §2.5).
     partials: Mutex<HashMap<String, HeldSplit>>,
+    /// The new parts of the "this and following" changes running now, a send or a settle, by
+    /// [`series_key`]: their journal records are theirs, no orphans.
+    splitting: Mutex<HashSet<String>>,
     /// One calendar sync at a time, so a fetch that started earlier can never finish after a later
     /// one has settled a save (plan A23). A second caller waits, then runs; the change check
     /// ([`super::check_google_calendars`]) never waits, it skips.
@@ -2116,6 +2120,10 @@ async fn send_series<W: Wire, H: Host>(
             }
         }
     };
+    // Its record is this run's from here to the end of its landing and look.
+    let _splitting = entry
+        .as_ref()
+        .map(|e| Splitting::mark(ctx.host.edit(), &e.calendar, &e.tail));
     let ran = drive(ctx.wire, &mut run).await;
     let (Some(facts), Some(entry)) = (facts, entry) else {
         return land_series(ctx, mirror, planning, run.plan(), ran, snapshot, landing).await;
@@ -2859,11 +2867,12 @@ impl CalendarEditState {
         ))
     }
 
-    /// Whether a write holds `key` now. A lock PM can't take reads as held.
-    fn claimed(&self, key: &str) -> bool {
-        self.in_flight
+    /// Whether the split whose new part is `key` ([`series_key`]) is running now. A lock PM can't
+    /// take reads as not running, so its record is read from Google.
+    fn splitting(&self, key: &str) -> bool {
+        self.splitting
             .lock()
-            .map_or(true, |held| held.contains(key))
+            .is_ok_and(|running| running.contains(key))
     }
 
     fn hold_partial(&self, token: String, held: HeldSplit) {
@@ -2929,6 +2938,30 @@ impl Drop for TakenSplit<'_> {
         if let Some(held) = self.back.take() {
             self.edit
                 .hold_partial(std::mem::take(&mut self.token), held);
+        }
+    }
+}
+
+/// A "this and following" change running, marked in [`CalendarEditState::splitting`] until this goes.
+struct Splitting<'a> {
+    edit: &'a CalendarEditState,
+    key: String,
+}
+
+impl<'a> Splitting<'a> {
+    fn mark(edit: &'a CalendarEditState, remote_calendar: &str, tail: &str) -> Self {
+        let key = series_key(remote_calendar, tail);
+        if let Ok(mut running) = edit.splitting.lock() {
+            running.insert(key.clone());
+        }
+        Splitting { edit, key }
+    }
+}
+
+impl Drop for Splitting<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.edit.splitting.lock() {
+            running.remove(&self.key);
         }
     }
 }
@@ -3486,6 +3519,7 @@ async fn settle_split<W: Wire, H: Host>(
     };
     let remote = held.target.remote_calendar.clone();
     let (master, tail) = (held.facts.master.clone(), held.facts.tail.clone());
+    let _splitting = Splitting::mark(edit, &remote, &tail);
     let outcome = settle_taken(wire, host, token, action, taken, held).await;
     // The claims still held, and the split held again unless it's settled: a settled one's record
     // goes (review H3). An unconfirmed end keeps it, for Google to be read again.
@@ -3909,10 +3943,9 @@ async fn orphaned<W: Wire, H: Host>(
         if entry.calendar != remote || (entry.series != series && entry.tail != series) {
             continue;
         }
-        // A split held in memory stands for it, and a split or settle running now holds both its
-        // series: either way it's no orphan. Any other change holds one claim at most.
-        let running = edit.claimed(&series_key(remote, &entry.series))
-            && edit.claimed(&series_key(remote, &entry.tail));
+        // A split held in memory stands for it, or the send or settle running it now: either way
+        // it's no orphan. Claims alone can't tell, since two unrelated writes may hold both series.
+        let running = edit.splitting(&series_key(remote, &entry.tail));
         if running || edit.held_on(remote, &entry.series).is_some() {
             continue;
         }
@@ -3939,10 +3972,12 @@ async fn orphaned<W: Wire, H: Host>(
         if orphan == Orphan::Twice {
             // Shown twice only while the original still repeats from the split on: read off the
             // occurrences, as the backstop reads them (review round 1).
-            let overlap = if entry.series == series {
-                planning.series.parts
-            } else {
-                original_overlap(wire, remote, mirror, &entry, this).await
+            let overlap = match &original {
+                None => planning.series.parts,
+                Some(Fetched::Event(copy)) => {
+                    original_overlap(wire, remote, mirror, copy, this).await
+                }
+                Some(_) => Parts::Unread,
             };
             orphan = journal::backed(orphan, overlap);
         }
@@ -3957,12 +3992,27 @@ async fn original_overlap<W: Wire>(
     wire: &W,
     remote: &str,
     mirror: &MirrorFacts,
-    entry: &Entry,
+    original: &Value,
     tail: &Value,
 ) -> Parts {
-    let Some(zone) = entry.tz().filter(|_| is_plain_segment(&entry.series)) else {
+    // Read as gather reads a series: its exceptions listed whole and cross-checked, so one changed
+    // on its own and left on it doesn't count as the rule repeating (review round 2).
+    let original = FreshEvent::from_google(original.clone());
+    let Ok(master) = Master::read(&original) else {
         return Parts::Unread;
     };
+    let Some(ical) = original.json().get("iCalUID").and_then(Value::as_str) else {
+        return Parts::Unread;
+    };
+    if !is_plain_segment(&master.id) {
+        return Parts::Unread;
+    }
+    let listed = list_pages(
+        wire,
+        |page: Option<&str>| plan::list_by_ical(remote, ical, page),
+        EXCEPTION_PAGES,
+    )
+    .await;
     let (time_min, time_max) = (mirror.window.0.as_str(), mirror.window.1.as_str());
     let window = list_pages(
         wire,
@@ -3974,20 +4024,34 @@ async fn original_overlap<W: Wire>(
                 ("fields", WINDOW_FIELDS),
             ];
             query.extend(page.map(|p| ("pageToken", p)));
-            plan::instances(remote, &entry.series, &query)
+            plan::instances(remote, &master.id, &query)
         },
         OCCURRENCE_PAGES,
     )
     .await;
-    let parts = Listing {
-        items: vec![tail.clone()],
-        complete: true,
-    };
     let window = Listing {
         items: window.items,
         complete: window.complete,
     };
-    parts_overlap(&parts, &entry.series, &window, &Exceptions::default(), zone)
+    let exceptions = Exceptions::sorted(listed.items, listed.complete).cross_checked(
+        original.json(),
+        &master,
+        &window,
+    );
+    if !exceptions.complete {
+        return Parts::Unread;
+    }
+    let parts = Listing {
+        items: vec![tail.clone()],
+        complete: true,
+    };
+    parts_overlap(
+        &parts,
+        &master.id,
+        &window,
+        &exceptions,
+        master.start.zone(),
+    )
 }
 
 /// Dev builds only: which calendars a write may change (`PM_CALENDAR_WRITE_ALLOW`, comma-separated
@@ -9977,9 +10041,9 @@ mod tests {
         tail["organizer"] = weekly()["organizer"].clone();
         tail["eventType"] = json!("default");
         let occurrence = tail_occurrence("2026-10-26T09:00:00Z", "\"u1\"");
-        // The new part's reads, then the original, and its occurrences when an uncut rule needs
-        // them to say it shows twice.
-        let tail_series_reads = |original: Value, occurrences: Option<Vec<Value>>| {
+        // The new part's reads, then the original, and its exceptions and occurrences when an uncut
+        // rule needs them to say it shows twice.
+        let tail_series_reads = |original: Value, occurrences: Option<(Vec<Value>, Vec<Value>)>| {
             let mut steps = vec![
                 instance_read(&occurrence),
                 event_read(TAIL, Scripted::Json(tail.clone())),
@@ -9999,14 +10063,21 @@ mod tests {
                 ),
                 event_read("abc", Scripted::Json(original)),
             ];
-            steps.extend(occurrences.map(window_read));
+            if let Some((listed, window)) = occurrences {
+                steps.push(ical_listing(
+                    "iCalUID=abc%40google.com",
+                    Scripted::Json(page(listed, None)),
+                ));
+                steps.push(window_read(window));
+            }
             steps
         };
+        let uncut = || Some((vec![weekly()], october()));
         let delete = ChoiceRequest::Delete {
             event_id: format!("cal:{}", occurrence["id"].as_str().unwrap()),
             seen: seen_by_user(&fresh_event(occurrence.clone())),
         };
-        let script = Script::new(tail_series_reads(weekly(), Some(october())));
+        let script = Script::new(tail_series_reads(weekly(), uncut()));
         let (this, following, all, _) = rows_of_choices(
             ask_on(
                 &host,
@@ -10026,7 +10097,7 @@ mod tests {
         for row in [this, following, all] {
             assert_eq!(row, refused_with(&twice));
         }
-        let script = Script::new(tail_series_reads(weekly(), Some(october())));
+        let script = Script::new(tail_series_reads(weekly(), uncut()));
         let opened = Some((&occurrence, Some(&tail)));
         let (_, _, all, _) = rows_of_choices(
             ask_on(
@@ -10040,6 +10111,38 @@ mod tests {
             .await,
         );
         assert_eq!(all, refused_with(&twice));
+        // Its rule as before, but from the split on only an occurrence changed on its own is left
+        // on it: the rule no longer repeats there, so nothing shows twice. Said once as changed.
+        let other = restarted_with(&entry);
+        let moved_26 = moved(
+            "2026-10-26T09:00:00Z",
+            "2026-10-26T11:00:00Z",
+            "2026-10-26T12:00:00Z",
+        );
+        let cancelled_19 = cancelled("2026-10-19T09:00:00+01:00");
+        let left = Some((
+            vec![weekly(), cancelled_19.clone(), moved_26.clone()],
+            vec![october()[0].clone(), cancelled_19, moved_26],
+        ));
+        let script = Script::new(tail_series_reads(weekly(), left));
+        let (_, _, all, notice) = rows_of_choices(
+            ask_on(
+                &other,
+                &script,
+                &occurrence,
+                delete.clone(),
+                None,
+                &["abc", TAIL],
+            )
+            .await,
+        );
+        let changed = Orphaned {
+            entry: entry.clone(),
+            orphan: Orphan::Changed,
+        }
+        .words();
+        assert_eq!(notice, Some(changed));
+        assert!(matches!(all, ScopeRow::Offered { .. }));
         // The original cut since (in Google): nothing shows twice, and nothing was left to move.
         let script = Script::new(tail_series_reads(cut_copy(&plan), None));
         let (_, _, all, notice) = rows_of_choices(
@@ -10202,15 +10305,18 @@ mod tests {
         assert!(host.journal().is_empty());
     }
 
-    /// While the split or settle a record stands for runs (both its series claimed), the record is
-    /// no orphan: the choices read nothing for it and block nothing by it. A change holding the
-    /// original's claim alone (a held delete, a save) doesn't hide it.
+    /// While the split or settle a record stands for runs, the record is no orphan: the choices read
+    /// nothing for it and block nothing by it. Claims alone don't say so: two unrelated writes (a
+    /// held delete on the original, a save on the new part) may hold both series (review round 2).
     #[tokio::test]
     async fn a_running_changes_record_is_left_to_it() {
         let plan = split_plan(Vec::new());
         let entry = orphan_entry(&plan, false);
         let host = restarted_with(&entry);
-        let held = InFlight::claim(&host.edit, &series_key(CALENDAR, "abc")).unwrap();
+        let _claims = (
+            InFlight::claim(&host.edit, &series_key(CALENDAR, "abc")).unwrap(),
+            InFlight::claim(&host.edit, &series_key(CALENDAR, TAIL)).unwrap(),
+        );
         let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
         let mut steps = reads_with_part(&monday_19(), &tail);
         steps.push(event_read(TAIL, Scripted::Json(tail.clone())));
@@ -10233,10 +10339,7 @@ mod tests {
         }
         .words();
         assert_eq!(this, refused_with(&twice));
-        let _running = (
-            held,
-            InFlight::claim(&host.edit, &series_key(CALENDAR, TAIL)).unwrap(),
-        );
+        let _running = Splitting::mark(&host.edit, CALENDAR, TAIL);
         let instance = monday_19();
         let script = Script::new(reads(&instance, &weekly(), vec![weekly()], october()));
         let opened = Some((&instance, Some(&weekly())));
