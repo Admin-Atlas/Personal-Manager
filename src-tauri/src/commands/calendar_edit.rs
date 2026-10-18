@@ -8510,7 +8510,126 @@ mod tests {
                     host.edit.held_on(CALENDAR, "abc").unwrap().offers,
                     [SplitAction::Check]
                 );
+                // Still changed on the next look: Check only, whichever action found it (M7).
+                let (again, _) = settle(
+                    &host,
+                    &held_token(&held),
+                    SplitAction::Check,
+                    vec![
+                        event_read(TAIL, Scripted::Json(changed.clone())),
+                        event_read(TAIL, Scripted::Json(changed.clone())),
+                    ],
+                )
+                .await;
+                assert_eq!(offers_of(&again), [SplitAction::Check], "{action:?}");
             }
+        }
+    }
+
+    /// Review round 3: a split held after its rollback couldn't delete the new part, then the new
+    /// part deleted in Google: a settle's first look settles it. The original cut (the cut ignored)
+    /// says the part was removed; the original deleted in Google (the cut answered 404) says gone and
+    /// lands it. Either way the new part's rows go and nothing stays held.
+    #[tokio::test]
+    async fn a_settle_whose_look_finds_the_new_part_gone_settles_it() {
+        let plan = split_plan(Vec::new());
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        for (cut, want, original_rows) in [
+            (
+                Scripted::Json(written(&weekly(), &[], "\"m2\"")),
+                WriteOutcome::SplitRemoved,
+                ids_of(rows_of(&october())),
+            ),
+            (Scripted::Status(404), WriteOutcome::Gone, Vec::new()),
+        ] {
+            for action in [SplitAction::Check, SplitAction::Remove] {
+                let host = TestHost::holding(&october());
+                let (held, _, _) = split_save(
+                    &host,
+                    vec![
+                        insert_step(Scripted::Json(tail.clone())),
+                        series_patch(match &cut {
+                            Scripted::Json(v) => Scripted::Json(v.clone()),
+                            _ => Scripted::Status(404),
+                        }),
+                        Step::write(
+                            Method::Delete,
+                            &format!("/events/{TAIL}"),
+                            "\"t1\"",
+                            Scripted::Status(403),
+                        ),
+                        event_read(TAIL, Scripted::Json(tail.clone())),
+                    ],
+                )
+                .await;
+                assert_eq!(offers_of(&held), [SplitAction::Remove]);
+                // A sync mirrored the new part meanwhile.
+                host.with_conn(|conn| {
+                    let mut rows = rows_of(&october());
+                    rows.extend(rows_of(&tail_october()));
+                    calendar::replace_events(conn, "cal", &rows, true)
+                })
+                .unwrap();
+                let (outcome, script) = settle(
+                    &host,
+                    &held_token(&held),
+                    action,
+                    vec![event_read(TAIL, Scripted::Status(404))],
+                )
+                .await;
+                script.finished();
+                assert_eq!(outcome, want, "{action:?}");
+                assert_eq!(split_rows(&host), (original_rows.clone(), Vec::new()));
+                assert_eq!(held_count(&host), 0);
+            }
+        }
+    }
+
+    /// Review round 3: what Remove and Finish can't read leaves the split as it was, held, with
+    /// nothing sent: the new part unread, or the original's occurrences listed short.
+    #[tokio::test]
+    async fn what_remove_or_finish_cant_read_sends_nothing() {
+        let plan = split_plan(Vec::new());
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        // Remove, the new part unread.
+        let host = TestHost::holding(&october());
+        let (held, _) = lost_cut(&host, Scripted::Json(written(&weekly(), &[], "\"m7\""))).await;
+        let (outcome, script) = settle(
+            &host,
+            &held_token(&held),
+            SplitAction::Remove,
+            vec![
+                event_read("abc", Scripted::Json(written(&weekly(), &[], "\"m7\""))),
+                event_read(TAIL, Scripted::Status(500)),
+            ],
+        )
+        .await;
+        script.finished();
+        assert_eq!(offers_of(&outcome), [SplitAction::Remove]);
+        assert_eq!(held_count(&host), 1);
+        // Finish, the new part unread; then the original's occurrences listed short.
+        let unread = WriteOutcome::Failed {
+            message: FINISH_UNREAD.into(),
+        };
+        let mut short = tail_reads(tail.clone(), Vec::new());
+        short.push(ical_listing(
+            "iCalUID=abc%40google.com",
+            Scripted::Json(page(vec![cut_copy(&plan)], Some("p2"))),
+        ));
+        short.push(ical_listing(
+            "iCalUID=abc%40google.com",
+            Scripted::Status(500),
+        ));
+        for reads in [vec![event_read(TAIL, Scripted::Status(500))], short] {
+            let host = TestHost::holding(&october());
+            let (held, _) = lost_cut(&host, lost()).await;
+            let mut steps = vec![event_read("abc", Scripted::Json(cut_copy(&plan)))];
+            steps.extend(reads);
+            let (outcome, script) =
+                settle(&host, &held_token(&held), SplitAction::Finish, steps).await;
+            script.finished();
+            assert_eq!(outcome, unread);
+            assert_eq!(held_count(&host), 1);
         }
     }
 

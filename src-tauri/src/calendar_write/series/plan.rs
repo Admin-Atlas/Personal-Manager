@@ -3862,12 +3862,18 @@ mod tests {
             ("attendees", json!([{ "email": "guest@example.com" }])),
             ("conferenceData", json!({ "conferenceId": "abc-defg-hij" })),
             ("hangoutLink", json!("https://meet.google.com/abc-defg-hij")),
+            (
+                "attachments",
+                json!([{ "fileUrl": "https://drive.google.com/file/d/x" }]),
+            ),
+            ("eventLabelId", json!("label-1")),
         ] {
             assert!(
                 !plan.tail_as_inserted(0, &with(copy.clone(), key, value)),
                 "{key}"
             );
         }
+        assert!(plan.tail_as_inserted(0, &with(copy.clone(), "attachments", Value::Null)));
         // Google's defaults, written out, are no change.
         let defaults = with(
             with(copy.clone(), "transparency", json!("opaque")),
