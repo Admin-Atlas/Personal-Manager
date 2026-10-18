@@ -1871,6 +1871,9 @@ fn plan_split(
         let private = obj.entry("private").or_insert_with(|| json!({}));
         if let Some(private) = private.as_object_mut() {
             private.insert("pmSplitOf".into(), Value::from(master.id.clone()));
+            // And the occurrence it was split at, which an uncut original still holds whatever day
+            // the new part was moved to: what the overlap backstop measures from (review round 6).
+            private.insert("pmSplitAt".into(), Value::from(super::point_text(at)));
         }
     }
     body.insert("extendedProperties".into(), properties);
@@ -2367,7 +2370,11 @@ mod tests {
             tail["extendedProperties"],
             json!({
                 "shared": { "team": "core" },
-                "private": { "pmSplitOf": "abc", "pmSplitPlan": note }
+                "private": {
+                    "pmSplitOf": "abc",
+                    "pmSplitAt": "2026-10-19T08:00:00+00:00",
+                    "pmSplitPlan": note,
+                }
             })
         );
         for never in [

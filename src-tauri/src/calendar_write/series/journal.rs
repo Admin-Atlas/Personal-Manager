@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +16,8 @@ use crate::calendar_recur::lines::{recurrence_verdict, Applied};
 use crate::calendar_recur::Point;
 
 use super::plan::{is_tail_of, start_of};
-use super::Parts;
+pub use super::point_text;
+use super::{point_from_text, Parts};
 use crate::calendar_write::patch::is_gone;
 
 /// `settings` key: the [`Journal`] as JSON. Absent when no change is running or left over.
@@ -52,24 +52,11 @@ pub struct Entry {
 impl Entry {
     /// [`Entry::at`] read back, `None` when PM can't.
     pub fn point(&self) -> Option<Point> {
-        if let Ok(day) = NaiveDate::parse_from_str(&self.at, "%Y-%m-%d") {
-            return Some(Point::Day(day));
-        }
-        DateTime::parse_from_rfc3339(&self.at)
-            .ok()
-            .map(|t| Point::At(t.with_timezone(&Utc)))
+        point_from_text(&self.at)
     }
 
     pub fn tz(&self) -> Option<Tz> {
         self.zone.parse().ok()
-    }
-}
-
-/// A point as an [`Entry`] keeps it: a day as `YYYY-MM-DD`, an instant as RFC 3339 in UTC.
-pub fn point_text(point: Point) -> String {
-    match point {
-        Point::Day(day) => day.format("%Y-%m-%d").to_string(),
-        Point::At(t) => t.to_rfc3339(),
     }
 }
 
@@ -180,6 +167,7 @@ pub fn backed(orphan: Orphan, overlap: Parts) -> Orphan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
     use serde_json::json;
 
     fn entry() -> Entry {

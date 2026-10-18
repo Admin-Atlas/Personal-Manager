@@ -376,10 +376,30 @@ pub fn fields_missing_vs_master(master_json: &Value, instances: &[Value]) -> Vec
         .collect()
 }
 
-/// The private notes PM itself puts on a series: which series a new one was split off and by what
-/// plan, and the fence a "Remove the new series" writes (C9). Bookkeeping, not a change anyone made:
-/// an occurrence holding a copy from before one was written isn't changed on its own.
-pub const PM_NOTES: &[&str] = &["pmSplitOf", "pmSplitPlan", "pmFence"];
+/// The private notes PM itself puts on a series: which series a new one was split off, at which
+/// occurrence and by what plan, and the fence a "Remove the new series" writes (C9). Bookkeeping, not
+/// a change anyone made: an occurrence holding a copy from before one was written isn't changed on its
+/// own.
+pub const PM_NOTES: &[&str] = &["pmSplitOf", "pmSplitAt", "pmSplitPlan", "pmFence"];
+
+/// A point as PM writes it down (a split's `pmSplitAt` note, the journal): a day as `YYYY-MM-DD`, an
+/// instant as RFC 3339 in UTC.
+pub fn point_text(point: Point) -> String {
+    match point {
+        Point::Day(day) => day.format("%Y-%m-%d").to_string(),
+        Point::At(t) => t.to_rfc3339(),
+    }
+}
+
+/// [`point_text`] read back, `None` when PM can't.
+pub fn point_from_text(text: &str) -> Option<Point> {
+    if let Ok(day) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Some(Point::Day(day));
+    }
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| Point::At(t.with_timezone(&Utc)))
+}
 
 /// `extendedProperties` without [`PM_NOTES`], an emptied map read as none.
 fn without_pm_notes(v: Option<&Value>) -> Value {
@@ -729,13 +749,13 @@ pub enum Parts {
 
 /// Read `parts` (the live events PM's note says were split off `master`) against the series' own
 /// occurrences in `window` (an `instances` listing with cancelled ones) and its stored `exceptions`.
-/// A part overlaps when the series' rule still makes a live occurrence on or after the part's first
-/// day: a finished split's original ends before its part starts. By day, so a part retimed later on
-/// the split day still overlaps an uncut original's occurrence that morning (review round 5). Only
-/// the rule's own occurrences count, never an occurrence changed on its own that a change couldn't
-/// move, nor an extra date (RDATE), which a cut keeps on the original when it comes before the split
-/// (review rounds 4-5). Outside the window nothing is checked, as for the exceptions' cross-check. A
-/// part's own exceptions, which may carry the note too, aren't parts (C9a-3b critique L4).
+/// A part overlaps when the series still has a live occurrence at or after the occurrence it was split
+/// at (its `pmSplitAt` note): a cut ends the original before that point, wherever the new part was
+/// moved to, and anything kept before it (an extra date earlier that day) isn't the overlap; an uncut
+/// original still holds the split occurrence itself (review rounds 4-6). A part from before the note
+/// is measured from its start. An occurrence changed on its own that a change couldn't move doesn't
+/// count. Outside the window nothing is checked, as for the exceptions' cross-check. A part's own
+/// exceptions, which may carry the notes too, aren't parts (C9a-3b critique L4).
 pub fn parts_overlap(
     parts: &Listing,
     master: &Master,
@@ -748,7 +768,8 @@ pub fn parts_overlap(
     }
     let live = |item: &&Value| item.get("status").and_then(Value::as_str) != Some("cancelled");
     let own = |item: &&Value| item.get("recurringEventId").and_then(Value::as_str) == Some(series);
-    let starts: Vec<NaiveDate> = parts
+    // Each part's split point: its note, or (a part from before the note) its start.
+    let points: Vec<Point> = parts
         .items
         .iter()
         .filter(live)
@@ -761,53 +782,38 @@ pub fn parts_overlap(
                 .and_then(Value::as_str)
                 == Some(series)
         })
-        .filter_map(|p| point_of(p.get("start")).map(|at| at.day_in(zone)))
+        .filter_map(|p| {
+            p.pointer("/extendedProperties/private/pmSplitAt")
+                .and_then(Value::as_str)
+                .and_then(point_from_text)
+                .or_else(|| point_of(p.get("start")))
+        })
         .collect();
-    let Some(first) = starts.iter().min().copied() else {
+    let Some(first) = points.iter().copied().min_by(|a, b| a.cmp_in(b, zone)) else {
         return Parts::Clear;
     };
     if !window.complete {
         return Parts::Unread;
     }
-    // What isn't the rule's own: the stored exceptions, and the extra dates.
-    let mut not_rule: Vec<Point> = exceptions
+    let stored: Vec<Point> = exceptions
         .items
         .iter()
         .filter(own)
         .filter_map(original_of)
         .collect();
-    not_rule.extend(extra_dates(&master.recurrence, &master.start));
-    let last = window
+    let still = window
         .items
         .iter()
         .filter(own)
         .filter(live)
         .filter_map(original_of)
-        .filter(|p| !not_rule.contains(p))
-        .map(|p| p.day_in(zone))
-        .max();
-    match last {
-        Some(last) if last >= first => Parts::Overlap(first),
-        _ => Parts::Clear,
+        .filter(|p| !stored.contains(p))
+        .any(|p| p.cmp_in(&first, zone) != std::cmp::Ordering::Less);
+    if still {
+        Parts::Overlap(first.day_in(zone))
+    } else {
+        Parts::Clear
     }
-}
-
-/// The extra dates (RDATE) a rule's lines add, as points in the series.
-fn extra_dates(recurrence: &[String], start: &SeriesStart) -> Vec<Point> {
-    lines::parse(recurrence)
-        .iter()
-        .filter_map(|l| match &l.kind {
-            Kind::RDate(dates) => Some(
-                dates
-                    .values
-                    .iter()
-                    .filter_map(|v| dates.point(v, start))
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .flatten()
-        .collect()
 }
 
 /// Google-shaped series and occurrences for the series tests: a weekly 09:00–10:00 "Standup" in
@@ -1442,20 +1448,25 @@ mod tests {
         assert!(!partial.cross_checked(&mj, &m, &window(Vec::new())).complete);
     }
 
-    /// scope-M4: a part PM split off overlaps its original only while the original still repeats on
-    /// or after the part's first day by its own rule.
+    /// scope-M4: a part PM split off overlaps its original only while the original still has an
+    /// occurrence at or after the one it was split at.
     #[test]
     fn a_part_overlaps_only_where_the_original_still_repeats() {
         let whole = |items: Vec<Value>| Listing {
             items,
             complete: true,
         };
+        // Split at Monday 19-10 09:00 London, whatever the part's start was moved to.
         let part = |start: &str| {
             json!({
                 "id": "pmtail",
                 "status": "confirmed",
                 "start": { "dateTime": start, "timeZone": "Europe/London" },
-                "extendedProperties": { "private": { "pmSplitOf": "abc", "pmSplitPlan": "p" } },
+                "extendedProperties": { "private": {
+                    "pmSplitOf": "abc",
+                    "pmSplitAt": "2026-10-19T08:00:00+00:00",
+                    "pmSplitPlan": "p",
+                } },
             })
         };
         let parts = whole(vec![part("2026-10-19T10:00:00+01:00")]);
@@ -1482,13 +1493,8 @@ mod tests {
             plain("2026-10-19T09:00:00+01:00"),
         ]);
         assert_eq!(read(&parts, &last_day, &none), Parts::Overlap(day));
-        // An extra date earlier on the split day stays on the cut original: it isn't the rule
-        // repeating, wherever the part was moved to (review rounds 4-5).
-        let with_extra = Master::read(&fresh(master(&[
-            "RRULE:FREQ=WEEKLY;BYDAY=MO",
-            "RDATE;TZID=Europe/London:20261019T070000",
-        ])))
-        .unwrap();
+        // An extra date earlier on the split day stays on the cut original, wherever the part was
+        // moved to: before the split point, so no overlap (review rounds 4-6).
         let extra = whole(vec![
             plain("2026-10-12T09:00:00+01:00"),
             plain("2026-10-19T07:00:00+01:00"),
@@ -1499,14 +1505,22 @@ mod tests {
             "2026-10-15T09:00:00+01:00",
         ] {
             let moved_part = whole(vec![part(start)]);
-            assert_eq!(
-                parts_overlap(&moved_part, &with_extra, &extra, &none),
-                Parts::Clear,
-                "{start}"
-            );
+            assert_eq!(read(&moved_part, &extra, &none), Parts::Clear, "{start}");
         }
-        // Without the extra date in the rule, that 07:00 occurrence would be the rule's own.
-        assert_eq!(read(&parts, &extra, &none), Parts::Overlap(day));
+        // Moved to a later day, the original uncut with nothing after the split occurrence in the
+        // window (a yearly event, say, or the last of a COUNT): it still shows that occurrence.
+        let later = whole(vec![part("2026-10-21T09:00:00+01:00")]);
+        assert_eq!(read(&later, &last_day, &none), Parts::Overlap(day));
+        assert_eq!(read(&later, &cut, &none), Parts::Clear);
+        // A part from before the note is measured from its start.
+        let mut legacy = part("2026-10-19T10:00:00+01:00");
+        legacy["extendedProperties"]["private"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pmSplitAt");
+        let legacy = whole(vec![legacy]);
+        assert_eq!(read(&legacy, &october, &none), Parts::Overlap(day));
+        assert_eq!(read(&legacy, &extra, &none), Parts::Clear);
         // An occurrence a change couldn't move, left on the original, isn't the rule repeating; nor
         // is a cancelled one.
         let left = moved(
