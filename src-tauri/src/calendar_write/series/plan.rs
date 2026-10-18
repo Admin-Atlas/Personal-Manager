@@ -454,7 +454,7 @@ impl Undo {
 }
 
 /// Whether `event` is the new series the plan `plan` split off the series `of`.
-fn is_tail_of(event: &Value, of: &str, plan: &str) -> bool {
+pub(crate) fn is_tail_of(event: &Value, of: &str, plan: &str) -> bool {
     let note = |key: &str| {
         event
             .pointer(&format!("/extendedProperties/private/{key}"))
@@ -946,7 +946,7 @@ fn text(v: &Value, key: &str) -> String {
 }
 
 /// A `start` node as a series' start: its day, or its instant in its own zone (A27).
-fn start_of(node: &Value) -> Option<SeriesStart> {
+pub(crate) fn start_of(node: &Value) -> Option<SeriesStart> {
     if let Some(day) = node.get("date").and_then(Value::as_str) {
         return NaiveDate::parse_from_str(day, "%Y-%m-%d")
             .ok()

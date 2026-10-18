@@ -383,6 +383,10 @@ pub enum SeriesChoices {
         this: ScopeRow,
         following: ScopeRow,
         all: ScopeRow,
+        /// Something to say once about this series, beside the rows: how a change PM was making
+        /// when it closed came out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
     },
     /// Nothing can be offered: the event is gone, read-only, needs a new sign-in, or Google couldn't
     /// be asked.
@@ -609,10 +613,24 @@ mod tests {
             all: ScopeRow::Conflict {
                 fields: vec!["summary".into()],
             },
+            notice: None,
         };
         assert_eq!(
             serde_json::to_string(&choices).unwrap(),
             r#"{"outcome":"ready","this":{"row":"offered","warnings":[],"token":"t1"},"following":{"row":"as_all","warnings":[{"warning":"split_sibling"},{"warning":"exceptions_may_reset","count":2,"complete":false},{"warning":"repeat_day_changes","from":"2026-10-18","to":"2026-10-19","before":"every Sunday","after":null,"shift_days":1}],"token":"t2"},"all":{"row":"conflict","fields":["summary"]}}"#
+        );
+        let refused = |message: &str| ScopeRow::Refused {
+            message: message.into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&SeriesChoices::Ready {
+                this: refused("a"),
+                following: refused("b"),
+                all: refused("c"),
+                notice: Some("Said once.".into()),
+            })
+            .unwrap(),
+            r#"{"outcome":"ready","this":{"row":"refused","message":"a"},"following":{"row":"refused","message":"b"},"all":{"row":"refused","message":"c"},"notice":"Said once."}"#
         );
         assert_eq!(
             serde_json::to_string(&ScopeRow::Pending {
