@@ -3504,6 +3504,21 @@ async fn finish_split<W: Wire, H: Host>(
     if !listed.complete {
         return unread();
     }
+    // The original deleted in Google while the split was held: never cut it now, whose rollback
+    // would delete the new part, then the only copy of what follows. Said, landed, nothing sent
+    // (review round 4).
+    let original_there = listed.items.iter().any(|item| {
+        item.get("id").and_then(Value::as_str) == Some(held.facts.master.as_str())
+            && !patch::is_gone(item)
+    });
+    if !cut_done && !original_there {
+        taken.settled();
+        let facts = &held.facts;
+        land_series_gone(host, cal, &facts.master, &[], facts.zone, &facts.moments);
+        return WriteOutcome::Failed {
+            message: original_gone_words(&facts.from),
+        };
+    }
     let facts = &held.facts;
     let changed = tail == TailCheck::Changed
         || marks_from(&listed.items, &facts.master, facts.at, facts.zone) != facts.marks;
@@ -9356,6 +9371,42 @@ mod tests {
         assert!(script.sent().iter().all(|r| r.method == Method::Get));
         assert_eq!(outcome, saved());
         assert_eq!(held_count(&host), 0);
+    }
+
+    /// Review round 4: Finish after a lost insert, the original deleted in Google meanwhile (its
+    /// cancelled copy listed, or none): the cut isn't sent, so no rollback deletes the new part, now
+    /// the only copy of what follows. Said, the original's rows go, nothing held.
+    #[tokio::test]
+    async fn finish_never_cuts_an_original_deleted_in_google() {
+        let plan = split_plan(Vec::new());
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let deleted = written(&with(weekly(), "status", json!("cancelled")), &[], "\"m8\"");
+        for listed in [vec![deleted], Vec::new()] {
+            let host = TestHost::holding(&october());
+            let (held, _, _) = split_save(
+                &host,
+                vec![
+                    insert_step(lost()),
+                    event_read(TAIL, lost()),
+                    event_read(TAIL, Scripted::Json(tail.clone())),
+                ],
+            )
+            .await;
+            let mut steps = vec![event_read(TAIL, Scripted::Json(tail.clone()))];
+            steps.extend(tail_reads(tail.clone(), Vec::new()));
+            steps.push(ical_listing(
+                "iCalUID=abc%40google.com",
+                Scripted::Json(page(listed, None)),
+            ));
+            let (outcome, script) =
+                settle(&host, &held_token(&held), SplitAction::Finish, steps).await;
+            script.finished();
+            assert!(
+                matches!(&outcome, WriteOutcome::Failed { message } if message.contains("deleted in Google"))
+            );
+            assert!(split_rows(&host).0.is_empty());
+            assert_eq!(held_count(&host), 0);
+        }
     }
 
     /// §7.5: the cut landed and the new part is gone: nothing PM can finish or undo; said, and
