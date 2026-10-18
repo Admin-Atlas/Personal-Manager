@@ -8036,16 +8036,24 @@ mod tests {
     }
 
     /// L-R5: Google answers the cut 2xx and keeps the old rule. The new part is deleted, on its
-    /// etag, emailing nobody, and the save says Google ignored it; nothing is held.
+    /// etag, emailing nobody, and the save says Google ignored it; nothing is held, and the new
+    /// part's rows a sync wrote meanwhile go too (critique L2).
     #[tokio::test]
     async fn a_cut_google_ignored_removes_the_new_part_and_says_so() {
         let host = TestHost::holding(&october());
         let plan = split_plan(Vec::new());
+        let syncing = Arc::clone(&host);
         let (outcome, _, _) = split_save(
             &host,
             vec![
                 insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
-                series_patch(Scripted::Json(written(&weekly(), &[], "\"m2\""))),
+                series_patch(Scripted::Json(written(&weekly(), &[], "\"m2\""))).then(move || {
+                    let mut rows = rows_of(&october());
+                    rows.extend(rows_of(&tail_october()));
+                    syncing
+                        .with_conn(|conn| calendar::replace_events(conn, "cal", &rows, true))
+                        .unwrap();
+                }),
                 Step::write(Method::Delete, &format!("/events/{TAIL}"), "\"t1\"", {
                     Scripted::Status(204)
                 }),
@@ -8053,8 +8061,19 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, WriteOutcome::IgnoredByGoogle { split: true });
-        assert_eq!(split_rows(&host).0, ids_of(rows_of(&october())));
+        assert_eq!(split_rows(&host), (ids_of(rows_of(&october())), Vec::new()));
         assert_eq!(held_count(&host), 0);
+    }
+
+    /// C9a-3b critique M9: the new series is claimed once planned, so a write to it meanwhile (or
+    /// this split, when one already holds it) is Busy, with only reads sent.
+    #[tokio::test]
+    async fn a_split_claims_its_new_series_too() {
+        let host = TestHost::holding(&october());
+        let _other = InFlight::claim(&host.edit, &series_key(CALENDAR, TAIL)).unwrap();
+        let (outcome, script, _) = split_save(&host, Vec::new()).await;
+        script.finished();
+        assert_eq!(outcome, WriteOutcome::Busy);
     }
 
     /// C9a-3a critique L6: a 404 to the first POST is the calendar, said so; nothing else goes.
@@ -8802,9 +8821,12 @@ mod tests {
         let left_out = of_tail(gone);
         let deleted_since = of_tail(cancelled("2026-11-09T09:00:00Z"));
         let bookkeeping = with(tail.clone(), "etag", json!("\"t3\""));
+        // At the etag PM saw, Google's own way of writing a field isn't a change.
+        let as_seen = with(tail.clone(), "description", json!("<p>Daily notes</p>"));
         for (copy, listed, want) in [
             (tail.clone(), vec![left_out.clone()], TailCheck::Unchanged),
             (bookkeeping, Vec::new(), TailCheck::Unchanged),
+            (as_seen, Vec::new(), TailCheck::Unchanged),
             (
                 tail.clone(),
                 vec![left_out, deleted_since],
@@ -9717,6 +9739,12 @@ mod tests {
         assert_eq!(dev_allow::decide(None, None, "home@group", false), Ok(()));
         assert_eq!(
             dev_allow::decide(None, None, "home@group", true),
+            Err(dev_allow::UNSET)
+        );
+        // A settle reaches a whole new part and a cut series: it fails closed too (C9a-3a
+        // critique 9).
+        assert_eq!(
+            dev_allow::decide(None, None, "home@group", dev_allow::SETTLE_SERIES_WIDE),
             Err(dev_allow::UNSET)
         );
     }
