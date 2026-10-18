@@ -1339,13 +1339,7 @@ async fn gather<W: Wire>(
         &master,
         &window,
     );
-    let parts = parts_overlap(
-        &parts,
-        &master.id,
-        &window,
-        &exceptions,
-        master.start.zone(),
-    );
+    let parts = parts_overlap(&parts, &master, &window, &exceptions);
     // Google's count of what comes before a split, for a rule that ends after so many (A7): every
     // occurrence, unwindowed, only the fields counting reads.
     let has_count = lines::series_rule(&lines::parse(&master.recurrence))
@@ -4049,13 +4043,7 @@ async fn original_overlap<W: Wire>(
         items: vec![tail.clone()],
         complete: true,
     };
-    parts_overlap(
-        &parts,
-        &master.id,
-        &window,
-        &exceptions,
-        master.start.zone(),
-    )
+    parts_overlap(&parts, &master, &window, &exceptions)
 }
 
 /// Dev builds only: which calendars a write may change (`PM_CALENDAR_WRITE_ALLOW`, comma-separated
