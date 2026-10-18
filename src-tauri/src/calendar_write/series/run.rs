@@ -1122,9 +1122,19 @@ pub struct Settle {
     phase: SettlePhase,
     pending: Option<Answer>,
     result: Option<Settled>,
+    /// The new series' etag when the caller last checked it was as PM made it: Remove deletes it on
+    /// that etag only, so a change made in Google in between is never deleted with it.
+    tail_etag: Option<String>,
 }
 
 impl Settle {
+    /// Delete the new series only at `etag`, the version the caller just checked
+    /// ([`SettleAction::Remove`]; C9a-3b review round 1).
+    pub fn at_tail_etag(mut self, etag: String) -> Settle {
+        self.tail_etag = Some(etag);
+        self
+    }
+
     /// Settle what `ran` left of `plan`, or `None` when it left no split to settle.
     pub fn new(plan: SeriesPlan, ran: &Ran, action: SettleAction) -> Option<Settle> {
         let insert = plan
@@ -1165,6 +1175,7 @@ impl Settle {
             phase: SettlePhase::Start,
             pending: None,
             result: None,
+            tail_etag: None,
         })
     }
 
@@ -1284,14 +1295,23 @@ impl Settle {
             } => None,
             _ => return self.over(Settled::Unknown),
         };
+        // Deleted in Google (a 404 or 410, or the cancelled copy Google keeps): nothing left to cut
+        // or carry from, and the new series is the only copy of what follows, so never Remove's to
+        // delete (C9a-3b critique L5, review round 1).
+        if fresh.as_ref().is_none_or(is_gone) {
+            return self.over(match self.action {
+                SettleAction::Check => Settled::OriginalGone,
+                SettleAction::Remove => Settled::Unknown,
+            });
+        }
         match self.plan.verdict(self.cut_step, fresh.as_ref()) {
             Applied::Yes => match fresh {
                 Some(original) => self.over(Settled::CutDone { original }),
                 None => self.over(Settled::Unknown),
             },
             Applied::No => {
-                // Gone (404/410) proves it, wherever the cut is; a copy without an etag proves
-                // nothing.
+                // At an etag no copy of the cut went out on, Google's copy proves it; a copy without
+                // an etag proves nothing.
                 let at_a_cut_etag = match &fresh {
                     None => false,
                     Some(b) => match etag_of(b) {
@@ -1300,7 +1320,6 @@ impl Settle {
                     },
                 };
                 match (self.action, at_a_cut_etag, fresh) {
-                    (SettleAction::Check, false, None) => self.over(Settled::OriginalGone),
                     (SettleAction::Check, false, _) => self.over(Settled::CutNotDone),
                     (SettleAction::Check, true, _) => self.over(Settled::CutUnproved),
                     (SettleAction::Remove, false, _) => self.look_at_tail_to_delete(),
@@ -1411,7 +1430,13 @@ impl Settle {
             return self.over(Settled::Removed);
         }
         match etag_of(&tail) {
-            Some(etag) if undo.resend_on(&tail) => {
+            Some(etag)
+                if undo.resend_on(&tail)
+                    && self
+                        .tail_etag
+                        .as_ref()
+                        .is_none_or(|checked| *checked == etag) =>
+            {
                 self.phase = SettlePhase::Delete { resent };
                 Next::Send(undo.request(&etag, self.plan.steps[self.insert].notify))
             }
@@ -2170,6 +2195,14 @@ mod tests {
                             Method::Delete => deleted(),
                         });
                     runs += 1;
+                    // The bounds of the test above hold with copies that never went too.
+                    let cuts: Vec<&RequestPlan> =
+                        sent.iter().filter(|r| r.method == Method::Patch).collect();
+                    assert!(cuts.len() <= 4, "{first:?} {w}/{g}");
+                    for c in &cuts {
+                        let per_etag = cuts.iter().filter(|x| x.if_match == c.if_match).count();
+                        assert!(per_etag <= 2, "{first:?} {w}/{g}");
+                    }
                     if proved {
                         proofs += 1;
                         assert!(deletes_the_tail(&sent), "{first:?} {w}/{g}: {sent:?}");
@@ -2413,15 +2446,51 @@ mod tests {
         }
     }
 
-    /// C9a-3b critique L5: a look after an unknown cut that finds the original gone says so; Remove
-    /// isn't asked of it.
+    /// C9a-3b critique L5: a look after an unknown cut that finds the original gone, a 404 or the
+    /// cancelled copy Google keeps, says so; Remove never deletes the new series then, it being the
+    /// only copy of what follows.
     #[test]
     fn a_check_that_finds_the_original_gone_says_so() {
-        let (_, plan, ran) = partial(weekly());
-        let mut settle = Settle::new(plan, &ran, SettleAction::Check).unwrap();
-        let (settled, sent, _) = drive(&mut settle, |_| status(Verdict::Gone));
-        assert_eq!(settled, Settled::OriginalGone);
-        assert_eq!(sent.len(), 1);
+        let (case, plan, ran) = partial(weekly());
+        let cancelled = at_etag(
+            &with(case.master.json().clone(), "status", json!("cancelled")),
+            "\"m8\"",
+        );
+        for google in [status(Verdict::Gone), ok(cancelled)] {
+            let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Check).unwrap();
+            let (settled, sent, _) = drive(&mut settle, |_| google.clone());
+            assert_eq!(settled, Settled::OriginalGone);
+            assert_eq!(sent.len(), 1);
+            let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove).unwrap();
+            let (settled, sent, _) = drive(&mut settle, |_| google.clone());
+            assert_eq!(settled, Settled::Unknown);
+            assert!(!deletes_the_tail(&sent));
+        }
+    }
+
+    /// Review round 1: Remove deletes the new series only at the etag the caller checked; Google
+    /// at another (a change made in between) is no delete.
+    #[test]
+    fn remove_deletes_the_new_series_only_at_the_etag_checked() {
+        let (plan, tail, ran) = refused_with_rollback_unknown();
+        for (checked, deletes) in [("\"t1\"", true), ("\"t0\"", false)] {
+            let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove)
+                .unwrap()
+                .at_tail_etag(checked.into());
+            let (settled, sent, _) = drive(&mut settle, |r| match r.method {
+                Method::Delete => deleted(),
+                _ => ok(tail.clone()),
+            });
+            assert_eq!(deletes_the_tail(&sent), deletes, "{checked}");
+            assert_eq!(
+                settled,
+                if deletes {
+                    Settled::Removed
+                } else {
+                    Settled::Unknown
+                }
+            );
+        }
     }
 
     #[test]

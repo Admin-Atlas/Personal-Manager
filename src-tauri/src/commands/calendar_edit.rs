@@ -2928,6 +2928,34 @@ fn inserted_copy(ran: &Ran, insert: usize) -> Option<&Value> {
     }
 }
 
+/// The new part is gone from Google and nothing is left to settle: its rows go, and when the run
+/// found the original deleted in Google (its cut answered 404), the original's too, which is then
+/// what to say (review round 1). `None`: the original stands.
+fn land_removed(
+    host: &impl Host,
+    cal: &str,
+    facts: &SplitFacts,
+    ran: &Ran,
+    seen: &[Option<&Value>],
+) -> Option<WriteOutcome> {
+    land_tail_removed(host, cal, facts, seen);
+    match ran {
+        Ran::NotDone {
+            step,
+            why: Why::Gone,
+            ..
+        } if *step == facts.insert + 1 => Some(land_series_gone(
+            host,
+            cal,
+            &facts.master,
+            &[],
+            facts.zone,
+            &facts.moments,
+        )),
+        _ => None,
+    }
+}
+
 /// The original series is gone from Google: every row of it goes, no older than its last copies.
 fn land_series_gone(
     host: &impl Host,
@@ -3033,15 +3061,15 @@ async fn look_and_hold<W: Wire, H: Host>(
         return WriteOutcome::Unconfirmed;
     };
     let settled = drive(ctx.wire, &mut look).await;
-    let tail_seen = match &settled {
-        Settled::TailThere { tail } => Some(tail.clone()),
-        _ => None,
-    };
-    let tail_seen = inserted_copy(&ran, facts.insert).cloned().or(tail_seen);
+    // Only the insert's own answer stands for the new part as PM made it: a look's copy may already
+    // hold a change made in Google since (review round 1).
+    let tail_seen = inserted_copy(&ran, facts.insert).cloned();
     match offers_for(kind, &settled, false) {
         // A rollback's delete that couldn't be proved turns out done: the run's own result.
         Offers::Removed => {
-            land_tail_removed(host, cal, &facts, &[tail_seen.as_ref()]);
+            if let Some(gone) = land_removed(host, cal, &facts, &ran, &[tail_seen.as_ref()]) {
+                return gone;
+            }
             match ran {
                 Ran::NotDone { why, .. } => not_done_outcome(why, ctx.editing, true),
                 _ => WriteOutcome::SplitRemoved,
@@ -3207,10 +3235,13 @@ async fn land_split_done<W: Wire, H: Host>(
 }
 
 /// The new part PM made, as Google holds it now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TailCheck {
-    /// There, this plan's, and as PM made it, with no occurrence changed on its own.
-    Unchanged,
+    /// There, this plan's, and as PM made it, with no occurrence changed on its own, at `etag`: the
+    /// only version Remove may then delete.
+    Unchanged {
+        etag: String,
+    },
     /// Changed in Google since PM made it, or an occurrence of it was.
     Changed,
     /// Deleted, or not this plan's.
@@ -3231,13 +3262,17 @@ async fn tail_check<W: Wire>(wire: &W, held: &HeldSplit) -> TailCheck {
     if held.plan.verdict(insert, Some(&copy)) != Applied::Yes {
         return TailCheck::Gone;
     }
-    // The copy PM saw at the same etag is unchanged by definition; otherwise it must still hold
-    // what the insert sent.
+    let Some(etag) = copy.get("etag").and_then(Value::as_str).map(str::to_string) else {
+        return TailCheck::Unread;
+    };
+    // At the etag of the insert's own answer it's as PM made it, however Google wrote it out;
+    // otherwise it must still hold what the insert sent.
     let same_etag = held
         .tail_seen
         .as_ref()
         .and_then(|seen| seen.get("etag"))
-        .is_some_and(|etag| copy.get("etag") == Some(etag));
+        .and_then(Value::as_str)
+        == Some(etag.as_str());
     if !same_etag && !held.plan.tail_as_inserted(insert, &copy) {
         return TailCheck::Changed;
     }
@@ -3262,7 +3297,7 @@ async fn tail_check<W: Wire>(wire: &W, held: &HeldSplit) -> TailCheck {
     if changed {
         TailCheck::Changed
     } else {
-        TailCheck::Unchanged
+        TailCheck::Unchanged { etag }
     }
 }
 
@@ -3325,13 +3360,10 @@ async fn settle_split<W: Wire, H: Host>(
         return WriteOutcome::Unconfirmed;
     };
     let settled = drive(wire, &mut look).await;
-    if let Settled::TailThere { tail } = &settled {
-        held.tail_seen.get_or_insert_with(|| tail.clone());
-    }
     if held.tail_changed
         && matches!(
             tail_check(wire, &held).await,
-            TailCheck::Unchanged | TailCheck::Gone
+            TailCheck::Unchanged { .. } | TailCheck::Gone
         )
     {
         // Changed back, or deleted in Google since: it no longer stops anything.
@@ -3340,12 +3372,9 @@ async fn settle_split<W: Wire, H: Host>(
     match offers_for(kind, &settled, held.tail_changed) {
         Offers::Removed => {
             taken.settled();
-            let seen = [
-                inserted_copy(&held.ran, held.facts.insert),
-                held.tail_seen.as_ref(),
-            ];
-            land_tail_removed(host, cal, &held.facts, &seen);
-            return WriteOutcome::SplitRemoved;
+            let seen = [inserted_copy(&held.ran, held.facts.insert)];
+            return land_removed(host, cal, &held.facts, &held.ran, &seen)
+                .unwrap_or(WriteOutcome::SplitRemoved);
         }
         Offers::OriginalGone => {
             taken.settled();
@@ -3376,7 +3405,7 @@ async fn remove_split<W: Wire, H: Host>(
     kind: CutKind,
     token: &str,
 ) -> WriteOutcome {
-    match tail_check(ctx.wire, &held).await {
+    let checked = match tail_check(ctx.wire, &held).await {
         TailCheck::Changed => {
             held.tail_changed = true;
             held.offers = vec![SplitAction::Check];
@@ -3386,22 +3415,31 @@ async fn remove_split<W: Wire, H: Host>(
             };
         }
         TailCheck::Unread => return partial_outcome(token, &held),
+        // Deleted only at the version just checked (review round 1).
+        TailCheck::Unchanged { etag } => Some(etag),
         // Gone: the machine finds it so, and says removed.
-        TailCheck::Unchanged | TailCheck::Gone => {}
-    }
-    let Some(mut remove) = Settle::new(held.plan.clone(), &held.ran, SettleAction::Remove) else {
+        TailCheck::Gone => None,
+    };
+    let Some(remove) = Settle::new(held.plan.clone(), &held.ran, SettleAction::Remove) else {
         return WriteOutcome::Unconfirmed;
+    };
+    let mut remove = match checked {
+        Some(etag) => remove.at_tail_etag(etag),
+        None => remove,
     };
     let settled = drive(ctx.wire, &mut remove).await;
     match offers_for(kind, &settled, held.tail_changed) {
         Offers::Removed => {
             taken.settled();
-            let seen = [
-                inserted_copy(&held.ran, held.facts.insert),
-                held.tail_seen.as_ref(),
-            ];
-            land_tail_removed(ctx.host, &ctx.target.calendar_id, &held.facts, &seen);
-            WriteOutcome::SplitRemoved
+            let seen = [inserted_copy(&held.ran, held.facts.insert)];
+            land_removed(
+                ctx.host,
+                &ctx.target.calendar_id,
+                &held.facts,
+                &held.ran,
+                &seen,
+            )
+            .unwrap_or(WriteOutcome::SplitRemoved)
         }
         Offers::Hold(offers) => {
             held.offers = offers;
@@ -3453,7 +3491,7 @@ async fn finish_split<W: Wire, H: Host>(
                 message: tail_changed_words(&held.facts.from),
             };
         }
-        TailCheck::Changed | TailCheck::Unchanged => {}
+        TailCheck::Changed | TailCheck::Unchanged { .. } => {}
     }
     // The original's exceptions from the split on, listed again: as the plan saw them, or no Finish.
     let listed = list_pages(
@@ -8148,13 +8186,223 @@ mod tests {
     /// nothing is held.
     #[tokio::test]
     async fn a_lost_cut_whose_original_is_gone_says_so() {
+        // A 404, or the cancelled copy Google keeps of a deleted event (review round 1).
+        let deleted = written(&with(weekly(), "status", json!("cancelled")), &[], "\"m8\"");
+        for look in [Scripted::Status(404), Scripted::Json(deleted)] {
+            let host = TestHost::holding(&october());
+            let (outcome, _) = lost_cut(&host, look).await;
+            assert!(
+                matches!(&outcome, WriteOutcome::Failed { message } if message.contains("deleted in Google"))
+            );
+            assert_eq!(held_count(&host), 0);
+            assert!(split_rows(&host).0.is_empty());
+        }
+    }
+
+    /// Review round 1: a cut answered 404 (the series deleted in Google) whose rollback couldn't be
+    /// proved, the look then finding the new part gone too: said gone, and the deleted series' rows
+    /// leave the mirror.
+    #[tokio::test]
+    async fn a_cut_meeting_its_series_deleted_lands_it_once_the_new_part_is_gone() {
         let host = TestHost::holding(&october());
-        let (outcome, _) = lost_cut(&host, Scripted::Status(404)).await;
-        assert!(
-            matches!(&outcome, WriteOutcome::Failed { message } if message.contains("deleted in Google"))
-        );
+        let plan = split_plan(Vec::new());
+        let (outcome, _, _) = split_save(
+            &host,
+            vec![
+                insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+                series_patch(Scripted::Status(404)),
+                Step::write(
+                    Method::Delete,
+                    &format!("/events/{TAIL}"),
+                    "\"t1\"",
+                    Scripted::Status(403),
+                ),
+                event_read(TAIL, Scripted::Status(404)),
+            ],
+        )
+        .await;
+        assert_eq!(outcome, WriteOutcome::Gone);
         assert_eq!(held_count(&host), 0);
         assert!(split_rows(&host).0.is_empty());
+    }
+
+    /// Review round 1: a split with an occurrence changed on its own after it carries that change
+    /// onto the new part's same occurrence, then cancels the old copy; both series land, the old
+    /// copy's row goes.
+    #[tokio::test]
+    async fn a_split_carries_and_cancels_what_changed_on_its_own_and_lands_both() {
+        let (events, mut steps) = with_off_site();
+        let host = TestHost::holding(&events);
+        let plan = split_plan(vec![off_site()]);
+        let moved = tail_occurrence("2026-11-02T09:00:00Z", "\"q1\"");
+        let carried = with(written(&moved, &[], "\"q2\""), "summary", json!("Off-site"));
+        let cancelled_copy = written(
+            &with(off_site(), "status", json!("cancelled")),
+            &[],
+            "\"c2\"",
+        );
+        let mut listed = tail_october();
+        listed.push(carried.clone());
+        steps.extend([
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(&plan))),
+            Step::get(
+                &format!("/events/{TAIL}/instances"),
+                "timeMin=2026-11-01T09%3A00%3A00Z timeMax=2026-11-03T09%3A00%3A00Z maxResults=10",
+                page(vec![moved], None),
+            ),
+            Step::write(
+                Method::Patch,
+                &format!("/events/{TAIL}_20261102T090000Z"),
+                "\"q1\"",
+                Scripted::Json(carried.clone()),
+            ),
+            Step::write(
+                Method::Patch,
+                "/events/abc_20261102T090000Z",
+                off_site()["etag"].as_str().unwrap(),
+                Scripted::Json(cancelled_copy.clone()),
+            ),
+            refetch_read(Scripted::Json(page(
+                vec![october()[0].clone(), cancelled_copy],
+                None,
+            ))),
+            tail_refetch(Scripted::Json(page(listed.clone(), None))),
+        ]);
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            title("Retro"),
+            Scope::Following,
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(outcome, saved());
+        let sent = script.sent();
+        let carry = sent
+            .iter()
+            .find(|r| r.url.contains("_20261102T090000Z?") && r.url.contains(TAIL))
+            .unwrap();
+        assert_eq!(carry.body, Some(json!({ "summary": "Off-site" })));
+        let (original, tail) = split_rows(&host);
+        assert_eq!(original, ["cal:abc_20261012T080000Z"]);
+        assert_eq!(sorted(tail), sorted(ids_of(rows_of(&listed))));
+    }
+
+    /// M4, corner c: a sync that mirrors the new part while the split is on its way; its rows are
+    /// still recorded as created (none were in the rows read before the first send), so a sync that
+    /// lags behind the split keeps them.
+    #[tokio::test]
+    async fn a_sync_mid_split_still_leaves_the_new_part_created() {
+        let host = TestHost::holding(&october());
+        let plan = split_plan(Vec::new());
+        let syncing = Arc::clone(&host);
+        let before = Instant::now();
+        let (outcome, _, _) = split_save(
+            &host,
+            vec![
+                insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+                series_patch(Scripted::Json(cut_copy(&plan))).then(move || {
+                    let mut rows = rows_of(&october());
+                    rows.extend(rows_of(&tail_october()));
+                    syncing
+                        .with_conn(|conn| calendar::replace_events(conn, "cal", &rows, true))
+                        .unwrap();
+                }),
+                refetch_read(Scripted::Json(page(vec![october()[0].clone()], None))),
+                tail_refetch(Scripted::Json(page(tail_october(), None))),
+            ],
+        )
+        .await;
+        assert_eq!(outcome, saved());
+        let lagging = ids_of(host.synced(&october(), before));
+        for id in ids_of(rows_of(&tail_october())) {
+            assert!(lagging.contains(&id), "{id}");
+        }
+    }
+
+    /// Review round 1 (high): after a lost insert no copy of the new part stands for "as PM made
+    /// it" but the insert's own answer. A later look that finds it renamed in Google is never taken
+    /// for it, so Remove refuses and deletes nothing.
+    #[tokio::test]
+    async fn a_new_part_renamed_after_a_lost_insert_is_never_removed() {
+        let host = TestHost::holding(&october());
+        let plan = split_plan(Vec::new());
+        let mut steps = vec![insert_step(lost()), event_read(TAIL, lost())];
+        steps.extend((0..3).map(|_| event_read(TAIL, Scripted::Status(404))));
+        let (held, _, _) = split_save(&host, steps).await;
+        assert_eq!(offers_of(&held), [SplitAction::Remove, SplitAction::Check]);
+        let renamed = with(
+            tail_copy(&plan, "\"t9\"", SAVED_AT),
+            "summary",
+            json!("Renamed in Google"),
+        );
+        let (outcome, script) = settle(
+            &host,
+            &held_token(&held),
+            SplitAction::Remove,
+            vec![
+                event_read(TAIL, Scripted::Json(renamed.clone())),
+                event_read(TAIL, Scripted::Json(renamed)),
+            ],
+        )
+        .await;
+        script.finished();
+        assert!(
+            matches!(&outcome, WriteOutcome::Failed { message } if message.contains("changed in Google"))
+        );
+        assert_eq!(held_count(&host), 1);
+    }
+
+    /// The guard: a split taken out to settle goes back under its token when the settle stops,
+    /// unless it was settled.
+    #[test]
+    fn a_taken_split_goes_back_unless_settled() {
+        let edit = CalendarEditState::default();
+        let plan = split_plan(Vec::new());
+        let held = HeldSplit {
+            target: target(&monday_19()),
+            plan: plan.clone(),
+            ran: Ran::Unknown {
+                step: 0,
+                sent_on: Vec::new(),
+                ends: vec![End::NotRun, End::NotRun],
+            },
+            facts: SplitFacts {
+                master: "abc".into(),
+                tail: TAIL.into(),
+                insert: 0,
+                at: point("2026-10-19T09:00:00+01:00"),
+                zone: chrono_tz::Europe::London,
+                from: "2026-10-19".into(),
+                moments: Vec::new(),
+                marks: Vec::new(),
+                ical: "abc@google.com".into(),
+            },
+            offers: vec![SplitAction::Check],
+            tail_seen: None,
+            tail_changed: false,
+        };
+        edit.hold_partial("t".into(), held);
+        {
+            let (mut taken, mut copy) = TakenSplit::take(&edit, "t").unwrap();
+            assert!(edit.held_on(CALENDAR, "abc").is_none());
+            assert!(TakenSplit::take(&edit, "t").is_none());
+            copy.offers = vec![SplitAction::Remove];
+            taken.keep(&copy);
+        }
+        assert_eq!(
+            edit.held_on(CALENDAR, "abc").unwrap().offers,
+            [SplitAction::Remove]
+        );
+        {
+            let (mut taken, _) = TakenSplit::take(&edit, "t").unwrap();
+            taken.settled();
+        }
+        assert!(edit.held_on(CALENDAR, "abc").is_none());
     }
 
     /// §5.3: a lost insert is held with Finish or Remove when the new part is there, and with
@@ -8303,6 +8551,11 @@ mod tests {
             |row: &ScopeRow| matches!(row, ScopeRow::Pending { token: t, .. } if *t == token);
         let (this, following, all) = ask_on(monday_19()).await;
         assert!(pending(&this) && pending(&following) && pending(&all));
+        // The new part is held under the same split.
+        assert_eq!(
+            host.edit.held_on(CALENDAR, TAIL).map(|v| v.token),
+            Some(token.clone())
+        );
         let (this, following, all) = ask_on(october()[0].clone()).await;
         assert!(matches!(this, ScopeRow::Offered { .. }));
         assert!(pending(&following) && pending(&all));
@@ -8374,6 +8627,11 @@ mod tests {
         assert_eq!(held_token(&outcome), token);
         assert_eq!(offers_of(&outcome), [SplitAction::Finish]);
         assert_eq!(held_count(&host), 1);
+        // Held again with the new offers, so a blocked save says them too.
+        assert_eq!(
+            host.edit.held_on(CALENDAR, "abc").unwrap().offers,
+            [SplitAction::Finish]
+        );
     }
 
     /// Remove and Finish not among the offers Google allows now: nothing is sent, the offers redraw.
@@ -8470,6 +8728,120 @@ mod tests {
             let back = host.edit.held_on(CALENDAR, "abc").unwrap();
             assert_eq!(back.offers, [SplitAction::Check]);
         }
+    }
+
+    /// Review round 1: Remove deletes the new part only at the etag it just checked; changed in
+    /// Google between that look and the delete's own, nothing is deleted and the split stays held.
+    #[tokio::test]
+    async fn remove_deletes_the_new_part_only_at_the_version_it_checked() {
+        let host = TestHost::holding(&october());
+        let plan = split_plan(Vec::new());
+        let (held, _) = lost_cut(&host, Scripted::Json(written(&weekly(), &[], "\"m7\""))).await;
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let uncut = || event_read("abc", Scripted::Json(written(&weekly(), &[], "\"m7\"")));
+        let mut steps = vec![uncut()];
+        steps.extend(tail_reads(tail.clone(), Vec::new()));
+        steps.push(uncut());
+        steps.push(event_read(
+            TAIL,
+            Scripted::Json(with(tail, "etag", json!("\"t2\""))),
+        ));
+        let (outcome, script) = settle(&host, &held_token(&held), SplitAction::Remove, steps).await;
+        script.finished();
+        assert!(matches!(outcome, WriteOutcome::PartialSplit { .. }));
+        assert_eq!(held_count(&host), 1);
+    }
+
+    /// C9a-3b critique M7: a new part found changed keeps Remove off on the next look while it stays
+    /// changed, and gives it back once Google shows it as PM made it.
+    #[tokio::test]
+    async fn a_changed_new_part_keeps_remove_off_until_it_is_as_made() {
+        let plan = split_plan(Vec::new());
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let renamed = with(
+            with(tail.clone(), "summary", json!("Renamed")),
+            "etag",
+            json!("\"t2\""),
+        );
+        let uncut = || event_read("abc", Scripted::Json(written(&weekly(), &[], "\"m7\"")));
+        let host = TestHost::holding(&october());
+        let (held, _) = lost_cut(&host, Scripted::Json(written(&weekly(), &[], "\"m7\""))).await;
+        let token = held_token(&held);
+        let (refused, _) = settle(
+            &host,
+            &token,
+            SplitAction::Remove,
+            vec![uncut(), event_read(TAIL, Scripted::Json(renamed.clone()))],
+        )
+        .await;
+        assert!(matches!(refused, WriteOutcome::Failed { .. }));
+        // Still renamed: Check only.
+        let (still, _) = settle(
+            &host,
+            &token,
+            SplitAction::Check,
+            vec![uncut(), event_read(TAIL, Scripted::Json(renamed))],
+        )
+        .await;
+        assert_eq!(offers_of(&still), [SplitAction::Check]);
+        // Renamed back: Remove again.
+        let mut steps = vec![uncut()];
+        steps.extend(tail_reads(tail, Vec::new()));
+        let (back, _) = settle(&host, &token, SplitAction::Check, steps).await;
+        assert_eq!(offers_of(&back), [SplitAction::Remove]);
+    }
+
+    /// Q2 with something to carry: Finish after a landed cut meets the occurrence changed since the
+    /// save; nothing is sent, what Google holds lands, and that occurrence is said left behind, its
+    /// row kept.
+    #[tokio::test]
+    async fn finish_after_a_landed_cut_leaves_a_changed_occurrence_behind() {
+        let (events, mut steps) = with_off_site();
+        let host = TestHost::holding(&events);
+        let plan = split_plan(vec![off_site()]);
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        steps.extend([
+            insert_step(Scripted::Json(tail.clone())),
+            series_patch(Scripted::Lost { retried: true }),
+            event_read("abc", lost()),
+            event_read("abc", lost()),
+        ]);
+        let script = Script::new(steps);
+        let (held, _) = save(
+            &host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            title("Retro"),
+            Scope::Following,
+        )
+        .await;
+        script.asked_all();
+        let changed_since = with(off_site(), "summary", json!("Changed since"));
+        let mut steps = vec![event_read("abc", Scripted::Json(cut_copy(&plan)))];
+        steps.extend(tail_reads(tail, Vec::new()));
+        steps.push(ical_listing(
+            "iCalUID=abc%40google.com",
+            Scripted::Json(page(vec![cut_copy(&plan), changed_since.clone()], None)),
+        ));
+        steps.push(refetch_read(Scripted::Json(page(
+            vec![october()[0].clone(), changed_since],
+            None,
+        ))));
+        steps.push(tail_refetch(Scripted::Json(page(tail_october(), None))));
+        let (outcome, script) = settle(&host, &held_token(&held), SplitAction::Finish, steps).await;
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        assert_eq!(
+            outcome,
+            WriteOutcome::Saved {
+                warnings: vec![WriteWarning::LeftOnOldSeries],
+                left_behind: vec!["2026-11-02".into()],
+            }
+        );
+        assert!(split_rows(&host)
+            .0
+            .contains(&"cal:abc_20261102T090000Z".to_string()));
+        assert_eq!(held_count(&host), 0);
     }
 
     /// §7.4: Remove never deletes after the cut landed: the look says Finish.
@@ -8779,6 +9151,7 @@ mod tests {
     /// "none" needs the whole listing.
     #[tokio::test]
     async fn the_new_part_is_checked_against_what_pm_made() {
+        let unchanged = |etag: &str| TailCheck::Unchanged { etag: etag.into() };
         let gone = cancelled("2026-11-02T09:00:00Z");
         let plan = split_plan(vec![gone.clone()]);
         let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
@@ -8824,9 +9197,9 @@ mod tests {
         // At the etag PM saw, Google's own way of writing a field isn't a change.
         let as_seen = with(tail.clone(), "description", json!("<p>Daily notes</p>"));
         for (copy, listed, want) in [
-            (tail.clone(), vec![left_out.clone()], TailCheck::Unchanged),
-            (bookkeeping, Vec::new(), TailCheck::Unchanged),
-            (as_seen, Vec::new(), TailCheck::Unchanged),
+            (tail.clone(), vec![left_out.clone()], unchanged("\"t1\"")),
+            (bookkeeping, Vec::new(), unchanged("\"t3\"")),
+            (as_seen, Vec::new(), unchanged("\"t1\"")),
             (
                 tail.clone(),
                 vec![left_out, deleted_since],
