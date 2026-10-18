@@ -1444,6 +1444,19 @@ pub fn event_by_id(conn: &Connection, id: &str) -> Result<Option<CalendarEvent>>
         .next())
 }
 
+/// The Google series a calendar's mirrored occurrences belong to (their masters' ids), each once:
+/// how editing tells that a series has another part split off it (#884).
+pub fn series_ids(conn: &Connection, calendar_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT series_id FROM calendar_events \
+         WHERE calendar_id = ?1 AND series_id IS NOT NULL ORDER BY series_id",
+    )?;
+    let ids = stmt
+        .query_map(params![calendar_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(ids)
+}
+
 /// Drop calendars under `source_id` that are no longer in `keep` (and their events) — an upstream
 /// calendar that was deleted/unshared. `keep` is the set of `calendars.id` still present this sync.
 pub fn prune_calendars_not_in(conn: &Connection, source_id: &str, keep: &[String]) -> Result<()> {

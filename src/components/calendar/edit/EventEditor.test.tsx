@@ -105,6 +105,7 @@ const ready = (ev: EventForEdit, permissions = ALL, session = "s1"): EditLoad =>
     all_day: false,
     location: ev.location,
   },
+  series: null,
 });
 
 async function open(onClose = vi.fn(), onDelete?: (r: CalendarEvent) => void) {

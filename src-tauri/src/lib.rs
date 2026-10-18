@@ -1789,6 +1789,9 @@ pub fn run() {
             commands::delete_calendar_event,
             commands::cancel_calendar_delete,
             commands::list_held_deletes,
+            commands::series_choices,
+            #[cfg(debug_assertions)]
+            commands::dev_series_report,
             commands::connect_outlook_calendar,
             commands::disconnect_outlook_calendar,
             commands::list_ics_feeds,

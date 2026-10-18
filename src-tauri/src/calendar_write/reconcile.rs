@@ -114,7 +114,10 @@ impl RecentWrites {
     /// lag behind a new event, and a missing row isn't proof it was deleted.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "first caller lands in C9, splitting a series")
+        expect(
+            dead_code,
+            reason = "first caller lands in C9a-3, landing a series write"
+        )
     )]
     pub fn record_create(&mut self, row: CalendarEvent, at: Stamp) {
         self.entries.insert(

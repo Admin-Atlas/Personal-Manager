@@ -45,6 +45,9 @@ export const NO_WRAPPER_EXPECTED = new Set([
   // with the calendar write grant?). It is run from the devtools console, so no screen needs it, and
   // a wrapper would put a debug-only command name into release code.
   "dev_google_grant_report",
+  // Dev builds only, likewise: what Google returns for one repeating event, for #884's C9a live
+  // probes. scripts/check-calendar-write-fence.mjs also refuses any mention of it in ipc.ts.
+  "dev_series_report",
 ]);
 
 /**

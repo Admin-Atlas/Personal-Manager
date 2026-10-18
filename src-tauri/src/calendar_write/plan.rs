@@ -87,6 +87,28 @@ pub fn instances(calendar: &str, event: &str, query: &[(&str, &str)]) -> Request
     }
 }
 
+/// The events stored under iCal UID `ical`: a series' master and its exceptions, cancelled ones
+/// included (`showDeleted`), never spread into occurrences (`singleEvents=false`). A page of up to 100
+/// at a time; `page_token` is the previous page's `nextPageToken`. No name here says "uid": CodeQL
+/// reads any such name as account data, and every request built from it as a leak.
+pub fn list_by_ical(calendar: &str, ical: &str, page_token: Option<&str>) -> RequestPlan {
+    let mut query = vec![
+        ("iCalUID", ical),
+        ("singleEvents", "false"),
+        ("showDeleted", "true"),
+        ("maxResults", "100"),
+    ];
+    if let Some(token) = page_token {
+        query.push(("pageToken", token));
+    }
+    RequestPlan {
+        method: Method::Get,
+        url: url(&["calendars", calendar, "events"], &query),
+        if_match: None,
+        body: None,
+    }
+}
+
 /// Change the fields in `body`, only if the event is still at `etag`.
 pub fn patch_event(
     calendar: &str,
@@ -126,7 +148,7 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
 /// id at creation), so a retry can't make a second event.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller lands in C9, splitting a series")
+    expect(dead_code, reason = "first caller lands in C9a-3, splitting a series")
 )]
 pub fn insert_event(
     calendar: &str,
@@ -151,10 +173,6 @@ pub fn insert_event(
 
 /// A new event id of PM's choosing: 32 lowercase hex characters, inside Google's allowed alphabet
 /// (base32hex: `0-9` and `a-v`, 5 to 1024 characters).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C9, splitting a series")
-)]
 pub fn client_event_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
@@ -196,6 +214,23 @@ mod tests {
             p.url,
             "https://www.googleapis.com/calendar/v3/calendars/me@example.com/events/abc/instances\
              ?showDeleted=true&timeMin=2026-10-18T09%3A00%3A00Z&maxResults=10"
+        );
+    }
+
+    #[test]
+    fn a_series_is_listed_by_its_ical_uid_as_stored() {
+        let first = list_by_ical("me@example.com", "abc@google.com", None);
+        assert_eq!((first.method, first.if_match), (Method::Get, None));
+        assert_eq!(
+            first.url,
+            "https://www.googleapis.com/calendar/v3/calendars/me@example.com/events\
+             ?iCalUID=abc%40google.com&singleEvents=false&showDeleted=true&maxResults=100"
+        );
+        let next = list_by_ical("me@example.com", "abc@google.com", Some("p2&x"));
+        assert!(
+            next.url.ends_with("&maxResults=100&pageToken=p2%26x"),
+            "{}",
+            next.url
         );
     }
 

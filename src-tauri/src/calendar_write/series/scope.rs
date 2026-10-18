@@ -6,15 +6,18 @@
 //! occurrence, an exception PM can't carry) is the planner's answer, and C9 runs the planner for each
 //! row it offers when the dialog opens, so each row shows its own warnings or reason (DS12).
 
+use std::fmt;
+
 use serde_json::Value;
 
 use crate::calendar_recur::lines::TextOnly;
-use crate::calendar_recur::Point;
+use crate::calendar_recur::remap::RetimeError;
+use crate::calendar_recur::{Point, RecurError};
 
 use super::super::dto::{EventPatchDraft, TimeDraft};
 use super::super::patch::build_patch;
 use super::super::time::{self, TimeError};
-use super::{original_of, point_of, FreshEvent, Length, Master};
+use super::{original_of, point_of, FreshEvent, Length, Master, SeriesRefusal};
 
 /// The three choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,13 +49,6 @@ pub struct TimeChange {
 }
 
 impl Change {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9, editing repeating events"
-        )
-    )]
     pub fn delete() -> Change {
         Change {
             delete: true,
@@ -61,13 +57,6 @@ impl Change {
     }
 
     /// The change `draft` makes to the occurrence `instance` of `master`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9, editing repeating events"
-        )
-    )]
     pub fn of(
         draft: &EventPatchDraft,
         instance: &FreshEvent,
@@ -157,6 +146,18 @@ pub enum ScopeReason {
     ZoneChange,
 }
 
+/// Shown on the row as is, in the planners' own words for the same refusals.
+impl fmt::Display for ScopeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScopeReason::VisibilityIsSeriesWide => SeriesRefusal::VisibilityIsSeriesWide.fmt(f),
+            ScopeReason::TextOnly(why) => RecurError::TextOnly(why.clone()).fmt(f),
+            ScopeReason::KindChange => RetimeError::KindChange.fmt(f),
+            ScopeReason::ZoneChange => SeriesRefusal::ZoneChange.fmt(f),
+        }
+    }
+}
+
 /// One row of the choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
@@ -175,13 +176,6 @@ pub struct ScopeOptions {
 
 /// The rows a `change` to an occurrence offers. `first`: it's the series' first occurrence.
 /// `text_only`: why PM can only show the series' rule as text, if it can.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn scope_options(change: &Change, first: bool, text_only: Option<&TextOnly>) -> ScopeOptions {
     let mut this = Row::Offered;
     let mut following = if first { Row::AsAll } else { Row::Offered };
@@ -398,5 +392,25 @@ mod tests {
             delete.following,
             Row::Refused(ScopeReason::TextOnly(custom))
         );
+    }
+
+    /// A refused row says why in the planners' words for the same refusal.
+    #[test]
+    fn a_refused_row_says_why() {
+        assert_eq!(
+            ScopeReason::VisibilityIsSeriesWide.to_string(),
+            SeriesRefusal::VisibilityIsSeriesWide.to_string()
+        );
+        assert_eq!(
+            ScopeReason::TextOnly(TextOnly::Part("BYSETPOS".into())).to_string(),
+            "PM can't change how this series repeats: its rule uses BYSETPOS, which PM doesn't \
+             change."
+        );
+        assert!(ScopeReason::KindChange
+            .to_string()
+            .contains("between all-day and timed"));
+        assert!(ScopeReason::ZoneChange
+            .to_string()
+            .contains("another time zone"));
     }
 }

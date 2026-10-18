@@ -440,13 +440,6 @@ pub fn series_rule(lines: &[Line]) -> Result<(&Rule, RuleFacts), TextOnly> {
 /// the old UNTIL, a reported fault) from one it applied. Mistaking an applied cut for an ignored one
 /// would undo the rest of a split and lose occurrences, so values are compared as the moments they
 /// name, never as text that Google may write back differently.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9, editing repeating events"
-    )
-)]
 pub fn same_recurrence<S: AsRef<str>, T: AsRef<str>>(
     a: &[S],
     b: &[T],
@@ -473,7 +466,7 @@ pub enum Applied {
     not(test),
     expect(
         dead_code,
-        reason = "first caller lands in C9, editing repeating events"
+        reason = "first caller lands in C9a-3, sending series writes"
     )
 )]
 pub fn recurrence_verdict<S: AsRef<str>, T: AsRef<str>, U: AsRef<str>>(
