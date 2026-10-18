@@ -729,7 +729,7 @@ pub enum Parts {
 
 /// Read `parts` (the live events PM's note says were split off `series`) against the series' own
 /// occurrences in `window` (an `instances` listing with cancelled ones) and its stored `exceptions`.
-/// A part overlaps when the series still has a live occurrence on or after the part's first day that
+/// A part overlaps when the series still has a live occurrence at or after the part's start that
 /// isn't one of its exceptions: a finished split's original ends before its part starts, and an
 /// occurrence changed on its own that a change couldn't move doesn't count. Outside the window
 /// nothing is checked, as for the exceptions' cross-check. A part's own exceptions, which may carry
@@ -746,7 +746,7 @@ pub fn parts_overlap(
     }
     let live = |item: &&Value| item.get("status").and_then(Value::as_str) != Some("cancelled");
     let own = |item: &&Value| item.get("recurringEventId").and_then(Value::as_str) == Some(series);
-    let starts: Vec<NaiveDate> = parts
+    let starts: Vec<Point> = parts
         .items
         .iter()
         .filter(live)
@@ -759,9 +759,9 @@ pub fn parts_overlap(
                 .and_then(Value::as_str)
                 == Some(series)
         })
-        .filter_map(|p| point_of(p.get("start")).map(|at| at.day_in(zone)))
+        .filter_map(|p| point_of(p.get("start")))
         .collect();
-    let Some(first) = starts.iter().min().copied() else {
+    let Some(first) = starts.iter().copied().min_by(|a, b| a.cmp_in(b, zone)) else {
         return Parts::Clear;
     };
     if !window.complete {
@@ -781,10 +781,13 @@ pub fn parts_overlap(
         .filter(live)
         .filter_map(original_of)
         .filter(|p| !stored.contains(p))
-        .map(|p| p.day_in(zone))
-        .max();
+        .max_by(|a, b| a.cmp_in(b, zone));
+    // By instant, not by day: an extra date earlier on the split day stays on a cut original
+    // (review round 4).
     match last {
-        Some(last) if last >= first => Parts::Overlap(first),
+        Some(last) if last.cmp_in(&first, zone) != std::cmp::Ordering::Less => {
+            Parts::Overlap(first.day_in(zone))
+        }
         _ => Parts::Clear,
     }
 }
@@ -1453,6 +1456,12 @@ mod tests {
         // Cut: it ends on 12-10, before the part.
         let cut = whole(vec![plain("2026-10-12T09:00:00+01:00")]);
         assert_eq!(read(&parts, &cut, &none), Parts::Clear);
+        // An extra date earlier on the split day stays on the cut original: no overlap.
+        let extra = whole(vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            plain("2026-10-19T07:00:00+01:00"),
+        ]);
+        assert_eq!(read(&parts, &extra, &none), Parts::Clear);
         // An occurrence a change couldn't move, left on the original, isn't the rule repeating; nor
         // is a cancelled one.
         let left = moved(
