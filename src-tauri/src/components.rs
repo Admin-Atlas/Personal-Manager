@@ -231,7 +231,66 @@ fn embedder_estimate_bytes(id: &str) -> u64 {
     mb * 1024 * 1024
 }
 
-fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageReport {
+/// The photo-OCR row. The feature is a first-class row whether or not it's installed: when working
+/// it's Removable (the image libraries cascade-remove under it), and otherwise it offers an Install
+/// action right here, so the whole feature is enabled/disabled in one place, like the others.
+///
+/// "Working" is the sidecar's marker (`ocr_ready`, what ingest reads), not the packages being on
+/// disk. They part ways when a lock moves and the reinstall at the next launch fails (offline, a
+/// dropped download): the old packages stay, every photo is indexed without its text, and a row
+/// keyed on presence alone went on showing OCR installed with nothing to press. Installing over
+/// the stale copy is what repairs it.
+fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
+    let label = "Photo text recognition (rapidocr)".into();
+    match (present, ready) {
+        (true, true) => Component {
+            id: "ocr",
+            label,
+            detail: "Reads text out of dropped photos and screenshots (OCR), on-device.".into(),
+            size_bytes: size,
+            approximate: false,
+            child: false,
+            status: Status::Removable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some(
+                "Removing it indexes new photos by date and location only, with no text. \
+                 You can reinstall it any time."
+                    .into(),
+            ),
+        },
+        (true, false) => Component {
+            id: "ocr",
+            label,
+            detail: "Reads text out of dropped photos and screenshots (OCR), on-device. It is on \
+                     this computer but needs installing again after an update before it works."
+                .into(),
+            size_bytes: size,
+            approximate: false,
+            child: false,
+            status: Status::Installable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some("Until then, photos are indexed by their date and location only.".into()),
+        },
+        (false, _) => Component {
+            id: "ocr",
+            label,
+            detail: "Reads text out of dropped photos and screenshots (OCR) so it's searchable — \
+                     all on-device. Optional, a one-time download."
+                .into(),
+            size_bytes: OCR_INSTALL_ESTIMATE_BYTES,
+            approximate: true,
+            child: false,
+            status: Status::Installable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some("Without it, photos are indexed by their date and location only.".into()),
+        },
+    }
+}
+
+fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageReport {
     let site = site_packages_dir(venv);
     let (tsne_present, tsne_size) = pkg(site.as_ref(), "openTSNE", &["openTSNE", "openTSNE-*"]);
     let (sklearn_present, sklearn_size) = pkg(
@@ -378,42 +437,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
         );
     }
 
-    // The photo-OCR feature is a first-class row whether or not it's installed: when present it's
-    // Removable (the image libraries cascade-remove under it), and when absent it offers an Install
-    // action right here — so the whole feature is enabled/disabled in one place, like the others.
-    if ocr_present {
-        components.push(Component {
-            id: "ocr",
-            label: "Photo text recognition (rapidocr)".into(),
-            detail: "Reads text out of dropped photos and screenshots (OCR), on-device.".into(),
-            size_bytes: ocr_size,
-            approximate: false,
-            child: false,
-            status: Status::Removable,
-            blockers: Vec::new(),
-            manage: None,
-            note: Some(
-                "Removing it indexes new photos by date and location only, with no text. \
-                 You can reinstall it any time."
-                    .into(),
-            ),
-        });
-    } else {
-        components.push(Component {
-            id: "ocr",
-            label: "Photo text recognition (rapidocr)".into(),
-            detail: "Reads text out of dropped photos and screenshots (OCR) so it's searchable — \
-                     all on-device. Optional, a one-time download."
-                .into(),
-            size_bytes: OCR_INSTALL_ESTIMATE_BYTES,
-            approximate: true,
-            child: false,
-            status: Status::Installable,
-            blockers: Vec::new(),
-            manage: None,
-            note: Some("Without it, photos are indexed by their date and location only.".into()),
-        });
-    }
+    components.push(ocr_row(ocr_present, ocr_ready, ocr_size));
     if cv2_present {
         lib(
             &mut components,
@@ -536,7 +560,9 @@ pub async fn list_storage_components(app: AppHandle) -> Result<StorageReport> {
     };
     let venv = paths::venv_dir(&app)?;
     let data = paths::data_dir(&app)?;
-    tauri::async_runtime::spawn_blocking(move || build_report(&venv, &data, &embedder))
+    // A marker read and a hash of the small OCR lock: cheap enough to take before the walk.
+    let ocr_ready = app.state::<AppState>().sidecar.optional_ocr_ready();
+    tauri::async_runtime::spawn_blocking(move || build_report(&venv, &data, &embedder, ocr_ready))
         .await
         .map_err(|e| Error::Other(format!("storage scan task panicked: {e}")))
 }
@@ -604,6 +630,22 @@ mod tests {
         assert_eq!(blocker_for("ocr", true, true, true), None);
         assert_eq!(blocker_for("opencv-python", true, true, false), None);
         assert_eq!(blocker_for("scipy", false, false, true), None);
+    }
+
+    #[test]
+    fn ocr_on_disk_but_not_working_offers_install() {
+        let row = |present, ready| ocr_row(present, ready, 7);
+        assert!(matches!(row(true, true).status, Status::Removable));
+        // The stale copy a failed reinstall leaves: Install, sized as what is really on disk.
+        let stale = row(true, false);
+        assert!(matches!(stale.status, Status::Installable));
+        assert_eq!((stale.size_bytes, stale.approximate), (7, false));
+        let absent = row(false, false);
+        assert!(matches!(absent.status, Status::Installable));
+        assert_eq!(
+            (absent.size_bytes, absent.approximate),
+            (OCR_INSTALL_ESTIMATE_BYTES, true)
+        );
     }
 
     #[test]

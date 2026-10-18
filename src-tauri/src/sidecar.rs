@@ -1070,9 +1070,10 @@ impl SidecarManager {
         // The in-place update loses them too, more quietly. Every optional lock is resolved against
         // the base lock and stamps its hash, so a base lock that moved (a fastembed bump) makes each
         // installed component's marker stale: `optional_ready` turned false, photos went EXIF-only,
-        // and Settings → Storage — which sees the packages on disk — went on showing OCR as
-        // installed, with no Install button to press. A marker that is there at all means the user
-        // installed the component, so it is put back whenever the venv no longer satisfies it.
+        // and Settings → Storage — which then saw only the packages on disk — went on showing OCR
+        // as installed; only dropping a photo by hand offered the install. A marker that is there
+        // at all means the user installed the component, so it is put back whenever the venv no
+        // longer satisfies it.
         let rebuild = should_rebuild_venv(
             venv_python_exists,
             self.paths.ready_marker().exists(),
@@ -1152,12 +1153,14 @@ impl SidecarManager {
         })?;
 
         // Put back the optional components the rebuild removed or the moved locks left stale (see
-        // `reinstall` above). Best-effort and deliberately NOT
-        // fatal: the base venv is what the app needs to function, and failing the whole provision
-        // over an optional extra would turn "OCR is missing" into "nothing works". A failure here
-        // leaves the component genuinely uninstalled — which is at least honest, and Settings →
-        // Storage can reinstall it — rather than a stamped marker lying about a package that isn't
-        // there.
+        // `reinstall` above). Best-effort and deliberately NOT fatal: the base venv is what the app
+        // needs to function, and failing the whole provision over an optional extra would turn "OCR
+        // is missing" into "nothing works". A failure leaves the component's marker absent or stale,
+        // never stamped over packages that aren't there, so the feature is honestly off and
+        // Settings → Storage offers Install: after a rebuild the packages are gone, and after an
+        // in-place update the stale copy still on disk shows as needing installing again
+        // (`components::ocr_row`). Not retried here: the next launch has a current base marker,
+        // and retrying a ~200 MB download on every launch would be worse on a metered link.
         //
         // `install_optional_locked`, not `install_optional`: we already hold `self.install` (see
         // `ensure_installed_with_progress`) and the base venv is up two statements ago.
