@@ -37,7 +37,7 @@ use crate::registry::{ModelEntry, Pooling, Source};
 /// fastembed's `ModelSource` accepts only `hf` or `url` and rejects a description with neither, so a
 /// disk-resident model still needs one — but it is never fetched: passing `specific_model_path` at
 /// construction short-circuits resolution before any source is consulted (verified against
-/// fastembed 0.8.1, `common/model_management.py`). The placeholder is deliberately not a real repo,
+/// fastembed 0.8.1 and 0.9.0, `common/model_management.py`). The placeholder is deliberately not a real repo,
 /// so that if the short-circuit ever regressed the failure would be an immediate 404 on a
 /// nonexistent name rather than a silent download of somebody else's weights.
 const LOCAL_MODEL_SOURCE: &str = "pm-local/not-a-hub-model";
@@ -247,7 +247,7 @@ const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
 /// machine to install for nothing, in an AGPL-3.0-or-later product it is not compatible with.
 /// pi-heif is the decode-only build of the same bindings: libheif + libde265, both LGPLv3, in a
 /// wheel a third of the size.
-const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pi-heif==1.4.0"];
+const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.10.0", "pi-heif==1.4.0"];
 
 /// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
 /// operations differ only in these fields, so they share one implementation each
@@ -272,6 +272,12 @@ struct OptionalComponent {
     /// deliberately LEFT in place so a removal can never break the base venv by pulling a package
     /// something else relies on (see the public delegates' docs for each component's cascade).
     uninstall: &'static [&'static str],
+    /// Packages an older lock of this component installed that the current lock replaces with a
+    /// differently-named distribution of the SAME files, uninstalled before the lock is installed.
+    /// pip never removes a package because another one supersedes it, so without this both would
+    /// end up owning one folder, and removing either later deletes the files the other still
+    /// claims.
+    superseded: &'static [&'static str],
 }
 
 const OPTIONAL_TSNE_COMPONENT: OptionalComponent = OptionalComponent {
@@ -279,6 +285,7 @@ const OPTIONAL_TSNE_COMPONENT: OptionalComponent = OptionalComponent {
     lock: "requirements-tsne.lock",
     pins: &[OPTIONAL_TSNE_PIN],
     uninstall: &["openTSNE"],
+    superseded: &[],
 };
 
 const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
@@ -290,6 +297,12 @@ const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     // them rather than strand 28 MB (and the GPL-2.0 x265 inside it) forever. `pip uninstall -y`
     // skips a package that isn't installed, so this costs the common case nothing.
     uninstall: &["rapidocr", "pi-heif", "pillow-heif"],
+    // rapidocr 3.10 depends on `opencv-python-headless` where 3.9 depended on `opencv-python`; both
+    // install `cv2/`. On an upgrade pip would add the headless build BESIDE the old one, and the
+    // Storage tab's "remove OpenCV" (or any later uninstall of one of them) would then delete the
+    // shared `cv2/` while the other's dist-info stayed: the next OCR install is a pip no-op,
+    // `import cv2` fails, and photos silently fall back to date and location only.
+    superseded: &["opencv-python"],
 };
 
 /// Every optional component, so a caller that must treat them all alike can't miss one. `provision`
@@ -1053,17 +1066,31 @@ impl SidecarManager {
         // permanently for those documents unless re-ingested) and the memory map quietly fell back
         // to PCA. A rebuild is triggered by a torn install or an outdated interpreter — neither of
         // which is a request to remove components.
-        let mut reinstall: Vec<&OptionalComponent> = Vec::new();
-        if should_rebuild_venv(
+        //
+        // The in-place update loses them too, more quietly. Every optional lock is resolved against
+        // the base lock and stamps its hash, so a base lock that moved (a fastembed bump) makes each
+        // installed component's marker stale: `optional_ready` turned false, photos went EXIF-only,
+        // and Settings → Storage — which then saw only the packages on disk — went on showing OCR
+        // as installed; only dropping a photo by hand offered the install. A marker that is there
+        // at all means the user installed the component, so it is put back whenever the venv no
+        // longer satisfies it.
+        let rebuild = should_rebuild_venv(
             venv_python_exists,
             self.paths.ready_marker().exists(),
             detected,
-        ) {
-            for component in ALL_OPTIONAL_COMPONENTS {
-                if self.optional_ready(component) {
-                    reinstall.push(component);
-                }
-            }
+        );
+        let reinstall: Vec<&OptionalComponent> = ALL_OPTIONAL_COMPONENTS
+            .iter()
+            .copied()
+            .filter(|c| {
+                should_reinstall_optional(
+                    rebuild,
+                    (c.marker)(&self.paths).exists(),
+                    self.optional_ready(c),
+                )
+            })
+            .collect();
+        if rebuild {
             // Drop any live child first: on Windows it would hold a lock on the
             // venv's python.exe and block removal.
             *self.proc.lock().unwrap() = None;
@@ -1125,19 +1152,22 @@ impl SidecarManager {
             source: e,
         })?;
 
-        // Put back the optional components the rebuild removed. Best-effort and deliberately NOT
-        // fatal: the base venv is what the app needs to function, and failing the whole provision
-        // over an optional extra would turn "OCR is missing" into "nothing works". A failure here
-        // leaves the component genuinely uninstalled — which is at least honest, and Settings →
-        // Storage can reinstall it — rather than a stamped marker lying about a package that isn't
-        // there.
+        // Put back the optional components the rebuild removed or the moved locks left stale (see
+        // `reinstall` above). Best-effort and deliberately NOT fatal: the base venv is what the app
+        // needs to function, and failing the whole provision over an optional extra would turn "OCR
+        // is missing" into "nothing works". A failure leaves the component's marker absent or stale,
+        // never stamped over packages that aren't there, so the feature is honestly off and
+        // Settings → Storage offers Install: after a rebuild the packages are gone, and after an
+        // in-place update the stale copy still on disk shows as needing installing again
+        // (`components::ocr_row`). Not retried here: the next launch has a current base marker,
+        // and retrying a ~200 MB download on every launch would be worse on a metered link.
         //
         // `install_optional_locked`, not `install_optional`: we already hold `self.install` (see
         // `ensure_installed_with_progress`) and the base venv is up two statements ago.
         for component in reinstall {
             if let Err(e) = self.install_optional_locked(component, |_| {}) {
                 eprintln!(
-                    "sidecar: rebuilt the venv but could not reinstall an optional component ({e}); \
+                    "sidecar: provisioned the venv but could not reinstall an optional component ({e}); \
                      reinstall it from Settings -> Storage"
                 );
             }
@@ -1716,6 +1746,27 @@ impl SidecarManager {
                 "optional component lock not found at {} (is the sidecar/ folder present?)",
                 lock.display()
             )));
+        }
+        if !component.superseded.is_empty() {
+            // Not `pip_uninstall`: that takes `self.install`, which the caller already holds (see
+            // above). Not best-effort either: installing beside a stale copy is the failure this
+            // step exists to prevent, so a failed removal stops the install. `-y` skips a package
+            // that isn't installed, which is every fresh install.
+            let mut pip = Command::new(&py);
+            pip.args([
+                "-m",
+                "pip",
+                "uninstall",
+                "-y",
+                "--disable-pip-version-check",
+            ]);
+            pip.args(component.superseded);
+            clean_python_env(&mut pip);
+            no_window(&mut pip);
+            run_command(
+                &mut pip,
+                &format!("pip uninstall {}", component.superseded.join(" ")),
+            )?;
         }
         let lock_arg = lock.to_string_lossy().into_owned();
         let args: Vec<&str> = vec![
@@ -2680,6 +2731,14 @@ fn should_rebuild_venv(
     !detected_version.is_some_and(meets_min)
 }
 
+/// Whether provisioning must put an optional component back: the user installed it (its marker is
+/// present, current or not; removing a component deletes the marker first) and the venv being
+/// provisioned no longer satisfies it — rebuilt from scratch, or updated in place to locks that
+/// moved its stamp.
+fn should_reinstall_optional(rebuild: bool, marker_present: bool, ready: bool) -> bool {
+    marker_present && (rebuild || !ready)
+}
+
 /// Parse a `python --version`-style string into `(major, minor)`. Tolerates the
 /// optional `Python ` prefix, a trailing patch / rc / build suffix, and `\r`.
 fn parse_python_version(s: &str) -> Option<(u32, u32)> {
@@ -3421,6 +3480,14 @@ mod tests {
     /// and a Landlock-capable kernel (≥ 5.13):
     ///   PM_SANDBOX_SMOKE_VENV="$HOME/.local/share/Personal Manager/runtime/venv" \
     ///     cargo test --manifest-path src-tauri/Cargo.toml confined_worker_ocr_smoke_linux -- --ignored --nocapture
+    ///
+    /// Run it COLD too, whenever rapidocr moves: `PM_SANDBOX_SMOKE_COLD=1` with
+    /// `PM_SANDBOX_SMOKE_VENV` pointing at a SCRATCH `<root>/runtime/venv` (base + OCR locks
+    /// installed) whose `<root>/runtime/models/rapidocr` holds no `.onnx`. That walks the whole
+    /// recovery: the offline worker misses, the unconfined `--fetch` helper downloads, the retry
+    /// reads the image. The warm run alone passed on the rapidocr 3.10.0 bump that left the fetcher
+    /// with nothing to fetch (#932): only a machine that has never run OCR could see it, so a live
+    /// test on a machine that has would not have either. Never point a cold run at the live install.
     #[test]
     #[ignore = "linux-only, needs the live venv + the OCR component + a Landlock kernel"]
     #[cfg(all(
@@ -3443,11 +3510,28 @@ mod tests {
         // OCR is an OPTIONAL component, so its absence is a legitimate state of a real install —
         // but it is also this test's entire subject, so it is an error here rather than a skip.
         let models = venv_dir.parent().unwrap().join("models/rapidocr");
-        assert!(
-            models.is_dir() && models.read_dir().is_ok_and(|mut d| d.next().is_some()),
-            "no rapidocr weights at {models:?} — install the photo-OCR component (Settings → \
-             Storage) before running this"
-        );
+        let onnx_count = || {
+            std::fs::read_dir(&models).map_or(0, |d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "onnx"))
+                    .count()
+            })
+        };
+        let cold = std::env::var("PM_SANDBOX_SMOKE_COLD").is_ok_and(|v| v == "1");
+        if cold {
+            assert_eq!(
+                onnx_count(),
+                0,
+                "PM_SANDBOX_SMOKE_COLD=1 needs a scratch runtime with no rapidocr weights at \
+                 {models:?} — never the live install"
+            );
+        } else {
+            assert!(
+                onnx_count() > 0,
+                "no rapidocr weights at {models:?} — install the photo-OCR component (Settings → \
+                 Storage) before running this, or run it cold (PM_SANDBOX_SMOKE_COLD=1)"
+            );
+        }
 
         // Render the fixture with the venv's OWN Pillow rather than checking a binary into a public
         // repo or adding an image crate to the build. Pillow is a pinned base requirement, so this
@@ -3505,6 +3589,14 @@ mod tests {
 
         // The image was read at all — separates "the sandbox blocked the file" from "OCR failed".
         assert_eq!(analysis.width, Some(900), "the worker never read the image");
+        if cold {
+            // Detection, orientation and recognition: the fetcher has to have built all three.
+            assert_eq!(
+                onnx_count(),
+                3,
+                "the --fetch helper did not download every OCR model into {models:?}"
+            );
+        }
 
         // The two assertions below are deliberately separate, because they fail for different
         // reasons and the difference is the whole finding:
@@ -3638,7 +3730,8 @@ mod tests {
         let source_dir = dir.path().join("sidecar");
         std::fs::create_dir_all(&source_dir).unwrap();
         let lock = source_dir.join(OPTIONAL_OCR_COMPONENT.lock);
-        std::fs::write(&lock, b"rapidocr==3.9.2 \\\n    --hash=sha256:aaa\n").unwrap();
+        // Neutral fixture bytes: only their hash reaches the stamp, so no real version belongs here.
+        std::fs::write(&lock, b"pkg==0 \\\n    --hash=sha256:aaa\n").unwrap();
 
         let mgr = SidecarManager::new(SidecarPaths {
             source_dir,
@@ -3646,18 +3739,63 @@ mod tests {
         });
 
         let first = mgr.optional_stamp(&OPTIONAL_OCR_COMPONENT).unwrap();
+        // Derived from the pins, not a copy of them: a literal here broke on every pin bump.
+        let want = format!("{};lock=", OPTIONAL_OCR_PINS.join(";"));
         assert!(
-            first.starts_with("rapidocr==3.9.2;pi-heif==1.4.0;lock="),
+            first.starts_with(&want),
             "the stamp must lead with the pins joined by ';': {first}"
         );
 
         // Same pins, regenerated lock (a moved transitive dependency) — must invalidate the marker.
-        std::fs::write(&lock, b"rapidocr==3.9.2 \\\n    --hash=sha256:bbb\n").unwrap();
+        std::fs::write(&lock, b"pkg==0 \\\n    --hash=sha256:bbb\n").unwrap();
         assert_ne!(
             first,
             mgr.optional_stamp(&OPTIONAL_OCR_COMPONENT).unwrap(),
             "a regenerated lock must not go on satisfying the old marker"
         );
+    }
+
+    #[test]
+    fn an_installed_component_survives_a_base_lock_update() {
+        // The in-place update after a base lock moves: the marker is there but stale. Before, this
+        // left photo OCR off with Storage still showing it installed.
+        assert!(should_reinstall_optional(false, true, false));
+        // Rebuilt venv: whatever the user had goes back, current marker or not.
+        assert!(should_reinstall_optional(true, true, true));
+        assert!(should_reinstall_optional(true, true, false));
+        // Already satisfied, or never installed / removed by the user: leave it alone.
+        assert!(!should_reinstall_optional(false, true, true));
+        assert!(!should_reinstall_optional(true, false, false));
+        assert!(!should_reinstall_optional(false, false, false));
+    }
+
+    /// A superseded package is uninstalled before its component's lock installs, so it must never be
+    /// in that lock: every install would then remove a package only to put it straight back. The
+    /// OCR entry is the reason the field exists (rapidocr 3.10 moved `opencv-python` to its
+    /// headless build), so it is pinned too.
+    #[test]
+    fn a_superseded_package_is_never_in_its_own_lock() {
+        for component in ALL_OPTIONAL_COMPONENTS {
+            let path = format!(
+                "{}/../sidecar/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                component.lock
+            );
+            let lock = std::fs::read_to_string(&path).expect("the component lock is checked in");
+            let locked: Vec<String> = lock
+                .lines()
+                .filter_map(|l| l.split_once("=="))
+                .map(|(name, _)| name.trim().to_ascii_lowercase())
+                .collect();
+            for gone in component.superseded {
+                assert!(
+                    !locked.contains(&gone.to_ascii_lowercase()),
+                    "{gone} is superseded yet still in {}",
+                    component.lock
+                );
+            }
+        }
+        assert_eq!(OPTIONAL_OCR_COMPONENT.superseded, &["opencv-python"]);
     }
 
     /// L-6: the audit-only `sidecar/requirements-optional.txt` (which `just pip-audit` scans) must list

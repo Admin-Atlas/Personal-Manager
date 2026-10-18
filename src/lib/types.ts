@@ -1427,9 +1427,11 @@ export interface OcrStatus {
 
 /** One on-device component in the Storage manager (the venv, the t-SNE libraries, the photo-OCR
  *  stack, the speech model, the active search model). `status` drives the action: removable now,
- *  blocked behind a dependent, required, in-use (managed elsewhere), or installable (an optional
- *  component not yet downloaded — the photo-OCR stack, whose `size_bytes` is then an estimate). */
-export type StorageStatus = "required" | "in_use" | "removable" | "blocked" | "installable";
+ *  blocked behind a dependent, required, in-use (managed elsewhere), installable (an optional
+ *  component not yet downloaded — the photo-OCR stack, whose `size_bytes` is then an estimate), or
+ *  stale (on disk but not working since an update: offers Install to repair it AND Remove). */
+export type StorageStatus =
+  "required" | "in_use" | "removable" | "blocked" | "installable" | "stale";
 export interface StorageBlocker {
   label: string;
   /** The component id to scroll to (remove that one first). */

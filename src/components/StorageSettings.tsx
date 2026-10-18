@@ -7,8 +7,9 @@
 // only be removed once nothing still needs it — its Remove button is greyed with a pill that jumps to
 // the dependent to remove first; the cascade is also enforced in the backend. numpy is never offered
 // (shared with the search model). Removing the big libraries asks for an extra confirm that recommends
-// keeping them. The photo-OCR stack is also installed from here (its row offers Install when absent),
-// so the whole feature is enabled/disabled in one place.
+// keeping them. The photo-OCR stack is also installed from here (its row offers Install when absent,
+// and Install beside Remove when an update left it on disk but not working), so the whole feature
+// is enabled/disabled in one place.
 
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -198,8 +199,8 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
 }
 
 function StatusChip({ status }: { status: StorageComponent["status"] }) {
-  // Removable and installable rows carry their own action button — no chip needed.
-  if (status === "removable" || status === "installable") return null;
+  // Removable, installable and stale rows carry their own action buttons — no chip needed.
+  if (status === "removable" || status === "installable" || status === "stale") return null;
   // `blocked` means installed and held by a dependent, not missing — say "Installed" first, or a
   // shared library reads as something still to be downloaded. The blocker pill names the holder.
   const label =
@@ -267,9 +268,14 @@ function ComponentRow({
             </div>
           )}
         </div>
-        <div className="shrink-0">
-          {c.status === "removable" && (
-            <Button variant="secondary" onClick={onRemove} disabled={busy}>
+        <div className="flex shrink-0 gap-2">
+          {c.status === "stale" && (
+            <Button variant="secondary" onClick={onInstall} disabled={installing || busy}>
+              {installing ? "Installing…" : "Install again"}
+            </Button>
+          )}
+          {(c.status === "removable" || c.status === "stale") && (
+            <Button variant="secondary" onClick={onRemove} disabled={busy || installing}>
               {busy ? "Removing…" : "Remove"}
             </Button>
           )}

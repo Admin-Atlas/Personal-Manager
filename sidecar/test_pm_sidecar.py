@@ -34,6 +34,19 @@ from unittest import mock
 import pm_sidecar as S
 
 
+def _needs_fastembed(reason):
+    """Skip a real-fastembed test where fastembed is absent (a plain `just sidecar-test` on a system
+    Python, locally or in CI) — unless `PM_REQUIRE_FASTEMBED=1`, which makes the absence a FAILURE
+    instead, so a run meant to exercise the pinned fastembed can't pass by skipping. pr.yml's
+    python job sets it for its second run, against a venv built from `sidecar/requirements.lock
+    --require-hashes`, on any PR that touches sidecar/. Locally:
+    `PM_REQUIRE_FASTEMBED=1 <venv>/bin/python sidecar/test_pm_sidecar.py`, inside the capped
+    systemd-run scope on the Linux dev machine."""
+    if os.environ.get("PM_REQUIRE_FASTEMBED") == "1":
+        return lambda test: test
+    return unittest.skipUnless(importlib.util.find_spec("fastembed") is not None, reason)
+
+
 class _FakeEncoding:
     def __init__(self, ids, attention_mask):
         self.ids = ids
@@ -120,10 +133,7 @@ class CountTokensTest(unittest.TestCase):
         ):
             self.assertIsNone(S.get_tokenizer("some-model"))
 
-    @unittest.skipUnless(
-        importlib.util.find_spec("fastembed") is not None,
-        "fastembed not installed (real-tokenizer counting is a local-only check)",
-    )
+    @_needs_fastembed("fastembed not installed (real-tokenizer counting is a local-only check)")
     def test_real_bge_tokenizer_mixed_batch_is_not_inflated(self):
         texts = ["Hi.", "the quarterly revenue rose across regions", " ".join(["lorem"] * 80)]
         counts = S.do_count_tokens({"texts": texts})["counts"]
@@ -139,10 +149,7 @@ class EmbedTest(unittest.TestCase):
     tokenizer fastembed embeds with, so an over-window chunk crashed ONNX (a 512-vs-N broadcast)
     instead of being truncated. Real-model, so local-only (skipped where fastembed is absent)."""
 
-    @unittest.skipUnless(
-        importlib.util.find_spec("fastembed") is not None,
-        "fastembed not installed (real embedding is a local-only check)",
-    )
+    @_needs_fastembed("fastembed not installed (real embedding is a local-only check)")
     def test_over_window_chunk_embeds_without_crashing(self):
         # ~750 words — comfortably past the 512-token window. Counting first caches the cloned
         # counting tokenizer; the bug would have stripped the embedder's own truncation, so this
@@ -319,16 +326,22 @@ class AnalyzeImageTest(unittest.TestCase):
                 S.do_analyze_image({"path": "/no/such/image.png", "run_ocr": True})
 
 
-def _fake_rapidocr(captured, model_file="/pm/models/rapidocr/det.onnx"):
+def _fake_rapidocr(captured, model_file="/pm/models/rapidocr/det.onnx", lazy=True):
     """A stand-in `rapidocr` package: enough of the real shape to pin the offline contract.
 
-    Two details are load-bearing and mirrored exactly from rapidocr 3.9.0:
+    Three details are load-bearing and mirrored exactly from rapidocr (3.9.0, and 3.10.0 for the
+    third):
 
     1. the engine holds its OWN reference to the downloader class (`from ... import DownloadFile`),
-       so patching the class attribute has to reach it; and
+       so patching the class attribute has to reach it;
     2. the engine calls `DownloadFile.run` UNCONDITIONALLY — the "it's already downloaded" check
        lives inside `run`, not around the call. A guard that simply refuses would therefore break
-       the warm cache as thoroughly as the cold one.
+       the warm cache as thoroughly as the cold one; and
+    3. from 3.10 the constructor is LAZY: it only reads config, `text_det`/`text_cls`/`text_rec`
+       start as None, and each session (with its model download) is built by `_load_<task>_model`,
+       which `__call__` runs on first use. `lazy=False` is the <= 3.9 shape, which built all three
+       in the constructor. A fake in the old shape is what let every test here pass on a 3.10 bump
+       that left the fetcher with nothing to fetch (#932).
     """
     import types
 
@@ -348,7 +361,25 @@ def _fake_rapidocr(captured, model_file="/pm/models/rapidocr/det.onnx"):
     class RapidOCR:
         def __init__(self, params=None):
             captured["params"] = params
-            DownloadFile.run(DownloadFileInput(model_file))
+            self.text_det = self.text_cls = self.text_rec = None
+            if not lazy:
+                for task in ("det", "cls", "rec"):
+                    getattr(self, f"_load_{task}_model")()
+
+        def _load(self, attr):
+            if getattr(self, attr) is None:
+                DownloadFile.run(DownloadFileInput(model_file))
+                setattr(self, attr, object())
+            return getattr(self, attr)
+
+        def _load_det_model(self):
+            return self._load("text_det")
+
+        def _load_cls_model(self):
+            return self._load("text_cls")
+
+        def _load_rec_model(self):
+            return self._load("text_rec")
 
     dl.DownloadFile = DownloadFile
     dl.DownloadFileInput = DownloadFileInput
@@ -369,8 +400,12 @@ class OcrOfflineContractTest(unittest.TestCase):
     swallowed it, and OCR was permanently and silently off. These pin the contract that fixes it.
     """
 
-    def _engine(self, captured, offline, models_dir="/pm/models", model_file=None):
-        mods = _fake_rapidocr(captured, model_file) if model_file else _fake_rapidocr(captured)
+    def _engine(self, captured, offline, models_dir="/pm/models", model_file=None, lazy=True):
+        mods = (
+            _fake_rapidocr(captured, model_file, lazy=lazy)
+            if model_file
+            else _fake_rapidocr(captured, lazy=lazy)
+        )
         with (
             mock.patch.dict(sys.modules, mods),
             mock.patch.object(S, "_ocr_engine", None),
@@ -418,7 +453,33 @@ class OcrOfflineContractTest(unittest.TestCase):
         # one child allowed a socket, so the same call must go through.
         captured = {}
         self._engine(captured, offline=False)
-        self.assertEqual(len(captured["downloads"]), 1)
+        self.assertEqual(len(captured["downloads"]), 3, "detection, orientation and recognition")
+
+    def test_the_fetcher_builds_every_session_of_a_lazy_engine(self):
+        # rapidocr 3.10 made the constructor lazy. Built alone it fetches NOTHING, the fetcher
+        # reports success, the offline retry misses again and OCR never gets its models (#932).
+        for lazy in (True, False):
+            with self.subTest(lazy=lazy):
+                captured = {}
+                engine = self._engine(captured, offline=False, lazy=lazy)
+                self.assertEqual(len(captured["downloads"]), 3)
+                for attr in ("text_det", "text_cls", "text_rec"):
+                    self.assertIsNotNone(getattr(engine, attr), attr)
+
+    def test_an_engine_that_builds_no_sessions_fails_closed(self):
+        # If rapidocr renames its loaders again, the fetcher must FAIL, not report a no-op success
+        # that leaves the worker missing forever.
+        captured = {}
+        mods = _fake_rapidocr(captured)
+        del mods["rapidocr"].RapidOCR._load_rec_model
+        with (
+            mock.patch.dict(sys.modules, mods),
+            mock.patch.object(S, "_ocr_engine", None),
+            mock.patch.object(S, "_OFFLINE", False),
+            mock.patch.object(S, "_MODELS_DIR", "/pm/models"),
+        ):
+            with self.assertRaises(RuntimeError):
+                S.get_ocr_engine()
 
     def test_ensure_model_knows_how_to_fetch_for_analyze_image(self):
         # Without this branch the fetcher raised "nothing to fetch for method 'analyze_image'", so
@@ -432,7 +493,156 @@ class OcrOfflineContractTest(unittest.TestCase):
         ):
             # No path in the params: Rust strips them, and nothing here may touch the image.
             S._ensure_model("analyze_image", {})
-        self.assertEqual(len(captured["downloads"]), 1)
+        self.assertEqual(len(captured["downloads"]), 3)
+
+
+# PM's one custom (non-bundled) model today, exactly as `custom_spec` in src-tauri/src/sidecar.rs
+# builds it from `BGE_RERANKER_V2_M3` in registry.rs.
+_RERANKER_SPEC = {
+    "model": "BAAI/bge-reranker-v2-m3",
+    "hf": "onnx-community/bge-reranker-v2-m3-ONNX",
+    "model_file": "onnx/model_int8.onnx",
+    "pooling": "none",
+    "normalize": False,
+    "dim": 0,
+    "local_path": None,
+}
+
+
+_FASTEMBED_090_RERANKERS = ("Xenova/ms-marco-MiniLM-L-6-v2", "BAAI/bge-reranker-v2-m3")
+
+
+def _fake_fastembed(captured, builtins=_FASTEMBED_090_RERANKERS):
+    """A stand-in `fastembed` with the one behaviour #956 turns on: `add_custom_model` refuses a
+    name its table already holds (a built-in, or an earlier registration) exactly as 0.9.0's
+    does, and a constructor only accepts a name in that table."""
+    pkg = types.ModuleType("fastembed")
+    rerank = types.ModuleType("fastembed.rerank")
+    cross = types.ModuleType("fastembed.rerank.cross_encoder")
+    common = types.ModuleType("fastembed.common")
+    desc = types.ModuleType("fastembed.common.model_description")
+
+    class ModelSource:
+        def __init__(self, hf=None, url=None):
+            self.hf, self.url = hf, url
+
+    class TextCrossEncoder:
+        _table = set(builtins)
+
+        @classmethod
+        def list_supported_models(cls):
+            return [{"model": name, "sources": {"hf": name}} for name in sorted(cls._table)]
+
+        @classmethod
+        def add_custom_model(cls, model, sources, model_file, **_):
+            if model in cls._table:
+                raise ValueError(f"Model {model} is already registered in CrossEncoderModel")
+            cls._table.add(model)
+            captured.setdefault("registered", []).append((model, sources.hf, model_file))
+
+        def __init__(self, model_name, **kwargs):
+            if model_name not in self._table:
+                raise ValueError(f"Model {model_name} is not supported")
+            self.model_name = model_name
+
+    desc.ModelSource = ModelSource
+    cross.TextCrossEncoder = TextCrossEncoder
+    rerank.cross_encoder = cross
+    common.model_description = desc
+    pkg.rerank, pkg.common = rerank, common
+    return {
+        "fastembed": pkg,
+        "fastembed.rerank": rerank,
+        "fastembed.rerank.cross_encoder": cross,
+        "fastembed.common": common,
+        "fastembed.common.model_description": desc,
+    }
+
+
+class CustomModelNameTest(unittest.TestCase):
+    """#956: fastembed 0.9.0 ships `BAAI/bge-reranker-v2-m3` as a BUILT-IN, PM registered its own
+    int8 export under that same name, and `add_custom_model` raised "already registered" before
+    the model loaded. The Rust gateway reads any rerank error as "no rerank", so every multilingual
+    vault silently lost its reranking, and CI (no fastembed) was green. These pin the fix: a custom
+    model is registered under a name only PM uses, while the registry id stays the id."""
+
+    def _reranker(self, captured, model, spec):
+        with (
+            mock.patch.dict(sys.modules, _fake_fastembed(captured)),
+            mock.patch.object(S, "_registered", set()),
+            mock.patch.object(S, "_rerankers", {}),
+            mock.patch.object(S, "_OFFLINE", False),
+        ):
+            first = S.get_reranker(model, spec)
+            again = S.get_reranker(model, spec)
+        self.assertIs(first, again, "cached for the process")
+        return first
+
+    def test_a_custom_name_is_never_a_registry_id(self):
+        # Pure: holds whichever fastembed is installed, so this half runs in CI too.
+        name = S._fastembed_name(_RERANKER_SPEC["model"], _RERANKER_SPEC)
+        self.assertTrue(name.startswith(S._CUSTOM_NAMESPACE))
+        self.assertNotEqual(name, _RERANKER_SPEC["model"])
+        bundled = "Xenova/ms-marco-MiniLM-L-6-v2"
+        self.assertEqual(S._fastembed_name(bundled, None), bundled)
+
+    def test_a_custom_reranker_beside_a_same_named_builtin_registers_and_loads(self):
+        captured = {}
+        engine = self._reranker(captured, _RERANKER_SPEC["model"], _RERANKER_SPEC)
+        want = S._CUSTOM_NAMESPACE + "BAAI/bge-reranker-v2-m3"
+        self.assertEqual(
+            captured["registered"],
+            [(want, "onnx-community/bge-reranker-v2-m3-ONNX", "onnx/model_int8.onnx")],
+            "registered once, under PM's own name, from PM's own export",
+        )
+        # The built-in of the same id is the 2.27 GB FP32 model: it must never be what loads.
+        self.assertEqual(engine.model_name, want)
+
+    def test_a_bundled_reranker_keeps_its_own_name_and_registers_nothing(self):
+        captured = {}
+        engine = self._reranker(captured, "Xenova/ms-marco-MiniLM-L-6-v2", None)
+        self.assertEqual(engine.model_name, "Xenova/ms-marco-MiniLM-L-6-v2")
+        self.assertNotIn("registered", captured)
+
+    @_needs_fastembed("fastembed not installed (the real model table is a local-only check)")
+    def test_the_pinned_fastembed_has_no_builtin_under_a_pm_custom_name(self):
+        # The real table: run with a venv built from sidecar/requirements.lock. No download.
+        from fastembed import TextEmbedding
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+        name = S._fastembed_name(_RERANKER_SPEC["model"], _RERANKER_SPEC)
+        for cls in (TextCrossEncoder, TextEmbedding):
+            builtins = {d["model"] for d in cls.list_supported_models()} - S._registered
+            self.assertNotIn(name, builtins, cls.__name__)
+            self.assertFalse(any(b.startswith(S._CUSTOM_NAMESPACE) for b in builtins), cls.__name__)
+        # And the registration itself goes through on the real class (on 0.9.0 it raised before).
+        S._register_custom(TextCrossEncoder, name, _RERANKER_SPEC)
+        self.assertIn(name, {d["model"] for d in TextCrossEncoder.list_supported_models()})
+
+    @unittest.skipUnless(
+        os.environ.get("PM_TEST_RERANKER_MODELS"),
+        "set PM_TEST_RERANKER_MODELS to a models dir holding the cached bge-reranker-v2-m3 int8",
+    )
+    def test_the_multilingual_reranker_loads_offline_and_ranks(self):
+        # The end-to-end half of the #956 guard, offline: the custom name has to resolve to the int8
+        # export PM's cache already holds, and the scores have to mean something.
+        with (
+            mock.patch.object(S, "_MODELS_DIR", os.environ["PM_TEST_RERANKER_MODELS"]),
+            mock.patch.object(S, "_OFFLINE", True),
+        ):
+            out = S.do_rerank(
+                {
+                    "query": "Wann ist die Miete fällig?",
+                    "passages": [
+                        "Das Rezept braucht drei Eier und Mehl.",
+                        "Die Miete ist am ersten Tag jedes Monats fällig.",
+                    ],
+                    "model": _RERANKER_SPEC["model"],
+                    "custom": _RERANKER_SPEC,
+                }
+            )
+        off_topic, relevant = out["scores"]
+        self.assertGreater(relevant, off_topic)
 
 
 def _case_sensitive(path):

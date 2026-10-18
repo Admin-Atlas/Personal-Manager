@@ -131,7 +131,7 @@ const BGE_SMALL_EN: ModelEntry = ModelEntry {
 /// pooling, L2-normalized, asymmetric `query: ` / `passage: ` prefixes applied in Rust by
 /// [`apply_prefix`]), just wider.
 //
-// Native support CONFIRMED: fastembed 0.8.1's `list_supported_models()` lists
+// Native support CONFIRMED: fastembed 0.8.1's and 0.9.0's `list_supported_models()` list
 // `intfloat/multilingual-e5-large` (and not e5-small, which is why PR 2 needed a custom export), so
 // `model_file: None` is correct — fastembed downloads + loads it directly. The remaining hardware
 // verification is narrower (the first live 1024 exercise): that the download embeds at 1024-d with
@@ -175,7 +175,9 @@ const MS_MARCO_MINILM: ModelEntry = ModelEntry {
 
 /// The multilingual cross-encoder reranker (PR 2) — `bge-reranker-v2-m3`, paired with the
 /// multilingual embedder. Not bundled: registered via `add_custom_model` from a community ONNX
-/// export (int8, ~570 MB). Replaces the deprecated jina-v2-multilingual reranker.
+/// export (int8, ~570 MB). Replaces the deprecated jina-v2-multilingual reranker. fastembed 0.9.0
+/// ships a built-in under this very id (the 2.27 GB FP32 export), so the sidecar registers this one
+/// under its own `pm-custom/` name; the id here, and so the config stamp, stays as it is (#956).
 const BGE_RERANKER_V2_M3: ModelEntry = ModelEntry {
     id: "BAAI/bge-reranker-v2-m3",
     role: Role::Reranker,

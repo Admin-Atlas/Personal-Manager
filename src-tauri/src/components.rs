@@ -3,7 +3,7 @@
 
 //! On-device storage inventory + a reference-counted, guarded teardown of the large, regenerable
 //! components PM downloads: the optional t-SNE stack (`openTSNE` → `scikit-learn`/`scipy`), the
-//! optional photo-OCR stack (`rapidocr`+`pi-heif` → `opencv-python`/`shapely`/`pyclipper`), the
+//! optional photo-OCR stack (`rapidocr`+`pi-heif` → OpenCV/`shapely`/`pyclipper`), the
 //! Whisper speech model, and a **read-only** view of the active embedder.
 //!
 //! The photo-OCR stack is also **installable** from this inventory (the one place it's enabled or
@@ -39,12 +39,18 @@ enum Status {
     /// An optional component that isn't installed yet — offers an Install action (photo OCR). The
     /// `size_bytes` on such a row is an estimate of what installing it will use, not on-disk usage.
     Installable,
+    /// An optional component that is on disk but not working (photo OCR whose marker a moved lock
+    /// left stale) — offers Install, to repair it, AND Remove, so the space can be had back without
+    /// first downloading it all again. `size_bytes` is real on-disk usage.
+    Stale,
 }
 
-/// Rough on-disk footprint of the optional photo-OCR stack once installed (opencv-python is the bulk
-/// at ~110 MB, rapidocr ~30 MB, the rest small). Shown on the not-yet-installed row so the cost is
-/// visible before choosing to install; never added to the on-disk total (nothing is on disk yet).
-const OCR_INSTALL_ESTIMATE_BYTES: u64 = 150 * 1024 * 1024;
+/// Rough on-disk footprint of the optional photo-OCR stack once installed: measured at 204 MiB with
+/// rapidocr 3.10.0 (OpenCV's headless build is the bulk; the old estimate of 150 MiB undercounted
+/// even the 239 MiB the full opencv-python build used). Shown on the not-yet-installed row so the
+/// cost is visible before choosing to install; never added to the on-disk total (nothing is on disk
+/// yet). The ~31 MB of OCR models download separately, on the first photo.
+const OCR_INSTALL_ESTIMATE_BYTES: u64 = 205 * 1024 * 1024;
 
 /// A dependent that must be removed first; `anchor` is the component id to scroll to in this tab.
 #[derive(Serialize)]
@@ -229,7 +235,68 @@ fn embedder_estimate_bytes(id: &str) -> u64 {
     mb * 1024 * 1024
 }
 
-fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageReport {
+/// The photo-OCR row. The feature is a first-class row whether or not it's installed: when working
+/// it's Removable (the image libraries cascade-remove under it), and otherwise it offers an Install
+/// action right here, so the whole feature is enabled/disabled in one place, like the others.
+///
+/// "Working" is the sidecar's marker (`ocr_ready`, what ingest reads), not the packages being on
+/// disk. They part ways when a lock moves and the reinstall at the next launch fails (offline, a
+/// dropped download): the old packages stay, every photo is indexed without its text, and a row
+/// keyed on presence alone went on showing OCR installed with nothing to press. Installing over
+/// the stale copy is what repairs it; Remove stays on offer beside it (`Status::Stale`), because
+/// the image libraries under it stay cascade-blocked while it is on disk, and an offline user who
+/// wants the space back must not have to download it all first.
+fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
+    let label = "Photo text recognition (rapidocr)".into();
+    match (present, ready) {
+        (true, true) => Component {
+            id: "ocr",
+            label,
+            detail: "Reads text out of dropped photos and screenshots (OCR), on-device.".into(),
+            size_bytes: size,
+            approximate: false,
+            child: false,
+            status: Status::Removable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some(
+                "Removing it indexes new photos by date and location only, with no text. \
+                 You can reinstall it any time."
+                    .into(),
+            ),
+        },
+        (true, false) => Component {
+            id: "ocr",
+            label,
+            detail: "Reads text out of dropped photos and screenshots (OCR), on-device. It is on \
+                     this computer but needs installing again after an update before it works."
+                .into(),
+            size_bytes: size,
+            approximate: false,
+            child: false,
+            status: Status::Stale,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some("Until then, photos are indexed by their date and location only.".into()),
+        },
+        (false, _) => Component {
+            id: "ocr",
+            label,
+            detail: "Reads text out of dropped photos and screenshots (OCR) so it's searchable — \
+                     all on-device. Optional, a one-time download."
+                .into(),
+            size_bytes: OCR_INSTALL_ESTIMATE_BYTES,
+            approximate: true,
+            child: false,
+            status: Status::Installable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some("Without it, photos are indexed by their date and location only.".into()),
+        },
+    }
+}
+
+fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageReport {
     let site = site_packages_dir(venv);
     let (tsne_present, tsne_size) = pkg(site.as_ref(), "openTSNE", &["openTSNE", "openTSNE-*"]);
     let (sklearn_present, sklearn_size) = pkg(
@@ -241,7 +308,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
 
     // Optional photo-OCR stack. The top-level component bundles rapidocr + pi-heif (the two pins
     // `uninstall_optional_ocr` removes) plus its tiny pure-Python siblings; the heavy image libraries
-    // (opencv-python / shapely / pyclipper) are separate, cascade-removable children. numpy is shared
+    // (OpenCV / shapely / pyclipper) are separate, cascade-removable children. numpy is shared
     // with the embedder and never listed. pyclipper installs no import dir, so it needs `pkg_dist`.
     let (ocr_present, ocr_size) = pkg(
         site.as_ref(),
@@ -376,47 +443,12 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
         );
     }
 
-    // The photo-OCR feature is a first-class row whether or not it's installed: when present it's
-    // Removable (the image libraries cascade-remove under it), and when absent it offers an Install
-    // action right here — so the whole feature is enabled/disabled in one place, like the others.
-    if ocr_present {
-        components.push(Component {
-            id: "ocr",
-            label: "Photo text recognition (rapidocr)".into(),
-            detail: "Reads text out of dropped photos and screenshots (OCR), on-device.".into(),
-            size_bytes: ocr_size,
-            approximate: false,
-            child: false,
-            status: Status::Removable,
-            blockers: Vec::new(),
-            manage: None,
-            note: Some(
-                "Removing it indexes new photos by date and location only, with no text. \
-                 You can reinstall it any time."
-                    .into(),
-            ),
-        });
-    } else {
-        components.push(Component {
-            id: "ocr",
-            label: "Photo text recognition (rapidocr)".into(),
-            detail: "Reads text out of dropped photos and screenshots (OCR) so it's searchable — \
-                     all on-device. Optional, a one-time download."
-                .into(),
-            size_bytes: OCR_INSTALL_ESTIMATE_BYTES,
-            approximate: true,
-            child: false,
-            status: Status::Installable,
-            blockers: Vec::new(),
-            manage: None,
-            note: Some("Without it, photos are indexed by their date and location only.".into()),
-        });
-    }
+    components.push(ocr_row(ocr_present, ocr_ready, ocr_size));
     if cv2_present {
         lib(
             &mut components,
             "opencv-python",
-            "OpenCV (opencv-python)",
+            "OpenCV (opencv-python-headless)",
             "Image processing used by photo text recognition.",
             cv2_size,
         );
@@ -500,7 +532,12 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
         "scikit-learn" => sidecar.pip_uninstall(&["scikit-learn", "joblib", "threadpoolctl"])?,
         "scipy" => sidecar.pip_uninstall(&["scipy"])?,
         "ocr" => sidecar.uninstall_optional_ocr()?,
-        "opencv-python" => sidecar.pip_uninstall(&["opencv-python"])?,
+        // The row keeps its old id (the frontend keys on it), but what is installed changed name:
+        // rapidocr 3.10 depends on `opencv-python-headless`, and a venv that had OCR before still
+        // holds `opencv-python`. Both own the same `cv2/` folder, so removing only one leaves either
+        // nothing reclaimed (a new install) or a dist-info pointing at deleted files (an old one).
+        // `pip uninstall -y` skips whichever is absent.
+        "opencv-python" => sidecar.pip_uninstall(&["opencv-python-headless", "opencv-python"])?,
         "shapely" => sidecar.pip_uninstall(&["shapely"])?,
         "pyclipper" => sidecar.pip_uninstall(&["pyclipper"])?,
         "whisper" => {
@@ -529,7 +566,9 @@ pub async fn list_storage_components(app: AppHandle) -> Result<StorageReport> {
     };
     let venv = paths::venv_dir(&app)?;
     let data = paths::data_dir(&app)?;
-    tauri::async_runtime::spawn_blocking(move || build_report(&venv, &data, &embedder))
+    // A marker read and a hash of the small OCR lock: cheap enough to take before the walk.
+    let ocr_ready = app.state::<AppState>().sidecar.optional_ocr_ready();
+    tauri::async_runtime::spawn_blocking(move || build_report(&venv, &data, &embedder, ocr_ready))
         .await
         .map_err(|e| Error::Other(format!("storage scan task panicked: {e}")))
 }
@@ -597,6 +636,24 @@ mod tests {
         assert_eq!(blocker_for("ocr", true, true, true), None);
         assert_eq!(blocker_for("opencv-python", true, true, false), None);
         assert_eq!(blocker_for("scipy", false, false, true), None);
+    }
+
+    #[test]
+    fn ocr_on_disk_but_not_working_offers_install() {
+        let row = |present, ready| ocr_row(present, ready, 7);
+        assert!(matches!(row(true, true).status, Status::Removable));
+        // The stale copy a failed reinstall leaves: Install AND Remove, sized as what is really on
+        // disk. Not plain Installable, which would leave it (and the libraries it blocks) with no
+        // way off the disk short of downloading it all again.
+        let stale = row(true, false);
+        assert!(matches!(stale.status, Status::Stale));
+        assert_eq!((stale.size_bytes, stale.approximate), (7, false));
+        let absent = row(false, false);
+        assert!(matches!(absent.status, Status::Installable));
+        assert_eq!(
+            (absent.size_bytes, absent.approximate),
+            (OCR_INSTALL_ESTIMATE_BYTES, true)
+        );
     }
 
     #[test]

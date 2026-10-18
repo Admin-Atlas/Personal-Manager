@@ -194,9 +194,9 @@
       "note": "Classifier says MIT only; the LICENSE file is MIT plus the PSF licence covering the CPython code it backports."
     },
     "fastembed": {
-      "versions": ["0.8.1"],
+      "versions": ["0.9.0"],
       "licence": "Apache-2.0",
-      "stamp": "3e84b2213e1fc1c05c4f4b57aa0d0a74",
+      "stamp": "37b3881cdf666040598f36c2a0a10c91",
       "evidence": {
         "expression": null,
         "license": "Apache-2.0",
@@ -474,7 +474,7 @@
         "classifiers": ["License :: OSI Approved :: MIT License"]
       }
     },
-    "opencv-python": {
+    "opencv-python-headless": {
       "versions": ["5.0.0.93"],
       "licence": "Apache-2.0 AND MIT",
       "stamp": "8b60ee0c8a3b993b6e99e2a003e4039e",
@@ -483,7 +483,7 @@
         "license": "Apache 2.0",
         "classifiers": ["License :: OSI Approved :: Apache Software License"]
       },
-      "note": "Two licences in one wheel: OpenCV itself — the library in the binary — is Apache-2.0, which is what `license` reports; the opencv-python packaging project that builds the wheel is MIT."
+      "note": "Two licences in one wheel: OpenCV itself — the library in the binary — is Apache-2.0, which is what `license` reports; the opencv-python packaging project that builds the wheel (this is its headless build, the one rapidocr 3.10 depends on) is MIT. Same evidence stamp as the opencv-python entry it replaces."
     },
     "openpyxl": {
       "versions": ["3.1.5"],
@@ -694,9 +694,9 @@
       }
     },
     "rapidocr": {
-      "versions": ["3.9.2"],
+      "versions": ["3.10.0"],
       "licence": "Apache-2.0",
-      "stamp": "8e26456be1444bed6ade123556797b2e",
+      "stamp": "6902bf00ea983c4afaa311757fc4c37e",
       "evidence": {
         "expression": "Apache-2.0",
         "license": null,
