@@ -600,7 +600,7 @@ pub enum SeriesRefusal {
     /// A whole series moved into another zone.
     ZoneChange,
     /// A part PM split off this series from this day is still there, and the series still repeats
-    /// past it ([`overlapping_part`]).
+    /// past it ([`parts_overlap`]).
     SplitOverlap(NaiveDate),
     /// PM couldn't list the parts it split off this series.
     PartsUnread,

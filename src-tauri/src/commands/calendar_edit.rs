@@ -2101,7 +2101,10 @@ async fn send_series<W: Wire, H: Host>(
     // The series' rows before the first send, so a sync that lands mid-run can't hide which rows
     // are new (review M4). A new series has none yet. A split's record is kept in the same lock,
     // before anything goes out, so a quit mid-change leaves it (review H3); failing that, nothing
-    // is sent.
+    // is sent. The record is this run's from before it's written to the end of the landing and look.
+    let _splitting = entry
+        .as_ref()
+        .map(|e| Splitting::mark(ctx.host.edit(), series_key(&e.calendar, &e.tail)));
     let snapshot = match ctx.host.with_conn(|conn| {
         let rows = calendar::series_rows(
             conn,
@@ -2120,10 +2123,6 @@ async fn send_series<W: Wire, H: Host>(
             }
         }
     };
-    // Its record is this run's from here to the end of its landing and look.
-    let _splitting = entry
-        .as_ref()
-        .map(|e| Splitting::mark(ctx.host.edit(), &e.calendar, &e.tail));
     let ran = drive(ctx.wire, &mut run).await;
     let (Some(facts), Some(entry)) = (facts, entry) else {
         return land_series(ctx, mirror, planning, run.plan(), ran, snapshot, landing).await;
@@ -2949,8 +2948,9 @@ struct Splitting<'a> {
 }
 
 impl<'a> Splitting<'a> {
-    fn mark(edit: &'a CalendarEditState, remote_calendar: &str, tail: &str) -> Self {
-        let key = series_key(remote_calendar, tail);
+    /// Mark the split whose new part is `key` ([`series_key`]). Before its record is written, or
+    /// before it leaves `partials`, so no moment shows a record with neither (review round 3).
+    fn mark(edit: &'a CalendarEditState, key: String) -> Self {
         if let Ok(mut running) = edit.splitting.lock() {
             running.insert(key.clone());
         }
@@ -3514,12 +3514,14 @@ async fn settle_split<W: Wire, H: Host>(
     let Some(_flight) = InFlight::claim_all(edit, &keys) else {
         return WriteOutcome::Busy;
     };
+    // Marked running before it leaves `partials` (the second key is its new part's).
+    let [_, tail_key] = keys;
+    let _splitting = Splitting::mark(edit, tail_key);
     let Some((taken, held)) = TakenSplit::take(edit, token) else {
         return settling();
     };
     let remote = held.target.remote_calendar.clone();
     let (master, tail) = (held.facts.master.clone(), held.facts.tail.clone());
-    let _splitting = Splitting::mark(edit, &remote, &tail);
     let outcome = settle_taken(wire, host, token, action, taken, held).await;
     // The claims still held, and the split held again unless it's settled: a settled one's record
     // goes (review H3). An unconfirmed end keeps it, for Google to be read again.
@@ -3973,6 +3975,8 @@ async fn orphaned<W: Wire, H: Host>(
             // Shown twice only while the original still repeats from the split on: read off the
             // occurrences, as the backstop reads them (review round 1).
             let overlap = match &original {
+                // Its exceptions read whole, as the new part's side requires (review round 3).
+                None if !planning.series.exceptions.complete => Parts::Unread,
                 None => planning.series.parts,
                 Some(Fetched::Event(copy)) => {
                     original_overlap(wire, remote, mirror, copy, this).await
@@ -9749,7 +9753,13 @@ mod tests {
         let plan = split_plan(Vec::new());
         let (held, _) = lost_cut(&host, lost()).await;
         let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
-        let mut steps = vec![event_read("abc", Scripted::Json(cut_copy(&plan)))];
+        // The settle marks its split running from before it's taken out of `partials`.
+        let at_look = Arc::clone(&host);
+        let mut steps = vec![
+            event_read("abc", Scripted::Json(cut_copy(&plan))).then(move || {
+                assert!(at_look.edit.splitting(&series_key(CALENDAR, TAIL)));
+            }),
+        ];
         steps.extend(tail_reads(tail, Vec::new()));
         steps.push(ical_listing(
             "iCalUID=abc%40google.com",
@@ -9766,8 +9776,9 @@ mod tests {
         assert_eq!(outcome, saved());
         assert_eq!(split_rows(&host).1, ids_of(rows_of(&tail_october())));
         assert_eq!(held_count(&host), 0);
-        // Finished: its record goes.
+        // Finished: its record goes, and so does the mark.
         assert!(host.journal().is_empty());
+        assert!(!host.edit.splitting(&series_key(CALENDAR, TAIL)));
     }
 
     // --- the journal, and the overlap backstop (C9a-3b-2) ---
@@ -9843,6 +9854,8 @@ mod tests {
                     let entry = journal.get(&journal::key(CALENDAR, "abc")).unwrap();
                     let want = orphan_entry(&split_plan(Vec::new()), false);
                     assert!(*entry == want, "the record isn't the split's");
+                    // And marked as this run's, so no look reads it as left over.
+                    assert!(at_insert.edit.splitting(&series_key(CALENDAR, TAIL)));
                 }),
                 series_patch(Scripted::Json(cut_copy(&plan))),
                 refetch_read(Scripted::Json(page(vec![october()[0].clone()], None))),
@@ -9852,6 +9865,7 @@ mod tests {
         .await;
         assert_eq!(outcome, saved());
         assert!(host.journal().is_empty());
+        assert!(!host.edit.splitting(&series_key(CALENDAR, TAIL)));
     }
 
     /// A split whose record can't be kept sends nothing: a quit mid-change would leave no trace.
@@ -9989,12 +10003,49 @@ mod tests {
         script.asked_all();
         assert_eq!(outcome, saved());
         assert_eq!(host.journal().len(), 1);
+        // Its exceptions not read whole: PM can't say it shows twice, so it can't check it now.
+        let unknown = Orphaned {
+            entry: entry.clone(),
+            orphan: Orphan::Unknown,
+        }
+        .words();
+        let steps = vec![
+            instance_read(&monday_19()),
+            Step::get("/events/abc", "", weekly()),
+            Step::get(
+                "/events",
+                "iCalUID=abc%40google.com",
+                page(vec![weekly()], Some("p2")),
+            ),
+            Step::status("/events", "pageToken=p2", 500),
+            window_read(october()),
+            parts_read(vec![tail.clone()]),
+            event_read(TAIL, Scripted::Json(tail.clone())),
+        ];
+        let script = Script::new(steps);
+        let opened = Some((&monday_19(), Some(&weekly())));
+        let (this, _, _, notice) = rows_of_choices(
+            ask_on(
+                &host,
+                &script,
+                &monday_19(),
+                edit(title("Again")),
+                opened,
+                &["abc"],
+            )
+            .await,
+        );
+        assert_eq!((this, notice), (refused_with(&unknown), None));
+        assert_eq!(host.journal().len(), 1);
         // The original's occurrences from the split deleted one by one in Google: its rule is as
         // before, but nothing shows twice. Said once as changed, then the backstop guards it.
         let mut cleared = october();
         cleared[1] = cancelled("2026-10-19T09:00:00+01:00");
         cleared[2] = cancelled("2026-10-26T09:00:00Z");
-        let mut steps = reads(&twelfth, &weekly(), vec![weekly()], cleared);
+        // Listed whole: the series and its two cancelled occurrences.
+        let mut listed = vec![weekly()];
+        listed.extend(cleared[1..].iter().cloned());
+        let mut steps = reads(&twelfth, &weekly(), listed, cleared);
         steps.pop();
         steps.push(parts_read(vec![tail.clone()]));
         steps.push(event_read(TAIL, Scripted::Json(tail)));
@@ -10111,6 +10162,29 @@ mod tests {
             .await,
         );
         assert_eq!(all, refused_with(&twice));
+        // The original's exceptions unread: unknown, never twice, and the record stays.
+        let mut steps = tail_series_reads(weekly(), None);
+        steps.push(Step::status("/events", "iCalUID=abc%40google.com", 500));
+        steps.push(window_read(october()));
+        let script = Script::new(steps);
+        let (_, _, all, _) = rows_of_choices(
+            ask_on(
+                &host,
+                &script,
+                &occurrence,
+                delete.clone(),
+                None,
+                &["abc", TAIL],
+            )
+            .await,
+        );
+        let unknown = Orphaned {
+            entry: entry.clone(),
+            orphan: Orphan::Unknown,
+        }
+        .words();
+        assert_eq!(all, refused_with(&unknown));
+        assert_eq!(host.journal().len(), 1);
         // Its rule as before, but from the split on only an occurrence changed on its own is left
         // on it: the rule no longer repeats there, so nothing shows twice. Said once as changed.
         let other = restarted_with(&entry);
@@ -10339,7 +10413,7 @@ mod tests {
         }
         .words();
         assert_eq!(this, refused_with(&twice));
-        let _running = Splitting::mark(&host.edit, CALENDAR, TAIL);
+        let _running = Splitting::mark(&host.edit, series_key(CALENDAR, TAIL));
         let instance = monday_19();
         let script = Script::new(reads(&instance, &weekly(), vec![weekly()], october()));
         let opened = Some((&instance, Some(&weekly())));
