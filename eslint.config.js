@@ -40,6 +40,7 @@ const CALENDAR_WRITES = {
     "cancelCalendarDelete",
     "listHeldDeletes",
     "seriesChoices",
+    "settleSeriesSplit",
   ],
   message: "Calendar edits go only through src/components/calendar/edit/useEventWrites.ts (#884).",
 };

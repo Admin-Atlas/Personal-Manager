@@ -143,6 +143,7 @@ import type {
   SeenSummary,
   SeriesChoices,
   SeriesScope,
+  SplitAction,
   WriteOutcome,
 } from "./types";
 
@@ -1119,6 +1120,11 @@ export const listHeldDeletes = () => invoke<HeldDeleteInfo[]>("list_held_deletes
  *  planned against Google's copies now: what it would do, or why it can't. Only reads go to Google. */
 export const seriesChoices = (request: ChoiceRequest) =>
   invoke<SeriesChoices>("series_choices", { request });
+
+/** Settle a "this and following" change PM couldn't finish (`token` from a `partial_split` outcome
+ *  or a `pending` row): look again, remove the new part, or finish the change. */
+export const settleSeriesSplit = (token: string, action: SplitAction) =>
+  invoke<WriteOutcome>("settle_series_split", { token, action });
 
 /** A held delete went to Google, and this is what came of it (none for an undone one). */
 export const onCalendarDeleteSettled = (

@@ -311,13 +311,6 @@ impl Run {
     /// holds ([`Settled::CutDone`]) runs the cleanup after it; an unknown insert whose new series is
     /// there ([`Settled::TailThere`]) runs the cut onward. Anything else is [`Unfit`], so no cut is
     /// ever sent again on less than that (plan.rs: "unknown offers neither").
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3b, settling a partial split"
-        )
-    )]
     pub fn finish(plan: SeriesPlan, ran: &Ran, settled: &Settled) -> Result<Run, Unfit> {
         let insert = plan
             .steps
@@ -561,10 +554,13 @@ impl Run {
             }
         };
         // A server error may have been applied whatever the flag says, and an answer classify can't
-        // read (a 409 to a change is no insert's duplicate) proves nothing either way.
-        if matches!(verdict, Verdict::ServerError | Verdict::Other(..))
-            || (verdict == Verdict::Duplicate && method != Method::Insert)
-        {
+        // read (a 409 to a change is no insert's duplicate) proves nothing either way. A 409 to an
+        // insert says Google holds its id, so a copy may be there: no later copy that never went, or
+        // was refused, proves it isn't (C9a-3b, the exhaustive insert test).
+        if matches!(
+            verdict,
+            Verdict::ServerError | Verdict::Other(..) | Verdict::Duplicate
+        ) {
             self.copies.in_doubt = true;
         }
         if verdict == Verdict::Ok {
@@ -587,6 +583,12 @@ impl Run {
             return Read::Check;
         }
         match verdict {
+            // A 404 to a new series' first POST, nothing in doubt: Google refused it before making
+            // anything (its calendar isn't there for this account). After a repost (A9) a 404 is no
+            // proof, and is looked for as before (C9a-3a critique L6).
+            Verdict::Gone if method == Method::Insert && !self.copies.reposted => {
+                Read::NotDone(Why::Refused(Verdict::Gone))
+            }
             Verdict::Gone => match self.plan.verdict(self.at, None) {
                 Applied::Yes => Read::Done(None, date),
                 Applied::No => Read::NotDone(Why::Gone),
@@ -1036,10 +1038,6 @@ fn find_occurrence(list: &Value, original: Point) -> Option<(String, String)> {
 
 /// What to do about a split a run left partial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first chosen in C9a-3b, settling a partial split")
-)]
 pub enum SettleAction {
     /// Look again: GETs only.
     Check,
@@ -1069,6 +1067,10 @@ pub enum Settled {
     /// The new series is deleted, or wasn't there to delete: Remove's answer, and Check's when a
     /// rollback's delete that couldn't be proved turns out done.
     Removed,
+    /// Check, after an unknown cut: the original is gone from Google (deleted there), so there is
+    /// nothing left to cut or carry from, and the new series is the only copy of what follows. Remove
+    /// isn't for this: it would delete that copy (C9a-3b critique L5).
+    OriginalGone,
     /// PM can't tell: look again later.
     Unknown,
 }
@@ -1124,13 +1126,6 @@ pub struct Settle {
 
 impl Settle {
     /// Settle what `ran` left of `plan`, or `None` when it left no split to settle.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3b, settling a partial split"
-        )
-    )]
     pub fn new(plan: SeriesPlan, ran: &Ran, action: SettleAction) -> Option<Settle> {
         let insert = plan
             .steps
@@ -1305,6 +1300,7 @@ impl Settle {
                     },
                 };
                 match (self.action, at_a_cut_etag, fresh) {
+                    (SettleAction::Check, false, None) => self.over(Settled::OriginalGone),
                     (SettleAction::Check, false, _) => self.over(Settled::CutNotDone),
                     (SettleAction::Check, true, _) => self.over(Settled::CutUnproved),
                     (SettleAction::Remove, false, _) => self.look_at_tail_to_delete(),
@@ -2102,8 +2098,8 @@ mod tests {
 
     /// [`no_answer_without_proof_ever_deletes_the_new_series`] with copies that never went: once a
     /// copy of the cut is in doubt, an unsent one after it proves nothing, however the answers fall.
-    /// (Google at a newer etag is left out: no copy can land there, so an unsent resend on it is the
-    /// proof it should be.)
+    /// The one proof among them: Google shown at a newer etag, where no earlier copy can land, and
+    /// the resend on it unsent; then, and only then, the new series is deleted (C9a-3b critique M2).
     #[test]
     fn an_unsent_cut_never_deletes_the_new_series_while_a_copy_may_land() {
         let (case, plan) = split_case(Vec::new());
@@ -2136,13 +2132,17 @@ mod tests {
             lost(),
             status(Verdict::ServerError),
             ok(third_rule),
+            ok(at_etag(&old, "\"m7\"")),
         ];
-        let mut runs = 0;
+        let (mut runs, mut proofs) = (0, 0);
         for first in &in_doubt {
             for w in 0..later.len().pow(2) {
                 for g in 0..gets.len().pow(3) {
                     let pick = |n: usize, i: usize, base: usize| (n / base.pow(i as u32)) % base;
                     let (mut wi, mut gi) = (0, 0);
+                    // An unsent copy on an etag no earlier copy went out on.
+                    let mut on: Vec<String> = Vec::new();
+                    let mut proved = false;
                     let (ran, sent, _) =
                         drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
                             Method::Insert => ok(tail.clone()),
@@ -2153,6 +2153,9 @@ mod tests {
                                     _ => lost(),
                                 };
                                 wi += 1;
+                                let etag = r.if_match.clone().unwrap_or_default();
+                                proved |= matches!(a, Answer::Unsent(_)) && !on.contains(&etag);
+                                on.push(etag);
                                 a
                             }
                             Method::Get => {
@@ -2167,15 +2170,258 @@ mod tests {
                             Method::Delete => deleted(),
                         });
                     runs += 1;
-                    assert!(!deletes_the_tail(&sent), "{first:?} {w}/{g}: {sent:?}");
-                    assert!(
-                        matches!(ran, Ran::Unknown { step: 1, .. }),
-                        "{first:?} {w}/{g}: {ran:?}"
-                    );
+                    if proved {
+                        proofs += 1;
+                        assert!(deletes_the_tail(&sent), "{first:?} {w}/{g}: {sent:?}");
+                        assert!(
+                            matches!(
+                                ran,
+                                Ran::NotDone {
+                                    step: 1,
+                                    why: Why::Unsent(_),
+                                    rollback: Rollback::Done,
+                                    ..
+                                }
+                            ),
+                            "{first:?} {w}/{g}: {ran:?}"
+                        );
+                    } else {
+                        assert!(!deletes_the_tail(&sent), "{first:?} {w}/{g}: {sent:?}");
+                        assert!(
+                            matches!(ran, Ran::Unknown { step: 1, .. }),
+                            "{first:?} {w}/{g}: {ran:?}"
+                        );
+                    }
                 }
             }
         }
-        assert_eq!(runs, 9 * 144 * 64);
+        assert_eq!(runs, 9 * 144 * 125);
+        assert!(proofs > 0);
+    }
+
+    /// C9a-3b critique M3: a plain 412 whose GET shows Google at the copy's own etag sends the same
+    /// copy once more; that copy refused, nothing of the cut can land, so an unsent one is proof and
+    /// the new series goes.
+    #[test]
+    fn a_412_the_get_contradicts_then_an_unsent_copy_is_proof() {
+        let (case, plan) = split_case(Vec::new());
+        let tail = tail_of(&plan, "\"t1\"");
+        let old = case.master.json().clone();
+        let mut patches = 0;
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Insert => ok(tail.clone()),
+            Method::Patch => {
+                patches += 1;
+                if patches == 1 {
+                    status(Verdict::Conflict)
+                } else {
+                    Answer::Unsent(Unsent::Offline)
+                }
+            }
+            Method::Get => ok(if to(r, TAIL) {
+                tail.clone()
+            } else {
+                old.clone()
+            }),
+            Method::Delete => deleted(),
+        });
+        assert!(
+            matches!(
+                ran,
+                Ran::NotDone {
+                    step: 1,
+                    why: Why::Unsent(Unsent::Offline),
+                    rollback: Rollback::Done,
+                    ..
+                }
+            ),
+            "{ran:?}"
+        );
+        let cuts: Vec<Option<&str>> = sent
+            .iter()
+            .filter(|r| r.method == Method::Patch)
+            .map(|r| r.if_match.as_deref())
+            .collect();
+        assert_eq!(cuts, [Some("\"m1\""), Some("\"m1\"")]);
+        assert_eq!(
+            sent.iter()
+                .filter(|r| r.method == Method::Delete && to(r, TAIL))
+                .count(),
+            1
+        );
+    }
+
+    /// C9a-3a critique L6 and corner a, for the insert: however its answers fall, the cut goes out
+    /// only once Google showed this plan's new series (its reply, or a GET), the insert is posted at
+    /// most twice, nothing is deleted, and the run ends not done at the insert only on a first answer
+    /// that proves nothing went (unsent) or a 404 to the first POST.
+    #[test]
+    fn no_answer_without_proof_ever_sends_the_cut_or_strands_the_new_series() {
+        let (case, plan) = split_case(Vec::new());
+        let tail = tail_of(&plan, "\"t1\"");
+        let mut other = tail.clone();
+        other["extendedProperties"]["private"]["pmSplitPlan"] = json!("another plan");
+        let gone_tail = with(tail.clone(), "status", json!("cancelled"));
+        let cut = landed(case.master.json(), &plan.steps[1], "\"m2\"");
+        let posts = [
+            lost(),
+            after_5xx(Verdict::ServerError),
+            status(Verdict::Duplicate),
+            status(Verdict::Gone),
+            Answer::Unsent(Unsent::Offline),
+            ok(tail.clone()),
+            Answer::Reply {
+                verdict: Verdict::Ok,
+                body: None,
+                date: None,
+                maybe_applied: false,
+            },
+            ok(other.clone()),
+        ];
+        let gets = [
+            ok(tail.clone()),
+            status(Verdict::Gone),
+            lost(),
+            status(Verdict::ServerError),
+            ok(other),
+            ok(gone_tail),
+        ];
+        let shows_tail =
+            |a: &Answer| matches!(a, Answer::Reply { body: Some(b), .. } if *b == tail);
+        let (mut runs, mut refused, mut done) = (0, 0, 0);
+        for p in 0..posts.len().pow(3) {
+            for g in 0..gets.len().pow(3) {
+                let pick = |n: usize, i: usize, base: usize| (n / base.pow(i as u32)) % base;
+                let (mut pi, mut gi) = (0, 0);
+                let mut proved = false;
+                let (ran, sent, _) =
+                    drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+                        Method::Insert => {
+                            let a = if pi < 3 {
+                                posts[pick(p, pi, posts.len())].clone()
+                            } else {
+                                lost()
+                            };
+                            pi += 1;
+                            proved |= shows_tail(&a);
+                            a
+                        }
+                        Method::Get => {
+                            let a = if gi < 3 {
+                                gets[pick(g, gi, gets.len())].clone()
+                            } else {
+                                lost()
+                            };
+                            gi += 1;
+                            proved |= shows_tail(&a);
+                            a
+                        }
+                        Method::Patch => {
+                            assert!(proved, "{p}/{g}: the cut before the new series showed");
+                            ok(cut.clone())
+                        }
+                        Method::Delete => deleted(),
+                    });
+                runs += 1;
+                let inserts = sent.iter().filter(|r| r.method == Method::Insert).count();
+                assert!(inserts <= 2, "{p}/{g}: {inserts} posts");
+                assert!(!sent.iter().any(|r| r.method == Method::Delete), "{p}/{g}");
+                let first = &posts[pick(p, 0, posts.len())];
+                let proof_first = matches!(
+                    first,
+                    Answer::Unsent(_)
+                        | Answer::Reply {
+                            verdict: Verdict::Gone,
+                            ..
+                        }
+                );
+                match &ran {
+                    Ran::NotDone { step: 0, .. } => {
+                        refused += 1;
+                        assert!(proof_first && sent.len() == 1, "{p}/{g}: {ran:?}");
+                    }
+                    Ran::Done { .. } => {
+                        done += 1;
+                        assert!(proved, "{p}/{g}");
+                    }
+                    Ran::Unknown { step: 0, .. } => assert!(!proof_first, "{p}/{g}"),
+                    other => panic!("{p}/{g}: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(runs, 512 * 216);
+        assert!(refused > 0 && done > 0);
+    }
+
+    #[test]
+    fn an_unsent_first_insert_is_proof_and_nothing_else_goes_out() {
+        let (_, plan) = split_case(Vec::new());
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |_| {
+            Answer::Unsent(Unsent::Offline)
+        });
+        assert!(matches!(
+            ran,
+            Ran::NotDone {
+                step: 0,
+                why: Why::Unsent(Unsent::Offline),
+                rollback: Rollback::Nothing,
+                ..
+            }
+        ));
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn a_404_to_the_first_insert_is_proof_its_calendar_isnt_there() {
+        let (_, plan) = split_case(Vec::new());
+        let (ran, sent, waits) = drive(&mut Run::new(plan).unwrap(), |_| status(Verdict::Gone));
+        assert!(matches!(
+            ran,
+            Ran::NotDone {
+                step: 0,
+                why: Why::Refused(Verdict::Gone),
+                rollback: Rollback::Nothing,
+                ..
+            }
+        ));
+        assert_eq!(sent.len(), 1);
+        assert!(waits.is_empty());
+    }
+
+    /// A 404 to a repost is no proof: the first copy, lost or answered 409, may be Google's.
+    #[test]
+    fn a_404_to_a_repost_after_a_lost_or_duplicate_insert_is_never_proof() {
+        let (_, plan) = split_case(Vec::new());
+        for first in [lost(), status(Verdict::Duplicate)] {
+            let mut posts = 0;
+            let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+                Method::Insert => {
+                    posts += 1;
+                    if posts == 1 {
+                        first.clone()
+                    } else {
+                        status(Verdict::Gone)
+                    }
+                }
+                _ => status(Verdict::Gone),
+            });
+            assert!(matches!(ran, Ran::Unknown { step: 0, .. }), "{ran:?}");
+            assert_eq!(
+                sent.iter().filter(|r| r.method == Method::Insert).count(),
+                2
+            );
+        }
+    }
+
+    /// C9a-3b critique L5: a look after an unknown cut that finds the original gone says so; Remove
+    /// isn't asked of it.
+    #[test]
+    fn a_check_that_finds_the_original_gone_says_so() {
+        let (_, plan, ran) = partial(weekly());
+        let mut settle = Settle::new(plan, &ran, SettleAction::Check).unwrap();
+        let (settled, sent, _) = drive(&mut settle, |_| status(Verdict::Gone));
+        assert_eq!(settled, Settled::OriginalGone);
+        assert_eq!(sent.len(), 1);
     }
 
     #[test]

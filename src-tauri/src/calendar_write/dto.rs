@@ -221,11 +221,33 @@ pub enum WriteOutcome {
     /// The plan for the occurrences chosen isn't the one the dialog showed any more, or none was
     /// named: choose again. Nothing was sent.
     NeedsChoice,
-    /// Google answered as if it had saved the change, but kept the event as it was. `split`: the
-    /// new series of a split was removed too (C9a-3b).
+    /// Google answered as if it had saved the change, but kept the event as it was. `split`: the new
+    /// part a "this and following" change made was removed too.
     IgnoredByGoogle {
         split: bool,
     },
+    /// A "this and following" change PM couldn't finish: Google may hold part of it. `token` names
+    /// it for settling; `offers` is what Google's state allows now; `from` is the day the change
+    /// starts (`YYYY-MM-DD`, in the series' zone). Never an id or an etag (R5).
+    PartialSplit {
+        token: String,
+        offers: Vec<SplitAction>,
+        from: String,
+    },
+    /// The new part of a change PM couldn't finish was removed: the repeating event is as it was.
+    SplitRemoved,
+}
+
+/// What to do about a "this and following" change PM couldn't finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitAction {
+    /// Delete the new part, once Google shows the original wasn't cut.
+    Remove,
+    /// Run the rest of the same change, once Google shows the part before it landed.
+    Finish,
+    /// Look again (reads only).
+    Check,
 }
 
 /// What asking to delete came to: held for its Undo window, or refused at once.
@@ -386,6 +408,13 @@ pub enum ScopeRow {
     Refused { message: String },
     /// Changed in Google since the editor opened, on these fields.
     Conflict { fields: Vec<String> },
+    /// A change PM couldn't finish holds this series (C9 design review M1): settle it first, as
+    /// [`WriteOutcome::PartialSplit`] says.
+    Pending {
+        token: String,
+        offers: Vec<SplitAction>,
+        from: String,
+    },
 }
 
 /// What the user should know before choosing a row. Dates are `YYYY-MM-DD` in the series' zone.
@@ -462,6 +491,19 @@ mod tests {
                 WriteOutcome::IgnoredByGoogle { split: false },
                 r#"{"outcome":"ignored_by_google","split":false}"#,
             ),
+            (
+                WriteOutcome::IgnoredByGoogle { split: true },
+                r#"{"outcome":"ignored_by_google","split":true}"#,
+            ),
+            (
+                WriteOutcome::PartialSplit {
+                    token: "t".into(),
+                    offers: vec![SplitAction::Remove, SplitAction::Check],
+                    from: "2026-11-02".into(),
+                },
+                r#"{"outcome":"partial_split","token":"t","offers":["remove","check"],"from":"2026-11-02"}"#,
+            ),
+            (WriteOutcome::SplitRemoved, r#"{"outcome":"split_removed"}"#),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),
             (WriteOutcome::Gone, r#"{"outcome":"gone"}"#),
             (WriteOutcome::Busy, r#"{"outcome":"busy"}"#),
@@ -572,6 +614,22 @@ mod tests {
             serde_json::to_string(&choices).unwrap(),
             r#"{"outcome":"ready","this":{"row":"offered","warnings":[],"token":"t1"},"following":{"row":"as_all","warnings":[{"warning":"split_sibling"},{"warning":"exceptions_may_reset","count":2,"complete":false},{"warning":"repeat_day_changes","from":"2026-10-18","to":"2026-10-19","before":"every Sunday","after":null,"shift_days":1}],"token":"t2"},"all":{"row":"conflict","fields":["summary"]}}"#
         );
+        assert_eq!(
+            serde_json::to_string(&ScopeRow::Pending {
+                token: "t".into(),
+                offers: vec![SplitAction::Finish],
+                from: "2026-11-02".into(),
+            })
+            .unwrap(),
+            r#"{"row":"pending","token":"t","offers":["finish"],"from":"2026-11-02"}"#
+        );
+        for (text, action) in [
+            (r#""remove""#, SplitAction::Remove),
+            (r#""finish""#, SplitAction::Finish),
+            (r#""check""#, SplitAction::Check),
+        ] {
+            assert_eq!(serde_json::from_str::<SplitAction>(text).unwrap(), action);
+        }
         for (choices, json) in [
             (
                 SeriesChoices::NotRepeating,

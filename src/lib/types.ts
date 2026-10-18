@@ -1671,7 +1671,12 @@ export type ScopeRow =
   /** "This and following" from the first occurrence: every occurrence, as "All events". */
   | { row: "as_all"; warnings: SeriesWarning[]; token: string }
   | { row: "refused"; message: string }
-  | { row: "conflict"; fields: string[] };
+  | { row: "conflict"; fields: string[] }
+  /** A change PM couldn't finish holds this series: settle it first (as `partial_split` says). */
+  | { row: "pending"; token: string; offers: SplitAction[]; from: string };
+
+/** What to do about a "this and following" change PM couldn't finish. */
+export type SplitAction = "remove" | "finish" | "check";
 
 /** The three choices for one change to a repeating occurrence, each planned against Google now. */
 export type SeriesChoices =
@@ -1692,8 +1697,14 @@ export type WriteOutcome =
   | { outcome: "no_change" }
   /** The repeating event's plan changed since the user chose: ask again; nothing was sent. */
   | { outcome: "needs_choice" }
-  /** Google answered success and kept what was there. */
+  /** Google answered success and kept what was there; `split`: the new part a "this and
+   *  following" change made was removed too. */
   | { outcome: "ignored_by_google"; split: boolean }
+  /** A "this and following" change PM couldn't finish: Google may hold part of it. `offers` is what
+   *  Google's state allows now; `from` is the day the change starts (YYYY-MM-DD). */
+  | { outcome: "partial_split"; token: string; offers: SplitAction[]; from: string }
+  /** The new part of a change PM couldn't finish was removed: the event is as it was. */
+  | { outcome: "split_removed" }
   | { outcome: "conflict"; fields: string[] }
   | { outcome: "gone" }
   | { outcome: "read_only"; reason: ReadOnlyReason }

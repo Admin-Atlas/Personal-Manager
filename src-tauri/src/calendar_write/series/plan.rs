@@ -572,6 +572,29 @@ const CANCEL_WATCH: &[&str] = &[
     "guestsCanSeeOtherGuests",
 ];
 
+/// The original's listed exceptions of `series` from `at` on (by original start, in `zone`), each
+/// with what a cleanup cancel watches of it, sorted: what a "Finish" compares a fresh listing with,
+/// so it never runs on occurrences changed since (C9 design review M5). By content, not etag, so
+/// Google touching them past a new end (P5) isn't read as someone's change (C9a-3b critique M10).
+/// One whose original start can't be read is kept too, so a new one always differs.
+pub fn marks_from(
+    items: &[Value],
+    series: &str,
+    at: Point,
+    zone: Tz,
+) -> Vec<(String, Map<String, Value>)> {
+    let mut marks: Vec<(String, Map<String, Value>)> = items
+        .iter()
+        .filter(|item| item.get("recurringEventId").and_then(Value::as_str) == Some(series))
+        .filter(|item| {
+            original_of(item).is_none_or(|p| p.cmp_in(&at, zone) != std::cmp::Ordering::Less)
+        })
+        .map(|item| (text(item, "id"), snapshot(item, CANCEL_WATCH)))
+        .collect();
+    marks.sort_by(|a, b| a.0.cmp(&b.0));
+    marks
+}
+
 const TAIL_FIELDS: &[&str] = &[
     "summary",
     "description",
@@ -810,6 +833,32 @@ impl SeriesPlan {
             None => recurrence.to_vec(),
         };
         Some((lines, start))
+    }
+
+    /// Whether `fresh`, Google's copy of the new series step `step` inserted, still holds what that
+    /// step sent, read as [`SeriesPlan::same`] reads (PM's own notes aside): a change made to it in
+    /// Google since (a rename, a move) means it's no longer only PM's to delete (C9a-3b critique M6).
+    pub fn tail_as_inserted(&self, step: usize, fresh: &Value) -> bool {
+        let Some(Op::Insert { body, .. }) = self.steps.get(step).map(|s| &s.op) else {
+            return false;
+        };
+        !is_gone(fresh)
+            && body
+                .iter()
+                .all(|(k, want)| self.same(k, Some(want), fresh.get(k.as_str())))
+    }
+
+    /// The occurrences the new series step `step` inserts leaves out from the start (the original's
+    /// deleted ones, as EXDATEs): Google may list them as cancelled occurrences of it, which are no
+    /// change anyone made (C9a-3b critique M11).
+    pub fn tail_exdates(&self, step: usize) -> Vec<Point> {
+        let Some(Op::Insert { body, .. }) = self.steps.get(step).map(|s| &s.op) else {
+            return Vec::new();
+        };
+        match body.get("start").and_then(start_of) {
+            Some(start) => excluded(&lines_of(body.get("recurrence")), &start),
+            None => Vec::new(),
+        }
     }
 
     /// Where the cleanup cancels among `skipped` would have cancelled.
@@ -3741,6 +3790,64 @@ mod tests {
 
     /// A29, C9 design review scope-L1: the rule and start a change leaves, for the question a move to
     /// another day asks; the master's rule where the change moves only the start.
+    #[test]
+    fn marks_from_keeps_the_originals_own_exceptions_from_the_split_on_by_content() {
+        use chrono_tz::Europe::London;
+        let at = point("2026-10-19T09:00:00+01:00");
+        let before = with(
+            plain("2026-10-12T09:00:00+01:00"),
+            "summary",
+            json!("Before"),
+        );
+        let after = with(plain("2026-11-02T09:00:00Z"), "summary", json!("Off-site"));
+        let mut elsewhere = after.clone();
+        elsewhere["recurringEventId"] = json!("other");
+        let mut unplaced = plain("2026-11-09T09:00:00Z");
+        unplaced["id"] = json!("abc_unplaced");
+        unplaced
+            .as_object_mut()
+            .unwrap()
+            .remove("originalStartTime");
+        let items = vec![weekly(), before, after.clone(), elsewhere, unplaced];
+        let marks = marks_from(&items, "abc", at, London);
+        let ids: Vec<&str> = marks.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["abc_20261102T090000Z", "abc_unplaced"]);
+        // Google touching it (a new etag, a new `updated`) is no change; a new title is.
+        let touched = with(
+            with(after.clone(), "etag", json!("\"z9\"")),
+            "updated",
+            json!("2026-10-18T00:00:00.000Z"),
+        );
+        assert_eq!(marks_from(&[touched], "abc", at, London), marks[..1]);
+        let renamed = with(after, "summary", json!("Renamed"));
+        assert_ne!(marks_from(&[renamed], "abc", at, London), marks[..1]);
+    }
+
+    #[test]
+    fn a_new_part_is_read_against_what_its_insert_sent() {
+        let plan = Case::new(weekly(), monday_19())
+            .exceptions(vec![cancelled("2026-11-02T09:00:00Z")])
+            .edit(Scope::Following, title("Retro"))
+            .unwrap();
+        let Op::Insert { body, .. } = &plan.steps[0].op else {
+            panic!("not a split");
+        };
+        let mut copy = Value::Object(body.clone());
+        copy["id"] = json!(TAIL);
+        copy["etag"] = json!("\"t1\"");
+        copy["status"] = json!("confirmed");
+        assert!(plan.tail_as_inserted(0, &copy));
+        // PM's own notes aside: a fence or a split note is bookkeeping.
+        let mut noted = copy.clone();
+        noted["extendedProperties"]["private"]["pmFence"] = json!("x");
+        assert!(plan.tail_as_inserted(0, &noted));
+        assert!(!plan.tail_as_inserted(0, &with(copy.clone(), "summary", json!("Renamed"))));
+        assert!(!plan.tail_as_inserted(0, &with(copy.clone(), "status", json!("cancelled"))));
+        assert!(!plan.tail_as_inserted(1, &copy));
+        assert_eq!(plan.tail_exdates(0), [point("2026-11-02T09:00:00Z")]);
+        assert!(plan.tail_exdates(1).is_empty());
+    }
+
     #[test]
     fn a_change_says_the_rule_it_leaves() {
         let case = Case::new(weekly(), monday_19());
