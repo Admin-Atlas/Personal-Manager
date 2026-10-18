@@ -1419,19 +1419,14 @@ async fn choices<W: Wire, H: Host>(
     let master = planning.series.master.id.as_str();
     let held = host.edit().held_on(remote, master);
     let original = original_of(planning.instance.json());
-    // A record of a change PM was making when it closed, unless a change to this series is running
-    // now, whose own record it would be (review H3).
-    let orphans = if host.edit().claimed(&series_key(remote, master)) {
-        Vec::new()
-    } else {
-        match orphaned(wire, host, remote, &planning).await {
-            Ok(orphans) => orphans,
-            Err(e) => {
-                return SeriesChoices::Refused {
-                    result: WriteOutcome::Failed {
-                        message: e.to_string(),
-                    },
-                }
+    // A record of a change PM was making when it closed (review H3).
+    let orphans = match orphaned(wire, host, remote, mirror, &planning).await {
+        Ok(orphans) => orphans,
+        Err(e) => {
+            return SeriesChoices::Refused {
+                result: WriteOutcome::Failed {
+                    message: e.to_string(),
+                },
             }
         }
     };
@@ -1462,7 +1457,6 @@ async fn choices<W: Wire, H: Host>(
         if let Some(found) = orphans.iter().find(|o| {
             matches!(o.orphan, Orphan::Twice | Orphan::Unknown)
                 && o.reaches(master, original, scope)
-                && !o.lets_through(master, request, scope)
         }) {
             return ScopeRow::Refused {
                 message: found.words(),
@@ -1957,7 +1951,8 @@ async fn prepared_for<W: Wire, H: Host>(
     }
     // One PM was making when it closed: Google's copies say what it came to (review H3). The claim
     // on this series is held, so no run of this PM is behind an entry found here.
-    let orphans = orphaned(ctx.wire, ctx.host, &ctx.target.remote_calendar, &planning)
+    let remote = ctx.target.remote_calendar.as_str();
+    let orphans = orphaned(ctx.wire, ctx.host, remote, &mirror, &planning)
         .await
         .map_err(|e| WriteOutcome::Failed {
             message: e.to_string(),
@@ -1967,7 +1962,6 @@ async fn prepared_for<W: Wire, H: Host>(
         match found.orphan {
             Orphan::Clear => forget(ctx.host, &e.calendar, &e.series, &e.tail),
             _ if !found.reaches(master, original, scope) => {}
-            _ if found.lets_through(master, request, scope) => {}
             // Said once, then it goes.
             Orphan::CutLanded | Orphan::Changed => {
                 forget(ctx.host, &e.calendar, &e.series, &e.tail);
@@ -3859,23 +3853,16 @@ impl Orphaned {
         reaches(&e.series, &e.tail, at, series, original, scope)
     }
 
-    /// The one change a provable duplicate lets through: deleting every occurrence of the new part,
-    /// while Google shows the original still holding those days (review H3, C9a-3b critique C1-H1).
-    fn lets_through(&self, series: &str, request: &ChoiceRequest, scope: Scope) -> bool {
-        self.orphan == Orphan::Twice
-            && series == self.entry.tail
-            && scope == Scope::All
-            && matches!(request, ChoiceRequest::Delete { .. })
-    }
-
-    /// What to say of it.
+    /// What to say of it. After a restart PM only refuses and says what Google shows; it deletes
+    /// nothing and offers no delete, even of a proven duplicate (DECISIONS 18-10, Q4 as narrowed by
+    /// C9a-3b critique C1-H1): the way out is in Google Calendar.
     fn words(&self) -> String {
         let day = day_words(&self.entry.from);
         match self.orphan {
             Orphan::Twice => format!(
                 "PM closed while it was changing this repeating event, so it shows twice from {day}. \
-                 Delete the new part (Delete › All events on one of its occurrences; PM won't let \
-                 that through on the earlier part), or fix it in Google Calendar."
+                 In Google Calendar, delete the newer copy (Delete › All events on it), then try \
+                 again."
             ),
             Orphan::CutLanded => format!(
                 "PM closed before it finished changing this repeating event from {day}: \
@@ -3911,16 +3898,22 @@ async fn orphaned<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     remote: &str,
+    mirror: &MirrorFacts,
     planning: &Planning,
 ) -> Result<Vec<Orphaned>> {
     let series = planning.series.master.id.as_str();
     let this = planning.series.master_fresh.json();
+    let edit = host.edit();
     let mut found = Vec::new();
     for entry in host.with_conn(stored_journal)?.into_values() {
         if entry.calendar != remote || (entry.series != series && entry.tail != series) {
             continue;
         }
-        if host.edit().held_on(remote, &entry.series).is_some() {
+        // A split held in memory stands for it, and a split or settle running now holds both its
+        // series: either way it's no orphan. Any other change holds one claim at most.
+        let running = edit.claimed(&series_key(remote, &entry.series))
+            && edit.claimed(&series_key(remote, &entry.tail));
+        if running || edit.held_on(remote, &entry.series).is_some() {
             continue;
         }
         let fetch_other = |id: &str| {
@@ -3938,14 +3931,63 @@ async fn orphaned<W: Wire, H: Host>(
         } else {
             (Some(fetch_other(&entry.tail).await), None)
         };
-        let orphan = journal::orphan(
+        let mut orphan = journal::orphan(
             &entry,
             tail.as_ref().map_or(Look::Copy(this), look),
             original.as_ref().map_or(Look::Copy(this), look),
         );
+        if orphan == Orphan::Twice {
+            // Shown twice only while the original still repeats from the split on: read off the
+            // occurrences, as the backstop reads them (review round 1).
+            let overlap = if entry.series == series {
+                planning.series.parts
+            } else {
+                original_overlap(wire, remote, mirror, &entry, this).await
+            };
+            orphan = journal::backed(orphan, overlap);
+        }
         found.push(Orphaned { entry, orphan });
     }
     Ok(found)
+}
+
+/// Whether the original of `entry` still repeats past the new part `tail` (Google's copy of it), read
+/// off its occurrences in the mirror's window.
+async fn original_overlap<W: Wire>(
+    wire: &W,
+    remote: &str,
+    mirror: &MirrorFacts,
+    entry: &Entry,
+    tail: &Value,
+) -> Parts {
+    let Some(zone) = entry.tz().filter(|_| is_plain_segment(&entry.series)) else {
+        return Parts::Unread;
+    };
+    let (time_min, time_max) = (mirror.window.0.as_str(), mirror.window.1.as_str());
+    let window = list_pages(
+        wire,
+        |page: Option<&str>| {
+            let mut query = vec![
+                ("timeMin", time_min),
+                ("timeMax", time_max),
+                ("maxResults", "250"),
+                ("fields", WINDOW_FIELDS),
+            ];
+            query.extend(page.map(|p| ("pageToken", p)));
+            plan::instances(remote, &entry.series, &query)
+        },
+        OCCURRENCE_PAGES,
+    )
+    .await;
+    let parts = Listing {
+        items: vec![tail.clone()],
+        complete: true,
+    };
+    let window = Listing {
+        items: window.items,
+        complete: window.complete,
+    };
+    parts_overlap(&parts, &entry.series, &window, &Exceptions::default(), zone)
 }
 
 /// Dev builds only: which calendars a write may change (`PM_CALENDAR_WRITE_ALLOW`, comma-separated
@@ -9816,7 +9858,7 @@ mod tests {
         let ask_at = |instance: Value| {
             let (host, tail) = (Arc::clone(&host), tail.clone());
             async move {
-                let mut steps = reads(&instance, &weekly(), vec![weekly()], october());
+                let mut steps = reads_with_part(&instance, &tail);
                 steps.push(event_read(TAIL, Scripted::Json(tail)));
                 let script = Script::new(steps);
                 let opened = Some((&instance, Some(&weekly())));
@@ -9845,7 +9887,7 @@ mod tests {
             (refused_with(&twice), refused_with(&twice))
         );
         // The send refuses alike, reading the same; only reads went out.
-        let mut steps = october_reads();
+        let mut steps = reads_with_part(&monday_19(), &tail);
         steps.push(event_read(TAIL, Scripted::Json(tail.clone())));
         let script = Script::new(steps);
         let (outcome, _) = save(
@@ -9862,8 +9904,8 @@ mod tests {
         assert_eq!(host.journal().len(), 1);
         // "This event" before the split isn't reached, and saves.
         let twelfth = october()[0].clone();
-        let mut steps = reads(&twelfth, &weekly(), vec![weekly()], october());
-        steps.push(event_read(TAIL, Scripted::Json(tail)));
+        let mut steps = reads_with_part(&twelfth, &tail);
+        steps.push(event_read(TAIL, Scripted::Json(tail.clone())));
         steps.push(Step::write(
             Method::Patch,
             "/events/abc_20261012T080000Z",
@@ -9883,12 +9925,50 @@ mod tests {
         script.asked_all();
         assert_eq!(outcome, saved());
         assert_eq!(host.journal().len(), 1);
+        // The original's occurrences from the split deleted one by one in Google: its rule is as
+        // before, but nothing shows twice. Said once as changed, then the backstop guards it.
+        let mut cleared = october();
+        cleared[1] = cancelled("2026-10-19T09:00:00+01:00");
+        cleared[2] = cancelled("2026-10-26T09:00:00Z");
+        let mut steps = reads(&twelfth, &weekly(), vec![weekly()], cleared);
+        steps.pop();
+        steps.push(parts_read(vec![tail.clone()]));
+        steps.push(event_read(TAIL, Scripted::Json(tail)));
+        let script = Script::new(steps);
+        let opened = Some((&twelfth, Some(&weekly())));
+        let (_, _, _, notice) = rows_of_choices(
+            ask_on(
+                &host,
+                &script,
+                &twelfth,
+                edit(title("Again")),
+                opened,
+                &["abc"],
+            )
+            .await,
+        );
+        let changed = Orphaned {
+            entry,
+            orphan: Orphan::Changed,
+        }
+        .words();
+        assert_eq!(notice, Some(changed));
+        assert!(host.journal().is_empty());
     }
 
-    /// The duplicate's way out: "All events" delete on the new part, while Google shows the
-    /// original uncut, so deleting it loses nothing. Anything else on the new part stays refused.
+    /// The October reads of `instance`, the parts listing holding the new part `tail`.
+    fn reads_with_part(instance: &Value, tail: &Value) -> Vec<Step> {
+        let mut steps = reads(instance, &weekly(), vec![weekly()], october());
+        steps.pop();
+        steps.push(parts_read(vec![tail.clone()]));
+        steps
+    }
+
+    /// Q4 as narrowed by critique C1-H1: after a restart PM offers no delete, not even of a proven
+    /// duplicate's new part; the words point to Google Calendar. Once Google shows the original cut,
+    /// the record clears and the new part is free again.
     #[tokio::test]
-    async fn a_proven_duplicates_new_part_can_be_deleted_whole() {
+    async fn a_proven_duplicates_new_part_is_refused_every_change_delete_included() {
         let plan = split_plan(Vec::new());
         let entry = orphan_entry(&plan, false);
         let host = restarted_with(&entry);
@@ -9897,8 +9977,10 @@ mod tests {
         tail["organizer"] = weekly()["organizer"].clone();
         tail["eventType"] = json!("default");
         let occurrence = tail_occurrence("2026-10-26T09:00:00Z", "\"u1\"");
-        let tail_series_reads = |original: Value| {
-            vec![
+        // The new part's reads, then the original, and its occurrences when an uncut rule needs
+        // them to say it shows twice.
+        let tail_series_reads = |original: Value, occurrences: Option<Vec<Value>>| {
+            let mut steps = vec![
                 instance_read(&occurrence),
                 event_read(TAIL, Scripted::Json(tail.clone())),
                 ical_listing(
@@ -9916,13 +9998,15 @@ mod tests {
                     page(Vec::new(), None),
                 ),
                 event_read("abc", Scripted::Json(original)),
-            ]
+            ];
+            steps.extend(occurrences.map(window_read));
+            steps
         };
         let delete = ChoiceRequest::Delete {
             event_id: format!("cal:{}", occurrence["id"].as_str().unwrap()),
             seen: seen_by_user(&fresh_event(occurrence.clone())),
         };
-        let script = Script::new(tail_series_reads(weekly()));
+        let script = Script::new(tail_series_reads(weekly(), Some(october())));
         let (this, following, all, _) = rows_of_choices(
             ask_on(
                 &host,
@@ -9939,13 +10023,10 @@ mod tests {
             orphan: Orphan::Twice,
         }
         .words();
-        assert_eq!(
-            (this, following),
-            (refused_with(&twice), refused_with(&twice))
-        );
-        assert!(matches!(all, ScopeRow::Offered { .. }));
-        // An edit of every occurrence of it is no way out.
-        let script = Script::new(tail_series_reads(weekly()));
+        for row in [this, following, all] {
+            assert_eq!(row, refused_with(&twice));
+        }
+        let script = Script::new(tail_series_reads(weekly(), Some(october())));
         let opened = Some((&occurrence, Some(&tail)));
         let (_, _, all, _) = rows_of_choices(
             ask_on(
@@ -9959,8 +10040,8 @@ mod tests {
             .await,
         );
         assert_eq!(all, refused_with(&twice));
-        // Not when the original was cut: deleting the new part would lose those days.
-        let script = Script::new(tail_series_reads(cut_copy(&plan)));
+        // The original cut since (in Google): nothing shows twice, and nothing was left to move.
+        let script = Script::new(tail_series_reads(cut_copy(&plan), None));
         let (_, _, all, notice) = rows_of_choices(
             ask_on(&host, &script, &occurrence, delete, None, &["abc", TAIL]).await,
         );
@@ -10121,13 +10202,41 @@ mod tests {
         assert!(host.journal().is_empty());
     }
 
-    /// While a change to the series runs, its own record is no orphan: the choices read nothing for
-    /// it and block nothing by it.
+    /// While the split or settle a record stands for runs (both its series claimed), the record is
+    /// no orphan: the choices read nothing for it and block nothing by it. A change holding the
+    /// original's claim alone (a held delete, a save) doesn't hide it.
     #[tokio::test]
     async fn a_running_changes_record_is_left_to_it() {
         let plan = split_plan(Vec::new());
-        let host = restarted_with(&orphan_entry(&plan, false));
-        let _running = InFlight::claim(&host.edit, &series_key(CALENDAR, "abc")).unwrap();
+        let entry = orphan_entry(&plan, false);
+        let host = restarted_with(&entry);
+        let held = InFlight::claim(&host.edit, &series_key(CALENDAR, "abc")).unwrap();
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let mut steps = reads_with_part(&monday_19(), &tail);
+        steps.push(event_read(TAIL, Scripted::Json(tail.clone())));
+        let script = Script::new(steps);
+        let opened = Some((&monday_19(), Some(&weekly())));
+        let (this, _, _, _) = rows_of_choices(
+            ask_on(
+                &host,
+                &script,
+                &monday_19(),
+                edit(title("Again")),
+                opened,
+                &["abc"],
+            )
+            .await,
+        );
+        let twice = Orphaned {
+            entry,
+            orphan: Orphan::Twice,
+        }
+        .words();
+        assert_eq!(this, refused_with(&twice));
+        let _running = (
+            held,
+            InFlight::claim(&host.edit, &series_key(CALENDAR, TAIL)).unwrap(),
+        );
         let instance = monday_19();
         let script = Script::new(reads(&instance, &weekly(), vec![weekly()], october()));
         let opened = Some((&instance, Some(&weekly())));

@@ -17,6 +17,7 @@ use crate::calendar_recur::lines::{recurrence_verdict, Applied};
 use crate::calendar_recur::Point;
 
 use super::plan::{is_tail_of, start_of};
+use super::Parts;
 use crate::calendar_write::patch::is_gone;
 
 /// `settings` key: the [`Journal`] as JSON. Absent when no change is running or left over.
@@ -121,8 +122,8 @@ pub enum Orphan {
     /// series.
     Changed,
     /// The original still holds its rule as it was before the change, and the new part is there: it
-    /// shows twice. Only then may the new part be deleted from PM, since the original still holds
-    /// those days.
+    /// shows twice, the only reading that may say so. PM still deletes nothing: the words point to
+    /// Google Calendar.
     Twice,
     /// PM couldn't read one of them.
     Unknown,
@@ -160,6 +161,19 @@ pub fn orphan(entry: &Entry, tail: Look<'_>, original: Look<'_>) -> Orphan {
         Applied::Yes => Orphan::Clear,
         Applied::No => Orphan::Twice,
         Applied::Unknown => Orphan::Changed,
+    }
+}
+
+/// A `Twice` reading checked against the original's occurrences (`overlap`, [`super::parts_overlap`]
+/// over the new part): an uncut rule alone doesn't prove it shows twice, since its occurrences from
+/// the split on may have been deleted one by one in Google. Without that, it was changed since; with
+/// them unread, unknown. Any other reading stands.
+pub fn backed(orphan: Orphan, overlap: Parts) -> Orphan {
+    match (orphan, overlap) {
+        (Orphan::Twice, Parts::Overlap(_)) => Orphan::Twice,
+        (Orphan::Twice, Parts::Clear) => Orphan::Changed,
+        (Orphan::Twice, Parts::Unread) => Orphan::Unknown,
+        (other, _) => other,
     }
 }
 
@@ -276,6 +290,23 @@ mod tests {
             orphan(&no_start, Look::Copy(&tail()), Look::Copy(&uncut)),
             Orphan::Changed
         );
+    }
+
+    #[test]
+    fn twice_needs_the_original_still_repeating_past_the_split() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert_eq!(backed(Orphan::Twice, Parts::Overlap(day)), Orphan::Twice);
+        assert_eq!(backed(Orphan::Twice, Parts::Clear), Orphan::Changed);
+        assert_eq!(backed(Orphan::Twice, Parts::Unread), Orphan::Unknown);
+        for other in [
+            Orphan::Clear,
+            Orphan::CutLanded,
+            Orphan::Changed,
+            Orphan::Unknown,
+        ] {
+            assert_eq!(backed(other, Parts::Clear), other);
+            assert_eq!(backed(other, Parts::Overlap(day)), other);
+        }
     }
 
     #[test]
