@@ -251,7 +251,9 @@ def _adopt_case_variant_cache(cache_dir, repo):
     case-sensitive. After the upgrade the worker missed its cache and the fetcher downloaded 67 MB
     it already had — or, offline, could not, and embedding stopped until the machine was online
     again. Windows and macOS (case-insensitive by default) find the old folder under the new name
-    and return at the first check.
+    and return at the first check. fastembed 0.9.0 did it again for the multilingual embedder
+    (`qdrant/multilingual-e5-large-onnx` became `Qdrant/...`), but it also learned to look for the
+    old spelling itself when loading offline, so this rename is now a second line of defence.
 
     Runs in the fetcher, which can write the model root; the worker sees it read-only. A failed
     rename is ignored, and the fetcher then downloads exactly as it did before."""
@@ -340,7 +342,8 @@ _markitdown = None
 # Per-model caches, keyed by model id, so one process can serve several models
 # (e.g. the English embedder plus a multilingual one). `_registered` tracks the
 # custom models already handed to fastembed's `add_custom_model` (calling it twice
-# for the same id raises).
+# for the same name raises). All four are keyed by the name fastembed knows the model by
+# (`_fastembed_name`), never the bare registry id.
 _embedders = {}
 _tokenizers = {}
 _rerankers = {}
@@ -373,14 +376,14 @@ def _load_model(build):
     """Construct a model, converting ANY failure in OFFLINE mode into ModelNotCached so Rust runs
     the network-allowed `--fetch` helper and retries. Treating every offline construction failure as
     "not downloaded yet" is deliberate: the exception differs by library and version. faster-whisper
-    surfaces huggingface_hub's `LocalEntryNotFoundError`, but fastembed 0.8.1 swallows the offline
-    error and raises a bare `ValueError("Could not load model ... from any source")` (verified
-    against the 0.8.0 venv; unchanged in 0.8.1's source), so matching specific types/messages
-    would silently break first-use ingest on a wording change. In offline mode the only recovery
-    for ANY load failure is for the fetcher (with the network) to obtain the model and retry, which
-    also self-heals a corrupt cache; if it still fails, `request()` fetches once then surfaces the
-    real error. In the FETCHER itself (`_OFFLINE` False) this is a passthrough: a genuine download
-    error must surface as-is."""
+    surfaces huggingface_hub's `LocalEntryNotFoundError`, but fastembed swallows the offline error
+    and raises a bare `ValueError("Could not load model ... from any source")` (verified against the
+    0.8.0 venv; unchanged in 0.8.1's and 0.9.0's source), so matching specific types/messages would
+    silently break first-use ingest on a wording change. In offline mode the only recovery for ANY
+    load failure is for the fetcher (with the network) to obtain the model and retry, which also
+    self-heals a corrupt cache; if it still fails, `request()` fetches once then surfaces the real
+    error. In the FETCHER itself (`_OFFLINE` False) this is a passthrough: a genuine download error
+    must surface as-is."""
     if not _OFFLINE:
         return build()
     try:
@@ -415,11 +418,46 @@ def _local_path_kwargs(spec):
     A locally-trained model (the Stage-4 learned reranker) has no Hugging Face repo to fetch from.
     fastembed's `ModelSource` requires an `hf` or `url` regardless, so Rust registers a deliberate
     placeholder — but `specific_model_path` short-circuits resolution before any source is consulted
-    (fastembed 0.8.1, `common/model_management.py`), so the placeholder is never fetched. Loading
-    still honours the offline posture: nothing here reaches the network either way.
+    (fastembed 0.8.1 and 0.9.0, `common/model_management.py`), so the placeholder is never fetched.
+    Loading still honours the offline posture: nothing here reaches the network either way.
     """
     path = (spec or {}).get("local_path")
     return {"specific_model_path": path} if path else {}
+
+
+# The namespace every custom model is registered under with fastembed. fastembed keeps ONE table of
+# model names per class, and `add_custom_model` refuses a name that is already in it. PM's registry
+# ids are the upstream names (`BAAI/bge-reranker-v2-m3`), which is exactly the kind of name a later
+# fastembed release adopts as a built-in: 0.9.0 did, for that reranker (#956). Registering under the
+# registry id then raised "already registered" before the model loaded, the Rust gateway reads any
+# rerank error as "no rerank", and every multilingual vault silently lost its reranking. Under a
+# name only PM uses, a new built-in can never collide with a registration, and fastembed can never
+# quietly hand back its own model (that one is the 2.27 GB FP32 export) in place of the one the
+# registry describes. The registry id itself is unchanged, so nothing stored (the config stamp, a
+# vault's selection) moves; the weights' cache folder is named from the `hf` source, not this name,
+# so nothing is downloaded again either.
+_CUSTOM_NAMESPACE = "pm-custom/"
+
+
+def _fastembed_name(model, spec):
+    """The name fastembed knows `model` by: the registry id for a model fastembed bundles (no
+    `spec`), or a PM-owned name in `_CUSTOM_NAMESPACE` for one PM registers itself."""
+    return _CUSTOM_NAMESPACE + spec["model"] if spec else model
+
+
+def _register_custom(cls, name, spec, **description):
+    """Hand a custom model to fastembed's `add_custom_model` under `name`, once per process."""
+    if name in _registered:
+        return
+    from fastembed.common.model_description import ModelSource
+
+    cls.add_custom_model(
+        model=name,
+        sources=ModelSource(hf=spec["hf"]),
+        model_file=spec.get("model_file", "onnx/model.onnx"),
+        **description,
+    )
+    _registered.add(name)
 
 
 def get_embedder(model=None, spec=None):
@@ -428,37 +466,35 @@ def get_embedder(model=None, spec=None):
     `spec` (present for a custom, non-bundled model) carries the fastembed
     `add_custom_model` arguments Rust derived from the registry: the HF source
     repo, the ONNX file, pooling, normalization, and dimension. We register a
-    custom model with fastembed once per id (calling it twice raises).
+    custom model with fastembed once, under its `_fastembed_name` (never the registry id).
     """
     model = model or EMBED_MODEL
-    if model not in _embedders:
+    name = _fastembed_name(model, spec)
+    if name not in _embedders:
         from fastembed import TextEmbedding
 
-        if spec and spec["model"] not in _registered:
-            from fastembed.common.model_description import ModelSource
-
-            TextEmbedding.add_custom_model(
-                model=spec["model"],
+        if spec:
+            _register_custom(
+                TextEmbedding,
+                name,
+                spec,
                 pooling=_pooling_type(spec.get("pooling")),
                 normalization=bool(spec.get("normalize", True)),
-                sources=ModelSource(hf=spec["hf"]),
                 dim=int(spec["dim"]),
-                model_file=spec.get("model_file", "onnx/model.onnx"),
             )
-            _registered.add(spec["model"])
         # local_files_only=_OFFLINE makes the offline posture hold even if the env var were somehow
         # not authoritative; fastembed passes it through **kwargs to its huggingface_hub download.
         # cache_dir keeps the weights under the shared model root (issue #286).
-        _embedders[model] = _load_model(
+        _embedders[name] = _load_model(
             lambda: TextEmbedding(
-                model_name=model,
+                model_name=name,
                 cache_dir=_fastembed_cache_dir(),
                 local_files_only=_OFFLINE,
                 **_session_posture(),
                 **_local_path_kwargs(spec),
             )
         )
-    return _embedders[model]
+    return _embedders[name]
 
 
 def get_tokenizer(model=None, spec=None):
@@ -477,8 +513,9 @@ def get_tokenizer(model=None, spec=None):
     mask. Falls back to loading the repo tokenizer, then to `None` (caller estimates).
     """
     model = model or EMBED_MODEL
-    if model in _tokenizers:
-        return _tokenizers[model]
+    name = _fastembed_name(model, spec)
+    if name in _tokenizers:
+        return _tokenizers[name]
     tok = None
     emb = get_embedder(model, spec)
     candidate = getattr(emb, "tokenizer", None) or getattr(
@@ -503,13 +540,14 @@ def get_tokenizer(model=None, spec=None):
         try:
             from tokenizers import Tokenizer
 
+            # The registry id names the Hub repo; `name` may be a PM-only alias.
             tok = Tokenizer.from_pretrained(model)
             tok.no_truncation()
         except Exception:
             tok = None
     if tok is not None:
         # Cache only on success so a transient failure retries next time.
-        _tokenizers[model] = tok
+        _tokenizers[name] = tok
     return tok
 
 
@@ -517,30 +555,25 @@ def get_reranker(model, spec=None):
     """The cross-encoder reranker for `model`, cached per id.
 
     `spec` (present for a custom, non-bundled reranker) registers it via
-    fastembed's `add_custom_model` from the HF source repo + ONNX file, once per id.
+    fastembed's `add_custom_model` from the HF source repo + ONNX file, once, under its
+    `_fastembed_name` — never the registry id, which fastembed 0.9.0 took for a built-in (#956).
     """
-    if model not in _rerankers:
+    name = _fastembed_name(model, spec)
+    if name not in _rerankers:
         from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-        if spec and spec["model"] not in _registered:
-            from fastembed.common.model_description import ModelSource
-
-            TextCrossEncoder.add_custom_model(
-                model=spec["model"],
-                sources=ModelSource(hf=spec["hf"]),
-                model_file=spec.get("model_file", "onnx/model.onnx"),
-            )
-            _registered.add(spec["model"])
-        _rerankers[model] = _load_model(
+        if spec:
+            _register_custom(TextCrossEncoder, name, spec)
+        _rerankers[name] = _load_model(
             lambda: TextCrossEncoder(
-                model_name=model,
+                model_name=name,
                 cache_dir=_fastembed_cache_dir(),
                 local_files_only=_OFFLINE,
                 **_session_posture(),
                 **_local_path_kwargs(spec),
             )
         )
-    return _rerankers[model]
+    return _rerankers[name]
 
 
 def get_whisper(model_dir):
@@ -1019,7 +1052,12 @@ def do_embed(params):
     else:
         vecs = embedder.embed(texts)
     vectors = [vec.tolist() for vec in vecs]
-    dim = int(spec["dim"]) if spec and spec.get("dim") else EMBED_DIM
+    # The width actually produced: a bundled model has no spec, so the spec's `dim` cannot be the
+    # source (it reported 384 for the 1024-d e5-large). Nothing in Rust reads it today.
+    if vectors:
+        dim = len(vectors[0])
+    else:
+        dim = int(spec["dim"]) if spec and spec.get("dim") else EMBED_DIM
     return {"vectors": vectors, "dim": dim, "model": model}
 
 
@@ -1125,6 +1163,32 @@ def _forbid_rapidocr_downloads():
         pass
 
 
+def _build_ocr_engine(RapidOCR, params):
+    """Construct rapidocr AND build its three ONNX sessions (detection, orientation, recognition)
+    now, so a model it is missing is fetched (or reported missing) here.
+
+    rapidocr 3.10 made the constructor lazy: `RapidOCR(...)` only reads its config, and each
+    session — with the download of its model — waits for the first `__call__`. The network-allowed
+    `--fetch` helper only builds the engine, so it then fetched NOTHING and reported success, the
+    OFFLINE worker missed again on the retry, and a machine that had never run OCR could never get
+    its models. Measured end to end through the confined worker on 3.10.0 (#932). Building every
+    session here restores 3.9's behaviour on both shapes: the helper downloads all three, and in
+    the worker a missing or corrupt model fails inside `_load_model`, so it becomes `ModelNotCached`
+    and rides the fetch-and-retry path instead of escaping to the caller's broad except.
+
+    Warming up on a blank image would not do: detection finds no text, so classification and
+    recognition would never be built. And if rapidocr renames these loaders again, this fails
+    closed rather than letting the fetcher report a no-op success."""
+    engine = RapidOCR(params=params)
+    for loader in ("_load_det_model", "_load_cls_model", "_load_rec_model"):
+        load = getattr(engine, loader, None)
+        if load is not None:
+            load()
+    if any(getattr(engine, k, None) is None for k in ("text_det", "text_cls", "text_rec")):
+        raise RuntimeError("rapidocr built no OCR sessions; its loader API has moved")
+    return engine
+
+
 def get_ocr_engine():
     """The OPTIONAL on-device OCR engine (rapidocr), cached. Lazy-imported so the engine — and its
     image-processing deps (opencv/shapely/pyclipper) — only load when OCR is actually requested, and
@@ -1136,7 +1200,8 @@ def get_ocr_engine():
     through `_load_model` so a cold cache in the OFFLINE worker becomes `ModelNotCached` and rides
     the fetch-and-retry path. Before that, this was the one loader outside that contract: under the
     no-network confinement rapidocr could never obtain its models, the constructor raised on every
-    photo, `do_analyze_image` swallowed it, and OCR was permanently and silently off.
+    photo, `do_analyze_image` swallowed it, and OCR was permanently and silently off. Every session
+    is built here, not on first use (`_build_ocr_engine`), or the fetcher would have nothing to do.
     """
     global _ocr_engine
     if _ocr_engine is None:
@@ -1146,7 +1211,7 @@ def get_ocr_engine():
             _forbid_rapidocr_downloads()
         model_dir = _rapidocr_model_dir()
         params = {"Global.model_root_dir": model_dir} if model_dir else None
-        _ocr_engine = _load_model(lambda: RapidOCR(params=params))
+        _ocr_engine = _load_model(lambda: _build_ocr_engine(RapidOCR, params))
     return _ocr_engine
 
 

@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.5-alpha",
+    date: "2026-10-18",
+    highlights: [
+      "Under-the-hood tidying: updates to the on-device search models' library, to photo text recognition, and to a piece of the app's window code. The search update would have quietly switched off the extra ranking step for multilingual libraries, so PM now keeps that step under a name of its own. If you've added photo text recognition, PM sets it up again by itself the first time it starts after this update, with a slimmer build of the image library it uses, and a computer that has never read a photo still fetches what it needs on the first one. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.148.4-alpha",
     date: "2026-10-17",
     highlights: [

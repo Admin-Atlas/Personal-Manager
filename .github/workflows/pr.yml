@@ -187,6 +187,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Full history so the base commit is present for the sidecar-changed check below.
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -200,6 +202,25 @@ jobs:
         run: just ruff-fmt
       - name: Sidecar unit tests
         run: just sidecar-test
+      # The step above runs on the runner's bare Python, so every test that needs the REAL
+      # fastembed skips, and a fastembed bump that broke PM went green here: 0.9.0 took the
+      # multilingual reranker's name for a built-in, and every multilingual rerank failed silently
+      # (#956). A PR that touches the sidecar runs the suite again against the locked dependency
+      # set, with a missing fastembed a failure rather than a skip. About 550 MB and a minute, and
+      # the embedding test downloads the 67 MB English model, so only when sidecar/ changed.
+      - name: Sidecar unit tests (the locked dependencies, sidecar changes only)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PM_REQUIRE_FASTEMBED: "1"
+        run: |
+          if git diff --quiet "$BASE_SHA" HEAD -- sidecar/; then
+            echo "sidecar/ unchanged since the base: nothing to re-test"
+            exit 0
+          fi
+          python -m venv "$RUNNER_TEMP/sidecar-venv"
+          "$RUNNER_TEMP/sidecar-venv/bin/python" -m pip install --disable-pip-version-check \
+            --no-cache-dir --require-hashes -r sidecar/requirements.lock
+          "$RUNNER_TEMP/sidecar-venv/bin/python" sidecar/test_pm_sidecar.py
 
   # --- secrets: gitleaks over the working tree AND git history ------------
   secrets:

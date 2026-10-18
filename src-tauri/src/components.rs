@@ -3,7 +3,7 @@
 
 //! On-device storage inventory + a reference-counted, guarded teardown of the large, regenerable
 //! components PM downloads: the optional t-SNE stack (`openTSNE` → `scikit-learn`/`scipy`), the
-//! optional photo-OCR stack (`rapidocr`+`pi-heif` → `opencv-python`/`shapely`/`pyclipper`), the
+//! optional photo-OCR stack (`rapidocr`+`pi-heif` → OpenCV/`shapely`/`pyclipper`), the
 //! Whisper speech model, and a **read-only** view of the active embedder.
 //!
 //! The photo-OCR stack is also **installable** from this inventory (the one place it's enabled or
@@ -41,10 +41,12 @@ enum Status {
     Installable,
 }
 
-/// Rough on-disk footprint of the optional photo-OCR stack once installed (opencv-python is the bulk
-/// at ~110 MB, rapidocr ~30 MB, the rest small). Shown on the not-yet-installed row so the cost is
-/// visible before choosing to install; never added to the on-disk total (nothing is on disk yet).
-const OCR_INSTALL_ESTIMATE_BYTES: u64 = 150 * 1024 * 1024;
+/// Rough on-disk footprint of the optional photo-OCR stack once installed: measured at 204 MiB with
+/// rapidocr 3.10.0 (OpenCV's headless build is the bulk; the old estimate of 150 MiB undercounted
+/// even the 239 MiB the full opencv-python build used). Shown on the not-yet-installed row so the
+/// cost is visible before choosing to install; never added to the on-disk total (nothing is on disk
+/// yet). The ~31 MB of OCR models download separately, on the first photo.
+const OCR_INSTALL_ESTIMATE_BYTES: u64 = 205 * 1024 * 1024;
 
 /// A dependent that must be removed first; `anchor` is the component id to scroll to in this tab.
 #[derive(Serialize)]
@@ -241,7 +243,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
 
     // Optional photo-OCR stack. The top-level component bundles rapidocr + pi-heif (the two pins
     // `uninstall_optional_ocr` removes) plus its tiny pure-Python siblings; the heavy image libraries
-    // (opencv-python / shapely / pyclipper) are separate, cascade-removable children. numpy is shared
+    // (OpenCV / shapely / pyclipper) are separate, cascade-removable children. numpy is shared
     // with the embedder and never listed. pyclipper installs no import dir, so it needs `pkg_dist`.
     let (ocr_present, ocr_size) = pkg(
         site.as_ref(),
@@ -416,7 +418,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
         lib(
             &mut components,
             "opencv-python",
-            "OpenCV (opencv-python)",
+            "OpenCV (opencv-python-headless)",
             "Image processing used by photo text recognition.",
             cv2_size,
         );
@@ -500,7 +502,12 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
         "scikit-learn" => sidecar.pip_uninstall(&["scikit-learn", "joblib", "threadpoolctl"])?,
         "scipy" => sidecar.pip_uninstall(&["scipy"])?,
         "ocr" => sidecar.uninstall_optional_ocr()?,
-        "opencv-python" => sidecar.pip_uninstall(&["opencv-python"])?,
+        // The row keeps its old id (the frontend keys on it), but what is installed changed name:
+        // rapidocr 3.10 depends on `opencv-python-headless`, and a venv that had OCR before still
+        // holds `opencv-python`. Both own the same `cv2/` folder, so removing only one leaves either
+        // nothing reclaimed (a new install) or a dist-info pointing at deleted files (an old one).
+        // `pip uninstall -y` skips whichever is absent.
+        "opencv-python" => sidecar.pip_uninstall(&["opencv-python-headless", "opencv-python"])?,
         "shapely" => sidecar.pip_uninstall(&["shapely"])?,
         "pyclipper" => sidecar.pip_uninstall(&["pyclipper"])?,
         "whisper" => {
