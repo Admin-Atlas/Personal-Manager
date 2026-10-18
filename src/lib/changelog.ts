@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.6-alpha",
+    date: "2026-10-18",
+    highlights: [
+      "Under the hood, PM can now change “this and the following” occurrences of a repeating event in Google Calendar, which makes the later part a repeating event of its own, the way Google does. If PM loses touch with Google halfway, it never guesses: it looks at what Google holds, then lets you finish the change or take back the part it made, and only once Google shows that's safe. None of this is in the app yet: repeating events stay read-only until the dialog that asks which occurrences you mean.",
+    ],
+  },
+  {
     version: "3.148.5-alpha",
     date: "2026-10-18",
     highlights: [

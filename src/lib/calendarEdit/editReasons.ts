@@ -5,7 +5,8 @@
 // reason and outcome the backend can return has a line here, and the switches are exhaustive, so a
 // new backend value is a `tsc` failure until it has words. The backend decides; this only explains.
 
-import type { EditLoad, ReadOnlyReason, WriteOutcome } from "../types";
+import { formatDateOnly } from "../format";
+import type { EditLoad, ReadOnlyReason, SplitAction, WriteOutcome } from "../types";
 import type { DraftProblem, EditorField } from "./eventDraft";
 
 function unreachable(value: never): never {
@@ -94,12 +95,38 @@ const REAUTH =
 const GONE =
   "This event is no longer in Google: it was deleted there, or this account can't see it any more.";
 
+/** A "this and following" change PM couldn't finish, worded by what Google's state allows now
+ *  (review H3/M3): never "Saved" while the event may show twice, and never a hint to delete while
+ *  the earlier part already ends before the day. */
+function partialText(offers: readonly SplitAction[], from: string): string {
+  const day = formatDateOnly(from);
+  const finish = offers.includes("finish");
+  const remove = offers.includes("remove");
+  if (finish && remove) {
+    return `PM couldn't finish this change: it may show twice from ${day}. Finish the change, or remove the new part.`;
+  }
+  if (finish) {
+    return `Saved from ${day}, but PM couldn't finish moving the occurrences you changed on their own. Press Finish.`;
+  }
+  if (remove) {
+    return `PM couldn't finish this change: it may show twice from ${day}. Remove the new part, or check again.`;
+  }
+  return `PM lost touch with Google while changing this from ${day}. Check again. If PM closes first, look at that day in Google Calendar: only if it shows twice, delete the newer one.`;
+}
+
 /** What a save came to, and how it should look. A conflict names the fields Google changed; it
  *  promises only that nothing was saved over them (the editor, rebasing onto Google's copy, says
  *  which of the user's changes Google's replaced). Deletes have their own words: `deleteText`. */
 export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string } {
   switch (outcome.outcome) {
     case "saved":
+      // A "this and following" change that couldn't move every occurrence changed on its own.
+      if (outcome.warnings.includes("left_on_old_series")) {
+        return {
+          tone: "warn",
+          text: "Saved from that day on. Some occurrences you changed on their own may still be on the earlier part, or hidden by Google; check them in Google Calendar.",
+        };
+      }
       return {
         tone: "ok",
         text: outcome.warnings.includes("mirror_refresh_pending")
@@ -116,7 +143,16 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
     case "ignored_by_google":
       return {
         tone: "warn",
-        text: "Google answered as if it saved this, but kept the event as it was. Nothing changed.",
+        text: outcome.split
+          ? "Google answered as if it saved this, but kept the event as it was, so PM removed the new part it had made. Nothing changed."
+          : "Google answered as if it saved this, but kept the event as it was. Nothing changed.",
+      };
+    case "partial_split":
+      return { tone: "warn", text: partialText(outcome.offers, outcome.from) };
+    case "split_removed":
+      return {
+        tone: "ok",
+        text: "PM removed the new part it had made. The repeating event is as it was.",
       };
     case "conflict": {
       const fields = conflictFields(outcome.fields);
@@ -186,6 +222,13 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       );
     case "ignored_by_google":
       return notDeleted("Google answered as if it deleted it, but kept it.", "warn");
+    case "partial_split":
+      return notDeleted(
+        `PM is still finishing an earlier change to it from ${formatDateOnly(outcome.from)}. Settle that first.`,
+        "warn",
+      );
+    case "split_removed":
+      return notDeleted("PM removed the new part of an earlier change instead.", "warn");
     case "conflict": {
       const fields = conflictFields(outcome.fields);
       const what = fields.length ? ` (the ${listFields(fields)})` : "";

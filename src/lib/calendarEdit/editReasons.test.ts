@@ -55,6 +55,10 @@ describe("edit reasons", () => {
       { outcome: "no_change" },
       { outcome: "needs_choice" },
       { outcome: "ignored_by_google", split: false },
+      { outcome: "ignored_by_google", split: true },
+      { outcome: "partial_split", token: "t", offers: ["finish"], from: "2026-11-02" },
+      { outcome: "partial_split", token: "t", offers: ["remove", "check"], from: "2026-11-02" },
+      { outcome: "split_removed" },
       { outcome: "conflict", fields: ["summary"] },
       { outcome: "conflict", fields: [] },
       { outcome: "gone" },
@@ -77,6 +81,46 @@ describe("edit reasons", () => {
     expect(outcomeText({ outcome: "saved", warnings: [] }).tone).toBe("ok");
     expect(outcomeText({ outcome: "failed", message: "x" })).toEqual({ tone: "error", text: "x" });
     expect(outcomeText({ outcome: "read_only", reason: "locked" }).text).toBe(reasonText("locked"));
+  });
+
+  it("words a change PM couldn't finish by what Google allows now", () => {
+    const partial = (offers: ("remove" | "finish" | "check")[]) =>
+      outcomeText({ outcome: "partial_split", token: "t", offers, from: "2026-11-02" });
+    // Finish alone: the earlier part already ends before the day, so it's saved, and never a hint
+    // to delete anything.
+    expect(partial(["finish"]).text).toMatch(/^Saved from 02-11.*Press Finish\.$/);
+    expect(partial(["finish"]).text).not.toMatch(/delete|remove/i);
+    // Finish or Remove: the original wasn't cut, so it may show twice; never "Saved".
+    expect(partial(["finish", "remove"]).text).toMatch(/may show twice from 02-11/);
+    expect(partial(["finish", "remove"]).text).not.toMatch(/^Saved/);
+    expect(partial(["remove", "check"]).text).toMatch(/Remove the new part, or check again\.$/);
+    expect(partial(["check"]).text).toMatch(/^PM lost touch .*only if it shows twice/);
+    for (const offers of [["finish"], ["remove"], ["check"]] as const) {
+      expect(partial([...offers]).tone).toBe("warn");
+    }
+    expect(outcomeText({ outcome: "ignored_by_google", split: true }).text).toMatch(
+      /removed the new part/,
+    );
+    expect(outcomeText({ outcome: "split_removed" }).tone).toBe("ok");
+    // A "this and following" save that couldn't move every occurrence says so, hedged.
+    expect(
+      outcomeText({
+        outcome: "saved",
+        warnings: ["left_on_old_series"],
+        left_behind: ["2026-11-02"],
+      }),
+    ).toEqual({
+      tone: "warn",
+      text: "Saved from that day on. Some occurrences you changed on their own may still be on the earlier part, or hidden by Google; check them in Google Calendar.",
+    });
+    expect(
+      deleteText(
+        { outcome: "partial_split", token: "t", offers: ["check"], from: "2026-11-02" },
+        "Standup",
+      ).text,
+    ).toMatch(
+      /^“Standup” wasn't deleted\. PM is still finishing an earlier change to it from 02-11/,
+    );
   });
 
   it("speaks of a delete as a delete, naming the event", () => {

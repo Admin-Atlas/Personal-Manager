@@ -1790,6 +1790,7 @@ pub fn run() {
             commands::cancel_calendar_delete,
             commands::list_held_deletes,
             commands::series_choices,
+            commands::settle_series_split,
             #[cfg(debug_assertions)]
             commands::dev_series_report,
             commands::connect_outlook_calendar,

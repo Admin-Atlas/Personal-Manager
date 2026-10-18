@@ -1457,18 +1457,22 @@ pub fn series_ids(conn: &Connection, calendar_id: &str) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// One Google series' mirrored occurrences in a calendar, read whole: what a write to the series
-/// lands against (#884).
+/// Google series' mirrored occurrences in a calendar, read whole: what a write to them lands against
+/// (#884). A "this and following" change lands against two, the series and its new part.
 pub fn series_rows(
     conn: &Connection,
     calendar_id: &str,
-    series_id: &str,
+    series: &[&str],
 ) -> Result<Vec<CalendarEvent>> {
-    list_events_where(
-        conn,
-        "WHERE calendar_id = ?1 AND series_id = ?2 ORDER BY start",
-        params![calendar_id, series_id],
-    )
+    let mut rows = Vec::new();
+    for series_id in series {
+        rows.extend(list_events_where(
+            conn,
+            "WHERE calendar_id = ?1 AND series_id = ?2 ORDER BY start",
+            params![calendar_id, series_id],
+        )?);
+    }
+    Ok(rows)
 }
 
 /// Drop calendars under `source_id` that are no longer in `keep` (and their events) — an upstream

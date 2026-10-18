@@ -47,6 +47,7 @@ export const WRITE_COMMANDS = [
   ["cancel_calendar_delete", "cancelCalendarDelete"],
   ["list_held_deletes", "listHeldDeletes"],
   ["series_choices", "seriesChoices"],
+  ["settle_series_split", "settleSeriesSplit"],
 ];
 export const COMMANDS = WRITE_COMMANDS.map(([command]) => command);
 export const WRAPPERS = WRITE_COMMANDS.map(([, wrapper]) => wrapper);
