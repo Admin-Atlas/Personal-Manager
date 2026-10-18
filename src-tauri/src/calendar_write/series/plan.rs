@@ -837,15 +837,26 @@ impl SeriesPlan {
 
     /// Whether `fresh`, Google's copy of the new series step `step` inserted, still holds what that
     /// step sent, read as [`SeriesPlan::same`] reads (PM's own notes aside): a change made to it in
-    /// Google since (a rename, a move) means it's no longer only PM's to delete (C9a-3b critique M6).
+    /// Google since (a rename, a move, a place or a guest added) means it's no longer only PM's to
+    /// delete (C9a-3b critique M6). Every field an insert may send is compared, sent or not, and
+    /// anything it never sends (a call, attachments, a label) reads as a change (review round 2).
     pub fn tail_as_inserted(&self, step: usize, fresh: &Value) -> bool {
         let Some(Op::Insert { body, .. }) = self.steps.get(step).map(|s| &s.op) else {
             return false;
         };
+        const NEVER_SENT: &[&str] = &[
+            "conferenceData",
+            "hangoutLink",
+            "attachments",
+            "eventLabelId",
+        ];
         !is_gone(fresh)
-            && body
+            && TAIL_FIELDS
                 .iter()
-                .all(|(k, want)| self.same(k, Some(want), fresh.get(k.as_str())))
+                .all(|k| self.same(k, body.get(*k), fresh.get(*k)))
+            && NEVER_SENT
+                .iter()
+                .all(|k| fresh.get(*k).is_none_or(Value::is_null))
     }
 
     /// The occurrences the new series step `step` inserts leaves out from the start (the original's
@@ -3843,6 +3854,27 @@ mod tests {
         assert!(plan.tail_as_inserted(0, &noted));
         assert!(!plan.tail_as_inserted(0, &with(copy.clone(), "summary", json!("Renamed"))));
         assert!(!plan.tail_as_inserted(0, &with(copy.clone(), "status", json!("cancelled"))));
+        // A field the original never had, added in Google since, or something an insert never
+        // sends (review round 2).
+        for (key, value) in [
+            ("location", json!("Room 4")),
+            ("colorId", json!("5")),
+            ("attendees", json!([{ "email": "guest@example.com" }])),
+            ("conferenceData", json!({ "conferenceId": "abc-defg-hij" })),
+            ("hangoutLink", json!("https://meet.google.com/abc-defg-hij")),
+        ] {
+            assert!(
+                !plan.tail_as_inserted(0, &with(copy.clone(), key, value)),
+                "{key}"
+            );
+        }
+        // Google's defaults, written out, are no change.
+        let defaults = with(
+            with(copy.clone(), "transparency", json!("opaque")),
+            "visibility",
+            json!("default"),
+        );
+        assert!(plan.tail_as_inserted(0, &defaults));
         assert!(!plan.tail_as_inserted(1, &copy));
         assert_eq!(plan.tail_exdates(0), [point("2026-11-02T09:00:00Z")]);
         assert!(plan.tail_exdates(1).is_empty());

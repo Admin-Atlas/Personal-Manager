@@ -2699,8 +2699,9 @@ struct HeldSplit {
     facts: SplitFacts,
     /// What the last look allowed.
     offers: Vec<SplitAction>,
-    /// The first copy of the new part PM saw from Google (the insert's answer, or a look's): what a
-    /// later copy is compared with.
+    /// Google's answer to the insert (or the copy that proved it), when known: the only copy that
+    /// stands for the new part as PM made it, so a later copy at its etag is unchanged. A look's copy
+    /// never does: it may already hold a change made in Google (review round 1).
     tail_seen: Option<Value>,
     /// The new part was changed in Google since PM made it: neither Remove nor Finish, until a look
     /// shows it gone or as it was (C9a-3b critiques M6, M7).
@@ -8308,6 +8309,8 @@ mod tests {
                 series_patch(Scripted::Json(cut_copy(&plan))).then(move || {
                     let mut rows = rows_of(&october());
                     rows.extend(rows_of(&tail_october()));
+                    // A row of the new part Google no longer lists by the time PM re-fetches it.
+                    rows.extend(rows_of(&[stale_tail_row()]));
                     syncing
                         .with_conn(|conn| calendar::replace_events(conn, "cal", &rows, true))
                         .unwrap();
@@ -8322,6 +8325,225 @@ mod tests {
         for id in ids_of(rows_of(&tail_october())) {
             assert!(lagging.contains(&id), "{id}");
         }
+        // The landing read the new part's rows too, so the one Google no longer lists went.
+        assert_eq!(split_rows(&host).1, ids_of(rows_of(&tail_october())));
+    }
+
+    /// A row of the new part that a sync wrote and the re-fetch no longer lists.
+    fn stale_tail_row() -> Value {
+        tail_occurrence("2026-10-28T09:00:00Z", "\"u9\"")
+    }
+
+    /// Review round 2: the claims last the whole send (the new part's too) and the whole settle
+    /// (both series), not just their first statement.
+    #[tokio::test]
+    async fn claims_last_the_whole_send_and_settle() {
+        let host = TestHost::holding(&october());
+        let plan = split_plan(Vec::new());
+        let held_then = |host: &Arc<TestHost>| {
+            let host = Arc::clone(host);
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&seen);
+            let check = move || {
+                let flight = host.edit.in_flight.lock().unwrap();
+                let both = [series_key(CALENDAR, "abc"), series_key(CALENDAR, TAIL)];
+                flag.store(
+                    both.iter().all(|k| flight.contains(k)),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            };
+            (seen, check)
+        };
+        let (during_send, check) = held_then(&host);
+        let (held, _, _) = split_save(
+            &host,
+            vec![
+                insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+                series_patch(Scripted::Lost { retried: true }).then(check),
+                event_read("abc", lost()),
+                event_read("abc", lost()),
+            ],
+        )
+        .await;
+        assert!(during_send.load(std::sync::atomic::Ordering::SeqCst));
+        let (during_settle, check) = held_then(&host);
+        let (_, script) = settle(
+            &host,
+            &held_token(&held),
+            SplitAction::Check,
+            vec![event_read("abc", lost()).then(check)],
+        )
+        .await;
+        script.finished();
+        assert!(during_settle.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Review round 2: a cut answered 404 whose rollback deleted the new part: gone, and the deleted
+    /// series' rows leave the mirror at once.
+    #[tokio::test]
+    async fn a_cut_meeting_its_series_deleted_lands_it() {
+        let host = TestHost::holding(&october());
+        let plan = split_plan(Vec::new());
+        let (outcome, _, _) = split_save(
+            &host,
+            vec![
+                insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+                series_patch(Scripted::Status(404)),
+                Step::write(
+                    Method::Delete,
+                    &format!("/events/{TAIL}"),
+                    "\"t1\"",
+                    Scripted::Status(204),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(outcome, WriteOutcome::Gone);
+        assert!(split_rows(&host).0.is_empty());
+    }
+
+    /// Review round 2: settling a split whose cut met its series deleted: Remove takes the new part,
+    /// and the answer is that the event is gone, its rows with it, never "as it was".
+    #[tokio::test]
+    async fn removing_the_new_part_of_a_deleted_series_says_gone() {
+        let host = TestHost::holding(&october());
+        let plan = split_plan(Vec::new());
+        let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let (held, _, _) = split_save(
+            &host,
+            vec![
+                insert_step(Scripted::Json(tail.clone())),
+                series_patch(Scripted::Status(404)),
+                Step::write(
+                    Method::Delete,
+                    &format!("/events/{TAIL}"),
+                    "\"t1\"",
+                    Scripted::Status(403),
+                ),
+                event_read(TAIL, Scripted::Json(tail.clone())),
+            ],
+        )
+        .await;
+        assert_eq!(offers_of(&held), [SplitAction::Remove]);
+        let mut steps = vec![event_read(TAIL, Scripted::Json(tail.clone()))];
+        steps.extend(tail_reads(tail.clone(), Vec::new()));
+        steps.push(event_read(TAIL, Scripted::Json(tail)));
+        steps.push(Step::write(
+            Method::Delete,
+            &format!("/events/{TAIL}"),
+            "\"t1\"",
+            Scripted::Status(204),
+        ));
+        let (outcome, _) = settle(&host, &held_token(&held), SplitAction::Remove, steps).await;
+        assert_eq!(outcome, WriteOutcome::Gone);
+        assert_eq!(split_rows(&host), (Vec::new(), Vec::new()));
+        assert_eq!(held_count(&host), 0);
+    }
+
+    /// Review round 2: a settle's look that finds the original deleted in Google says so, lands it,
+    /// and holds nothing.
+    #[tokio::test]
+    async fn a_settle_that_finds_the_original_gone_says_so() {
+        let host = TestHost::holding(&october());
+        let (held, _) = lost_cut(&host, lost()).await;
+        let (outcome, _) = settle(
+            &host,
+            &held_token(&held),
+            SplitAction::Check,
+            vec![event_read("abc", Scripted::Status(404))],
+        )
+        .await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Failed { message } if message.contains("deleted in Google"))
+        );
+        assert!(split_rows(&host).0.is_empty());
+        assert_eq!(held_count(&host), 0);
+    }
+
+    /// Review rounds 1 and 2: after a lost insert, a new part renamed in Google, or given a place it
+    /// never had, before PM's first look, is never taken for "as PM made it": neither Remove nor
+    /// Finish acts on it.
+    #[tokio::test]
+    async fn a_new_part_changed_before_the_first_look_is_never_acted_on() {
+        let plan = split_plan(Vec::new());
+        let changes = [
+            with(
+                tail_copy(&plan, "\"t9\"", SAVED_AT),
+                "summary",
+                json!("Renamed in Google"),
+            ),
+            with(
+                tail_copy(&plan, "\"t9\"", SAVED_AT),
+                "location",
+                json!("Room 4"),
+            ),
+        ];
+        for changed in changes {
+            for action in [SplitAction::Remove, SplitAction::Finish] {
+                let host = TestHost::holding(&october());
+                let (held, _, _) = split_save(
+                    &host,
+                    vec![
+                        insert_step(lost()),
+                        event_read(TAIL, lost()),
+                        event_read(TAIL, Scripted::Json(changed.clone())),
+                    ],
+                )
+                .await;
+                assert_eq!(offers_of(&held), [SplitAction::Finish, SplitAction::Remove]);
+                let (outcome, script) = settle(
+                    &host,
+                    &held_token(&held),
+                    action,
+                    vec![
+                        event_read(TAIL, Scripted::Json(changed.clone())),
+                        event_read(TAIL, Scripted::Json(changed.clone())),
+                    ],
+                )
+                .await;
+                script.finished();
+                assert!(
+                    matches!(&outcome, WriteOutcome::Failed { message } if message.contains("changed in Google")),
+                    "{action:?}"
+                );
+                assert_eq!(
+                    host.edit.held_on(CALENDAR, "abc").unwrap().offers,
+                    [SplitAction::Check]
+                );
+            }
+        }
+    }
+
+    /// Review round 2: a new part found changed, then deleted in Google by the user: Remove comes
+    /// back, and finds it gone.
+    #[tokio::test]
+    async fn a_changed_new_part_deleted_in_google_gives_remove_back() {
+        let plan = split_plan(Vec::new());
+        let renamed = with(
+            tail_copy(&plan, "\"t2\"", SAVED_AT),
+            "summary",
+            json!("Renamed"),
+        );
+        let uncut = || event_read("abc", Scripted::Json(written(&weekly(), &[], "\"m7\"")));
+        let host = TestHost::holding(&october());
+        let (held, _) = lost_cut(&host, Scripted::Json(written(&weekly(), &[], "\"m7\""))).await;
+        let token = held_token(&held);
+        let (refused, _) = settle(
+            &host,
+            &token,
+            SplitAction::Remove,
+            vec![uncut(), event_read(TAIL, Scripted::Json(renamed))],
+        )
+        .await;
+        assert!(matches!(refused, WriteOutcome::Failed { .. }));
+        let (back, _) = settle(
+            &host,
+            &token,
+            SplitAction::Check,
+            vec![uncut(), event_read(TAIL, Scripted::Status(404))],
+        )
+        .await;
+        assert_eq!(offers_of(&back), [SplitAction::Remove]);
     }
 
     /// Review round 1 (high): after a lost insert no copy of the new part stands for "as PM made

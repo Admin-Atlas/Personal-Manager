@@ -1354,6 +1354,13 @@ impl Settle {
 
     fn on_fence(&mut self, answer: Answer) -> Next<Settled> {
         match answer {
+            // Deleted in Google meanwhile: never Remove's to delete the new series then (critique
+            // L5, review round 2).
+            Answer::Reply {
+                verdict: Verdict::Ok,
+                body: Some(b),
+                ..
+            } if is_gone(&b) => self.over(Settled::Unknown),
             Answer::Reply {
                 verdict: Verdict::Ok,
                 body: Some(b),
@@ -1383,7 +1390,8 @@ impl Settle {
                 verdict: Verdict::Ok,
                 body: Some(b),
                 ..
-            } => b,
+            } if !is_gone(&b) => b,
+            // Gone, or deleted in Google meanwhile: never Remove's to delete the new series then.
             _ => return self.over(Settled::Unknown),
         };
         match self.plan.verdict(self.cut_step, Some(&fresh)) {
@@ -3526,6 +3534,33 @@ mod tests {
             find_occurrence(&occurrence, Point::Day(day)),
             Some(("d1".into(), "\"d\"".into()))
         );
+    }
+
+    /// Review round 2: the series deleted in Google between Remove's look and its fence (the fence
+    /// meets a 412, or lands on the cancelled copy): never a delete of the new series.
+    #[test]
+    fn a_series_deleted_around_the_fence_is_no_delete() {
+        let (case, plan, ran) = partial(weekly());
+        let old = case.master.json().clone();
+        let cancelled = at_etag(&with(old.clone(), "status", json!("cancelled")), "\"m9\"");
+        for fence in [status(Verdict::Conflict), ok(cancelled.clone())] {
+            let mut gets = 0;
+            let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove).unwrap();
+            let (settled, sent, _) = drive(&mut settle, |r| match r.method {
+                Method::Get => {
+                    gets += 1;
+                    ok(if gets == 1 {
+                        old.clone()
+                    } else {
+                        cancelled.clone()
+                    })
+                }
+                Method::Patch => fence.clone(),
+                _ => deleted(),
+            });
+            assert_eq!(settled, Settled::Unknown);
+            assert!(!deletes_the_tail(&sent));
+        }
     }
 
     #[test]
