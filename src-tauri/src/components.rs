@@ -39,6 +39,10 @@ enum Status {
     /// An optional component that isn't installed yet — offers an Install action (photo OCR). The
     /// `size_bytes` on such a row is an estimate of what installing it will use, not on-disk usage.
     Installable,
+    /// An optional component that is on disk but not working (photo OCR whose marker a moved lock
+    /// left stale) — offers Install, to repair it, AND Remove, so the space can be had back without
+    /// first downloading it all again. `size_bytes` is real on-disk usage.
+    Stale,
 }
 
 /// Rough on-disk footprint of the optional photo-OCR stack once installed: measured at 204 MiB with
@@ -239,7 +243,9 @@ fn embedder_estimate_bytes(id: &str) -> u64 {
 /// disk. They part ways when a lock moves and the reinstall at the next launch fails (offline, a
 /// dropped download): the old packages stay, every photo is indexed without its text, and a row
 /// keyed on presence alone went on showing OCR installed with nothing to press. Installing over
-/// the stale copy is what repairs it.
+/// the stale copy is what repairs it; Remove stays on offer beside it (`Status::Stale`), because
+/// the image libraries under it stay cascade-blocked while it is on disk, and an offline user who
+/// wants the space back must not have to download it all first.
 fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
     let label = "Photo text recognition (rapidocr)".into();
     match (present, ready) {
@@ -268,7 +274,7 @@ fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
             size_bytes: size,
             approximate: false,
             child: false,
-            status: Status::Installable,
+            status: Status::Stale,
             blockers: Vec::new(),
             manage: None,
             note: Some("Until then, photos are indexed by their date and location only.".into()),
@@ -636,9 +642,11 @@ mod tests {
     fn ocr_on_disk_but_not_working_offers_install() {
         let row = |present, ready| ocr_row(present, ready, 7);
         assert!(matches!(row(true, true).status, Status::Removable));
-        // The stale copy a failed reinstall leaves: Install, sized as what is really on disk.
+        // The stale copy a failed reinstall leaves: Install AND Remove, sized as what is really on
+        // disk. Not plain Installable, which would leave it (and the libraries it blocks) with no
+        // way off the disk short of downloading it all again.
         let stale = row(true, false);
-        assert!(matches!(stale.status, Status::Installable));
+        assert!(matches!(stale.status, Status::Stale));
         assert_eq!((stale.size_bytes, stale.approximate), (7, false));
         let absent = row(false, false);
         assert!(matches!(absent.status, Status::Installable));
