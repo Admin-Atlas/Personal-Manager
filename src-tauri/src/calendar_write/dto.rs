@@ -114,6 +114,15 @@ pub struct SeenSummary {
     pub location: Option<String>,
 }
 
+/// Which occurrences of a repeating event a save or a delete is for: the dialog's three rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesScope {
+    This,
+    Following,
+    All,
+}
+
 /// Why PM won't change an event, or one part of it. Each has a reason line in the editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +191,10 @@ impl FieldPermissions {
 pub enum WriteOutcome {
     Saved {
         warnings: Vec<WriteWarning>,
+        /// Occurrences changed on their own that PM couldn't cancel (`YYYY-MM-DD`, in the series'
+        /// zone): they may still show. Empty, and left out, for every other save.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        left_behind: Vec<String>,
     },
     /// Google already holds exactly this; nothing was sent.
     NoChange,
@@ -205,6 +218,14 @@ pub enum WriteOutcome {
     Failed {
         message: String,
     },
+    /// The plan for the occurrences chosen isn't the one the dialog showed any more, or none was
+    /// named: choose again. Nothing was sent.
+    NeedsChoice,
+    /// Google answered as if it had saved the change, but kept the event as it was. `split`: the
+    /// new series of a split was removed too (C9a-3b).
+    IgnoredByGoogle {
+        split: bool,
+    },
 }
 
 /// What asking to delete came to: held for its Undo window, or refused at once.
@@ -216,6 +237,10 @@ pub enum DeleteStart {
     Held {
         undo_token: String,
         undo_seconds: u64,
+        /// The mirror rows the delete hides while it waits: every occurrence it reaches, for "This
+        /// and following" or "All events". Empty, and left out, for one event.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        hidden: Vec<String>,
     },
     /// Refused before anything was held (busy, read-only, editing off).
     Refused { result: WriteOutcome },
@@ -229,6 +254,9 @@ pub struct HeldDeleteInfo {
     /// The title the user saw.
     pub summary: String,
     pub seconds_left: u64,
+    /// The rows it hides, as [`DeleteStart::Held`] gave them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
 }
 
 /// The `calendar://delete-settled` payload: a held delete went to Google, and this is what came of
@@ -246,6 +274,8 @@ pub struct DeleteSettled {
 pub enum WriteWarning {
     /// Google took the change, but the calendar couldn't be refreshed yet; the next sync will.
     MirrorRefreshPending,
+    /// Some occurrences changed on their own couldn't be cancelled: `Saved.left_behind` says which.
+    LeftOnOldSeries,
 }
 
 /// One event as the editor shows it, read from a fresh copy (never the mirror, which clips text).
@@ -412,12 +442,26 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&WriteOutcome::Saved {
-                warnings: vec![WriteWarning::MirrorRefreshPending]
+                warnings: vec![WriteWarning::MirrorRefreshPending],
+                left_behind: Vec::new(),
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["mirror_refresh_pending"]}"#
         );
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: vec![WriteWarning::LeftOnOldSeries],
+                left_behind: vec!["2026-11-02".into()],
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":["left_on_old_series"],"left_behind":["2026-11-02"]}"#
+        );
         for (outcome, json) in [
+            (WriteOutcome::NeedsChoice, r#"{"outcome":"needs_choice"}"#),
+            (
+                WriteOutcome::IgnoredByGoogle { split: false },
+                r#"{"outcome":"ignored_by_google","split":false}"#,
+            ),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),
             (WriteOutcome::Gone, r#"{"outcome":"gone"}"#),
             (WriteOutcome::Busy, r#"{"outcome":"busy"}"#),
@@ -436,11 +480,28 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DeleteStart::Held {
                 undo_token: "t".into(),
-                undo_seconds: 8
+                undo_seconds: 8,
+                hidden: Vec::new(),
             })
             .unwrap(),
             r#"{"outcome":"held","undo_token":"t","undo_seconds":8}"#
         );
+        assert_eq!(
+            serde_json::to_string(&DeleteStart::Held {
+                undo_token: "t".into(),
+                undo_seconds: 8,
+                hidden: vec!["cal:a".into(), "cal:b".into()],
+            })
+            .unwrap(),
+            r#"{"outcome":"held","undo_token":"t","undo_seconds":8,"hidden":["cal:a","cal:b"]}"#
+        );
+        for (scope, json) in [
+            (SeriesScope::This, r#""this""#),
+            (SeriesScope::Following, r#""following""#),
+            (SeriesScope::All, r#""all""#),
+        ] {
+            assert_eq!(serde_json::from_str::<SeriesScope>(json).unwrap(), scope);
+        }
         assert_eq!(
             serde_json::to_string(&DeleteStart::Refused {
                 result: WriteOutcome::Busy

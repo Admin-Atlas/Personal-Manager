@@ -14,7 +14,7 @@ use crate::calendar_recur::lines::TextOnly;
 use crate::calendar_recur::remap::RetimeError;
 use crate::calendar_recur::{Point, RecurError};
 
-use super::super::dto::{EventPatchDraft, TimeDraft};
+use super::super::dto::{EventPatchDraft, SeriesScope, TimeDraft};
 use super::super::patch::build_patch;
 use super::super::time::{self, TimeError};
 use super::{original_of, point_of, FreshEvent, Length, Master, SeriesRefusal};
@@ -25,6 +25,16 @@ pub enum Scope {
     This,
     Following,
     All,
+}
+
+impl From<SeriesScope> for Scope {
+    fn from(scope: SeriesScope) -> Scope {
+        match scope {
+            SeriesScope::This => Scope::This,
+            SeriesScope::Following => Scope::Following,
+            SeriesScope::All => Scope::All,
+        }
+    }
 }
 
 /// What a change does to the occurrence, as far as the choice cares.
@@ -219,6 +229,19 @@ pub fn is_first(master: &Master, instance: &FreshEvent) -> bool {
 mod tests {
     use super::super::fixtures::*;
     use super::*;
+
+    /// The scope the webview names is the scope a plan is made for, from the wire on.
+    #[test]
+    fn the_scope_sent_is_the_scope_planned() {
+        for (json, scope) in [
+            (r#""this""#, Scope::This),
+            (r#""following""#, Scope::Following),
+            (r#""all""#, Scope::All),
+        ] {
+            let sent: SeriesScope = serde_json::from_str(json).unwrap();
+            assert_eq!(Scope::from(sent), scope, "{json}");
+        }
+    }
 
     fn timed(date: &str, start: &str, end: &str, zone: &str) -> TimeDraft {
         TimeDraft::Timed {

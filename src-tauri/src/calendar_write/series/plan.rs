@@ -169,6 +169,9 @@ pub struct SeriesPlan {
     pub removes: Removes,
     /// The series' start, for reading recurrence lines by what they mean.
     start: SeriesStart,
+    /// Whether it was planned with guests allowed (C12): until then, a guest who appears before a
+    /// step is sent again is a conflict ([`SeriesPlan::resend`]).
+    guests_allowed: bool,
 }
 
 /// One write.
@@ -241,13 +244,6 @@ pub enum Op {
 impl Op {
     /// The request, sent with `notify`. `None` for a carry, which needs its occurrence found first
     /// ([`Op::carry_request`]).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn request(&self, notify: Notify) -> Option<RequestPlan> {
         Some(match self {
             Op::Insert { calendar, id, body } => insert_event(
@@ -298,13 +294,6 @@ impl Op {
     }
 
     /// A carry's request, once its occurrence is found as `event` at `etag`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn carry_request(&self, event: &str, etag: &str, notify: Notify) -> Option<RequestPlan> {
         match self {
             Op::Carry { calendar, body, .. } if is_plain_segment(event) => Some(patch_event(
@@ -321,13 +310,6 @@ impl Op {
 
     /// Whether the body holds only keys this kind of write may send; anything else is a bug, and C9
     /// refuses to send it (G5).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn fits(&self) -> bool {
         self.body()
             .is_none_or(|b| b.keys().all(|k| self.allowed().contains(&k.as_str())))
@@ -433,13 +415,6 @@ pub enum Undo {
 }
 
 impl Undo {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn request(&self, etag: &str, notify: Notify) -> RequestPlan {
         match self {
             Undo::DeleteInserted {
@@ -461,13 +436,6 @@ impl Undo {
     }
 
     /// Whether a 404 or 410 means the undo is done: a delete of something already deleted.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn gone_is_done(&self) -> bool {
         matches!(self, Undo::DeleteInserted { .. })
     }
@@ -475,13 +443,6 @@ impl Undo {
     /// A 412, `fresh` being Google's copy now: whether to send the undo once more on its etag. A
     /// guest's reply (a room accepts within seconds) moves a new series' etag, and it's still PM's to
     /// delete while it says it was split off the original; a restore meets a change and stops.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn resend_on(&self, fresh: &Value) -> bool {
         match self {
             Undo::DeleteInserted { split_of, plan, .. } => {
@@ -636,19 +597,17 @@ impl SeriesPlan {
     /// A 412 on step `step`, `fresh` being Google's copy now: send again, or not. Asked only once no
     /// copy of the step can land: [`SeriesPlan::verdict`] found it not landed, or found neither the
     /// change nor what was there with every copy refused and Google at an etag none went out on.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
+    /// Until C12, a guest who appeared meanwhile is a conflict, whatever the step watches (C9a-3a
+    /// design review).
     pub fn resend(&self, step: usize, fresh: &Value) -> Resend {
         let Some(step) = self.steps.get(step) else {
             return Resend::Conflict(Vec::new());
         };
         if is_gone(fresh) {
             return Resend::Gone;
+        }
+        if !self.guests_allowed && guests_on(fresh) {
+            return Resend::Conflict(vec!["attendees".into()]);
         }
         let changed: Vec<String> = match &step.conflict {
             Recheck::Never => return Resend::Conflict(Vec::new()),
@@ -690,13 +649,6 @@ impl SeriesPlan {
 
     /// Whether step `step` landed, read from Google's copy (`None` for a 404 or 410): its reply, or a
     /// GET after an answer that may have been applied.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn verdict(&self, step: usize, fresh: Option<&Value>) -> Applied {
         let Some(step) = self.steps.get(step) else {
             return Applied::Unknown;
@@ -732,13 +684,6 @@ impl SeriesPlan {
     /// Whether step `step` half landed (DS8): `fresh` holds the new start but the old rule, or the new
     /// rule but the old start, which leaves a series starting off its own rule. The one case its
     /// [`Undo::RestoreMaster`] is for, sent on `fresh`'s etag with the step's own `notify`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn half_applied(&self, step: usize, fresh: &Value) -> bool {
         let Some(Step {
             shows: Shows::Fields { sent, old },
@@ -781,13 +726,6 @@ impl SeriesPlan {
     /// What a re-fetch has to show once the run is over, the cleanup cancels in `skipped` (step
     /// indexes) not done: their occurrences are still in Google, so a re-fetch listing them still
     /// shows the write (C8b review R2).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn expect_after(&self, skipped: &[usize]) -> Vec<Expect> {
         let left = self.left_behind(skipped);
         self.expect
@@ -809,13 +747,6 @@ impl SeriesPlan {
     /// a list that lags leaves the original's rows on screen rather than a gap (DS18, A14); anything
     /// else removes whatever the re-fetch shows. The rows of occurrences the run couldn't cancel stay
     /// (R2, R5).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, sending series writes"
-        )
-    )]
     pub fn removes_for(&self, diff: &SeriesDiff, skipped: &[usize]) -> Removes {
         let splits = self.steps.iter().any(|s| matches!(s.op, Op::Insert { .. }));
         if splits && diff.stale {
@@ -882,7 +813,7 @@ impl SeriesPlan {
     }
 
     /// Where the cleanup cancels among `skipped` would have cancelled.
-    fn left_behind(&self, skipped: &[usize]) -> Vec<Point> {
+    pub fn left_behind(&self, skipped: &[usize]) -> Vec<Point> {
         skipped
             .iter()
             .filter_map(|i| self.steps.get(*i))
@@ -1272,6 +1203,7 @@ pub fn plan_series_delete(
                 series: master.id.clone(),
             },
             start: master.start,
+            guests_allowed: input.guests_allowed,
         })
     };
     match scope {
@@ -1304,6 +1236,7 @@ pub fn plan_series_delete(
                 event: text(instance, "id"),
             },
             start: master.start,
+            guests_allowed: input.guests_allowed,
         }),
         Scope::All => whole(warnings),
         Scope::Following if is_first(&master, input.fresh.instance) => whole(warnings),
@@ -1326,6 +1259,7 @@ pub fn plan_series_delete(
                         left: Vec::new(),
                     },
                     start: master.start,
+                    guests_allowed: input.guests_allowed,
                 })
             }
         },
@@ -1443,6 +1377,7 @@ fn probe(start: &SeriesStart) -> SeriesPlan {
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: *start,
+        guests_allowed: false,
     }
 }
 
@@ -1530,6 +1465,7 @@ fn plan_this(
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: master.start,
+        guests_allowed: input.guests_allowed,
     })
 }
 
@@ -1696,6 +1632,7 @@ fn plan_all(
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: master.start,
+        guests_allowed: input.guests_allowed,
     })
 }
 
@@ -2058,6 +1995,7 @@ fn plan_split(
             left: Vec::new(),
         },
         start: master.start,
+        guests_allowed: input.guests_allowed,
     })
 }
 
@@ -3305,7 +3243,6 @@ mod tests {
             .unwrap();
         let diff = |stale| SeriesDiff {
             upserts: Vec::new(),
-            created: Vec::new(),
             deletes: Vec::new(),
             stale,
         };

@@ -27,10 +27,6 @@ use super::{original_of, Listing};
 pub enum Expect {
     /// Some occurrence of the series was updated at or after `after`, the write's own `updated`
     /// (C9 adds this from the reply: an occurrence follows its master's; INFERRED, L-R14).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first made in C9, from a write's reply")
-    )]
     Updated { series: String, after: String },
     /// The occurrence at `original` is cancelled, or gone.
     Cancelled { series: String, original: Point },
@@ -107,13 +103,6 @@ impl GoneRow {
 
 /// The latest of `moments` (RFC 3339; others are ignored), for a removal's floor ([`GoneRow`]). An
 /// HTTP `Date` is whole seconds, so C9 passes it a second on, as RFC 3339.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9a-3, landing a series write"
-    )
-)]
 pub fn floor_of<'a>(moments: impl IntoIterator<Item = &'a str>) -> Option<String> {
     moments
         .into_iter()
@@ -140,13 +129,6 @@ fn mirror_point(s: &str) -> Option<Point> {
 impl Removes {
     /// The rows of `before` (the mirror's rows of `calendar_id`) this removes, each no older than
     /// `floor` ([`GoneRow`]).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first caller lands in C9a-3, landing a series write"
-        )
-    )]
     pub fn rows(
         &self,
         calendar_id: &str,
@@ -181,15 +163,9 @@ pub struct Refetch<'a> {
 
 /// A re-fetch as mirror changes.
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first read in C9, landing a series write")
-)]
 pub struct SeriesDiff {
     /// Every occurrence listed, as a sync would mirror it.
     pub upserts: Vec<CalendarEvent>,
-    /// The ids among them the mirror didn't have (new rows: a split's new series).
-    pub created: Vec<String>,
     pub deletes: Vec<GoneRow>,
     /// The re-fetch doesn't show the write yet: record nothing from it, and keep the rows on screen
     /// until a later fetch does (A14).
@@ -200,13 +176,6 @@ pub struct SeriesDiff {
 /// `calendar_id`. `window`: the re-fetch's `timeMin`/`timeMax` (the mirror's own window); a row
 /// outside it is neither written nor removed by omission (DS13). A row missing from a listing is
 /// removed only when that listing is complete. `floor`: the write's own `updated` ([`GoneRow`]).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C9a-3, landing a series write"
-    )
-)]
 pub fn diff_series(
     calendar_id: &str,
     before: &[CalendarEvent],
@@ -265,17 +234,24 @@ pub fn diff_series(
         })
         .map(|row| GoneRow::of(row, floor))
         .collect();
-    let created = upserts
-        .iter()
-        .filter(|u| !before.iter().any(|b| b.id == u.id))
-        .map(|u| u.id.clone())
-        .collect();
     let stale = !expect.iter().all(|e| shows(e, refetched, zone));
     SeriesDiff {
         upserts,
-        created,
         deletes,
         stale,
+    }
+}
+
+impl SeriesDiff {
+    /// The upserts' ids the mirror didn't hold before the write went out (`snapshot`, read before the
+    /// first send), so a list that lags behind them can't take them off the screen, even if a sync has
+    /// written them since (C9 design §0.6, review M4).
+    pub fn created_since(&self, snapshot: &[CalendarEvent]) -> Vec<String> {
+        self.upserts
+            .iter()
+            .filter(|u| !snapshot.iter().any(|s| s.id == u.id))
+            .map(|u| u.id.clone())
+            .collect()
     }
 }
 
@@ -391,7 +367,7 @@ mod tests {
                 format!("{CAL}:abc_20261026T090000Z")
             ]
         );
-        assert!(diff.created.is_empty());
+        assert!(diff.created_since(&before).is_empty());
         assert!(!diff.stale);
         // Not complete: only the cancelled one goes; the missing 26-10 proves nothing.
         let partial = Listing {
@@ -457,7 +433,7 @@ mod tests {
         );
         assert_eq!(ids(&diff.deletes), vec![old.id.as_str()]);
         assert_eq!(
-            diff.created,
+            diff.created_since(std::slice::from_ref(&old)),
             vec![
                 format!("{CAL}:abc_r2_20261012"),
                 format!("{CAL}:tail_20261019")
@@ -605,7 +581,7 @@ mod tests {
             listing: &far,
         }];
         let diff = diff_series(CAL, &[], &refetch, window(), &[], London, None);
-        assert!(diff.upserts.is_empty() && diff.created.is_empty());
+        assert!(diff.upserts.is_empty() && diff.created_since(&[]).is_empty());
     }
 
     /// C8b review R2: an occurrence the run reported it couldn't cancel is still in Google. A

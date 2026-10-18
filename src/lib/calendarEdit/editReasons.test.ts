@@ -51,7 +51,10 @@ describe("edit reasons", () => {
     const outcomes: WriteOutcome[] = [
       { outcome: "saved", warnings: [] },
       { outcome: "saved", warnings: ["mirror_refresh_pending"] },
+      { outcome: "saved", warnings: ["left_on_old_series"], left_behind: ["2026-11-02"] },
       { outcome: "no_change" },
+      { outcome: "needs_choice" },
+      { outcome: "ignored_by_google", split: false },
       { outcome: "conflict", fields: ["summary"] },
       { outcome: "conflict", fields: [] },
       { outcome: "gone" },
@@ -95,6 +98,23 @@ describe("edit reasons", () => {
       tone: "warn",
       text: "PM lost touch with Google before it could confirm whether “Dentist” was deleted. Refresh the calendar to see.",
     });
+    // A series delete that left occurrences changed on their own says they may still show.
+    expect(
+      deleteText(
+        { outcome: "saved", warnings: ["left_on_old_series"], left_behind: ["2026-11-02"] },
+        "Standup",
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "Deleted “Standup” from that day on. Some occurrences changed on their own may still show; check them in Google Calendar.",
+    });
+    // A plan that changed since the choice, or a change Google ignored, deleted nothing.
+    expect(deleteText({ outcome: "needs_choice" }, "Standup").text).toMatch(
+      /wasn't deleted\. .*Choose again\.$/,
+    );
+    expect(deleteText({ outcome: "ignored_by_google", split: false }, "Standup").text).toMatch(
+      /^“Standup” wasn't deleted\./,
+    );
   });
 
   it("explains an editor that couldn't open, and a draft that can't be saved", () => {

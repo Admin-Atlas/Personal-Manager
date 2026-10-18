@@ -1677,12 +1677,21 @@ export type SeriesChoices =
   | { outcome: "ready"; this: ScopeRow; following: ScopeRow; all: ScopeRow }
   | { outcome: "refused"; result: WriteOutcome };
 
-export type WriteWarning = "mirror_refresh_pending";
+/** Which occurrences of a repeating event a save or delete is for. */
+export type SeriesScope = "this" | "following" | "all";
+
+export type WriteWarning = "mirror_refresh_pending" | "left_on_old_series";
 
 /** What a save came to. `saved` and `no_change` are the successes. */
 export type WriteOutcome =
-  | { outcome: "saved"; warnings: WriteWarning[] }
+  /** `left_behind`: the days (YYYY-MM-DD) of occurrences changed on their own that a series delete
+   *  couldn't cancel, so they may still show. */
+  | { outcome: "saved"; warnings: WriteWarning[]; left_behind?: string[] }
   | { outcome: "no_change" }
+  /** The repeating event's plan changed since the user chose: ask again; nothing was sent. */
+  | { outcome: "needs_choice" }
+  /** Google answered success and kept what was there. */
+  | { outcome: "ignored_by_google"; split: boolean }
   | { outcome: "conflict"; fields: string[] }
   | { outcome: "gone" }
   | { outcome: "read_only"; reason: ReadOnlyReason }
@@ -1698,11 +1707,14 @@ export interface HeldDeleteInfo {
   event_id: string;
   summary: string;
   seconds_left: number;
+  /** The rows a series delete hides while it waits (PM's own row ids). */
+  hidden?: string[];
 }
 
-/** What asking to delete came to: held for its Undo window (`undo_token` cancels it), or refused. */
+/** What asking to delete came to: held for its Undo window (`undo_token` cancels it), or refused.
+ *  A series delete names the rows it hides (`hidden`). */
 export type DeleteStart =
-  | { outcome: "held"; undo_token: string; undo_seconds: number }
+  | { outcome: "held"; undo_token: string; undo_seconds: number; hidden?: string[] }
   | { outcome: "refused"; result: WriteOutcome };
 
 /** The `calendar://delete-settled` event: how a held delete ended at Google. */

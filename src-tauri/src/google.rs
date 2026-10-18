@@ -385,7 +385,9 @@ pub async fn authorized_get_dated(token_key: &str, url: &str, policy: SendPolicy
 }
 
 /// When a reply says it was sent, from its HTTP `Date` header ("Sat, 10 Oct 2026 10:00:00 GMT").
-fn server_time_of(headers: &reqwest::header::HeaderMap) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn server_time_of(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let text = headers.get(reqwest::header::DATE)?.to_str().ok()?;
     chrono::DateTime::parse_from_rfc2822(text)
         .ok()
@@ -517,6 +519,12 @@ impl SendPolicy {
 }
 
 /// [`authorized_send`] under an explicit [`SendPolicy`].
+///
+/// What a calendar write relies on when it reads an error from this (#884): every error but an
+/// [`Error::Http`] comes from getting or renewing the token, before the request is built or after
+/// Google answered it 401 or 429, so none of them went with a request Google applied. An
+/// [`Error::Http`] whose connection was never made (`is_connect`) wasn't applied either; any other
+/// may have been.
 pub async fn authorized_send_with<F>(
     client: &reqwest::Client,
     token_key: &str,
