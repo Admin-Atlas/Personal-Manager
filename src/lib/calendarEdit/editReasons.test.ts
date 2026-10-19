@@ -358,9 +358,10 @@ describe("settling a change PM couldn't finish", () => {
         "Gym",
       ).text,
     ).toMatch(/^“Gym”: Saved from 02-11/);
-    // A settle's Busy is PM's own claim, never Google's (C1-L9).
+    // PM's own claim comes back held, with a note; a plain busy is Google's, after Finish was taken
+    // back (C9b-1a review round 2).
     expect(settleText({ outcome: "busy" }, "Gym").text).toBe(
-      "“Gym”: PM is still changing this repeating event; try again in a moment.",
+      "“Gym”: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.",
     );
     expect(settleText({ outcome: "failed", message: "x" }, "Gym")).toEqual({
       tone: "error",

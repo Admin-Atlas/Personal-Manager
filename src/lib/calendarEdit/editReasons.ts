@@ -359,11 +359,13 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
         tone: "warn",
         text: `${t}: ${result.note ?? partialText(result.offers, result.from)}`,
       };
-    // PM's own claim on the repeating event (a held delete, a save), not Google (C9b-1 critique 1 L9).
+    // PM's own claim on the repeating event comes back as `partial_split` with a note, the change still
+    // held. A plain busy means Google refused Finish's next step and PM took its new part back, the
+    // change no longer held (C9b-1a review round 2).
     case "busy":
       return {
         tone: "warn",
-        text: `${t}: PM is still changing this repeating event; try again in a moment.`,
+        text: `${t}: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.`,
       };
     case "no_change":
     case "needs_choice":
