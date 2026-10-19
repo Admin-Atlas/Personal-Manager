@@ -79,15 +79,21 @@ type PartialSplit = Extract<WriteOutcome, { outcome: "partial_split" }>;
 interface State {
   held: readonly HeldDelete[];
   /** Rows a delete removed from Google, hidden until a read of the mirror no longer has them (the
-   *  read that `calendar://write-outcome` starts can land after the settle). */
-  removed: ReadonlySet<string>;
+   *  read that `calendar://write-outcome` starts can land after the settle). A number is the
+   *  settle's mark: a read that started after it is the truth about the row, so a row it still
+   *  has comes back (an occurrence a delete of several couldn't cancel stays in Google). Null: the
+   *  row is hidden while any read has it (Google deleted it; only the mirror lags). */
+  removed: ReadonlyMap<string, number | null>;
   notices: readonly WriteNotice[];
+  /** How many deletes have settled. The calendar reads the mirror again on each, since the read
+   *  the backend's landing starts can begin before the webview hears the settle. */
+  settles: number;
 }
 
 /** How long a notice with nothing left to do stays up. Anything else stays until dismissed. */
 const NOTICE_MS = 5000;
 
-let state: State = { held: [], removed: new Set(), notices: [] };
+let state: State = { held: [], removed: new Map(), notices: [], settles: 0 };
 const subscribers = new Set<() => void>();
 let nextNotice = 1;
 let listening = false;
@@ -200,10 +206,17 @@ function settle(settled: DeleteSettled) {
   if (!held) return; // undone, or from before a reload the backend no longer listed
   const result = settled.result;
   const gone = result.outcome === "saved" || result.outcome === "gone";
-  update({
-    held: state.held.filter((h) => h !== held),
-    removed: gone ? new Set([...state.removed, ...held.hidden]) : state.removed,
-  });
+  const mark = state.settles + 1;
+  // Only a delete that landed and left occurrences in Google is settled by the next read: those
+  // rows are still in the mirror, and would otherwise stay hidden until a reload. Any other stays
+  // hidden while the mirror has it, so a deleted event never shows again before a sync catches up.
+  const releasable =
+    result.outcome === "saved" &&
+    result.warnings.includes("left_on_old_series") &&
+    !result.warnings.includes("mirror_refresh_pending");
+  const removed = new Map(state.removed);
+  if (gone) for (const id of held.hidden) removed.set(id, releasable ? mark : null);
+  update({ held: state.held.filter((h) => h !== held), removed, settles: mark });
   if (result.outcome === "partial_split") {
     holdPartial(held.summary, result, deleteText(result, held.summary).text, held.noticeId);
     return;
@@ -460,8 +473,9 @@ export function notePartial(title: string, outcome: PartialSplit): boolean {
   return holdPartial(title, outcome, settleText(outcome, title).text);
 }
 
-/** Words from the choices said once (a change PM was making when it closed) that the user closed
- *  without choosing: kept as a notice, until dismissed, so they aren't lost. */
+/** Words about a repeating event kept as a notice until dismissed: what the choices said once (a
+ *  change PM was making when it closed) that the user closed without choosing, so they aren't
+ *  lost, or a delete whose plan changed under the user twice. */
 export function noteSeriesNotice(text: string) {
   put({ id: nextNotice++, tone: "warn", text });
 }
@@ -479,30 +493,53 @@ export function noteSaved(
   put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from) });
 }
 
-/** A fresh read of the mirror: rows it no longer has needn't be hidden any more. */
-export function pruneRemoved(events: readonly CalendarEvent[]) {
-  if (state.removed.size === 0) return;
-  const present = new Set(events.map((e) => e.id));
-  const still = [...state.removed].filter((id) => present.has(id));
-  if (still.length !== state.removed.size) update({ removed: new Set(still) });
+/** The read mark: take it before a read of the mirror starts, and give it to `pruneRemoved` with
+ *  what the read found. */
+export function readMark(): number {
+  return state.settles;
 }
 
-/** The calendar's view of the writes in flight: notices, and the rows to hide (held or removed). */
+/** A fresh read of the mirror, started at `startedAt` (a {@link readMark}): rows it no longer has
+ *  needn't be hidden any more, nor a row it has whose delete settled before the read began and
+ *  left it in Google. Without a mark, only rows the read no longer has. */
+export function pruneRemoved(events: readonly CalendarEvent[], startedAt = -1) {
+  if (state.removed.size === 0) return;
+  const present = new Set(events.map((e) => e.id));
+  const still = [...state.removed].filter(
+    ([id, mark]) => present.has(id) && (mark === null || mark > startedAt),
+  );
+  if (still.length !== state.removed.size) update({ removed: new Map(still) });
+}
+
+/** Read the mirror with `read`, marked, and show again what that read settles. */
+export async function readMirror<T extends readonly CalendarEvent[]>(
+  read: () => Promise<T>,
+): Promise<T> {
+  const mark = readMark();
+  const events = await read();
+  pruneRemoved(events, mark);
+  return events;
+}
+
+/** The calendar's view of the writes in flight: notices, the rows to hide (held or removed), and
+ *  how many deletes have settled (read the mirror again when it changes). */
 export function useEventWrites() {
   // On first use (and after a reload): hear how held deletes end, and pick up any still waiting.
   useEffect(watchHeldDeletes, []);
   const snap = useSyncExternalStore(subscribe, () => state);
   const hiddenIds = useMemo(
-    () => new Set([...snap.held.flatMap((h) => h.hidden), ...snap.removed]),
+    () => new Set([...snap.held.flatMap((h) => h.hidden), ...snap.removed.keys()]),
     [snap.held, snap.removed],
   );
   return {
     notices: snap.notices,
     hiddenIds,
+    settles: snap.settles,
     startDelete,
     undoDelete,
     undoLatest,
     settleSplit,
+    noteSeriesNotice,
     dismissNotice,
     pruneRemoved,
   };

@@ -6,11 +6,13 @@
 //! save runs it again on a fresh copy from Google before sending anything. It fails closed: a role or
 //! an event type PM doesn't know reads as read-only, never as editable.
 //!
-//! The first layers edit only solo, one-off events you organise. Repeating events, events with
-//! guests and invitations are read-only with a reason until the layers that handle them (C9, C12,
-//! C14) lift that reason, each replacing it with the rule it stood in for (rule R9). A one-off that
-//! Google has since turned into a repeating event is read-only with its own reason on every path,
-//! since a write to it would change every occurrence with no choice asked.
+//! Events PM can change are the ones you organise on a calendar you can edit, with no guests,
+//! repeating ones included: a change to an occurrence of one names which occurrences it's for
+//! ("this event", "this and following", "all events"), and a write without that choice is asked
+//! again (rule R9). Events with guests and invitations are read-only with a reason until the layers
+//! that handle them (C12, C14) lift it, each replacing it with the rule it stood in for. A one-off
+//! that Google has since turned into a repeating event is read-only with its own reason on every
+//! path, since a write to it would change every occurrence with no choice asked.
 
 use crate::calendar_editing::EditingStatus;
 
@@ -30,7 +32,6 @@ pub struct EditFacts<'a> {
     pub organizer_self: bool,
     pub locked: bool,
     pub visibility: Option<&'a str>,
-    pub recurring: bool,
     /// Google's copy is a repeating event's series itself (its rule, no `recurringEventId`), while PM
     /// asked about one event: a one-off that had a rule added in Google since. Saving or deleting it
     /// would change every occurrence with no choice asked (C9 design §0.7, critique 2 M6). Known only
@@ -113,12 +114,8 @@ fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
     if !facts.organizer_self {
         return Some(ReadOnlyReason::NotOrganizer);
     }
-    // Before `recurring`: a copy turned into a series has both, and its own reason says what to do.
     if facts.series_master {
         return Some(ReadOnlyReason::BecameRepeating);
-    }
-    if facts.recurring {
-        return Some(ReadOnlyReason::Recurring);
     }
     if facts.has_guests {
         return Some(ReadOnlyReason::HasGuests);
@@ -141,7 +138,6 @@ mod tests {
             organizer_self: true,
             locked: false,
             visibility: None,
-            recurring: false,
             series_master: false,
             has_guests: false,
             html_description: false,
@@ -292,23 +288,7 @@ mod tests {
             ),
             (
                 EditFacts {
-                    recurring: true,
-                    ..e()
-                },
-                Recurring,
-            ),
-            (
-                EditFacts {
                     series_master: true,
-                    ..e()
-                },
-                BecameRepeating,
-            ),
-            // A copy turned into a series also repeats: its own reason is the one shown.
-            (
-                EditFacts {
-                    series_master: true,
-                    recurring: true,
                     ..e()
                 },
                 BecameRepeating,
@@ -320,11 +300,10 @@ mod tests {
                 },
                 HasGuests,
             ),
-            // The first reason wins: a read-only shared calendar outranks "it repeats".
+            // The first reason wins: a read-only shared calendar outranks "it has guests".
             (
                 EditFacts {
                     access_role: Some("reader"),
-                    recurring: true,
                     has_guests: true,
                     ..e()
                 },

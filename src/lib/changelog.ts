@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.149.0-alpha",
+    date: "2026-10-19",
+    highlights: [
+      "You can now change and delete repeating events you organise in Google Calendar, right from PM. Like Google Calendar, PM asks whether you mean this event, this and the following events, or all events, and before you choose it says what that would change: occurrences you changed on their own, a move to another day, or a video call the new part won't have.",
+      "There's no Undo after saving a repeating event: the notice says how to change it back, by editing it again. Deleting one still gives you a few seconds to undo, as with any event. A new part made by “this and the following events” starts without a video call; add one in Google Calendar if you need it.",
+      "If PM loses touch with Google halfway through a change, it says so and gives you buttons to finish it or take it back, so nothing is left showing twice.",
+    ],
+  },
+  {
     version: "3.148.9-alpha",
     date: "2026-10-19",
     highlights: [

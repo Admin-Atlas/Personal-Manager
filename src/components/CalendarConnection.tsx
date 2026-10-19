@@ -626,7 +626,7 @@ const EDITING_COPY: Record<
     enable: true,
   },
   on: {
-    text: "Editing on: PM can change and delete one-off events you organise on this account’s calendars.",
+    text: "Editing on: PM can change and delete events you organise without guests on this account’s calendars, repeating ones included.",
     action: "Turn off editing",
     enable: false,
     paused: true,

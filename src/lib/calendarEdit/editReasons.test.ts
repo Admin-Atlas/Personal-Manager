@@ -40,7 +40,6 @@ const REASONS: ReadOnlyReason[] = [
   "calendar_read_only",
   "private_event",
   "not_organizer",
-  "recurring",
   "became_repeating",
   "has_guests",
   "special_type",

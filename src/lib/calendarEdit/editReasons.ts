@@ -34,8 +34,6 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This is a private event on a calendar shared with you, and you can't change private events there.";
     case "not_organizer":
       return "Someone else organises this event, so only they can change it.";
-    case "recurring":
-      return "This is a repeating event, and PM can't change repeating events yet.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "has_guests":

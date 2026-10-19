@@ -137,8 +137,6 @@ pub enum ReadOnlyReason {
     PrivateEvent,
     /// Someone else organises it: an invitation.
     NotOrganizer,
-    /// A repeating event (until "this / following / all" lands).
-    Recurring,
     /// A one-off in PM that has since become a repeating event in Google: open one of its occurrences.
     BecameRepeating,
     /// It has guests, who Google would email (until Send / Don't send lands).

@@ -239,7 +239,6 @@ fn facts_from_fresh<'a>(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         visibility: text("visibility"),
-        recurring: fresh.get("recurringEventId").is_some() || fresh.get("recurrence").is_some(),
         series_master: turned_series(fresh),
         has_guests: fresh
             .get("attendees")
@@ -271,12 +270,25 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         organizer_self: row.organizer_self,
         locked: row.locked,
         visibility: row.visibility.as_deref(),
-        recurring: row.recurring || row.series_id.is_some(),
-        // The mirror never holds a series itself (`calendar::parse_event`).
+        // The mirror never holds a series itself (`calendar::parse_event`). An occurrence is
+        // editable like a one-off here: which occurrences is asked at the write (rule R9).
         series_master: false,
         has_guests: row.attendees.iter().any(|a| !a.is_self),
         html_description: false,
     }
+}
+
+/// Whether a mirror row is an occurrence of a repeating event: its series id, or the flag a row
+/// read before series ids existed carries (the webview's `isRepeating` asks the same).
+fn row_repeats(row: &CalendarEvent) -> bool {
+    row.recurring || row.series_id.is_some()
+}
+
+/// Whether the mirror row `row_id` is an occurrence of a repeating event, so a delete of it must
+/// name which occurrences (rule R9; C9 design review scope-L8: refused before it's held, not 8 s
+/// later). A row that's gone answers false: the delete's own read says so.
+fn needs_scope(conn: &Connection, row_id: &str) -> Result<bool> {
+    Ok(calendar::event_by_id(conn, row_id)?.is_some_and(|row| row_repeats(&row)))
 }
 
 /// Each row's list-level edit block (see [`facts_from_row`]): the one reason nothing about it may
@@ -619,7 +631,8 @@ fn seen_of(calendar_id: &str, fresh: &Value) -> Option<SeenSummary> {
 /// Save the fields the user changed. Built against a fresh copy, sent with its etag, and never over a
 /// change Google made meanwhile to a field this save also sends. `scope` names which occurrences of
 /// a repeating event it's for and `choice` the plan the user chose ([`series_choices`]); without a
-/// scope it's one event, as before (a repeating one stays read-only until the dialog, C9b-1).
+/// scope it's one event: a one-off (an occurrence of a repeating event answers `NeedsChoice`, rule
+/// R9).
 #[tauri::command]
 pub async fn update_calendar_event(
     app: AppHandle,
@@ -631,11 +644,6 @@ pub async fn update_calendar_event(
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
-    if scope.is_some() && !cfg!(debug_assertions) {
-        return Ok(WriteOutcome::Failed {
-            message: SCOPED_NOT_YET.into(),
-        });
-    }
     let state = app.state::<AppState>();
     let Some(open) = open_session(&state.calendar_edit, &session)? else {
         return Ok(WriteOutcome::Failed {
@@ -712,6 +720,11 @@ async fn save_event<W: Wire, H: Host>(
         let perms = gate::edit_rights(&facts);
         if let Some(reason) = refused_field(&perms, draft) {
             return WriteOutcome::ReadOnly { reason };
+        }
+        // An occurrence of a repeating event: which occurrences is the user's choice, never a
+        // default (rule R9). Only a GET has gone out.
+        if fresh.get("recurringEventId").is_some() {
+            return WriteOutcome::NeedsChoice;
         }
         let body = match patch::build_patch(&fresh, draft) {
             Ok(body) => body,
@@ -806,18 +819,16 @@ pub async fn delete_calendar_event(
     require_main_window(&window)?;
     require_owner(&app)?;
     let refused = |result| Ok(DeleteStart::Refused { result });
-    if scope.is_some() && !cfg!(debug_assertions) {
-        return refused(WriteOutcome::Failed {
-            message: SCOPED_NOT_YET.into(),
-        });
-    }
     let state = app.state::<AppState>();
-    let (target, editing_choice) = {
+    // One lock for the row's target, its account's choice and whether it repeats (the DB mutex
+    // isn't re-entrant).
+    let (target, editing_choice, in_series) = {
         let conn = state.conn()?;
         match resolve_target(&conn, &event_id)? {
             Ok(target) => {
                 let editing_choice = calendar_editing::choice(&conn, &target.email)?;
-                (target, editing_choice)
+                let in_series = needs_scope(&conn, &event_id)?;
+                (target, editing_choice, in_series)
             }
             Err(reason) => return refused(WriteOutcome::ReadOnly { reason }),
         }
@@ -838,6 +849,12 @@ pub async fn delete_calendar_event(
                 message: message.into(),
             });
         }
+    }
+    // An occurrence of a repeating event with no choice: ask now, rather than hold it for the Undo
+    // window and refuse it at the send (rule R9). A one-off Google has turned into a series since
+    // isn't one here; it holds, and the gate refuses it at the send.
+    if scope.is_none() && in_series {
+        return refused(WriteOutcome::NeedsChoice);
     }
     if let Some(scope) = scope {
         return start_series_delete(
@@ -1055,6 +1072,11 @@ async fn send_delete<W: Wire, H: Host>(
                     .copied()
                     .unwrap_or(ReadOnlyReason::CalendarReadOnly),
             };
+        }
+        // An occurrence of a repeating event: which occurrences is the user's choice, never a
+        // default (rule R9). Only a GET has gone out.
+        if fresh.get("recurringEventId").is_some() {
+            return WriteOutcome::NeedsChoice;
         }
         match patch::delete_still_matches(seen, &fresh) {
             DeleteCheck::Matches => {}
@@ -1618,12 +1640,9 @@ async fn prepare_change<W: Wire>(
             Err(result) => return refused(result),
         },
     };
-    // The gate on Google's copy, all but its stand-in for this very choice: a repeating event is
-    // read-only only until the dialog asks which occurrences (R9). A one-off turned into a series
-    // keeps its own reason: nothing here may clear `series_master`.
-    let mut facts = facts_from_fresh(&fresh, &target.facts, editing);
-    facts.recurring = false;
-    let perms = gate::edit_rights(&facts);
+    // The gate on Google's copy. A one-off turned into a series keeps its own reason: nothing here
+    // may clear `series_master`.
+    let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
     let closed = match request {
         ChoiceRequest::Edit { draft, .. } => refused_field(&perms, draft),
         ChoiceRequest::Delete { .. } => (!perms.delete).then(|| {
@@ -1764,9 +1783,6 @@ const NOT_REPEATING: &str =
     "This event doesn't repeat, so there are no occurrences to choose from. Save it without choosing.";
 const NOT_REPEATING_DELETE: &str = "This event doesn't repeat, so there are no occurrences to \
                                     choose from. Delete it without choosing.";
-/// Until the dialog that asks which occurrences arrives (C9b-1), release builds send no change to
-/// more than one event, and settle none; dev builds do, for the live checks.
-const SCOPED_NOT_YET: &str = "Changing repeating events from PM isn't available yet.";
 const UNFIT: &str = "PM built a change it isn't allowed to send, so nothing was saved.";
 /// A new series' own POST answered 404 with nothing in doubt (C9a-3a critique L6).
 const NO_CALENDAR: &str = "Google couldn't find this calendar for this account, so nothing was \
@@ -2771,12 +2787,6 @@ pub async fn settle_series_split(
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
-    // A change is only ever partial after a dev build's scoped write; release refuses first.
-    if !cfg!(debug_assertions) {
-        return Ok(WriteOutcome::Failed {
-            message: SCOPED_NOT_YET.into(),
-        });
-    }
     let state = app.state::<AppState>();
     let Some((target, _)) = state.calendar_edit.partial_claim(&token) else {
         return Ok(WriteOutcome::Failed {
@@ -4655,9 +4665,6 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
         ReadOnlyReason::NotOrganizer => {
             "Someone else organises this event, so only they can change it."
         }
-        ReadOnlyReason::Recurring => {
-            "This is a repeating event, and PM can't change repeating events yet."
-        }
         ReadOnlyReason::BecameRepeating => {
             "This became a repeating event in Google. Refresh, then open one of its occurrences."
         }
@@ -4696,7 +4703,7 @@ trait Host: Sync {
     }
     /// Whether a settle may write to the Google calendar `remote`: a dev build's allow-list, failing
     /// closed when unset, since a settle reaches a whole new part and a cut series (C9a-3a critique
-    /// 9). Release builds refuse every settle in its shell.
+    /// 9). Release builds settle; dev builds check the allow-list (fails closed when unset).
     fn settle_allowed(&self, remote: &str) -> Result<std::result::Result<(), &'static str>> {
         #[cfg(debug_assertions)]
         {
@@ -5424,16 +5431,16 @@ mod tests {
             "description": "<b>agenda</b>"
         });
         let f = facts_from_fresh(&mine, &facts, EditingStatus::On);
-        assert!(f.organizer_self && !f.has_guests && f.html_description && !f.recurring);
+        assert!(f.organizer_self && !f.has_guests && f.html_description && !f.series_master);
         let invite = json!({
             "organizer": { "email": "boss@x.com" }, "recurringEventId": "s1",
             "attendees": [{ "email": "me@x.com", "self": true }, { "email": "boss@x.com" }]
         });
         let f = facts_from_fresh(&invite, &facts, EditingStatus::On);
-        assert!(!f.organizer_self && f.has_guests && f.recurring);
+        assert!(!f.organizer_self && f.has_guests && !f.series_master);
         assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::NotOrganizer));
         // An occurrence, a one-off, and a one-off Google has since given a rule: only the last is a
-        // series itself, and its own reason outranks "it repeats" (C9 design critique 2 M6).
+        // series itself, with its own reason (C9 design critique 2 M6).
         let mine = || json!({ "organizer": { "self": true }, "eventType": "default" });
         let mut occurrence = mine();
         occurrence["recurringEventId"] = json!("s1");
@@ -5446,13 +5453,10 @@ mod tests {
         assert_eq!(masters, [false, false, true]);
         let f = facts_from_fresh(&turned, &facts, EditingStatus::On);
         assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::BecameRepeating));
-        // An occurrence you organise: `recurring` is all that blocks it, the stand-in the choices
-        // and every scoped write clear (and C9b-1b deletes). Without it, every field and the delete
-        // are open, so nothing else in the gate stands between it and the dialog (C9b-1 critiques
-        // 1 L5, 2 L11).
-        let mut f = facts_from_fresh(&occurrence, &facts, EditingStatus::On);
-        assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::Recurring));
-        f.recurring = false;
+        // An occurrence you organise edits like a one-off: every field and the delete are open, so
+        // nothing in the gate stands between it and the dialog; which occurrences is asked at the
+        // write (R9; C9b-1 critiques 1 L5, 2 L11).
+        let f = facts_from_fresh(&occurrence, &facts, EditingStatus::On);
         let open = FieldPermissions {
             summary: true,
             time: true,
@@ -5542,7 +5546,6 @@ mod tests {
             organizer_self: true,
             locked: true,
             visibility: None,
-            recurring: false,
             series_master: false,
             has_guests: false,
             html_description: false,
@@ -5616,14 +5619,58 @@ mod tests {
             calendar_id: "gone".into(),
             ..mine.clone()
         };
+        // An occurrence of a repeating event you organise gets Edit and Delete: the dialog asks
+        // which occurrences (R9).
+        let occurrence = CalendarEvent {
+            id: format!("{cal}:c_20261012T090000Z"),
+            series_id: Some("c".into()),
+            recurring: true,
+            ..mine.clone()
+        };
         assert_eq!(
-            edit_blocks(&conn, &[mine, invite, orphan]).unwrap(),
+            edit_blocks(&conn, &[mine, invite, orphan, occurrence]).unwrap(),
             vec![
                 None,
                 Some(ReadOnlyReason::NotOrganizer),
-                Some(ReadOnlyReason::NotGoogle)
+                Some(ReadOnlyReason::NotGoogle),
+                None
             ]
         );
+    }
+
+    /// scope-L8: a delete of an occurrence with no choice is refused before it's held. The test is
+    /// the same "is it repeating" the list's facts and the webview's `isRepeating` use.
+    #[test]
+    fn a_series_row_needs_a_choice_before_its_delete_is_held() {
+        let (_d, conn) = store();
+        let cal = "gcal:me@x.com:me@x.com";
+        add_calendar(&conn, "gcal:me@x.com", "google", cal, Some("me@x.com"));
+        let one_off = CalendarEvent {
+            id: format!("{cal}:a"),
+            calendar_id: cal.into(),
+            summary: "Mine".into(),
+            start: "2026-10-12T09:00:00Z".into(),
+            organizer_self: true,
+            ..Default::default()
+        };
+        let occurrence = CalendarEvent {
+            id: format!("{cal}:s_20261012T090000Z"),
+            series_id: Some("s".into()),
+            recurring: true,
+            ..one_off.clone()
+        };
+        // A row read before series ids existed repeats by its flag alone.
+        let flagged = CalendarEvent {
+            id: format!("{cal}:f_20261012T090000Z"),
+            recurring: true,
+            ..one_off.clone()
+        };
+        let rows = [one_off.clone(), occurrence.clone(), flagged.clone()];
+        calendar::replace_events(&conn, cal, &rows, true).unwrap();
+        assert!(needs_scope(&conn, &occurrence.id).unwrap());
+        assert!(needs_scope(&conn, &flagged.id).unwrap());
+        assert!(!needs_scope(&conn, &one_off.id).unwrap());
+        assert!(!needs_scope(&conn, &format!("{cal}:missing")).unwrap());
     }
 
     // --- repeating events (C9a-2): Google scripted ---
@@ -12144,6 +12191,100 @@ mod tests {
         assert!(row.is_some());
     }
 
+    // --- an unscoped write on an occurrence asks which occurrences (R9, C9b-1b) ---
+
+    /// The dentist as one occurrence of a weekly event you organise.
+    fn dentist_occurrence() -> Value {
+        with(dentist(), "recurringEventId", json!("weekly"))
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_save_on_an_occurrence_asks_which_occurrences() {
+        let event = dentist_occurrence();
+        let target = target(&event);
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+        let open = open_session(&host.edit, &session).unwrap().unwrap();
+        let script = Script::new(vec![Step::get("/events/solo", "", event)]);
+        let outcome = save_event(
+            &script,
+            &*host,
+            &session,
+            &open,
+            &title("Retro"),
+            EditingStatus::On,
+        )
+        .await;
+        script.finished();
+        assert!(
+            matches!(outcome, WriteOutcome::NeedsChoice),
+            "asks rather than saving this event alone"
+        );
+        assert_eq!(script.sent().len(), 1);
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.summary, "Dentist");
+    }
+
+    /// A read-only reason outranks the choice: asking which occurrences of an event PM can't
+    /// change would lead nowhere.
+    #[tokio::test]
+    async fn an_unscoped_save_on_a_read_only_occurrence_says_why_first() {
+        let event = with(
+            dentist_occurrence(),
+            "attendees",
+            json!([{ "email": "guest@x.com" }]),
+        );
+        let target = target(&event);
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+        let open = open_session(&host.edit, &session).unwrap().unwrap();
+        let script = Script::new(vec![Step::get("/events/solo", "", event)]);
+        let outcome = save_event(
+            &script,
+            &*host,
+            &session,
+            &open,
+            &title("Retro"),
+            EditingStatus::On,
+        )
+        .await;
+        script.finished();
+        assert!(matches!(
+            outcome,
+            WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::HasGuests
+            }
+        ));
+        assert_eq!(script.sent().len(), 1);
+    }
+
+    /// A held delete with no choice whose row turned out to be an occurrence (the mirror row looked
+    /// like a one-off when it was held) sends nothing: the user deletes again and chooses.
+    #[tokio::test]
+    async fn an_unscoped_delete_on_an_occurrence_asks_which_occurrences() {
+        let event = dentist_occurrence();
+        let target = target(&event);
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![Step::get("/events/solo", "", event)]);
+        let outcome = send_delete(&script, &*host, &target, &seen).await;
+        script.finished();
+        assert!(
+            matches!(outcome, WriteOutcome::NeedsChoice),
+            "asks rather than deleting this event alone"
+        );
+        assert_eq!(script.sent().len(), 1);
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap();
+        assert!(row.is_some());
+    }
+
     // --- the release gate, and the words rows show (C9b-1 critiques 1 M8, 2 M4) ---
 
     /// The one release gate for a scoped write without its choice: every shell's series write takes
@@ -12281,7 +12422,6 @@ mod tests {
             ReadOnlyReason::CalendarReadOnly,
             ReadOnlyReason::PrivateEvent,
             ReadOnlyReason::NotOrganizer,
-            ReadOnlyReason::Recurring,
             ReadOnlyReason::BecameRepeating,
             ReadOnlyReason::HasGuests,
             ReadOnlyReason::SpecialType,

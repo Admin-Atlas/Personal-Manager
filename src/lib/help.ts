@@ -26,7 +26,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "nav-calendar": {
     title: "Calendar",
-    body: "One place to see everything from the calendars you've connected — Google, Outlook and iCal subscriptions — laid over each other. Switch between Agenda, Month, Week and Year, jump to today, and choose which calendars show. Click an event for its details; on a Google account with editing turned on, you can change or delete one-off events you organise without guests from there. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
+    body: "One place to see everything from the calendars you've connected — Google, Outlook and iCal subscriptions — laid over each other. Switch between Agenda, Month, Week and Year, jump to today, and choose which calendars show. Click an event for its details; on a Google account with editing turned on, you can change or delete events you organise without guests from there, repeating ones included: PM asks which occurrences you mean, as Google Calendar does. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
   },
   "nav-documents": {
     title: "Documents",
@@ -262,7 +262,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Calendar (unified view, card 8; editing #884)
   "calendar-view": {
     title: "Your calendar",
-    body: "A single view of every calendar you've connected, merged together and colour-coded by source (an event you gave its own colour in Google shows in it, with its calendar's colour down the edge), so you can see your whole schedule in one place; PM uses the same events for your agenda, chat answers and 'Due soon' flags. While PM is open, changes made in Google show within about half a minute. Click an event for its details. On a Google account with editing turned on (Settings → Connectors), Edit and Delete appear there for one-off events you organise without guests. Changes go straight to Google: a save never overwrites a field someone changed there in the meantime, and a delete waits a few seconds for Undo (or Ctrl+Z, ⌘Z on a Mac) and doesn't happen if the title, time or place changed there. Anything else says why it can't be changed. Connect or choose calendars in Settings → Connectors.",
+    body: "A single view of every calendar you've connected, merged together and colour-coded by source (an event you gave its own colour in Google shows in it, with its calendar's colour down the edge), so you can see your whole schedule in one place; PM uses the same events for your agenda, chat answers and 'Due soon' flags. While PM is open, changes made in Google show within about half a minute. Click an event for its details. On a Google account with editing turned on (Settings → Connectors), Edit and Delete appear there for events you organise without guests. For a repeating event PM asks whether you mean this event, this and the following events, or all of them, as Google Calendar does, and says first what that would change. Changes go straight to Google: a save never overwrites a field someone changed there in the meantime, and a delete waits a few seconds for Undo (or Ctrl+Z, ⌘Z on a Mac) and doesn't happen if the title, time or place changed there. Anything else says why it can't be changed. Connect or choose calendars in Settings → Connectors.",
   },
   "calendar-header": {
     title: "Move around & choose a view",
@@ -394,7 +394,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-calendar-editing": {
     title: "Calendar editing",
-    body: "Lets PM change and delete events on this Google account's calendars (one-off events you organise without guests, for now), including calendars shared with you that you can edit. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
+    body: "Lets PM change and delete events on this Google account's calendars (events you organise without guests, repeating ones included), including calendars shared with you that you can edit. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
   },
   "settings-calendar-microsoft": {
     title: "Outlook Calendar",

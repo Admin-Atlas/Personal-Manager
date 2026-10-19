@@ -7,30 +7,48 @@
 // pressed before the field loses focus, a conflict never loses the draft silently, a dirty draft asks
 // before it goes, and what can't change is greyed out with a reason (no device zone included).
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CalendarEvent,
   EditLoad,
   EventForEdit,
+  EventPatchDraft,
   FieldPermissions,
+  ScopeRow,
+  SeriesChoices,
+  SplitAction,
   WriteOutcome,
 } from "../../../lib/types";
+import type { Picked } from "../../../lib/calendarEdit/saveChoices";
 
+type SaveAnswer = WriteOutcome & { newPartial?: boolean };
 const openForEdit = vi.fn<(id: string) => Promise<EditLoad>>();
-const saveEdit = vi.fn<(session: string, changes: unknown) => Promise<WriteOutcome>>();
-const savedTitles: string[] = [];
+const saveEdit =
+  vi.fn<
+    (
+      session: string,
+      changes: EventPatchDraft,
+      picked: Picked | null,
+      title: string,
+    ) => Promise<SaveAnswer>
+  >();
+const choicesForEdit = vi.fn<(session: string, draft: EventPatchDraft) => Promise<SeriesChoices>>();
+const settleSplit =
+  vi.fn<(token: string, action: SplitAction, title: string) => Promise<WriteOutcome | null>>();
 const noteSaved = vi.fn();
+const noteSeriesNotice = vi.fn();
 let deviceZone: string | null = "Europe/London";
 
 vi.mock("./useEventWrites", () => ({
   openForEdit: (id: string) => openForEdit(id),
-  // The title goes aside, so a save's notice can't fall back to "(no title)" unseen.
-  saveEdit: (s: string, c: unknown, _p: unknown, t: string) => {
-    savedTitles.push(t);
-    return saveEdit(s, c);
-  },
+  // Every argument passes through, so a scope sent without its token couldn't pass for free.
+  saveEdit: (s: string, c: EventPatchDraft, p: Picked | null, t: string) => saveEdit(s, c, p, t),
+  choicesForEdit: (s: string, d: EventPatchDraft) => choicesForEdit(s, d),
+  settleSplit: (token: string, action: SplitAction, title: string) =>
+    settleSplit(token, action, title),
   noteSaved: (...a: unknown[]) => noteSaved(...a),
+  noteSeriesNotice: (text: string) => noteSeriesNotice(text),
 }));
 
 vi.mock("../../../theme/timezones", async (importOriginal) => ({
@@ -113,10 +131,14 @@ const ready = (ev: EventForEdit, permissions = ALL, session = "s1"): EditLoad =>
   series: null,
 });
 
-async function open(onClose = vi.fn(), onDelete?: (r: CalendarEvent) => void) {
+async function open(
+  onClose = vi.fn(),
+  onDelete?: (r: CalendarEvent) => void,
+  clicked: CalendarEvent = row,
+) {
   render(
     <EventEditor
-      row={row}
+      row={clicked}
       calendar={null}
       account="me@x.com"
       milestone={null}
@@ -127,6 +149,9 @@ async function open(onClose = vi.fn(), onDelete?: (r: CalendarEvent) => void) {
   await screen.findByLabelText("Title");
   return onClose;
 }
+
+/** A one-off's save: no scope, and the draft's title for its notices. */
+const UNSCOPED = [null, "Dentist"] as const;
 
 beforeEach(() => {
   deviceZone = "Europe/London";
@@ -158,19 +183,26 @@ describe("EventEditor", () => {
     expect(text.querySelector("b, i, script")).toBeNull();
   });
 
-  it("sends only what changed, then closes and says so", async () => {
+  it("sends only what changed, then closes and says so, asking no choices of a one-off", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
     const onClose = await open();
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Dentist (moved)" });
-    expect(savedTitles[savedTitles.length - 1]).toBe("Dentist (moved)");
-    expect(noteSaved).toHaveBeenCalledWith("Dentist (moved)", {
-      outcome: "saved",
-      warnings: [],
-    });
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { summary: "Dentist (moved)" },
+      null,
+      "Dentist (moved)",
+    );
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Dentist (moved)",
+      { outcome: "saved", warnings: [] },
+      null,
+      "2026-10-12",
+    );
+    expect(choicesForEdit).not.toHaveBeenCalled();
   });
 
   it("sends a date typed but not yet committed when Save is pressed", async () => {
@@ -184,17 +216,21 @@ describe("EventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     // The end moved with it, keeping the hour.
-    expect(saveEdit).toHaveBeenCalledWith("s1", {
-      time: {
-        kind: "timed",
-        start_date: "2026-10-13",
-        start_time: "09:00",
-        start_zone: "Europe/London",
-        end_date: "2026-10-13",
-        end_time: "10:00",
-        end_zone: "Europe/London",
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      {
+        time: {
+          kind: "timed",
+          start_date: "2026-10-13",
+          start_time: "09:00",
+          start_zone: "Europe/London",
+          end_date: "2026-10-13",
+          end_time: "10:00",
+          end_zone: "Europe/London",
+        },
       },
-    });
+      ...UNSCOPED,
+    );
   });
 
   it("closes without sending anything when nothing changed", async () => {
@@ -222,7 +258,12 @@ describe("EventEditor", () => {
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(saveEdit).toHaveBeenLastCalledWith("s2", { location: "Room 2" });
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { location: "Room 2" },
+      null,
+      "Dentist (Google)",
+    );
   });
 
   it("asks before throwing a dirty draft away", async () => {
@@ -311,9 +352,11 @@ describe("EventEditor", () => {
     fireEvent.change(first, { target: { value: "12-10-2026" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(saveEdit).toHaveBeenCalledWith("s1", {
-      time: { kind: "all_day", first_day: "2026-10-12", last_day: "2026-10-13" },
-    });
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: { kind: "all_day", first_day: "2026-10-12", last_day: "2026-10-13" } },
+      ...UNSCOPED,
+    );
   });
 
   it("turning All day on and off again leaves the time as Google holds it", async () => {
@@ -355,9 +398,11 @@ describe("EventEditor", () => {
     fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(saveEdit).toHaveBeenCalledWith("s1", {
-      time: expect.objectContaining({ start_time: "11:00", end_time: "12:00" }),
-    });
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: expect.objectContaining({ start_time: "11:00", end_time: "12:00" }) },
+      ...UNSCOPED,
+    );
   });
 
   it("gives a moved start an end after it, even from a 0-minute event", async () => {
@@ -375,9 +420,11 @@ describe("EventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     // An hour, as All day switched off gives.
-    expect(saveEdit).toHaveBeenCalledWith("s1", {
-      time: expect.objectContaining({ start_time: "11:00", end_time: "12:00" }),
-    });
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: expect.objectContaining({ start_time: "11:00", end_time: "12:00" }) },
+      ...UNSCOPED,
+    );
   });
 
   it("moves an end date set before the start up to the start's day", async () => {
@@ -404,9 +451,11 @@ describe("EventEditor", () => {
     expect(endDate.value).toBe("12-10-2026");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(saveEdit).toHaveBeenCalledWith("s1", {
-      time: expect.objectContaining({ end_date: "2026-10-12", end_time: "09:15" }),
-    });
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: expect.objectContaining({ end_date: "2026-10-12", end_time: "09:15" }) },
+      ...UNSCOPED,
+    );
   });
 
   it("keeps the last day of an all-day event on or after its first", async () => {
@@ -531,7 +580,7 @@ describe("EventEditor", () => {
     fireEvent.change(desc, { target: { value: "line one\nline two" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(saveEdit).toHaveBeenCalledWith("s1", { description: "line one\nline two" });
+    expect(saveEdit).toHaveBeenCalledWith("s1", { description: "line one\nline two" }, ...UNSCOPED);
   });
 
   it("says why it couldn't open", async () => {
@@ -540,5 +589,304 @@ describe("EventEditor", () => {
       <EventEditor row={row} calendar={null} account={null} milestone={null} onClose={() => {}} />,
     );
     expect(await screen.findByText(/Google needs you to sign in again/)).toBeTruthy();
+  });
+});
+
+// A repeating event's save (#884, C9b-1b): the choices first, the save for the occurrences picked
+// with their token and the very changes the choices were asked for, and every way back to the
+// editor keeping the draft, the words said once, and focus on Save.
+describe("EventEditor, a repeating event", () => {
+  const occurrence: CalendarEvent = { ...row, series_id: "abc", recurring: true };
+  const offered = (token: string): ScopeRow => ({ row: "offered", warnings: [], token });
+  const choices = (over: Partial<Extract<SeriesChoices, { outcome: "ready" }>> = {}) =>
+    ({
+      outcome: "ready",
+      this: offered("t-this"),
+      following: offered("t-following"),
+      all: offered("t-all"),
+      ...over,
+    }) as SeriesChoices;
+  const NOTICE = "PM closed before it finished an earlier change to this repeating event.";
+
+  /** Open the occurrence, retitle it, press Save: the choices dialog, and the editor's Save. */
+  async function retitle(title = "Gym") {
+    const onClose = await open(vi.fn(), undefined, occurrence);
+    const editorSave = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: title } });
+    fireEvent.click(editorSave);
+    const dialog = await screen.findByRole("dialog", { name: "Edit repeating event" });
+    return { onClose, editorSave, dialog };
+  }
+  const inDialog = (dialog: HTMLElement) => within(dialog);
+  const choicesOpen = () => screen.queryByRole("dialog", { name: "Edit repeating event" });
+
+  it("asks, then saves the occurrences picked with their token and the same changes", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(choices());
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const { onClose, dialog } = await retitle();
+    const d = inDialog(dialog);
+    await d.findByRole("radio", { name: /^This event/ });
+    expect(d.getByRole<HTMLInputElement>("radio", { name: /^This event/ }).checked).toBe(true);
+    expect(saveEdit).not.toHaveBeenCalled();
+    fireEvent.click(d.getByRole("radio", { name: /^All events/ }));
+    fireEvent.click(d.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(choicesForEdit).toHaveBeenCalledWith("s1", { summary: "Gym" });
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { summary: "Gym" },
+      { scope: "all", token: "t-all" },
+      "Gym",
+    );
+    // The very object the choices were asked for: the token binds it.
+    expect(saveEdit.mock.calls[0][1]).toBe(choicesForEdit.mock.calls[0][1]);
+    // No Undo after a repeating save: the notice says how to change it back.
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Gym",
+      { outcome: "saved", warnings: [] },
+      "all",
+      "2026-10-12",
+    );
+  });
+
+  it("asks when the editor knows its repeating event, whatever the row says", async () => {
+    openForEdit.mockResolvedValue({
+      ...ready(event()),
+      series: { first: false, repeats: "Weekly on Monday" },
+    } as EditLoad);
+    choicesForEdit.mockResolvedValue(choices());
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: "Edit repeating event" });
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("pre-selects nothing for a visibility change, and Save waits for a pick", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(
+      choices({
+        this: {
+          row: "refused",
+          message: "Visibility applies to every occurrence, so it can't change for this one only.",
+        },
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    await open(vi.fn(), undefined, occurrence);
+    fireEvent.change(screen.getByRole("combobox", { name: /Visibility/ }), {
+      target: { value: "private" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const d = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    await d.findByRole("radio", { name: /^All events/ });
+    expect(d.getAllByRole<HTMLInputElement>("radio").some((r) => r.checked)).toBe(false);
+    const send = d.getByRole<HTMLButtonElement>("button", { name: "Save" });
+    expect(send.disabled).toBe(true);
+    fireEvent.click(d.getByRole("radio", { name: /^All events/ }));
+    expect(send.disabled).toBe(false);
+  });
+
+  it("puts focus on Back, so Enter on open sends nothing, and Back closes", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(choices());
+    const { dialog } = await retitle();
+    const d = inDialog(dialog);
+    await d.findByRole("radio", { name: /^This event/ });
+    const back = d.getByRole("button", { name: "Back" });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+    expect(d.getAllByRole("radio")).not.toContain(document.activeElement);
+    expect(document.activeElement).not.toBe(d.getByRole("button", { name: "Save" }));
+    fireEvent.click(back);
+    expect(choicesOpen()).toBeNull();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("goes Back to the draft, keeping the words said once and putting focus on Save", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(choices({ notice: NOTICE }));
+    const { onClose, editorSave, dialog } = await retitle();
+    const d = inDialog(dialog);
+    expect(await d.findByText(NOTICE)).toBeTruthy();
+    fireEvent.click(d.getByRole("button", { name: "Back" }));
+    expect(choicesOpen()).toBeNull();
+    expect(noteSeriesNotice).toHaveBeenCalledWith(NOTICE);
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Gym");
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  it("closes only the choices on Escape: no discard prompt", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(choices());
+    const { onClose, editorSave } = await retitle();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(choicesOpen()).toBeNull();
+    expect(screen.queryByText("Discard your changes?")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  // C9b-1 critique 1 H1: an answer to an earlier ask never replaces a later one, so the save
+  // never sends a draft older than the one on screen.
+  it("saves the changes on screen when an earlier ask's answer arrives late", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    let first: (c: SeriesChoices) => void = () => {};
+    let second: (c: SeriesChoices) => void = () => {};
+    choicesForEdit
+      .mockReturnValueOnce(new Promise((r) => (first = r)))
+      .mockReturnValueOnce(new Promise((r) => (second = r)));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const { onClose, editorSave, dialog } = await retitle("Gym");
+    fireEvent.click(inDialog(dialog).getByRole("button", { name: "Back" }));
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym (moved)" } });
+    fireEvent.click(editorSave);
+    await screen.findByRole("dialog", { name: "Edit repeating event" });
+    await act(async () => first(choices({ notice: NOTICE, this: offered("old") })));
+    // Dropped, though its words aren't.
+    expect(noteSeriesNotice).toHaveBeenCalledWith(NOTICE);
+    await act(async () => second(choices()));
+    const d = inDialog(screen.getByRole("dialog", { name: "Edit repeating event" }));
+    expect(d.queryByText(NOTICE)).toBeNull();
+    fireEvent.click(d.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(saveEdit.mock.calls[0][1]).toBe(choicesForEdit.mock.calls[1][1]);
+    expect(saveEdit.mock.calls[0][1]).toEqual({ summary: "Gym (moved)" });
+    expect(saveEdit.mock.calls[0][2]).toEqual({ scope: "this", token: "t-this" });
+  });
+
+  it("opens the choices when a save without one is answered that it repeats (R9)", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice" });
+    choicesForEdit.mockResolvedValue(choices());
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const d = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    await d.findByRole("radio", { name: /^This event/ });
+    // The dialog is the answer: no "changed since you chose" line, no banner.
+    expect(screen.queryByText(/since you chose/)).toBeNull();
+    expect(choicesForEdit.mock.calls[0][1]).toBe(saveEdit.mock.calls[0][1]);
+    // Focus is the dialog's, on Back: the save that opened it never pulls it to the editor's Save
+    // behind (C9b-1 critique 1 M2).
+    const back = d.getByRole("button", { name: "Back" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(document.activeElement).toBe(back);
+  });
+
+  it("asks again once when the plan changed since the choice, then says so", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(choices());
+    saveEdit.mockResolvedValue({ outcome: "needs_choice" });
+    const { onClose, dialog } = await retitle();
+    await inDialog(dialog).findByRole("radio", { name: /^This event/ });
+    fireEvent.click(inDialog(dialog).getByRole("button", { name: "Save" }));
+    const again = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    expect(
+      await again.findByText(/changed since you chose which occurrences to change/),
+    ).toBeTruthy();
+    await again.findByRole("radio", { name: /^This event/ });
+    fireEvent.click(again.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(choicesOpen()).toBeNull());
+    expect(
+      await screen.findByText(/changed since you chose which occurrences to change/),
+    ).toBeTruthy();
+    expect(choicesForEdit).toHaveBeenCalledTimes(2);
+    expect(saveEdit).toHaveBeenCalledTimes(2);
+    expect(onClose).not.toHaveBeenCalled();
+    // A new Save starts its count afresh: the plan changing once more is asked again, not refused.
+    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice" });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const next = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    await next.findByRole("radio", { name: /^This event/ });
+    fireEvent.click(next.getByRole("button", { name: "Save" }));
+    const reasked = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    expect(
+      await reasked.findByText(/changed since you chose which occurrences to change/),
+    ).toBeTruthy();
+    expect(choicesForEdit).toHaveBeenCalledTimes(4);
+  });
+
+  it("closes on a partial save it started, and stays open when an earlier change blocked it", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(choices());
+    const partial = {
+      outcome: "partial_split",
+      token: "p",
+      offers: ["finish"],
+      from: "2026-11-02",
+    } as const;
+    saveEdit.mockResolvedValueOnce({ ...partial, offers: ["finish"], newPartial: false });
+    const { onClose, dialog } = await retitle();
+    await inDialog(dialog).findByRole("radio", { name: /^This event/ });
+    fireEvent.click(inDialog(dialog).getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(/^PM is still finishing an earlier change to it from 02-11/),
+    ).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Gym");
+    // New: Google holds part of it, and its notice outlives the editor.
+    saveEdit.mockResolvedValueOnce({ ...partial, offers: ["finish"], newPartial: true });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const d = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    await d.findByRole("radio", { name: /^This event/ });
+    fireEvent.click(d.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  it("rebases instead of asking when Google changed the event, keeping the words said once", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event()))
+      .mockResolvedValueOnce(ready(event({ summary: "Gym (Google)" }), ALL, "s2"));
+    choicesForEdit.mockResolvedValue(
+      choices({ notice: NOTICE, following: { row: "conflict", fields: ["summary"] } }),
+    );
+    await open(vi.fn(), undefined, occurrence);
+    fireEvent.change(screen.getByLabelText("Location"), { target: { value: "Room 2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(/This event changed in Google while you were editing/),
+    ).toBeTruthy();
+    expect(choicesOpen()).toBeNull();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Gym (Google)");
+    expect(screen.getByLabelText<HTMLInputElement>("Location").value).toBe("Room 2");
+    expect(noteSeriesNotice).toHaveBeenCalledWith(NOTICE);
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("says why when the choices are refused", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "read_only", reason: "has_guests" },
+    });
+    await open(vi.fn(), undefined, occurrence);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(/This event has guests/)).toBeTruthy();
+    expect(choicesOpen()).toBeNull();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("settles an earlier change from the dialog, then closes it, keeping the words said once", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(
+      choices({
+        notice: NOTICE,
+        following: { row: "pending", token: "p", offers: ["finish", "remove"], from: "2026-11-02" },
+        all: { row: "pending", token: "p", offers: ["finish", "remove"], from: "2026-11-02" },
+      }),
+    );
+    settleSplit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const { onClose, editorSave, dialog } = await retitle();
+    fireEvent.click(await inDialog(dialog).findByRole("button", { name: "Finish" }));
+    await waitFor(() => expect(choicesOpen()).toBeNull());
+    expect(settleSplit).toHaveBeenCalledWith("p", "finish", "Gym");
+    expect(noteSeriesNotice).toHaveBeenCalledWith(NOTICE);
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
   });
 });

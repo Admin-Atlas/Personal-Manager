@@ -427,6 +427,105 @@ describe("a repeating event", () => {
     expect(hook.result.current.hiddenIds.size).toBe(0);
   });
 
+  // C9b-1 critique 1 H3 / 2 M6: the calendar as it reads the mirror, with no hand-run prune. A
+  // settle starts a read of its own; only a read that started after the settle can show again a
+  // row the delete left in Google, and only when the delete said it left some.
+  describe("the read a settle starts", () => {
+    const rows = (ids: string[]) => ids.map((id) => ({ ...event, id }));
+    let reads: ((events: CalendarEvent[]) => void)[] = [];
+
+    /** A fresh store, read through a hook that reads the mirror as the calendar does. */
+    async function loadCalendar() {
+      vi.resetModules();
+      const mod = await import("./useEventWrites");
+      const { renderHook, act } = await import("@testing-library/react");
+      const { useEffect, useRef } = await import("react");
+      const read = () => new Promise<CalendarEvent[]>((r) => reads.push(r));
+      const hook = renderHook(() => {
+        const writes = mod.useEventWrites();
+        const seen = useRef(writes.settles);
+        useEffect(() => {
+          if (writes.settles === seen.current) return;
+          seen.current = writes.settles;
+          void mod.readMirror(read);
+        }, [writes.settles]);
+        return writes;
+      });
+      await act(async () => {});
+      return { mod, hook, act, read };
+    }
+
+    beforeEach(() => {
+      reads = [];
+      deleteCalendarEvent.mockResolvedValue({
+        outcome: "held",
+        undo_token: "t1",
+        undo_seconds: 8,
+        hidden: later,
+      });
+    });
+
+    it("shows again a row the delete left in Google, once a read after it lands", async () => {
+      const { mod, hook, act, read } = await loadCalendar();
+      await act(() => mod.startDelete(occurrence, { scope: "following", token: "f" }));
+      // The read the backend's landing starts, begun before the webview hears the settle.
+      const early = mod.readMirror(read);
+      act(() =>
+        settledHandler!({
+          undo_token: "t1",
+          event_id: occurrence.id,
+          result: {
+            outcome: "saved",
+            warnings: ["left_on_old_series"],
+            left_behind: ["2026-11-02"],
+          },
+        }),
+      );
+      // The settle started a read of its own.
+      expect(reads).toHaveLength(2);
+      const all = [occurrence.id, ...later];
+      await act(async () => {
+        reads[0](rows(all));
+        await early;
+      });
+      expect([...hook.result.current.hiddenIds].sort()).toEqual([...all].sort());
+      // Google kept the occurrence changed on its own; the rest went.
+      await act(async () => reads[1](rows([later[0]])));
+      expect(hook.result.current.hiddenIds.size).toBe(0);
+    });
+
+    it("keeps a deleted row hidden while the mirror lags behind Google", async () => {
+      const { mod, hook, act } = await loadCalendar();
+      await act(() => mod.startDelete(occurrence, { scope: "following", token: "f" }));
+      act(() =>
+        settledHandler!({
+          undo_token: "t1",
+          event_id: occurrence.id,
+          result: {
+            outcome: "saved",
+            warnings: ["mirror_refresh_pending", "left_on_old_series"],
+            left_behind: ["2026-11-02"],
+          },
+        }),
+      );
+      const all = [occurrence.id, ...later];
+      await act(async () => reads[0](rows(all)));
+      expect([...hook.result.current.hiddenIds].sort()).toEqual([...all].sort());
+      // A plain delete that landed: hidden while the mirror has it, whenever the read began.
+      deleteCalendarEvent.mockResolvedValue({ outcome: "held", undo_token: "t2", undo_seconds: 8 });
+      await act(() => mod.startDelete(event));
+      act(() =>
+        settledHandler!({
+          undo_token: "t2",
+          event_id: event.id,
+          result: { outcome: "saved", warnings: [] },
+        }),
+      );
+      await act(async () => reads[1](rows([...all, event.id])));
+      expect(hook.result.current.hiddenIds.has(event.id)).toBe(true);
+    });
+  });
+
   it("picks up a held delete's rows after a reload", async () => {
     listHeldDeletes.mockResolvedValue([
       { undo_token: "t9", event_id: occurrence.id, summary: "Gym", seconds_left: 5, hidden: later },

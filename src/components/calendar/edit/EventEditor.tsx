@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The event editor (#884): change one Google event, a one-off you organise without guests. It opens
-// on Google's fresh copy (never the mirror, which clips text), greys out whatever the backend says
-// can't change and says why, and saves only the fields the user changed. If the event changed in
-// Google meanwhile on a field this save also sends, nothing is overwritten: the editor reloads
-// Google's copy, keeps the user's other changes, and names the fields where Google's version now
-// shows. A dirty draft asks before it is thrown away (closing, Escape, or Delete).
+// The event editor (#884): change one Google event you organise without guests, a repeating one
+// included: for an occurrence, the choices dialog asks which occurrences first. It opens on Google's
+// fresh copy (never the mirror, which clips text), greys out whatever the backend says can't change
+// and says why, and saves only the fields the user changed. If the event changed in Google
+// meanwhile on a field this save also sends, nothing is overwritten: the editor reloads Google's
+// copy, keeps the user's other changes, and names the fields where Google's version now shows. A
+// dirty draft asks before it is thrown away (closing, Escape, or Delete).
+//
+// The choices dialog sits inside the editor's, so it alone hears Escape and holds Tab. Its answer
+// binds this session and these very changes, so the save sends the object the choices were asked
+// for, and an answer to an earlier ask (Back, then Save again) is never applied. Words the choices
+// say once are kept as a notice whenever the dialog closes without a choice.
 //
 // Time fields never use `<input type="time">` (WebKitGTK has no widget): TimeField and DateField.
 // Every time carries its own zone; when this computer's zone can't be read, times can't be changed
@@ -20,11 +26,15 @@ import type {
   Calendar,
   CalendarEvent,
   EventForEdit,
+  EventPatchDraft,
   EventVisibility,
   FieldPermissions,
   Milestone,
   SeenSummary,
+  SeriesChoices,
+  SeriesInfo,
   ShowAs,
+  SplitAction,
   TimeDraft,
 } from "../../../lib/types";
 import {
@@ -47,6 +57,7 @@ import {
 import {
   ambiguousText,
   CALLOUT_TONE,
+  earlierChangeText,
   listFields,
   loadText,
   outcomeText,
@@ -54,6 +65,7 @@ import {
   reasonText,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
+import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import {
@@ -72,7 +84,15 @@ import {
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { ZoneSearchList } from "../ZoneSearchList";
-import { noteSaved, openForEdit, saveEdit } from "./useEventWrites";
+import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
+import {
+  choicesForEdit,
+  noteSaved,
+  noteSeriesNotice,
+  openForEdit,
+  saveEdit,
+  settleSplit,
+} from "./useEventWrites";
 
 interface Props {
   /** The row that was clicked: its title while Google's copy loads, and its id. */
@@ -94,6 +114,20 @@ interface Loaded {
   base: EditorFields;
   permissions: FieldPermissions;
   seen: SeenSummary | null;
+  /** Its repeating event, when it's an occurrence of one Google let PM read. */
+  series: SeriesInfo | null;
+}
+
+/** The choices dialog, open: what it was asked for, and what it shows. */
+interface Asking {
+  /** The session and the very changes the save sends: the token binds both. */
+  session: string;
+  changes: EventPatchDraft;
+  /** The draft's title, for the dialog and the notices. */
+  title: string;
+  /** The draft's first day (YYYY-MM-DD), where a "this and following" save starts. */
+  from: string;
+  view: ChoicesView;
 }
 
 type Timed = Extract<TimeDraft, { kind: "timed" }>;
@@ -151,6 +185,13 @@ function switchKind(t: TimeDraft, base: TimeDraft, zone: string): TimeDraft {
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+function unreachable(value: never): never {
+  throw new Error(`unhandled save answer: ${JSON.stringify(value)}`);
+}
+
+/** The first day a draft's time covers. */
+const firstDay = (t: TimeDraft) => (t.kind === "timed" ? t.start_date : t.first_day);
+
 export function EventEditor({ row, calendar, account, milestone, onDelete, onClose }: Props) {
   const { showPower } = useDepth();
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
@@ -175,6 +216,21 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   const [uncertain, setUncertain] = useState(false);
   const [askDiscard, setAskDiscard] = useState<"close" | "delete" | null>(null);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
+  // The choices dialog for a repeating event (null = closed).
+  const [asking, setAsking] = useState<Asking | null>(null);
+  // Each ask's number: an answer applies only while its ask is the latest. Back, Escape and a
+  // choice end an ask too (C9b-1 critique 1 H1).
+  const askSeq = useRef(0);
+  // Words the choices said once, until the dialog closes without a choice (then a notice) or the
+  // save is over; kept across a choice for the re-ask, which no longer has them.
+  const heldNotice = useRef<string | null>(null);
+  // Times this Save was asked again because the plan changed: once, then it says so.
+  const againRef = useRef(0);
+  const [settlingSplit, setSettlingSplit] = useState(false);
+  // Focus returns here whenever the choices close or a save stays open: the button was blurred
+  // before the dialog opened, so the dialog's own restore has nowhere to go back to.
+  const saveRef = useRef<HTMLButtonElement>(null);
+  const refocusSave = () => setTimeout(() => saveRef.current?.focus(), 0);
 
   const setDraft = (next: EditorFields) => {
     draftRef.current = next;
@@ -197,6 +253,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           base,
           permissions: load.permissions,
           seen: load.seen,
+          series: load.series,
         });
         draftRef.current = base;
         setDraftState(base);
@@ -294,6 +351,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       base: r.base,
       permissions: fresh.permissions,
       seen: fresh.seen,
+      series: fresh.series,
     });
     setDraft(r.draft);
     setBanner({
@@ -305,10 +363,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   }
 
   async function save() {
-    const focused = document.activeElement;
     commitFocused();
     const current = draftRef.current;
-    if (!loaded || !current || saving) return;
+    if (!loaded || !current || saving || asking) return;
+    // A new Save: no earlier ask's count or words carry into it (C9b-1 critique 1 L8).
+    againRef.current = 0;
+    heldNotice.current = null;
     // What stops this save is already said under When, as it happened; a banner repeating it would
     // outlive the fix.
     if (badDateRef.current || checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
@@ -321,20 +381,153 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       return;
     }
     setZonePick(null);
-    setSaving(true);
     setBanner(null);
-    let stayOpen = true;
+    const what = {
+      session: loaded.session,
+      changes,
+      title: current.summary,
+      from: firstDay(current.time),
+    };
+    // The row is the safer trigger: the series is null when Google's copy of it couldn't be read.
+    if (isRepeating(row) || loaded.series !== null) void ask(what, false);
+    else await send(what, null);
+  }
+
+  /** Close the choices without a choice (Back, Escape, a rebase, a settle): any answer still on its
+   *  way is dropped, and words said once become a notice so they aren't lost (critique 2 M1). */
+  function closeChoices() {
+    askSeq.current++;
+    if (heldNotice.current) noteSeriesNotice(heldNotice.current);
+    heldNotice.current = null;
+    setAsking(null);
+  }
+
+  /** Open the choices for `what` and show Google's answer. `again`: a write answered that the plan
+   *  changed since the choice, so this is the re-ask. */
+  async function ask(what: Omit<Asking, "view">, again: boolean) {
+    const seq = ++askSeq.current;
+    setAsking({ ...what, view: { state: "loading" } });
+    let c: SeriesChoices;
     try {
-      const outcome = await saveEdit(loaded.session, changes, null, current.summary);
+      c = await choicesForEdit(what.session, what.changes);
+    } catch (e) {
+      if (seq !== askSeq.current) return;
+      closeChoices();
+      setBanner({ tone: "error", text: message(e) });
+      refocusSave();
+      return;
+    }
+    if (seq !== askSeq.current) {
+      // Closed, or asked again, meanwhile: the answer is dropped, its words aren't.
+      if (c.outcome === "ready" && c.notice) noteSeriesNotice(c.notice);
+      return;
+    }
+    switch (c.outcome) {
+      case "not_repeating":
+        // Google's copy doesn't repeat (any more): one event. Counted, so a backend that says
+        // "choose" to the plain save and "nothing to choose" here can't loop.
+        closeChoices();
+        if (++againRef.current > 1) {
+          setBanner(outcomeText({ outcome: "needs_choice" }));
+          refocusSave();
+          return;
+        }
+        await send(what, null);
+        return;
+      case "refused":
+        closeChoices();
+        if (c.result.outcome === "conflict") await rebaseAfterConflict(outcomeText(c.result).text);
+        else setBanner(outcomeText(c.result));
+        refocusSave();
+        return;
+      case "ready": {
+        if (c.notice) heldNotice.current = c.notice;
+        // Google changed the occurrence or its event since the editor opened: take Google's copy,
+        // keep the draft, and the next Save asks again (spec §0.4.5).
+        const fields = conflictOf(c);
+        if (fields) {
+          closeChoices();
+          await rebaseAfterConflict(outcomeText({ outcome: "conflict", fields }).text);
+          refocusSave();
+          return;
+        }
+        setAsking({
+          ...what,
+          view: { state: "ready", choices: c, again, notice: heldNotice.current },
+        });
+        return;
+      }
+      default:
+        return unreachable(c);
+    }
+  }
+
+  /** The user picked which occurrences: the dialog closes and the save goes, with the very changes
+   *  the choices were asked for. */
+  function onChoose(picked: Picked) {
+    if (!asking) return;
+    const { session, changes, title, from } = asking;
+    askSeq.current++;
+    setAsking(null);
+    void send({ session, changes, title, from }, picked);
+  }
+
+  /** Settle the earlier change the dialog's pending row names. Its notice says how it went; the
+   *  choices were planned before it, so they close, and the next Save asks again. */
+  async function onSettle(token: string, action: SplitAction) {
+    if (!asking) return;
+    setSettlingSplit(true);
+    await settleSplit(token, action, asking.title);
+    setSettlingSplit(false);
+    closeChoices();
+    refocusSave();
+  }
+
+  /** Send the save, for `picked` when the choices were asked, and act on what came back. */
+  async function send(what: Omit<Asking, "view">, picked: Picked | null) {
+    setSaving(true);
+    let stayOpen = true;
+    // The choices opened again from here: focus is theirs.
+    let reasked = false;
+    try {
+      const outcome = await saveEdit(what.session, what.changes, picked, what.title);
+      if (outcome.outcome !== "needs_choice") heldNotice.current = null;
       switch (outcome.outcome) {
         case "saved":
-          noteSaved(current.summary, outcome);
+          noteSaved(what.title, outcome, picked?.scope ?? null, what.from);
           stayOpen = false;
           onClose();
           return;
         case "no_change":
           stayOpen = false;
           onClose();
+          return;
+        case "needs_choice":
+          // No choice sent, and the event repeats after all (R9): ask, saying nothing.
+          if (picked === null) {
+            reasked = true;
+            void ask(what, false);
+            return;
+          }
+          // The plan changed between the choice and the save: ask again once. If it keeps
+          // changing under the user, say so and stop asking.
+          if (++againRef.current <= 1) {
+            reasked = true;
+            void ask(what, true);
+            return;
+          }
+          setBanner(outcomeText(outcome));
+          return;
+        case "partial_split":
+          // New: Google holds part of this save, and its notice (with the buttons) outlives the
+          // editor, whose session has ended. Not new: an earlier change blocked this save; nothing
+          // was sent, so the draft stays, and that change's notice has the buttons.
+          if (outcome.newPartial) {
+            stayOpen = false;
+            onClose();
+            return;
+          }
+          setBanner({ tone: "warn", text: earlierChangeText(outcome.offers, outcome.from) });
           return;
         case "conflict":
           await rebaseAfterConflict(outcomeText(outcome).text);
@@ -343,18 +536,27 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           setUncertain(true);
           setBanner(outcomeText(outcome));
           return;
-        default:
+        // After a save of several occurrences that Google put back, the session has ended; those
+        // words already say to open the event again.
+        case "ignored_by_google":
+        case "split_removed":
+        case "failed":
+        case "busy":
+        case "read_only":
+        case "gone":
+        case "reauth":
           setBanner(outcomeText(outcome));
+          return;
+        default:
+          return unreachable(outcome);
       }
     } catch (e) {
       setUncertain(true);
       setBanner({ tone: "error", text: message(e) });
     } finally {
       setSaving(false);
-      // Staying open: hand focus back to where it was, rather than leaving it on the page.
-      if (stayOpen && focused instanceof HTMLElement && focused.isConnected) {
-        setTimeout(() => focused.focus(), 0);
-      }
+      // Staying open: focus back on Save, rather than left on the page (C9b-1 critiques 1 M2, 2 M2).
+      if (stayOpen && !reasked) refocusSave();
     }
   }
 
@@ -408,7 +610,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             <Button variant="tertiary" onClick={requestClose} disabled={saving}>
               Cancel
             </Button>
-            <Button variant="primary" onClick={() => void save()} disabled={!loaded || saving}>
+            <Button
+              ref={saveRef}
+              variant="primary"
+              onClick={() => void save()}
+              disabled={!loaded || saving}
+            >
               {saving ? "Saving…" : "Save"}
             </Button>
           </>
@@ -601,6 +808,22 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               </div>
             )}
           </div>
+        )}
+        {/* Inside the editor's dialog, not beside it: nested, it alone is topmost, so one Escape
+            closes only it and Tab stays in it (C9b-1 critiques 1 M3, 2 L9). */}
+        {asking && (
+          <SaveChoicesDialog
+            kind="save"
+            title={asking.title}
+            view={asking.view}
+            settling={settlingSplit}
+            onChoose={onChoose}
+            onSettle={(token, action) => void onSettle(token, action)}
+            onClose={() => {
+              closeChoices();
+              refocusSave();
+            }}
+          />
         )}
       </Dialog>
 

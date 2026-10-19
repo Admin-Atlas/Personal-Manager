@@ -1545,7 +1545,6 @@ export type ReadOnlyReason =
   | "calendar_read_only"
   | "private_event"
   | "not_organizer"
-  | "recurring"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
   | "has_guests"
