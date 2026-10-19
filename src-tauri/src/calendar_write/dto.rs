@@ -139,6 +139,8 @@ pub enum ReadOnlyReason {
     NotOrganizer,
     /// A repeating event (until "this / following / all" lands).
     Recurring,
+    /// A one-off in PM that has since become a repeating event in Google: open one of its occurrences.
+    BecameRepeating,
     /// It has guests, who Google would email (until Send / Don't send lands).
     HasGuests,
     /// A birthday, a Gmail event, focus time, out of office or a working location.
@@ -228,11 +230,15 @@ pub enum WriteOutcome {
     },
     /// A "this and following" change PM couldn't finish: Google may hold part of it. `token` names
     /// it for settling; `offers` is what Google's state allows now; `from` is the day the change
-    /// starts (`YYYY-MM-DD`, in the series' zone). Never an id or an etag (R5).
+    /// starts (`YYYY-MM-DD`, in the series' zone). Never an id or an etag (R5). `note`: a settle
+    /// that didn't end the change says why here, while PM still holds it to settle (so its buttons
+    /// stay); left out for every other answer.
     PartialSplit {
         token: String,
         offers: Vec<SplitAction>,
         from: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// The new part of a change PM couldn't finish was removed: the repeating event is as it was.
     SplitRemoved,
@@ -474,6 +480,13 @@ mod tests {
             r#"{"outcome":"read_only","reason":"html_description"}"#
         );
         assert_eq!(
+            serde_json::to_string(&WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::BecameRepeating
+            })
+            .unwrap(),
+            r#"{"outcome":"read_only","reason":"became_repeating"}"#
+        );
+        assert_eq!(
             serde_json::to_string(&WriteOutcome::Saved {
                 warnings: vec![WriteWarning::MirrorRefreshPending],
                 left_behind: Vec::new(),
@@ -504,8 +517,18 @@ mod tests {
                     token: "t".into(),
                     offers: vec![SplitAction::Remove, SplitAction::Check],
                     from: "2026-11-02".into(),
+                    note: None,
                 },
                 r#"{"outcome":"partial_split","token":"t","offers":["remove","check"],"from":"2026-11-02"}"#,
+            ),
+            (
+                WriteOutcome::PartialSplit {
+                    token: "t".into(),
+                    offers: vec![SplitAction::Check],
+                    from: "2026-11-02".into(),
+                    note: Some("Try again in a moment.".into()),
+                },
+                r#"{"outcome":"partial_split","token":"t","offers":["check"],"from":"2026-11-02","note":"Try again in a moment."}"#,
             ),
             (WriteOutcome::SplitRemoved, r#"{"outcome":"split_removed"}"#),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),

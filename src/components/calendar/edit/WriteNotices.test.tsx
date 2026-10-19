@@ -3,7 +3,7 @@
 
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
@@ -58,5 +58,49 @@ describe("WriteNotices", () => {
     expect(now).toBe(older);
     expect(document.activeElement).toBe(older);
     expect(now.getAttribute("aria-keyshortcuts")).toBe("Control+Z Meta+Z");
+  });
+
+  // A "this and following" change PM couldn't finish keeps its buttons, in one order, until settled.
+  it("offers the actions a change PM couldn't finish allows, in order", () => {
+    const partial = (id: number, title: string, settling = false): WriteNotice => ({
+      id,
+      tone: "warn",
+      text: `“${title}”: PM couldn't finish this change.`,
+      split: { token: `s${id}`, offers: ["check", "remove", "finish"], title },
+      settling,
+    });
+    const onSettle = vi.fn();
+    const onDismiss = vi.fn();
+    const view = render(
+      <WriteNotices
+        notices={[partial(1, "Gym")]}
+        onUndo={vi.fn()}
+        onDismiss={onDismiss}
+        onSettle={onSettle}
+      />,
+    );
+    const labels = screen
+      .getAllByRole("button")
+      .map((b) => b.textContent)
+      .filter((t) => t !== "×");
+    expect(labels).toEqual(["Finish", "Remove the new part", "Check again"]);
+    fireEvent.click(screen.getByRole("button", { name: "Remove the new part" }));
+    expect(onSettle).toHaveBeenCalledWith("s1", "remove", "Gym");
+    // It can still be dismissed.
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(onDismiss).toHaveBeenCalledWith(1);
+    // Settling: every button off. Two up: each names its event.
+    view.rerender(
+      <WriteNotices
+        notices={[partial(1, "Gym", true), partial(2, "Standup")]}
+        onUndo={vi.fn()}
+        onDismiss={onDismiss}
+        onSettle={onSettle}
+      />,
+    );
+    const gym = screen.getByRole("button", { name: "Finish (“Gym”)" }) as HTMLButtonElement;
+    const standup = screen.getByRole("button", { name: "Finish (“Standup”)" }) as HTMLButtonElement;
+    expect(gym.disabled).toBe(true);
+    expect(standup.disabled).toBe(false);
   });
 });

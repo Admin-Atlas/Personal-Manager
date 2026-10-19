@@ -10,6 +10,12 @@
 // lives in this module, not in a component: a store the views subscribe to, fed by
 // `calendar://delete-settled`. A webview reload empties it, so the first use asks the backend which
 // deletes are still waiting (plan A15).
+//
+// A repeating event's writes come through here too: the choices the dialog shows, a save or delete
+// for the occurrences picked (always with its token), and settling a "this and following" change PM
+// couldn't finish. A change like that keeps a notice with its buttons until it's settled, in this
+// store, so it outlives the editor and the tab. A reload loses the notice, not the change: the
+// backend still holds it, and the dialog's pending row offers the same buttons on the next change.
 
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import {
@@ -18,6 +24,8 @@ import {
   getCalendarEventForEdit,
   listHeldDeletes,
   onCalendarDeleteSettled,
+  seriesChoices,
+  settleSeriesSplit,
   updateCalendarEvent,
 } from "../../../lib/ipc";
 import type {
@@ -26,9 +34,18 @@ import type {
   EditLoad,
   EventPatchDraft,
   SeenSummary,
+  SeriesChoices,
+  SeriesScope,
+  SplitAction,
   WriteOutcome,
 } from "../../../lib/types";
-import { deleteText, type Tone } from "../../../lib/calendarEdit/editReasons";
+import {
+  deleteText,
+  savedNotice,
+  settleText,
+  type Tone,
+} from "../../../lib/calendarEdit/editReasons";
+import type { Picked } from "../../../lib/calendarEdit/saveChoices";
 import { deviceTimeZoneOrNull } from "../../../theme";
 
 /** A line the calendar shows about a write: what happened, and an Undo while one is offered. */
@@ -39,16 +56,25 @@ export interface WriteNotice {
   /** While a delete waits: the token that undoes it, and the Undo button's accessible name. */
   undoToken?: string;
   undoLabel?: string;
+  /** A "this and following" change PM couldn't finish: the token it is settled by, what Google's
+   *  state allows now (buttons in SPLIT_ORDER), and the event's title for the result's words. */
+  split?: { token: string; offers: SplitAction[]; title: string };
+  /** Its settle is on its way: the buttons are disabled. */
+  settling?: boolean;
 }
 
 /** A delete the backend is holding or sending. */
 interface HeldDelete {
   token: string;
   eventId: string;
+  /** Every row it hides: the row asked about, and every occurrence a delete of several reaches. */
+  hidden: readonly string[];
   /** The title the user saw. */
   summary: string;
   noticeId: number;
 }
+
+type PartialSplit = Extract<WriteOutcome, { outcome: "partial_split" }>;
 
 interface State {
   held: readonly HeldDelete[];
@@ -97,7 +123,8 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** Show `notice` (replacing the one with its id, if any). One that is done and fine goes by itself,
  *  once a view has shown it; the timer only removes the notice it was set for, never a later one
  *  under the same id. A delete still held or being sent isn't done, though its notice has lost its
- *  Undo: that one stays until the delete settles. */
+ *  Undo: that one stays until the delete settles. Nor is a change PM couldn't finish: its notice
+ *  keeps its buttons until it's settled, whatever its tone. */
 function put(notice: WriteNotice) {
   const shown = state.notices.some((n) => n.id === notice.id);
   update({
@@ -106,7 +133,7 @@ function put(notice: WriteNotice) {
       : [...state.notices, notice],
   });
   const inFlight = state.held.some((h) => h.noticeId === notice.id);
-  if (notice.tone === "ok" && !notice.undoToken && !inFlight) {
+  if (notice.tone === "ok" && !notice.undoToken && !notice.split && !inFlight) {
     if (subscribers.size > 0) expire(notice);
     else unseen.add(notice);
   }
@@ -145,17 +172,43 @@ function seenOf(event: CalendarEvent): SeenSummary {
   };
 }
 
-/** A held delete went to Google: say how it ended. A row that left Google stays hidden until the
- *  mirror read catches up; any other outcome leaves the row in the mirror, so it comes back. */
+/** The rows a held delete hides: the one asked about first, then any others it reaches, once each. */
+function hiddenOf(eventId: string, more: readonly string[] | undefined): string[] {
+  return [...new Set([eventId, ...(more ?? [])])];
+}
+
+/** Keep a change PM couldn't finish on screen with its buttons, worded `text`: the notice already
+ *  up for its token takes the new offers and words, or a new one goes up (under `id`, replacing
+ *  that notice, when given). Whether it was new. */
+function holdPartial(title: string, outcome: PartialSplit, text: string, id?: number): boolean {
+  const split = { token: outcome.token, offers: outcome.offers, title };
+  const shown = state.notices.find((n) => n.split?.token === outcome.token);
+  if (shown) {
+    put({ id: shown.id, tone: "warn", text, split, settling: shown.settling });
+    if (id !== undefined && id !== shown.id) dismissNotice(id);
+    return false;
+  }
+  put({ id: id ?? nextNotice++, tone: "warn", text, split });
+  return true;
+}
+
+/** A held delete went to Google: say how it ended. Rows that left Google stay hidden until the
+ *  mirror read catches up; any other outcome leaves them in the mirror, so they come back. One an
+ *  earlier change PM couldn't finish blocked gets that change's buttons. */
 function settle(settled: DeleteSettled) {
   const held = state.held.find((h) => h.token === settled.undo_token);
   if (!held) return; // undone, or from before a reload the backend no longer listed
-  const gone = settled.result.outcome === "saved" || settled.result.outcome === "gone";
+  const result = settled.result;
+  const gone = result.outcome === "saved" || result.outcome === "gone";
   update({
     held: state.held.filter((h) => h !== held),
-    removed: gone ? new Set([...state.removed, held.eventId]) : state.removed,
+    removed: gone ? new Set([...state.removed, ...held.hidden]) : state.removed,
   });
-  put({ id: held.noticeId, ...deleteText(settled.result, held.summary) });
+  if (result.outcome === "partial_split") {
+    holdPartial(held.summary, result, deleteText(result, held.summary).text, held.noticeId);
+    return;
+  }
+  put({ id: held.noticeId, ...deleteText(result, held.summary) });
 }
 
 /** Hear how held deletes end, and pick up any still waiting (a reload emptied this store; the backend
@@ -175,6 +228,7 @@ export function watchHeldDeletes() {
         const held = {
           token: w.undo_token,
           eventId: w.event_id,
+          hidden: hiddenOf(w.event_id, w.hidden),
           summary: w.summary,
           noticeId: nextNotice++,
         };
@@ -185,35 +239,56 @@ export function watchHeldDeletes() {
     .catch(() => {});
 }
 
-/** Ask to delete `event`. The backend holds it for an Undo window; the row is hidden meanwhile. */
-export async function startDelete(event: CalendarEvent): Promise<void> {
+/** Ask to delete `event` (for `picked`, when it repeats). The backend holds it for an Undo window;
+ *  hidden meanwhile are the row and every row a delete of several occurrences reaches. "ask": the
+ *  backend wants the occurrences chosen first, or chosen again (R9), and nothing was held or said;
+ *  the caller opens the choices. */
+export async function startDelete(
+  event: CalendarEvent,
+  picked: Picked | null = null,
+): Promise<"held" | "ask" | "refused"> {
   watchHeldDeletes();
   const title = quoted(event.summary);
   try {
-    const start = await deleteCalendarEvent(event.id, seenOf(event));
+    // A scope never goes without its token: `Picked` carries both.
+    const start = await deleteCalendarEvent(
+      event.id,
+      seenOf(event),
+      picked?.scope ?? null,
+      picked?.token ?? null,
+    );
     if (start.outcome === "refused") {
+      const result = start.result;
+      if (result.outcome === "needs_choice") return "ask";
+      if (result.outcome === "partial_split") {
+        holdPartial(event.summary, result, deleteText(result, event.summary).text);
+        return "refused";
+      }
       // Busy before anything was held is PM's own write to the event, not Google.
       put(
-        start.result.outcome === "busy"
+        result.outcome === "busy"
           ? {
               id: nextNotice++,
               tone: "warn",
               text: `PM is already changing ${title}. Wait a moment, then try again.`,
             }
-          : { id: nextNotice++, ...deleteText(start.result, event.summary) },
+          : { id: nextNotice++, ...deleteText(result, event.summary) },
       );
-      return;
+      return "refused";
     }
     const held = {
       token: start.undo_token,
       eventId: event.id,
+      hidden: hiddenOf(event.id, start.hidden),
       summary: event.summary,
       noticeId: nextNotice++,
     };
     update({ held: [...state.held, held] });
     showHeld(held, start.undo_seconds);
+    return "held";
   } catch (e) {
     put({ id: nextNotice++, tone: "error", text: `${title} wasn't deleted. ${message(e)}` });
+    return "refused";
   }
 }
 
@@ -278,21 +353,130 @@ export function openForEdit(eventId: string): Promise<EditLoad> {
   return getCalendarEventForEdit(eventId, deviceTimeZoneOrNull());
 }
 
-/** Save an editor's changes. The outcome comes back as data; the editor explains it. */
-export function saveEdit(session: string, changes: EventPatchDraft): Promise<WriteOutcome> {
-  return updateCalendarEvent(session, changes);
+/** The choices for a change in an open editor. Call it only when the dialog opens: a notice in the
+ *  answer is said once, and the backend forgets it once returned. The token binds the session and
+ *  the draft, so the save must send this very `draft`. */
+export function choicesForEdit(session: string, draft: EventPatchDraft): Promise<SeriesChoices> {
+  return seriesChoices({ kind: "edit", session, draft });
 }
 
-/** A save that landed, said once the editor has closed. */
-export function noteSaved(summary: string, outcome: WriteOutcome) {
-  if (outcome.outcome !== "saved") return;
-  put({
-    id: nextNotice++,
-    tone: "ok",
-    text: outcome.warnings.includes("mirror_refresh_pending")
-      ? `Saved ${quoted(summary)} to Google. PM's calendar will show it after the next refresh.`
-      : `Saved ${quoted(summary)}.`,
+/** Choices asked for and not yet answered, by row and what the user saw: StrictMode mounts a
+ *  dialog's effect twice, and a second ask would read Google twice for one answer. */
+const asking = new Map<string, Promise<SeriesChoices>>();
+
+/** The choices for deleting a mirror row: what the user saw is taken from the row itself, exactly
+ *  as `startDelete` sends it, because the token binds it. */
+export function choicesForDelete(event: CalendarEvent): Promise<SeriesChoices> {
+  const seen = seenOf(event);
+  const key = JSON.stringify([event.id, seen]);
+  const waiting = asking.get(key);
+  if (waiting) return waiting;
+  const answer = seriesChoices({ kind: "delete", event_id: event.id, seen }).finally(() => {
+    asking.delete(key);
   });
+  asking.set(key, answer);
+  return answer;
+}
+
+/** A save's outcome. `newPartial`, on a `partial_split` only: whether its notice is new. False
+ *  means one for that change was already up, so an earlier change blocked this save. */
+export type SaveAnswer = WriteOutcome & { newPartial?: boolean };
+
+/** Save an editor's changes; `picked` names the occurrences and the plan chosen (a scope never goes
+ *  without its token), and `title` is the event's for a notice. The outcome comes back as data; the
+ *  editor explains it. A change PM couldn't finish keeps its notice and buttons here, in the store,
+ *  so it outlives the editor and the Calendar tab. */
+export async function saveEdit(
+  session: string,
+  changes: EventPatchDraft,
+  picked: Picked | null = null,
+  title = "",
+): Promise<SaveAnswer> {
+  const outcome = await updateCalendarEvent(
+    session,
+    changes,
+    picked?.scope ?? null,
+    picked?.token ?? null,
+  );
+  if (outcome.outcome === "partial_split") {
+    return { ...outcome, newPartial: notePartial(title, outcome) };
+  }
+  return outcome;
+}
+
+/** Tokens with a settle on its way. The backend claims the repeating event and takes the token
+ *  first too; this only spares a request. */
+const settling = new Set<string>();
+
+/** Settle a change PM couldn't finish. One at a time per token: a second call while one runs sends
+ *  nothing and answers null. Its notice (made if there's none, as for the dialog's pending row)
+ *  then says how it ended, and keeps its buttons, with the offers now, while the change is still
+ *  held; only an answer that ends it takes them away. */
+export async function settleSplit(
+  token: string,
+  action: SplitAction,
+  title: string,
+): Promise<WriteOutcome | null> {
+  if (settling.has(token)) return null;
+  settling.add(token);
+  for (const n of state.notices) {
+    if (n.split?.token === token) put({ ...n, settling: true });
+  }
+  let result: WriteOutcome;
+  let answered = true;
+  try {
+    result = await settleSeriesSplit(token, action);
+  } catch (e) {
+    result = { outcome: "failed", message: message(e) };
+    answered = false;
+  } finally {
+    settling.delete(token);
+  }
+  const shown = state.notices.find((n) => n.split?.token === token);
+  const id = shown?.id ?? nextNotice++;
+  if (result.outcome === "partial_split") {
+    put({
+      id,
+      tone: "warn",
+      text: settleText(result, title).text,
+      split: { token: result.token, offers: result.offers, title },
+    });
+  } else if (!answered) {
+    // No answer came: nothing says the change ended, so its buttons stay.
+    put({
+      id,
+      ...settleText(result, title),
+      split: shown?.split ?? { token, offers: ["check"], title },
+    });
+  } else {
+    put({ id, ...settleText(result, title) });
+  }
+  return result;
+}
+
+/** A save that went partial: a notice that stays, with its actions. Whether it was new: false means
+ *  a notice for that change was already up, so this was an earlier change blocking the save. */
+export function notePartial(title: string, outcome: PartialSplit): boolean {
+  return holdPartial(title, outcome, settleText(outcome, title).text);
+}
+
+/** Words from the choices said once (a change PM was making when it closed) that the user closed
+ *  without choosing: kept as a notice, until dismissed, so they aren't lost. */
+export function noteSeriesNotice(text: string) {
+  put({ id: nextNotice++, tone: "warn", text });
+}
+
+/** A save that landed, said once the editor has closed. `scope`: a repeating event's occurrences
+ *  saved, which have no Undo, so the notice says how to change them back; `from` (YYYY-MM-DD) is
+ *  where a "this and following" save starts. */
+export function noteSaved(
+  summary: string,
+  outcome: WriteOutcome,
+  scope: SeriesScope | null = null,
+  from?: string,
+) {
+  if (outcome.outcome !== "saved") return;
+  put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from) });
 }
 
 /** A fresh read of the mirror: rows it no longer has needn't be hidden any more. */
@@ -309,7 +493,7 @@ export function useEventWrites() {
   useEffect(watchHeldDeletes, []);
   const snap = useSyncExternalStore(subscribe, () => state);
   const hiddenIds = useMemo(
-    () => new Set([...snap.held.map((h) => h.eventId), ...snap.removed]),
+    () => new Set([...snap.held.flatMap((h) => h.hidden), ...snap.removed]),
     [snap.held, snap.removed],
   );
   return {
@@ -318,6 +502,7 @@ export function useEventWrites() {
     startDelete,
     undoDelete,
     undoLatest,
+    settleSplit,
     dismissNotice,
     pruneRemoved,
   };

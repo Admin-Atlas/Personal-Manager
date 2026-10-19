@@ -160,18 +160,22 @@ pub enum RecurError {
 impl fmt::Display for RecurError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // Shown on the dialog's rows: no "series" or "split" (C9b-1 critique 2 M4).
             RecurError::TextOnly(why) => {
-                write!(f, "PM can't change how this series repeats: {why}.")
+                write!(f, "PM can't change how this event repeats: {why}.")
             }
-            RecurError::Ended => write!(f, "This series had already ended by then."),
+            RecurError::Ended => write!(f, "This repeating event had already ended by then."),
             RecurError::CannotCount => write!(
                 f,
-                "PM can't work out how many times this series has left, so it won't split it."
+                "PM can't work out how many times this event has left to repeat, so it won't \
+                 change it from this occurrence on."
             ),
-            RecurError::BeforeStart => write!(f, "That occurrence is before the series starts."),
+            RecurError::BeforeStart => {
+                write!(f, "That occurrence is before the repeating event starts.")
+            }
             RecurError::Mismatch => write!(
                 f,
-                "That occurrence and its series don't agree on whether they're all-day."
+                "That occurrence and its repeating event don't agree on whether they're all-day."
             ),
         }
     }

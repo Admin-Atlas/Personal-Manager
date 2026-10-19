@@ -25,6 +25,13 @@ export interface ChangelogEntry {
 export const CHANGELOG: ChangelogEntry[] = [
   {
     version: "3.148.8-alpha",
+    date: "2026-10-19",
+    highlights: [
+      "Under the hood, the dialog that asks which occurrences of a repeating event you mean is built and checked, along with what it warns about first and the buttons for finishing or taking back a change PM couldn't complete. It isn't shown yet: repeating events stay read-only until the next update. One thing you might notice: an event you made in PM that has since been turned into a repeating event in Google Calendar now says so, and suggests refreshing and opening one of its occurrences.",
+    ],
+  },
+  {
+    version: "3.148.8-alpha",
     date: "2026-10-18",
     highlights: [
       "Under the hood, a “this and the following” change to a repeating event is now remembered while it runs, so if PM closes halfway, the next change to that event first checks what Google holds and says what happened. PM also won't change more of a repeating event while an earlier split of it still overlaps, so nothing shows twice by accident. None of this is in the app yet: repeating events stay read-only until the dialog that asks which occurrences you mean.",

@@ -240,6 +240,7 @@ fn facts_from_fresh<'a>(
             .unwrap_or(false),
         visibility: text("visibility"),
         recurring: fresh.get("recurringEventId").is_some() || fresh.get("recurrence").is_some(),
+        series_master: turned_series(fresh),
         has_guests: fresh
             .get("attendees")
             .and_then(Value::as_array)
@@ -249,6 +250,13 @@ fn facts_from_fresh<'a>(
             }),
         html_description: text("description").is_some_and(patch::description_is_html),
     }
+}
+
+/// Google's copy of a single event is now a repeating event's series: it carries a rule and is no
+/// occurrence. The sync never mirrors such a copy (`calendar::parse_event`), so only a row that was
+/// a one-off can be under one.
+fn turned_series(fresh: &Value) -> bool {
+    fresh.get("recurrence").is_some() && fresh.get("recurringEventId").is_none()
 }
 
 /// The gate's facts from a mirror row, for the list. Account state isn't read here (that would be
@@ -264,6 +272,8 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         locked: row.locked,
         visibility: row.visibility.as_deref(),
         recurring: row.recurring || row.series_id.is_some(),
+        // The mirror never holds a series itself (`calendar::parse_event`).
+        series_master: false,
         has_guests: row.attendees.iter().any(|a| !a.is_self),
         html_description: false,
     }
@@ -653,7 +663,7 @@ pub async fn update_calendar_event(
             host: &app,
             target: &target,
             editing,
-            missing_ok: cfg!(debug_assertions),
+            missing_ok: MISSING_CHOICE_OK,
             new_series_id: plan::client_event_id,
         };
         return Ok(save_series(&ctx, &session, open, draft, scope.into(), choice.as_deref()).await);
@@ -1049,14 +1059,7 @@ async fn send_delete<W: Wire, H: Host>(
         match patch::delete_still_matches(seen, &fresh) {
             DeleteCheck::Matches => {}
             DeleteCheck::Gone => return land_gone(host, target, Some(&fresh)),
-            DeleteCheck::Changed(fields) => {
-                // Show what Google holds now, so the row that comes back is the changed one and a
-                // second delete compares against it rather than conflicting again.
-                if let Some(row) = calendar::parse_event(&target.calendar_id, &fresh) {
-                    let _ = land(host, target, vec![row], Vec::new());
-                }
-                return WriteOutcome::Conflict { fields };
-            }
+            DeleteCheck::Changed(fields) => return land_changed(host, target, &fresh, fields),
         }
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
             return WriteOutcome::Failed {
@@ -1246,15 +1249,16 @@ async fn gather<W: Wire>(
 ) -> std::result::Result<Option<Series>, WriteOutcome> {
     let Some(master_id) = fresh.get("recurringEventId").and_then(Value::as_str) else {
         // A one-off, or a row that has since become a series' master in Google (a rule added there):
-        // saving it unscoped would change every occurrence with no warning (C9 design §0.7).
-        return match fresh.get("recurrence") {
-            None => Ok(None),
-            Some(_) => Err(WriteOutcome::Failed {
-                message: "This became a repeating event in Google. Refresh, then open one of its \
-                          occurrences."
-                    .into(),
-            }),
-        };
+        // saving it unscoped would change every occurrence with no warning (C9 design §0.7). The
+        // gate refuses it first on every write path; the dev report reaches here without the gate.
+        if !turned_series(fresh) {
+            return Ok(None);
+        }
+        return Err(WriteOutcome::Failed {
+            message: "This became a repeating event in Google. Refresh, then open one of its \
+                      occurrences."
+                .into(),
+        });
     };
     let unreadable = || WriteOutcome::Failed {
         message: SeriesRefusal::Unreadable.to_string(),
@@ -1411,6 +1415,11 @@ async fn choices<W: Wire, H: Host>(
                 result: WriteOutcome::Gone,
             }
         }
+        Prepared::Changed { fresh, fields } => {
+            return SeriesChoices::Refused {
+                result: land_changed(host, target, &fresh, fields),
+            }
+        }
         Prepared::Refused(result) => return SeriesChoices::Refused { result },
     };
     let remote = target.remote_calendar.as_str();
@@ -1428,19 +1437,21 @@ async fn choices<W: Wire, H: Host>(
             }
         }
     };
-    // What the record says once, then forgets: the change stands, or Google changed it since.
-    let mut notice = None;
+    // What the record says once, then forgets: the change stands, or Google changed it since. Every
+    // record forgotten here is said, since none can be said again.
+    let mut said = Vec::new();
     for found in &orphans {
         let e = &found.entry;
         match found.orphan {
             Orphan::Clear => forget(host, &e.calendar, &e.series, &e.tail),
             Orphan::CutLanded | Orphan::Changed => {
-                notice = Some(found.words());
+                said.push(found.words());
                 forget(host, &e.calendar, &e.series, &e.tail);
             }
             Orphan::Twice | Orphan::Unknown => {}
         }
     }
+    let notice = (!said.is_empty()).then(|| said.join(" "));
     let row = |scope: Scope| -> ScopeRow {
         // A change PM couldn't finish holds this series: a row it blocks is settled first, and the
         // save would answer the same (review M1).
@@ -1521,6 +1532,13 @@ enum Prepared {
     NotRepeating,
     /// The occurrence is gone from Google: its cancelled copy, when Google sent one.
     Gone(Option<Value>),
+    /// A delete's occurrence changed in Google since the user saw it: Google's copy, for the caller
+    /// to land (so a second delete compares against it, as the one-event delete does), and the
+    /// fields.
+    Changed {
+        fresh: Value,
+        fields: Vec<String>,
+    },
     Refused(WriteOutcome),
 }
 
@@ -1601,7 +1619,8 @@ async fn prepare_change<W: Wire>(
         },
     };
     // The gate on Google's copy, all but its stand-in for this very choice: a repeating event is
-    // read-only only until the dialog asks which occurrences (R9).
+    // read-only only until the dialog asks which occurrences (R9). A one-off turned into a series
+    // keeps its own reason: nothing here may clear `series_master`.
     let mut facts = facts_from_fresh(&fresh, &target.facts, editing);
     facts.recurring = false;
     let perms = gate::edit_rights(&facts);
@@ -1622,7 +1641,7 @@ async fn prepare_change<W: Wire>(
         match patch::delete_still_matches(seen, &fresh) {
             DeleteCheck::Matches => {}
             DeleteCheck::Gone => return Prepared::Gone(Some(fresh)),
-            DeleteCheck::Changed(fields) => return refused(WriteOutcome::Conflict { fields }),
+            DeleteCheck::Changed(fields) => return Prepared::Changed { fresh, fields },
         }
     }
     let series = match gather(wire, target, &fresh, mirror, false).await {
@@ -1768,11 +1787,16 @@ const OFFLINE: &str =
     "PM couldn't reach Google. Nothing was changed; try again when you're back online.";
 const NOT_SENT: &str = "PM couldn't get this account's Google sign-in ready, so nothing was sent \
                         and nothing changed. Try again in a moment.";
-const PUT_BACK: &str = "PM put the series' times and repeat back as they were before this save. \
-                        Anything else in this save may have gone through; PM's calendar shows it \
-                        after the next refresh. Open the event again to change it.";
-const RETIME_UNSURE: &str = "PM lost touch with Google while moving the series, so it may have \
-                             moved, or moved only partly. Check it in Google Calendar.";
+const PUT_BACK: &str = "PM put this repeating event's times and repeat back as they were before \
+                        this save. Anything else in this save may have gone through; PM's calendar \
+                        shows it after the next refresh. Open the event again to change it.";
+const RETIME_UNSURE: &str = "PM lost touch with Google while moving the occurrences, so they may \
+                             have moved, or moved only partly. Check them in Google Calendar.";
+
+/// Whether a scoped write may leave out the dialog's choice: dev builds only, for the devtools
+/// probes. The one release gate for it, which every shell's [`SeriesWrite`] takes (a settle, which
+/// plans nothing anew, takes `false`); a test reads this file to hold them to it (C9b-1 review M8).
+const MISSING_CHOICE_OK: bool = cfg!(debug_assertions);
 
 /// Whether the save names the plan the user chose. A missing choice passes only in dev builds
 /// (the devtools probes); in release it's asked again (review scope-M2).
@@ -1925,6 +1949,9 @@ async fn prepared_for<W: Wire, H: Host>(
                     }
                 });
             }
+            Prepared::Changed { fresh, fields } => {
+                return Err(land_changed(ctx.host, ctx.target, &fresh, fields))
+            }
             Prepared::Refused(result) => return Err(result),
         };
     // The series claimed before anything was read must be the one Google holds now, or two writes
@@ -1944,6 +1971,7 @@ async fn prepared_for<W: Wire, H: Host>(
                 token: view.token,
                 offers: view.offers,
                 from: view.from,
+                note: None,
             });
         }
     }
@@ -2620,7 +2648,7 @@ async fn start_series_delete(
         host: &app,
         target: &target,
         editing,
-        missing_ok: cfg!(debug_assertions),
+        missing_ok: MISSING_CHOICE_OK,
         new_series_id: plan::client_event_id,
     };
     let (flight, held) =
@@ -2707,7 +2735,7 @@ async fn finish_held_series_delete<W: Wire, H: Host>(
         host,
         target,
         editing,
-        missing_ok: cfg!(debug_assertions),
+        missing_ok: MISSING_CHOICE_OK,
         new_series_id: plan::client_event_id,
     };
     Some(send_held_series_delete(&ctx, &held.event_id, &held.seen, held.scope, &held.plan).await)
@@ -2866,6 +2894,13 @@ impl CalendarEditState {
         self.splitting
             .lock()
             .is_ok_and(|running| running.contains(key))
+    }
+
+    /// What the split held under `token` allows now, and its day: `None` once it's settled or taken.
+    fn held_split(&self, token: &str) -> Option<(Vec<SplitAction>, String)> {
+        let partials = self.partials.lock().ok()?;
+        let held = partials.get(token)?;
+        Some((held.offers.clone(), held.facts.from.clone()))
     }
 
     fn hold_partial(&self, token: String, held: HeldSplit) {
@@ -3089,6 +3124,7 @@ fn partial_outcome(token: &str, held: &HeldSplit) -> WriteOutcome {
         token: token.to_string(),
         offers: held.offers.clone(),
         from: held.facts.from.clone(),
+        note: None,
     }
 }
 
@@ -3284,6 +3320,7 @@ async fn look_and_hold<W: Wire, H: Host>(
                 token,
                 offers,
                 from,
+                note: None,
             }
         }
     }
@@ -3476,8 +3513,56 @@ async fn tail_check<W: Wire>(wire: &W, held: &HeldSplit) -> TailCheck {
 }
 
 /// The settle command past its shell: Google through `wire`; the held split, the claims and the
-/// mirror through `host`.
+/// mirror through `host`. A settle that leaves the change held says so, whatever stopped it.
 async fn settle_split<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    token: &str,
+    action: SplitAction,
+) -> WriteOutcome {
+    let outcome = settle_split_once(wire, host, token, action).await;
+    still_held(host.edit(), token, outcome)
+}
+
+/// A settle's `outcome`, as the change still held when PM holds it under `token` yet: its offers
+/// now and the outcome's words as the note, so the notice keeps its buttons (C9b-1 critiques 1 H2,
+/// 2 H1). A result that ends the change, or a token that's gone (`SETTLING`), stays as it is.
+fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> WriteOutcome {
+    let note = match &outcome {
+        WriteOutcome::Failed { message } => message.clone(),
+        // PM's own claim: an 8-second held delete on this repeating event, or a save on it.
+        WriteOutcome::Busy => {
+            "PM is still changing this repeating event; try again in a moment.".to_string()
+        }
+        WriteOutcome::ReadOnly { reason } => read_only_message(*reason).to_string(),
+        WriteOutcome::Unconfirmed => "PM lost touch with Google; check again.".to_string(),
+        WriteOutcome::Reauth => {
+            "Google's sign-in for this account needs renewing. Reconnect it, then try again."
+                .to_string()
+        }
+        WriteOutcome::Conflict { .. } | WriteOutcome::NeedsChoice => {
+            "This repeating event changed in Google meanwhile; check again.".to_string()
+        }
+        WriteOutcome::PartialSplit { .. }
+        | WriteOutcome::Saved { .. }
+        | WriteOutcome::NoChange
+        | WriteOutcome::Gone
+        | WriteOutcome::IgnoredByGoogle { .. }
+        | WriteOutcome::SplitRemoved => return outcome,
+    };
+    let Some((offers, from)) = edit.held_split(token) else {
+        return outcome;
+    };
+    WriteOutcome::PartialSplit {
+        token: token.to_string(),
+        offers,
+        from,
+        note: Some(note),
+    }
+}
+
+/// [`settle_split`] up to its answer.
+async fn settle_split_once<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     token: &str,
@@ -4550,11 +4635,45 @@ fn failure_message(verdict: &Verdict) -> String {
 }
 
 fn read_only_message(reason: ReadOnlyReason) -> &'static str {
+    // The editor's own reason lines (`reasonText`), so a row of the choices refused for one says
+    // why, as the editor would (C9b-1 critique 2 M4).
     match reason {
         ReadOnlyReason::NotGoogle => {
             "This event comes from a calendar PM can only read (a subscription or Outlook)."
         }
-        _ => "PM can't change this event.",
+        ReadOnlyReason::EditingOff => {
+            "Editing isn't on for this Google account. Turn it on in Settings › Connectors › \
+             Google Calendar."
+        }
+        ReadOnlyReason::CalendarReadOnly => {
+            "This calendar is shared with you to view only, so its events can't be changed here."
+        }
+        ReadOnlyReason::PrivateEvent => {
+            "This is a private event on a calendar shared with you, and you can't change private \
+             events there."
+        }
+        ReadOnlyReason::NotOrganizer => {
+            "Someone else organises this event, so only they can change it."
+        }
+        ReadOnlyReason::Recurring => {
+            "This is a repeating event, and PM can't change repeating events yet."
+        }
+        ReadOnlyReason::BecameRepeating => {
+            "This became a repeating event in Google. Refresh, then open one of its occurrences."
+        }
+        ReadOnlyReason::HasGuests => {
+            "This event has guests, and PM can't change events with guests yet."
+        }
+        ReadOnlyReason::SpecialType => {
+            "Birthdays, events from Gmail, focus time, out of office and working locations can't \
+             be changed here."
+        }
+        ReadOnlyReason::Locked => {
+            "Google has locked this event's title, time, place and description."
+        }
+        ReadOnlyReason::HtmlDescription => {
+            "This description has formatting, so PM shows its text here and can't change it yet."
+        }
     }
 }
 
@@ -4623,6 +4742,21 @@ fn land(
     deletes: Vec<GoneRow>,
 ) -> Result<()> {
     land_on(host, &target.calendar_id, upserts, &[], deletes)
+}
+
+/// A delete met an event Google changed since the user saw it: show what Google holds now, so the
+/// row that comes back is the changed one and a second delete compares against it rather than
+/// conflicting again. The one-event delete and a repeating event's (its choices and its send) alike.
+fn land_changed(
+    host: &impl Host,
+    target: &Target,
+    fresh: &Value,
+    fields: Vec<String>,
+) -> WriteOutcome {
+    if let Some(row) = calendar::parse_event(&target.calendar_id, fresh) {
+        let _ = land(host, target, vec![row], Vec::new());
+    }
+    WriteOutcome::Conflict { fields }
 }
 
 fn land_on(
@@ -5298,6 +5432,41 @@ mod tests {
         let f = facts_from_fresh(&invite, &facts, EditingStatus::On);
         assert!(!f.organizer_self && f.has_guests && f.recurring);
         assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::NotOrganizer));
+        // An occurrence, a one-off, and a one-off Google has since given a rule: only the last is a
+        // series itself, and its own reason outranks "it repeats" (C9 design critique 2 M6).
+        let mine = || json!({ "organizer": { "self": true }, "eventType": "default" });
+        let mut occurrence = mine();
+        occurrence["recurringEventId"] = json!("s1");
+        let mut turned = mine();
+        turned["recurrence"] = json!(["RRULE:FREQ=WEEKLY"]);
+        let masters: Vec<bool> = [occurrence.clone(), mine(), turned.clone()]
+            .iter()
+            .map(|fresh| facts_from_fresh(fresh, &facts, EditingStatus::On).series_master)
+            .collect();
+        assert_eq!(masters, [false, false, true]);
+        let f = facts_from_fresh(&turned, &facts, EditingStatus::On);
+        assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::BecameRepeating));
+        // An occurrence you organise: `recurring` is all that blocks it, the stand-in the choices
+        // and every scoped write clear (and C9b-1b deletes). Without it, every field and the delete
+        // are open, so nothing else in the gate stands between it and the dialog (C9b-1 critiques
+        // 1 L5, 2 L11).
+        let mut f = facts_from_fresh(&occurrence, &facts, EditingStatus::On);
+        assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::Recurring));
+        f.recurring = false;
+        let open = FieldPermissions {
+            summary: true,
+            time: true,
+            location: true,
+            description: true,
+            show_as: true,
+            visibility: true,
+            delete: true,
+            reasons: Vec::new(),
+        };
+        assert!(
+            gate::edit_rights(&f) == open,
+            "an occurrence edits like a one-off"
+        );
     }
 
     #[test]
@@ -5374,6 +5543,7 @@ mod tests {
             locked: true,
             visibility: None,
             recurring: false,
+            series_master: false,
             has_guests: false,
             html_description: false,
         });
@@ -6419,12 +6589,73 @@ mod tests {
             .await
         };
         assert_eq!(ask_one(one_off.clone()).await, SeriesChoices::NotRepeating);
+        // A one-off turned into a series in Google: the gate refuses it, with its own reason, before
+        // anything else is read.
         let now_a_series = with(one_off, "recurrence", json!(["RRULE:FREQ=DAILY"]));
         assert!(matches!(
             ask_one(now_a_series).await,
-            SeriesChoices::Refused { result: WriteOutcome::Failed { message } }
-                if message.starts_with("This became a repeating event in Google")
+            SeriesChoices::Refused {
+                result: WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::BecameRepeating
+                }
+            }
         ));
+    }
+
+    /// The C9a-3a hand-off: a delete's choices that meet an occurrence changed in Google land
+    /// Google's copy, as the one-event delete does, so the next ask compares against it instead of
+    /// conflicting again until a sync.
+    #[tokio::test]
+    async fn a_delete_choice_on_a_changed_occurrence_shows_googles_copy() {
+        let (series, instance) = (weekly(), monday_19());
+        let host = TestHost::holding(&october());
+        let renamed = with(instance.clone(), "summary", json!("Standup moved"));
+        let delete = |seen: SeenSummary| ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen,
+        };
+        let script = Script::new(vec![instance_read(&renamed)]);
+        let got = choices(
+            &script,
+            &*host,
+            &target(&instance),
+            EditingStatus::On,
+            &mirror(&["abc"]),
+            &delete(seen_by_user(&fresh_event(instance.clone()))),
+            None,
+        )
+        .await;
+        script.finished();
+        assert!(matches!(
+            &got,
+            SeriesChoices::Refused { result: WriteOutcome::Conflict { fields } }
+                if fields == &["summary"]
+        ));
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:abc_20261019T080000Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.summary, "Standup moved");
+        assert_eq!(host.told.lock().unwrap().len(), 1);
+        // Asked again on what the user now sees (an occurrence changed on its own, so listed with
+        // its series): every row offered.
+        let script = Script::new(reads(
+            &renamed,
+            &series,
+            vec![series.clone(), renamed.clone()],
+            vec![renamed.clone()],
+        ));
+        let (this, following, all) = ask(
+            &script,
+            &renamed,
+            delete(seen_by_user(&fresh_event(renamed.clone()))),
+            None,
+            &["abc"],
+        )
+        .await;
+        for row in [this, following, all] {
+            assert!(matches!(row, ScopeRow::Offered { .. }));
+        }
     }
 
     /// A listing is read page by page; a page that fails or that PM can't read, or the cap, leaves
@@ -6842,7 +7073,7 @@ mod tests {
         let held = |day: &str| ScopeRow::Refused {
             message: format!(
                 "The occurrence on {day} has guests of its own, and PM can't change events with \
-                 guests yet. Choose \"This event\" to change only this one."
+                 guests yet. Choose “This event” to change only this one."
             ),
         };
         let later = invited("2026-10-26T09:00:00Z");
@@ -7962,6 +8193,63 @@ mod tests {
         assert!(host.nothing_recorded() && !host.hash_dropped() && host.told().is_empty());
     }
 
+    /// Scope-L2: "This event" edited, Google answering 2xx with the old title kept, says so as
+    /// "All events" does; the row is as it was.
+    #[tokio::test]
+    async fn a_this_event_edit_google_ignored_says_so() {
+        let host = TestHost::holding(&october());
+        let instance = monday_19();
+        let mut steps = october_reads();
+        steps.push(Step::write(
+            Method::Patch,
+            "/events/abc_20261019T080000Z",
+            instance["etag"].as_str().unwrap(),
+            Scripted::Json(written(&instance, &[], "\"i2\"")),
+        ));
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &instance,
+            &weekly(),
+            title("Retro"),
+            Scope::This,
+        )
+        .await;
+        script.asked_all();
+        assert!(matches!(
+            outcome,
+            WriteOutcome::IgnoredByGoogle { split: false }
+        ));
+        assert!(host.rows().iter().all(|r| r.summary == "Standup"));
+        assert!(host.nothing_recorded());
+    }
+
+    /// Scope-L2: "This event" deleted, Google answering 2xx to the cancel with the occurrence still
+    /// confirmed, says so; the row stays.
+    #[tokio::test]
+    async fn a_this_event_delete_google_ignored_says_so() {
+        let host = TestHost::holding(&october());
+        let instance = monday_19();
+        let mut steps = october_reads();
+        steps.extend(october_reads());
+        steps.push(Step::write(
+            Method::Patch,
+            "/events/abc_20261019T080000Z",
+            instance["etag"].as_str().unwrap(),
+            Scripted::Json(written(&instance, &[], "\"i2\"")),
+        ));
+        let script = Script::new(steps);
+        let outcome = held_delete(&host, &script, &instance, Scope::This).await;
+        script.asked_all();
+        assert!(matches!(
+            outcome,
+            WriteOutcome::IgnoredByGoogle { split: false }
+        ));
+        assert!(host.ids().contains(&"cal:abc_20261019T080000Z".to_string()));
+        assert!(host.nothing_recorded());
+    }
+
     /// No answer, Google still showing what was there, and no answer to the once-more either: it
     /// may yet land, so nothing is recorded and the next sync rewrites the rows.
     #[tokio::test]
@@ -8301,6 +8589,67 @@ mod tests {
         assert_eq!(planned.err(), Some(no_base));
     }
 
+    /// The C9a-3a hand-off, for a scoped delete: before its hold and at its send, an occurrence
+    /// changed in Google since the user saw it is a conflict that lands Google's copy, with nothing
+    /// written.
+    #[tokio::test]
+    async fn a_held_series_delete_meeting_a_changed_occurrence_lands_it() {
+        let instance = monday_19();
+        let renamed = with(instance.clone(), "summary", json!("Standup moved"));
+        let target = target(&instance);
+        let seen = seen_by_user(&fresh_event(instance.clone()));
+        let title_now = |host: &TestHost| {
+            host.with_conn(|conn| calendar::event_by_id(conn, &target.row_id))
+                .unwrap()
+                .unwrap()
+                .summary
+        };
+        let conflict = |outcome: &WriteOutcome| matches!(outcome, WriteOutcome::Conflict { fields } if fields == &["summary"]);
+        // Before the hold.
+        let host = TestHost::holding(&october());
+        let script = Script::new(vec![instance_read(&renamed)]);
+        let planned = plan_held_delete(
+            &writer(&script, &host, &target),
+            &target.row_id,
+            &seen,
+            Scope::All,
+            None,
+        )
+        .await;
+        script.finished();
+        assert!(planned.err().as_ref().is_some_and(conflict));
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        assert_eq!(title_now(&host), "Standup moved");
+        // At the send, after a hold planned on what the user saw.
+        let host = TestHost::holding(&october());
+        let script = Script::new(october_reads());
+        let Ok((_claim, held)) = plan_held_delete(
+            &writer(&script, &host, &target),
+            &target.row_id,
+            &seen,
+            Scope::All,
+            None,
+        )
+        .await
+        else {
+            panic!("the delete wasn't held");
+        };
+        script.finished();
+        let script = Script::new(vec![instance_read(&renamed)]);
+        let sent = send_held_series_delete(
+            &writer(&script, &host, &target),
+            &target.row_id,
+            &seen,
+            Scope::All,
+            &held,
+        )
+        .await;
+        script.finished();
+        assert!(conflict(&sent));
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        assert_eq!(title_now(&host), "Standup moved");
+    }
+
     // --- "this and following" and settling (C9a-3b) ---
 
     const TAIL_ICAL: &str = "tail@google.com";
@@ -8433,6 +8782,27 @@ mod tests {
             WriteOutcome::PartialSplit { offers, .. } => offers.clone(),
             _ => Vec::new(),
         }
+    }
+
+    /// A settle's words while the change is still held: its note, `None` for any other answer.
+    fn note_of(outcome: &WriteOutcome) -> Option<&str> {
+        match outcome {
+            WriteOutcome::PartialSplit { note, .. } => note.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The answer is the change still held under `token`, with what PM holds now and `words` as
+    /// its note: the notice keeps its buttons (C9b-1 critiques 1 H2, 2 H1).
+    fn still_held_with(host: &TestHost, outcome: &WriteOutcome, token: &str, words: &str) {
+        let held = host.edit.held_split(token);
+        assert!(held.is_some(), "the change is still held");
+        let (offers, from) = held.unwrap();
+        assert!(
+            matches!(outcome, WriteOutcome::PartialSplit { token: t, offers: o, from: f, note: Some(n) }
+                if t == token && *o == offers && *f == from && n == words),
+            "the answer is the held change with the outcome's words"
+        );
     }
 
     /// A split whose cut's answer was lost (and lost again on the look the run makes), then held
@@ -9028,8 +9398,10 @@ mod tests {
                 )
                 .await;
                 script.finished();
+                // Still held, so the answer keeps its buttons (Check) and says why.
                 assert!(
-                    matches!(&outcome, WriteOutcome::Failed { message } if message.contains("changed in Google")),
+                    matches!(&outcome, WriteOutcome::PartialSplit { offers, note: Some(message), .. }
+                        if message.contains("changed in Google") && offers == &[SplitAction::Check]),
                     "{action:?}"
                 );
                 assert_eq!(
@@ -9133,10 +9505,8 @@ mod tests {
         script.finished();
         assert_eq!(offers_of(&outcome), [SplitAction::Remove]);
         assert_eq!(held_count(&host), 1);
-        // Finish, the new part unread; then the original's occurrences listed short.
-        let unread = WriteOutcome::Failed {
-            message: FINISH_UNREAD.into(),
-        };
+        // Finish, the new part unread; then the original's occurrences listed short. Still held,
+        // with Finish's words, so its buttons stay.
         let mut short = tail_reads(tail.clone(), Vec::new());
         short.push(ical_listing(
             "iCalUID=abc%40google.com",
@@ -9154,7 +9524,7 @@ mod tests {
             let (outcome, script) =
                 settle(&host, &held_token(&held), SplitAction::Finish, steps).await;
             script.finished();
-            assert_eq!(outcome, unread);
+            still_held_with(&host, &outcome, &held_token(&held), FINISH_UNREAD);
             assert_eq!(held_count(&host), 1);
         }
     }
@@ -9180,7 +9550,10 @@ mod tests {
             vec![uncut(), event_read(TAIL, Scripted::Json(renamed))],
         )
         .await;
-        assert!(matches!(refused, WriteOutcome::Failed { .. }));
+        let from = host.edit.held_split(&token).map(|(_, from)| from);
+        let words = tail_changed_words(from.as_deref().unwrap_or_default());
+        still_held_with(&host, &refused, &token, &words);
+        assert_eq!(offers_of(&refused), [SplitAction::Check]);
         let (back, _) = settle(
             &host,
             &token,
@@ -9218,9 +9591,8 @@ mod tests {
         )
         .await;
         script.finished();
-        assert!(
-            matches!(&outcome, WriteOutcome::Failed { message } if message.contains("changed in Google"))
-        );
+        assert!(note_of(&outcome).is_some_and(|n| n.contains("changed in Google")));
+        assert_eq!(offers_of(&outcome), [SplitAction::Check]);
         assert_eq!(held_count(&host), 1);
     }
 
@@ -9453,7 +9825,13 @@ mod tests {
             let token = held_token(&held);
             let _other = InFlight::claim(&host.edit, &series_key(CALENDAR, series)).unwrap();
             let (outcome, _) = settle(&host, &token, SplitAction::Check, Vec::new()).await;
-            assert_eq!(outcome, WriteOutcome::Busy, "{series}");
+            // PM's own claim, worded as such (C9b-1 critique 1 L9), with the buttons kept.
+            still_held_with(
+                &host,
+                &outcome,
+                &token,
+                "PM is still changing this repeating event; try again in a moment.",
+            );
             assert_eq!(held_count(&host), 1);
             // A save meanwhile still meets the held split.
             assert!(host.edit.held_on(CALENDAR, "abc").is_some());
@@ -9468,13 +9846,31 @@ mod tests {
         let (held, _) = lost_cut(&host, lost()).await;
         *host.allowed.lock().unwrap() = Err("not this calendar");
         let (outcome, _) = settle(&host, &held_token(&held), SplitAction::Check, Vec::new()).await;
-        assert_eq!(
-            outcome,
-            WriteOutcome::Failed {
-                message: "not this calendar".into()
-            }
+        still_held_with(&host, &outcome, &held_token(&held), "not this calendar");
+        assert_eq!(held_count(&host), 1);
+    }
+
+    /// Editing turned off before a settle: refused after the take, nothing sent, and the change
+    /// still held with its buttons and the reason.
+    #[tokio::test]
+    async fn a_settle_with_editing_off_keeps_the_change_held() {
+        let host = TestHost::holding(&october());
+        let (held, _) = lost_cut(&host, lost()).await;
+        let token = held_token(&held);
+        *host.editing.lock().unwrap() = EditingStatus::Paused;
+        let (outcome, script) = settle(&host, &token, SplitAction::Finish, Vec::new()).await;
+        script.finished();
+        still_held_with(
+            &host,
+            &outcome,
+            &token,
+            read_only_message(ReadOnlyReason::EditingOff),
         );
         assert_eq!(held_count(&host), 1);
+        // A token that's gone stays a plain answer: there's nothing to keep buttons for.
+        let (gone, _) = settle(&host, "no-such-split", SplitAction::Check, Vec::new()).await;
+        assert!(note_of(&gone).is_none());
+        assert!(matches!(gone, WriteOutcome::Failed { .. }));
     }
 
     /// Check reads only, and holds the split again under its token with the new offers.
@@ -9593,9 +9989,9 @@ mod tests {
             steps.extend(tail_steps);
             let (outcome, script) = settle(&host, &token, SplitAction::Remove, steps).await;
             script.finished();
-            assert!(
-                matches!(&outcome, WriteOutcome::Failed { message } if message.contains("changed in Google"))
-            );
+            // The tail-changed words, with Check left as the one button.
+            assert!(note_of(&outcome).is_some_and(|n| n.contains("changed in Google")));
+            assert_eq!(offers_of(&outcome), [SplitAction::Check]);
             let back = host.edit.held_on(CALENDAR, "abc").unwrap();
             assert_eq!(back.offers, [SplitAction::Check]);
         }
@@ -9645,7 +10041,7 @@ mod tests {
             vec![uncut(), event_read(TAIL, Scripted::Json(renamed.clone()))],
         )
         .await;
-        assert!(matches!(refused, WriteOutcome::Failed { .. }));
+        assert!(note_of(&refused).is_some_and(|n| n.contains("changed in Google")));
         // Still renamed: Check only.
         let (still, _) = settle(
             &host,
@@ -10286,6 +10682,91 @@ mod tests {
         }
     }
 
+    /// Two records on one series, one as its original (abc → the new part) and one as its new part
+    /// (an earlier xyz → abc), both said and forgotten at once: each is said, since neither can be
+    /// said again (C9b-1 spec §1.5, critique 1 L4).
+    #[tokio::test]
+    async fn two_orphans_both_say_their_words_once() {
+        let plan = split_plan(Vec::new());
+        let as_original = orphan_entry(&plan, true);
+        // abc is itself the new part of an earlier change to xyz, whose start PM can't read back.
+        let as_tail = Entry {
+            series: "xyz".into(),
+            tail: "abc".into(),
+            plan: "earlier-plan".into(),
+            from: "2026-10-05".into(),
+            start: Value::Null,
+            ..as_original.clone()
+        };
+        let host = restarted_with(&as_original);
+        host.with_conn(|conn| journal_add(conn, &as_tail)).unwrap();
+        // abc's repeat changed in Google since; it carries the note of the change that made it.
+        let mut abc = written(
+            &weekly(),
+            &[(
+                "recurrence",
+                json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261201T000000Z"]),
+            )],
+            "\"m5\"",
+        );
+        abc["extendedProperties"] =
+            json!({ "private": { "pmSplitOf": "xyz", "pmSplitPlan": "earlier-plan" } });
+        let xyz = with(weekly(), "id", json!("xyz"));
+        let twelfth = october()[0].clone();
+        let ask = |with_looks: bool| {
+            let mut steps = reads(&twelfth, &abc, vec![abc.clone()], vec![twelfth.clone()]);
+            if with_looks {
+                // In the journal's order: abc's own record looks at its new part, then xyz's at xyz.
+                steps.push(event_read(
+                    TAIL,
+                    Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT)),
+                ));
+                steps.push(event_read("xyz", Scripted::Json(xyz.clone())));
+            }
+            Script::new(steps)
+        };
+        let opened = Some((&twelfth, Some(&abc)));
+        let script = ask(true);
+        let (this, _, _, notice) = rows_of_choices(
+            ask_on(
+                &host,
+                &script,
+                &twelfth,
+                edit(title("Again")),
+                opened,
+                &["abc"],
+            )
+            .await,
+        );
+        script.finished();
+        let words = |entry: &Entry| {
+            Orphaned {
+                entry: entry.clone(),
+                orphan: Orphan::Changed,
+            }
+            .words()
+        };
+        let both = format!("{} {}", words(&as_original), words(&as_tail));
+        assert_eq!(notice.as_deref(), Some(both.as_str()));
+        assert!(matches!(this, ScopeRow::Offered { .. }));
+        assert!(host.journal().is_empty());
+        // Both said: the next ask reads nothing more for them and says nothing.
+        let script = ask(false);
+        let (_, _, _, notice) = rows_of_choices(
+            ask_on(
+                &host,
+                &script,
+                &twelfth,
+                edit(title("Again")),
+                opened,
+                &["abc"],
+            )
+            .await,
+        );
+        script.finished();
+        assert_eq!(notice, None);
+    }
+
     /// A record whose new part is gone is forgotten by the next send, which goes ahead; one PM
     /// can't check refuses what it reaches, and stays.
     #[tokio::test]
@@ -10575,12 +11056,9 @@ mod tests {
         ));
         let (outcome, script) = settle(&host, &held_token(&held), SplitAction::Finish, steps).await;
         script.finished();
-        assert_eq!(
-            outcome,
-            WriteOutcome::Failed {
-                message: FINISH_CHANGED.into()
-            }
-        );
+        // Still held, with Remove as the button its words name.
+        still_held_with(&host, &outcome, &held_token(&held), FINISH_CHANGED);
+        assert_eq!(offers_of(&outcome), [SplitAction::Remove]);
         assert_eq!(
             host.edit.held_on(CALENDAR, "abc").unwrap().offers,
             [SplitAction::Remove]
@@ -11567,6 +12045,272 @@ mod tests {
                 .unwrap();
             assert_eq!(row.summary, title_now, "{expected:?}");
         }
+    }
+
+    // --- a one-off Google has since turned into a repeating event (C9 design critique 2 M6) ---
+
+    /// The dentist one-off as Google holds it once a weekly rule was added there: a series itself,
+    /// on the same first day, so what the user saw of the one-off still matches it.
+    fn dentist_turned_series() -> Value {
+        with(dentist(), "recurrence", json!(["RRULE:FREQ=WEEKLY"]))
+    }
+
+    #[tokio::test]
+    async fn a_row_turned_series_is_read_only_in_the_editor() {
+        let turned = dentist_turned_series();
+        let edit_state = CalendarEditState::default();
+        // No `recurringEventId`, so nothing more is read.
+        let script = Script::new(Vec::new());
+        let load = open_editor(
+            &script,
+            &edit_state,
+            target(&turned),
+            turned.clone(),
+            EditingStatus::On,
+            None,
+        )
+        .await
+        .unwrap();
+        script.finished();
+        let EditLoad::Ready { permissions, .. } = load else {
+            panic!("the editor didn't open");
+        };
+        assert!(
+            permissions == FieldPermissions::none(ReadOnlyReason::BecameRepeating),
+            "read-only, with its own reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_on_a_row_turned_series_sends_nothing() {
+        let (event, turned) = (dentist(), dentist_turned_series());
+        let target = target(&event);
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+        let open = open_session(&host.edit, &session).unwrap().unwrap();
+        let script = Script::new(vec![Step::get("/events/solo", "", turned)]);
+        let outcome = save_event(
+            &script,
+            &*host,
+            &session,
+            &open,
+            &title("Retro"),
+            EditingStatus::On,
+        )
+        .await;
+        script.finished();
+        assert!(matches!(
+            outcome,
+            WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::BecameRepeating
+            }
+        ));
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        assert_eq!(script.sent().len(), 1);
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.summary, "Dentist");
+    }
+
+    /// Critique M6's own case: a one-off deleted in PM, turned into a series in Google during the
+    /// Undo wait, on the same first day. The gate stops it first, with its own reason; "is it still
+    /// what you saw" would refuse it too (no series is a row PM mirrors), but as a changed start.
+    #[tokio::test]
+    async fn a_held_delete_of_a_row_turned_series_deletes_nothing() {
+        let (event, turned) = (dentist(), dentist_turned_series());
+        let target = target(&event);
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        assert!(
+            patch::delete_still_matches(&seen, &turned) != DeleteCheck::Matches,
+            "the backstop behind the gate"
+        );
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![Step::get("/events/solo", "", turned)]);
+        let outcome = send_delete(&script, &*host, &target, &seen).await;
+        script.finished();
+        assert!(matches!(
+            outcome,
+            WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::BecameRepeating
+            }
+        ));
+        assert_eq!(script.sent().len(), 1);
+        assert!(script.sent().iter().all(|r| r.method == Method::Get));
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap();
+        assert!(row.is_some());
+    }
+
+    // --- the release gate, and the words rows show (C9b-1 critiques 1 M8, 2 M4) ---
+
+    /// The one release gate for a scoped write without its choice: every shell's series write takes
+    /// [`MISSING_CHOICE_OK`] (a settle, which plans nothing anew, `false`), and nothing spreads
+    /// another value in. Read from this file's own text, so a later `missing_ok: true` fails here.
+    #[test]
+    fn every_shell_takes_the_one_release_gate_for_a_missing_choice() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let mut gated = 0;
+        let mut literals = 0;
+        for (at, _) in shipped.match_indices("SeriesWrite {") {
+            literals += 1;
+            let body = &shipped[at..];
+            let body = &body[..body.find("};").unwrap_or(body.len())];
+            assert!(
+                !body.contains(".."),
+                "a series write spreads another's fields"
+            );
+            if body.contains("missing_ok: MISSING_CHOICE_OK,") {
+                gated += 1;
+            } else {
+                assert!(
+                    body.contains("missing_ok: false,"),
+                    "a series write sets its own missing-choice rule"
+                );
+            }
+        }
+        assert_eq!((literals, gated), (4, 3), "the three shells and the settle");
+        // And the gate itself is a dev build's only.
+        assert!(
+            shipped.contains("const MISSING_CHOICE_OK: bool = cfg!(debug_assertions);"),
+            "only a dev build may leave out the choice"
+        );
+    }
+
+    /// No row, banner or settle answer says "series", "split", "instance", "exception" or "master":
+    /// every refusal a row can show, nested ones included, and the two banners that said it.
+    #[test]
+    fn what_rows_show_has_no_jargon() {
+        use crate::calendar_recur::lines::TextOnly;
+        use crate::calendar_recur::reanchor::ReanchorError;
+        use crate::calendar_recur::remap::RetimeError;
+        use crate::calendar_recur::RecurError;
+        use crate::calendar_write::time::TimeError;
+        use chrono::{NaiveDate, Weekday};
+        let day = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let text_only = [
+            TextOnly::NoRule,
+            TextOnly::SeveralRules,
+            TextOnly::ExRule,
+            TextOnly::SubDaily,
+            TextOnly::Part("BYSETPOS".into()),
+            TextOnly::Unreadable,
+        ];
+        let recur: Vec<RecurError> = text_only
+            .iter()
+            .cloned()
+            .map(RecurError::TextOnly)
+            .chain([
+                RecurError::Ended,
+                RecurError::CannotCount,
+                RecurError::BeforeStart,
+                RecurError::Mismatch,
+            ])
+            .collect();
+        let reanchor = [
+            ReanchorError::Collision(Weekday::Tue),
+            ReanchorError::Crosses(Weekday::Tue),
+            ReanchorError::CrossWeek,
+            ReanchorError::CrossMonth,
+            ReanchorError::CrossYear,
+            ReanchorError::Fifth,
+            ReanchorError::NotLast,
+            ReanchorError::NotDerivable,
+        ];
+        let retime: Vec<RetimeError> = recur
+            .iter()
+            .cloned()
+            .map(RetimeError::Recur)
+            .chain(reanchor.iter().cloned().map(RetimeError::Reanchor))
+            .chain([
+                RetimeError::KindChange,
+                RetimeError::HasExtraDates,
+                RetimeError::NotOnRule,
+                RetimeError::StartNotOnRule(day),
+                RetimeError::RepeatedTime(day),
+                RetimeError::Gap(day),
+                RetimeError::Overlaps(day),
+                RetimeError::Loses(day),
+                RetimeError::Adds(day),
+                RetimeError::CannotPlace,
+            ])
+            .collect();
+        let time = [
+            TimeError::NoZone,
+            TimeError::UnknownZone("Mars/Base".into()),
+            TimeError::BadDate("x".into()),
+            TimeError::BadTime("x".into()),
+            TimeError::Gap {
+                zone: "Europe/London".into(),
+                wall: "01:30".into(),
+            },
+            TimeError::EndBeforeStart,
+        ];
+        let refusals: Vec<SeriesRefusal> = recur
+            .into_iter()
+            .map(SeriesRefusal::Recur)
+            .chain(retime.into_iter().map(SeriesRefusal::Retime))
+            .chain(time.into_iter().map(SeriesRefusal::Time))
+            .chain([
+                SeriesRefusal::Unreadable,
+                SeriesRefusal::NoZone,
+                SeriesRefusal::NotInSeries,
+                SeriesRefusal::Incomplete,
+                SeriesRefusal::NoBase,
+                SeriesRefusal::CannotCarry(day),
+                SeriesRefusal::GuestsElsewhere(day),
+                SeriesRefusal::FormattedDescription,
+                SeriesRefusal::VisibilityIsSeriesWide,
+                SeriesRefusal::OnlyThisDiffers,
+                SeriesRefusal::OnlyThisTimeDiffers,
+                SeriesRefusal::SplitInGap(day),
+                SeriesRefusal::ZoneChange,
+                SeriesRefusal::SplitOverlap(day),
+                SeriesRefusal::PartsUnread,
+            ])
+            .collect();
+        let reasons = [
+            ReadOnlyReason::NotGoogle,
+            ReadOnlyReason::EditingOff,
+            ReadOnlyReason::CalendarReadOnly,
+            ReadOnlyReason::PrivateEvent,
+            ReadOnlyReason::NotOrganizer,
+            ReadOnlyReason::Recurring,
+            ReadOnlyReason::BecameRepeating,
+            ReadOnlyReason::HasGuests,
+            ReadOnlyReason::SpecialType,
+            ReadOnlyReason::Locked,
+            ReadOnlyReason::HtmlDescription,
+        ];
+        let mut lines: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+        lines.extend(reasons.iter().map(|r| read_only_message(*r).to_string()));
+        lines.extend([PUT_BACK.to_string(), RETIME_UNSURE.to_string()]);
+        for line in &lines {
+            let lower = line.to_lowercase();
+            for word in ["series", "split", "instance", "exception", "master"] {
+                assert!(!lower.contains(word), "“{line}” says “{word}”");
+            }
+            // Straight quotes only around nothing: titles and labels take curly ones.
+            assert!(
+                !line.contains("\"This event\""),
+                "“{line}” has straight quotes"
+            );
+        }
+        // Dates as the design system writes them, DD-MM-YYYY.
+        assert!(SeriesRefusal::CannotCarry(day)
+            .to_string()
+            .contains("19-10-2026"));
+        // A row refused for a reason says that reason, never just "can't change this event".
+        let reason_lines: Vec<&str> = reasons.iter().map(|r| read_only_message(*r)).collect();
+        assert!(reason_lines
+            .iter()
+            .all(|l| *l != "PM can't change this event."));
     }
 
     // --- the sender's folds (review H1, L6) ---

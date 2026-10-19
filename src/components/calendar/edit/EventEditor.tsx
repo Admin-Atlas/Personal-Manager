@@ -46,6 +46,7 @@ import {
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
+  CALLOUT_TONE,
   listFields,
   loadText,
   outcomeText,
@@ -426,12 +427,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
         ) : (
           <div className="flex flex-col gap-4">
             {banner && (
-              <Callout
-                tone={
-                  banner.tone === "error" ? "danger" : banner.tone === "warn" ? "warning" : "info"
-                }
-                live
-              >
+              <Callout tone={CALLOUT_TONE[banner.tone]} live>
                 {banner.text}
               </Callout>
             )}

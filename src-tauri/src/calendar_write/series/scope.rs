@@ -426,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             ScopeReason::TextOnly(TextOnly::Part("BYSETPOS".into())).to_string(),
-            "PM can't change how this series repeats: its rule uses BYSETPOS, which PM doesn't \
+            "PM can't change how this event repeats: its rule uses BYSETPOS, which PM doesn't \
              change."
         );
         assert!(ScopeReason::KindChange

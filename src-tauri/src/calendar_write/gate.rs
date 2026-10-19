@@ -8,7 +8,9 @@
 //!
 //! The first layers edit only solo, one-off events you organise. Repeating events, events with
 //! guests and invitations are read-only with a reason until the layers that handle them (C9, C12,
-//! C14) lift that reason, each replacing it with the rule it stood in for (rule R9).
+//! C14) lift that reason, each replacing it with the rule it stood in for (rule R9). A one-off that
+//! Google has since turned into a repeating event is read-only with its own reason on every path,
+//! since a write to it would change every occurrence with no choice asked.
 
 use crate::calendar_editing::EditingStatus;
 
@@ -29,6 +31,11 @@ pub struct EditFacts<'a> {
     pub locked: bool,
     pub visibility: Option<&'a str>,
     pub recurring: bool,
+    /// Google's copy is a repeating event's series itself (its rule, no `recurringEventId`), while PM
+    /// asked about one event: a one-off that had a rule added in Google since. Saving or deleting it
+    /// would change every occurrence with no choice asked (C9 design §0.7, critique 2 M6). Known only
+    /// from a fresh copy; the mirror never holds a series itself.
+    pub series_master: bool,
     /// Guests besides the calendar itself.
     pub has_guests: bool,
     /// The description is formatted. Known only from a fresh copy (the mirror clips descriptions).
@@ -106,6 +113,10 @@ fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
     if !facts.organizer_self {
         return Some(ReadOnlyReason::NotOrganizer);
     }
+    // Before `recurring`: a copy turned into a series has both, and its own reason says what to do.
+    if facts.series_master {
+        return Some(ReadOnlyReason::BecameRepeating);
+    }
     if facts.recurring {
         return Some(ReadOnlyReason::Recurring);
     }
@@ -131,6 +142,7 @@ mod tests {
             locked: false,
             visibility: None,
             recurring: false,
+            series_master: false,
             has_guests: false,
             html_description: false,
         }
@@ -287,6 +299,22 @@ mod tests {
             ),
             (
                 EditFacts {
+                    series_master: true,
+                    ..e()
+                },
+                BecameRepeating,
+            ),
+            // A copy turned into a series also repeats: its own reason is the one shown.
+            (
+                EditFacts {
+                    series_master: true,
+                    recurring: true,
+                    ..e()
+                },
+                BecameRepeating,
+            ),
+            (
+                EditFacts {
                     has_guests: true,
                     ..e()
                 },
@@ -298,6 +326,15 @@ mod tests {
                     access_role: Some("reader"),
                     recurring: true,
                     has_guests: true,
+                    ..e()
+                },
+                CalendarReadOnly,
+            ),
+            // A read-only shared calendar outranks "it became a repeating event".
+            (
+                EditFacts {
+                    access_role: Some("reader"),
+                    series_master: true,
                     ..e()
                 },
                 CalendarReadOnly,
