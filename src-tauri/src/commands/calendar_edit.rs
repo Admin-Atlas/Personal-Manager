@@ -15,6 +15,10 @@
 //! 6. Google's reply into the mirror (never the draft), remembered so a sync that started earlier
 //!    can't put the old version back, and the briefing told to look again.
 //!
+//! Creating an event (C10) has nothing to read first: it goes out under an id PM chose, and an
+//! answer that never arrives is looked for under that id before anything is sent again (A9), so a
+//! dropped connection can't make a second copy.
+//!
 //! Every outcome comes back as data (`WriteOutcome`), so the editor keeps the draft and explains.
 //! Nothing here is reachable from a model: no model call has tools, the commands refuse any window
 //! but the main one, and `scripts/check-calendar-write-fence.mjs` keeps the command names and
@@ -34,12 +38,12 @@ use crate::calendar_editing::{self, EditingStatus};
 use crate::calendar_recur::lines::{self, Applied};
 use crate::calendar_recur::spec::{day_phrase, describe_lines};
 use crate::calendar_recur::Point;
-use crate::calendar_write::classify::Verdict;
+use crate::calendar_write::classify::{Method, Verdict};
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
-    FieldPermissions, HeldDeleteInfo, Notify, ReadOnlyReason, ScopeRow, SeenSummary, SeriesChoices,
-    SeriesInfo, SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft, Visibility,
-    WriteOutcome, WriteWarning,
+    FieldPermissions, HeldDeleteInfo, NewEventDraft, Notify, ReadOnlyReason, ScopeRow, SeenSummary,
+    SeriesChoices, SeriesInfo, SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft,
+    Visibility, WriteOutcome, WriteWarning,
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
@@ -70,8 +74,8 @@ use super::shared::require_main_window;
 use super::vaults::require_vault_owner;
 
 /// What editing keeps in memory, in [`AppState`]. Lock order everywhere: the DB, then `recent`;
-/// `partials`, `splitting` and `in_flight` are each taken alone, never with the DB or another of these
-/// held.
+/// `partials`, `splitting`, `creates` and `in_flight` are each taken alone, never with the DB or
+/// another of these held.
 #[derive(Default)]
 pub struct CalendarEditState {
     /// Saves of the last ten minutes, laid over each sync's fetch (rule R4).
@@ -88,6 +92,11 @@ pub struct CalendarEditState {
     /// The new parts of the "this and following" changes running now, a send or a settle, by
     /// [`series_key`]: their journal records are theirs, no orphans.
     splitting: Mutex<HashSet<String>>,
+    /// New events whose answer never arrived, by the retry token PM gave the webview (R5): what to
+    /// look for and, if it's still not there, send again under the same id. Lapses after
+    /// `SESSION_TTL`; lost on quit, which loses nothing (a create that landed shows at the next
+    /// sync, and one that didn't is simply absent: a create has no half to leave behind).
+    creates: Mutex<HashMap<String, HeldCreate>>,
     /// One calendar sync at a time, so a fetch that started earlier can never finish after a later
     /// one has settled a save (plan A23). A second caller waits, then runs; the change check
     /// ([`super::check_google_calendars`]) never waits, it skips.
@@ -163,6 +172,51 @@ struct Target {
     facts: CalendarFacts,
 }
 
+/// Where a PM calendar lives at Google, from the DB alone: an iCal feed or an Outlook calendar comes
+/// back as `NotGoogle`, never a target.
+#[derive(Clone, Debug, PartialEq)]
+struct CalendarTarget {
+    calendar_id: String,
+    remote_calendar: String,
+    email: String,
+    token_key: String,
+    facts: CalendarFacts,
+    /// Synced into the mirror (`calendars.selected`): a write to one that isn't lands nothing
+    /// (`calendar::apply_write_effect`).
+    selected: bool,
+}
+
+/// Resolve PM's calendar `calendar_id` to its Google calendar. `missing`: the words for a calendar
+/// that isn't in PM any more, each caller its own (an event's calendar, or the one chosen).
+fn resolve_calendar(
+    conn: &Connection,
+    calendar_id: &str,
+    missing: &str,
+) -> Result<std::result::Result<CalendarTarget, ReadOnlyReason>> {
+    let Some(cal) = calendar::calendar_by_id(conn, calendar_id)? else {
+        return Err(Error::Other(missing.into()));
+    };
+    let email = match (cal.provider.as_str(), cal.source_id.strip_prefix("gcal:")) {
+        ("google", Some(email)) => email.to_string(),
+        _ => return Ok(Err(ReadOnlyReason::NotGoogle)),
+    };
+    let remote_calendar = cal.remote_id.clone().unwrap_or_else(|| cal.id.clone());
+    if !is_plain_segment(&remote_calendar) {
+        return Ok(Err(ReadOnlyReason::NotGoogle));
+    }
+    let Some(token_key) = secrets::token_key_for("google", "calendar", &email) else {
+        return Ok(Err(ReadOnlyReason::NotGoogle));
+    };
+    Ok(Ok(CalendarTarget {
+        calendar_id: cal.id,
+        remote_calendar,
+        email,
+        token_key,
+        facts: cal.facts,
+        selected: cal.selected,
+    }))
+}
+
 /// Resolve a mirror row to its Google calendar and event. A row from an iCal feed or an Outlook
 /// calendar isn't Google OAuth, so it comes back as that reason rather than a target.
 fn resolve_target(
@@ -174,14 +228,13 @@ fn resolve_target(
             "That event is no longer in PM's calendar. Refresh and try again.".into(),
         ));
     };
-    let Some(cal) = calendar::calendar_by_id(conn, &row.calendar_id)? else {
-        return Err(Error::Other(
-            "That event's calendar is no longer connected.".into(),
-        ));
-    };
-    let email = match (cal.provider.as_str(), cal.source_id.strip_prefix("gcal:")) {
-        ("google", Some(email)) => email.to_string(),
-        _ => return Ok(Err(ReadOnlyReason::NotGoogle)),
+    let cal = match resolve_calendar(
+        conn,
+        &row.calendar_id,
+        "That event's calendar is no longer connected.",
+    )? {
+        Ok(cal) => cal,
+        Err(reason) => return Ok(Err(reason)),
     };
     let Some(remote_event) = row
         .id
@@ -190,20 +243,13 @@ fn resolve_target(
     else {
         return Ok(Err(ReadOnlyReason::NotGoogle));
     };
-    let remote_calendar = cal.remote_id.clone().unwrap_or_else(|| cal.id.clone());
-    if !is_plain_segment(&remote_calendar) {
-        return Ok(Err(ReadOnlyReason::NotGoogle));
-    }
-    let Some(token_key) = secrets::token_key_for("google", "calendar", &email) else {
-        return Ok(Err(ReadOnlyReason::NotGoogle));
-    };
     Ok(Ok(Target {
         row_id: row.id.clone(),
         calendar_id: row.calendar_id.clone(),
-        remote_calendar,
+        remote_calendar: cal.remote_calendar,
         remote_event: remote_event.to_string(),
-        email,
-        token_key,
+        email: cal.email,
+        token_key: cal.token_key,
         facts: cal.facts,
     }))
 }
@@ -798,6 +844,544 @@ async fn save_event<W: Wire, H: Host>(
         }
     }
     WriteOutcome::Conflict { fields: Vec::new() }
+}
+
+// --- creating an event (C10) ---
+
+/// C10a only: release builds refuse creates until the UI ships (C10b).
+const CREATE_NOT_YET: &str = "Creating events from PM isn't available yet.";
+/// A calendar PM doesn't sync: a new event there would land nothing in the mirror.
+const NOT_SYNCED: &str = "PM doesn't sync this calendar, so it won't create events in it. Choose \
+                          it in Settings › Connectors first.";
+/// The retry token is unknown: PM restarted, or the eight hours passed. A constant, the title left
+/// to the webview's notice, so the webview can tell it apart (it ends the token, C10 critiques).
+const CREATE_LOST: &str = "PM lost touch with Google and can't tell whether this new event was \
+                           made. Look for it in Google Calendar before creating it again, so it \
+                           isn't made twice.";
+/// A retry naming another calendar, or a draft other than the one sent (C10 critique 2 M2).
+const CREATE_CHANGED: &str = "This differs from the new event PM was creating when it lost touch \
+                              with Google, so PM didn't send it. Check again with the event as it \
+                              was then.";
+/// The new event went to Google [`MAX_POSTS`] times without a readable answer (C10 critique 1 M5).
+const CREATE_LATER: &str = "PM has already sent this new event to Google more than once without \
+                            hearing back, so it won't send it again. Check again later: PM looks \
+                            for it first. If it still isn't there, look for it in Google Calendar \
+                            before creating it again, so it isn't made twice.";
+
+/// The most POSTs one new event's id gets, across its first run and every retry: the first and
+/// two more. A run posts twice at most (A9) and a retry once, so the bound is what stops "Check
+/// again" from sending it for ever (Google warns it can't always catch a repeated id).
+const MAX_POSTS: usize = 3;
+
+/// The pause between a retry's two looks for a new event: the same second `run.rs` waits before a
+/// lost insert's second look (`LOOK_AGAIN`), kept here so that one stays private.
+const RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+/// Create an event on one of the user's Google calendars, under an id PM chose. `calendar_id` is
+/// PM's calendar row id; `draft` is what the editor holds; `retry_token` names a create whose
+/// answer never arrived (from an `Ambiguous` outcome), which is looked for before anything is sent
+/// again (R2). Nobody is emailed: a new event has no guests (R7).
+#[tauri::command]
+pub async fn create_calendar_event(
+    app: AppHandle,
+    window: tauri::Window,
+    calendar_id: String,
+    draft: NewEventDraft,
+    retry_token: Option<String>,
+) -> Result<WriteOutcome> {
+    require_main_window(&window)?;
+    require_owner(&app)?;
+    // C10a only (§16): no UI creates yet, so release builds refuse; C10b removes this.
+    if !cfg!(debug_assertions) {
+        return Ok(WriteOutcome::Failed {
+            message: CREATE_NOT_YET.into(),
+        });
+    }
+    let state = app.state::<AppState>();
+    let target = match resolve_calendar(
+        &*state.conn()?,
+        &calendar_id,
+        "That calendar is no longer connected.",
+    )? {
+        Ok(target) => target,
+        Err(reason) => return Ok(WriteOutcome::ReadOnly { reason }),
+    };
+    #[cfg(debug_assertions)]
+    {
+        // A create reaches one new event, never a series.
+        let allowed = dev_allow::check(&*state.conn()?, &target.remote_calendar, false)?;
+        if let Err(message) = allowed {
+            return Ok(WriteOutcome::Failed {
+                message: message.into(),
+            });
+        }
+    }
+    let editing_choice = calendar_editing::choice(&*state.conn()?, &target.email)?;
+    // A keychain read, with no lock held.
+    let editing = editing_status(editing_choice, &target.token_key);
+    let token_key = target.token_key.clone();
+    let ctx = CreateWrite {
+        wire: &GoogleWire(&token_key),
+        host: &app,
+        target: &target,
+        editing,
+        new_id: plan::client_event_id,
+        new_ref: new_create_ref,
+    };
+    Ok(create_event(&ctx, draft, retry_token.as_deref()).await)
+}
+
+/// What one create works with: Google through `wire`, the mirror and the held creates through
+/// `host`, the calendar, the account's editing status, and the two ids PM mints: the new event's
+/// ([`plan::client_event_id`]) and the retry token ([`new_create_ref`]), fixed ones in the tests.
+struct CreateWrite<'a, W, H> {
+    wire: &'a W,
+    host: &'a H,
+    target: &'a CalendarTarget,
+    editing: EditingStatus,
+    new_id: fn() -> String,
+    new_ref: fn() -> String,
+}
+
+/// A retry token: PM's own random id, a separate one from the event's, so the webview never holds
+/// or learns the id PM chose for Google (R5).
+fn new_create_ref() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// A held create's key in the claims: never a row id (those start with PM's calendar id) or a
+/// [`series_key`].
+fn create_key(token: &str) -> String {
+    format!("create\u{1f}{token}")
+}
+
+/// A new event whose answer never arrived, held under its retry token.
+#[derive(Clone)]
+struct HeldCreate {
+    /// Where it was sent: the retry must name the same calendar.
+    target: CalendarTarget,
+    /// The one-step plan, PM's id inside it.
+    plan: SeriesPlan,
+    /// What was sent, for telling a retry of the same event from a changed one.
+    body: serde_json::Map<String, Value>,
+    /// POSTs under its id so far, the first run's and every retry's ([`MAX_POSTS`]).
+    posts: usize,
+    /// When it was last sent, for [`SESSION_TTL`].
+    at: Instant,
+}
+
+impl CalendarEditState {
+    fn hold_create(&self, token: &str, held: HeldCreate) {
+        if let Ok(mut creates) = self.creates.lock() {
+            creates.insert(token.to_string(), held);
+        }
+    }
+
+    /// Let held creates sent [`SESSION_TTL`] or more before `now` go.
+    fn prune_creates(&self, now: Instant) {
+        if let Ok(mut creates) = self.creates.lock() {
+            creates.retain(|_, held| now.saturating_duration_since(held.at) < SESSION_TTL);
+        }
+    }
+}
+
+/// A held create taken out for a retry: held again under its token when this goes, unless it was
+/// consumed (a landing, or Google showing it deleted), a panic or an early return included, so a
+/// retry that stops partway never loses it (the [`TakenSplit`] precedent; C10 critique 1 M1).
+struct TakenCreate<'a> {
+    edit: &'a CalendarEditState,
+    token: String,
+    back: Option<HeldCreate>,
+}
+
+impl<'a> TakenCreate<'a> {
+    /// Take the create out, so a second retry of it finds nothing: the guard, and a copy to work on.
+    /// Only a token PM still holds; the map's key is PM's own, never fetched data.
+    fn take(edit: &'a CalendarEditState, token: &str) -> Option<(Self, HeldCreate)> {
+        let held = edit.creates.lock().ok()?.remove(token)?;
+        let taken = TakenCreate {
+            edit,
+            token: token.to_string(),
+            back: Some(held.clone()),
+        };
+        Some((taken, held))
+    }
+
+    /// What goes back: `held`, as the retry left it.
+    fn keep(&mut self, held: HeldCreate) {
+        self.back = Some(held);
+    }
+
+    /// Nothing goes back: Google showed the new event, or showed it deleted.
+    fn consume(&mut self) {
+        self.back = None;
+    }
+}
+
+impl Drop for TakenCreate<'_> {
+    fn drop(&mut self) {
+        if let Some(held) = self.back.take() {
+            self.edit.hold_create(&self.token, held);
+        }
+    }
+}
+
+/// [`create_calendar_event`] past its shell: Google through `ctx.wire`, the mirror and the held
+/// creates through `ctx.host`.
+async fn create_event<W: Wire, H: Host>(
+    ctx: &CreateWrite<'_, W, H>,
+    draft: NewEventDraft,
+    retry_token: Option<&str>,
+) -> WriteOutcome {
+    let body = match patch::insert_body(&draft) {
+        Ok(body) => body,
+        Err(e) => {
+            return WriteOutcome::Failed {
+                message: e.to_string(),
+            }
+        }
+    };
+    ctx.host.edit().prune_creates(Instant::now());
+    if let Some(token) = retry_token {
+        return retry_create(ctx, token, body).await;
+    }
+    if !ctx.target.selected {
+        return WriteOutcome::Failed {
+            message: NOT_SYNCED.into(),
+        };
+    }
+    if let Some(reason) = create_blocked(ctx, &body) {
+        return WriteOutcome::ReadOnly { reason };
+    }
+    let id = (ctx.new_id)();
+    let Some(plan) = SeriesPlan::create(&ctx.target.remote_calendar, &id, body.clone()) else {
+        return WriteOutcome::Failed {
+            message: UNFIT.into(),
+        };
+    };
+    let Ok(mut run) = Run::new(plan.clone()) else {
+        return WriteOutcome::Failed {
+            message: UNFIT.into(),
+        };
+    };
+    let wire = Posts::new(ctx.wire);
+    match drive(&wire, &mut run).await {
+        Ran::Done { ends } => landed_create(ctx.host, ctx.target, &ends),
+        // Gone: made, then deleted in Google before PM could look.
+        Ran::NotDone { why, .. } => not_done_outcome(why, ctx.editing, false),
+        Ran::Unknown { .. } => {
+            let token = (ctx.new_ref)();
+            ctx.host.edit().hold_create(
+                &token,
+                HeldCreate {
+                    target: ctx.target.clone(),
+                    plan,
+                    body,
+                    posts: wire.count(),
+                    at: Instant::now(),
+                },
+            );
+            WriteOutcome::Ambiguous { retry_token: token }
+        }
+    }
+}
+
+/// Why the account and calendar can't take the new event `body`: the gate's rules for a solo
+/// one-off you organise ([`gate::create_block`]), on the calendar's role as the DB has it. A role
+/// Google lowered since gets its own 403, read by [`outcome_for`].
+fn create_blocked<W, H>(
+    ctx: &CreateWrite<'_, W, H>,
+    body: &serde_json::Map<String, Value>,
+) -> Option<ReadOnlyReason> {
+    gate::create_block(
+        ctx.editing,
+        ctx.target.facts.access_role.as_deref(),
+        body.get("visibility").and_then(Value::as_str),
+    )
+}
+
+/// A look a retry makes for its new event, read off the GET. No `Debug`: it holds Google's copy,
+/// which never goes into a message.
+enum RetryLook {
+    Live(Value),
+    /// There, cancelled: made, then deleted in Google.
+    Cancelled,
+    /// 404 or 410: no copy yet, which proves nothing on its own (DS5).
+    Absent,
+    Reauth,
+    Busy,
+    /// Offline, a server error, an answer PM can't read, a refused read.
+    Unknown,
+}
+
+impl RetryLook {
+    fn of(fetched: Fetched) -> RetryLook {
+        match fetched {
+            Fetched::Event(v) if patch::is_gone(&v) => RetryLook::Cancelled,
+            Fetched::Event(v) => RetryLook::Live(v),
+            Fetched::Gone => RetryLook::Absent,
+            Fetched::Reauth => RetryLook::Reauth,
+            Fetched::Busy => RetryLook::Busy,
+            Fetched::Failed(_) => RetryLook::Unknown,
+        }
+    }
+}
+
+/// Why a retry stops with the create still held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    Reauth,
+    Busy,
+    Ambiguous,
+}
+
+impl Kept {
+    fn outcome(self, token: &str) -> WriteOutcome {
+        match self {
+            Kept::Reauth => WriteOutcome::Reauth,
+            Kept::Busy => WriteOutcome::Busy,
+            Kept::Ambiguous => WriteOutcome::Ambiguous {
+                retry_token: token.to_string(),
+            },
+        }
+    }
+}
+
+/// What a retry does after one look.
+enum RetryStep {
+    /// It's there: land it.
+    Land(Value),
+    /// Made, then deleted in Google.
+    Gone,
+    /// Not there yet: wait [`RETRY_PAUSE`] and look again.
+    LookAgain,
+    /// Not there after two looks: send it again under the same id.
+    Send,
+    /// Stop, the create held as it was.
+    Keep(Kept),
+}
+
+/// A retry's next step after `look`, `first` saying whether it was the first of its two looks.
+/// Google's insert-then-get isn't guaranteed consistent, so one 404 proves nothing (DS5): only two,
+/// a second apart, let the same request go again, and the same id makes that safe (a copy that
+/// landed meanwhile turns it into a 409, which the run then looks up).
+fn retry_next(look: RetryLook, first: bool) -> RetryStep {
+    match look {
+        RetryLook::Live(copy) => RetryStep::Land(copy),
+        RetryLook::Cancelled => RetryStep::Gone,
+        RetryLook::Absent if first => RetryStep::LookAgain,
+        RetryLook::Absent => RetryStep::Send,
+        RetryLook::Reauth => RetryStep::Keep(Kept::Reauth),
+        RetryLook::Busy => RetryStep::Keep(Kept::Busy),
+        RetryLook::Unknown => RetryStep::Keep(Kept::Ambiguous),
+    }
+}
+
+/// A retry of the create `token` named: look for it under its id first, and only after looking
+/// twice and not finding it, send it again under the same id (A9). Never with a changed calendar or
+/// body: a copy that landed holds what was first sent, and a retry can't edit it. The looks are
+/// reads, so the account's editing and the calendar's role are asked only before a re-send (C10
+/// critique 1 M1). Every end but Google showing the event, or showing it deleted, keeps it held
+/// under the same token.
+async fn retry_create<W: Wire, H: Host>(
+    ctx: &CreateWrite<'_, W, H>,
+    token: &str,
+    body: serde_json::Map<String, Value>,
+) -> WriteOutcome {
+    let edit = ctx.host.edit();
+    // Claim before take, so a second retry of the same token is Busy and never finds it missing.
+    let Some(_claim) = InFlight::claim(edit, &create_key(token)) else {
+        return WriteOutcome::Busy;
+    };
+    let Some((mut taken, held)) = TakenCreate::take(edit, token) else {
+        return WriteOutcome::Failed {
+            message: CREATE_LOST.into(),
+        };
+    };
+    if held.target.calendar_id != ctx.target.calendar_id || held.body != body {
+        return WriteOutcome::Failed {
+            message: CREATE_CHANGED.into(),
+        };
+    }
+    let Some(Op::Insert { calendar, id, .. }) = held.plan.steps.first().map(|s| &s.op) else {
+        return WriteOutcome::Failed {
+            message: UNFIT.into(),
+        };
+    };
+    let mut first = true;
+    loop {
+        match retry_next(RetryLook::of(get(ctx.wire, calendar, id).await), first) {
+            RetryStep::Land(copy) => {
+                taken.consume();
+                return land_created(ctx.host, &held.target, &copy);
+            }
+            RetryStep::Gone => {
+                taken.consume();
+                return WriteOutcome::Gone;
+            }
+            RetryStep::LookAgain => {
+                ctx.wire.wait(RETRY_PAUSE).await;
+                first = false;
+            }
+            RetryStep::Send => break,
+            RetryStep::Keep(kept) => return kept.outcome(token),
+        }
+    }
+    if held.posts >= MAX_POSTS {
+        return WriteOutcome::Failed {
+            message: CREATE_LATER.into(),
+        };
+    }
+    if let Some(reason) = create_blocked(ctx, &held.body) {
+        return WriteOutcome::ReadOnly { reason };
+    }
+    let Ok(mut run) = Run::retry_insert(held.plan.clone()) else {
+        return WriteOutcome::Failed {
+            message: UNFIT.into(),
+        };
+    };
+    let wire = Posts::new(ctx.wire);
+    let ran = drive(&wire, &mut run).await;
+    match ran {
+        Ran::Done { ends } => {
+            taken.consume();
+            landed_create(ctx.host, &held.target, &ends)
+        }
+        Ran::NotDone { why: Why::Gone, .. } => {
+            taken.consume();
+            WriteOutcome::Gone
+        }
+        ran => {
+            // Sent again: counted, and its eight hours start over.
+            taken.keep(HeldCreate {
+                posts: held.posts + wire.count(),
+                at: Instant::now(),
+                ..held
+            });
+            let kept = match ran {
+                Ran::NotDone {
+                    why: Why::Refused(Verdict::Reauth) | Why::Unsent(Unsent::SignIn),
+                    ..
+                } => Kept::Reauth,
+                Ran::NotDone {
+                    why: Why::Refused(Verdict::RateLimited),
+                    ..
+                } => Kept::Busy,
+                // A retry starts in doubt (`Run::retry_insert`), so nothing it meets is proof the
+                // first copy isn't there.
+                _ => Kept::Ambiguous,
+            };
+            kept.outcome(token)
+        }
+    }
+}
+
+/// A create's run proved it landed: Google's copy into the mirror, from the step's end.
+fn landed_create(host: &impl Host, target: &CalendarTarget, ends: &[End]) -> WriteOutcome {
+    match ends.first() {
+        Some(End::Done {
+            reply: Some(copy), ..
+        }) => land_created(host, target, copy),
+        // Proved without a copy to show: under `Shows::Created` every proof carries one, but the
+        // next sync shows it anyway.
+        _ => created_pending(host, target),
+    }
+}
+
+/// A new event Google holds: its copy into the mirror as a CREATED row (a list that lags can't take
+/// it off the screen, A28), unless it starts outside the months PM mirrors ([`in_mirror`]).
+fn land_created(host: &impl Host, target: &CalendarTarget, copy: &Value) -> WriteOutcome {
+    let Some(row) = calendar::parse_event(&target.calendar_id, copy) else {
+        return created_pending(host, target);
+    };
+    let window = host
+        .mirror(&target.calendar_id)
+        .ok()
+        .and_then(|m| m.instants());
+    if in_mirror(&row, window) == Some(false) {
+        return WriteOutcome::Saved {
+            warnings: vec![WriteWarning::OutsideMirror],
+            left_behind: Vec::new(),
+        };
+    }
+    let id = row.id.clone();
+    match land_on(host, &target.calendar_id, vec![row], &[id], Vec::new()) {
+        Ok(()) => WriteOutcome::Saved {
+            warnings: Vec::new(),
+            left_behind: Vec::new(),
+        },
+        Err(_) => created_pending(host, target),
+    }
+}
+
+/// Created in Google, not mirrored yet: the next sync shows it.
+fn created_pending(host: &impl Host, target: &CalendarTarget) -> WriteOutcome {
+    drop_hash(host, &target.calendar_id);
+    WriteOutcome::Saved {
+        warnings: vec![WriteWarning::MirrorRefreshPending],
+        left_behind: Vec::new(),
+    }
+}
+
+/// Whether a mirror row overlaps the window PM syncs (`[start, end)`, as instants): what the next
+/// sync will fetch. Landing one outside it would show it until the created entry's ten minutes ran
+/// out, then the next complete sync would drop it, so it isn't landed (C10 §6.2). `None` when the
+/// row's times or the window can't be read, which lands it. All-day dates read as UTC midnight,
+/// while Google bounds them in the calendar's zone: at the window's very edges a day can read a few
+/// hours off, which at worst skips one that the next sync shows, or lands one it then drops. Never
+/// a wrong write (C10 critique 1 L9).
+fn in_mirror(
+    row: &CalendarEvent,
+    window: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+) -> Option<bool> {
+    let (from, until) = window?;
+    let instant = |s: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(s.trim()) {
+            return Some(at.with_timezone(&chrono::Utc));
+        }
+        chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|t| t.and_utc())
+    };
+    let start = instant(&row.start)?;
+    let end = match row.end.as_deref() {
+        Some(end) => instant(end)?,
+        None => start,
+    };
+    Some(start < until && end > from)
+}
+
+/// A wire that counts the POSTs it passes on: the new event's copies, for [`MAX_POSTS`].
+struct Posts<'w, W> {
+    wire: &'w W,
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl<'w, W: Wire> Posts<'w, W> {
+    fn new(wire: &'w W) -> Self {
+        Posts {
+            wire,
+            count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<W: Wire> Wire for Posts<'_, W> {
+    fn send(&self, plan: &RequestPlan) -> impl std::future::Future<Output = Sent> + Send {
+        if plan.method == Method::Insert {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.wire.send(plan)
+    }
+
+    fn wait(&self, pause: Duration) -> impl std::future::Future<Output = ()> + Send {
+        self.wire.wait(pause)
+    }
 }
 
 /// Delete an event after an Undo window (plan Q2). The delete is held here in the backend, so it
@@ -3558,7 +4142,9 @@ fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> W
         | WriteOutcome::NoChange
         | WriteOutcome::Gone
         | WriteOutcome::IgnoredByGoogle { .. }
-        | WriteOutcome::SplitRemoved => return outcome,
+        | WriteOutcome::SplitRemoved
+        // Only creating an event answers this; a settle never does.
+        | WriteOutcome::Ambiguous { .. } => return outcome,
     };
     let Some((offers, from)) = edit.held_split(token) else {
         return outcome;
@@ -12688,5 +13274,860 @@ mod tests {
             &to("work@group")
         ));
         assert!(dev_allow::permits(None, None, &to("home@group")));
+    }
+
+    // --- creating an event (C10) ---
+
+    /// The id PM picks for the new event in these tests.
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Dentist on Monday 26-10, 10:00 to 11:00 in London: inside the tests' mirror window.
+    fn dentist_draft() -> NewEventDraft {
+        on_day("2026-10-26")
+    }
+
+    fn on_day(day: &str) -> NewEventDraft {
+        NewEventDraft {
+            summary: "Dentist".into(),
+            time: TimeDraft::Timed {
+                start_date: day.into(),
+                start_time: "10:00".into(),
+                start_zone: "Europe/London".into(),
+                end_date: day.into(),
+                end_time: "11:00".into(),
+                end_zone: "Europe/London".into(),
+            },
+            location: String::new(),
+            description: String::new(),
+            show_as: None,
+            visibility: None,
+        }
+    }
+
+    /// The tests' calendar "cal" ([`CALENDAR`] at Google), as the create command resolves it.
+    fn new_target() -> CalendarTarget {
+        CalendarTarget {
+            calendar_id: "cal".into(),
+            remote_calendar: CALENDAR.into(),
+            email: "me@example.com".into(),
+            token_key: "key".into(),
+            facts: CalendarFacts {
+                access_role: Some("owner".into()),
+                time_zone: Some("Europe/London".into()),
+                ..Default::default()
+            },
+            selected: true,
+        }
+    }
+
+    /// A create through `script` against `host`, editing as `editing` says, the new event under
+    /// [`NEW`] and its retry token "ref-1".
+    fn creator<'a>(
+        script: &'a Script,
+        host: &'a TestHost,
+        target: &'a CalendarTarget,
+        editing: EditingStatus,
+    ) -> CreateWrite<'a, Script, TestHost> {
+        CreateWrite {
+            wire: script,
+            host,
+            target,
+            editing,
+            new_id: || NEW.to_string(),
+            new_ref: || "ref-1".to_string(),
+        }
+    }
+
+    /// Google's copy of the new event `draft` makes, at `etag`.
+    fn google_copy(draft: &NewEventDraft, etag: &str) -> Value {
+        let mut v = Value::Object(patch::insert_body(draft).unwrap());
+        v["kind"] = json!("calendar#event");
+        v["id"] = json!(NEW);
+        v["etag"] = json!(etag);
+        v["status"] = json!("confirmed");
+        v["iCalUID"] = json!("new@google.com");
+        v["updated"] = json!(SAVED_AT);
+        v
+    }
+
+    fn new_read(answer: Scripted) -> Step {
+        event_read(NEW, answer)
+    }
+
+    fn absent() -> Scripted {
+        Scripted::Status(404)
+    }
+
+    /// Create `draft` (or retry `token`) on `target` through `steps`, which must all be asked for.
+    async fn create_on(
+        host: &TestHost,
+        target: &CalendarTarget,
+        editing: EditingStatus,
+        steps: Vec<Step>,
+        draft: NewEventDraft,
+        token: Option<&str>,
+    ) -> (WriteOutcome, Script) {
+        let script = Script::new(steps);
+        let outcome = create_event(&creator(&script, host, target, editing), draft, token).await;
+        script.asked_all();
+        (outcome, script)
+    }
+
+    /// The dentist created on "cal", editing on.
+    async fn create(
+        host: &TestHost,
+        steps: Vec<Step>,
+        token: Option<&str>,
+    ) -> (WriteOutcome, Script) {
+        create_on(
+            host,
+            &new_target(),
+            EditingStatus::On,
+            steps,
+            dentist_draft(),
+            token,
+        )
+        .await
+    }
+
+    /// A create whose answer is lost and whose event two looks don't find; posted again under
+    /// the same id, that answer is lost too: held as "ref-1", two POSTs spent.
+    async fn lost_create(host: &TestHost) -> WriteOutcome {
+        let (outcome, _) = create(
+            host,
+            vec![
+                insert_step(lost()),
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(lost()),
+                new_read(absent()),
+            ],
+            None,
+        )
+        .await;
+        outcome
+    }
+
+    fn held_creates(host: &TestHost) -> usize {
+        host.edit.creates.lock().unwrap().len()
+    }
+
+    fn held_posts(host: &TestHost, token: &str) -> Option<usize> {
+        host.edit
+            .creates
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|h| h.posts)
+    }
+
+    fn new_row(host: &TestHost) -> Option<CalendarEvent> {
+        host.with_conn(|conn| calendar::event_by_id(conn, &format!("cal:{NEW}")))
+            .unwrap()
+    }
+
+    fn ambiguous(token: &str) -> WriteOutcome {
+        WriteOutcome::Ambiguous {
+            retry_token: token.into(),
+        }
+    }
+
+    fn failed(message: &str) -> WriteOutcome {
+        WriteOutcome::Failed {
+            message: message.into(),
+        }
+    }
+
+    fn inserts(script: &Script) -> Vec<RequestPlan> {
+        script
+            .sent()
+            .into_iter()
+            .filter(|r| r.method == Method::Insert)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_create_posts_under_pms_id_with_send_updates_none_and_lands_as_created() {
+        let host = TestHost::holding(&[]);
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        let (outcome, script) = create(&host, vec![insert_step(Scripted::Json(copy))], None).await;
+        assert!(outcome == saved(), "the new event is saved");
+        let sent = script.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].url.ends_with(&format!(
+            "/calendars/{CALENDAR}/events?sendUpdates=none&conferenceDataVersion=1"
+        )));
+        let body = sent[0].body.as_ref().unwrap().as_object().unwrap();
+        assert_eq!(body["id"], NEW);
+        assert!(body
+            .keys()
+            .all(|k| k == "id" || patch::CREATABLE.contains(&k.as_str())));
+        let row = new_row(&host).expect("the new event is in the mirror");
+        assert!(row.summary == "Dentist" && row.start == "2026-10-26T10:00:00Z");
+        assert_eq!(host.told(), vec!["cal".to_string()]);
+        // A complete list that doesn't show it yet keeps it on screen: it was recorded as new.
+        let shown = host.synced(&[], Instant::now());
+        assert!(shown.iter().any(|r| r.id == format!("cal:{NEW}")));
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    #[tokio::test]
+    async fn a_create_sends_no_guests_reminders_conference_or_notes() {
+        let host = TestHost::holding(&[]);
+        let draft = NewEventDraft {
+            location: "High St".into(),
+            description: "Bring the form".into(),
+            show_as: Some(ShowAs::Free),
+            visibility: Some(Visibility::Private),
+            ..dentist_draft()
+        };
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![insert_step(Scripted::Json(copy))],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "saved");
+        let body = script.sent()[0].body.clone().unwrap();
+        for never in [
+            "attendees",
+            "reminders",
+            "conferenceData",
+            "extendedProperties",
+            "recurrence",
+            "colorId",
+        ] {
+            assert!(body.get(never).is_none(), "{never}");
+        }
+        assert_eq!(body["transparency"], "transparent");
+        assert_eq!(body["visibility"], "private");
+    }
+
+    #[tokio::test]
+    async fn a_create_the_account_or_calendar_cant_take_sends_nothing() {
+        let host = TestHost::holding(&[]);
+        let with_role = |role: &str| CalendarTarget {
+            facts: CalendarFacts {
+                access_role: Some(role.into()),
+                ..Default::default()
+            },
+            ..new_target()
+        };
+        let private = NewEventDraft {
+            visibility: Some(Visibility::Private),
+            ..dentist_draft()
+        };
+        let cases = [
+            (
+                with_role("reader"),
+                EditingStatus::On,
+                dentist_draft(),
+                ReadOnlyReason::CalendarReadOnly,
+            ),
+            (
+                with_role("writerWithoutPrivateAccess"),
+                EditingStatus::On,
+                private,
+                ReadOnlyReason::PrivateEvent,
+            ),
+            (
+                new_target(),
+                EditingStatus::Off,
+                dentist_draft(),
+                ReadOnlyReason::EditingOff,
+            ),
+            (
+                new_target(),
+                EditingStatus::NeedsConsent,
+                dentist_draft(),
+                ReadOnlyReason::EditingOff,
+            ),
+        ];
+        for (target, editing, draft, reason) in cases {
+            let (outcome, _) = create_on(&host, &target, editing, Vec::new(), draft, None).await;
+            assert!(
+                outcome == WriteOutcome::ReadOnly { reason },
+                "refused with its reason, nothing sent"
+            );
+        }
+        // A calendar PM doesn't sync lands nothing, so it takes no creates.
+        let unsynced = CalendarTarget {
+            selected: false,
+            ..new_target()
+        };
+        let (outcome, _) = create_on(
+            &host,
+            &unsynced,
+            EditingStatus::On,
+            Vec::new(),
+            dentist_draft(),
+            None,
+        )
+        .await;
+        assert!(
+            outcome == failed(NOT_SYNCED),
+            "an unsynced calendar is refused"
+        );
+        // A time PM can't save builds nothing to send.
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            Vec::new(),
+            on_day("2026-02-30"),
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, WriteOutcome::Failed { .. }));
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    /// R10: a 403 to a create, with editing on, is the calendar refusing; never a consent loop.
+    #[tokio::test]
+    async fn a_403_to_a_create_reads_as_the_calendar_or_editing() {
+        let host = TestHost::holding(&[]);
+        let forbidden = |reason: &str| Scripted::Reply {
+            status: 403,
+            body: Some(json!({ "error": { "errors": [{ "reason": reason }] } })),
+            date: None,
+            maybe_applied: false,
+        };
+        for reason in ["requiredAccessLevel", "insufficientPermissions"] {
+            let (outcome, script) = create(&host, vec![insert_step(forbidden(reason))], None).await;
+            assert!(
+                outcome
+                    == WriteOutcome::ReadOnly {
+                        reason: ReadOnlyReason::CalendarReadOnly
+                    },
+                "{reason}: the calendar's"
+            );
+            assert_eq!(script.sent().len(), 1);
+        }
+        // Without the write scope, the same refusal asks for editing to be turned on again.
+        assert!(
+            not_done_outcome(
+                Why::Refused(Verdict::InsufficientScope),
+                EditingStatus::NeedsConsent,
+                false
+            ) == WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::EditingOff
+            },
+            "editing's"
+        );
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    #[tokio::test]
+    async fn a_404_create_says_the_calendar_isnt_there() {
+        let host = TestHost::holding(&[]);
+        let (outcome, script) = create(&host, vec![insert_step(absent())], None).await;
+        assert!(outcome == failed(NO_CALENDAR), "no calendar");
+        assert_eq!(script.sent().len(), 1);
+        assert!(script.waits().is_empty());
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unsent_create_sends_nothing_more() {
+        let host = TestHost::holding(&[]);
+        for (why, want) in [
+            (Unsent::SignIn, WriteOutcome::Reauth),
+            (Unsent::Offline, failed(OFFLINE)),
+            (Unsent::Local, failed(NOT_SENT)),
+        ] {
+            let (outcome, script) =
+                create(&host, vec![insert_step(Scripted::Unsent(why))], None).await;
+            assert!(outcome == want, "nothing was sent, and it says so");
+            assert_eq!(script.sent().len(), 1);
+        }
+        assert_eq!(held_creates(&host), 0);
+        assert!(new_row(&host).is_none());
+    }
+
+    /// Google made it, but its copy isn't a row PM can mirror: saved, and the next sync shows it.
+    #[tokio::test]
+    async fn a_create_reply_pm_cant_parse_is_saved_pending() {
+        let host = TestHost::holding(&[]);
+        let unreadable = Scripted::Reply {
+            status: 200,
+            body: None,
+            date: None,
+            maybe_applied: false,
+        };
+        let bare = json!({ "id": NEW, "status": "confirmed", "etag": "\"n1\"" });
+        let (outcome, script) = create(
+            &host,
+            vec![insert_step(unreadable), new_read(Scripted::Json(bare))],
+            None,
+        )
+        .await;
+        assert!(outcome == pending(), "saved, the mirror to catch up");
+        assert_eq!(inserts(&script).len(), 1);
+        assert!(host.hash_dropped());
+        assert!(new_row(&host).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_create_outside_the_mirror_is_saved_but_not_landed() {
+        let host = TestHost::holding(&[]);
+        let draft = on_day("2028-01-10");
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![insert_step(Scripted::Json(copy))],
+            draft,
+            None,
+        )
+        .await;
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::OutsideMirror],
+                    left_behind: Vec::new(),
+                },
+            "saved in Google, and said to be outside"
+        );
+        assert!(new_row(&host).is_none());
+        assert!(host.nothing_recorded());
+        assert!(host.told().is_empty());
+    }
+
+    /// R5: the webview gets PM's own token, never the id PM chose for Google.
+    #[tokio::test]
+    async fn a_lost_create_is_held_under_a_retry_token_never_the_event_id() {
+        let host = TestHost::holding(&[]);
+        let outcome = lost_create(&host).await;
+        assert!(outcome == ambiguous("ref-1"), "held as ref-1");
+        let said = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !said.contains(NEW),
+            "the event's id never reaches the webview"
+        );
+        assert_eq!(held_posts(&host, "ref-1"), Some(2));
+        assert!(new_row(&host).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_retry_finds_the_event_and_lands_it_without_posting() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        let (outcome, script) =
+            create(&host, vec![new_read(Scripted::Json(copy))], Some("ref-1")).await;
+        assert!(outcome == saved(), "found and landed");
+        script.finished();
+        assert_eq!(held_creates(&host), 0);
+        assert!(new_row(&host).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_retry_finding_nothing_twice_posts_the_same_id_once() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        let (outcome, script) = create(
+            &host,
+            vec![
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(Scripted::Json(copy)),
+            ],
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == saved(), "sent again, and landed");
+        assert_eq!(script.waits(), vec![RETRY_PAUSE]);
+        let posts = inserts(&script);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body.as_ref().unwrap()["id"], NEW);
+        assert_eq!(held_creates(&host), 0);
+        assert!(new_row(&host).is_some());
+    }
+
+    /// Made, then deleted in Google: gone, the token with it, nothing landed.
+    #[tokio::test]
+    async fn a_retry_finding_it_cancelled_says_gone() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let cancelled = with(
+            google_copy(&dentist_draft(), "\"n2\""),
+            "status",
+            json!("cancelled"),
+        );
+        let (outcome, script) = create(
+            &host,
+            vec![new_read(Scripted::Json(cancelled))],
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == WriteOutcome::Gone, "gone");
+        script.finished();
+        assert_eq!(held_creates(&host), 0);
+        assert!(new_row(&host).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_look_is_lost_keeps_the_token() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        for (look, want) in [
+            (lost(), ambiguous("ref-1")),
+            (Scripted::Status(503), ambiguous("ref-1")),
+            (Scripted::Status(401), WriteOutcome::Reauth),
+            (Scripted::Status(429), WriteOutcome::Busy),
+        ] {
+            let (outcome, script) = create(&host, vec![new_read(look)], Some("ref-1")).await;
+            assert!(outcome == want, "kept, and said why");
+            script.finished();
+            assert_eq!(held_posts(&host, "ref-1"), Some(2));
+        }
+    }
+
+    /// The re-send's answer lost too: held again under the same token, never a new one.
+    #[tokio::test]
+    async fn a_retry_that_is_unknown_again_keeps_the_same_token() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let script = Script::new(vec![
+            new_read(absent()),
+            new_read(absent()),
+            insert_step(lost()),
+            new_read(absent()),
+        ]);
+        let target = new_target();
+        let ctx = CreateWrite {
+            new_ref: || "ref-2".to_string(),
+            ..creator(&script, &host, &target, EditingStatus::On)
+        };
+        let outcome = create_event(&ctx, dentist_draft(), Some("ref-1")).await;
+        script.asked_all();
+        assert!(outcome == ambiguous("ref-1"), "the same token");
+        assert_eq!(held_creates(&host), 1);
+        assert_eq!(held_posts(&host, "ref-1"), Some(3));
+    }
+
+    /// C10 critiques 1 M1, 2 H1: after two empty looks, a re-send that never left, or one answered
+    /// 404, proves nothing about the first copy: still ambiguous, the token still held.
+    #[tokio::test]
+    async fn a_resend_unsent_or_answered_404_is_never_proof() {
+        for answer in [
+            Scripted::Unsent(Unsent::Offline),
+            Scripted::Unsent(Unsent::SignIn),
+            absent(),
+            Scripted::Reply {
+                status: 403,
+                body: None,
+                date: None,
+                maybe_applied: false,
+            },
+        ] {
+            let host = TestHost::holding(&[]);
+            lost_create(&host).await;
+            let (outcome, script) = create(
+                &host,
+                vec![
+                    new_read(absent()),
+                    new_read(absent()),
+                    insert_step(answer),
+                    new_read(absent()),
+                ],
+                Some("ref-1"),
+            )
+            .await;
+            assert!(outcome == ambiguous("ref-1"), "still unknown");
+            assert_eq!(inserts(&script).len(), 1);
+            assert_eq!(held_creates(&host), 1);
+        }
+    }
+
+    /// C10 critique 1 M5: one id gets three POSTs at most, across the first run and every retry;
+    /// after that a retry only looks.
+    #[tokio::test]
+    async fn the_posts_under_one_id_are_bounded_across_retries() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let (outcome, script) = create(
+            &host,
+            vec![
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(lost()),
+                new_read(absent()),
+            ],
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == ambiguous("ref-1"), "held");
+        assert_eq!(inserts(&script).len(), 1);
+        assert_eq!(held_posts(&host, "ref-1"), Some(MAX_POSTS));
+        let (outcome, script) = create(
+            &host,
+            vec![new_read(absent()), new_read(absent())],
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == failed(CREATE_LATER), "looks only, then says so");
+        script.finished();
+        assert_eq!(held_posts(&host, "ref-1"), Some(MAX_POSTS));
+        // Still found when it shows.
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        let (outcome, _) = create(&host, vec![new_read(Scripted::Json(copy))], Some("ref-1")).await;
+        assert!(outcome == saved(), "landed at last");
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    /// The looks are reads: editing turned off since doesn't stop a retry finding the event, and
+    /// only a re-send is refused, the token kept (C10 critique 1 M1).
+    #[tokio::test]
+    async fn a_retry_looks_whatever_editing_says_and_only_a_resend_needs_it() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::Paused,
+            vec![new_read(absent()), new_read(absent())],
+            dentist_draft(),
+            Some("ref-1"),
+        )
+        .await;
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::EditingOff
+                },
+            "the re-send is refused"
+        );
+        assert_eq!(held_posts(&host, "ref-1"), Some(2));
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::Paused,
+            vec![new_read(Scripted::Json(copy))],
+            dentist_draft(),
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == saved(), "found with editing paused");
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_a_changed_draft_or_calendar_is_refused_and_kept() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let renamed = NewEventDraft {
+            summary: "Dentist (moved)".into(),
+            ..dentist_draft()
+        };
+        let other = CalendarTarget {
+            calendar_id: "cal2".into(),
+            ..new_target()
+        };
+        for (target, draft) in [(new_target(), renamed), (other, dentist_draft())] {
+            let (outcome, script) = create_on(
+                &host,
+                &target,
+                EditingStatus::On,
+                Vec::new(),
+                draft,
+                Some("ref-1"),
+            )
+            .await;
+            assert!(outcome == failed(CREATE_CHANGED), "refused, nothing sent");
+            assert!(script.sent().is_empty());
+            assert_eq!(held_posts(&host, "ref-1"), Some(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_while_one_runs_is_busy() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let claim = InFlight::claim(&host.edit, &create_key("ref-1")).unwrap();
+        let (outcome, _) = create(&host, Vec::new(), Some("ref-1")).await;
+        assert!(outcome == WriteOutcome::Busy, "busy");
+        assert_eq!(held_creates(&host), 1);
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_lapsed_token_says_so_and_sends_nothing() {
+        let host = TestHost::holding(&[]);
+        let (outcome, _) = create(&host, Vec::new(), Some("nope")).await;
+        assert!(outcome == failed(CREATE_LOST), "unknown");
+        lost_create(&host).await;
+        host.edit
+            .prune_creates(Instant::now() + SESSION_TTL + Duration::from_secs(1));
+        let (outcome, _) = create(&host, Vec::new(), Some("ref-1")).await;
+        assert!(outcome == failed(CREATE_LOST), "lapsed");
+    }
+
+    /// A28: a list that lags behind the new event can't take it off the screen, and a fetch that
+    /// began before the landing can't settle its entry.
+    #[tokio::test]
+    async fn a_lagging_list_keeps_a_new_event_on_screen() {
+        let host = TestHost::holding(&[]);
+        let before = Instant::now();
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        create(&host, vec![insert_step(Scripted::Json(copy.clone()))], None).await;
+        let id = format!("cal:{NEW}");
+        let after = Instant::now();
+        assert!(host.synced(&[], after).iter().any(|r| r.id == id));
+        // An older fetch that happens to show it settles nothing.
+        assert!(host
+            .synced(std::slice::from_ref(&copy), before)
+            .iter()
+            .any(|r| r.id == id));
+        assert!(!host.nothing_recorded());
+        // A fetch that began after the landing and shows it ends the entry.
+        host.synced(&[copy], after);
+        assert!(host.nothing_recorded());
+    }
+
+    /// C10a ships the create command inert: a release build refuses it before reading anything,
+    /// and only after the window and owner checks every write makes (C10 §16).
+    #[test]
+    fn the_create_command_is_refused_in_release_builds_until_its_ui_ships() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let start = shipped
+            .find("pub async fn create_calendar_event(")
+            .expect("the create command");
+        let shell = &shipped[start..];
+        let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
+        let at = |needle: &str| shell.find(needle).unwrap_or(usize::MAX);
+        let gate = at("if !cfg!(debug_assertions) {");
+        assert!(
+            at("require_owner(&app)?;") < gate,
+            "the gate comes after the window and owner checks"
+        );
+        assert!(
+            gate < at("message: CREATE_NOT_YET.into()")
+                && at("message: CREATE_NOT_YET.into()") < at("state.conn()")
+                && at("state.conn()") < at("create_event(&ctx"),
+            "a release build refuses before reading anything or sending"
+        );
+    }
+
+    /// The retry's table: two empty looks before a re-send, a cancelled copy gone, anything it
+    /// can't read keeping the create held.
+    #[test]
+    fn retry_next_follows_the_table() {
+        let copy = json!({ "id": NEW });
+        for first in [true, false] {
+            assert!(
+                matches!(retry_next(RetryLook::Live(copy.clone()), first), RetryStep::Land(c) if c == copy)
+            );
+            assert!(matches!(
+                retry_next(RetryLook::Cancelled, first),
+                RetryStep::Gone
+            ));
+            assert!(matches!(
+                retry_next(RetryLook::Reauth, first),
+                RetryStep::Keep(Kept::Reauth)
+            ));
+            assert!(matches!(
+                retry_next(RetryLook::Busy, first),
+                RetryStep::Keep(Kept::Busy)
+            ));
+            assert!(matches!(
+                retry_next(RetryLook::Unknown, first),
+                RetryStep::Keep(Kept::Ambiguous)
+            ));
+        }
+        assert!(matches!(
+            retry_next(RetryLook::Absent, true),
+            RetryStep::LookAgain
+        ));
+        assert!(matches!(
+            retry_next(RetryLook::Absent, false),
+            RetryStep::Send
+        ));
+        let cancelled = json!({ "id": NEW, "status": "cancelled" });
+        assert!(matches!(
+            RetryLook::of(Fetched::Event(cancelled)),
+            RetryLook::Cancelled
+        ));
+        assert!(matches!(
+            RetryLook::of(Fetched::Event(copy)),
+            RetryLook::Live(_)
+        ));
+        assert!(matches!(RetryLook::of(Fetched::Gone), RetryLook::Absent));
+        assert!(matches!(
+            RetryLook::of(Fetched::Failed("x".into())),
+            RetryLook::Unknown
+        ));
+    }
+
+    #[test]
+    fn in_mirror_reads_overlap_at_both_edges() {
+        let window = mirror(&[]).instants();
+        let row = |start: &str, end: Option<&str>, all_day: bool| CalendarEvent {
+            start: start.into(),
+            end: end.map(str::to_string),
+            all_day,
+            ..Default::default()
+        };
+        // Ends exactly where the window starts: out.
+        let edge = row("2026-08-31T23:00:00Z", Some("2026-09-01T00:00:00Z"), false);
+        assert_eq!(in_mirror(&edge, window), Some(false));
+        let across = row("2026-08-31T23:00:00Z", Some("2026-09-01T00:30:00Z"), false);
+        assert_eq!(in_mirror(&across, window), Some(true));
+        // The last day before the window ends: in. The day the window ends on: out.
+        let last = row("2027-10-31", Some("2027-11-01"), true);
+        assert_eq!(in_mirror(&last, window), Some(true));
+        let after = row("2027-11-01", Some("2027-11-02"), true);
+        assert_eq!(in_mirror(&after, window), Some(false));
+        // No end: its start alone.
+        let point = row("2026-10-26T10:00:00Z", None, false);
+        assert_eq!(in_mirror(&point, window), Some(true));
+        // What can't be read lands.
+        assert_eq!(in_mirror(&row("soon", None, false), window), None);
+        assert_eq!(in_mirror(&point, None), None);
+    }
+
+    #[test]
+    fn resolve_calendar_turns_feeds_and_outlook_into_not_google() {
+        let (_d, conn) = store();
+        let cal = "gcal:me@x.com:primary";
+        add_calendar(&conn, "gcal:me@x.com", "google", cal, Some("me@x.com"));
+        let google = resolve_calendar(&conn, cal, "gone").unwrap().unwrap();
+        assert!(google.remote_calendar == "me@x.com" && google.email == "me@x.com");
+        assert_eq!(google.token_key, "google_oauth_token_calendar::me@x.com");
+        assert!(google.selected);
+        calendar::set_calendar_selected(&conn, cal, false).unwrap();
+        assert!(
+            !resolve_calendar(&conn, cal, "gone")
+                .unwrap()
+                .unwrap()
+                .selected
+        );
+        add_calendar(&conn, "ics:feed", "ics", "ics:feed:1", None);
+        add_calendar(
+            &conn,
+            "outlook:me@x.com",
+            "outlook",
+            "outlook:me@x.com:1",
+            None,
+        );
+        for other in ["ics:feed:1", "outlook:me@x.com:1"] {
+            assert!(matches!(
+                resolve_calendar(&conn, other, "gone").unwrap(),
+                Err(ReadOnlyReason::NotGoogle)
+            ));
+        }
+        // Each caller says it its own way when the calendar has gone.
+        let missing = resolve_calendar(&conn, "gcal:me@x.com:nope", "That calendar is gone.");
+        assert!(matches!(missing, Err(Error::Other(m)) if m == "That calendar is gone."));
     }
 }

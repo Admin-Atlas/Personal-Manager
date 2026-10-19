@@ -140,6 +140,7 @@ import type {
   EditLoad,
   EventPatchDraft,
   HeldDeleteInfo,
+  NewEventDraft,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -1098,6 +1099,16 @@ export const updateCalendarEvent = (
   scope: SeriesScope | null = null,
   choice: string | null = null,
 ) => invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice });
+
+/** Create an event on one of PM's Google calendars (`calendarId`, PM's own id). Outcomes come back as
+ *  data. `retryToken` (from an `ambiguous` outcome) looks for the earlier attempt before anything is
+ *  sent again, so a retry never makes a second copy. Nobody is emailed: new events have no guests.
+ *  Release builds refuse it until the editor's create mode ships. */
+export const createCalendarEvent = (
+  calendarId: string,
+  draft: NewEventDraft,
+  retryToken: string | null = null,
+) => invoke<WriteOutcome>("create_calendar_event", { calendarId, draft, retryToken });
 
 /** Delete a mirrored event after an Undo window held by the backend. It goes to Google when the
  *  window ends, only if Google still holds what the user saw (`seen`); `onCalendarDeleteSettled`

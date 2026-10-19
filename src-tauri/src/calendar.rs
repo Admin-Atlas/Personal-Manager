@@ -262,6 +262,48 @@ fn primary_calendar_id(value: &serde_json::Value) -> Option<String> {
     (!id.is_empty()).then(|| id.to_lowercase())
 }
 
+// --- each Google account's default event length (A28, C10) ---
+
+/// `settings` key: `{ "<lowercased account email>": minutes }`, Google's default length for a new
+/// event on each account. The `calendar_editing` shape: one key for every account, so a change is
+/// one read-modify-write under the DB lock. Read from Google at each sync from C10b; until then
+/// nothing stores one, and a disconnect only clears it.
+pub const DEFAULT_LENGTH_KEY: &str = "calendar_default_length";
+
+/// Every account's stored default length. A value PM can't read is none at all: the editor then
+/// uses an hour, as it would before the first sync.
+pub fn default_lengths(conn: &Connection) -> Result<std::collections::BTreeMap<String, u32>> {
+    let Some(raw) = db::get_setting(conn, DEFAULT_LENGTH_KEY)? else {
+        return Ok(Default::default());
+    };
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+/// Store (or with `None`, forget) one account's default length, under the caller's lock. Writes
+/// only on a change, so a sync that reads the same value writes nothing; forgetting the last one
+/// removes the key.
+pub fn set_default_length(conn: &Connection, email: &str, minutes: Option<u32>) -> Result<()> {
+    let mut all = default_lengths(conn)?;
+    let key = email.trim().to_lowercase();
+    let changed = match minutes {
+        Some(m) => all.insert(key, m) != Some(m),
+        None => all.remove(&key).is_some(),
+    };
+    if !changed {
+        return Ok(());
+    }
+    if all.is_empty() {
+        return db::delete_setting(conn, DEFAULT_LENGTH_KEY);
+    }
+    let json = serde_json::to_string(&all).map_err(|e| Error::Other(e.to_string()))?;
+    db::set_setting(conn, DEFAULT_LENGTH_KEY, &json)
+}
+
+/// Forget every account's default length (every Google account went).
+pub fn clear_default_lengths(conn: &Connection) -> Result<()> {
+    db::delete_setting(conn, DEFAULT_LENGTH_KEY)
+}
+
 /// Fetch events from one Google calendar within `[time_min, time_max]` (RFC3339), with recurring
 /// events expanded to single instances and ordered by start. `mirror_calendar_id` is the owning
 /// [`Calendar::id`] the events are stored under; `remote_id` is Google's own calendar id for the API
@@ -3466,5 +3508,27 @@ mod tests {
         for p in ["google", "microsoft", "Google", "evil\nline"] {
             assert!(feed_provider(p).is_err(), "{p:?}");
         }
+    }
+
+    #[test]
+    fn default_lengths_round_trip_and_none_removes_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        set_default_length(&conn, "Me@Example.com", Some(30)).unwrap();
+        set_default_length(&conn, "work@example.com", Some(45)).unwrap();
+        let all = default_lengths(&conn).unwrap();
+        assert_eq!(all.get("me@example.com"), Some(&30));
+        assert_eq!(all.get("work@example.com"), Some(&45));
+        set_default_length(&conn, "me@example.com", None).unwrap();
+        assert_eq!(default_lengths(&conn).unwrap().len(), 1);
+        set_default_length(&conn, "work@example.com", None).unwrap();
+        assert_eq!(db::get_setting(&conn, DEFAULT_LENGTH_KEY).unwrap(), None);
+        // A value PM can't read is none, never an error.
+        db::set_setting(&conn, DEFAULT_LENGTH_KEY, "not json").unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        set_default_length(&conn, "me@example.com", Some(20)).unwrap();
+        clear_default_lengths(&conn).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
     }
 }

@@ -554,7 +554,10 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
         case "conflict":
           await rebaseAfterConflict(outcomeText(outcome).text);
           return;
+        // `ambiguous`: only creating an event answers it, never a save; read as a save it would be
+        // unconfirmed.
         case "unconfirmed":
+        case "ambiguous":
           setUncertain(true);
           setBanner(outcomeText(outcome));
           return;

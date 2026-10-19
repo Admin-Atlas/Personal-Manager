@@ -101,6 +101,27 @@ pub struct EventPatchDraft {
     pub visibility: Option<Visibility>,
 }
 
+/// A new event as the editor holds it (A22: defined with its first caller, the create command). No
+/// repeat (C11), guests (C12), reminders or colour (C13): Google gives the calendar's default
+/// reminders when none are sent. Empty text is left out of the insert, never sent as "".
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewEventDraft {
+    #[serde(default)]
+    pub summary: String,
+    pub time: TimeDraft,
+    #[serde(default)]
+    pub location: String,
+    /// Plain text.
+    #[serde(default)]
+    pub description: String,
+    /// `None` is Google's default (busy).
+    #[serde(default)]
+    pub show_as: Option<ShowAs>,
+    /// `None` or `Default` is the calendar's default, and isn't sent.
+    #[serde(default)]
+    pub visibility: Option<Visibility>,
+}
+
 /// What the user saw of an event when they chose to delete it, taken from the mirror row they
 /// clicked. A delete sends no fields, so this is what decides whether a version Google changed in the
 /// meantime may still be deleted ([`super::patch::delete_still_matches`]).
@@ -214,6 +235,12 @@ pub enum WriteOutcome {
     Reauth,
     /// The answer never arrived and PM couldn't look afterwards: it may or may not have happened.
     Unconfirmed,
+    /// A new event whose answer never arrived, and PM couldn't tell whether Google made it. Calling
+    /// the create command again with `retry_token` looks for it first and never makes a second copy
+    /// (R2). PM's own token, never the event's id (R5); it lapses after eight hours or a restart.
+    Ambiguous {
+        retry_token: String,
+    },
     /// Anything else, with Google's message clipped to plain text.
     Failed {
         message: String,
@@ -302,6 +329,8 @@ pub enum WriteWarning {
     MirrorRefreshPending,
     /// Some occurrences changed on their own couldn't be cancelled: `Saved.left_behind` says which.
     LeftOnOldSeries,
+    /// Saved in Google, but it starts outside the months PM mirrors, so PM's calendar won't show it.
+    OutsideMirror,
 }
 
 /// One event as the editor shows it, read from a fresh copy (never the mirror, which clips text).
@@ -535,6 +564,19 @@ mod tests {
             (WriteOutcome::Reauth, r#"{"outcome":"reauth"}"#),
             (WriteOutcome::Unconfirmed, r#"{"outcome":"unconfirmed"}"#),
             (
+                WriteOutcome::Ambiguous {
+                    retry_token: "ref-1".into(),
+                },
+                r#"{"outcome":"ambiguous","retry_token":"ref-1"}"#,
+            ),
+            (
+                WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::OutsideMirror],
+                    left_behind: Vec::new(),
+                },
+                r#"{"outcome":"saved","warnings":["outside_mirror"]}"#,
+            ),
+            (
                 WriteOutcome::Failed {
                     message: "Backend Error".into(),
                 },
@@ -698,6 +740,38 @@ mod tests {
             .unwrap(),
             r#"{"first":false,"repeats":"Weekly on Monday"}"#
         );
+    }
+
+    /// What the editor sends for a new event: text and choices it leaves out take their defaults;
+    /// a time of a kind PM doesn't know is refused, never guessed.
+    #[test]
+    fn new_event_draft_reads_what_the_editor_sends() {
+        let full: NewEventDraft = serde_json::from_str(
+            r#"{"summary":"Dentist","time":{"kind":"timed","start_date":"2026-10-26",
+                "start_time":"10:00","start_zone":"Europe/London","end_date":"2026-10-26",
+                "end_time":"11:00","end_zone":"Europe/London"},"location":"High St",
+                "description":"Bring the form","show_as":"free","visibility":"private"}"#,
+        )
+        .unwrap();
+        assert!(full.summary == "Dentist" && full.location == "High St");
+        assert!(full.description == "Bring the form");
+        assert!(matches!(full.time, TimeDraft::Timed { .. }));
+        assert_eq!(full.show_as, Some(ShowAs::Free));
+        assert_eq!(full.visibility, Some(Visibility::Private));
+
+        let bare: NewEventDraft = serde_json::from_str(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"}}"#,
+        )
+        .unwrap();
+        assert!(bare.summary.is_empty() && bare.location.is_empty());
+        assert!(bare.description.is_empty());
+        assert_eq!((bare.show_as, bare.visibility), (None, None));
+
+        let unknown = serde_json::from_str::<NewEventDraft>(
+            r#"{"summary":"x","time":{"kind":"floating","day":"2026-10-26"}}"#,
+        );
+        assert!(unknown.is_err(), "an unknown kind of time is refused");
+        assert!(serde_json::from_str::<NewEventDraft>(r#"{"summary":"x"}"#).is_err());
     }
 
     #[test]

@@ -18,7 +18,7 @@
 
 use serde_json::{Map, Value};
 
-use super::dto::{EventPatchDraft, SeenSummary};
+use super::dto::{EventPatchDraft, NewEventDraft, SeenSummary, Visibility};
 use super::time::{self, TimeError};
 
 /// The only fields a single-event save sends.
@@ -31,6 +31,46 @@ pub const PATCHABLE: &[&str] = &[
     "transparency",
     "visibility",
 ];
+
+/// The only fields a create sends: [`PATCHABLE`]'s, nothing more (no attendees, recurrence,
+/// reminders, conference, colour or private notes until their layers). The same list on purpose:
+/// widening what a save sends (C13's reminders) widens creates too, and the create plan's own
+/// refusal test then fails, so it is a decision, never a slip (C10 critique 1 L10).
+pub const CREATABLE: &[&str] = PATCHABLE;
+
+/// The insert body for `draft`. Google's `start`/`end` come from [`time::resolve`] (explicit zones,
+/// a skipped hour refused, a repeated hour's first occurrence, an all-day end the day after the
+/// last day); empty text is left out, so Google keeps no empty strings. No `id`: the insert request
+/// writes PM's own in ([`super::plan::insert_event`]).
+pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, TimeError> {
+    let when = time::resolve(&draft.time)?;
+    let mut body = Map::new();
+    for (key, text) in [
+        ("summary", &draft.summary),
+        ("location", &draft.location),
+        ("description", &draft.description),
+    ] {
+        // As typed, untrimmed, as a save sends it; only text that is all blank is left out.
+        if !text.trim().is_empty() {
+            body.insert(key.into(), Value::String(text.clone()));
+        }
+    }
+    body.insert("start".into(), when.start);
+    body.insert("end".into(), when.end);
+    if let Some(show_as) = draft.show_as {
+        body.insert(
+            "transparency".into(),
+            Value::String(show_as.as_transparency().into()),
+        );
+    }
+    if let Some(visibility) = draft.visibility.filter(|v| *v != Visibility::Default) {
+        body.insert(
+            "visibility".into(),
+            Value::String(visibility.as_param().into()),
+        );
+    }
+    Ok(body)
+}
 
 /// The PATCH body for `draft` against `fresh`, Google's current copy. Empty means Google already
 /// holds exactly this, and nothing should be sent.
@@ -695,6 +735,134 @@ mod tests {
             delete_still_matches(&seen_none, &no_location),
             DeleteCheck::Matches
         );
+    }
+
+    // --- creating an event (C10) ---
+
+    fn new_event(time: TimeDraft) -> NewEventDraft {
+        NewEventDraft {
+            summary: "Dentist".into(),
+            time,
+            location: "High St".into(),
+            description: "Bring the form\nand a pen".into(),
+            show_as: Some(ShowAs::Free),
+            visibility: Some(Visibility::Private),
+        }
+    }
+
+    #[test]
+    fn insert_body_sends_only_what_a_create_may() {
+        let body = insert_body(&new_event(timed(
+            "2026-10-26",
+            "10:00",
+            "2026-10-26",
+            "11:00",
+        )))
+        .unwrap();
+        let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "description",
+                "end",
+                "location",
+                "start",
+                "summary",
+                "transparency",
+                "visibility"
+            ]
+        );
+        assert!(keys.iter().all(|k| CREATABLE.contains(k)));
+        assert_eq!(body["summary"], "Dentist");
+        assert_eq!(body["description"], "Bring the form\nand a pen");
+        assert_eq!(body["transparency"], "transparent");
+        assert_eq!(body["visibility"], "private");
+        assert!(!body.contains_key("id"), "the insert request writes the id");
+    }
+
+    /// Blank text is left out, so Google stores no empty strings; text with words in is sent as
+    /// typed, spaces and all.
+    #[test]
+    fn an_empty_title_and_empty_text_are_left_out() {
+        let draft = NewEventDraft {
+            summary: "   ".into(),
+            location: String::new(),
+            description: "\n ".into(),
+            ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+        };
+        let body = insert_body(&draft).unwrap();
+        for key in ["summary", "location", "description"] {
+            assert!(!body.contains_key(key), "{key}");
+        }
+        let spaced = NewEventDraft {
+            summary: " Dentist ".into(),
+            ..draft
+        };
+        assert_eq!(insert_body(&spaced).unwrap()["summary"], " Dentist ");
+    }
+
+    /// A flight: each half carries its own zone and offset.
+    #[test]
+    fn a_timed_insert_names_its_zones() {
+        let body = insert_body(&new_event(TimeDraft::Timed {
+            start_date: "2026-10-26".into(),
+            start_time: "10:00".into(),
+            start_zone: "Europe/London".into(),
+            end_date: "2026-10-26".into(),
+            end_time: "13:00".into(),
+            end_zone: "America/New_York".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-26T10:00:00+00:00", "timeZone": "Europe/London" })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "dateTime": "2026-10-26T13:00:00-04:00", "timeZone": "America/New_York" })
+        );
+    }
+
+    #[test]
+    fn an_all_day_insert_ends_the_day_after() {
+        let body = insert_body(&new_event(TimeDraft::AllDay {
+            first_day: "2026-10-26".into(),
+            last_day: "2026-10-26".into(),
+        }))
+        .unwrap();
+        assert_eq!(body["start"], json!({ "date": "2026-10-26" }));
+        assert_eq!(body["end"], json!({ "date": "2026-10-27" }));
+    }
+
+    #[test]
+    fn a_gap_or_an_end_before_start_builds_nothing() {
+        let gap = insert_body(&new_event(timed(
+            "2026-03-29",
+            "01:30",
+            "2026-03-29",
+            "03:00",
+        )));
+        assert!(matches!(gap, Err(TimeError::Gap { .. })));
+        for end in ["10:00", "09:00"] {
+            let backwards =
+                insert_body(&new_event(timed("2026-10-26", "10:00", "2026-10-26", end)));
+            assert!(matches!(backwards, Err(TimeError::EndBeforeStart)), "{end}");
+        }
+    }
+
+    #[test]
+    fn default_visibility_and_no_show_as_are_left_out() {
+        for visibility in [None, Some(Visibility::Default)] {
+            let body = insert_body(&NewEventDraft {
+                show_as: None,
+                visibility,
+                ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+            })
+            .unwrap();
+            assert!(!body.contains_key("transparency"));
+            assert!(!body.contains_key("visibility"), "{visibility:?}");
+        }
     }
 
     #[test]

@@ -142,6 +142,9 @@ export function writeWarningText(
         ? `Some occurrences you changed on their own may still be on the earlier part, or hidden by Google${days}; check them in Google Calendar.`
         : `Some occurrences changed on their own may still show${days}; check them in Google Calendar.`;
     }
+    // Only a new event comes back with it.
+    case "outside_mirror":
+      return "It starts outside the months PM syncs, so PM's calendar won't show it.";
     default:
       return unreachable(warning);
   }
@@ -243,6 +246,12 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
         tone: "warn",
         text: "PM lost touch with Google before it could confirm this save. Refresh the calendar to see whether it went through.",
       };
+    // Only creating an event answers this; its token is kept so Check again can look first.
+    case "ambiguous":
+      return {
+        tone: "warn",
+        text: "PM lost touch with Google while creating this event, so it may already be in your calendar. Check again: PM looks for it first and won't make a second copy.",
+      };
     case "failed":
       return { tone: "error", text: outcome.message };
     default:
@@ -309,6 +318,12 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
         tone: "warn",
         text: `PM lost touch with Google before it could confirm whether ${t} was deleted. Refresh the calendar to see.`,
       };
+    // Only creating an event answers this; a delete never does, so it says only what's known.
+    case "ambiguous":
+      return {
+        tone: "warn",
+        text: `PM lost touch with Google, so it can't tell whether ${t} was deleted. Refresh the calendar to see.`,
+      };
     case "failed":
       return notDeleted(outcome.message);
     default:
@@ -374,6 +389,7 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
         tone: "warn",
         text: `${t}: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.`,
       };
+    // `ambiguous` is listed for completeness: only creating an event answers it; a settle never does.
     case "no_change":
     case "needs_choice":
     case "ignored_by_google":
@@ -382,6 +398,7 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
     case "read_only":
     case "reauth":
     case "unconfirmed":
+    case "ambiguous":
     case "failed": {
       const said = outcomeText(result);
       return { tone: said.tone, text: `${t}: ${said.text}` };

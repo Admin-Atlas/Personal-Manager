@@ -127,10 +127,6 @@ pub struct GoogleWhen {
 /// A time draft as Google's `start` and `end`, for a new event. A timed event keeps its own
 /// zone(s): `dateTime` with that zone's offset, plus `timeZone`, so Google shows it as the user set it
 /// and a repeating event follows that zone's daylight saving.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C10, creating events")
-)]
 pub fn resolve(draft: &TimeDraft) -> Result<GoogleWhen, TimeError> {
     resolve_against(draft, None, None)
 }
