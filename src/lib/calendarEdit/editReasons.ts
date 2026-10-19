@@ -316,6 +316,15 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
   }
 }
 
+/** A delete of chosen occurrences that the plan changed under again, after the dialog reopened
+ *  once (or with something else open by then): the user deletes again and chooses then. */
+export function deleteChangedText(title: string): { tone: Tone; text: string } {
+  return {
+    tone: "warn",
+    text: `${quote(title)} wasn't deleted. This repeating event changed since you chose which occurrences to delete. Delete it again to choose.`,
+  };
+}
+
 const quote = (title: string) => `“${title.trim() || "(no title)"}”`;
 
 /** The buttons for a change PM couldn't finish, always in this order, filtered by what's offered. */

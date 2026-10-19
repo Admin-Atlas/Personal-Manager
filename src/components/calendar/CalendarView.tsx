@@ -26,7 +26,7 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { deleteText, reasonText } from "../../lib/calendarEdit/editReasons";
+import { reasonText } from "../../lib/calendarEdit/editReasons";
 import {
   clampDayCount,
   readCursorDay,
@@ -84,7 +84,7 @@ import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
 import { EventEditor } from "./edit/EventEditor";
 import { WriteNotices } from "./edit/WriteNotices";
-import { readMirror, undoLatest, useEventWrites } from "./edit/useEventWrites";
+import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -239,9 +239,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const [error, setError] = useState<string | null>(null);
   const [eventsFailed, setEventsFailed] = useState(false);
   const aliveRef = useRef(true);
-  // Monotonic token so an older in-flight events read (e.g. a focus refresh) can't overwrite a newer
-  // one that resolved first.
-  const eventsSeqRef = useRef(0);
   const now = useNowTick();
 
   useEffect(() => {
@@ -251,23 +248,20 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     };
   }, []);
 
-  const loadEvents = useCallback(async () => {
-    const seq = ++eventsSeqRef.current;
-    try {
-      // Marked, so rows a delete hid are shown again only by a read that knows how it ended.
-      const evts = await readMirror(listAllCalendarEvents);
-      if (!aliveRef.current || seq !== eventsSeqRef.current) return;
-      setEvents(evts);
-      cachedEvents = evts;
-      setEventsFailed(false);
-    } catch {
-      // Keep the last-good events; a read failure is transient. Flag it only when we have nothing to
-      // show, so the empty grid isn't mistaken for "no events".
-      if (aliveRef.current && seq === eventsSeqRef.current && cachedEvents.length === 0) {
-        setEventsFailed(true);
-      }
-    }
+  const applyEvents = useCallback((evts: CalendarEvent[]) => {
+    setEvents(evts);
+    cachedEvents = evts;
+    setEventsFailed(false);
   }, []);
+  const eventsReadFailed = useCallback(() => {
+    // Keep the last-good events; a read failure is transient. Flag it only when we have nothing to
+    // show, so the empty grid isn't mistaken for "no events".
+    if (cachedEvents.length === 0) setEventsFailed(true);
+  }, []);
+  // Only the newest read applies (an older in-flight one, e.g. a focus refresh, can't overwrite a
+  // newer one that resolved first), and each is marked, so rows a delete hid are shown again only
+  // by a read that knows how it ended. A delete that settles reads again.
+  const loadEvents = useMirrorReads(listAllCalendarEvents, applyEvents, eventsReadFailed);
 
   const loadMilestones = useCallback(async () => {
     try {
@@ -567,14 +561,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   );
 
   const writes = useEventWrites();
-  // A delete settled: read the mirror again. The read the backend's landing starts can begin before
-  // the settle is heard, and so can't show again a row the delete left in Google.
-  const settlesSeen = useRef(writes.settles);
-  useEffect(() => {
-    if (writes.settles === settlesSeen.current) return;
-    settlesSeen.current = writes.settles;
-    void loadEvents();
-  }, [writes.settles, loadEvents]);
 
   // What PM may do to a synced event (#884): the row's own block, then its account's editing status.
   // The list computes `edit_block` assuming editing is on; the overview says whether it is.
@@ -638,14 +624,12 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return out;
   }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor]);
 
-  // The event the delete dialog is asking about (null = closed).
-  const [confirmDelete, setConfirmDelete] = useState<CalendarEvent | null>(null);
-  // The delete dialog reopened because the backend wanted the occurrences chosen (null = asked
-  // first time). `again`: a choice was made, but the plan changed since.
-  const [deleteReask, setDeleteReask] = useState<{ again: boolean } | null>(null);
   // The popover's editing actions for `ev`. Delete closes the popover and asks first.
   // The event open in the editor (null = closed).
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
+  // The delete dialog: the event it asks about (null = closed), and the delete it sends.
+  const deleteDialog = useDeleteDialog(editing !== null);
+  const confirmDelete = deleteDialog.asked?.event ?? null;
   // The address of the account a synced event's calendar belongs to.
   const accountOf = (ev: CalendarEvent): string | null => {
     const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
@@ -659,7 +643,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     },
     onDelete: () => {
       setEventPopup(null);
-      setConfirmDelete(ev);
+      deleteDialog.ask(ev);
     },
   });
 
@@ -991,7 +975,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             // Close the editor first so its focus goes back to the event's chip, and the delete
             // dialog that opens next returns it there too.
             flushSync(() => setEditing(null));
-            setConfirmDelete(row);
+            deleteDialog.ask(row);
           }}
           onClose={() => setEditing(null)}
         />
@@ -1002,29 +986,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           overview?.calendars.find((c) => c.id === confirmDelete?.calendar_id)?.name ?? null
         }
         when={confirmDelete ? whenText(confirmDelete) : ""}
-        again={deleteReask?.again ?? false}
-        forceRepeating={deleteReask !== null}
-        onClose={() => {
-          setConfirmDelete(null);
-          setDeleteReask(null);
-        }}
-        onConfirm={(ev, picked) => {
-          const reasked = deleteReask !== null;
-          setConfirmDelete(null);
-          setDeleteReask(null);
-          void writes.startDelete(ev, picked).then((r) => {
-            if (r !== "ask") return;
-            // The backend wants the occurrences chosen (the row looked like a one-off here), or
-            // chosen again: reopen once, asking whatever the row says. A second time, the plan
-            // keeps changing under the user, so say so and stop.
-            if (reasked) {
-              writes.noteSeriesNotice(deleteText({ outcome: "needs_choice" }, ev.summary).text);
-              return;
-            }
-            setDeleteReask({ again: picked !== null });
-            setConfirmDelete(ev);
-          });
-        }}
+        again={deleteDialog.asked?.reask?.again ?? false}
+        forceRepeating={!!deleteDialog.asked?.reask}
+        onClose={deleteDialog.close}
+        onConfirm={deleteDialog.confirm}
       />
       <WriteNotices
         notices={writes.notices}

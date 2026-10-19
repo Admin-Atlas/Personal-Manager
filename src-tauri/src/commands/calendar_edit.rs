@@ -5639,7 +5639,8 @@ mod tests {
     }
 
     /// scope-L8: a delete of an occurrence with no choice is refused before it's held. The test is
-    /// the same "is it repeating" the list's facts and the webview's `isRepeating` use.
+    /// `row_repeats`, the same "is it repeating" as the webview's `isRepeating` (recurring || series
+    /// id).
     #[test]
     fn a_series_row_needs_a_choice_before_its_delete_is_held() {
         let (_d, conn) = store();

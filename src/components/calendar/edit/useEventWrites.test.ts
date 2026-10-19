@@ -434,25 +434,22 @@ describe("a repeating event", () => {
     const rows = (ids: string[]) => ids.map((id) => ({ ...event, id }));
     let reads: ((events: CalendarEvent[]) => void)[] = [];
 
-    /** A fresh store, read through a hook that reads the mirror as the calendar does. */
+    /** A fresh store, read through the hook the calendar reads the mirror with. `applied`: what
+     *  each read that was applied found. */
     async function loadCalendar() {
       vi.resetModules();
       const mod = await import("./useEventWrites");
       const { renderHook, act } = await import("@testing-library/react");
-      const { useEffect, useRef } = await import("react");
+      const applied: CalendarEvent[][] = [];
       const read = () => new Promise<CalendarEvent[]>((r) => reads.push(r));
-      const hook = renderHook(() => {
-        const writes = mod.useEventWrites();
-        const seen = useRef(writes.settles);
-        useEffect(() => {
-          if (writes.settles === seen.current) return;
-          seen.current = writes.settles;
-          void mod.readMirror(read);
-        }, [writes.settles]);
-        return writes;
-      });
+      const apply = (events: CalendarEvent[]) => applied.push(events);
+      const failed = () => {};
+      const hook = renderHook(() => ({
+        writes: mod.useEventWrites(),
+        load: mod.useMirrorReads(read, apply, failed),
+      }));
       await act(async () => {});
-      return { mod, hook, act, read };
+      return { mod, hook, act, applied };
     }
 
     beforeEach(() => {
@@ -466,10 +463,10 @@ describe("a repeating event", () => {
     });
 
     it("shows again a row the delete left in Google, once a read after it lands", async () => {
-      const { mod, hook, act, read } = await loadCalendar();
+      const { mod, hook, act } = await loadCalendar();
       await act(() => mod.startDelete(occurrence, { scope: "following", token: "f" }));
       // The read the backend's landing starts, begun before the webview hears the settle.
-      const early = mod.readMirror(read);
+      const early = hook.result.current.load();
       act(() =>
         settledHandler!({
           undo_token: "t1",
@@ -488,10 +485,37 @@ describe("a repeating event", () => {
         reads[0](rows(all));
         await early;
       });
-      expect([...hook.result.current.hiddenIds].sort()).toEqual([...all].sort());
+      expect([...hook.result.current.writes.hiddenIds].sort()).toEqual([...all].sort());
       // Google kept the occurrence changed on its own; the rest went.
       await act(async () => reads[1](rows([later[0]])));
-      expect(hook.result.current.hiddenIds.size).toBe(0);
+      expect(hook.result.current.writes.hiddenIds.size).toBe(0);
+    });
+
+    // C9b-1b review F4: an older read landing after a newer one began is dropped whole. It would
+    // otherwise release rows it no longer has while the calendar still shows the list from before
+    // the delete, painting the deleted event again until the newer read lands.
+    it("keeps a deleted row hidden when an older read lands first", async () => {
+      deleteCalendarEvent.mockResolvedValue({ outcome: "held", undo_token: "t2", undo_seconds: 8 });
+      const { mod, hook, act, applied } = await loadCalendar();
+      await act(() => mod.startDelete(event));
+      const early = hook.result.current.load();
+      act(() =>
+        settledHandler!({
+          undo_token: "t2",
+          event_id: event.id,
+          result: { outcome: "saved", warnings: [] },
+        }),
+      );
+      expect(reads).toHaveLength(2);
+      await act(async () => {
+        reads[0](rows([]));
+        await early;
+      });
+      expect(applied).toHaveLength(0);
+      expect(hook.result.current.writes.hiddenIds.has(event.id)).toBe(true);
+      await act(async () => reads[1](rows([])));
+      expect(applied).toEqual([[]]);
+      expect(hook.result.current.writes.hiddenIds.size).toBe(0);
     });
 
     it("keeps a deleted row hidden while the mirror lags behind Google", async () => {
@@ -510,7 +534,7 @@ describe("a repeating event", () => {
       );
       const all = [occurrence.id, ...later];
       await act(async () => reads[0](rows(all)));
-      expect([...hook.result.current.hiddenIds].sort()).toEqual([...all].sort());
+      expect([...hook.result.current.writes.hiddenIds].sort()).toEqual([...all].sort());
       // A plain delete that landed: hidden while the mirror has it, whenever the read began.
       deleteCalendarEvent.mockResolvedValue({ outcome: "held", undo_token: "t2", undo_seconds: 8 });
       await act(() => mod.startDelete(event));
@@ -522,7 +546,7 @@ describe("a repeating event", () => {
         }),
       );
       await act(async () => reads[1](rows([...all, event.id])));
-      expect(hook.result.current.hiddenIds.has(event.id)).toBe(true);
+      expect(hook.result.current.writes.hiddenIds.has(event.id)).toBe(true);
     });
   });
 
@@ -555,6 +579,95 @@ describe("a repeating event", () => {
       expect(await mod.startDelete(occurrence)).toBe("refused");
     });
     expect(hook.result.current.notices[0].text).toMatch(/^“Gym” wasn't deleted\. Editing isn't on/);
+  });
+
+  // The delete dialog as the calendar runs it (C9b-1b review F1, F6, F8, F11): a delete answered
+  // "choose" reopens it once, never over a dialog or the editor opened meanwhile, and a notice says
+  // to delete again otherwise, in words that fit whether a choice was made.
+  describe("the delete dialog", () => {
+    const ASK = { outcome: "refused", result: { outcome: "needs_choice" } } as DeleteStart;
+    const CHANGED =
+      "“Gym” wasn't deleted. This repeating event changed since you chose which occurrences to delete. Delete it again to choose.";
+
+    async function loadDialog() {
+      vi.resetModules();
+      const mod = await import("./useEventWrites");
+      const { renderHook, act } = await import("@testing-library/react");
+      const hook = renderHook(
+        ({ editor }: { editor: boolean }) => ({
+          writes: mod.useEventWrites(),
+          dialog: mod.useDeleteDialog(editor),
+        }),
+        { initialProps: { editor: false } },
+      );
+      await act(async () => {});
+      /** Let a delete's answer reach the dialog. */
+      const settle = () =>
+        act(async () => {
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+        });
+      return { hook, act, settle };
+    }
+
+    it("reopens once for a row that looked like a one-off, then says so", async () => {
+      deleteCalendarEvent.mockResolvedValue(ASK);
+      const { hook, act, settle } = await loadDialog();
+      act(() => hook.result.current.dialog.ask(occurrence));
+      expect(hook.result.current.dialog.asked).toEqual({ event: occurrence, reask: null });
+      act(() => hook.result.current.dialog.confirm(occurrence, null));
+      expect(hook.result.current.dialog.asked).toBeNull();
+      await settle();
+      expect(hook.result.current.dialog.asked).toEqual({
+        event: occurrence,
+        reask: { again: false },
+      });
+      expect(hook.result.current.writes.notices).toEqual([]);
+      // Chosen this time, and the plan changed again: no third dialog.
+      act(() => hook.result.current.dialog.confirm(occurrence, { scope: "this", token: "t" }));
+      await settle();
+      expect(hook.result.current.dialog.asked).toBeNull();
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([CHANGED]);
+    });
+
+    it("reopens saying the plan changed when a choice was made", async () => {
+      deleteCalendarEvent.mockResolvedValue(ASK);
+      const { hook, act, settle } = await loadDialog();
+      act(() => hook.result.current.dialog.ask(occurrence));
+      act(() => hook.result.current.dialog.confirm(occurrence, { scope: "all", token: "a" }));
+      await settle();
+      expect(hook.result.current.dialog.asked).toEqual({
+        event: occurrence,
+        reask: { again: true },
+      });
+    });
+
+    it("never replaces a delete dialog opened while the delete was on its way", async () => {
+      let answer: (s: DeleteStart) => void = () => {};
+      deleteCalendarEvent.mockReturnValue(new Promise((r) => (answer = r)));
+      const { hook, act, settle } = await loadDialog();
+      act(() => hook.result.current.dialog.ask(occurrence));
+      act(() => hook.result.current.dialog.confirm(occurrence, { scope: "this", token: "t" }));
+      act(() => hook.result.current.dialog.ask(event));
+      answer(ASK);
+      await settle();
+      expect(hook.result.current.dialog.asked).toEqual({ event, reask: null });
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([CHANGED]);
+    });
+
+    it("never opens over the editor opened while the delete was on its way", async () => {
+      let answer: (s: DeleteStart) => void = () => {};
+      deleteCalendarEvent.mockReturnValue(new Promise((r) => (answer = r)));
+      const { hook, act, settle } = await loadDialog();
+      act(() => hook.result.current.dialog.ask(occurrence));
+      act(() => hook.result.current.dialog.confirm(occurrence, null));
+      hook.rerender({ editor: true });
+      answer(ASK);
+      await settle();
+      expect(hook.result.current.dialog.asked).toBeNull();
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([
+        "“Gym” wasn't deleted. PM needs to ask which occurrences first. Delete it again to choose.",
+      ]);
+    });
   });
 
   it("never sends a scope without its token", async () => {

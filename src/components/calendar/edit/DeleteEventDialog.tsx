@@ -51,7 +51,6 @@ export function DeleteEventDialog({
         calendarName={calendarName}
         when={when}
         again={again}
-        forced={forceRepeating}
         onConfirm={onConfirm}
         onClose={onClose}
       />
@@ -104,7 +103,6 @@ function RepeatingDelete({
   calendarName,
   when,
   again,
-  forced,
   onConfirm,
   onClose,
 }: {
@@ -112,13 +110,11 @@ function RepeatingDelete({
   calendarName: string | null;
   when: string;
   again: boolean;
-  forced: boolean;
   onConfirm: (event: CalendarEvent, picked: Picked | null) => void;
   onClose: () => void;
 }) {
   const title = event.summary.trim() || "(no title)";
-  // "plain": Google's copy doesn't repeat (any more), so it's the one-event confirm.
-  const [view, setView] = useState<ChoicesView | "plain">({ state: "loading" });
+  const [view, setView] = useState<ChoicesView>({ state: "loading" });
   const [settling, setSettling] = useState(false);
   // Words the backend says once (C9a-3b-2): shown here, and kept as a notice if the dialog closes
   // without a choice, so they aren't lost.
@@ -141,13 +137,15 @@ function RepeatingDelete({
       }
       switch (c.outcome) {
         case "not_repeating":
-          // Forced, PM's calendar says it repeats and Google says it doesn't: asking again would
-          // go round in a circle until a refresh (C9b-1 critique 2 L8).
-          setView(
-            forced
-              ? { state: "refused", tone: "warn", text: "Refresh the calendar, then try again." }
-              : "plain",
-          );
+          // PM's calendar says it repeats (or the backend did, asking for a choice) and Google says
+          // it doesn't. The delete is checked against PM's calendar, which still says it repeats, so
+          // a one-event confirm would only be asked for a choice again: refresh first (C9b-1
+          // critique 2 L8, C9b-1b review F7).
+          setView({
+            state: "refused",
+            tone: "warn",
+            text: "Refresh the calendar, then try again.",
+          });
           return;
         case "refused":
           // A conflict has already put Google's copy in PM's calendar behind this dialog.
@@ -169,7 +167,7 @@ function RepeatingDelete({
     return () => {
       mounted.current = false;
     };
-  }, [event, again, forced, title]);
+  }, [event, again, title]);
 
   /** Every way out but a choice: the words said once go to a notice first. */
   const close = () => {
@@ -181,23 +179,15 @@ function RepeatingDelete({
   const onSettle = async (token: string, action: SplitAction) => {
     setSettling(true);
     await settleSplit(token, action, title);
-    if (mounted.current) setSettling(false);
+    // Closed meanwhile (Cancel stays open while it settles): its words went to a notice then, and
+    // closing again would close whatever delete dialog is open now.
+    if (!mounted.current) return;
+    setSettling(false);
     // The choices were planned before the settle, and its notice says how it went: the next
     // delete asks again.
     close();
   };
 
-  if (view === "plain") {
-    return (
-      <PlainDelete
-        event={event}
-        calendarName={calendarName}
-        when={when}
-        onConfirm={onConfirm}
-        onClose={close}
-      />
-    );
-  }
   const start = parseLocal(event.start, event.all_day);
   return (
     <SaveChoicesDialog

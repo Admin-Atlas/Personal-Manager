@@ -140,12 +140,17 @@ describe("DeleteEventDialog", () => {
     );
   });
 
-  it("falls back to the plain confirm when Google's copy doesn't repeat", async () => {
+  // C9b-1b review F7: the delete is checked against PM's calendar, which still says it repeats, so
+  // a one-event confirm could never delete it; it says to refresh instead.
+  it("says to refresh when PM's calendar says it repeats and Google says it doesn't", async () => {
     choicesForDelete.mockResolvedValue({ outcome: "not_repeating" });
     const { onConfirm } = open(occurrence);
-    await screen.findByRole("dialog", { name: "Delete this event?" });
-    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
-    expect(onConfirm).toHaveBeenCalledWith(occurrence, null);
+    expect(await screen.findByText("Refresh the calendar, then try again.")).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Delete this event?" })).toBeNull();
+    expect((screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect(onConfirm).not.toHaveBeenCalled();
   });
 
   // C9b-1 critique 2 L8: reopened because the backend wanted a choice, a "doesn't repeat" answer
@@ -185,6 +190,29 @@ describe("DeleteEventDialog", () => {
     expect(settleSplit).toHaveBeenCalledWith("p", "finish", "Gym");
     expect(noteSeriesNotice).toHaveBeenCalledWith(NOTICE);
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  // C9b-1b review F5: Cancel stays open while a settle is on its way. Closed meanwhile, the settle's
+  // end closes nothing more: by then another delete's dialog may be up.
+  it("closes nothing more when a settle ends after the dialog was closed", async () => {
+    choicesForDelete.mockResolvedValue(
+      ready({
+        following: { row: "pending", token: "p", offers: ["finish"], from: "2026-11-02" },
+        all: { row: "pending", token: "p", offers: ["finish"], from: "2026-11-02" },
+      }),
+    );
+    let settled: (r: WriteOutcome | null) => void = () => {};
+    settleSplit.mockReturnValue(new Promise((r) => (settled = r)));
+    const { onClose, rerender } = open(occurrence);
+    fireEvent.click(await screen.findByRole("button", { name: "Finish" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    const props = { calendarName: "Personal", when: "12-10", onConfirm: vi.fn(), onClose };
+    rerender(<DeleteEventDialog event={null} {...props} />);
+    rerender(<DeleteEventDialog event={{ ...occurrence, id: "other" }} {...props} />);
+    await act(async () => settled({ outcome: "saved", warnings: [] }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog", { name: "Delete repeating event" })).toBeTruthy();
   });
 
   it("keeps the words said once when closed without a choice, and only then", async () => {

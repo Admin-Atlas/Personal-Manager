@@ -25,6 +25,7 @@ import { flushSync } from "react-dom";
 import type {
   Calendar,
   CalendarEvent,
+  EditLoad,
   EventForEdit,
   EventPatchDraft,
   EventVisibility,
@@ -339,7 +340,14 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   /** Google changed the event on a field this save sends: take its copy, keep the rest. */
   async function rebaseAfterConflict(head: string) {
     if (!loaded || !draftRef.current) return;
-    const fresh = await openForEdit(row.id);
+    let fresh: EditLoad;
+    try {
+      fresh = await openForEdit(row.id);
+    } catch (e) {
+      // A conflict means nothing was written, so this save isn't in doubt.
+      setBanner({ tone: "error", text: message(e) });
+      return;
+    }
     if (fresh.outcome !== "ready") {
       setBanner({ tone: "error", text: loadText(fresh) });
       return;
@@ -393,6 +401,18 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     else await send(what, null);
   }
 
+  /** The choices found Google changed the event: rebase, with Save held until it's done (a Save
+   *  meanwhile would ask with the session and draft the rebase is replacing), then focus on it. */
+  async function rebaseFromChoices(head: string) {
+    setSaving(true);
+    try {
+      await rebaseAfterConflict(head);
+    } finally {
+      setSaving(false);
+      refocusSave();
+    }
+  }
+
   /** Close the choices without a choice (Back, Escape, a rebase, a settle): any answer still on its
    *  way is dropped, and words said once become a notice so they aren't lost (critique 2 M1). */
   function closeChoices() {
@@ -436,8 +456,11 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
         return;
       case "refused":
         closeChoices();
-        if (c.result.outcome === "conflict") await rebaseAfterConflict(outcomeText(c.result).text);
-        else setBanner(outcomeText(c.result));
+        if (c.result.outcome === "conflict") {
+          await rebaseFromChoices(outcomeText(c.result).text);
+          return;
+        }
+        setBanner(outcomeText(c.result));
         refocusSave();
         return;
       case "ready": {
@@ -447,8 +470,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
         const fields = conflictOf(c);
         if (fields) {
           closeChoices();
-          await rebaseAfterConflict(outcomeText({ outcome: "conflict", fields }).text);
-          refocusSave();
+          await rebaseFromChoices(outcomeText({ outcome: "conflict", fields }).text);
           return;
         }
         setAsking({

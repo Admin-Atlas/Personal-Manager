@@ -870,6 +870,117 @@ describe("EventEditor, a repeating event", () => {
     expect(saveEdit).not.toHaveBeenCalled();
   });
 
+  // C9b-1b review F3 / F9: what the choices answer besides "ready", each pinned.
+  it("saves the one event when Google's copy no longer repeats", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue({ outcome: "not_repeating" });
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), undefined, occurrence);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Gym" }, null, "Gym");
+    expect(saveEdit.mock.calls[0][1]).toBe(choicesForEdit.mock.calls[0][1]);
+  });
+
+  it("stops when the save wants a choice and the choices say it doesn't repeat", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    // Twice each, then answers that end a loop, so one would fail here rather than hang.
+    saveEdit
+      .mockResolvedValueOnce({ outcome: "needs_choice" })
+      .mockResolvedValueOnce({ outcome: "needs_choice" })
+      .mockResolvedValue({ outcome: "failed", message: "Sent a third time." });
+    choicesForEdit
+      .mockResolvedValueOnce({ outcome: "not_repeating" })
+      .mockResolvedValueOnce({ outcome: "not_repeating" })
+      .mockResolvedValue(choices());
+    const onClose = await open();
+    const editorSave = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(editorSave);
+    expect(
+      await screen.findByText(/changed since you chose which occurrences to change/),
+    ).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(choicesForEdit).toHaveBeenCalledTimes(2);
+    expect(saveEdit).toHaveBeenCalledTimes(2);
+    expect(choicesOpen()).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  it("says why the choices couldn't be read, with focus back on Save", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockRejectedValue(new Error("PM couldn't reach the calendar."));
+    await open(vi.fn(), undefined, occurrence);
+    const editorSave = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(editorSave);
+    expect(await screen.findByText("PM couldn't reach the calendar.")).toBeTruthy();
+    expect(choicesOpen()).toBeNull();
+    expect(saveEdit).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  it("rebases when the choices are refused because Google changed the event", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event()))
+      .mockResolvedValueOnce(ready(event({ summary: "Gym (Google)" }), ALL, "s2"));
+    choicesForEdit.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "conflict", fields: ["summary"] },
+    });
+    await open(vi.fn(), undefined, occurrence);
+    const editorSave = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Location"), { target: { value: "Room 2" } });
+    fireEvent.click(editorSave);
+    expect(
+      await screen.findByText(/This event changed in Google while you were editing/),
+    ).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Gym (Google)");
+    expect(screen.getByLabelText<HTMLInputElement>("Location").value).toBe("Room 2");
+    expect(saveEdit).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  // C9b-1b review F2: the rebase's read failing is said, with Save held while it runs and focus
+  // back on it after.
+  it("says why a rebase after the choices couldn't read the event, holding Save meanwhile", async () => {
+    let reread: (e: unknown) => void = () => {};
+    openForEdit
+      .mockResolvedValueOnce(ready(event()))
+      .mockReturnValueOnce(new Promise((_, reject) => (reread = reject)));
+    choicesForEdit.mockResolvedValue(choices({ following: { row: "conflict", fields: [] } }));
+    await open(vi.fn(), undefined, occurrence);
+    const editorSave = screen.getByRole<HTMLButtonElement>("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(editorSave);
+    await waitFor(() => expect(openForEdit).toHaveBeenCalledTimes(2));
+    expect(editorSave.disabled).toBe(true);
+    await act(async () => reread(new Error("PM couldn't open the event.")));
+    expect(await screen.findByText("PM couldn't open the event.")).toBeTruthy();
+    expect(choicesOpen()).toBeNull();
+    expect(editorSave.disabled).toBe(false);
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Gym");
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  // A conflict means nothing was written: a rebase that can't read the event says why, and
+  // doesn't mark the save as possibly in Google.
+  it("keeps a save Google refused as a conflict out of doubt when the rebase can't read", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event()))
+      .mockRejectedValueOnce(new Error("PM couldn't open the event."));
+    saveEdit.mockResolvedValue({ outcome: "conflict", fields: ["summary"] });
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("PM couldn't open the event.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Nothing has been saved to Google yet.")).toBeTruthy();
+  });
+
   it("settles an earlier change from the dialog, then closes it, keeping the words said once", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     choicesForEdit.mockResolvedValue(

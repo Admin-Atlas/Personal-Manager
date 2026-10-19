@@ -17,7 +17,7 @@
 // store, so it outlives the editor and the tab. A reload loses the notice, not the change: the
 // backend still holds it, and the dialog's pending row offers the same buttons on the next change.
 
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   cancelCalendarDelete,
   deleteCalendarEvent,
@@ -40,6 +40,7 @@ import type {
   WriteOutcome,
 } from "../../../lib/types";
 import {
+  deleteChangedText,
   deleteText,
   savedNotice,
   settleText,
@@ -475,7 +476,7 @@ export function notePartial(title: string, outcome: PartialSplit): boolean {
 
 /** Words about a repeating event kept as a notice until dismissed: what the choices said once (a
  *  change PM was making when it closed) that the user closed without choosing, so they aren't
- *  lost, or a delete whose plan changed under the user twice. */
+ *  lost, or a delete that wanted the occurrences chosen when the dialog couldn't reopen. */
 export function noteSeriesNotice(text: string) {
   put({ id: nextNotice++, tone: "warn", text });
 }
@@ -511,14 +512,95 @@ export function pruneRemoved(events: readonly CalendarEvent[], startedAt = -1) {
   if (still.length !== state.removed.size) update({ removed: new Map(still) });
 }
 
-/** Read the mirror with `read`, marked, and show again what that read settles. */
-export async function readMirror<T extends readonly CalendarEvent[]>(
+/** The calendar's reads of the mirror, with `read`: each one marked, and only the newest one started
+ *  is applied (`apply`) and shows again what it settles. An older read that lands after a newer one
+ *  began is dropped whole, pruning nothing: it may have started before a delete it no longer has
+ *  settled, and would show that row again until the newer read lands. `failed`: the newest read
+ *  threw. A delete that settles starts one more read, since the read the backend's landing starts
+ *  can begin before the settle is heard, and so can't show again a row the delete left in Google.
+ *  Keep the three functions stable; the answer is the read to call. */
+export function useMirrorReads<T extends readonly CalendarEvent[]>(
   read: () => Promise<T>,
-): Promise<T> {
-  const mark = readMark();
-  const events = await read();
-  pruneRemoved(events, mark);
-  return events;
+  apply: (events: T) => void,
+  failed: () => void,
+): () => Promise<void> {
+  const latest = useRef(0);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  const load = useCallback(async () => {
+    const mine = ++latest.current;
+    const mark = readMark();
+    try {
+      const events = await read();
+      if (!alive.current || mine !== latest.current) return;
+      pruneRemoved(events, mark);
+      apply(events);
+    } catch {
+      if (alive.current && mine === latest.current) failed();
+    }
+  }, [read, apply, failed]);
+  const { settles } = useSyncExternalStore(subscribe, () => state);
+  const settlesSeen = useRef(settles);
+  useEffect(() => {
+    if (settles === settlesSeen.current) return;
+    settlesSeen.current = settles;
+    void load();
+  }, [settles, load]);
+  return load;
+}
+
+/** What the delete dialog is asking about: the event, and `reask` when it reopened because the
+ *  backend wanted the occurrences chosen (`again`: a choice was made, but the plan changed since). */
+export interface DeleteAsk {
+  event: CalendarEvent;
+  reask: { again: boolean } | null;
+}
+
+/** The delete dialog's state and its delete. A delete's answer can come seconds later (a delete of
+ *  chosen occurrences reads Google first), and one that wants the occurrences chosen reopens the
+ *  dialog once, asking whatever the row says. It never replaces a dialog opened meanwhile, nor
+ *  opens over the editor (`editorOpen`): a notice says to delete again instead, as it does when the
+ *  plan keeps changing under the user. */
+export function useDeleteDialog(editorOpen: boolean) {
+  const [asked, setAskedState] = useState<DeleteAsk | null>(null);
+  // What's open now, readable when a delete's answer lands.
+  const open = useRef<DeleteAsk | null>(null);
+  const editor = useRef(editorOpen);
+  useEffect(() => {
+    editor.current = editorOpen;
+  }, [editorOpen]);
+  const setAsked = useCallback((next: DeleteAsk | null) => {
+    open.current = next;
+    setAskedState(next);
+  }, []);
+  const ask = useCallback((event: CalendarEvent) => setAsked({ event, reask: null }), [setAsked]);
+  const close = useCallback(() => setAsked(null), [setAsked]);
+  const confirm = useCallback(
+    (event: CalendarEvent, picked: Picked | null) => {
+      const reasked = open.current?.reask != null;
+      setAsked(null);
+      void startDelete(event, picked).then((r) => {
+        if (r !== "ask") return;
+        if (reasked || open.current !== null || editor.current) {
+          // Chosen, and the plan changed since; or never asked, and something else is open now.
+          noteSeriesNotice(
+            picked
+              ? deleteChangedText(event.summary).text
+              : deleteText({ outcome: "needs_choice" }, event.summary).text,
+          );
+          return;
+        }
+        setAsked({ event, reask: { again: picked !== null } });
+      });
+    },
+    [setAsked],
+  );
+  return { asked, ask, close, confirm };
 }
 
 /** The calendar's view of the writes in flight: notices, the rows to hide (held or removed), and
