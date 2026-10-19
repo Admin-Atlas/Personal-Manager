@@ -325,7 +325,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     setBanner(null);
     let stayOpen = true;
     try {
-      const outcome = await saveEdit(loaded.session, changes);
+      const outcome = await saveEdit(loaded.session, changes, null, current.summary);
       switch (outcome.outcome) {
         case "saved":
           noteSaved(current.summary, outcome);

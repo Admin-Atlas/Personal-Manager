@@ -157,7 +157,7 @@ export function SaveChoicesDialog({
         </div>
       )}
       {view.state === "refused" && (
-        <Callout as="p" tone={CALLOUT_TONE[view.tone]} size="md" className="mt-3">
+        <Callout as="p" tone={CALLOUT_TONE[view.tone]} size="md" className="mt-3" live>
           {view.text}
         </Callout>
       )}

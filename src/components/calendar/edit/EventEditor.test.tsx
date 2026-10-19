@@ -19,12 +19,17 @@ import type {
 
 const openForEdit = vi.fn<(id: string) => Promise<EditLoad>>();
 const saveEdit = vi.fn<(session: string, changes: unknown) => Promise<WriteOutcome>>();
+const savedTitles: string[] = [];
 const noteSaved = vi.fn();
 let deviceZone: string | null = "Europe/London";
 
 vi.mock("./useEventWrites", () => ({
   openForEdit: (id: string) => openForEdit(id),
-  saveEdit: (s: string, c: unknown) => saveEdit(s, c),
+  // The title goes aside, so a save's notice can't fall back to "(no title)" unseen.
+  saveEdit: (s: string, c: unknown, _p: unknown, t: string) => {
+    savedTitles.push(t);
+    return saveEdit(s, c);
+  },
   noteSaved: (...a: unknown[]) => noteSaved(...a),
 }));
 
@@ -161,6 +166,7 @@ describe("EventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Dentist (moved)" });
+    expect(savedTitles[savedTitles.length - 1]).toBe("Dentist (moved)");
     expect(noteSaved).toHaveBeenCalledWith("Dentist (moved)", {
       outcome: "saved",
       warnings: [],

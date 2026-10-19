@@ -264,6 +264,12 @@ describe("SaveChoicesDialog", () => {
     expect(button("Save").disabled).toBe(true);
   });
 
+  it("announces a refusal of any tone, since it arrives after the dialog opened", () => {
+    open({ view: { state: "refused", tone: "warn", text: "It changed in Google." } });
+    const announced = screen.getAllByRole("status").map((el) => el.textContent);
+    expect(announced).toContain("It changed in Google.");
+  });
+
   it("closes on Escape", () => {
     const { onClose } = open();
     fireEvent.keyDown(window, { key: "Escape" });

@@ -39,7 +39,11 @@ export function WriteNotices({ notices, onUndo, onDismiss, onSettle }: Props) {
             size="md"
             body="ink"
             live
-            className="flex flex-wrap items-center justify-between gap-3 text-ink2 shadow-lg"
+            // Only a notice with settle buttons wraps them under its words; the rest keep × beside
+            // the text, as before.
+            className={`flex items-center justify-between gap-3 text-ink2 shadow-lg${
+              n.split ? " flex-wrap" : ""
+            }`}
             style={{
               background: `color-mix(in oklab, var(${TONE_TOKEN[tone]}) ${TONE_MIX.surface}%, var(--bg))`,
             }}

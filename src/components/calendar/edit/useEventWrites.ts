@@ -389,8 +389,8 @@ export type SaveAnswer = WriteOutcome & { newPartial?: boolean };
 export async function saveEdit(
   session: string,
   changes: EventPatchDraft,
-  picked: Picked | null = null,
-  title = "",
+  picked: Picked | null,
+  title: string,
 ): Promise<SaveAnswer> {
   const outcome = await updateCalendarEvent(
     session,

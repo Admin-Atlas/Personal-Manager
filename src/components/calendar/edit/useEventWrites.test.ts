@@ -472,7 +472,7 @@ describe("a repeating event", () => {
     );
     await act(async () => {
       await mod.saveEdit("sess", changes, { scope: "all", token: "a" }, "Gym");
-      await mod.saveEdit("sess", changes);
+      await mod.saveEdit("sess", changes, null, "Gym");
     });
     expect(updateCalendarEvent.mock.calls).toEqual([
       ["sess", changes, "all", "a"],
@@ -623,6 +623,22 @@ describe("a repeating event", () => {
       tone: "error",
       text: "“Gym”: PM's backend didn't answer.",
       split: { token: "p", offers: ["check"], title: "Gym" },
+    });
+  });
+
+  it("keeps a notice's own offers when its settle gets no answer", async () => {
+    const { mod, hook, act } = await load();
+    act(() => {
+      mod.notePartial("Gym", partial(["finish", "remove"]));
+    });
+    const id = hook.result.current.notices[0].id;
+    settleSeriesSplit.mockRejectedValueOnce(new Error("PM's backend didn't answer."));
+    await act(() => mod.settleSplit("s1", "finish", "Gym"));
+    expect(hook.result.current.notices).toHaveLength(1);
+    expect(hook.result.current.notices[0]).toMatchObject({
+      id,
+      tone: "error",
+      split: { token: "s1", offers: ["finish", "remove"] },
     });
   });
 
