@@ -47,6 +47,7 @@ import {
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import type { Picked } from "../../../lib/calendarEdit/saveChoices";
+import { isAnyDialogOpen } from "../../../lib/useDialogLayer";
 import { deviceTimeZoneOrNull } from "../../../theme";
 
 /** A line the calendar shows about a write: what happened, and an Undo while one is offered. */
@@ -564,16 +565,25 @@ export interface DeleteAsk {
 /** The delete dialog's state and its delete. A delete's answer can come seconds later (a delete of
  *  chosen occurrences reads Google first), and one that wants the occurrences chosen reopens the
  *  dialog once, asking whatever the row says. It never replaces a dialog opened meanwhile, nor
- *  opens over the editor (`editorOpen`): a notice says to delete again instead, as it does when the
- *  plan keeps changing under the user. */
-export function useDeleteDialog(editorOpen: boolean) {
+ *  opens over any other dialog (the editor, the command palette) or over what `openElsewhere` says
+ *  is open that isn't one (the event popover), nor once the Calendar tab has gone: a notice says to
+ *  delete again instead, as it does when the plan keeps changing under the user. */
+export function useDeleteDialog(openElsewhere: () => boolean) {
   const [asked, setAskedState] = useState<DeleteAsk | null>(null);
   // What's open now, readable when a delete's answer lands.
   const open = useRef<DeleteAsk | null>(null);
-  const editor = useRef(editorOpen);
+  const elsewhere = useRef(openElsewhere);
   useEffect(() => {
-    editor.current = editorOpen;
-  }, [editorOpen]);
+    elsewhere.current = openElsewhere;
+  }, [openElsewhere]);
+  // Whether the calendar still shows: an answer after the tab unmounted can't open the dialog.
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   const setAsked = useCallback((next: DeleteAsk | null) => {
     open.current = next;
     setAskedState(next);
@@ -586,8 +596,15 @@ export function useDeleteDialog(editorOpen: boolean) {
       setAsked(null);
       void startDelete(event, picked).then((r) => {
         if (r !== "ask") return;
-        if (reasked || open.current !== null || editor.current) {
-          // Chosen, and the plan changed since; or never asked, and something else is open now.
+        if (
+          reasked ||
+          !alive.current ||
+          open.current !== null ||
+          isAnyDialogOpen() ||
+          elsewhere.current()
+        ) {
+          // Chosen, and the plan changed since; or never asked, and the calendar has gone or
+          // something else is open now.
           noteSeriesNotice(
             picked
               ? deleteChangedText(event.summary).text

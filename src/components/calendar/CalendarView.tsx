@@ -448,6 +448,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   useEffect(() => {
     popoverOpenRef.current = eventPopup !== null;
   }, [eventPopup]);
+  const popoverOpen = useCallback(() => popoverOpenRef.current, []);
   // The popover's own close, which hands focus back as its Escape does (it fills this in).
   const popoverCloseRef = useRef<(() => void) | null>(null);
 
@@ -627,8 +628,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // The popover's editing actions for `ev`. Delete closes the popover and asks first.
   // The event open in the editor (null = closed).
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
-  // The delete dialog: the event it asks about (null = closed), and the delete it sends.
-  const deleteDialog = useDeleteDialog(editing !== null);
+  // The delete dialog: the event it asks about (null = closed), and the delete it sends. It sees open
+  // dialogs (the editor among them) itself; the popover isn't one.
+  const deleteDialog = useDeleteDialog(popoverOpen);
   const confirmDelete = deleteDialog.asked?.event ?? null;
   // The address of the account a synced event's calendar belongs to.
   const accountOf = (ev: CalendarEvent): string | null => {
