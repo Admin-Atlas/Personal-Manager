@@ -253,6 +253,17 @@ describe("CalendarPicker", () => {
     );
   });
 
+  // A click on a Mac leaves focus where it was (jsdom's click does the same).
+  it("Escape closes the list with focus on the button, even after a click that didn't focus it", async () => {
+    const { trigger, list } = open();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(list).getByRole("radio", { name: "Personal" })),
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Calendars that can take a new event" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("closes when it's disabled, and doesn't come back by itself", () => {
     const props = {
       targets: createTargets(overview),

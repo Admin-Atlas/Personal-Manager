@@ -14,8 +14,9 @@
 // locked, the ghost is told how far the event has got, and the calendar list the keyboard can reach
 // stays inside the box. Repeating (C11): a ready-made rule is sent with the create, one the backend
 // refuses stops every save (a start the clocks skip said once), one from before the months PM syncs
-// is said to show inside them, a rule's own day follows a moved date, and Custom… carries on in the
-// full editor with its dialog open, sending nothing.
+// is said to show inside them, a rule's own day follows a moved date, the Repeat list stays inside
+// the box (Escape there closing only it), and Custom…, clicked or reached by the keyboard, carries
+// on in the full editor with its dialog open, sending nothing.
 
 import { createRef, StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -1058,14 +1059,25 @@ describe("QuickCreatePopover", () => {
 
   // --- repeating (C11) ---
 
-  const repeat = () => screen.getByRole<HTMLSelectElement>("combobox", { name: "Repeat" });
+  const repeat = () => screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / });
+  /** The rule the Repeat button names. */
+  const shownRepeat = () =>
+    repeat()
+      .getAttribute("aria-label")
+      ?.replace(/^Repeat: /, "");
+  const REPEATS = { name: "Repeat" };
 
-  /** Pick the Repeat row whose words are `label`, as a click picks it, once the menu has them. */
-  async function pickRepeat(label: string) {
+  /** Open the Repeat list, once the menu has its ready-made rules. */
+  async function openRepeat() {
     await act(async () => {});
-    const option = Array.from(repeat().options).find((o) => o.text === label);
-    if (!option) throw new Error(`no row ${label}`);
-    fireEvent.change(repeat(), { target: { value: option.value } });
+    fireEvent.click(repeat());
+    return screen.getByRole("group", REPEATS);
+  }
+
+  /** Click the Repeat row whose words are `label`. */
+  async function pickRepeat(label: string) {
+    const list = await openRepeat();
+    fireEvent.click(within(list).getByRole("radio", { name: label }), { detail: 1 });
     await act(async () => {});
   }
 
@@ -1074,7 +1086,7 @@ describe("QuickCreatePopover", () => {
     const { onClose } = open();
     fireEvent.change(title(), { target: { value: "Standup" } });
     await pickRepeat("Weekly on Monday");
-    expect(repeat().selectedOptions[0].text).toBe("Weekly on Monday");
+    expect(shownRepeat()).toBe("Weekly on Monday");
     // It starts on the day picked, so nothing says it moved.
     expect(screen.queryByText(/the first day this repeat allows/)).toBeNull();
     fireEvent.keyDown(title(), { key: "Enter" });
@@ -1148,17 +1160,60 @@ describe("QuickCreatePopover", () => {
     fireEvent.change(date, { target: { value: "13-10-2026" } });
     fireEvent.blur(date);
     await act(async () => {});
-    expect(repeat().selectedOptions[0].text).toBe("Weekly on Tuesday");
+    expect(shownRepeat()).toBe("Weekly on Tuesday");
     fireEvent.keyDown(title(), { key: "Enter" });
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
     expect(createEvent.mock.calls[0][1].recurrence).toEqual(weeklyOn("tue"));
+  });
+
+  // The Repeat list stays inside the box, as in the full editor's dialog, and Escape there closes
+  // the list, never the box (even an empty one, which Escape in the box itself would close).
+  it("the Repeat list is inside the box, and Escape closes only it", async () => {
+    const { onClose } = open();
+    const list = await openRepeat();
+    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    const picked = within(list).getByRole("radio", { name: "Does not repeat" });
+    await waitFor(() => expect(document.activeElement).toBe(picked));
+    fireEvent.keyDown(picked, { key: "Escape" });
+    expect(screen.queryByRole("group", REPEATS)).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(repeat());
+  });
+
+  it("Custom… reached by the keyboard hands over on Enter, and an arrow key never does", async () => {
+    const { onMore } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    const list = await openRepeat();
+    const picked = within(list).getByRole("radio", { name: "Does not repeat" });
+    await waitFor(() => expect(document.activeElement).toBe(picked));
+    // The arrow keys go round the rules only: up from the first is the last.
+    fireEvent.keyDown(picked, { key: "ArrowUp" });
+    const last = within(list).getByRole("radio", { name: "Weekly on Monday" });
+    last.focus();
+    fireEvent.click(last, { detail: 0 });
+    await act(async () => {});
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    expect(onMore).not.toHaveBeenCalled();
+    // Tab reaches Custom…, and Enter (its click) hands over.
+    fireEvent.keyDown(last, { key: "Tab" });
+    const custom = within(list).getByRole("button", { name: "Custom…" });
+    expect(document.activeElement).toBe(custom);
+    expect(fireEvent.keyDown(custom, { key: "Enter" })).toBe(true);
+    fireEvent.click(custom, { detail: 0 });
+    expect(onMore).toHaveBeenCalledTimes(1);
+    expect(onMore.mock.lastCall![0]).toMatchObject({
+      draft: { recurrence: { kind: "rule", rule: weeklyOn("mon") } },
+      openCustom: true,
+    });
+    expect(createEvent).not.toHaveBeenCalled();
   });
 
   it("Custom… hands over to the full editor with the custom dialog open, sending nothing", async () => {
     const { onMore, onClose } = open();
     fireEvent.change(title(), { target: { value: "Standup" } });
     await pickRepeat("Weekly on Monday");
-    fireEvent.change(repeat(), { target: { value: "custom" } });
+    const list = await openRepeat();
+    fireEvent.click(within(list).getByRole("button", { name: "Custom…" }), { detail: 1 });
     expect(createEvent).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
     expect(onMore).toHaveBeenCalledWith({

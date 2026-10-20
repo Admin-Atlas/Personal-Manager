@@ -12,8 +12,9 @@
 // in quick create) refusing every save until its own field is given one (that field named, marked,
 // and where a save it stops puts focus), and a calendar list the keyboard can reach.
 //
-// Repeating (C11): the rule chosen is sent, and the Repeat menu, arrowed through, never shows a rule
-// the draft doesn't hold; the backend's words say where it really starts, or why it can't be saved
+// Repeating (C11): the rule chosen is sent, and the Repeat button, its list arrowed through, names
+// exactly the rule a save sends; the list sits inside the dialog and Escape closes only it, never
+// the editor; the backend's words say where it really starts, or why it can't be saved
 // (a start the clocks skip said once), and every way to save but Check again waits for them; the
 // zone it repeats in is said when it isn't this computer's; one from before the months PM syncs is
 // said to show inside them; a rule's own day follows a moved start; and the Custom dialog, opened
@@ -1141,18 +1142,33 @@ describe("NewEventEditor", () => {
 
   // --- repeating (C11) ---
 
-  const repeat = () => screen.getByRole<HTMLSelectElement>("combobox", { name: "Repeat" });
+  const repeat = () => screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / });
   const saveButton = () => screen.getByRole<HTMLButtonElement>("button", { name: "Save" });
-  const shownRepeat = () => repeat().selectedOptions[0]?.text;
+  /** The rule the Repeat button names. */
+  const shownRepeat = () =>
+    repeat()
+      .getAttribute("aria-label")
+      ?.replace(/^Repeat: /, "");
+  const REPEATS = { name: "Repeat" };
 
-  /** Pick the Repeat row whose words are `label`, as a click picks it, once the menu has them; and
-   *  let the backend's words for it land. */
+  /** Open the Repeat list, once the menu has its ready-made rules. */
+  async function openRepeat() {
+    await act(async () => {});
+    fireEvent.click(repeat());
+    return screen.getByRole("group", REPEATS);
+  }
+
+  /** Click the Repeat row whose words are `label`; and let the backend's words for it land. */
   async function pickRepeat(label: string) {
+    const list = await openRepeat();
+    fireEvent.click(within(list).getByRole("radio", { name: label }), { detail: 1 });
     await act(async () => {});
-    const option = Array.from(repeat().options).find((o) => o.text === label);
-    if (!option) throw new Error(`no row ${label}`);
-    fireEvent.change(repeat(), { target: { value: option.value } });
-    await act(async () => {});
+  }
+
+  /** Click Custom… in the Repeat list. */
+  async function chooseCustom() {
+    const list = await openRepeat();
+    fireEvent.click(within(list).getByRole("button", { name: "Custom…" }), { detail: 1 });
   }
 
   /** A timed event on `date`, 09:00 to 10:00 in `zone`. */
@@ -1192,31 +1208,56 @@ describe("NewEventEditor", () => {
     ]);
   });
 
-  /** ArrowDown on the closed Repeat select as Linux and Windows take it: its own handler, then a
-   *  step to the next row that's on, which changes the value; and the backend's words for it. */
-  async function arrowDown() {
-    const el = repeat();
-    fireEvent.keyDown(el, { key: "ArrowDown" });
-    const next = Array.from(el.options).find((o) => !o.disabled && o.index > el.selectedIndex);
-    if (next) fireEvent.change(el, { target: { value: next.value } });
-    await act(async () => {});
-  }
-
-  // The menu never shows a rule the draft doesn't hold, so a save sends what it shows.
-  it("arrowed past every rule, the menu shows the last, and Ctrl+S sends exactly that", async () => {
+  // The arrow keys move the rule and the button follows, so a save sends what the button names.
+  it("arrowed through the Repeat list, Ctrl+S sends exactly the rule the button names", async () => {
     createEvent.mockResolvedValue(saved);
     const { onClose } = open();
     fireEvent.change(title(), { target: { value: "Standup" } });
     await act(async () => {});
+    // Enter or Space on a button is its click, with no pointer behind it.
     repeat().focus();
-    for (let i = 0; i < 3; i++) await arrowDown();
+    fireEvent.click(repeat(), { detail: 0 });
+    const list = screen.getByRole("group", REPEATS);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(list).getByRole("radio", { name: "Does not repeat" }),
+      ),
+    );
+    // An arrow key: the browser moves focus and the choice, with a click no pointer made.
+    for (const name of ["Daily", "Weekly on Monday"]) {
+      fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+      const next = within(list).getByRole("radio", { name });
+      next.focus();
+      fireEvent.click(next, { detail: 0 });
+      await act(async () => {});
+    }
     expect(shownRepeat()).toBe("Weekly on Monday");
+    expect(screen.queryByRole("group", REPEATS)).not.toBeNull();
     expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
     await ctrlS();
+    // The save closes the list.
+    expect(screen.queryByRole("group", REPEATS)).toBeNull();
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls).toEqual([
       [PERSONAL, { ...sentFor("Standup").draft, recurrence: MONDAYS }, null],
     ]);
+  });
+
+  // The list sits inside the dialog, so its focus trap and aria-modal cover it; Escape there closes
+  // only the list, focus back on its button.
+  it("the Repeat list is inside the dialog, and Escape closes only it", async () => {
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Gym" } });
+    const list = await openRepeat();
+    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    const picked = within(list).getByRole("radio", { name: "Does not repeat" });
+    await waitFor(() => expect(document.activeElement).toBe(picked));
+    fireEvent.keyDown(picked, { key: "Escape" });
+    expect(screen.queryByRole("group", REPEATS)).toBeNull();
+    expect(screen.getByRole("dialog", { name: "New event" })).toBeTruthy();
+    expect(screen.queryByText("Discard this new event?")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(repeat());
   });
 
   it("a long rule's words never widen the editor", async () => {
@@ -1227,8 +1268,10 @@ describe("NewEventEditor", () => {
     });
     await act(async () => {});
     expect(shownRepeat()).toBe(LONG);
-    // The menu fits its row, and the When fields may be narrower than the widest thing in them.
+    // The button fits its row, its words wrapping, and the When fields may be narrower than the
+    // widest thing in them.
     expect(repeat().className.split(" ")).toContain("max-w-full");
+    expect(within(repeat()).getByText(LONG).className).not.toMatch(/truncate|whitespace-nowrap/);
     expect(screen.getByRole("group", { name: "When" }).className.split(" ")).toContain("min-w-0");
   });
 
@@ -1467,9 +1510,7 @@ describe("NewEventEditor", () => {
     );
     const { onClose } = open();
     fireEvent.change(title(), { target: { value: "Gym" } });
-    await act(async () => {});
-    repeat().focus();
-    fireEvent.change(repeat(), { target: { value: "custom" } });
+    await chooseCustom();
     const custom = screen.getByRole("dialog", { name: "Custom recurrence" });
     // Weekly on the start's own day to begin with, as Google's dialog opens.
     expect(
@@ -1489,9 +1530,7 @@ describe("NewEventEditor", () => {
   it("Escape in the custom dialog leaves the editor open", async () => {
     const { onClose } = open();
     fireEvent.change(title(), { target: { value: "Gym" } });
-    await act(async () => {});
-    repeat().focus();
-    fireEvent.change(repeat(), { target: { value: "custom" } });
+    await chooseCustom();
     expect(screen.getByRole("dialog", { name: "Custom recurrence" })).toBeTruthy();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
@@ -1507,8 +1546,7 @@ describe("NewEventEditor", () => {
     createEvent.mockResolvedValue(saved);
     open();
     fireEvent.change(title(), { target: { value: "Gym" } });
-    await act(async () => {});
-    fireEvent.change(repeat(), { target: { value: "custom" } });
+    await chooseCustom();
     await ctrlS();
     expect(createEvent).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog", { name: "Custom recurrence" })).toBeTruthy();
