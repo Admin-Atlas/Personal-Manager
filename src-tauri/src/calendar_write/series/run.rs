@@ -749,8 +749,15 @@ impl Run {
                 verdict: Verdict::Ok,
                 body: Some(b),
                 ..
-            } if self.plan.verdict(self.at, Some(&b)) == Applied::Yes => {
-                self.apply(Read::Done(Some(b), None))
+            } => {
+                let read = match self.plan.verdict(self.at, Some(&b)) {
+                    Applied::Yes => Read::Done(Some(b), None),
+                    // Its own copy, cancelled in Google since: gone, as on the first look (C10
+                    // critique 1 L11).
+                    Applied::No => self.not_landed(Some(b)),
+                    Applied::Unknown => Read::Unknown,
+                };
+                self.apply(read)
             }
             // Still not there after a pause: post it again under the same id (A9). If the first
             // copy landed after all, Google refuses this one as a duplicate.
@@ -2919,6 +2926,21 @@ mod tests {
             assert!(matches!(ran, Ran::NotDone { why: Why::Gone, .. }));
             assert_eq!(posts(&sent).len(), 1);
         }
+        // On the second look too, after a first that found nothing: gone, never posted again.
+        let mut looks = 0;
+        let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+            Method::Insert => lost(),
+            _ => {
+                looks += 1;
+                if looks == 1 {
+                    status(Verdict::Gone)
+                } else {
+                    ok(cancelled.clone())
+                }
+            }
+        });
+        assert!(matches!(ran, Ran::NotDone { why: Why::Gone, .. }));
+        assert_eq!((posts(&sent).len(), looks), (1, 2));
         let (ran, _, _) = drive(&mut Run::new(plan).unwrap(), |_| ok(cancelled.clone()));
         assert!(matches!(ran, Ran::NotDone { why: Why::Gone, .. }));
     }
@@ -2926,7 +2948,8 @@ mod tests {
     /// Every sequence of answers to depth five (two POSTs, three looks): at most two POSTs, each
     /// the same request under PM's id, nobody emailed and no Meet of Google's own; done only once
     /// Google showed the new event; gone only once it showed it cancelled; not done otherwise only
-    /// on a first answer that proves nothing went (unsent) or a 404 to the first POST.
+    /// on a first answer that proves nothing went (unsent) or a 404 to the first POST; unknown
+    /// never once Google showed a copy, live or cancelled.
     #[test]
     fn every_create_answer_sequence_sends_at_most_two_posts_under_one_id() {
         let plan = create_plan();
@@ -3004,7 +3027,9 @@ mod tests {
                     }
                     Ran::Unknown { .. } => {
                         seen.3 += 1;
-                        assert!(!proof_first, "{p}/{g}");
+                        // A copy Google showed, live or cancelled, always settles it (C10
+                        // critique 1 L11): on the first look or the second.
+                        assert!(!proof_first && !live && !gone, "{p}/{g}");
                     }
                 }
             }

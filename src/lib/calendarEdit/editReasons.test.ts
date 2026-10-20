@@ -186,12 +186,13 @@ describe("edit reasons", () => {
   });
 
   it("ambiguous has words", () => {
-    // A new event whose answer never arrived: it may be there, and Check again won't duplicate it.
-    // Never "wasn't created", and never the token in the words.
+    // A new event whose answer never arrived: it may be there, and Check again looks before it
+    // sends. Never "wasn't created", never a promise that no second copy can be made (Google can't
+    // always catch a repeated id), and never the token in the words.
     const said = outcomeText({ outcome: "ambiguous", retry_token: "ref-1" });
     expect(said).toEqual({
       tone: "warn",
-      text: "PM lost touch with Google while creating this event, so it may already be in your calendar. Check again: PM looks for it first and won't make a second copy.",
+      text: "PM lost touch with Google while creating this event, so it may already be in your calendar. Check again: PM looks for it first and sends it again only if Google still doesn't show it.",
     });
     expect(said.text).not.toContain("ref-1");
     expect(settleText({ outcome: "ambiguous", retry_token: "ref-1" }, "Dentist").tone).toBe("warn");

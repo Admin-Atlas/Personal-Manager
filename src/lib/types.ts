@@ -1732,7 +1732,8 @@ export type WriteOutcome =
   /** The answer never arrived and PM couldn't look afterwards: it may or may not have happened. */
   | { outcome: "unconfirmed" }
   /** A new event whose answer never arrived: creating it again with `retry_token` looks for it
-   *  first and never makes a second copy. PM's own token, never the event's id. */
+   *  first and sends it again, under the same id, only if Google still doesn't show it, so a
+   *  second copy is very unlikely. PM's own token, never the event's id. */
   | { outcome: "ambiguous"; retry_token: string }
   | { outcome: "failed"; message: string };
 

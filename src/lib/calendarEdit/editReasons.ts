@@ -250,7 +250,7 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
     case "ambiguous":
       return {
         tone: "warn",
-        text: "PM lost touch with Google while creating this event, so it may already be in your calendar. Check again: PM looks for it first and won't make a second copy.",
+        text: "PM lost touch with Google while creating this event, so it may already be in your calendar. Check again: PM looks for it first and sends it again only if Google still doesn't show it.",
       };
     case "failed":
       return { tone: "error", text: outcome.message };

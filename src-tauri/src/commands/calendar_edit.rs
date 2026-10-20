@@ -17,7 +17,8 @@
 //!
 //! Creating an event (C10) has nothing to read first: it goes out under an id PM chose, and an
 //! answer that never arrives is looked for under that id before anything is sent again (A9), so a
-//! dropped connection can't make a second copy.
+//! dropped connection very rarely makes a second copy (Google can't always catch a repeated id,
+//! which is why the posts under one id are capped, [`MAX_POSTS`]).
 //!
 //! Every outcome comes back as data (`WriteOutcome`), so the editor keeps the draft and explains.
 //! Nothing here is reachable from a model: no model call has tools, the commands refuse any window
@@ -858,10 +859,13 @@ const NOT_SYNCED: &str = "PM doesn't sync this calendar, so it won't create even
 const CREATE_LOST: &str = "PM lost touch with Google and can't tell whether this new event was \
                            made. Look for it in Google Calendar before creating it again, so it \
                            isn't made twice.";
-/// A retry naming another calendar, or a draft other than the one sent (C10 critique 2 M2).
+/// A retry naming another calendar, or a draft other than the one sent (C10 critique 2 M2). The
+/// webview drops its token on this, so the words can't offer a Check again; the earlier event may
+/// be there all the same.
 const CREATE_CHANGED: &str = "This differs from the new event PM was creating when it lost touch \
-                              with Google, so PM didn't send it. Check again with the event as it \
-                              was then.";
+                              with Google, so PM didn't send it. PM may already have made the \
+                              earlier one: look for it in Google Calendar before creating it \
+                              again, so it isn't made twice.";
 /// The new event went to Google [`MAX_POSTS`] times without a readable answer (C10 critique 1 M5).
 const CREATE_LATER: &str = "PM has already sent this new event to Google more than once without \
                             hearing back, so it won't send it again. Check again later: PM looks \
@@ -1230,6 +1234,13 @@ async fn retry_create<W: Wire, H: Host>(
     if held.posts >= MAX_POSTS {
         return WriteOutcome::Failed {
             message: CREATE_LATER.into(),
+        };
+    }
+    // A re-send meets the refusals a first send does: a calendar PM stopped syncing since would
+    // land nothing. The create stays held, so a look can still find it.
+    if !ctx.target.selected {
+        return WriteOutcome::Failed {
+            message: NOT_SYNCED.into(),
         };
     }
     if let Some(reason) = create_blocked(ctx, &held.body) {
@@ -13421,6 +13432,13 @@ mod tests {
             .map(|h| h.posts)
     }
 
+    /// Say the create `token` names was last sent `at`, to age it without waiting.
+    fn set_held_at(host: &TestHost, token: &str, at: Instant) {
+        if let Some(held) = host.edit.creates.lock().unwrap().get_mut(token) {
+            held.at = at;
+        }
+    }
+
     fn new_row(host: &TestHost) -> Option<CalendarEvent> {
         host.with_conn(|conn| calendar::event_by_id(conn, &format!("cal:{NEW}")))
             .unwrap()
@@ -13946,15 +13964,123 @@ mod tests {
         }
     }
 
+    /// A retry running holds its claim and has taken the create out, as `retry_create` does: a
+    /// second one is Busy, never told the token is lost, and sends nothing (claim before take).
     #[tokio::test]
     async fn a_retry_while_one_runs_is_busy() {
         let host = TestHost::holding(&[]);
         lost_create(&host).await;
         let claim = InFlight::claim(&host.edit, &create_key("ref-1")).unwrap();
-        let (outcome, _) = create(&host, Vec::new(), Some("ref-1")).await;
-        assert!(outcome == WriteOutcome::Busy, "busy");
-        assert_eq!(held_creates(&host), 1);
+        let (taken, _held) = TakenCreate::take(&host.edit, "ref-1").unwrap();
+        assert_eq!(held_creates(&host), 0);
+        let (outcome, script) = create(&host, Vec::new(), Some("ref-1")).await;
+        assert!(outcome == WriteOutcome::Busy, "busy, not lost");
+        assert!(script.sent().is_empty());
+        // The running one ends: the create goes back under its token.
+        drop(taken);
         drop(claim);
+        assert_eq!(held_creates(&host), 1);
+        assert_eq!(held_posts(&host, "ref-1"), Some(2));
+    }
+
+    /// The eight hours run out with no prune but the command's own: a retry after them is told
+    /// the token is lost, and nothing is sent.
+    #[tokio::test]
+    async fn a_retry_past_the_eight_hours_finds_the_token_lapsed() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        // Only where the clock reaches back that far (every Unix one), as `local_slot`'s TTL test.
+        let Some(old) = Instant::now().checked_sub(SESSION_TTL + Duration::from_secs(1)) else {
+            return;
+        };
+        set_held_at(&host, "ref-1", old);
+        let (outcome, script) = create(&host, Vec::new(), Some("ref-1")).await;
+        assert!(outcome == failed(CREATE_LOST), "lapsed");
+        assert!(script.sent().is_empty());
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    /// A re-send starts the eight hours over: a create sent again just before they ran out is
+    /// still held after them.
+    #[tokio::test]
+    async fn a_resend_starts_the_eight_hours_over() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let Some(old) = Instant::now().checked_sub(SESSION_TTL - Duration::from_secs(60)) else {
+            return;
+        };
+        set_held_at(&host, "ref-1", old);
+        let (outcome, _) = create(
+            &host,
+            vec![
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(lost()),
+                new_read(absent()),
+            ],
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == ambiguous("ref-1"), "held");
+        host.edit
+            .prune_creates(Instant::now() + Duration::from_secs(120));
+        assert_eq!(
+            held_posts(&host, "ref-1"),
+            Some(3),
+            "kept past the old eight hours"
+        );
+    }
+
+    /// A re-send Google answers with the copy cancelled, or one whose answer is lost and then
+    /// found cancelled: made, then deleted in Google. Gone, the token with it.
+    #[tokio::test]
+    async fn a_resend_that_meets_a_cancelled_copy_says_gone() {
+        let cancelled = with(
+            google_copy(&dentist_draft(), "\"n2\""),
+            "status",
+            json!("cancelled"),
+        );
+        for tail in [
+            vec![insert_step(Scripted::Json(cancelled.clone()))],
+            vec![
+                insert_step(lost()),
+                new_read(Scripted::Json(cancelled.clone())),
+            ],
+        ] {
+            let host = TestHost::holding(&[]);
+            lost_create(&host).await;
+            let mut steps = vec![new_read(absent()), new_read(absent())];
+            steps.extend(tail);
+            let (outcome, script) = create(&host, steps, Some("ref-1")).await;
+            assert!(outcome == WriteOutcome::Gone, "gone");
+            assert_eq!(inserts(&script).len(), 1);
+            assert_eq!(held_creates(&host), 0);
+            assert!(new_row(&host).is_none());
+        }
+    }
+
+    /// A retry into a calendar PM stopped syncing still looks, but never sends it again there:
+    /// refused as a first create is, the token kept.
+    #[tokio::test]
+    async fn a_retry_never_resends_into_a_calendar_pm_doesnt_sync() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let unsynced = CalendarTarget {
+            selected: false,
+            ..new_target()
+        };
+        let (outcome, script) = create_on(
+            &host,
+            &unsynced,
+            EditingStatus::On,
+            vec![new_read(absent()), new_read(absent())],
+            dentist_draft(),
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == failed(NOT_SYNCED), "refused before a re-send");
+        assert!(inserts(&script).is_empty());
+        assert_eq!(held_posts(&host, "ref-1"), Some(2));
     }
 
     #[tokio::test]

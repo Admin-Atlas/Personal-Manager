@@ -205,8 +205,9 @@ pub enum Stage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     /// A new event under PM's own id, minted for this plan and kept for every retry of it:
-    /// re-sending the same id can't make a second one, and a 409 means it's there (DS5). A new
-    /// plan gets a new id. A split's new series, or a new event ([`SeriesPlan::create`]).
+    /// re-sending the same id normally can't make a second one (Google warns it can't always
+    /// catch a repeated id, so the sends stay few), and a 409 means it's there (DS5). A new plan
+    /// gets a new id. A split's new series, or a new event ([`SeriesPlan::create`]).
     Insert {
         calendar: String,
         id: String,

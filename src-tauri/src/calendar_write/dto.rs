@@ -236,8 +236,9 @@ pub enum WriteOutcome {
     /// The answer never arrived and PM couldn't look afterwards: it may or may not have happened.
     Unconfirmed,
     /// A new event whose answer never arrived, and PM couldn't tell whether Google made it. Calling
-    /// the create command again with `retry_token` looks for it first and never makes a second copy
-    /// (R2). PM's own token, never the event's id (R5); it lapses after eight hours or a restart.
+    /// the create command again with `retry_token` looks for it first and sends it again, under the
+    /// same id, only if Google still doesn't show it (R2), so a second copy is very unlikely. PM's
+    /// own token, never the event's id (R5); it lapses after eight hours or a restart.
     Ambiguous {
         retry_token: String,
     },
