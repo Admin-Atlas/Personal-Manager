@@ -745,6 +745,13 @@ describe("NewEventEditor", () => {
     const endLine = screen.getByText(/^End date: “31-11-2026” isn't a date PM can read/);
     expect(start.getAttribute("aria-describedby")).toBe(startLine.id);
     expect(end.getAttribute("aria-describedby")).toBe(endLine.id);
+    // Each line has its own id, so each field is described by the line that names it: one id for
+    // both would read the start's line in End date too.
+    expect(startLine.id).not.toBe(endLine.id);
+    const said = (field: HTMLElement) =>
+      document.getElementById(field.getAttribute("aria-describedby") ?? "")?.textContent;
+    expect(said(start)).toMatch(/^Start date:/);
+    expect(said(end)).toMatch(/^End date:/);
     act(() => title().focus());
     fireEvent.keyDown(title(), { key: "Enter" });
     await act(async () => {});

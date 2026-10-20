@@ -416,6 +416,13 @@ describe("EventEditor", () => {
     );
     expect(first.getAttribute("aria-describedby")).toBe(firstLine.id);
     expect(lastLine.isConnected).toBe(true);
+    // Each line has its own id, so each field is described by the line that names it: one id for
+    // both would read the first day's line in Last day too.
+    expect(firstLine.id).not.toBe(lastLine.id);
+    const said = (field: HTMLElement) =>
+      document.getElementById(field.getAttribute("aria-describedby") ?? "")?.textContent;
+    expect(said(first)).toMatch(/^First day:/);
+    expect(said(last)).toMatch(/^Last day:/);
     await saveFromTitle();
     expect(saveEdit).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(first);
