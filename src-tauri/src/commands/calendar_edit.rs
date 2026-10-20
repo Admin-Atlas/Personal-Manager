@@ -8334,8 +8334,8 @@ mod tests {
         editing: Mutex<EditingStatus>,
         /// What a dev build's allow-list says of a settle.
         allowed: Mutex<std::result::Result<(), &'static str>>,
-        /// The day linked milestones are resolved on.
-        today: Mutex<&'static str>,
+        /// The instant linked milestones are resolved at, its day read in the zone asked for.
+        now: Mutex<chrono::DateTime<chrono::Utc>>,
         _dir: tempfile::TempDir,
     }
 
@@ -8357,9 +8357,19 @@ mod tests {
                 told: Mutex::new(Vec::new()),
                 editing: Mutex::new(EditingStatus::On),
                 allowed: Mutex::new(Ok(())),
-                today: Mutex::new("2026-10-12"),
+                now: Mutex::new(noon("2026-10-12")),
                 _dir: dir,
             })
+        }
+
+        /// Today is `day` (`YYYY-MM-DD`) in every zone these tests use (UTC, London, Honolulu).
+        fn today_is(&self, day: &str) {
+            *self.now.lock().unwrap() = noon(day);
+        }
+
+        /// It's `at` (RFC 3339): a test can put the user's day and the series' apart.
+        fn now_is(&self, at: &str) {
+            *self.now.lock().unwrap() = at.parse().unwrap();
         }
 
         /// The series' rows, in time order.
@@ -8443,9 +8453,14 @@ mod tests {
             Ok(*self.allowed.lock().unwrap())
         }
 
-        fn today_in(&self, _zone: chrono_tz::Tz) -> String {
-            self.today.lock().unwrap().to_string()
+        fn today_in(&self, zone: chrono_tz::Tz) -> String {
+            crate::clock::today_sql_in_at(zone, *self.now.lock().unwrap())
         }
+    }
+
+    /// Noon UTC on `day`: that day from Honolulu (02:00) to London (13:00).
+    fn noon(day: &str) -> chrono::DateTime<chrono::Utc> {
+        format!("{day}T12:00:00Z").parse().unwrap()
     }
 
     fn rows_of(events: &[Value]) -> Vec<CalendarEvent> {
@@ -15154,14 +15169,14 @@ mod tests {
 
     /// A host whose mirror holds [`linked_october`] and resolves milestones on `today`, with
     /// "Launch" in "Atlas" linked to the series: its id.
-    fn linked_host(today: &'static str) -> (Arc<TestHost>, i64) {
+    fn linked_host(today: &str) -> (Arc<TestHost>, i64) {
         linked_host_holding(october(), today)
     }
 
     /// [`linked_host`], its mirror holding `events`, [`linked`].
-    fn linked_host_holding(events: Vec<Value>, today: &'static str) -> (Arc<TestHost>, i64) {
+    fn linked_host_holding(events: Vec<Value>, today: &str) -> (Arc<TestHost>, i64) {
         let host = TestHost::holding(&linked(events));
-        *host.today.lock().unwrap() = today;
+        host.today_is(today);
         let launch = host
             .with_conn(|conn| {
                 milestones::add(conn, "Atlas", "Launch", None, Some("abc@google.com".into()))
@@ -15262,7 +15277,7 @@ mod tests {
     #[tokio::test]
     async fn a_split_with_nothing_to_offer_reads_nothing_more() {
         let host = TestHost::holding(&linked_october());
-        *host.today.lock().unwrap() = "2026-10-13";
+        host.today_is("2026-10-13");
         host.with_conn(|conn| {
             milestones::add(conn, "Atlas", "Elsewhere", None, Some("else@x".into()))?;
             let done = milestones::add(conn, "Atlas", "Done", None, Some("abc@google.com".into()))?;
@@ -15380,7 +15395,7 @@ mod tests {
         let (host, launch) = linked_host("2026-10-13");
         let plan = split_plan(Vec::new());
         let (held, _) = lost_cut(&host, lost()).await;
-        *host.today.lock().unwrap() = "2026-10-12";
+        host.today_is("2026-10-12");
         let tail = tail_copy(&plan, "\"t1\"", SAVED_AT);
         let mut steps = vec![event_read("abc", Scripted::Json(cut_copy(&plan)))];
         steps.extend(tail_reads(tail, Vec::new()));
@@ -15864,7 +15879,7 @@ mod tests {
     #[tokio::test]
     async fn a_milestone_on_no_row_goes_by_its_date() {
         let host = TestHost::holding(&october());
-        *host.today.lock().unwrap() = "2026-10-13";
+        host.today_is("2026-10-13");
         let later = host
             .with_conn(|conn| {
                 let link = Some("abc@google.com".to_string());
@@ -15931,6 +15946,43 @@ mod tests {
                     && m.first_day.as_deref() == Some("2026-10-18")
                     && m.earlier_last_day.as_deref() == Some("2026-10-11")),
             "Launch offered on the user's 18-10"
+        );
+    }
+
+    /// C9b-2 review round 4: today is the user's day too, not the series'. At 03:00 UTC it's still
+    /// the evening before in Honolulu, the user's zone, and already the day in London, the series'.
+    /// On 14-10 "Launch" takes the 19-10 occurrence, the user's 18-10, and is offered with today the
+    /// user's 13-10, by which the words say whether the earlier part's last day has passed. On 12-10
+    /// it takes the 12-10 occurrence, still to come at 22:00 on the user's 11-10, a week before the
+    /// change starts, so nothing is asked; on the series' 12-10 it would take 19-10 and be asked
+    /// about.
+    #[tokio::test]
+    async fn a_split_reads_today_in_the_users_zone() {
+        let in_honolulu_at = |now: &str| {
+            let (host, launch) = linked_host("2026-10-13");
+            host.with_conn(|conn| {
+                crate::db::set_setting(conn, crate::settings::TIME_ZONE_KEY, "Pacific/Honolulu")
+            })
+            .unwrap();
+            host.now_is(now);
+            (host, launch)
+        };
+        let (host, launch) = in_honolulu_at("2026-10-14T03:00:00Z");
+        let plan = split_plan(Vec::new());
+        let insert = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let (outcome, _, _) = split_save(&host, landed_split(&plan, insert)).await;
+        assert!(
+            moves_of(&outcome)
+                .is_some_and(|m| m.milestones == [launch_offer(launch, "2026-10-18")]
+                    && m.today == "2026-10-13"),
+            "Launch offered, today the user's 13-10"
+        );
+        let (host, _) = in_honolulu_at("2026-10-12T03:00:00Z");
+        let insert = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let (outcome, _, _) = split_save(&host, landed_split(&plan, insert)).await;
+        assert!(
+            outcome == saved(),
+            "on the user's 11-10: saved, nothing offered"
         );
     }
 
@@ -16032,6 +16084,44 @@ mod tests {
         );
     }
 
+    /// C9b-2 review round 4: the same in Honolulu, the user's zone, 10 hours behind. The occurrence
+    /// moved to Sunday 18-10, 09:00 London time, shows in Honolulu at 22:00 on Saturday 17-10,
+    /// though its place in the series falls on the user's 18-10. "Launch" takes it (today 14-10) on
+    /// 17-10, the day the split goes from as the user sees it, so it's asked about, the new part
+    /// starting on 17-10 and the earlier part ending on 11-10; by the series' days the split would
+    /// go from 18-10, after Launch's date.
+    #[tokio::test]
+    async fn a_split_from_an_occurrence_moved_earlier_goes_from_the_users_day_it_shows() {
+        let opened = moved(
+            "2026-10-19T09:00:00+01:00",
+            "2026-10-18T09:00:00+01:00",
+            "2026-10-18T10:00:00+01:00",
+        );
+        let events = vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            opened.clone(),
+            plain("2026-10-26T09:00:00Z"),
+        ];
+        let (host, launch) = linked_host_holding(events.clone(), "2026-10-14");
+        host.with_conn(|conn| {
+            crate::db::set_setting(conn, crate::settings::TIME_ZONE_KEY, "Pacific/Honolulu")
+        })
+        .unwrap();
+        assert!(
+            launch_date(&host, "2026-10-14").as_deref() == Some("2026-10-17"),
+            "the fixture's rows put Launch on the user's 17-10"
+        );
+        let outcome = split_from_moved(&host, &opened, events).await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m) }
+                if warnings.is_empty() && left_behind.is_empty()
+                    && m.milestones == [launch_offer(launch, "2026-10-17")]
+                    && m.first_day.as_deref() == Some("2026-10-17")
+                    && m.earlier_last_day.as_deref() == Some("2026-10-11")),
+            "Launch offered from the user's day the occurrence shows"
+        );
+    }
+
     /// C9b-2 review round 3, R3-F1's other half: the 19-10 occurrence moved to Wednesday 21-10. The
     /// split goes from the earlier of the two days, its place in the series, so "Prep", dated 20-10
     /// on no row, is asked about; "Earlier", dated 18-10, isn't.
@@ -16048,7 +16138,7 @@ mod tests {
             plain("2026-10-26T09:00:00Z"),
         ];
         let host = TestHost::holding(&events);
-        *host.today.lock().unwrap() = "2026-10-14";
+        host.today_is("2026-10-14");
         let prep = host
             .with_conn(|conn| {
                 let link = Some("abc@google.com".to_string());
