@@ -141,6 +141,10 @@ import type {
   EventPatchDraft,
   HeldDeleteInfo,
   NewEventDraft,
+  RepeatPreset,
+  RepeatRule,
+  RepeatStart,
+  RepeatView,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -1086,6 +1090,18 @@ export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_cal
 
 /** The active PM flags anchored on a calendar event's iCal UID — for the event detail popup. */
 export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid });
+
+// Repeat rules (#884, C11): pure reads for the editor's Repeat row. They change nothing.
+
+/** The repeat menu's ready-made rules for an event starting on `day` (YYYY-MM-DD); none when the day
+ *  can't be read. */
+export const recurrencePresets = (day: string) =>
+  invoke<RepeatPreset[]>("recurrence_presets", { day });
+
+/** A rule in the repeat menu's words for an event starting at `start`, and the day its first
+ *  occurrence falls on, or why it can't be saved. */
+export const describeRecurrence = (rule: RepeatRule, start: RepeatStart) =>
+  invoke<RepeatView>("describe_recurrence", { rule, start });
 
 // Calendar editing (#884). Importable only from src/components/calendar/edit/useEventWrites.ts
 // (eslint.config.js + scripts/check-calendar-write-fence.mjs); every command is main-window only.

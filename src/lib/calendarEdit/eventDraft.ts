@@ -546,7 +546,8 @@ export function switchNewKind(
   };
 }
 
-/** What creating an event sends: every field, as the editor holds it. */
+/** What creating an event sends: every field, as the editor holds it. The editor has no repeat menu
+ *  yet, so nothing it creates repeats. */
 export function toNewEvent(draft: EditorFields): NewEventDraft {
   return {
     summary: draft.summary,
@@ -555,6 +556,7 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
     description: draft.description,
     show_as: draft.show_as,
     visibility: draft.visibility,
+    recurrence: null,
   };
 }
 

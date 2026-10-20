@@ -1003,6 +1003,17 @@ fn google_conference(it: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether a Google event resource is a repeating event's master: it carries a rule and no
+/// `recurringEventId`. An empty or null `recurrence` is no rule (C11 critique 1 L10), so an event
+/// Google echoes with `[]` after its repeat was taken off is a one-off again, here and in every
+/// check that asks this.
+pub(crate) fn is_master(it: &serde_json::Value) -> bool {
+    it.get("recurrence")
+        .and_then(|r| r.as_array())
+        .is_some_and(|lines| !lines.is_empty())
+        && it.get("recurringEventId").is_none()
+}
+
 fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEvent> {
     value
         .get("items")
@@ -1022,14 +1033,14 @@ fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEve
 /// back, so a saved event is mirrored exactly as the next sync would mirror it. The row id is the
 /// event's own id, an occurrence's instance id included (`<series>_<start>`).
 ///
-/// A master (it carries the `recurrence` rule and no `recurringEventId`) never becomes a row: the sync
-/// asks for `singleEvents=true` and so only ever mirrors occurrences, and a master's `start` is just
-/// its first occurrence's. A save that touches a series refetches the occurrences instead.
+/// A master ([`is_master`]) never becomes a row: the sync asks for `singleEvents=true` and so only
+/// ever mirrors occurrences, and a master's `start` is just its first occurrence's. A save that
+/// touches a series refetches the occurrences instead.
 pub(crate) fn parse_event(calendar_id: &str, it: &serde_json::Value) -> Option<CalendarEvent> {
     if it.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
         return None;
     }
-    if it.get("recurrence").is_some() && it.get("recurringEventId").is_none() {
+    if is_master(it) {
         return None;
     }
     let event_id = it
@@ -3327,8 +3338,16 @@ mod tests {
             "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
         });
         assert!(parse_event("cal-1", &master).is_none());
+        assert!(is_master(&master));
         // An occurrence of it is mirrored as usual.
         assert!(parse_event("cal-1", &google_occurrence()).is_some());
+        // C11 critique 1 L10: an empty or null rule is no rule, so that event is a one-off row.
+        for none in [serde_json::json!([]), serde_json::Value::Null] {
+            let mut once = master.clone();
+            once["recurrence"] = none;
+            assert!(!is_master(&once));
+            assert!(parse_event("cal-1", &once).is_some_and(|row| row.summary == "Standup"));
+        }
     }
 
     #[test]

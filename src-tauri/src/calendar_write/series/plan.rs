@@ -4017,6 +4017,7 @@ mod tests {
             description: String::new(),
             show_as: Some(ShowAs::Busy),
             visibility: None,
+            recurrence: None,
         })
         .unwrap()
     }
@@ -4045,12 +4046,11 @@ mod tests {
     }
 
     /// G5: a key a create may not send, a body with no start PM can read, or an id that isn't one
-    /// path segment builds no plan at all.
+    /// path segment builds no plan at all. The repeat rule is one a create sends since C11.
     #[test]
     fn a_create_plan_refuses_a_key_a_create_may_not_send() {
         for key in [
             "attendees",
-            "recurrence",
             "extendedProperties",
             "reminders",
             "conferenceData",
@@ -4070,6 +4070,38 @@ mod tests {
                 "{id:?}"
             );
         }
+    }
+
+    /// C11: a repeating event's body (its one rule line, its zone on both nodes) builds the same
+    /// one-step plan, the rule in what it sends.
+    #[test]
+    fn a_create_plan_sends_a_repeating_events_rule() {
+        let body =
+            super::super::super::patch::insert_body(&crate::calendar_write::dto::NewEventDraft {
+                recurrence: Some(crate::calendar_recur::wire::RepeatRule {
+                    pattern: crate::calendar_recur::wire::RepeatPattern::Daily,
+                    interval: 1,
+                    ends: crate::calendar_recur::wire::RepeatEnds::After { count: 5 },
+                }),
+                summary: "Dentist".into(),
+                time: TimeDraft::AllDay {
+                    first_day: "2026-10-26".into(),
+                    last_day: "2026-10-26".into(),
+                },
+                location: String::new(),
+                description: String::new(),
+                show_as: None,
+                visibility: None,
+            })
+            .unwrap();
+        let plan = SeriesPlan::create(CALENDAR, NEW, body).unwrap();
+        let step = &plan.steps[0];
+        assert!(step.op.fits());
+        assert_eq!(step.notify, Notify::None);
+        let request = step.op.request(step.notify).unwrap();
+        let sent = request.body.unwrap();
+        assert_eq!(sent["recurrence"], json!(["RRULE:FREQ=DAILY;COUNT=5"]));
+        assert_eq!(sent["id"], NEW);
     }
 
     /// A live copy under PM's id is this create's, renamed or not; a cancelled one is this create's,

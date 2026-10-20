@@ -128,7 +128,7 @@ const seed: EditorFields = {
 /** What the box sends for the seed titled `summary`, on Personal. */
 const sentFor = (summary: string) => ({
   calendarId: PERSONAL,
-  draft: { ...seed, summary } as NewEventDraft,
+  draft: { ...seed, summary, recurrence: null } as NewEventDraft,
 });
 
 const saved: WriteOutcome = { outcome: "saved", warnings: [], left_behind: [] };
@@ -277,11 +277,12 @@ describe("QuickCreatePopover", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.keyDown(title(), { key: "Enter" });
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
-    // The calendar, every field of the draft, and no token: no one to notify, no guests.
+    // The calendar, every field of the draft, and no token: no one to notify, no repeat, no guests.
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
       "description",
       "location",
+      "recurrence",
       "show_as",
       "summary",
       "time",

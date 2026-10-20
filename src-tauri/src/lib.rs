@@ -1793,6 +1793,8 @@ pub fn run() {
             commands::series_choices,
             commands::get_series_summary,
             commands::settle_series_split,
+            commands::recurrence_presets,
+            commands::describe_recurrence,
             #[cfg(debug_assertions)]
             commands::dev_series_report,
             commands::connect_outlook_calendar,

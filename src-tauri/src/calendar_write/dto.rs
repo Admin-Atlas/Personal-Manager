@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::calendar_recur::wire::RepeatRule;
+
 /// Who Google emails about a change (`sendUpdates`). Every write states it; PM never relies on
 /// Google's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,8 +104,8 @@ pub struct EventPatchDraft {
 }
 
 /// A new event as the editor holds it (A22: defined with its first caller, the create command). No
-/// repeat (C11), guests (C12), reminders or colour (C13): Google gives the calendar's default
-/// reminders when none are sent. Empty text is left out of the insert, never sent as "".
+/// guests (C12), reminders or colour (C13): Google gives the calendar's default reminders when none
+/// are sent. Empty text is left out of the insert, never sent as "".
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewEventDraft {
     #[serde(default)]
@@ -120,6 +122,10 @@ pub struct NewEventDraft {
     /// `None` or `Default` is the calendar's default, and isn't sent.
     #[serde(default)]
     pub visibility: Option<Visibility>,
+    /// How it repeats; `None` doesn't repeat. Started on the first day the rule makes
+    /// ([`crate::calendar_recur::expand::sync_start`]), its end moved with it (C11).
+    #[serde(default)]
+    pub recurrence: Option<RepeatRule>,
 }
 
 /// What the user saw of an event when they chose to delete it, taken from the mirror row they
@@ -843,7 +849,9 @@ mod tests {
             r#"{"summary":"Dentist","time":{"kind":"timed","start_date":"2026-10-26",
                 "start_time":"10:00","start_zone":"Europe/London","end_date":"2026-10-26",
                 "end_time":"11:00","end_zone":"Europe/London"},"location":"High St",
-                "description":"Bring the form","show_as":"free","visibility":"private"}"#,
+                "description":"Bring the form","show_as":"free","visibility":"private",
+                "recurrence":{"pattern":{"kind":"weekly","days":["mon"]},"interval":1,
+                "ends":{"kind":"after","count":10}}}"#,
         )
         .unwrap();
         assert!(full.summary == "Dentist" && full.location == "High St");
@@ -851,6 +859,9 @@ mod tests {
         assert!(matches!(full.time, TimeDraft::Timed { .. }));
         assert_eq!(full.show_as, Some(ShowAs::Free));
         assert_eq!(full.visibility, Some(Visibility::Private));
+        assert!(full
+            .recurrence
+            .is_some_and(|rule| rule.interval == 1 && rule.to_spec().is_ok()));
 
         let bare: NewEventDraft = serde_json::from_str(
             r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"}}"#,
@@ -859,6 +870,14 @@ mod tests {
         assert!(bare.summary.is_empty() && bare.location.is_empty());
         assert!(bare.description.is_empty());
         assert_eq!((bare.show_as, bare.visibility), (None, None));
+        // Left out or null, it doesn't repeat.
+        assert!(bare.recurrence.is_none());
+        let null: NewEventDraft = serde_json::from_str(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"},
+                "recurrence":null}"#,
+        )
+        .unwrap();
+        assert!(null.recurrence.is_none());
 
         let unknown = serde_json::from_str::<NewEventDraft>(
             r#"{"summary":"x","time":{"kind":"floating","day":"2026-10-26"}}"#,

@@ -1050,6 +1050,7 @@ const draft: NewEventDraft = {
   description: "",
   show_as: "busy",
   visibility: "default",
+  recurrence: null,
 };
 const sent = { calendarId: CAL, draft };
 const shown = { name: "Me", hidden: false };

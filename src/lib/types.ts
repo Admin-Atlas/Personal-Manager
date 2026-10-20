@@ -1583,7 +1583,7 @@ export interface EventPatchDraft {
 }
 
 /** A new event, for creating an event: every field as the editor holds it (empty text is left out
- *  of what goes to Google). No repeat, guests, reminders or colour yet. */
+ *  of what goes to Google). No guests, reminders or colour yet. */
 export interface NewEventDraft {
   summary: string;
   time: TimeDraft;
@@ -1591,7 +1591,64 @@ export interface NewEventDraft {
   description: string;
   show_as: ShowAs;
   visibility: EventVisibility;
+  /** How it repeats; null doesn't repeat. The backend starts it on the first day the rule makes
+   *  (the repeat menu's words say which) and moves the end with it. */
+  recurrence: RepeatRule | null;
 }
+
+// --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---
+
+/** A day of the week, Monday first. */
+export type DayCode = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+/** Which of a month's weekdays: the first four or the last, never a fifth. */
+export type NthCode = "first" | "second" | "third" | "fourth" | "last";
+
+export type RepeatPattern =
+  | { kind: "daily" }
+  /** Monday first, each day once. */
+  | { kind: "weekly"; days: DayCode[] }
+  | { kind: "monthly_day"; day: number }
+  | { kind: "monthly_weekday"; nth: NthCode; weekday: DayCode }
+  /** On the first occurrence's own date. */
+  | { kind: "yearly_date" }
+  | { kind: "yearly_weekday"; month: number; nth: NthCode; weekday: DayCode };
+
+/** `date` is the last day an occurrence can start on (YYYY-MM-DD, in the event's zone); `count`
+ *  is 1 to 730. */
+export type RepeatEnds =
+  { kind: "never" } | { kind: "on_date"; date: string } | { kind: "after"; count: number };
+
+/** A repeat rule from the editor's set. `interval`: every 1 to 99 days, weeks, months or years. */
+export interface RepeatRule {
+  pattern: RepeatPattern;
+  interval: number;
+  ends: RepeatEnds;
+}
+
+/** One ready-made rule of the repeat menu, with the repeat menu's words for it. */
+export interface RepeatPreset {
+  label: string;
+  rule: RepeatRule;
+}
+
+/** A wall-clock time as the editor's fields hold it. */
+export interface WallTime {
+  date: string;
+  time: string;
+  zone: string;
+}
+
+/** Where a new repeating event starts, as the editor's fields hold it. `end`: where its first
+ *  occurrence ends, so an end the rule moves into a skipped hour is said too. */
+export type RepeatStart =
+  | { kind: "timed"; date: string; time: string; zone: string; end?: WallTime | null }
+  | { kind: "all_day"; date: string };
+
+/** A rule in the repeat menu's words, and the day (YYYY-MM-DD) its first occurrence falls on;
+ *  `moved` when that isn't the day asked for. Or why it can't be saved, in words. */
+export type RepeatView =
+  | { outcome: "ready"; summary: string; starts: string; moved: boolean }
+  | { outcome: "refused"; message: string };
 
 /** What the user saw of an event when they chose to delete it, from the row they clicked. */
 export interface SeenSummary {

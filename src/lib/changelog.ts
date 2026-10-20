@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.152.1-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Under the hood, PM can now put repeat rules into words and work out the day a repeating event starts, ready for creating repeating events in the next update.",
+    ],
+  },
+  {
     version: "3.152.0-alpha",
     date: "2026-10-20",
     highlights: [

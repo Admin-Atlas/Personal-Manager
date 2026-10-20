@@ -1,0 +1,134 @@
+{
+  "about": "T2 (#884, C11 §1.5): the repeat rules Google Calendar's editor writes, the words it says them in, and each as the webview holds it, all read against `start`. Rust's calendar_recur::wire tests hold every row to spec.rs's rules_read_as_google_says_them, in order, and the webview's repeat tests read the same file, so both mean the same rules.",
+  "start": { "kind": "timed", "date": "2026-10-13", "time": "09:00", "zone": "Europe/London" },
+  "rows": [
+    {
+      "rule": "RRULE:FREQ=DAILY",
+      "words": "Daily",
+      "spec": { "pattern": { "kind": "daily" }, "interval": 1, "ends": { "kind": "never" } }
+    },
+    {
+      "rule": "RRULE:FREQ=DAILY;INTERVAL=3;COUNT=10",
+      "words": "Every 3 days, 10 times",
+      "spec": {
+        "pattern": { "kind": "daily" },
+        "interval": 3,
+        "ends": { "kind": "after", "count": 10 }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=WEEKLY",
+      "words": "Weekly on Tuesday",
+      "spec": {
+        "pattern": { "kind": "weekly", "days": ["tue"] },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=WEEKLY;BYDAY=TU",
+      "words": "Weekly on Tuesday",
+      "spec": {
+        "pattern": { "kind": "weekly", "days": ["tue"] },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+      "words": "Every weekday (Monday to Friday)",
+      "spec": {
+        "pattern": { "kind": "weekly", "days": ["mon", "tue", "wed", "thu", "fri"] },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=20261231T235959Z",
+      "words": "Every 2 weeks on Monday and Wednesday, until 31-12-2026",
+      "spec": {
+        "pattern": { "kind": "weekly", "days": ["mon", "wed"] },
+        "interval": 2,
+        "ends": { "kind": "on_date", "date": "2026-12-31" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=WEEKLY;BYDAY=FR,MO,WE",
+      "words": "Weekly on Monday, Wednesday and Friday",
+      "spec": {
+        "pattern": { "kind": "weekly", "days": ["mon", "wed", "fri"] },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=MONTHLY",
+      "words": "Monthly on day 13",
+      "spec": {
+        "pattern": { "kind": "monthly_day", "day": 13 },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=MONTHLY;BYMONTHDAY=13",
+      "words": "Monthly on day 13",
+      "spec": {
+        "pattern": { "kind": "monthly_day", "day": 13 },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=MONTHLY;BYDAY=2TU",
+      "words": "Monthly on the second Tuesday",
+      "spec": {
+        "pattern": { "kind": "monthly_weekday", "nth": "second", "weekday": "tue" },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=MONTHLY;BYDAY=-1TU",
+      "words": "Monthly on the last Tuesday",
+      "spec": {
+        "pattern": { "kind": "monthly_weekday", "nth": "last", "weekday": "tue" },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=YEARLY",
+      "words": "Annually on 13 October",
+      "spec": { "pattern": { "kind": "yearly_date" }, "interval": 1, "ends": { "kind": "never" } }
+    },
+    {
+      "rule": "RRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=13",
+      "words": "Annually on 13 October",
+      "spec": { "pattern": { "kind": "yearly_date" }, "interval": 1, "ends": { "kind": "never" } }
+    },
+    {
+      "rule": "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=2TU",
+      "words": "Annually on the second Tuesday of October",
+      "spec": {
+        "pattern": { "kind": "yearly_weekday", "month": 10, "nth": "second", "weekday": "tue" },
+        "interval": 1,
+        "ends": { "kind": "never" }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=DAILY;COUNT=1",
+      "words": "Daily, once",
+      "spec": {
+        "pattern": { "kind": "daily" },
+        "interval": 1,
+        "ends": { "kind": "after", "count": 1 }
+      }
+    },
+    {
+      "rule": "RRULE:FREQ=YEARLY;INTERVAL=2",
+      "words": "Every 2 years on 13 October",
+      "spec": { "pattern": { "kind": "yearly_date" }, "interval": 2, "ends": { "kind": "never" } }
+    }
+  ]
+}

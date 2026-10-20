@@ -2773,6 +2773,7 @@ mod tests {
                 description: String::new(),
                 show_as: None,
                 visibility: None,
+                recurrence: None,
             })
             .unwrap();
         SeriesPlan::create(CALENDAR, NEW, body).unwrap()

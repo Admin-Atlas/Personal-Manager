@@ -38,9 +38,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::calendar::{self, CalendarEvent, CalendarFacts};
 use crate::calendar_editing::{self, EditingStatus};
+use crate::calendar_recur::expand;
 use crate::calendar_recur::lines::{self, Applied};
 use crate::calendar_recur::spec::{day_phrase, describe_lines};
-use crate::calendar_recur::Point;
+use crate::calendar_recur::{Point, SeriesStart};
 use crate::calendar_write::classify::{Method, Verdict};
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
@@ -304,10 +305,10 @@ fn facts_from_fresh<'a>(
 }
 
 /// Google's copy of a single event is now a repeating event's series: it carries a rule and is no
-/// occurrence. The sync never mirrors such a copy (`calendar::parse_event`), so only a row that was
-/// a one-off can be under one.
+/// occurrence ([`calendar::is_master`], where an empty rule is none). The sync never mirrors such a
+/// copy (`calendar::parse_event`), so only a row that was a one-off can be under one.
 fn turned_series(fresh: &Value) -> bool {
-    fresh.get("recurrence").is_some() && fresh.get("recurringEventId").is_none()
+    calendar::is_master(fresh)
 }
 
 /// The gate's facts from a mirror row, for the list. Account state isn't read here (that would be
@@ -909,8 +910,10 @@ pub async fn create_calendar_event(
     };
     #[cfg(debug_assertions)]
     {
-        // A create reaches one new event, never a series.
-        let allowed = dev_allow::check(&*state.conn()?, &target.remote_calendar, false)?;
+        // A create reaches one new event, or a whole repeating one: that is series-wide, so an
+        // unset allow-list refuses it (C11 critique 1 L11).
+        let series_wide = draft.recurrence.is_some();
+        let allowed = dev_allow::check(&*state.conn()?, &target.remote_calendar, series_wide)?;
         if let Err(message) = allowed {
             return Ok(WriteOutcome::Failed {
                 message: message.into(),
@@ -1067,7 +1070,7 @@ async fn create_event<W: Wire, H: Host>(
     };
     let wire = Posts::new(ctx.wire);
     match drive(&wire, &mut run).await {
-        Ran::Done { ends } => landed_create(ctx.host, ctx.target, &ends),
+        Ran::Done { ends } => landed_create(ctx.wire, ctx.host, ctx.target, &ends).await,
         // Gone: made, then deleted in Google before PM could look.
         Ran::NotDone { why, .. } => not_done_outcome(why, ctx.editing, false),
         Ran::Unknown { .. } => {
@@ -1215,7 +1218,7 @@ async fn retry_create<W: Wire, H: Host>(
         match retry_next(RetryLook::of(get(ctx.wire, calendar, id).await), first) {
             RetryStep::Land(copy) => {
                 taken.consume();
-                return land_created(ctx.host, &held.target, &copy);
+                return land_copy(ctx.wire, ctx.host, &held.target, &copy).await;
             }
             RetryStep::Gone => {
                 taken.consume();
@@ -1255,7 +1258,7 @@ async fn retry_create<W: Wire, H: Host>(
     match ran {
         Ran::Done { ends } => {
             taken.consume();
-            landed_create(ctx.host, &held.target, &ends)
+            landed_create(ctx.wire, ctx.host, &held.target, &ends).await
         }
         Ran::NotDone { why: Why::Gone, .. } => {
             taken.consume();
@@ -1287,15 +1290,146 @@ async fn retry_create<W: Wire, H: Host>(
 }
 
 /// A create's run proved it landed: Google's copy into the mirror, from the step's end.
-fn landed_create(host: &impl Host, target: &CalendarTarget, ends: &[End]) -> WriteOutcome {
+async fn landed_create<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &CalendarTarget,
+    ends: &[End],
+) -> WriteOutcome {
     match ends.first() {
         Some(End::Done {
             reply: Some(copy), ..
-        }) => land_created(host, target, copy),
+        }) => land_copy(wire, host, target, copy).await,
         // Proved without a copy to show: under `Shows::Created` every proof carries one, but the
         // next sync shows it anyway.
         _ => created_pending(host, target),
     }
+}
+
+/// Google's copy of a new event into the mirror. A one-off's copy is its row; a repeating event's is
+/// its master, which never becomes a row (`calendar::parse_event`), so its occurrences are listed
+/// and landed instead (C11).
+async fn land_copy<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &CalendarTarget,
+    copy: &Value,
+) -> WriteOutcome {
+    if calendar::is_master(copy) {
+        return land_new_series(wire, host, &CalIds::of(target), copy).await;
+    }
+    land_created(host, target, copy)
+}
+
+/// PM's and Google's ids for one calendar, for landing what a write made there.
+struct CalIds<'a> {
+    calendar_id: &'a str,
+    remote_calendar: &'a str,
+}
+
+impl<'a> CalIds<'a> {
+    fn of(target: &'a CalendarTarget) -> Self {
+        CalIds {
+            calendar_id: &target.calendar_id,
+            remote_calendar: &target.remote_calendar,
+        }
+    }
+}
+
+/// A repeating event Google now holds, from its copy `copy` (its master): its occurrences in the
+/// months PM mirrors, listed and landed as CREATED rows, so a list that lags can't take them off the
+/// screen (A28). One with no occurrence in those months (it starts after them, or a COUNT or UNTIL
+/// ended it before them) is saved and said to be outside, with nothing listed (C10 §6.2, C11
+/// critique 1 L8). Looks up to three times (now, 1 s, 3 s) while the listing is empty or
+/// incomplete; then "saved, the calendar will catch up" rather than a guess. No lock is held across
+/// a listing; the landing takes the DB, then `recent`.
+async fn land_new_series<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    cal: &CalIds<'_>,
+    copy: &Value,
+) -> WriteOutcome {
+    let pending = || {
+        drop_hash(host, cal.calendar_id);
+        WriteOutcome::Saved {
+            warnings: vec![WriteWarning::MirrorRefreshPending],
+            left_behind: Vec::new(),
+            milestone_moves: None,
+        }
+    };
+    // Its id one path segment, its start and rule readable (never a guessed zone).
+    let Ok(master) = Master::read(&FreshEvent::from_google(copy.clone())) else {
+        return pending();
+    };
+    let Ok(mirror) = host.mirror(cal.calendar_id) else {
+        return pending();
+    };
+    let Some(window) = mirror.instants() else {
+        return pending();
+    };
+    if series_in_window(&master, window) == Some(false) {
+        return WriteOutcome::Saved {
+            warnings: vec![WriteWarning::OutsideMirror],
+            left_behind: Vec::new(),
+            milestone_moves: None,
+        };
+    }
+    let mut listing = Listing::default();
+    for pause in [None, Some(REFETCH_AGAIN[0]), Some(REFETCH_AGAIN[1])] {
+        if let Some(pause) = pause {
+            wire.wait(pause).await;
+        }
+        listing = refetch(wire, cal.remote_calendar, &master.id, &mirror.window, false).await;
+        if listing.complete && !listing.items.is_empty() {
+            break;
+        }
+    }
+    if !listing.complete {
+        return pending();
+    }
+    let rows: Vec<CalendarEvent> = listing
+        .items
+        .iter()
+        .filter_map(|item| calendar::parse_event(cal.calendar_id, item))
+        .collect();
+    if rows.is_empty() {
+        return pending();
+    }
+    // Every row is new: the mirror never held one of this event's.
+    let created: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    match land_on(host, cal.calendar_id, rows, &created, Vec::new()) {
+        Ok(()) => WriteOutcome::Saved {
+            warnings: Vec::new(),
+            left_behind: Vec::new(),
+            milestone_moves: None,
+        },
+        Err(_) => pending(),
+    }
+}
+
+/// Whether a repeating event has an occurrence in the window PM mirrors (`[from, until)`): its
+/// first at or after `from` comes before `until`. `None` when PM can't walk its rule, which lists it
+/// anyway. An occurrence begun before `from` that runs into the window doesn't count: at worst the
+/// next sync shows it.
+fn series_in_window(
+    master: &Master,
+    (from, until): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+) -> Option<bool> {
+    let parsed = lines::parse(&master.recurrence);
+    let (_, facts) = lines::series_rule(&parsed).ok()?;
+    let (from, until) = match master.start {
+        SeriesStart::AllDay(_) => (
+            Point::Day(from.date_naive()),
+            Point::Day(until.date_naive()),
+        ),
+        SeriesStart::Timed { .. } => (Point::At(from), Point::At(until)),
+    };
+    let first = expand::occurrences_from(&facts, &master.start, from, 1).ok()?;
+    Some(
+        first
+            .first()
+            .is_some_and(|at| at.cmp_in(&until, master.start.zone()) == std::cmp::Ordering::Less),
+    )
 }
 
 /// A new event Google holds: its copy into the mirror as a CREATED row (a list that lags can't take
@@ -13774,6 +13908,8 @@ mod tests {
 
     // --- creating an event (C10) ---
 
+    use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
+
     /// The id PM picks for the new event in these tests.
     const NEW: &str = "fedcba9876543210fedcba9876543210";
 
@@ -13797,6 +13933,21 @@ mod tests {
             description: String::new(),
             show_as: None,
             visibility: None,
+            recurrence: None,
+        }
+    }
+
+    /// The dentist from `day`, weekly on its Monday, `count` times.
+    fn weekly_dentist(day: &str, count: u16) -> NewEventDraft {
+        NewEventDraft {
+            recurrence: Some(RepeatRule {
+                pattern: RepeatPattern::Weekly {
+                    days: vec![DayCode::Mon],
+                },
+                interval: 1,
+                ends: RepeatEnds::After { count },
+            }),
+            ..on_day(day)
         }
     }
 
@@ -14001,11 +14152,12 @@ mod tests {
             "reminders",
             "conferenceData",
             "extendedProperties",
-            "recurrence",
             "colorId",
         ] {
             assert!(body.get(never).is_none(), "{never}");
         }
+        // A rule goes only with a draft that repeats (C11).
+        assert!(body.get("recurrence").is_none(), "no rule, no recurrence");
         assert_eq!(body["transparency"], "transparent");
         assert_eq!(body["visibility"], "private");
     }
@@ -14604,6 +14756,295 @@ mod tests {
         // A fetch that began after the landing and shows it ends the entry.
         host.synced(&[copy], after);
         assert!(host.nothing_recorded());
+    }
+
+    // --- creating a repeating event (C11) ---
+
+    /// One occurrence of the new repeating event, at `at` for an hour, as an instances listing
+    /// gives it; `stamp` is its start in an instance id's compact form.
+    fn new_occurrence(stamp: &str, at: &str, end: &str) -> Value {
+        json!({
+            "kind": "calendar#event",
+            "id": format!("{NEW}_{stamp}"),
+            "etag": "\"o1\"",
+            "status": "confirmed",
+            "summary": "Dentist",
+            "recurringEventId": NEW,
+            "originalStartTime": { "dateTime": at, "timeZone": "Europe/London" },
+            "start": { "dateTime": at, "timeZone": "Europe/London" },
+            "end": { "dateTime": end, "timeZone": "Europe/London" },
+            "iCalUID": "new@google.com",
+            "updated": SAVED_AT,
+        })
+    }
+
+    /// The weekly dentist from Monday 26-10, three times, as Google lists it.
+    fn three_mondays() -> Vec<Value> {
+        vec![
+            new_occurrence(
+                "20261026T100000Z",
+                "2026-10-26T10:00:00Z",
+                "2026-10-26T11:00:00Z",
+            ),
+            new_occurrence(
+                "20261102T100000Z",
+                "2026-11-02T10:00:00Z",
+                "2026-11-02T11:00:00Z",
+            ),
+            new_occurrence(
+                "20261109T100000Z",
+                "2026-11-09T10:00:00Z",
+                "2026-11-09T11:00:00Z",
+            ),
+        ]
+    }
+
+    /// The new repeating event's occurrences over the mirror's window, 50 a page.
+    fn new_listing(answer: Scripted) -> Step {
+        Step::new(
+            Method::Get,
+            &format!("/events/{NEW}/instances"),
+            "timeMin=2026-09-01T00%3A00%3A00Z timeMax=2027-11-01T00%3A00%3A00Z maxResults=50",
+            answer,
+        )
+    }
+
+    fn listed(items: Vec<Value>) -> Scripted {
+        Scripted::Json(page(items, None))
+    }
+
+    /// The new repeating event's rows in the mirror, in time order.
+    fn new_rows(host: &TestHost) -> Vec<String> {
+        ids_of(
+            host.with_conn(|conn| calendar::series_rows(conn, "cal", &[NEW]))
+                .unwrap(),
+        )
+    }
+
+    fn three_ids() -> Vec<String> {
+        ["20261026T100000Z", "20261102T100000Z", "20261109T100000Z"]
+            .iter()
+            .map(|stamp| format!("cal:{NEW}_{stamp}"))
+            .collect()
+    }
+
+    /// C11 §3.4: Google answers a repeating create with its master, which is never a row, so its
+    /// occurrences are listed and landed as created rows. Nobody is emailed, and the rule and the
+    /// zone go out with it.
+    #[tokio::test]
+    async fn a_created_series_lands_its_occurrences_from_a_listing() {
+        let host = TestHost::holding(&[]);
+        let draft = weekly_dentist("2026-10-26", 3);
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(copy)),
+                new_listing(listed(three_mondays())),
+            ],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "saved and landed");
+        let sent = script.sent();
+        assert!(sent[0]
+            .url
+            .ends_with("?sendUpdates=none&conferenceDataVersion=1"));
+        let body = sent[0].body.as_ref().unwrap();
+        assert_eq!(
+            body["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3"])
+        );
+        assert_eq!(body["start"]["timeZone"], "Europe/London");
+        assert_eq!(body["end"]["timeZone"], "Europe/London");
+        assert!(script.waits().is_empty(), "the first look found them");
+        assert_eq!(new_rows(&host), three_ids());
+        assert!(new_row(&host).is_none(), "the master itself is never a row");
+        assert_eq!(host.told(), vec!["cal".to_string()]);
+        // Recorded as created: a complete list that doesn't show them yet keeps them on screen.
+        let shown = ids_of(host.synced(&[], Instant::now()));
+        assert!(three_ids().iter().all(|id| shown.contains(id)));
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    /// A28: a listing that lags shows nothing at first; the second look, a second later, lands it.
+    #[tokio::test]
+    async fn a_created_series_whose_listing_lags_lands_on_the_second_look() {
+        let host = TestHost::holding(&[]);
+        let draft = weekly_dentist("2026-10-26", 3);
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(copy)),
+                new_listing(listed(Vec::new())),
+                new_listing(listed(three_mondays())),
+            ],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "landed on the second look");
+        assert_eq!(script.waits(), vec![REFETCH_AGAIN[0]]);
+        assert_eq!(new_rows(&host), three_ids());
+    }
+
+    /// Three looks that never show it whole: saved, the next sync to show it, and no guess landed.
+    /// Half a listing is no listing, and one that shows only deleted occurrences lands nothing.
+    #[tokio::test]
+    async fn a_created_series_that_never_lists_is_saved_pending() {
+        let half = vec![
+            // A first page, then its second refused.
+            new_listing(Scripted::Json(page(three_mondays(), Some("p2")))),
+            new_listing(Scripted::Status(503)),
+        ];
+        let deleted = vec![new_listing(listed(
+            three_mondays()
+                .into_iter()
+                .map(|o| with(o, "status", json!("cancelled")))
+                .collect(),
+        ))];
+        for last in [half, deleted] {
+            let host = TestHost::holding(&[]);
+            let draft = weekly_dentist("2026-10-26", 3);
+            let copy = google_copy(&draft, "\"n1\"");
+            let mut steps = vec![
+                insert_step(Scripted::Json(copy)),
+                new_listing(listed(Vec::new())),
+                new_listing(Scripted::Status(503)),
+            ];
+            steps.extend(last);
+            let (outcome, script) =
+                create_on(&host, &new_target(), EditingStatus::On, steps, draft, None).await;
+            assert!(outcome == pending(), "saved, the mirror to catch up");
+            assert_eq!(script.waits(), REFETCH_AGAIN.to_vec());
+            assert!(new_rows(&host).is_empty());
+            assert!(host.hash_dropped());
+            assert!(host.nothing_recorded());
+        }
+    }
+
+    /// C10 §6.2, C11 critique 1 L8: a new repeating event with no occurrence in the months PM
+    /// mirrors, after them or ended before them, is saved and said to be outside, with no listing
+    /// at all. One begun before them that runs into them is listed.
+    #[tokio::test]
+    async fn a_created_series_after_the_window_is_saved_not_landed() {
+        let outside = WriteOutcome::Saved {
+            warnings: vec![WriteWarning::OutsideMirror],
+            left_behind: Vec::new(),
+            milestone_moves: None,
+        };
+        // Monday 10-01-2028 is past the window; Monday 01-06-2026 three times ends before it.
+        for draft in [
+            weekly_dentist("2028-01-10", 3),
+            weekly_dentist("2026-06-01", 3),
+        ] {
+            let host = TestHost::holding(&[]);
+            let copy = google_copy(&draft, "\"n1\"");
+            let (outcome, script) = create_on(
+                &host,
+                &new_target(),
+                EditingStatus::On,
+                vec![insert_step(Scripted::Json(copy))],
+                draft,
+                None,
+            )
+            .await;
+            assert!(
+                outcome == outside,
+                "saved in Google, and said to be outside"
+            );
+            assert_eq!(script.sent().len(), 1, "nothing listed");
+            assert!(new_rows(&host).is_empty() && host.nothing_recorded());
+            assert!(host.told().is_empty());
+        }
+        // From Monday 03-08-2026, ten times: its last five fall in the window, so it is listed (the
+        // listing's own occurrences are what land, three here).
+        let host = TestHost::holding(&[]);
+        let draft = weekly_dentist("2026-08-03", 10);
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(copy)),
+                new_listing(listed(three_mondays())),
+            ],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "listed and landed");
+        assert_eq!(new_rows(&host).len(), 3);
+    }
+
+    /// A retry that finds the lost repeating create lands its occurrences, never its master.
+    #[tokio::test]
+    async fn a_retried_create_of_a_series_lands_its_occurrences() {
+        let host = TestHost::holding(&[]);
+        let draft = weekly_dentist("2026-10-26", 3);
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(lost()),
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(lost()),
+                new_read(absent()),
+            ],
+            draft.clone(),
+            None,
+        )
+        .await;
+        assert!(outcome == ambiguous("ref-1"), "held as ref-1");
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![
+                new_read(Scripted::Json(copy)),
+                new_listing(listed(three_mondays())),
+            ],
+            draft,
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == saved(), "found and landed");
+        script.finished();
+        assert_eq!(new_rows(&host), three_ids());
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    /// C11 critique 1 L11: a repeating create reaches a whole series, so a dev build's unset
+    /// allow-list refuses it, as it does every write that reaches more than one event.
+    #[test]
+    fn a_repeating_create_is_series_wide_to_the_dev_allow_list() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let start = shipped
+            .find("pub async fn create_calendar_event(")
+            .expect("the create command");
+        let shell = &shipped[start..];
+        let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
+        assert!(shell.contains("let series_wide = draft.recurrence.is_some();"));
+        assert!(shell
+            .contains("dev_allow::check(&*state.conn()?, &target.remote_calendar, series_wide)"));
+        assert_eq!(
+            dev_allow::decide(None, None, "home@group", true),
+            Err(dev_allow::UNSET)
+        );
     }
 
     /// Creating events ships in every build (C10b): the command makes the window and owner checks
