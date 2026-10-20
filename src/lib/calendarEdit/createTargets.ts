@@ -116,14 +116,18 @@ export function lengthFor(overview: CalendarOverview, target: CreateTarget | nul
 /** `date` (`YYYY-MM-DD`) at UTC midnight, moved by `days`, as ms. */
 const utcDay = (date: string, days = 0) => Date.parse(`${date}T00:00:00Z`) + days * 86_400_000;
 
-/** Whether a new event's time falls wholly outside the months PM mirrors, so it would be saved in
- *  Google but not shown here: the backend's own overlap test (start before the window's end, end
- *  after its start; all-day days as UTC midnights, the last one exclusive). The backend decides; this
- *  is the warning before Save. A time that can't be read says nothing: the problem lines do. */
-export function outsideMirror(time: TimeDraft, overview: CalendarOverview): boolean {
+/** Which side of the months PM mirrors a new event's time falls wholly on, so it would be saved in
+ *  Google but not shown here, or null when it overlaps them: the backend's own overlap test (start
+ *  before the window's end, end after its start; all-day days as UTC midnights, the last one
+ *  exclusive). The backend decides; this is the warning before Save. A time that can't be read says
+ *  nothing: the problem lines do. */
+export function outsideMirror(
+  time: TimeDraft,
+  overview: CalendarOverview,
+): "before" | "after" | null {
   const from = Date.parse(overview.mirror_start);
   const until = Date.parse(overview.mirror_end);
-  if (Number.isNaN(from) || Number.isNaN(until)) return false;
+  if (Number.isNaN(from) || Number.isNaN(until)) return null;
   let start: number;
   let end: number;
   if (time.kind === "all_day") {
@@ -131,12 +135,13 @@ export function outsideMirror(time: TimeDraft, overview: CalendarOverview): bool
     end = utcDay(time.last_day, 1);
   } else {
     const s = wallInstant(time.start_date, time.start_time, time.start_zone);
-    if (s === null) return false;
+    if (s === null) return null;
     start = s.getTime();
     end = wallInstant(time.end_date, time.end_time, time.end_zone)?.getTime() ?? start;
   }
-  if (Number.isNaN(start) || Number.isNaN(end)) return false;
-  return !(start < until && end > from);
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  if (start >= until) return "after";
+  return end <= from ? "before" : null;
 }
 
 /** Where a new event on `calendarId` shows (C10 §15): its name, and whether PM's calendar keeps it
@@ -163,20 +168,26 @@ export function createdWhere(
 }
 
 /** What a new event's surfaces (the full editor and quick create) say before Save (C10 §15): a start
- *  outside the months PM syncs, and a calendar hidden here with no twin showing it. */
+ *  outside the months PM syncs, and a calendar hidden here with no twin showing it. One that
+ *  `repeats` from before those months still shows here wherever it falls inside them, as the backend
+ *  lists and lands those (C11); one that starts after them has none there. */
 export function createNotes(
   time: TimeDraft,
+  repeats: boolean,
   overview: CalendarOverview,
   hidden: ReadonlySet<string>,
   calendarId: string,
 ): string[] {
   const notes: string[] = [];
-  if (outsideMirror(time, overview)) {
+  const side = outsideMirror(time, overview);
+  if (side !== null) {
     const range = `${formatDateLocal(new Date(overview.mirror_start))} – ${formatDateLocal(
       new Date(overview.mirror_end),
     )}`;
     notes.push(
-      `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
+      side === "before" && repeats
+        ? `This starts before the months PM syncs (${range}), so only its occurrences within them will show here.`
+        : `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
     );
   }
   const where = createdWhere(overview, hidden, calendarId);

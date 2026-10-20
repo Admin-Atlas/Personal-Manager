@@ -13,8 +13,9 @@
 // with the tab is handed back to open on again, the keyboard comes back into the box even while it's
 // locked, the ghost is told how far the event has got, and the calendar list the keyboard can reach
 // stays inside the box. Repeating (C11): a ready-made rule is sent with the create, one the backend
-// refuses stops every save, a rule's own day follows a moved date, and Custom… carries on in the full
-// editor with its dialog open, sending nothing.
+// refuses stops every save (a start the clocks skip said once), one from before the months PM syncs
+// is said to show inside them, a rule's own day follows a moved date, and Custom… carries on in the
+// full editor with its dialog open, sending nothing.
 
 import { createRef, StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -1074,6 +1075,8 @@ describe("QuickCreatePopover", () => {
     fireEvent.change(title(), { target: { value: "Standup" } });
     await pickRepeat("Weekly on Monday");
     expect(repeat().selectedOptions[0].text).toBe("Weekly on Monday");
+    // It starts on the day picked, so nothing says it moved.
+    expect(screen.queryByText(/the first day this repeat allows/)).toBeNull();
     fireEvent.keyDown(title(), { key: "Enter" });
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
     expect(createEvent.mock.calls).toEqual([
@@ -1095,6 +1098,44 @@ describe("QuickCreatePopover", () => {
     await act(async () => {});
     expect(createEvent).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(title());
+  });
+
+  /** Give the Date field `text`, as typed and left. */
+  function typeDate(text: string) {
+    const date = screen.getByLabelText<HTMLInputElement>("Date");
+    date.focus();
+    fireEvent.change(date, { target: { value: text } });
+    fireEvent.blur(date);
+  }
+
+  // The time line already refuses a start the clocks skip, and the backend refuses a first
+  // occurrence on it in other words: said once.
+  it("a start the clocks skip is refused once, not again under Repeat", async () => {
+    const SKIPPED =
+      "The first occurrence would be on 28-03-2027, when the clocks skip that time. Pick a time outside that hour.";
+    describeRecurrence.mockResolvedValue({ outcome: "refused", message: SKIPPED });
+    open();
+    fireEvent.change(title(), { target: { value: "Swim" } });
+    typeDate("28-03-2027");
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
+    await pickRepeat("Daily");
+    expect(screen.getAllByText(/the clocks skip/)).toHaveLength(1);
+    expect(screen.getByText(/^01:30 doesn't happen in Europe\/London that night/)).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+  });
+
+  // The backend lists and lands its occurrences inside the months PM syncs, wherever it starts.
+  it("a repeat that starts before the months PM syncs says only its occurrences there show", async () => {
+    open();
+    fireEvent.change(title(), { target: { value: "Gym" } });
+    typeDate("06-07-2026");
+    await pickRepeat("Weekly on Monday");
+    expect(
+      screen.getByText(
+        /^This starts before the months PM syncs \(.+\), so only its occurrences within them will show here\.$/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/won't show here/)).toBeNull();
   });
 
   it("moving the date moves a one-day weekly rule", async () => {

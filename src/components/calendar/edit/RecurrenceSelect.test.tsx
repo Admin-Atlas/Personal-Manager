@@ -4,9 +4,9 @@
 // @vitest-environment jsdom
 //
 // The Repeat menu (#884, C11 §6): Google's order, a rule that is none of the ready-made ones shown as
-// its own row in the backend's words, Custom… acting only on a pick the user commits (never on the
-// keyboard passing through it) and leaving the value as it was, and a rule PM can only show kept
-// until it's replaced.
+// its own row in the backend's words, Custom… acting only on a pick from the list (never on the
+// keyboard stepping through it, which passes it by) and leaving the value as it was, the select never
+// showing a row the value isn't, and a rule PM can only show kept until it's replaced.
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,9 +14,17 @@ import type { RepeatPreset, RepeatRule } from "../../../lib/types";
 import type { RepeatValue } from "../../../lib/calendarEdit/recurrenceDraft";
 
 const recurrencePresets = vi.fn<(day: string) => Promise<RepeatPreset[]>>();
+let mac = false;
 
 vi.mock("../../../lib/ipc", () => ({
   recurrencePresets: (day: string) => recurrencePresets(day),
+}));
+
+vi.mock("../../../lib/setupGuide", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  get IS_MAC() {
+    return mac;
+  },
 }));
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
@@ -50,6 +58,7 @@ const PRESETS: RepeatPreset[] = [
 const monWed: RepeatValue = { kind: "rule", rule: rule({ kind: "weekly", days: ["mon", "wed"] }) };
 
 beforeEach(() => {
+  mac = false;
   recurrencePresets.mockResolvedValue(PRESETS);
 });
 
@@ -88,6 +97,28 @@ function open(value: RepeatValue, ruleWords: string | null = null) {
 const select = () => screen.getByRole<HTMLSelectElement>("combobox", { name: "Repeat" });
 const rows = () => Array.from(select().options).map((o) => o.text);
 const shown = () => select().selectedOptions[0]?.text;
+const customRow = () => Array.from(select().options).find((o) => o.value === "custom")!;
+
+/** A key on the closed select as Linux and Windows take it: the select's own handler, then a step
+ *  to the next row that's on (the last, for End), which changes the value. */
+function step(key: "ArrowDown" | "End", init: { altKey?: boolean } = {}) {
+  const el = select();
+  fireEvent.keyDown(el, { key, ...init });
+  const on = Array.from(el.options).filter((o) => !o.disabled);
+  const next = key === "End" ? on[on.length - 1] : on.find((o) => o.index > el.selectedIndex);
+  if (next && next.index !== el.selectedIndex) {
+    fireEvent.change(el, { target: { value: next.value } });
+  }
+}
+
+/** A row picked from the open list, as a click or Enter there picks it: one that's off can't be. */
+function choose(value: string) {
+  const row = Array.from(select().options).find((o) => o.value === value)!;
+  if (!row.disabled) fireEvent.change(select(), { target: { value } });
+}
+
+/** Let the timers a key started run. */
+const settle = () => act(async () => void (await new Promise((r) => setTimeout(r, 0))));
 
 describe("RecurrenceSelect", () => {
   it("lists Does not repeat, the presets and Custom… in Google's order", async () => {
@@ -152,40 +183,86 @@ describe("RecurrenceSelect", () => {
   });
 
   // A closed select changes value at every arrow on Linux and Windows: passing "Custom…" on the way
-  // must not open a dialog nobody asked for (C11 critique 2 M9). Enter on it does.
-  it("arrowing past the presets never opens Custom…", async () => {
-    const { onChange, onCustom } = open({ kind: "once" });
+  // must not open a dialog nobody asked for (C11 critique 2 M9), nor show a row the value isn't (a
+  // save would send something else).
+  it("arrowing past the presets never lands on Custom…", async () => {
+    const { onChange, rerender, onCustom } = open({ kind: "once" });
     await act(async () => {});
-    fireEvent.keyDown(select(), { key: "ArrowDown" });
-    fireEvent.change(select(), { target: { value: "preset:4" } });
-    fireEvent.keyDown(select(), { key: "ArrowDown" });
-    fireEvent.change(select(), { target: { value: "custom" } });
-    expect(onCustom).not.toHaveBeenCalled();
-    // It shows Custom…, waiting.
-    expect(shown()).toBe("Custom…");
-    // Arrowing on moves away; back onto it and Enter opens it.
-    fireEvent.keyDown(select(), { key: "ArrowUp" });
-    fireEvent.change(select(), { target: { value: "preset:4" } });
+    for (let i = 0; i < 5; i++) {
+      step("ArrowDown");
+      rerender(onChange.mock.lastCall![0]);
+    }
+    expect(shown()).toBe("Every weekday (Monday to Friday)");
     expect(onChange).toHaveBeenLastCalledWith({ kind: "rule", rule: PRESETS[4].rule });
-    fireEvent.keyDown(select(), { key: "ArrowDown" });
-    fireEvent.change(select(), { target: { value: "custom" } });
-    fireEvent.keyUp(select(), { key: "ArrowDown" });
+    // One more, and End: the step passes Custom… by.
+    step("ArrowDown");
+    step("End");
+    expect(shown()).toBe("Every weekday (Monday to Friday)");
+    expect(onChange).toHaveBeenCalledTimes(5);
     expect(onCustom).not.toHaveBeenCalled();
+    // Once the key has done its work, the list offers it again.
+    await settle();
+    expect(customRow().disabled).toBe(false);
+    // A type-ahead letter steps too.
+    fireEvent.keyDown(select(), { key: "c" });
+    expect(customRow().disabled).toBe(true);
+    await settle();
+    expect(customRow().disabled).toBe(false);
+  });
+
+  // The key-up of a key that opened a menu instead of stepping (Up or Down on a Mac) can be swallowed
+  // by that menu, so Custom… comes back without waiting for it.
+  it("a pick of Custom… opens it, even straight after arrowing with no key-up", async () => {
+    const { onChange, onCustom, rerender } = open({ kind: "once" });
+    await act(async () => {});
+    step("ArrowDown");
+    rerender(onChange.mock.lastCall![0]);
+    await settle();
+    choose("custom");
+    expect(onCustom).toHaveBeenCalledTimes(1);
+    expect(shown()).toBe("Daily");
+  });
+
+  it("Space and Enter open the list: Custom… picked there opens it", async () => {
+    const { onCustom } = open({ kind: "once" });
+    await act(async () => {});
+    fireEvent.keyDown(select(), { key: " " });
+    choose("custom");
+    expect(onCustom).toHaveBeenCalledTimes(1);
     fireEvent.keyDown(select(), { key: "Enter" });
+    choose("custom");
+    expect(onCustom).toHaveBeenCalledTimes(2);
+    expect(shown()).toBe("Does not repeat");
+  });
+
+  it("Alt+Down opens the list rather than stepping: Custom… stays on offer", async () => {
+    const { onCustom } = open({ kind: "once" });
+    await act(async () => {});
+    fireEvent.keyDown(select(), { key: "ArrowDown", altKey: true });
+    choose("custom");
     expect(onCustom).toHaveBeenCalledTimes(1);
   });
 
-  it("a Custom… arrowed onto and left goes back to the value", async () => {
+  // WebKit on a Mac opens the menu on Up and Down: Custom… must be in it, on.
+  it("on a Mac, Up and Down open the list with Custom… in it", async () => {
+    mac = true;
     const { onCustom } = open({ kind: "once" });
     await act(async () => {});
-    fireEvent.keyDown(select(), { key: "End" });
-    fireEvent.change(select(), { target: { value: "custom" } });
-    expect(shown()).toBe("Custom…");
-    fireEvent.blur(select());
-    expect(shown()).toBe("Does not repeat");
-    // Enter now is just Enter.
-    fireEvent.keyDown(select(), { key: "Enter" });
-    expect(onCustom).not.toHaveBeenCalled();
+    fireEvent.keyDown(select(), { key: "ArrowDown" });
+    expect(customRow().disabled).toBe(false);
+    choose("custom");
+    expect(onCustom).toHaveBeenCalledTimes(1);
+    // Type-ahead still steps there.
+    fireEvent.keyDown(select(), { key: "c" });
+    expect(customRow().disabled).toBe(true);
+  });
+
+  // A custom rule's words can run long: the select fits its row, its words cut short on screen only.
+  it("is never wider than its row", async () => {
+    open(monWed, "Weekly on Monday, Wednesday, Thursday and Friday, until 20-12-2026");
+    await act(async () => {});
+    expect(select().className.split(" ")).toContain("max-w-full");
+    expect(shown()).toBe("Weekly on Monday, Wednesday, Thursday and Friday, until 20-12-2026");
   });
 
   it("a kept rule shows its words; picking a preset replaces it", async () => {

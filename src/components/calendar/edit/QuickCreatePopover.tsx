@@ -592,7 +592,7 @@ export function QuickCreatePopover({
   const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...createNotes(t, overview, hidden, calendarId),
+    ...createNotes(t, draft.recurrence.kind === "rule", overview, hidden, calendarId),
   ];
 
   return (
@@ -717,6 +717,7 @@ export function QuickCreatePopover({
           view={repeat.state}
           time={t}
           deviceZone={deviceZone}
+          skippedTime={check.problems.some((p) => p.kind === "gap")}
           disabled={!timeEditable}
           onChange={(recurrence) => setDraft({ ...draftRef.current, recurrence })}
           onCustom={() => more(true)}

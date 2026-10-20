@@ -522,7 +522,7 @@ export function NewEventEditor({
   const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...createNotes(draft.time, overview, hidden, calendarId),
+    ...createNotes(draft.time, draft.recurrence.kind === "rule", overview, hidden, calendarId),
     ...(noPrivate ? [PRIVATE_OFF] : []),
   ];
 
@@ -628,6 +628,7 @@ export function NewEventEditor({
                 view={repeat.state}
                 time={draft.time}
                 deviceZone={deviceZone}
+                skippedTime={check.problems.some((p) => p.kind === "gap")}
                 disabled={!timeEditable}
                 onChange={(recurrence) => setDraft({ ...draftRef.current, recurrence })}
                 onCustom={() => setCustom("row")}

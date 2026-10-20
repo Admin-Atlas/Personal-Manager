@@ -12,10 +12,12 @@
 // in quick create) refusing every save until its own field is given one (that field named, marked,
 // and where a save it stops puts focus), and a calendar list the keyboard can reach.
 //
-// Repeating (C11): the rule chosen is sent; the backend's words say where it really starts, or why it
-// can't be saved, and every way to save waits for them; the zone it repeats in is said when it isn't
-// this computer's; a rule's own day follows a moved start; and the Custom dialog, opened here or
-// handed over by quick create, closes alone on Escape and holds every save while open.
+// Repeating (C11): the rule chosen is sent, and the Repeat menu, arrowed through, never shows a rule
+// the draft doesn't hold; the backend's words say where it really starts, or why it can't be saved
+// (a start the clocks skip said once), and every way to save but Check again waits for them; the
+// zone it repeats in is said when it isn't this computer's; one from before the months PM syncs is
+// said to show inside them; a rule's own day follows a moved start; and the Custom dialog, opened
+// here or handed over by quick create, closes alone on Escape and holds every save while open.
 
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -1181,11 +1183,101 @@ describe("NewEventEditor", () => {
       end: { date: "2026-10-12", time: "10:00", zone: "Europe/London" },
     });
     expect(shownRepeat()).toBe("Weekly on Monday");
+    // It starts on the day typed, so nothing says it moved.
+    expect(screen.queryByText(/the first day this repeat allows/)).toBeNull();
     fireEvent.click(saveButton());
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls).toEqual([
       [PERSONAL, { ...sentFor("Dentist").draft, recurrence: MONDAYS }, null],
     ]);
+  });
+
+  /** ArrowDown on the closed Repeat select as Linux and Windows take it: its own handler, then a
+   *  step to the next row that's on, which changes the value; and the backend's words for it. */
+  async function arrowDown() {
+    const el = repeat();
+    fireEvent.keyDown(el, { key: "ArrowDown" });
+    const next = Array.from(el.options).find((o) => !o.disabled && o.index > el.selectedIndex);
+    if (next) fireEvent.change(el, { target: { value: next.value } });
+    await act(async () => {});
+  }
+
+  // The menu never shows a rule the draft doesn't hold, so a save sends what it shows.
+  it("arrowed past every rule, the menu shows the last, and Ctrl+S sends exactly that", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await act(async () => {});
+    repeat().focus();
+    for (let i = 0; i < 3; i++) await arrowDown();
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
+    await ctrlS();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Standup").draft, recurrence: MONDAYS }, null],
+    ]);
+  });
+
+  it("a long rule's words never widen the editor", async () => {
+    const LONG = "Weekly on Monday, Wednesday, Thursday and Friday, until 20-12-2026";
+    describeRecurrence.mockImplementation(async (_rule, start) => readyAt(start, LONG));
+    open({
+      handover: handed({ ...seed, summary: "Gym", recurrence: { kind: "rule", rule: MON_WED } }),
+    });
+    await act(async () => {});
+    expect(shownRepeat()).toBe(LONG);
+    // The menu fits its row, and the When fields may be narrower than the widest thing in them.
+    expect(repeat().className.split(" ")).toContain("max-w-full");
+    expect(screen.getByRole("group", { name: "When" }).className.split(" ")).toContain("min-w-0");
+  });
+
+  // The backend lists and lands its occurrences inside the months PM syncs, wherever it starts.
+  it("a repeat that starts before the months PM syncs says only its occurrences there show", async () => {
+    const draft: EditorFields = {
+      ...seed,
+      summary: "Gym",
+      time: timedOn("2026-07-06"),
+      recurrence: { kind: "rule", rule: MONDAYS },
+    };
+    open({ handover: handed(draft) });
+    await act(async () => {});
+    expect(
+      screen.getByText(
+        /^This starts before the months PM syncs \(.+\), so only its occurrences within them will show here\.$/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/won't show here/)).toBeNull();
+    // Not repeating, none of it would.
+    await pickRepeat("Does not repeat");
+    expect(
+      screen.getByText(/^This starts outside the months PM syncs \(.+\), so it'll be saved/),
+    ).toBeTruthy();
+  });
+
+  // The When fields already refuse a start the clocks skip, and the backend refuses a first
+  // occurrence on it in other words: said once.
+  it("a start the clocks skip is refused once, not again under Repeat", async () => {
+    const SKIPPED =
+      "The first occurrence would be on 29-03-2026, when the clocks skip that time. Pick a time outside that hour.";
+    describeRecurrence.mockImplementation(async (_rule, start) =>
+      start.kind === "timed" && start.time === "01:30"
+        ? { outcome: "refused", message: SKIPPED }
+        : { outcome: "refused", message: "PM couldn't check this repeat. Try again." },
+    );
+    open();
+    fireEvent.change(title(), { target: { value: "Swim" } });
+    typeOver(screen.getByLabelText<HTMLInputElement>("Start date"), "29-03-2026");
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
+    await pickRepeat("Daily");
+    expect(screen.getAllByText(/the clocks skip/)).toHaveLength(1);
+    expect(screen.getByText(/^01:30 doesn't happen in Europe\/London that night/)).toBeTruthy();
+    expect(saveButton().disabled).toBe(true);
+    // The time fixed, what the backend says of the rule is the Repeat row's to say.
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "09:00" } });
+    await act(async () => {});
+    expect(screen.queryByText(/the clocks skip/)).toBeNull();
+    expect(screen.getByText("PM couldn't check this repeat. Try again.")).toBeTruthy();
   });
 
   it("Does not repeat sends recurrence null", async () => {
@@ -1435,16 +1527,29 @@ describe("NewEventEditor", () => {
   // Check again sends exactly what was sent: what the Repeat row says of the fields now can't hold it.
   it("a handed-over retry token's Check again doesn't wait for the repeat's words", async () => {
     describeRecurrence.mockReturnValue(new Promise<RepeatView>(() => {}));
+    createEvent.mockResolvedValue(saved);
     const draft: EditorFields = {
       ...seed,
       summary: "Gym",
       recurrence: { kind: "rule", rule: MONDAYS },
     };
     const sent = { calendarId: PERSONAL, draft: toNewEvent(draft) };
-    open({ handover: handed(draft, { held: { token: "ref-1", sent } }) });
+    expect(sent.draft.recurrence).toEqual(MONDAYS);
+    const first = open({ handover: handed(draft, { held: { token: "ref-1", sent } }) });
     await act(async () => {});
-    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Check again" }).disabled).toBe(
-      false,
-    );
+    const again = screen.getByRole<HTMLButtonElement>("button", { name: "Check again" });
+    expect(again.disabled).toBe(false);
+    // With the words still to come, it sends the held body, rule and all, under the same token.
+    fireEvent.click(again);
+    await waitFor(() => expect(first.onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1"]]);
+    cleanup();
+    // Ctrl+S too.
+    createEvent.mockClear();
+    const second = open({ handover: handed(draft, { held: { token: "ref-1", sent } }) });
+    await act(async () => {});
+    await ctrlS();
+    await waitFor(() => expect(second.onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1"]]);
   });
 });

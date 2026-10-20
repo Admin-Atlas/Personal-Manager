@@ -5,14 +5,16 @@
 // for the event's start date, the current rule when it is none of them (in the backend's words), and
 // "Custom…". A native select, so it reads and works as one everywhere.
 //
-// "Custom…" opens a dialog (or, in quick create, the full editor), so it acts only on a pick the user
-// commits: a click, or Enter once it shows. Arrowing through a closed select changes its value at
-// every step on Linux and Windows, and a dialog springing open on the way past would take the
-// keyboard somewhere the user never asked to go (C11 critique 2 M9). Arrowed onto, it only shows
-// "Custom…" until Enter (or Space) opens it, or the user moves on.
+// It only ever shows the rule the Repeat value holds, so a save sends what it shows. "Custom…" opens
+// a dialog (or, in quick create, the full editor), so it acts only on a pick from the list: a click,
+// or Enter in the list once the keyboard has opened it (Space or Alt+Down; Up and Down on a Mac).
+// Arrowing through a closed select changes its value at every step on Linux and Windows, and a dialog
+// springing open on the way past would take the keyboard somewhere the user never asked to go (C11
+// critique 2 M9), so while a key steps the select, "Custom…" is off and the step passes over it.
 
-import { useRef, useState } from "react";
+import { useRef } from "react";
 import { ONCE, sameRule, type RepeatValue } from "../../../lib/calendarEdit/recurrenceDraft";
+import { IS_MAC } from "../../../lib/setupGuide";
 import { Select } from "../../ui";
 import { usePresets } from "./useRepeat";
 
@@ -51,10 +53,8 @@ export function RecurrenceSelect({
   onCustom,
 }: Props) {
   const presets = usePresets(startDate);
-  // "Custom…" arrowed onto: shown, waiting for Enter, nothing opened.
-  const [armed, setArmed] = useState(false);
-  // A key that steps the select is down, so a change now is the keyboard passing through.
-  const stepping = useRef(false);
+  // The "Custom…" row, off while a key steps the select (`holdCustom`).
+  const customRow = useRef<HTMLOptionElement>(null);
 
   const match =
     value.kind === "rule" && presets ? presets.findIndex((p) => sameRule(p.rule, value.rule)) : -1;
@@ -69,7 +69,6 @@ export function RecurrenceSelect({
         : null;
 
   function pick(next: string) {
-    setArmed(false);
     if (next === "once") {
       onChange(ONCE);
     } else if (next.startsWith("preset:")) {
@@ -79,40 +78,38 @@ export function RecurrenceSelect({
     // "current" is the value already: picking it again changes nothing.
   }
 
+  /** Turn "Custom…" off for the key being pressed: a step passes over a row that's off (Chromium and
+   *  WebKit alike), so the keyboard going through the list never lands on it. It comes back on by a
+   *  timer, not the key coming up: the step is made inside the key's own handling, before any timer
+   *  runs, and a key that opened a menu instead may never send its key-up. */
+  function holdCustom() {
+    const row = customRow.current;
+    if (!row) return;
+    row.disabled = true;
+    setTimeout(() => {
+      row.disabled = false;
+    }, 0);
+  }
+
   return (
     <Select
       aria-label="Repeat"
       compact={compact}
-      value={armed ? "custom" : selected}
+      // Never wider than its row: a long rule's words are cut short on screen, and read out whole.
+      className="max-w-full"
+      value={selected}
       disabled={disabled}
       onKeyDown={(e) => {
-        if (armed && (e.key === "Enter" || e.key === " ")) {
-          e.preventDefault();
-          setArmed(false);
-          onCustom();
-          return;
-        }
-        const letter = e.key.length === 1 && e.key !== " " && !e.ctrlKey && !e.metaKey;
-        // Alt+Down opens the list rather than stepping.
-        if (!e.altKey && (STEP_KEYS.has(e.key) || letter)) stepping.current = true;
-      }}
-      onKeyUp={() => {
-        stepping.current = false;
-      }}
-      onBlur={() => {
-        stepping.current = false;
-        setArmed(false);
+        const steps = STEP_KEYS.has(e.key) || (e.key.length === 1 && e.key !== " ");
+        // Alt+Down opens the list rather than stepping, and on a Mac Up and Down alone do.
+        const opens = e.altKey || (IS_MAC && (e.key === "ArrowUp" || e.key === "ArrowDown"));
+        if (steps && !opens) holdCustom();
       }}
       onChange={(e) => {
         const next = e.target.value;
-        if (next !== "custom") {
-          pick(next);
-        } else if (stepping.current) {
-          setArmed(true);
-        } else {
-          setArmed(false);
-          onCustom();
-        }
+        // Only a pick from the list reaches it; the select goes back to the value it holds.
+        if (next === "custom") onCustom();
+        else pick(next);
       }}
     >
       <option value="once">Does not repeat</option>
@@ -122,7 +119,9 @@ export function RecurrenceSelect({
         </option>
       ))}
       {current !== null && <option value="current">{current}</option>}
-      <option value="custom">Custom…</option>
+      <option ref={customRow} value="custom">
+        Custom…
+      </option>
     </Select>
   );
 }

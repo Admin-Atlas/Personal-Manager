@@ -253,7 +253,8 @@ export function WhenFields({
     onAccept: () => onAcceptDate(half),
   });
   return (
-    <fieldset className="flex flex-col gap-2" disabled={disabled}>
+    // Never wider than the editor: a fieldset is as wide as its widest content unless told otherwise.
+    <fieldset className="flex min-w-0 flex-col gap-2" disabled={disabled}>
       <legend className="text-sm text-ink2">When</legend>
       <label className="flex items-center gap-2 text-xs text-ink3">
         <Toggle
@@ -375,6 +376,7 @@ export function RepeatRow({
   view,
   time,
   deviceZone,
+  skippedTime,
   disabled,
   compact,
   onChange,
@@ -385,6 +387,9 @@ export function RepeatRow({
   time: TimeDraft;
   /** This computer's zone, which the zone note compares the event's with. */
   deviceZone: string | null;
+  /** The editor already refuses a start or end the clocks skip. The rule's own refusal then waits
+   *  until the time is fixed: for a first occurrence on that day it says the same in other words. */
+  skippedTime: boolean;
   disabled: boolean;
   compact?: boolean;
   onChange: (value: RepeatValue) => void;
@@ -413,7 +418,7 @@ export function RepeatRow({
         {view.state === "ready" && view.moved && (
           <p className="text-ink4">{movedStartText(view.starts)}</p>
         )}
-        {view.state === "refused" && <p className="text-st-due">{view.message}</p>}
+        {view.state === "refused" && !skippedTime && <p className="text-st-due">{view.message}</p>}
       </div>
       {note && <p className="text-xs text-ink4">{note}</p>}
     </div>
