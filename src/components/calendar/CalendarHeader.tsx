@@ -97,15 +97,16 @@ export function CalendarHeader({
   const { system } = useTheme();
   const reasonId = useId();
   // A click on New event while none can be made: the reason, said beside it for a moment (a
-  // tooltip shows only on hover or focus, and a click doesn't focus a button in WebKit).
-  const [said, setSaid] = useState(false);
+  // tooltip shows only on hover or focus, and a click doesn't focus a button in WebKit). Counted
+  // (0 = not said), so another click starts the moment over and says it again as new text.
+  const [said, setSaid] = useState(0);
   useEffect(() => {
-    if (!said) return;
-    const t = setTimeout(() => setSaid(false), SAID_MS);
+    if (said === 0) return;
+    const t = setTimeout(() => setSaid(0), SAID_MS);
     return () => clearTimeout(t);
   }, [said]);
   useEffect(() => {
-    if (createReason === null) setSaid(false);
+    if (createReason === null) setSaid(0);
   }, [createReason]);
   // The last successful sync: clock time if it was today, else the date. Null when unset/unparseable.
   const synced = lastSync ? formatSyncedShort(lastSync) || null : null;
@@ -134,7 +135,7 @@ export function CalendarHeader({
               aria-keyshortcuts="c"
               className="aria-disabled:cursor-not-allowed aria-disabled:text-ink4"
               onClick={() => {
-                if (createReason !== null) setSaid(true);
+                if (createReason !== null) setSaid((n) => n + 1);
                 else onCreate();
               }}
             >
@@ -145,7 +146,8 @@ export function CalendarHeader({
             <>
               <VisuallyHidden id={reasonId}>{createReason}</VisuallyHidden>
               <span role="status" className="max-w-xs text-xs text-ink3">
-                {said ? createReason : ""}
+                {/* A new node each click: a screen reader says text added, not text unchanged. */}
+                {said > 0 && <span key={said}>{createReason}</span>}
               </span>
             </>
           )}

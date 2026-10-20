@@ -44,6 +44,12 @@ interface Props {
    *  transformed/filtered ancestor rather than the viewport, so an ancestor gaining a `transform`
    *  later would silently break placement. This follows Tooltip, which portals for the same reason. */
   escapeClipping?: boolean;
+  /** With `escapeClipping`, portal into the modal dialog the trigger sits in rather than
+   *  `document.body`. A panel outside an `aria-modal` dialog is out of reach of its focus trap and
+   *  hidden from screen readers, so a list the keyboard has to get into belongs inside. Still
+   *  `fixed`, so the dialog's scrolling body never clips it (Modal's dialog has no transform, which
+   *  would become the panel's containing block). Read when the panel opens. */
+  withinDialog?: boolean;
   /** Accessible name for the panel — it's a `group` of controls (a checkbox list or a date grid),
    *  not a `menu` of menuitems, so screen readers shouldn't enter menu-navigation mode. */
   ariaLabel?: string;
@@ -61,6 +67,7 @@ export function Popover({
   panelClassName,
   rootClassName,
   escapeClipping = false,
+  withinDialog = false,
   ariaLabel,
   open: controlledOpen,
   onOpenChange,
@@ -215,10 +222,13 @@ export function Popover({
     </div>
   );
 
+  const host =
+    (withinDialog && rootRef.current?.closest<HTMLElement>('[role="dialog"]')) || document.body;
+
   return (
     <div ref={rootRef} className={cn("relative", rootClassName)}>
       {trigger({ open, toggle: () => setOpen(!open) })}
-      {escapeClipping ? panel && createPortal(panel, document.body) : panel}
+      {escapeClipping ? panel && createPortal(panel, host) : panel}
     </div>
   );
 }

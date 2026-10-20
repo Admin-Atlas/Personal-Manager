@@ -224,8 +224,9 @@ async fn do_connect_google_calendar(
     let default_length = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
-    // A nicety, so a store that can't take it never fails the connect.
-    let _ = calendar::remember_default_length(&conn, &email, default_length);
+    // A nicety, so a store that can't take it never fails the connect. The same guarded store as a
+    // sync's (the source was registered just above, under this lock).
+    let _ = calendar::remember_default_length_if_connected(&conn, &account, &email, default_length);
     // A read-only connect asked Google for reading only, so it turns editing off even when the
     // account had it: only the "Turn on editing" consent sets the choice.
     calendar_editing::set_choice(&conn, &email, None)?;
@@ -864,12 +865,7 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
                 continue;
             };
             // Disconnected during the read: its length went with it, and stays gone.
-            let connected = calendar::list_sources(&conn, Some("google"))
-                .map(|sources| sources.iter().any(|a| a.id == acc.id))
-                .unwrap_or(false);
-            if connected {
-                let _ = calendar::remember_default_length(&conn, &email, read);
-            }
+            let _ = calendar::remember_default_length_if_connected(&conn, &acc.id, &email, read);
         }
     }
 }

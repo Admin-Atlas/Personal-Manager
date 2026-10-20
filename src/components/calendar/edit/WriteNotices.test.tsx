@@ -11,6 +11,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
+import { Modal } from "../../ui";
 import { WriteNotices } from "./WriteNotices";
 import type { WriteNotice } from "./useEventWrites";
 
@@ -24,7 +25,33 @@ const deleting = (id: number, summary: string): WriteNotice => ({
   undoLabel: `Undo deleting “${summary}”`,
 });
 
+/** An element's one z-index utility, as a number (`z-50`, `z-[45]`). jsdom paints nothing, so the
+ *  stacking is read from the classes. */
+function zOf(el: Element | null): number {
+  const z = Array.from(el?.classList ?? [])
+    .map((c) => /^z-\[?(\d+)\]?$/.exec(c))
+    .filter((m) => m !== null);
+  expect(z).toHaveLength(1);
+  return Number(z[0]![1]);
+}
+
 describe("WriteNotices", () => {
+  // A notice that never goes (Check again) covered a new event's Cancel and Save on a short window,
+  // and sat outside the dialog's focus trap: notices stack under any open dialog's scrim.
+  it("sits under an open dialog's scrim, whichever comes later in the page", () => {
+    render(
+      <>
+        <Modal open onClose={vi.fn()} label="New event">
+          <button type="button">Save</button>
+        </Modal>
+        <WriteNotices notices={[deleting(1, "Gym")]} onUndo={vi.fn()} onDismiss={vi.fn()} />
+      </>,
+    );
+    const scrim = screen.getByRole("dialog").parentElement;
+    const stack = screen.getByText("Deleting “Gym”.").closest(".fixed");
+    expect(zOf(stack)).toBeLessThan(zOf(scrim));
+  });
+
   it("names the shortcut on the newest Undo only", () => {
     render(
       <WriteNotices

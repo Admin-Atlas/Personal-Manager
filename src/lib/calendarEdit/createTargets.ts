@@ -68,6 +68,19 @@ export function createTargets(overview: CalendarOverview): CreateTargets {
   return { groups, off };
 }
 
+/** Why no new event can be made, for "+ New event" (which shows only once a Google account is
+ *  connected), or null when a calendar can take one. With editing on somewhere, none of its
+ *  calendars can; with it on nowhere, the way out is the switch in Settings. */
+export function createReasonFor(overview: CalendarOverview, t: CreateTargets): string | null {
+  if (t.groups.length > 0) return null;
+  const editingOn = overview.accounts.some(
+    (a) => a.provider === "google" && overview.editing[a.id] === "on",
+  );
+  return editingOn
+    ? "None of your calendars can take new events."
+    : "Turn on editing for a Google account in Settings › Connectors to create events.";
+}
+
 /** Where a new event starts: the calendar last created in (`lastId`), while it can still take one;
  *  else the first primary calendar, in account order; else the first calendar on offer; else none,
  *  and nothing can be created. */

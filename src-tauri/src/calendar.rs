@@ -294,10 +294,30 @@ pub fn parse_default_length(v: &serde_json::Value) -> Option<u32> {
 /// Store what a read of one account's default length found, under the caller's lock: a value Google
 /// gave replaces the last one; a read that failed (`None`) changes nothing, so the last good value
 /// stays rather than falling back to an hour.
-pub fn remember_default_length(conn: &Connection, email: &str, read: Option<u32>) -> Result<()> {
+fn remember_default_length(conn: &Connection, email: &str, read: Option<u32>) -> Result<()> {
     match read {
         Some(minutes) => set_default_length(conn, email, Some(minutes)),
         None => Ok(()),
+    }
+}
+
+/// [`remember_default_length`] for a read made with no lock held, under the lock taken again after
+/// it: only while the Google source `source_id` is still connected. A disconnect during the read
+/// cleared the account's length, and a value read with the token it had before must not bring the
+/// length back for an account PM no longer holds.
+pub fn remember_default_length_if_connected(
+    conn: &Connection,
+    source_id: &str,
+    email: &str,
+    read: Option<u32>,
+) -> Result<()> {
+    let connected = list_sources(conn, Some("google"))?
+        .iter()
+        .any(|s| s.id == source_id);
+    if connected {
+        remember_default_length(conn, email, read)
+    } else {
+        Ok(())
     }
 }
 
@@ -3611,5 +3631,36 @@ mod tests {
         // Nothing read for an account with none stored stores nothing.
         remember_default_length(&conn, "new@example.com", None).unwrap();
         assert_eq!(default_lengths(&conn).unwrap().len(), 1);
+    }
+
+    /// A sync reads the length with no lock held; an account disconnected meanwhile (its source gone,
+    /// its length cleared) gets none back from that read. A connected one does.
+    #[test]
+    fn a_default_length_read_lands_only_while_its_account_is_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let me = google_account_id("me@example.com");
+        upsert_source(
+            &conn,
+            &me,
+            "google",
+            Some("me@example.com"),
+            "me@example.com",
+        )
+        .unwrap();
+        remember_default_length_if_connected(&conn, &me, "me@example.com", Some(30)).unwrap();
+        assert_eq!(
+            default_lengths(&conn).unwrap().get("me@example.com"),
+            Some(&30)
+        );
+        // Disconnected during the read, as the disconnect does it: source removed, length cleared.
+        remove_source(&conn, &me).unwrap();
+        set_default_length(&conn, "me@example.com", None).unwrap();
+        remember_default_length_if_connected(&conn, &me, "me@example.com", Some(45)).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        // A source by that id that isn't Google's doesn't count.
+        upsert_source(&conn, &me, "other", None, "Feed").unwrap();
+        remember_default_length_if_connected(&conn, &me, "me@example.com", Some(45)).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
     }
 }

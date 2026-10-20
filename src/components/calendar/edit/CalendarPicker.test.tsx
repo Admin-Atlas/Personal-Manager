@@ -5,9 +5,10 @@
 //
 // The calendar a new event goes to (#884, C10): only calendars PM may create on, grouped by account
 // as radios, the accounts that can't named by why, a calendar that can't hold a private event greyed
-// out for a private draft, and a hidden one still offered and marked.
+// out for a private draft, a hidden one still offered and marked, and a pointer's pick told from the
+// keyboard's. Inside the editor's dialog it's NewEventEditor.test that reaches it by keyboard.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Calendar, CalendarAccount, CalendarOverview } from "../../../lib/types";
 import { createTargets } from "../../../lib/calendarEdit/createTargets";
@@ -109,7 +110,7 @@ function open(over: Partial<Parameters<typeof CalendarPicker>[0]> = {}) {
       {...over}
     />,
   );
-  const trigger = screen.getByRole("button", { name: "Calendar: Personal" });
+  const trigger = screen.getByRole("button", { name: /^Calendar: / });
   fireEvent.click(trigger);
   const list = screen.getByRole("group", { name: "Calendars that can take a new event" });
   return { onChange, trigger, list };
@@ -210,6 +211,65 @@ describe("CalendarPicker", () => {
     ).getByRole("radio", { name: "Family" });
     fireEvent.click(family, { detail: 1 });
     expect(onChange).toHaveBeenLastCalledWith(`${ME}:family`);
+    expect(screen.queryByRole("group", { name: "Calendars that can take a new event" })).toBeNull();
+  });
+
+  // A click on the name or dot reaches the radio forwarded by its label, with `detail` 0 in every
+  // engine PM runs on, as an arrow key's click has: the pointer going down on the row is what tells.
+  it("a click on a row's name picks and closes, as one on its radio does", () => {
+    const { onChange, trigger, list } = open();
+    fireEvent.pointerDown(within(list).getByText("Family"));
+    fireEvent.click(within(list).getByRole("radio", { name: "Family" }), { detail: 0 });
+    expect(onChange).toHaveBeenLastCalledWith(`${ME}:family`);
+    expect(screen.queryByRole("group", { name: "Calendars that can take a new event" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("a key after a pointer went down on a row is the keyboard's again", () => {
+    const { onChange, list } = open();
+    // Pressed on a row and let go off it: no click. Then an arrow key moves the choice.
+    fireEvent.pointerDown(within(list).getByText("Family"));
+    const work = within(list).getByRole("radio", { name: "Work" });
+    fireEvent.keyDown(work, { key: "ArrowDown" });
+    fireEvent.click(work, { detail: 0 });
+    expect(onChange).toHaveBeenLastCalledWith(`${WORK}:work@x.com`);
+    expect(
+      screen.queryByRole("group", { name: "Calendars that can take a new event" }),
+    ).not.toBeNull();
+  });
+
+  it("opening puts focus on the calendar picked, else the first that can be", async () => {
+    const { list } = open({ value: `${WORK}:work@x.com` });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(list).getByRole("radio", { name: "Work" })),
+    );
+    cleanup();
+    // Picked, but a private draft can't go there: the first calendar that can take it.
+    const again = open({ value: `${ME}:family`, privateDraft: true });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(again.list).getByRole("radio", { name: "Personal" }),
+      ),
+    );
+  });
+
+  it("closes when it's disabled, and doesn't come back by itself", () => {
+    const props = {
+      targets: createTargets(overview),
+      value: `${ME}:me@x.com`,
+      onChange: vi.fn(),
+      privateDraft: false,
+      hidden: new Set<string>(),
+      colorOf: () => "var(--accent)",
+      shapeOf: () => undefined,
+    };
+    const view = render(<CalendarPicker {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    expect(
+      screen.queryByRole("group", { name: "Calendars that can take a new event" }),
+    ).not.toBeNull();
+    view.rerender(<CalendarPicker {...props} disabled />);
+    view.rerender(<CalendarPicker {...props} />);
     expect(screen.queryByRole("group", { name: "Calendars that can take a new event" })).toBeNull();
   });
 

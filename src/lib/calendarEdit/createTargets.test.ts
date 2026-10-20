@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { Calendar, CalendarAccount, CalendarOverview } from "../types";
 import {
   createdWhere,
+  createReasonFor,
   createTargets,
   defaultTarget,
   lengthFor,
@@ -111,6 +112,45 @@ describe("createTargets", () => {
     const t = createTargets(overview({ editing: {} }));
     expect(t.groups).toEqual([]);
     expect(t.off).toHaveLength(4);
+  });
+});
+
+describe("createReasonFor", () => {
+  const reason = (o: CalendarOverview) => createReasonFor(o, createTargets(o));
+  const TURN_ON = "Turn on editing for a Google account in Settings › Connectors to create events.";
+  const NONE = "None of your calendars can take new events.";
+
+  it("says nothing while a calendar can take an event", () => {
+    expect(reason(overview())).toBeNull();
+  });
+
+  it("points to the switch when editing is on nowhere, paused or not", () => {
+    expect(reason(overview({ editing: {} }))).toBe(TURN_ON);
+    expect(reason(overview({ editing: { [ME]: "paused", [OFF]: "needs_consent" } }))).toBe(TURN_ON);
+    // A non-Google account's entry never counts as editing on.
+    expect(reason(overview({ editing: { "outlook:me@y.com": "on" } }))).toBe(TURN_ON);
+  });
+
+  it("says none can when editing is on but no calendar there takes events", () => {
+    const readOnly = overview({
+      calendars: overview().calendars.map((c) =>
+        c.source_id === ME ? { ...c, access_role: "reader" } : c,
+      ),
+    });
+    expect(reason(readOnly)).toBe(NONE);
+    // Every writable calendar unticked in Settings, likewise.
+    const unticked = overview({
+      calendars: overview().calendars.map((c) => ({ ...c, selected: false })),
+    });
+    expect(reason(unticked)).toBe(NONE);
+  });
+
+  it("without a Google account (no button at all), would point to the switch", () => {
+    const none = overview({
+      accounts: overview().accounts.filter((a) => a.provider !== "google"),
+      editing: {},
+    });
+    expect(reason(none)).toBe(TURN_ON);
   });
 });
 

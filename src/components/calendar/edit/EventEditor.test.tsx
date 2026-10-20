@@ -205,6 +205,20 @@ describe("EventEditor", () => {
     expect(choicesForEdit).not.toHaveBeenCalled();
   });
 
+  it("turns Close off with Cancel while a save is out, and back on after", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    let answer: (a: SaveAnswer) => void = () => {};
+    saveEdit.mockReturnValue(new Promise<SaveAnswer>((resolve) => (answer = resolve)));
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const close = () => screen.getByRole<HTMLButtonElement>("button", { name: "Close" });
+    expect(close().disabled).toBe(true);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Cancel" }).disabled).toBe(true);
+    await act(async () => answer({ outcome: "failed", message: "PM couldn't reach Google." }));
+    expect(close().disabled).toBe(false);
+  });
+
   it("sends a date typed but not yet committed when Save is pressed", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
@@ -322,6 +336,8 @@ describe("EventEditor", () => {
     expect(await screen.findByText(/“31-13-2026” isn't a date PM can read/)).toBeTruthy();
     expect(saveEdit).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+    // The field it was typed in keeps focus, rather than the page behind the dialog.
+    expect(document.activeElement).toBe(start);
   });
 
   it("asks before closing over a date typed but not yet committed", async () => {

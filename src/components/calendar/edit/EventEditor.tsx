@@ -234,6 +234,13 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     }
   }
 
+  /** Focus back on what `commitFocused` blurred (`el`), when the save it began went no further:
+   *  never left on the page behind the dialog. */
+  function refocus(el: Element | null) {
+    if (!(el instanceof HTMLElement) || !el.closest('[role="dialog"]')) return;
+    if (el.isConnected && !el.matches(":disabled")) el.focus();
+  }
+
   const isDirty = () =>
     !!loaded && !!draftRef.current && changedFields(loaded.base, draftRef.current).length > 0;
 
@@ -329,9 +336,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   }
 
   async function save() {
+    // Refused before anything is blurred, so focus stays put.
+    if (!loaded || saving || asking) return;
+    const focused = document.activeElement;
     commitFocused();
     const current = draftRef.current;
-    if (!loaded || !current || saving || asking) return;
+    if (!current) return;
     // A new Save: no earlier ask's count or words carry into it (C9b-1 critique 1 L8).
     againRef.current = 0;
     heldNotice.current = null;
@@ -339,6 +349,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     // outlive the fix.
     if (badDateRef.current || checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
       setBanner(null);
+      refocus(focused);
       return;
     }
     const changes = toChanges(loaded.base, current);
@@ -579,6 +590,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           calendar ? `Saving to ${calendar.name}${account ? ` · ${account}` : ""}` : undefined
         }
         closeLabel="Close"
+        closeDisabled={saving}
         widthClassName="max-w-lg"
         heightClassName="max-h-[85vh]"
         footer={

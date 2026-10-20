@@ -4,10 +4,12 @@
 // Which calendar a new event goes to (#884, C10): a button naming the calendar, opening every
 // calendar that can take one, grouped by account as radios (the browser gives the arrow keys within
 // a group), with the Google accounts whose editing is off named underneath. The list escapes
-// clipping, so the editor's scrolling body never cuts it off. A click, or Enter, picks and closes;
-// the arrow keys move the choice without closing.
+// clipping, so the editor's scrolling body never cuts it off, and stays inside the editor's dialog,
+// where its focus trap and screen readers reach it. Opening puts focus on the calendar picked. A
+// click on a row, or Enter, picks and closes; the arrow keys move the choice without closing; Tab
+// and Escape close it, focus back on the button. Disabled (a save on its way), it closes.
 
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { CalendarAccount, EditingStatus } from "../../../lib/types";
 import { targetById, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
 import { useDepth } from "../../../theme";
@@ -54,10 +56,35 @@ export function CalendarPicker({
   const { showMeta } = useDepth();
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  // A pointer went down on a row: the click that follows is a pick, whatever its `detail` (a click
+  // on the name or dot reaches the radio forwarded by its label, with `detail` 0, as an arrow key's
+  // does). Any key clears it.
+  const pointer = useRef(false);
   const name = useId();
   const picked = targetById(targets, value);
   const label = picked?.calendar.name ?? "Choose a calendar";
   const account = picked ? picked.account.email || picked.account.label : null;
+  const shown = open && !disabled;
+
+  // Disabled while open (Ctrl+S with the list up): closed for good, not back by itself after.
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  // Opened, focus goes to the calendar picked (else the first that can be), so the keyboard is in
+  // the list. After the panel's measuring frame, which hides it, and a hidden radio can't take focus.
+  useEffect(() => {
+    if (!shown) return;
+    const t = setTimeout(() => {
+      const list = listRef.current;
+      const radio =
+        list?.querySelector<HTMLInputElement>("input[type=radio]:checked:not(:disabled)") ??
+        list?.querySelector<HTMLInputElement>("input[type=radio]:not(:disabled)");
+      radio?.focus();
+    }, 0);
+    return () => clearTimeout(t);
+  }, [shown]);
 
   /** Close, with focus back on the button (the popover's own restore is Escape's). */
   const done = () => {
@@ -67,18 +94,19 @@ export function CalendarPicker({
 
   return (
     <Popover
-      open={open && !disabled}
+      open={shown}
       onOpenChange={setOpen}
       escapeClipping
+      withinDialog
       ariaLabel="Calendars that can take a new event"
       panelClassName="max-w-sm"
-      trigger={({ open: shown, toggle }) => (
+      trigger={({ open: expanded, toggle }) => (
         <Button
           ref={triggerRef}
           variant="secondary"
           size="sm"
           aria-label={`Calendar: ${label}`}
-          aria-expanded={shown}
+          aria-expanded={expanded}
           disabled={disabled}
           onClick={toggle}
         >
@@ -96,10 +124,13 @@ export function CalendarPicker({
       )}
     >
       <div
+        ref={listRef}
         className="flex max-h-[60vh] flex-col gap-1 overflow-y-auto"
         onKeyDown={(e) => {
-          // Enter picks what the arrow keys moved to, as a click does.
-          if (e.key === "Enter") {
+          pointer.current = false;
+          // Enter picks what the arrow keys moved to, as a click does; Tab leaves the list for the
+          // button it hangs from, rather than for wherever the list sits in the dialog.
+          if (e.key === "Enter" || e.key === "Tab") {
             e.preventDefault();
             done();
           }
@@ -116,6 +147,7 @@ export function CalendarPicker({
               return (
                 <label
                   key={id}
+                  onPointerDown={() => (pointer.current = true)}
                   className={cn(
                     "flex items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1 text-sm",
                     noPrivate
@@ -133,7 +165,9 @@ export function CalendarPicker({
                     // A pointer's click closes the list; one the arrow keys make (no pointer, so
                     // `detail` 0) only moves the choice.
                     onClick={(e) => {
-                      if (e.detail > 0) done();
+                      const byPointer = e.detail > 0 || pointer.current;
+                      pointer.current = false;
+                      if (byPointer) done();
                     }}
                     className="accent-[var(--accent)]"
                   />

@@ -54,6 +54,9 @@ export interface DialogProps extends Omit<ModalBaseProps, "children"> {
   chrome?: DialogChrome;
   /** Label for the bar chrome's Close button. Ignored by the card chrome, which has none. */
   closeLabel?: string;
+  /** The bar chrome's Close button is disabled: while the dialog won't close (a save on its way), it
+   *  shouldn't look or announce as if it would. Escape and the scrim stay `onClose`'s to refuse. */
+  closeDisabled?: boolean;
   /** The action row. Card: right-aligned under the body. Bar: a bordered row at the foot, rendered
    *  only when given. */
   footer?: ReactNode;
@@ -67,6 +70,7 @@ export function Dialog({
   tone = "default",
   chrome = "card",
   closeLabel = "Close",
+  closeDisabled = false,
   footer,
   children,
   className,
@@ -100,7 +104,7 @@ export function Dialog({
             </h1>
             {subtitle != null && <p className="mt-1 text-xs text-ink4">{subtitle}</p>}
           </div>
-          <Button variant="tertiary" onClick={onClose}>
+          <Button variant="tertiary" onClick={onClose} disabled={closeDisabled}>
             {closeLabel}
           </Button>
         </div>

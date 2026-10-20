@@ -7,12 +7,14 @@
 // names the calendar it saves to. Save, Ctrl+S (⌘S on a Mac) and Enter in the title all save.
 //
 // A new event never goes twice by accident. Every way to save passes one guard, set before the
-// request goes; while it's out, every field, the picker and closing are off. What was sent is kept:
-// an answer that never arrived shows exactly that draft, locked, and Check again sends it again
-// under the retry token the backend gave (it looks for the event first), never anything newer. Only
-// Google showing the event or its deletion, or the backend no longer holding it, ends the token.
-// Closing while one is held, or an answer that arrives once the editor has gone, leaves a notice in
-// `useEventWrites` that says so and keeps Check again.
+// request goes; while it's out, every field, the picker and closing are off, and a held key's
+// repeats or the Enter that ends composing text send nothing. What was sent is kept: an answer that
+// never arrived shows exactly that draft, locked, and Check again sends it again under the retry
+// token the backend gave (it looks for the event first), never anything newer. Only Google showing
+// the event or its deletion, or the backend no longer holding it, ends the token. Closing while one
+// is held, or an answer that arrives once the editor has gone, leaves a notice in `useEventWrites`
+// that says so and keeps Check again. A token that ended without Google showing the event made is
+// never "nothing saved": discarding says what PM knows, and closing leaves it as a notice.
 //
 // Times are in this computer's zone (plan rule R6): when it can't be read, the times can't be
 // changed and nothing can be saved, rather than guessing UTC.
@@ -55,7 +57,6 @@ import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
 import {
-  NO_ZONE,
   ShowAsControl,
   TextRow,
   VisibilitySelect,
@@ -90,7 +91,17 @@ interface Held {
   fields: EditorFields;
 }
 
+/** A held token that ended without Google showing the event made (PM lost it, the draft differed,
+ *  or it was made and since deleted): what was sent, and the answer that ended it. */
+interface Unproven {
+  sent: CreateSent;
+  outcome: WriteOutcome;
+}
+
 const PRIVATE_OFF = "This calendar's sharing doesn't let you make private events on it.";
+// The edit mode's line says times can't change; here nothing can be saved, which it has to say.
+const NO_ZONE_CREATE =
+  "PM couldn't tell which time zone this computer is in, so it can't save a new event. Set the time zone in your system settings.";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -131,6 +142,9 @@ export function NewEventEditor({
   const [saving, setSaving] = useState(false);
   const heldRef = useRef<Held | null>(null);
   const [held, setHeldState] = useState<Held | null>(null);
+  // PM may have made an event this editor sent, though no token is held for it any more.
+  const unprovenRef = useRef<Unproven | null>(null);
+  const [unproven, setUnprovenState] = useState<Unproven | null>(null);
   const [askDiscard, setAskDiscardState] = useState(false);
   const askDiscardRef = useRef(false);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
@@ -158,6 +172,10 @@ export function NewEventEditor({
     heldRef.current = next;
     setHeldState(next);
   };
+  const setUnproven = (next: Unproven | null) => {
+    unprovenRef.current = next;
+    setUnprovenState(next);
+  };
   const setAskDiscard = (open: boolean) => {
     askDiscardRef.current = open;
     setAskDiscardState(open);
@@ -183,11 +201,17 @@ export function NewEventEditor({
   }, [focusRef, focusTitle]);
 
   // Going (closed, or with the Calendar tab) while PM may already have made the event leaves a
-  // notice with Check again. A save still out says how it ended itself, once it does.
+  // notice with Check again. A save still out says how it ended itself, once it does. One whose
+  // token ended unproven leaves its words (look for it before creating it again).
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
+      const u = unprovenRef.current;
+      if (u) {
+        const where = createdWhere(overviewRef.current, hiddenRef.current, u.sent.calendarId);
+        noteCreateResult(u.sent, null, u.outcome, where);
+      }
       const h = heldRef.current;
       if (h && !savingRef.current) noteHeldCreate(h.sent, h.token);
     };
@@ -200,6 +224,14 @@ export function NewEventEditor({
       active.blur();
       flushSync(() => {});
     }
+  }
+
+  /** Focus back on what `commitFocused` blurred (`el`), when the save it began went no further:
+   *  never left on the page behind the dialog. */
+  function refocus(el: Element | null) {
+    if (!(el instanceof HTMLElement) || !el.closest('[role="dialog"]')) return;
+    if (el.isConnected && !el.matches(":disabled")) el.focus();
+    else focusTitle();
   }
 
   const isDirty = () =>
@@ -265,9 +297,13 @@ export function NewEventEditor({
   }
 
   async function save() {
-    commitFocused();
+    // Refused before anything is blurred: focus stays put (in the discard question too).
     if (savingRef.current || askDiscardRef.current) return;
     const h = heldRef.current;
+    // Without a zone a new draft can't go (that's said under the fields); a held one goes as sent.
+    if (!h && deviceZone === null) return;
+    const focused = document.activeElement;
+    commitFocused();
     let sent: CreateSent;
     let fields: EditorFields;
     if (h) {
@@ -276,10 +312,10 @@ export function NewEventEditor({
       fields = h.fields;
     } else {
       const current = draftRef.current;
-      if (deviceZone === null) return;
       // What stops it is already said under When, as it happened.
       if (badDateRef.current || checkDraft(NEW_EVENT_BASE, current).problems.length > 0) {
         setBanner(null);
+        refocus(focused);
         return;
       }
       sent = { calendarId: calendarRef.current, draft: toNewEvent(current) };
@@ -321,6 +357,8 @@ export function NewEventEditor({
     setSaving(false);
     if (outcome.outcome === "saved") {
       setHeld(null);
+      // Made again after the look-first words: they've done their job.
+      setUnproven(null);
       noteCreateResult(sent, token, outcome, whereOf(sent.calendarId));
       onClose();
       return;
@@ -333,13 +371,16 @@ export function NewEventEditor({
       setCalendarId(sent.calendarId);
     } else {
       setHeld(null);
+      // A held token ended without Google showing it made: it may still be there.
+      if (h) setUnproven({ sent, outcome });
     }
     setBanner(createText(outcome, fields.summary, next !== null));
     refocusSave();
   }
 
   // Ctrl+S (⌘S) saves, as Google's event page does, through the same guard; the page's own save
-  // never opens over the editor.
+  // never opens over the editor. A held key's repeats save nothing more (the first answer may have
+  // just unlocked Save), nor does a key that's part of composing text.
   const saveNow = useRef(save);
   useEffect(() => {
     saveNow.current = save;
@@ -348,6 +389,7 @@ export function NewEventEditor({
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || !isLetterKey(e, "s")) return;
       e.preventDefault();
+      if (e.repeat || e.isComposing || e.keyCode === 229) return;
       void saveNow.current();
     };
     window.addEventListener("keydown", onKey);
@@ -380,7 +422,7 @@ export function NewEventEditor({
     ]),
   ];
   const notes = [
-    ...(timeOff ? [NO_ZONE] : []),
+    ...(timeOff ? [NO_ZONE_CREATE] : []),
     ...(outside
       ? [
           `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
@@ -402,6 +444,7 @@ export function NewEventEditor({
         chrome="bar"
         title="New event"
         closeLabel="Close"
+        closeDisabled={saving}
         widthClassName="max-w-lg"
         heightClassName="max-h-[85vh]"
         footer={
@@ -413,6 +456,10 @@ export function NewEventEditor({
               ref={saveButton}
               variant="primary"
               onClick={() => void save()}
+              // A held Enter here, once an answer put focus on it, clicks it again on every repeat.
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && e.repeat) e.preventDefault();
+              }}
               disabled={saving || timeOff}
             >
               {saving ? (held ? "Checking…" : "Saving…") : held ? "Check again" : "Save"}
@@ -444,10 +491,14 @@ export function NewEventEditor({
           <div
             ref={titleBox}
             onKeyDown={(e) => {
-              // Enter in the title saves, as in Google's quick box; not while composing text.
-              if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+              // Enter in the title saves, as in Google's quick box; not while composing text (WebKit
+              // sends the Enter that ends a composition after it, as key code 229), nor again on a
+              // held key's repeats.
+              if (e.key !== "Enter" || e.shiftKey) return;
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
               if (!(e.target instanceof HTMLInputElement)) return;
               e.preventDefault();
+              if (e.repeat) return;
               void save();
             }}
           >
@@ -563,7 +614,9 @@ export function NewEventEditor({
           onClose();
         }}
       >
-        Nothing has been saved to Google yet.
+        {unproven
+          ? createText(unproven.outcome, unproven.sent.draft.summary, false).text
+          : "Nothing has been saved to Google yet."}
       </ConfirmDialog>
     </>
   );

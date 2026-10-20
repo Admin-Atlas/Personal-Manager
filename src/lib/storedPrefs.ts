@@ -5,9 +5,9 @@
 // instead of the webview's localStorage.
 //
 // WHY THESE THREE AND NOT THE REST. The per-project milestone sort is keyed by PROJECT NAME; the
-// hidden-calendar set is a list of calendar ids, which for Google/Outlook is routinely the account's
-// email address; the backup dismissals were one key per destination+account, with the cloud account
-// in the KEY NAME. All three sat in the WebView2/WebKit localStorage — a plaintext LevelDB beside the
+// hidden-calendar set and the last calendar an event was created in are calendar ids, which for
+// Google/Outlook are routinely the account's email address; the backup dismissals were one key per
+// destination+account, with the cloud account in the KEY NAME. All three sat in the WebView2/WebKit localStorage — a plaintext LevelDB beside the
 // SQLCipher store that exists to hold exactly this, absent from a `.pmbackup` (pack.rs archives the
 // DB snapshot and the vault, not the webview profile), and described in the "remove PM data" panel
 // as "on-device interface preferences". View state — view mode, panel sizes, theme, fold state, the

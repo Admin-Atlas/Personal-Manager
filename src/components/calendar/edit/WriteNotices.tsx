@@ -7,6 +7,10 @@
 // Ctrl+Z (⌘Z on a Mac), which its tooltip says. A "this and following" change PM couldn't finish
 // keeps its notice, with a button for each thing Google's state allows now, until it's settled; a
 // new event PM can't tell was made keeps its Check again.
+//
+// They sit under an open dialog's scrim (z-50), above the docked reader (z-40) as the briefing
+// panel does: a notice that never goes would otherwise cover an editor's Cancel and Save on a short
+// window, outside its focus trap. The dialog is what the keyboard is in until it closes.
 
 import { IS_MAC } from "../../../lib/setupGuide";
 import { Button, Callout, TONE_MIX, TONE_TOKEN, Tooltip } from "../../ui";
@@ -33,7 +37,7 @@ export function WriteNotices({ notices, onUndo, onDismiss, onSettle, onCheckCrea
   const partials = notices.filter((n) => n.split).length;
   const creates = notices.filter((n) => n.create).length;
   return (
-    <div className="fixed bottom-4 left-1/2 z-50 flex w-max max-w-md -translate-x-1/2 flex-col gap-2">
+    <div className="fixed bottom-4 left-1/2 z-[45] flex w-max max-w-md -translate-x-1/2 flex-col gap-2">
       {notices.map((n) => {
         const tone = CALLOUT_TONE[n.tone];
         return (

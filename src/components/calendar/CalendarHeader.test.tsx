@@ -7,7 +7,7 @@
 // account is connected, and when no calendar can take an event it stays focusable and says why
 // rather than going grey and silent.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
@@ -22,7 +22,11 @@ afterEach(cleanup);
 const REASON = "None of your calendars can take new events.";
 
 function header(over: { onCreate?: () => void; createReason?: string | null } = {}) {
-  render(
+  return render(element(over));
+}
+
+function element(over: { onCreate?: () => void; createReason?: string | null } = {}) {
+  return (
     <CalendarHeader
       view="week"
       availableViews={["month", "week", "day", "agenda"]}
@@ -44,7 +48,7 @@ function header(over: { onCreate?: () => void; createReason?: string | null } = 
       syncing={false}
       lastSync={null}
       {...over}
-    />,
+    />
   );
 }
 
@@ -74,6 +78,54 @@ describe("CalendarHeader", () => {
     fireEvent.click(button);
     expect(onCreate).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  // One primary button on screen: the editor's Save (C1-L5).
+  it("New event is a secondary button", () => {
+    for (const createReason of [null, REASON]) {
+      header({ onCreate: vi.fn(), createReason });
+      const button = screen.getByRole("button", { name: "+ New event" });
+      expect(button.getAttribute("data-variant")).toBe("secondary");
+      cleanup();
+    }
+  });
+
+  it("says why for six seconds; another click starts over and says it anew", () => {
+    vi.useFakeTimers();
+    try {
+      header({ onCreate: vi.fn(), createReason: REASON });
+      const button = screen.getByRole("button", { name: "+ New event" });
+      const status = () => screen.getByRole("status");
+      const pass = (ms: number) =>
+        act(() => {
+          vi.advanceTimersByTime(ms);
+        });
+      fireEvent.click(button);
+      const first = status().firstElementChild;
+      expect(status().textContent).toBe(REASON);
+      pass(4000);
+      fireEvent.click(button);
+      // New text for a screen reader to say, not the same text left in place.
+      expect(status().firstElementChild).not.toBeNull();
+      expect(status().firstElementChild).not.toBe(first);
+      // Six seconds from the second click, not the first.
+      pass(4000);
+      expect(status().textContent).toBe(REASON);
+      pass(2000);
+      expect(status().textContent).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forgets a reason said once a calendar can take an event, so the next waits for a click", () => {
+    const onCreate = vi.fn();
+    const view = header({ onCreate, createReason: REASON });
+    fireEvent.click(screen.getByRole("button", { name: "+ New event" }));
+    expect(screen.getByRole("status").textContent).toBe(REASON);
+    view.rerender(element({ onCreate, createReason: null }));
+    view.rerender(element({ onCreate, createReason: REASON }));
+    expect(screen.getByRole("status").textContent).toBe("");
   });
 
   it("has no New event without a Google account", () => {

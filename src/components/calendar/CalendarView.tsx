@@ -30,6 +30,7 @@ import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types
 import { reasonText } from "../../lib/calendarEdit/editReasons";
 import {
   createdWhere,
+  createReasonFor,
   createTargets,
   defaultTarget,
   lengthFor,
@@ -472,12 +473,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // calendar to take an event, the button says why.
   const targets = useMemo(() => (overview ? createTargets(overview) : null), [overview]);
   const hasGoogle = overview?.accounts.some((a) => a.provider === "google") ?? false;
-  const createReason =
-    !targets || targets.groups.length > 0
-      ? null
-      : overview?.accounts.some((a) => a.provider === "google" && overview.editing[a.id] === "on")
-        ? "None of your calendars can take new events."
-        : "Turn on editing for a Google account in Settings › Connectors to create events.";
+  const createReason = overview && targets ? createReasonFor(overview, targets) : null;
   // "+ New event" and `c`: the full editor, on the calendar last created in (else the primary), at
   // the next half hour today when today is on screen, else at 09:00 on the day the view is on, for
   // the account's own default length. Times are this computer's; without its zone, the calendar's
