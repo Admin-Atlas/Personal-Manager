@@ -93,17 +93,34 @@ pub fn update_milestone(
 }
 
 /// Link a milestone to a calendar event (`event_uid` Some, `cached_date` seeds the offline cache)
-/// or unlink it (None — the date becomes editable again).
+/// or unlink it (None — the date becomes editable again). `only_if_linked_to`: only while it's
+/// still linked to that event (the calendar's move between the two parts of a repeating event,
+/// C9b-2). An id no milestone has, or a link changed since, is an error, so nothing is said to have
+/// moved that didn't. A relink moves the date that governs the project, so the briefing looks again.
 #[tauri::command]
 pub fn set_milestone_event(
     state: State<'_, AppState>,
     id: i64,
     event_uid: Option<String>,
     cached_date: Option<String>,
+    only_if_linked_to: Option<String>,
 ) -> Result<()> {
     let conn = state.conn()?;
-    milestones::set_event(&conn, id, event_uid, cached_date)?;
+    if !milestones::set_event(
+        &conn,
+        id,
+        event_uid,
+        cached_date,
+        only_if_linked_to.as_deref(),
+    )? {
+        let words = match milestones::project_of(&conn, id)? {
+            None => "That milestone no longer exists.",
+            Some(_) => "That milestone changed since; nothing was moved.",
+        };
+        return Err(Error::Other(words.into()));
+    }
     touch_milestone_project(&conn, id)?;
+    briefing::nudge(&state);
     Ok(())
 }
 

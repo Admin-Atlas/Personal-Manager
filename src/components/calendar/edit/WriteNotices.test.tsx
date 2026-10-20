@@ -22,6 +22,7 @@ import { Modal } from "../../ui";
 import { BriefingPanel } from "../../BriefingPanel";
 import { WriteNotices } from "./WriteNotices";
 import type { WriteNotice } from "./useEventWrites";
+import type { MilestoneMove } from "../../../lib/types";
 
 afterEach(() => {
   cleanup();
@@ -183,5 +184,105 @@ describe("WriteNotices", () => {
     }) as HTMLButtonElement;
     expect(gym.disabled).toBe(true);
     expect(untitled.disabled).toBe(false);
+  });
+
+  // C9b-2: a milestone's move after a "this and following" change.
+  const launch: MilestoneMove = {
+    milestoneId: 7,
+    label: "Launch",
+    project: "Atlas",
+    newTitle: "Retro",
+    earlierTitle: "Gym",
+    toIcal: "tail@google.com",
+    toDate: "2026-10-19",
+    backIcal: "abc@google.com",
+    backDate: "2026-10-19",
+    earlierLastDay: "2026-10-12",
+    pending: false,
+  };
+  const offer = (moving = false): WriteNotice => ({
+    id: 4,
+    tone: "ok",
+    text: "Move the “Launch” milestone in Atlas…?",
+    move: launch,
+    moving,
+  });
+  const moved = (moving = false): WriteNotice => ({
+    id: 4,
+    tone: "ok",
+    text: "Moved “Launch” to the new part of “Retro”.",
+    moveBack: launch,
+    moving,
+  });
+
+  it("an offer shows Move with its name, unpressable while moving, and Keep it there", () => {
+    const props = { onUndo: vi.fn(), onDismiss: vi.fn(), onMove: vi.fn(), onMoveBack: vi.fn() };
+    const view = render(<WriteNotices notices={[offer()]} {...props} />);
+    const move = screen.getByRole("button", { name: "Move “Launch” to the new part of “Retro”" });
+    expect(move.textContent).toBe("Move");
+    fireEvent.click(move);
+    expect(props.onMove).toHaveBeenCalledWith(4);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Keep “Launch” on the earlier part of “Gym”" }),
+    );
+    expect(props.onDismiss).toHaveBeenCalledWith(4);
+    // Moving: still focusable (aria-disabled, never disabled), and a press does nothing.
+    move.focus();
+    view.rerender(<WriteNotices notices={[offer(true)]} {...props} />);
+    const waiting = screen.getByRole("button", { name: /^Move “Launch”/ }) as HTMLButtonElement;
+    expect(waiting.disabled).toBe(false);
+    expect(waiting.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(waiting);
+    expect(props.onMove).toHaveBeenCalledTimes(1);
+    // Moved: the very button, now Move back, keeps the focus.
+    view.rerender(<WriteNotices notices={[moved()]} {...props} />);
+    const back = screen.getByRole("button", {
+      name: "Move “Launch” back to the earlier part of “Gym”",
+    });
+    expect(back).toBe(move);
+    expect(document.activeElement).toBe(move);
+    expect(back.textContent).toBe("Move back");
+  });
+
+  it("Move back shows only on a moved notice, and holds its window while the pointer or focus is on it", () => {
+    const props = {
+      onUndo: vi.fn(),
+      onDismiss: vi.fn(),
+      onMove: vi.fn(),
+      onMoveBack: vi.fn(),
+      onHold: vi.fn(),
+    };
+    const view = render(<WriteNotices notices={[offer()]} {...props} />);
+    expect(screen.queryByRole("button", { name: /back to the earlier part/ })).toBeNull();
+    view.rerender(<WriteNotices notices={[moved()]} {...props} />);
+    expect(screen.queryByRole("button", { name: /Keep/ })).toBeNull();
+    const back = screen.getByRole("button", { name: /back to the earlier part/ });
+    fireEvent.click(back);
+    expect(props.onMoveBack).toHaveBeenCalledWith(4);
+    const notice = screen.getByRole("status");
+    props.onHold.mockClear();
+    fireEvent.pointerEnter(notice);
+    fireEvent.pointerLeave(notice);
+    fireEvent.focus(back);
+    // Focus moving within the notice holds on; leaving it lets go.
+    fireEvent.blur(back, { relatedTarget: screen.getByRole("button", { name: "Dismiss" }) });
+    fireEvent.blur(back, { relatedTarget: document.body });
+    expect(props.onHold.mock.calls).toEqual([
+      [4, "pointer", true],
+      [4, "pointer", false],
+      [4, "focus", true],
+      [4, "focus", false],
+    ]);
+  });
+
+  it("without the handlers, no move buttons", () => {
+    render(
+      <WriteNotices
+        notices={[offer(), { ...moved(), id: 5 }]}
+        onUndo={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["×", "×"]);
   });
 });

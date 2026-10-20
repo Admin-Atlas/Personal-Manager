@@ -16,6 +16,7 @@ import type {
   EventForEdit,
   EventPatchDraft,
   FieldPermissions,
+  Milestone,
   ScopeRow,
   SeriesChoices,
   SplitAction,
@@ -1145,5 +1146,50 @@ describe("EventEditor, a repeating event", () => {
     expect(saveEdit).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
     await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+});
+
+// C9b-2: a milestone linked to a repeating event takes its date from the next occurrence, so moving
+// one occurrence moves it only when it's that one; a one-off's words would overclaim.
+describe("EventEditor, a linked milestone", () => {
+  const launch: Milestone = {
+    id: 7,
+    project_name: "Atlas",
+    label: "Launch",
+    due_date: "2026-10-19",
+    event_uid: "abc@google.com",
+    calendar_linked: true,
+    event_missing: false,
+    state: null,
+    status: null,
+    source_type: null,
+    external_id: null,
+    sort_order: 0,
+  };
+  const editor = (clicked: CalendarEvent) => (
+    <EventEditor
+      row={clicked}
+      calendar={null}
+      account="me@x.com"
+      milestone={launch}
+      onClose={() => {}}
+    />
+  );
+
+  it("a repeating event's milestone takes its date from the next occurrence", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    render(editor({ ...row, series_id: "abc", recurring: true }));
+    expect(
+      await screen.findByText(
+        "Linked to the “Launch” milestone in Atlas, which takes its date from the next occurrence.",
+      ),
+    ).toBeTruthy();
+    cleanup();
+    render(editor(row));
+    expect(
+      await screen.findByText(
+        "Linked to the “Launch” milestone in Atlas: moving this event moves the milestone too.",
+      ),
+    ).toBeTruthy();
   });
 });

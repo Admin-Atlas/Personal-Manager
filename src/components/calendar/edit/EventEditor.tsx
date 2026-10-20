@@ -756,8 +756,11 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
 
             {milestone && (
               <p className="text-xs text-ink3">
-                Linked to the “{milestone.label}” milestone in {milestone.project_name}: moving this
-                event moves the milestone too.
+                {/* A repeating event's milestone follows its next occurrence, so moving this one
+                    moves it only when it's that one: the one-off's words would overclaim. */}
+                {isRepeating(row)
+                  ? `Linked to the “${milestone.label}” milestone in ${milestone.project_name}, which takes its date from the next occurrence.`
+                  : `Linked to the “${milestone.label}” milestone in ${milestone.project_name}: moving this event moves the milestone too.`}
               </p>
             )}
 

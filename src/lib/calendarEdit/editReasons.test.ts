@@ -6,7 +6,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ReadOnlyReason, SplitAction, WriteOutcome, WriteWarning } from "../types";
+import type {
+  MilestoneMove,
+  ReadOnlyReason,
+  SplitAction,
+  WriteOutcome,
+  WriteWarning,
+} from "../types";
 import {
   CALLOUT_TONE,
   CREATE_CHANGED,
@@ -20,9 +26,18 @@ import {
   heldCreateText,
   retryAfter,
   earlierChangeText,
+  keepLabel,
   leftBehindText,
   listFields,
   loadText,
+  milestoneStayedText,
+  moveBackFailedText,
+  moveBackLabel,
+  movedBackText,
+  movedText,
+  moveFailedText,
+  moveLabel,
+  moveOfferText,
   outcomeText,
   problemText,
   reasonText,
@@ -226,7 +241,12 @@ const saved = (warnings: WriteWarning[], left_behind?: string[]) =>
 
 describe("a write's warnings", () => {
   it("words every warning, for a save and for a delete", () => {
-    const all: WriteWarning[] = ["mirror_refresh_pending", "left_on_old_series", "outside_mirror"];
+    const all: WriteWarning[] = [
+      "mirror_refresh_pending",
+      "left_on_old_series",
+      "outside_mirror",
+      "milestone_not_offered",
+    ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
         expect(writeWarningText(w, kind)).toMatch(/^[A-Z].*\.$/);
@@ -353,6 +373,11 @@ describe("settling a change PM couldn't finish", () => {
         "Gym",
       ).tone,
     ).toBe("warn");
+    // A milestone that stayed has its own notice naming it (C9b-2): not said twice.
+    expect(settleText({ outcome: "saved", warnings: ["milestone_not_offered"] }, "Gym")).toEqual({
+      tone: "ok",
+      text: "Finished the change to “Gym”.",
+    });
     expect(settleText({ outcome: "split_removed" }, "Gym")).toEqual({
       tone: "ok",
       text: "Removed the new part of “Gym”. The repeating event is as it was.",
@@ -526,6 +551,67 @@ describe("creating an event", () => {
     });
     expect(createText(changed, "Dentist", false).text).toMatch(
       /^“Dentist” wasn't sent again: .* so it isn't made twice\.$/,
+    );
+  });
+});
+
+// C9b-2: moving a milestone after a "this and following" change.
+describe("move words", () => {
+  const launch: MilestoneMove = {
+    milestoneId: 7,
+    label: "Launch",
+    project: "Atlas",
+    newTitle: "Retro",
+    earlierTitle: "Gym",
+    toIcal: "tail@google.com",
+    toDate: "2026-10-19",
+    backIcal: "abc@google.com",
+    backDate: "2026-10-19",
+    earlierLastDay: "2026-10-12",
+    pending: false,
+  };
+
+  it("names the new part by its title and first day, and what saying no costs", () => {
+    expect(moveOfferText(launch)).toBe(
+      "Move the “Launch” milestone in Atlas to the new part of “Retro”, which starts on 19-10? If you don't, it stays on the earlier part, which ended on 12-10, and shows as overdue.",
+    );
+    // Days PM can't say are left out; a year outside this one is said; a blank title has a name.
+    expect(
+      moveOfferText({ ...launch, newTitle: "  ", toDate: null, earlierLastDay: "2025-12-29" }),
+    ).toBe(
+      "Move the “Launch” milestone in Atlas to the new part of “(no title)”? If you don't, it stays on the earlier part, which ended on 29-12-2025, and shows as overdue.",
+    );
+    expect(moveOfferText({ ...launch, earlierLastDay: null })).toMatch(
+      /stays on the earlier part, which has ended, and shows as overdue\.$/,
+    );
+  });
+
+  it("names each part by its own title once the change retitled the new one", () => {
+    expect(moveLabel(launch)).toBe("Move “Launch” to the new part of “Retro”");
+    expect(keepLabel(launch)).toBe("Keep “Launch” on the earlier part of “Gym”");
+    expect(movedText(launch)).toBe("Moved “Launch” to the new part of “Retro”.");
+    expect(moveBackLabel(launch)).toBe("Move “Launch” back to the earlier part of “Gym”");
+    expect(movedBackText(launch)).toBe("“Launch” is back on the earlier part of “Gym”.");
+  });
+
+  it("says when PM's calendar will show a move to a part it hasn't shown yet", () => {
+    expect(movedText({ ...launch, pending: true })).toBe(
+      "Moved “Launch” to the new part of “Retro”. PM's calendar will show its new date after the next refresh.",
+    );
+  });
+
+  it("says why a move failed, and the way out when a move back did", () => {
+    expect(moveFailedText(launch, "That milestone no longer exists.")).toBe(
+      "Couldn't move “Launch”. That milestone no longer exists.",
+    );
+    expect(moveBackFailedText(launch, "That milestone changed since; nothing was moved.")).toBe(
+      "Couldn't move “Launch” back. That milestone changed since; nothing was moved. Unlink it in Atlas if it shouldn't follow the new part.",
+    );
+  });
+
+  it("says which milestone stayed when PM couldn't find the new part", () => {
+    expect(milestoneStayedText(launch)).toBe(
+      "PM couldn't find the new part of “Retro” in Google, so “Launch” in Atlas stays on the earlier part, which ended on 12-10, and shows as overdue. Unlink it in Atlas to set its date yourself.",
     );
   });
 });

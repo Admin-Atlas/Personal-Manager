@@ -216,6 +216,12 @@ pub enum WriteOutcome {
         /// zone): they may still show. Empty, and left out, for every other save.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         left_behind: Vec<String>,
+        /// A "this and following" change that landed, with milestones linked to the earlier part
+        /// dated on or after the day it starts: the webview asks about each (DECISIONS 17-10 #2).
+        /// `None`, and left out, for every other save, and for a split with nothing to offer. Boxed,
+        /// so every outcome (and every `Result` that carries one as its error) stays small.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        milestone_moves: Option<Box<MilestoneMoves>>,
     },
     /// Google already holds exactly this; nothing was sent.
     NoChange,
@@ -332,6 +338,41 @@ pub enum WriteWarning {
     LeftOnOldSeries,
     /// Saved in Google, but it starts outside the months PM mirrors, so PM's calendar won't show it.
     OutsideMirror,
+    /// A "this and following" change landed, and PM couldn't tell which repeating event Google made
+    /// of the new part, so it can't offer to move the milestones `Saved.milestone_moves` names: they
+    /// stay on the earlier part (C9b-2 critique C2-M1).
+    MilestoneNotOffered,
+}
+
+/// What moving milestones to the new part of a "this and following" change needs (C9b-2). Dates
+/// are `YYYY-MM-DD` in the user's zone, as the milestone list resolves them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MilestoneMoves {
+    /// The new part's iCal UID (Google mints it; the insert never sets one), where Move sends a
+    /// milestone. `None`: PM couldn't tell, so nothing can be moved ([`WriteWarning::MilestoneNotOffered`]).
+    pub new_series_ical: Option<String>,
+    /// The earlier part's, where Move back sends it.
+    pub earlier_series_ical: String,
+    /// The new part's title, and the earlier part's, as Google holds them after the change.
+    pub new_title: String,
+    pub earlier_title: String,
+    /// The new part's first occurrence, the date a moved milestone shows until the next read; `None`
+    /// when PM can't say.
+    pub first_day: Option<String>,
+    /// The earlier part's last occurrence before the change: a milestone left on it reads overdue
+    /// from then. `None` when PM can't say.
+    pub earlier_last_day: Option<String>,
+    /// Never empty.
+    pub milestones: Vec<MilestoneOffer>,
+}
+
+/// A milestone PM may move: PM's own id, its words, and its date before the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MilestoneOffer {
+    pub id: i64,
+    pub label: String,
+    pub project: String,
+    pub date: String,
 }
 
 /// One event as the editor shows it, read from a fresh copy (never the mirror, which clips text).
@@ -518,6 +559,7 @@ mod tests {
             serde_json::to_string(&WriteOutcome::Saved {
                 warnings: vec![WriteWarning::MirrorRefreshPending],
                 left_behind: Vec::new(),
+                milestone_moves: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["mirror_refresh_pending"]}"#
@@ -526,6 +568,7 @@ mod tests {
             serde_json::to_string(&WriteOutcome::Saved {
                 warnings: vec![WriteWarning::LeftOnOldSeries],
                 left_behind: vec!["2026-11-02".into()],
+                milestone_moves: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["left_on_old_series"],"left_behind":["2026-11-02"]}"#
@@ -574,6 +617,7 @@ mod tests {
                 WriteOutcome::Saved {
                     warnings: vec![WriteWarning::OutsideMirror],
                     left_behind: Vec::new(),
+                    milestone_moves: None,
                 },
                 r#"{"outcome":"saved","warnings":["outside_mirror"]}"#,
             ),
@@ -633,6 +677,49 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(draft, TimeDraft::AllDay { .. }));
+    }
+
+    /// C9b-2: a split's milestone offers, in the shape the webview reads; a new part PM couldn't
+    /// name is `null` beside its warning.
+    #[test]
+    fn saved_with_milestone_moves_serialises_as_the_webview_reads_it() {
+        let moves = MilestoneMoves {
+            new_series_ical: Some("tail@google.com".into()),
+            earlier_series_ical: "abc@google.com".into(),
+            new_title: "Gym".into(),
+            earlier_title: "Gym".into(),
+            first_day: Some("2026-10-19".into()),
+            earlier_last_day: Some("2026-10-12".into()),
+            milestones: vec![MilestoneOffer {
+                id: 7,
+                label: "Launch".into(),
+                project: "Atlas".into(),
+                date: "2026-10-19".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: Vec::new(),
+                left_behind: Vec::new(),
+                milestone_moves: Some(Box::new(moves.clone())),
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":[],"milestone_moves":{"new_series_ical":"tail@google.com","earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":"2026-10-19","earlier_last_day":"2026-10-12","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: vec![WriteWarning::MilestoneNotOffered],
+                left_behind: Vec::new(),
+                milestone_moves: Some(Box::new(MilestoneMoves {
+                    new_series_ical: None,
+                    first_day: None,
+                    earlier_last_day: None,
+                    ..moves
+                })),
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":["milestone_not_offered"],"milestone_moves":{"new_series_ical":null,"earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":null,"earlier_last_day":null,"milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
+        );
     }
 
     /// The series choices, in the shapes the webview reads and sends.

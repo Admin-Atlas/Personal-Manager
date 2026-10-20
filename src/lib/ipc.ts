@@ -944,9 +944,15 @@ export const addMilestone = (
 export const updateMilestone = (id: number, label: string, dueDate: string | null) =>
   invoke<void>("update_milestone", { id, label, dueDate });
 
-/** Link a milestone to a calendar event (uid + cached date) or unlink it (null uid). */
-export const setMilestoneEvent = (id: number, eventUid: string | null, cachedDate: string | null) =>
-  invoke<void>("set_milestone_event", { id, eventUid, cachedDate });
+/** Link a milestone to a calendar event (uid + cached date) or unlink it (null uid).
+ *  `onlyIfLinkedTo`: only while it's still linked to that event, so an offer made a while ago never
+ *  undoes a change made since; it throws when nothing was changed (the calendar's milestone move). */
+export const setMilestoneEvent = (
+  id: number,
+  eventUid: string | null,
+  cachedDate: string | null,
+  onlyIfLinkedTo: string | null = null,
+) => invoke<void>("set_milestone_event", { id, eventUid, cachedDate, onlyIfLinkedTo });
 
 /** Set a milestone's progress status — the SINGLE writer for "how far along is this".
  *
@@ -1131,6 +1137,11 @@ export const listHeldDeletes = () => invoke<HeldDeleteInfo[]>("list_held_deletes
  *  planned against Google's copies now: what it would do, or why it can't. Only reads go to Google. */
 export const seriesChoices = (request: ChoiceRequest) =>
   invoke<SeriesChoices>("series_choices", { request });
+
+/** How the repeating event a mirrored Google row belongs to repeats, in Google Calendar's words
+ *  ("Weekly on Monday"), or null when PM can't say. Only a read goes to Google. */
+export const getSeriesSummary = (eventId: string) =>
+  invoke<string | null>("get_series_summary", { eventId });
 
 /** Settle a "this and following" change PM couldn't finish (`token` from a `partial_split` outcome
  *  or a `pending` row): look again, remove the new part, or finish the change. */

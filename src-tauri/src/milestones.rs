@@ -318,6 +318,31 @@ pub fn list_all(conn: &Connection, today: &str) -> Result<Vec<Milestone>> {
         .collect())
 }
 
+/// The unmet milestones linked to the calendar event `ical`, resolved as [`list_all`] resolves them
+/// (the soonest occurrence on or after `today`, else the latest past one, in the user's zone), whose
+/// date is on or after `day` (`YYYY-MM-DD`): what a "this and following" change offers to move to
+/// its new part (C9b-2). A ticked-off one isn't offered: moving it would change nothing the user
+/// sees.
+pub fn linked_on_or_after(
+    conn: &Connection,
+    ical: &str,
+    day: &str,
+    today: &str,
+) -> Result<Vec<Milestone>> {
+    let dates = calendar_dates_by_uid(conn, today)?;
+    Ok(load_rows(conn, None)?
+        .into_iter()
+        .filter(|r| r.event_uid.as_deref() == Some(ical))
+        .map(|r| resolve(r, &dates))
+        .filter(|m| !m.is_met())
+        .filter(|m| {
+            m.due_date
+                .as_deref()
+                .is_some_and(|d| d.get(..10).unwrap_or(d) >= day)
+        })
+        .collect())
+}
+
 /// Every milestone, resolved and grouped by project name — one pass for `list_overviews`.
 pub fn all_by_project(conn: &Connection, today: &str) -> Result<HashMap<String, Vec<Milestone>>> {
     let uid_dates = calendar_dates_by_uid(conn, today)?;
@@ -385,33 +410,37 @@ pub fn update(conn: &Connection, id: i64, label: &str, due_date: Option<String>)
 /// Link a milestone to a calendar event (Some uid; `cached_date` seeds the offline
 /// cache) or unlink it (None — the date becomes PM-native/editable again, keeping its
 /// last value). The two provenances share one row, distinguished only by `event_uid`.
+/// `only_if_linked_to`: change it only while it is still linked to that event (a move between the
+/// two parts of a repeating event, offered a while ago, never undoes a change made since; C9b-2).
+/// Whether a milestone was changed: false for an id no milestone has, or one linked elsewhere now.
 pub fn set_event(
     conn: &Connection,
     id: i64,
     event_uid: Option<String>,
     cached_date: Option<String>,
-) -> Result<()> {
+    only_if_linked_to: Option<&str>,
+) -> Result<bool> {
     let event_uid = clean(event_uid);
     let cached_date = clean(cached_date);
-    match event_uid {
+    let changed = match event_uid {
         // Link: stamp the uid and seed the cache (keep the old date if none supplied).
         Some(uid) => conn.execute(
             "UPDATE project_milestones \
              SET event_uid = ?2, due_date = COALESCE(?3, due_date), \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-             WHERE id = ?1",
-            params![id, uid, cached_date],
+             WHERE id = ?1 AND (?4 IS NULL OR event_uid = ?4)",
+            params![id, uid, cached_date, only_if_linked_to],
         )?,
         // Unlink: clear the uid; the last resolved date stays as the editable value.
         None => conn.execute(
             "UPDATE project_milestones \
              SET event_uid = NULL, due_date = COALESCE(?2, due_date), \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-             WHERE id = ?1",
-            params![id, cached_date],
+             WHERE id = ?1 AND (?3 IS NULL OR event_uid = ?3)",
+            params![id, cached_date, only_if_linked_to],
         )?,
     };
-    Ok(())
+    Ok(changed > 0)
 }
 
 /// Mark a milestone met or unmet (the row's tick-box). Also carries `status` along so the pair
@@ -834,6 +863,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    /// Mirror rows of the calendar event `uid`, one per start.
+    fn occurrences(conn: &Connection, uid: &str, starts: &[&str]) {
+        for (i, start) in starts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO calendar_events (id, calendar_id, summary, start, all_day, uid) \
+                 VALUES (?1, 'cal', 'Gym', ?2, 0, ?3)",
+                params![format!("{uid}#{i}"), start, uid],
+            )
+            .unwrap();
+        }
+    }
+
+    /// C9b-2: a split offers the milestones whose date, resolved as the list resolves it (the
+    /// soonest occurrence from today), is on or after the day it starts; a ticked-off one, or one
+    /// on another event, never.
+    #[test]
+    fn linked_on_or_after_resolves_as_the_list_does() {
+        let (_dir, conn) = store();
+        let today = "2026-10-12";
+        occurrences(
+            &conn,
+            "gym@x",
+            &[
+                "2026-10-05T09:00:00Z",
+                "2026-10-19T09:00:00Z",
+                "2026-10-26T09:00:00Z",
+            ],
+        );
+        occurrences(
+            &conn,
+            "past@x",
+            &["2026-09-28T09:00:00Z", "2026-10-05T09:00:00Z"],
+        );
+        let launch = add(&conn, "Atlas", "Launch", None, Some("gym@x".into())).unwrap();
+        let done = add(&conn, "Atlas", "Done", None, Some("gym@x".into())).unwrap();
+        set_state(&conn, done, true).unwrap();
+        add(&conn, "Atlas", "Other", None, Some("past@x".into())).unwrap();
+        let ids = |day: &str, uid: &str| -> Vec<(i64, Option<String>)> {
+            linked_on_or_after(&conn, uid, day, today)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.id, m.due_date))
+                .collect()
+        };
+        assert_eq!(
+            ids("2026-10-19", "gym@x"),
+            vec![(launch, Some("2026-10-19".into()))]
+        );
+        assert!(ids("2026-10-26", "gym@x").is_empty());
+        // Only past occurrences: the latest past one, which is before the day.
+        assert!(ids("2026-10-19", "past@x").is_empty());
+        let other = linked_on_or_after(&conn, "past@x", "2026-10-05", today).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].due_date.as_deref(), Some("2026-10-05"));
+    }
+
+    /// C9b-2: linking says whether a milestone had that id, so "Moved" is never said of nothing;
+    /// with `only_if_linked_to`, only while it's still linked there (a stale offer moves nothing).
+    #[test]
+    fn set_event_says_when_no_milestone_has_the_id() {
+        let (_dir, conn) = store();
+        let id = add(&conn, "Atlas", "Launch", None, Some("abc@x".into())).unwrap();
+        let link = |m: i64, uid: Option<&str>, only: Option<&str>| {
+            set_event(&conn, m, uid.map(str::to_string), None, only).unwrap()
+        };
+        let now = || -> Option<String> {
+            conn.query_row(
+                "SELECT event_uid FROM project_milestones WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!link(id + 99, Some("tail@x"), None));
+        assert!(!link(id + 99, None, None));
+        assert!(link(id, Some("tail@x"), Some("abc@x")));
+        assert_eq!(now().as_deref(), Some("tail@x"));
+        // An offer made before the move: it's no longer linked there, so nothing changes.
+        assert!(!link(id, Some("tail@x"), Some("abc@x")));
+        assert!(link(id, Some("abc@x"), None));
+        // Unlinked meanwhile: a Move pressed now moves nothing, and the link stays as the user set it.
+        assert!(link(id, None, None));
+        assert!(!link(id, Some("tail@x"), Some("abc@x")));
+        assert_eq!(now(), None);
     }
 
     /// The migration stamps `done` on rows already marked met, so no pre-v42 row starts life in the

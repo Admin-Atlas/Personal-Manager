@@ -286,8 +286,10 @@ describe("the warnings", () => {
   });
 
   it("says where links go when it becomes a new repeating event, and what an earlier change made", () => {
-    expect(seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")).toMatch(
-      /milestone stays with the earlier part, and reminders to prepare may show again/,
+    // C9b-2: a milestone is offered a move after saving (hedged: only when PM can make the offer),
+    // and the flags' warning stays before the save (scope-L9).
+    expect(seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")).toBe(
+      "From this occurrence on, it becomes a new repeating event in Google. If a milestone linked to it falls on or after this day, PM offers to move it to the new part after saving. Reminders to prepare may show again for the new part.",
     );
     const sibling = (kind: "save" | "delete") =>
       seriesWarningText({ warning: "split_sibling" }, kind, "all", "Gym");

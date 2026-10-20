@@ -55,6 +55,9 @@ interface Props {
   /** Filled with a way to close the panel from outside it (CalendarView's Ctrl+Z), handing focus
    *  back as Escape does. */
   closeRef?: MutableRefObject<(() => void) | null>;
+  /** How the repeating event a Google row belongs to repeats, in Google Calendar's words, or null
+   *  when PM can't say. Without it the line reads "Repeats" (C9b-2). */
+  describeSeries?: (eventId: string) => Promise<string | null>;
 }
 
 /** The popover's editing actions. */
@@ -140,6 +143,7 @@ export function CalendarEventPopover({
   onOpenProject,
   editing,
   closeRef,
+  describeSeries,
 }: Props) {
   const { showPower } = useDepth();
   // The colour the event was given in Google, if any.
@@ -147,9 +151,17 @@ export function CalendarEventPopover({
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   const [flags, setFlags] = useState<Flag[]>([]);
+  // How a Google occurrence's repeating event repeats, kept with the event it was asked for.
+  const [seriesWords, setSeriesWords] = useState<{ id: string; words: string } | null>(null);
+  // Shown only while that event is: the keyboard path re-points this mounted panel at another chip
+  // (see the focus block), and the last event's words must never show on the next one, not even
+  // for one paint. Until they come, and when they can't, the line reads "Repeats".
+  const words = seriesWords?.id === event.id ? seriesWords.words : null;
 
   // Position beside the anchor once measured: clamp horizontally, prefer below, flip above (or clamp
-  // to the bottom) when there isn't room. Hidden until placed so it never flashes at 0,0.
+  // to the bottom) when there isn't room. Hidden until placed so it never flashes at 0,0. Measured
+  // again when the repeat line's words or the flags arrive, since either can make the panel taller,
+  // and one flipped above its chip would then grow over it; a move only when the numbers change.
   useLayoutEffect(() => {
     const el = panelRef.current;
     if (!el) return;
@@ -161,8 +173,9 @@ export function CalendarEventPopover({
       const above = anchor.top - 6 - h;
       top = above >= MARGIN ? above : Math.max(MARGIN, window.innerHeight - h - MARGIN);
     }
-    setPos({ left, top });
-  }, [anchor]);
+    setPos((p) => (p && p.left === left && p.top === top ? p : { left, top }));
+  }, [anchor, words, flags.length]);
+  const placed = pos !== null;
 
   // Focus handling for a NON-MODAL dialog. This panel is deliberately not a `Modal`: there is no
   // scrim, the calendar behind it stays live, and clicking a different event dismisses this one and
@@ -199,15 +212,17 @@ export function CalendarEventPopover({
     };
   }, [closeRef, restoreFocus, onClose]);
 
-  // Move focus onto the panel once it has been PLACED. Keyed on `pos`, which is only set after the
-  // measuring layout effect above: until then the panel is `visibility: hidden`, and a hidden
-  // element cannot take focus.
+  // Move focus onto the panel once it has been PLACED, and again when it's re-pointed at another
+  // chip. Keyed on `placed`, which is only true after the measuring layout effect above: until then
+  // the panel is `visibility: hidden`, and a hidden element cannot take focus. Never on a later
+  // move: the repeat line's words arriving re-place the panel, and focus the user has since taken
+  // elsewhere (Tab out to the grid) must stay there.
   useEffect(() => {
-    if (!pos) return;
+    if (!placed) return;
     const el = panelRef.current;
     // Never steal focus back from a child the user has already reached.
     if (el && !el.contains(document.activeElement)) el.focus();
-  }, [pos]);
+  }, [anchor, placed]);
 
   // Dismiss on Escape or a click/tap outside the panel.
   useEffect(() => {
@@ -225,12 +240,11 @@ export function CalendarEventPopover({
     };
   }, [dismiss, onClose]);
 
-  // Load any PM flags anchored on this event's UID.
+  // Load any PM flags anchored on this event's UID. The last event's go first, whatever this one's
+  // read comes to: re-pointed at another chip, a read that fails mustn't leave them up.
   useEffect(() => {
-    if (!event.uid) {
-      setFlags([]);
-      return;
-    }
+    setFlags([]);
+    if (!event.uid) return;
     let alive = true;
     eventFlags(event.uid)
       .then((f) => {
@@ -241,6 +255,23 @@ export function CalendarEventPopover({
       alive = false;
     };
   }, [event.uid]);
+
+  // How a Google occurrence's repeating event repeats, in Google Calendar's words: asked once per
+  // event shown (C9b-2). A feed's row has its own words and never asks.
+  useEffect(() => {
+    if (!event.recurring || !event.series_id || !describeSeries) return;
+    const id = event.id;
+    let alive = true;
+    describeSeries(id)
+      .then((said) => {
+        const text = said?.trim();
+        if (alive && text) setSeriesWords({ id, words: text });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [event.id, event.recurring, event.series_id, describeSeries]);
 
   const attendees = event.attendees ?? [];
 
@@ -287,7 +318,7 @@ export function CalendarEventPopover({
       <div className="flex flex-col gap-2 overflow-y-auto px-3 py-3">
         <Field label="When">
           <div>{whenText(event)}</div>
-          {event.recurring && <div className="mt-0.5 text-ink4">{repeatsText(event)}</div>}
+          {event.recurring && <div className="mt-0.5 text-ink4">{words ?? repeatsText(event)}</div>}
         </Field>
 
         {event.show_as && <Field label="Shows as">{showAsLabel(event.show_as)}</Field>}

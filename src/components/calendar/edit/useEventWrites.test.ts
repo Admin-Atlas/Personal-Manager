@@ -15,6 +15,7 @@ import type {
   DeleteStart,
   EventPatchDraft,
   HeldDeleteInfo,
+  MilestoneMoves,
   NewEventDraft,
   SeriesChoices,
   SplitAction,
@@ -36,6 +37,11 @@ const settleSeriesSplit = vi.fn<(token: string, action: SplitAction) => Promise<
 const createCalendarEvent =
   vi.fn<(calendarId: string, draft: NewEventDraft, token: Scope) => Promise<WriteOutcome>>();
 const writeLastCreate = vi.fn<(calendarId: string) => void>();
+const getSeriesSummary = vi.fn<(eventId: string) => Promise<string | null>>();
+const setMilestoneEvent =
+  vi.fn<
+    (id: number, uid: string | null, date: string | null, only: string | null) => Promise<void>
+  >();
 let settledHandler: ((s: DeleteSettled) => void) | null = null;
 
 vi.mock("../../../lib/calendarPrefs", async (importOriginal) => ({
@@ -46,6 +52,9 @@ vi.mock("../../../lib/calendarPrefs", async (importOriginal) => ({
 vi.mock("../../../lib/ipc", () => ({
   // Every argument passes through, so an extra one, or a dropped token, shows in the calls.
   createCalendarEvent: (...a: [string, NewEventDraft, Scope]) => createCalendarEvent(...a),
+  getSeriesSummary: (eventId: string) => getSeriesSummary(eventId),
+  setMilestoneEvent: (id: number, uid: string | null, date: string | null, only: string | null) =>
+    setMilestoneEvent(id, uid, date, only),
   deleteCalendarEvent: (id: string, seen: unknown, scope: Scope, choice: Scope) =>
     deleteCalendarEvent(id, seen, scope, choice),
   cancelCalendarDelete: (token: string) => cancelCalendarDelete(token),
@@ -1213,5 +1222,277 @@ describe("creating an event", () => {
     const [notice] = hook.result.current.notices;
     expect(notice.create).toEqual({ token: "ref-1", sent });
     expect(notice.text).toMatch(/The app's channel closed\.$/);
+  });
+});
+
+// C9b-2: the popover's words, and the milestones a "this and following" change offers to move.
+describe("how a repeating event repeats, and moving its milestones", () => {
+  const moves: MilestoneMoves = {
+    new_series_ical: "tail@google.com",
+    earlier_series_ical: "abc@google.com",
+    new_title: "Retro",
+    earlier_title: "Gym",
+    first_day: "2026-10-19",
+    earlier_last_day: "2026-10-12",
+    milestones: [
+      { id: 7, label: "Launch", project: "Atlas", date: "2026-10-19" },
+      { id: 8, label: "Review", project: "Atlas", date: "2026-10-26" },
+    ],
+  };
+  const one: MilestoneMoves = { ...moves, milestones: [moves.milestones[0]] };
+  const landed = (m: MilestoneMoves, warnings: WriteWarning[] = []): WriteOutcome => ({
+    outcome: "saved",
+    warnings,
+    milestone_moves: m,
+  });
+
+  beforeEach(() => {
+    vi.setSystemTime(new Date("2026-10-20T12:00:00Z"));
+    setMilestoneEvent.mockResolvedValue(undefined);
+  });
+
+  /** A store with Launch's offer up: the store, and the offer's notice id. */
+  async function offered() {
+    const loaded = await load();
+    loaded.act(() => loaded.mod.noteSaved("Retro", landed(one), "following", "2026-10-19"));
+    const offer = loaded.hook.result.current.notices.find((n) => n.move);
+    const notice = () => loaded.hook.result.current.notices.find((n) => n.id === offer!.id);
+    return { ...loaded, id: offer!.id, notice };
+  }
+
+  it("describeSeries shares one request per row and answers null on a throw", async () => {
+    const { mod } = await load();
+    let answer!: (words: string | null) => void;
+    getSeriesSummary.mockReturnValueOnce(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const first = mod.describeSeries("row");
+    const second = mod.describeSeries("row");
+    expect(getSeriesSummary).toHaveBeenCalledTimes(1);
+    answer("Weekly on Monday");
+    await expect(first).resolves.toBe("Weekly on Monday");
+    await expect(second).resolves.toBe("Weekly on Monday");
+    // Answered, so a later call asks again; a throw is null ("Repeats").
+    getSeriesSummary.mockRejectedValueOnce(new Error("offline"));
+    await expect(mod.describeSeries("row")).resolves.toBeNull();
+    expect(getSeriesSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it("a landed split offers one notice per milestone, that stays", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteSaved("Retro", landed(moves), "following", "2026-10-19"));
+    const [, launch, review] = hook.result.current.notices;
+    expect(launch).toMatchObject({
+      tone: "ok",
+      text: "Move the “Launch” milestone in Atlas to the new part of “Retro”, which starts on 19-10? If you don't, it stays on the earlier part, which ended on 12-10, and shows as overdue.",
+      move: {
+        milestoneId: 7,
+        newTitle: "Retro",
+        earlierTitle: "Gym",
+        toIcal: "tail@google.com",
+        toDate: "2026-10-19",
+        backIcal: "abc@google.com",
+        backDate: "2026-10-19",
+      },
+    });
+    expect(review.move).toMatchObject({ milestoneId: 8, backDate: "2026-10-26" });
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    // The saved notice went by itself; the questions wait for an answer.
+    expect(hook.result.current.notices.map((n) => n.move?.milestoneId)).toEqual([7, 8]);
+  });
+
+  it("no milestone_moves, no offer", async () => {
+    settleSeriesSplit.mockResolvedValueOnce({
+      outcome: "partial_split",
+      token: "s1",
+      offers: ["finish"],
+      from: "2026-10-19",
+    });
+    const { mod, hook, act } = await load();
+    act(() => mod.noteSaved("Retro", { outcome: "saved", warnings: [] }, "following"));
+    act(() => mod.noteSaved("Retro", { outcome: "failed", message: "No." }, "following"));
+    await act(() => mod.settleSplit("s1", "check", "Gym"));
+    expect(hook.result.current.notices.some((n) => n.move || n.moveBack)).toBe(false);
+  });
+
+  it("a finished split offers too", async () => {
+    settleSeriesSplit.mockResolvedValueOnce(landed(one));
+    const { mod, hook, act } = await load();
+    await act(() => mod.settleSplit("s1", "finish", "Gym"));
+    expect(hook.result.current.notices.map((n) => n.move?.milestoneId)).toEqual([undefined, 7]);
+  });
+
+  it("a new part PM couldn't find says which milestone stayed, with nothing to press", async () => {
+    const { mod, hook, act } = await load();
+    const unnamed = { ...one, new_series_ical: null, earlier_last_day: null };
+    act(() =>
+      mod.noteSaved("Retro", landed(unnamed, ["milestone_not_offered"]), "following", "2026-10-19"),
+    );
+    expect(hook.result.current.notices[1]).toEqual({
+      id: 2,
+      tone: "warn",
+      text: "PM couldn't find the new part of “Retro” in Google, so “Launch” in Atlas stays on the earlier part, which has ended, and shows as overdue. Unlink it in Atlas to set its date yourself.",
+    });
+  });
+
+  it("Move sends the new part and its first day, then offers Move back for 8 s", async () => {
+    const { mod, act, id, notice } = await offered();
+    await act(async () => {
+      expect(await mod.moveMilestone(id)).toBe(true);
+    });
+    // Only while it's still on the earlier part.
+    expect(setMilestoneEvent).toHaveBeenCalledWith(
+      7,
+      "tail@google.com",
+      "2026-10-19",
+      "abc@google.com",
+    );
+    expect(notice()).toMatchObject({
+      tone: "ok",
+      text: "Moved “Launch” to the new part of “Retro”.",
+      moveBack: { milestoneId: 7 },
+    });
+    expect(notice()?.move).toBeUndefined();
+    act(() => {
+      vi.advanceTimersByTime(7_999);
+    });
+    expect(notice()?.moveBack).toBeDefined();
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(notice()).toEqual({
+      id,
+      tone: "ok",
+      text: "Moved “Launch” to the new part of “Retro”.",
+    });
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(notice()).toBeUndefined();
+  });
+
+  it("Move back sends the earlier part and the milestone's date", async () => {
+    const { mod, act, id, notice } = await offered();
+    await act(() => mod.moveMilestone(id));
+    await act(async () => {
+      expect(await mod.moveMilestoneBack(id)).toBe(true);
+    });
+    expect(setMilestoneEvent).toHaveBeenLastCalledWith(
+      7,
+      "abc@google.com",
+      "2026-10-19",
+      "tail@google.com",
+    );
+    expect(notice()).toEqual({
+      id,
+      tone: "ok",
+      text: "“Launch” is back on the earlier part of “Gym”.",
+    });
+    // The window it had is closed: nothing comes back later.
+    act(() => {
+      vi.advanceTimersByTime(8_000);
+    });
+    expect(notice()).toBeUndefined();
+  });
+
+  it("Move back waits while the pointer or focus is on its notice, then has what it had left", async () => {
+    const { mod, act, id, notice } = await offered();
+    // Focus on the Move button as it's pressed: the window starts held.
+    act(() => mod.holdMoveBack(id, "focus", true));
+    await act(() => mod.moveMilestone(id));
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(notice()?.moveBack).toBeDefined();
+    act(() => mod.holdMoveBack(id, "pointer", true));
+    act(() => mod.holdMoveBack(id, "focus", false));
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(notice()?.moveBack).toBeDefined();
+    act(() => mod.holdMoveBack(id, "pointer", false));
+    act(() => {
+      vi.advanceTimersByTime(3_000);
+    });
+    act(() => mod.holdMoveBack(id, "pointer", true));
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    act(() => mod.holdMoveBack(id, "pointer", false));
+    act(() => {
+      vi.advanceTimersByTime(4_999);
+    });
+    expect(notice()?.moveBack).toBeDefined();
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(notice()?.moveBack).toBeUndefined();
+  });
+
+  it("a second press while moving sends nothing", async () => {
+    let finish!: () => void;
+    setMilestoneEvent.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const { mod, act, id, notice } = await offered();
+    let first!: Promise<boolean>;
+    act(() => {
+      first = mod.moveMilestone(id);
+    });
+    expect(notice()?.moving).toBe(true);
+    await act(async () => {
+      expect(await mod.moveMilestone(id)).toBe(false);
+    });
+    expect(setMilestoneEvent).toHaveBeenCalledTimes(1);
+    finish();
+    await act(async () => {
+      expect(await first).toBe(true);
+    });
+    expect(notice()?.moving).toBeFalsy();
+  });
+
+  it("a failed move keeps the offer with the error", async () => {
+    setMilestoneEvent.mockRejectedValueOnce(new Error("That milestone no longer exists."));
+    const { mod, act, id, notice } = await offered();
+    await act(async () => {
+      expect(await mod.moveMilestone(id)).toBe(false);
+    });
+    expect(notice()).toMatchObject({
+      tone: "error",
+      text: "Couldn't move “Launch”. That milestone no longer exists.",
+      move: { milestoneId: 7 },
+    });
+    expect(notice()?.moving).toBeFalsy();
+  });
+
+  it("a failed move back says the way out, with nothing to press", async () => {
+    const { mod, act, id, notice } = await offered();
+    await act(() => mod.moveMilestone(id));
+    setMilestoneEvent.mockRejectedValueOnce(
+      new Error("That milestone changed since; nothing was moved."),
+    );
+    await act(async () => {
+      expect(await mod.moveMilestoneBack(id)).toBe(false);
+    });
+    expect(notice()).toEqual({
+      id,
+      tone: "error",
+      text: "Couldn't move “Launch” back. That milestone changed since; nothing was moved. Unlink it in Atlas if it shouldn't follow the new part.",
+    });
+  });
+
+  it("Ctrl+Z never moves a milestone", async () => {
+    const { mod, act, id } = await offered();
+    expect(mod.undoLatest()).toBe(false);
+    expect(setMilestoneEvent).not.toHaveBeenCalled();
+    await act(() => mod.moveMilestone(id));
+    expect(mod.undoLatest()).toBe(false);
+    expect(setMilestoneEvent).toHaveBeenCalledTimes(1);
   });
 });
