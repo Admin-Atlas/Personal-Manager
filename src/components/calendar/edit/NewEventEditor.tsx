@@ -19,7 +19,15 @@
 // Times are in this computer's zone (plan rule R6): when it can't be read, the times can't be
 // changed and nothing can be saved, rather than guessing UTC.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
 import { flushSync } from "react-dom";
 import type { CalendarOverview, WriteOutcome } from "../../../lib/types";
 import {
@@ -34,6 +42,7 @@ import {
   firstEndOnItsDate,
   halfInstant,
   hasBadDate,
+  refusedDateId,
   switchNewKind,
   toNewEvent,
   type BadDates,
@@ -41,7 +50,6 @@ import {
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
-  badDateLines,
   CALLOUT_TONE,
   createText,
   problemText,
@@ -134,6 +142,8 @@ export function NewEventEditor({
     badDatesRef.current = next;
     setBadDatesState(next);
   };
+  // The When fields' own, so a save a refusal stops can find the date field it names.
+  const whenId = useId();
   // The event's length, kept while its start moves: the account's default to begin with.
   const lengthRef = useRef(lengthFor(overview, targetById(targets, firstCalendar)));
   // Whether the user has changed the time: until then, another calendar brings its own length.
@@ -231,8 +241,8 @@ export function NewEventEditor({
     }
   }
 
-  /** Focus back on what `commitFocused` blurred (`el`), when the save it began went no further:
-   *  never left on the page behind the dialog. */
+  /** Focus on `el` (what `commitFocused` blurred, or the field a refusal names) when the save it
+   *  began went no further: never left on the page behind the dialog. */
   function refocus(el: Element | null) {
     if (!(el instanceof HTMLElement) || !el.closest('[role="dialog"]')) return;
     if (el.isConnected && !el.matches(":disabled")) el.focus();
@@ -317,12 +327,15 @@ export function NewEventEditor({
       fields = h.fields;
     } else {
       const current = draftRef.current;
-      // What stops it is already said under When, as it happened. Focus goes back where it was, a
-      // date field included: the text it put back is no date given, so this refusal stands.
-      if (
-        hasBadDate(badDatesRef.current) ||
-        checkDraft(NEW_EVENT_BASE, current).problems.length > 0
-      ) {
+      // What stops it is already said under When, as it happened. A date a field couldn't read puts
+      // focus on that field, which the line names and only a date typed or picked there clears (a
+      // blur gives it nothing, so the refusal stands); anything else puts focus back where it was.
+      if (hasBadDate(badDatesRef.current)) {
+        setBanner(null);
+        refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
+        return;
+      }
+      if (checkDraft(NEW_EVENT_BASE, current).problems.length > 0) {
         setBanner(null);
         refocus(focused);
         return;
@@ -420,7 +433,8 @@ export function NewEventEditor({
   const range = `${formatDateLocal(new Date(overview.mirror_start))} – ${formatDateLocal(
     new Date(overview.mirror_end),
   )}`;
-  const lines = [...new Set([...badDateLines(badDates), ...check.problems.map(problemText)])];
+  // A date a field couldn't read is said under When, naming the field.
+  const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
     ...(outside
@@ -511,7 +525,9 @@ export function NewEventEditor({
           </div>
 
           <WhenFields
+            id={whenId}
             draft={draft}
+            badDates={badDates}
             held={null}
             endChoices={endChoices}
             endMin={endMin}

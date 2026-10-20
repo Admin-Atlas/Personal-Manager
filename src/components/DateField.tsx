@@ -33,6 +33,11 @@ interface Props {
    *  text nobody typed (its own date, or the one it put back after a rejection) gives it nothing,
    *  so a refusal the caller holds can't end by a blur alone. */
   onAccept?: () => void;
+  /** The caller still holds an `onReject` of this field's: marked wrong (a red edge and
+   *  `aria-invalid`) as nonsense being typed is, until the caller lets it go. */
+  refused?: boolean;
+  /** The id of the words that say what's wrong with it (`aria-describedby`). */
+  describedBy?: string;
   disabled?: boolean;
   /** Applied to the text input (height, padding, font). */
   className?: string;
@@ -56,6 +61,8 @@ export function DateField({
   onCommit,
   onReject,
   onAccept,
+  refused = false,
+  describedBy,
   disabled,
   className,
   wrapperClassName,
@@ -146,7 +153,8 @@ export function DateField({
           disabled={disabled}
           placeholder={placeholder}
           aria-label={ariaLabel}
-          aria-invalid={invalid || undefined}
+          aria-invalid={invalid || refused || undefined}
+          aria-describedby={describedBy}
           title={title ?? "Type a date as dd-mm-yyyy, or click to pick one"}
           onChange={(e) => {
             setDraft(e.currentTarget.value);
@@ -178,7 +186,7 @@ export function DateField({
           }}
           className={cn(
             "min-w-0 flex-1 rounded-[var(--radius-sm)] border bg-surface outline-none transition placeholder:text-ink4 focus:border-accent",
-            invalid ? "border-st-due" : "border-border2",
+            invalid || refused ? "border-st-due" : "border-border2",
             className,
           )}
         />

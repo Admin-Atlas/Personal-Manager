@@ -18,10 +18,11 @@
 // Every time carries its own zone; when this computer's zone can't be read, times can't be changed
 // at all rather than guessing UTC (plan rule R6). A typed date only counts once its field commits
 // it (on blur), so Save and Close blur the focused field first, and a date the field couldn't read
-// stops the save rather than vanishing, until that field is given a date. The fields themselves
-// live in `EventFields`, shared with creating an event (`NewEventEditor`).
+// stops the save rather than vanishing, until that field is given a date: its line names it, and a
+// save it stops puts focus there. The fields themselves live in `EventFields`, shared with creating
+// an event (`NewEventEditor`).
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type {
   Calendar,
@@ -52,6 +53,7 @@ import {
   halfInstant,
   hasBadDate,
   rebaseDraft,
+  refusedDateId,
   seedDraft,
   toChanges,
   type BadDates,
@@ -59,7 +61,6 @@ import {
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
-  badDateLines,
   CALLOUT_TONE,
   earlierChangeText,
   listFields,
@@ -171,6 +172,8 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     badDatesRef.current = next;
     setBadDatesState(next);
   };
+  // The When fields' own, so a save a refusal stops can find the date field it names.
+  const whenId = useId();
   // The event's length, kept while its start moves (and across a start that can't be read).
   const lengthRef = useRef<number | null>(null);
   const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(null);
@@ -238,8 +241,8 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     }
   }
 
-  /** Focus back on what `commitFocused` blurred (`el`), when the save it began went no further:
-   *  never left on the page behind the dialog. */
+  /** Focus on `el` (what `commitFocused` blurred, or the field a refusal names) when the save it
+   *  began went no further: never left on the page behind the dialog. */
   function refocus(el: Element | null) {
     if (!(el instanceof HTMLElement) || !el.closest('[role="dialog"]')) return;
     if (el.isConnected && !el.matches(":disabled")) el.focus();
@@ -350,12 +353,15 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     againRef.current = 0;
     heldNotice.current = null;
     // What stops this save is already said under When, as it happened; a banner repeating it would
-    // outlive the fix. Focus goes back where it was, a date field included: the text it put back is
-    // no date given, so this refusal stands.
-    if (
-      hasBadDate(badDatesRef.current) ||
-      checkDraft(loaded.base, current, loaded.event).problems.length > 0
-    ) {
+    // outlive the fix. A date a field couldn't read puts focus on that field, which the line names
+    // and only a date typed or picked there clears (a blur gives it nothing, so the refusal stands);
+    // anything else puts focus back where it was.
+    if (hasBadDate(badDatesRef.current)) {
+      setBanner(null);
+      refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
+      return;
+    }
+    if (checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
       setBanner(null);
       refocus(focused);
       return;
@@ -650,7 +656,9 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             />
 
             <WhenFields
+              id={whenId}
               draft={draft}
+              badDates={badDates}
               held={heldTimed}
               endChoices={endChoices}
               endMin={endMin}
@@ -690,11 +698,10 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
                 {ambiguousText(half)}
               </p>
             ))}
-            {/* What would stop the save, shown as it happens rather than only on Save (each sentence
-                once: a start and an end in the same skipped hour say the same thing). */}
-            {[
-              ...new Set([...badDateLines(badDates), ...(check?.problems.map(problemText) ?? [])]),
-            ].map((text) => (
+            {/* What else would stop the save (a date a field couldn't read is said under When),
+                shown as it happens rather than only on Save (each sentence once: a start and an end
+                in the same skipped hour say the same thing). */}
+            {[...new Set(check?.problems.map(problemText) ?? [])].map((text) => (
               <p key={text} className="text-xs text-st-due">
                 {text}
               </p>

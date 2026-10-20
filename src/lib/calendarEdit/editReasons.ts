@@ -15,7 +15,7 @@ import type {
   WriteOutcome,
   WriteWarning,
 } from "../types";
-import type { BadDates, DraftProblem, EditorField } from "./eventDraft";
+import type { DraftProblem, EditorField } from "./eventDraft";
 
 function unreachable(value: never): never {
   throw new Error(`unhandled calendar edit value: ${JSON.stringify(value)}`);
@@ -644,12 +644,9 @@ export function ambiguousText(half: "start" | "end"): string {
   return `The ${half} time happens twice that night, as the clocks go back. PM saves the first.`;
 }
 
-/** The line for each typed date a field couldn't read (`BadDates`), the start's first. */
-export function badDateLines(bad: BadDates): string[] {
-  return [bad.start, bad.end]
-    .filter((text) => text !== null)
-    .map(
-      (text) =>
-        `“${text}” isn't a date PM can read. Type it as dd-mm-yyyy, or pick it from the calendar.`,
-    );
+/** The line for typed `text` the date field named `field` ("End date", "Last day") couldn't read.
+ *  It names the field, since only a date typed or picked there ends the refusal (`BadDates`), even
+ *  the one it shows already. */
+export function badDateText(field: string, text: string): string {
+  return `${field}: “${text}” isn't a date PM can read. Type the ${field.toLowerCase()} again as dd-mm-yyyy, or pick it from the calendar.`;
 }

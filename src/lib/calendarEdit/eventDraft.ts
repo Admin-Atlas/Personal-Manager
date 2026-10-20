@@ -154,6 +154,15 @@ export const NO_BAD_DATES: BadDates = { start: null, end: null };
 
 export const hasBadDate = (bad: BadDates) => bad.start !== null || bad.end !== null;
 
+/** The id of the date field setting `half`, in the When fields given `when` as their id. */
+export const dateFieldId = (when: string, half: "start" | "end") => `${when}-${half}-date`;
+
+/** Where a save refused for `bad` puts focus: the date field whose refusal stands, the start's
+ *  first (each half has one, whatever the event's kind). A blur there gives it nothing, so only a
+ *  date typed or picked in it ends the refusal. */
+export const refusedDateId = (when: string, bad: BadDates) =>
+  dateFieldId(when, bad.start !== null ? "start" : "end");
+
 /** Google's exact instants for the copy the base was seeded from (`EventForEdit` carries them). */
 export interface HeldTimes {
   start_at: string | null;

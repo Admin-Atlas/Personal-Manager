@@ -7,13 +7,27 @@
 // Time fields never use `<input type="time">` (WebKitGTK has no widget): TimeField and DateField.
 
 import type { EventVisibility, ShowAs, TimeDraft } from "../../../lib/types";
-import type { EditorFields, EndChoice } from "../../../lib/calendarEdit/eventDraft";
+import {
+  dateFieldId,
+  type BadDates,
+  type EditorFields,
+  type EndChoice,
+} from "../../../lib/calendarEdit/eventDraft";
+import { badDateText } from "../../../lib/calendarEdit/editReasons";
 import { Button, Input, SegmentedControl, Select, Textarea, Toggle, useFieldA11y } from "../../ui";
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { ZoneSearchList } from "../ZoneSearchList";
 
 export type Timed = Extract<TimeDraft, { kind: "timed" }>;
+
+type Half = "start" | "end";
+
+/** Each half's date field under When, by the event's kind: its name, on screen and in a refusal. */
+const DATE_FIELD = {
+  timed: { start: "Start date", end: "End date" },
+  all_day: { start: "First day", end: "Last day" },
+} as const;
 
 const SHOW_AS: { value: ShowAs; label: string }[] = [
   { value: "busy", label: "Busy" },
@@ -165,7 +179,9 @@ export function ZonePanel({
 
 /** When: all day or timed, the dates and times, and the zone(s). */
 export function WhenFields({
+  id,
   draft,
+  badDates,
   held,
   endChoices,
   endMin,
@@ -179,7 +195,11 @@ export function WhenFields({
   canSwitchKind,
   onPickZone,
 }: {
+  /** What its date fields' ids start with (`dateFieldId`), so a save can find one. */
+  id: string;
   draft: EditorFields;
+  /** Text each half's date field couldn't read, said under the fields. */
+  badDates: BadDates;
   /** Google's timed start and end, kept on offer in the time lists. */
   held: Timed | null;
   /** The End time list: times after the start, with the event's length. */
@@ -190,9 +210,9 @@ export function WhenFields({
   onChange: (t: TimeDraft) => void;
   /** A date field gave up on typed text it couldn't read, and showed its date again: `half` is the
    *  part of the event it sets (Start date or First day, End date or Last day). */
-  onRejectDate: (half: "start" | "end", text: string) => void;
+  onRejectDate: (half: Half, text: string) => void;
   /** That half's date field was given a date, typed or picked. */
-  onAcceptDate: (half: "start" | "end") => void;
+  onAcceptDate: (half: Half) => void;
   moveStart: (t: Timed, date: string, time: string) => Timed;
   moveEndDate: (t: Timed, date: string) => Timed;
   onSwitchKind: () => void;
@@ -200,10 +220,17 @@ export function WhenFields({
   onPickZone: (which: "both" | "start" | "end") => void;
 }) {
   const t = draft.time;
-  // What every date field here shares, for the half of the event it sets.
-  const dateProps = (half: "start" | "end") => ({
+  const names = DATE_FIELD[t.kind];
+  const lineId = (half: Half) => `${dateFieldId(id, half)}-refused`;
+  // What every date field here shares, for the half of the event it sets: a refusal it holds marks
+  // it wrong and points it at the line that names it.
+  const dateProps = (half: Half) => ({
+    id: dateFieldId(id, half),
+    ariaLabel: names[half],
     clearable: false,
     disabled,
+    refused: badDates[half] !== null,
+    describedBy: badDates[half] !== null ? lineId(half) : undefined,
     onReject: (text: string) => onRejectDate(half, text),
     onAccept: () => onAcceptDate(half),
   });
@@ -223,7 +250,6 @@ export function WhenFields({
         <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
           <DateField
             {...dateProps("start")}
-            ariaLabel="First day"
             value={t.first_day}
             // Moving the first day moves the whole event; the last day alone changes its length.
             onCommit={(first_day) =>
@@ -237,7 +263,6 @@ export function WhenFields({
           <span>to</span>
           <DateField
             {...dateProps("end")}
-            ariaLabel="Last day"
             value={t.last_day}
             min={t.first_day}
             onCommit={(last_day) => onChange({ ...t, last_day })}
@@ -249,7 +274,6 @@ export function WhenFields({
             <span className="w-10">Starts</span>
             <DateField
               {...dateProps("start")}
-              ariaLabel="Start date"
               value={t.start_date}
               onCommit={(d) => onChange(moveStart(t, d, t.start_time))}
             />
@@ -266,7 +290,6 @@ export function WhenFields({
             <span className="w-10">Ends</span>
             <DateField
               {...dateProps("end")}
-              ariaLabel="End date"
               value={t.end_date}
               min={endMin}
               onCommit={(end_date) => onChange(moveEndDate(t, end_date))}
@@ -307,6 +330,18 @@ export function WhenFields({
           </div>
         </>
       )}
+      {/* A date a field couldn't read, said as it happens and naming the field it points at: each
+          half its own line, the same text in both included. */}
+      {(["start", "end"] as const).map((half) => {
+        const text = badDates[half];
+        return (
+          text !== null && (
+            <p key={half} id={lineId(half)} role="alert" className="text-xs text-st-due">
+              {badDateText(names[half], text)}
+            </p>
+          )
+        );
+      })}
     </fieldset>
   );
 }

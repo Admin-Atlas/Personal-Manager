@@ -8,7 +8,8 @@
 // a save is out, an answer that never arrived shown locked as it was sent with Check again under the
 // same token, a token that ended unproven never called "nothing saved", a failure that keeps the
 // draft, the words that warn before a save PM's calendar won't show, a date it can't read refusing
-// every save until its own field is given one, and a calendar list the keyboard can reach.
+// every save until its own field is given one (that field named, marked, and where a save it stops
+// puts focus), and a calendar list the keyboard can reach.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -181,6 +182,18 @@ function open(over: { calendarId?: string; hidden?: Set<string>; onClose?: () =>
 }
 
 const title = () => screen.getByLabelText<HTMLInputElement>("Title");
+
+/** Type `text` over what `input` shows, and leave it (a change to the same text is no change). */
+function typeOver(input: HTMLInputElement, text: string) {
+  input.focus();
+  fireEvent.change(input, { target: { value: "" } });
+  fireEvent.change(input, { target: { value: text } });
+  fireEvent.blur(input);
+}
+
+async function ctrlS() {
+  await act(async () => void fireEvent.keyDown(window, CTRL_S));
+}
 
 function pickCalendar(from: string, to: string) {
   fireEvent.click(screen.getByRole("button", { name: `Calendar: ${from}` }));
@@ -629,19 +642,114 @@ describe("NewEventEditor", () => {
     expect(document.activeElement).toBe(focused);
   });
 
-  it("a save refused for a date it can't read keeps focus where it was", async () => {
+  // The line names the field, and a save it stops puts focus there: only a date typed or picked in
+  // that field ends the refusal, and a blur there gives nothing.
+  it("a save refused for a date it can't read puts focus on the field its line names", async () => {
     open();
     const start = screen.getByLabelText<HTMLInputElement>("Start date");
     start.focus();
     fireEvent.change(start, { target: { value: "99-99-2026" } });
     // Leaving the field commits it, and it's refused.
     act(() => title().focus());
-    expect(screen.getByText(/^“99-99-2026” isn't a date PM can read/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Start date: “99-99-2026” isn't a date PM can read. Type the start date again as dd-mm-yyyy, or pick it from the calendar.",
+      ),
+    ).toBeTruthy();
     expect(document.activeElement).toBe(title());
     fireEvent.keyDown(title(), { key: "Enter" });
     await act(async () => {});
     expect(createEvent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(start);
+  });
+
+  it("a save refused for a time the clocks skip keeps focus where it was", async () => {
+    open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    start.focus();
+    fireEvent.change(start, { target: { value: "29-03-2026" } });
+    fireEvent.blur(start);
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
+    expect(screen.getByText(/01:30 doesn't happen in Europe\/London that night/)).toBeTruthy();
+    act(() => title().focus());
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(title());
+  });
+
+  // Nothing else changed, but what was typed would be lost.
+  it("asks before closing when only a date it can't read stands", () => {
+    const { onClose } = open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    start.focus();
+    fireEvent.change(start, { target: { value: "99-99-2026" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
+    expect(start.value).toBe("12-10-2026");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // The end refused, then a start that moves the end to the day wanted: what's on screen is right,
+  // but the refusal stands. The line names End date, the field is marked and described by it, and a
+  // save puts focus there, where typing the date it shows ends it.
+  it("a refused end date is named, marked and focused by a save, after a start moved it", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    const end = screen.getByLabelText<HTMLInputElement>("End date");
+    const text =
+      "End date: “31-11-2026” isn't a date PM can read. Type the end date again as dd-mm-yyyy, or pick it from the calendar.";
+    typeOver(end, "31-11-2026");
+    expect(end.value).toBe("12-10-2026");
+    typeOver(start, "30-11-2026");
+    expect(end.value).toBe("30-11-2026");
+    const line = screen.getByText(text);
+    expect(line.getAttribute("role")).toBe("alert");
+    expect(end.getAttribute("aria-invalid")).toBe("true");
+    expect(end.getAttribute("aria-describedby")).toBe(line.id);
+    expect(start.getAttribute("aria-invalid")).toBeNull();
+    expect(start.getAttribute("aria-describedby")).toBeNull();
+    // Save, pressed with focus on it.
+    const save = screen.getByRole("button", { name: "Save" });
+    act(() => save.focus());
+    fireEvent.click(save);
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(end);
+    // Leaving it from there gives nothing.
+    await ctrlS();
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(end);
+    // The date it shows, typed there: the line and the mark go, and the event is made on it.
+    typeOver(end, "30-11-2026");
+    expect(screen.queryByText(text)).toBeNull();
+    expect(end.getAttribute("aria-invalid")).toBeNull();
+    expect(end.getAttribute("aria-describedby")).toBeNull();
+    await ctrlS();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].time).toMatchObject({
+      start_date: "2026-11-30",
+      end_date: "2026-11-30",
+    });
+  });
+
+  // The same text in both is two refusals, each named, and a save goes to the start's field.
+  it("the same text refused in both date fields is said for each", async () => {
+    open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    const end = screen.getByLabelText<HTMLInputElement>("End date");
+    typeOver(end, "31-11-2026");
+    typeOver(start, "31-11-2026");
+    const startLine = screen.getByText(/^Start date: “31-11-2026” isn't a date PM can read/);
+    const endLine = screen.getByText(/^End date: “31-11-2026” isn't a date PM can read/);
+    expect(start.getAttribute("aria-describedby")).toBe(startLine.id);
+    expect(end.getAttribute("aria-describedby")).toBe(endLine.id);
+    act(() => title().focus());
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(start);
   });
 
   // A refused Ctrl+S puts focus back in the field that refused, now showing the date it had. The
@@ -652,7 +760,6 @@ describe("NewEventEditor", () => {
     const { onClose } = open();
     fireEvent.change(title(), { target: { value: "Dentist" } });
     const start = screen.getByLabelText<HTMLInputElement>("Start date");
-    const ctrlS = () => act(async () => void fireEvent.keyDown(window, CTRL_S));
     start.focus();
     fireEvent.change(start, { target: { value: "31-11-2026" } });
     await ctrlS();
@@ -667,7 +774,8 @@ describe("NewEventEditor", () => {
     await act(async () => {});
     expect(createEvent).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
-    expect(screen.getByText(/^“31-11-2026” isn't a date PM can read/)).toBeTruthy();
+    expect(screen.getByText(/^Start date: “31-11-2026” isn't a date PM can read/)).toBeTruthy();
+    expect(document.activeElement).toBe(start);
     // A date typed there ends it, and that's the date sent.
     start.focus();
     fireEvent.change(start, { target: { value: "13-10-2026" } });
@@ -687,18 +795,9 @@ describe("NewEventEditor", () => {
     const { onClose } = open();
     const start = screen.getByLabelText<HTMLInputElement>("Start date");
     const end = screen.getByLabelText<HTMLInputElement>("End date");
-    const endRefused = () => screen.queryByText(/^“99-99-2026” isn't a date PM can read/);
-    const startRefused = () => screen.queryByText(/^“31-11-2026” isn't a date PM can read/);
-    const ctrlS = async () => {
-      await act(async () => void fireEvent.keyDown(window, CTRL_S));
-    };
-    /** Type `text` over what `input` shows (a change to the same text is no change at all). */
-    const typeOver = (input: HTMLInputElement, text: string) => {
-      input.focus();
-      fireEvent.change(input, { target: { value: "" } });
-      fireEvent.change(input, { target: { value: text } });
-      fireEvent.blur(input);
-    };
+    const endRefused = () => screen.queryByText(/^End date: “99-99-2026” isn't a date PM can read/);
+    const startRefused = () =>
+      screen.queryByText(/^Start date: “31-11-2026” isn't a date PM can read/);
     typeOver(end, "99-99-2026");
     expect(endRefused()).not.toBeNull();
     await ctrlS();

@@ -4,7 +4,8 @@
 // @vitest-environment jsdom
 //
 // The event editor's promises (#884): only what changed is sent, a typed date counts even if Save is
-// pressed before the field loses focus, a conflict never loses the draft silently, a dirty draft asks
+// pressed before the field loses focus, a date it can't read is said naming its field (marked, and
+// where a save it stops puts focus), a conflict never loses the draft silently, a dirty draft asks
 // before it goes, and what can't change is greyed out with a reason (no device zone included).
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -350,6 +351,89 @@ describe("EventEditor", () => {
     expect(screen.getByText(/“31-13-2026” isn't a date PM can read/)).toBeTruthy();
   });
 
+  // Nothing else changed, but what was typed would be lost.
+  it("asks before closing when only a date it couldn't read stands", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onClose = await open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    start.focus();
+    fireEvent.change(start, { target: { value: "31-13-2026" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+    expect(start.value).toBe("12-10-2026");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // The line names the field, since only a date typed or picked there ends the refusal; the field
+  // is marked and described by the line, and a save the refusal stops puts focus there, whatever
+  // had it. An All day switch hands the refusal to that half's field, and its name to the line.
+  it("names the field a date was refused in, marks it, and a save it stops puts focus there", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const title = screen.getByLabelText<HTMLInputElement>("Title");
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    const end = screen.getByLabelText<HTMLInputElement>("End date");
+    const typeOver = (input: HTMLInputElement, text: string) => {
+      input.focus();
+      fireEvent.change(input, { target: { value: "" } });
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.blur(input);
+    };
+    const saveFromTitle = async () => {
+      act(() => title.focus());
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await act(async () => {});
+    };
+    typeOver(end, "31-11-2026");
+    // A start that moves the end to the day wanted: the end's refusal stands.
+    typeOver(start, "30-11-2026");
+    expect(end.value).toBe("30-11-2026");
+    const line = screen.getByText(
+      "End date: “31-11-2026” isn't a date PM can read. Type the end date again as dd-mm-yyyy, or pick it from the calendar.",
+    );
+    expect(line.getAttribute("role")).toBe("alert");
+    expect(end.getAttribute("aria-invalid")).toBe("true");
+    expect(end.getAttribute("aria-describedby")).toBe(line.id);
+    expect(start.getAttribute("aria-invalid")).toBeNull();
+    expect(start.getAttribute("aria-describedby")).toBeNull();
+    await saveFromTitle();
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(end);
+    // All day: the last day's refusal now, named so. The same text in the first day is said too,
+    // and a save goes to the first day's field.
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    const first = screen.getByLabelText<HTMLInputElement>("First day");
+    const last = screen.getByLabelText<HTMLInputElement>("Last day");
+    const lastLine = screen.getByText(
+      "Last day: “31-11-2026” isn't a date PM can read. Type the last day again as dd-mm-yyyy, or pick it from the calendar.",
+    );
+    expect(last.getAttribute("aria-invalid")).toBe("true");
+    expect(last.getAttribute("aria-describedby")).toBe(lastLine.id);
+    typeOver(first, "31-11-2026");
+    const firstLine = screen.getByText(
+      "First day: “31-11-2026” isn't a date PM can read. Type the first day again as dd-mm-yyyy, or pick it from the calendar.",
+    );
+    expect(first.getAttribute("aria-describedby")).toBe(firstLine.id);
+    expect(lastLine.isConnected).toBe(true);
+    await saveFromTitle();
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(first);
+    // Each given its date: the lines and the marks go, and the save goes.
+    typeOver(first, "30-11-2026");
+    typeOver(last, "30-11-2026");
+    expect(screen.queryByText(/isn't a date PM can read/)).toBeNull();
+    expect(first.getAttribute("aria-invalid")).toBeNull();
+    expect(last.getAttribute("aria-describedby")).toBeNull();
+    await saveFromTitle();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: { kind: "all_day", first_day: "2026-11-30", last_day: "2026-11-30" } },
+      ...UNSCOPED,
+    );
+  });
+
   it("asks before closing over a date typed but not yet committed", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     const onClose = await open();
@@ -537,8 +621,12 @@ describe("EventEditor", () => {
     fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
     // Before any Save: the clocks skip 01:30 in London that night.
     expect(screen.getByText(/01:30 doesn't happen in Europe\/London that night/)).toBeTruthy();
+    // A save it stops leaves focus where it was.
+    const title = screen.getByLabelText("Title");
+    act(() => title.focus());
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(saveEdit).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(title);
   });
 
   it("says the same problem once, for a start and an end in the same skipped hour", async () => {

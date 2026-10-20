@@ -5,7 +5,8 @@
 //
 // The date field's earliest allowed date (`min`): a date before it, typed or picked, becomes it, and
 // the picker greys the days before it. Without `min` nothing changes. And `onAccept`: only a date
-// typed or picked is given, never text the field showed on its own.
+// typed or picked is given, never text the field showed on its own; `refused` marks the field wrong
+// while the form holds a refusal.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -137,5 +138,31 @@ describe("DateField's onAccept", () => {
     expect(input.value).toBe("20-10-2026");
     fireEvent.blur(input);
     expect(onAccept).not.toHaveBeenCalled();
+  });
+});
+
+// A refusal the form holds shows on the field, which shows its own date again: without the mark a
+// screen reader hears a normal date, and nothing says which field the form's line is about.
+describe("DateField refused", () => {
+  it("is marked wrong and described by the form's words while refused, and only then", () => {
+    const field = (refused: boolean) => (
+      <DateField
+        value="2026-10-14"
+        onCommit={() => {}}
+        refused={refused}
+        describedBy={refused ? "why" : undefined}
+        ariaLabel="Ends"
+      />
+    );
+    const { rerender } = render(field(true));
+    const input = screen.getByLabelText<HTMLInputElement>("Ends");
+    expect(input.value).toBe("14-10-2026");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(input.getAttribute("aria-describedby")).toBe("why");
+    expect(input.className).toContain("border-st-due");
+    rerender(field(false));
+    expect(input.getAttribute("aria-invalid")).toBeNull();
+    expect(input.getAttribute("aria-describedby")).toBeNull();
+    expect(input.className).not.toContain("border-st-due");
   });
 });
