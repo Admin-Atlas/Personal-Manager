@@ -1116,7 +1116,8 @@ describe("NewEventEditor", () => {
     // Enter or Space on a button is its click, with no pointer behind it.
     fireEvent.click(trigger, { detail: 0 });
     const list = screen.getByRole("group", LIST);
-    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    // In the dialog itself, never inside its scrolling body, which would cut it off.
+    expect(list.parentElement).toBe(screen.getByRole("dialog", { name: "New event" }));
     await waitFor(() =>
       expect(document.activeElement).toBe(within(list).getByRole("radio", { name: "Personal" })),
     );
@@ -1249,7 +1250,8 @@ describe("NewEventEditor", () => {
     const { onClose } = open();
     fireEvent.change(title(), { target: { value: "Gym" } });
     const list = await openRepeat();
-    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    // In the dialog itself, never inside its scrolling body, which would cut it off.
+    expect(list.parentElement).toBe(screen.getByRole("dialog", { name: "New event" }));
     const picked = within(list).getByRole("radio", { name: "Does not repeat" });
     await waitFor(() => expect(document.activeElement).toBe(picked));
     fireEvent.keyDown(picked, { key: "Escape" });

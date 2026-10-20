@@ -786,7 +786,7 @@ describe("QuickCreatePopover", () => {
     // Enter or Space on a button is its click, with no pointer behind it.
     fireEvent.click(trigger, { detail: 0 });
     const list = screen.getByRole("group", LIST);
-    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    expect(list.parentElement).toBe(screen.getByRole("dialog", { name: "New event" }));
     const picked = within(list).getByRole("radio", { name: "Personal" });
     await waitFor(() => expect(document.activeElement).toBe(picked));
     fireEvent.keyDown(picked, { key: "Tab" });
@@ -1171,7 +1171,7 @@ describe("QuickCreatePopover", () => {
   it("the Repeat list is inside the box, and Escape closes only it", async () => {
     const { onClose } = open();
     const list = await openRepeat();
-    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    expect(list.parentElement).toBe(screen.getByRole("dialog", { name: "New event" }));
     const picked = within(list).getByRole("radio", { name: "Does not repeat" });
     await waitFor(() => expect(document.activeElement).toBe(picked));
     fireEvent.keyDown(picked, { key: "Escape" });

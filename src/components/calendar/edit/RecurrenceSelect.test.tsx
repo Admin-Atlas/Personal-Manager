@@ -392,10 +392,13 @@ describe("RecurrenceSelect", () => {
     }
   });
 
-  it("the list is inside the dialog around it", async () => {
+  // Mounted in the dialog itself, not inside the button's box, and placed against the window: an
+  // absolute list would be cut off by the dialog's scrolling body.
+  it("the list is inside the dialog around it, never clipped by it", async () => {
     mount({ kind: "once" });
     await openList();
-    expect(screen.getByRole("dialog", { name: "Editor" }).contains(list())).toBe(true);
+    expect(list()!.parentElement).toBe(screen.getByRole("dialog", { name: "Editor" }));
+    expect(list()!.className.split(" ")).toContain("fixed");
   });
 
   it("closes when it's disabled, and doesn't come back by itself", async () => {
@@ -448,5 +451,24 @@ describe("RecurrenceSelect", () => {
     expect(rows()).toHaveLength(6);
     expect(checked()).toBe(radio("Weekly on Tuesday"));
     expect(shown()).toBe("Weekly on Tuesday");
+    // The row focus was on went with them: focus is on the rule's new row, still in the list.
+    await waitFor(() => expect(document.activeElement).toBe(radio("Weekly on Tuesday")));
+    expect(list()).not.toBeNull();
+  });
+
+  it("presets arriving leave focus where it was in the list", async () => {
+    let arrive: (presets: RepeatPreset[]) => void = () => {};
+    recurrencePresets.mockReturnValue(new Promise<RepeatPreset[]>((r) => (arrive = r)));
+    mount({ kind: "rule", rule: PRESETS[1].rule });
+    await openList();
+    fireEvent.keyDown(checked()!, { key: "Tab" });
+    expect(document.activeElement).toBe(customRow());
+    await act(async () => arrive(PRESETS));
+    expect(rows()).toHaveLength(6);
+    // Custom… is still there: nothing takes focus off it, however long it waits.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    expect(document.activeElement).toBe(customRow());
   });
 });

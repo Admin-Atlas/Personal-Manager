@@ -118,12 +118,17 @@ export function RecurrenceSelect({
   }, [disabled]);
 
   // Opened, focus goes to the rule picked, so the keyboard is in the list. After the panel's
-  // measuring frame, which hides it, and a hidden radio can't take focus.
+  // measuring frame, which hides it, and a hidden radio can't take focus. The ready-made rules
+  // arriving while it's open can take away the row focus was on (the rule's own row, shown while
+  // they loaded): focus goes back to the rule picked. Anywhere else in the list, it stays.
   useEffect(() => {
     if (!shown) return;
-    const t = setTimeout(() => focusPicked(listRef.current), 0);
+    const t = setTimeout(() => {
+      const list = listRef.current;
+      if (list && !list.contains(document.activeElement)) focusPicked(list);
+    }, 0);
     return () => clearTimeout(t);
-  }, [shown]);
+  }, [shown, presets]);
 
   /** Open or close the list; opening, keep the rule held if it has a row of its own. */
   const openList = (next: boolean) => {
