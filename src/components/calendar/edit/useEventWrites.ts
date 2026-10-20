@@ -24,7 +24,7 @@
 //
 // And two things beside the writes (C9b-2): how a repeating event repeats, for the event popover
 // (only a read), and, after a "this and following" change lands, a question per milestone linked to
-// an occurrence it took, whether to move it to the new part (DECISIONS 17-10 #2). Moving one changes
+// it from that day on, whether to move it to the new part (DECISIONS 17-10 #2). Moving one changes
 // PM's own milestone, never Google; Move back is offered for a few seconds after.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
@@ -578,8 +578,8 @@ export const MOVE_BACK_MS = 8000;
  *  Move (a second Enter, a quick double-click) lands on it, and would undo the move just made. */
 const MOVE_BACK_ARMS_MS = 500;
 
-/** After a "this and following" change landed: one question per milestone the backend found on an
- *  occurrence the new part took, or, when PM couldn't find the new part, one notice per milestone
+/** After a "this and following" change landed: one question per milestone the backend read as dated
+ *  on or after its first day, or, when PM couldn't find the new part, one notice per milestone
  *  saying it stayed. Nothing for any other outcome. */
 function offerMoves(outcome: WriteOutcome): void {
   if (outcome.outcome !== "saved" || !outcome.milestone_moves) return;

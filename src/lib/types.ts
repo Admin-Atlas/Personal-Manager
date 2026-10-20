@@ -1761,8 +1761,8 @@ export interface MilestoneMove {
 export type WriteOutcome =
   /** `left_behind`: the days (YYYY-MM-DD) of occurrences changed on their own that a series delete
    *  couldn't cancel, so they may still show. `milestone_moves`: a "this and following" change that
-   *  landed, with milestones linked to the earlier part on occurrences it took to the new one
-   *  (C9b-2). */
+   *  landed, with milestones linked to the earlier part dated from its first day on, but not one on
+   *  an occurrence it left there (C9b-2). */
   | {
       outcome: "saved";
       warnings: WriteWarning[];

@@ -217,7 +217,7 @@ pub enum WriteOutcome {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         left_behind: Vec<String>,
         /// A "this and following" change that landed, with milestones linked to the earlier part
-        /// whose occurrence it took to the new part (on none, dated from the day it starts): the
+        /// dated on or after the day it starts, except one on an occurrence it left there: the
         /// webview asks about each (DECISIONS 17-10 #2).
         /// `None`, and left out, for every other save, and for a split with nothing to offer. Boxed,
         /// so every outcome (and every `Result` that carries one as its error) stays small.
