@@ -222,7 +222,9 @@ describe("a row Google changed since the editor opened", () => {
 describe("the warnings", () => {
   const every: SeriesWarning[] = [
     dayMove("every Sunday", "every Monday", 1),
+    { warning: "becomes_one_event", day: "2026-10-05" },
     { warning: "start_moved", from: "2026-10-05", to: "2026-10-06" },
+    { warning: "changes_lost", count: 2 },
     { warning: "length_changes" },
     { warning: "exceptions_may_reset", count: 1, complete: true },
     { warning: "not_carried", attachments: true, conference: true, label: true },
@@ -240,7 +242,7 @@ describe("the warnings", () => {
         }
       }
     }
-    expect(seriesWarningText(every[1], "save", "all", "Gym")).toBe(
+    expect(seriesWarningText(every[2], "save", "all", "Gym")).toBe(
       "The first occurrence of “Gym” moves from 05-10 to 06-10.",
     );
     expect(seriesWarningText({ warning: "length_changes" }, "save", "following", "Gym")).toBe(
@@ -323,6 +325,55 @@ describe("the warnings", () => {
     expect(
       warningLines({ ...row, warnings: [nothing, { warning: "new_identity" }] }, "save", "Gym"),
     ).toEqual([seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")]);
+  });
+
+  it("words a new repeat and 'Does not repeat' for each row (C11 §9.9)", () => {
+    const say = (w: SeriesWarning, scope: "following" | "all") =>
+      seriesWarningText(w, "save", scope, "Gym");
+    const stops: SeriesWarning = { warning: "becomes_one_event", day: "2026-10-05" };
+    expect(say(stops, "all")).toBe(
+      "Only the occurrence on 05-10 stays, as an event that doesn't repeat. Every other occurrence of “Gym” goes.",
+    );
+    // Never "a new repeating event" for one that doesn't repeat (C11 critique 2 M2).
+    expect(say(stops, "following")).toBe(
+      "From this occurrence on, “Gym” becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.",
+    );
+    expect(say({ warning: "changes_lost", count: 1 }, "following")).toBe(
+      "One occurrence of “Gym” you changed on its own falls on a day the new repeat skips, so that change goes.",
+    );
+    expect(say({ warning: "changes_lost", count: 3 }, "following")).toBe(
+      "3 occurrences of “Gym” you changed on their own fall on days the new repeat skips, so those changes go.",
+    );
+    const moved: SeriesWarning = { warning: "start_moved", from: "2026-10-20", to: "2026-10-21" };
+    expect(say(moved, "following")).toBe(
+      "From this occurrence on, the new part of “Gym” starts on 21-10, the first day the new repeat allows.",
+    );
+    expect(say(moved, "all")).toBe("The first occurrence of “Gym” moves from 20-10 to 21-10.");
+    // The question first, then the stop, where it starts and what's lost, before the rest.
+    const row: RowView = {
+      scope: "following",
+      label: "This and following events",
+      detail: "",
+      selectable: true,
+      token: "f",
+      warnings: [
+        { warning: "new_identity" },
+        { warning: "changes_lost", count: 1 },
+        moved,
+        { warning: "length_changes" },
+        stops,
+        dayMove("every Sunday", "every Monday", 1),
+      ],
+    };
+    const fromHere = (w: SeriesWarning) => say(w, "following");
+    expect(warningLines(row, "save", "Gym")).toEqual([
+      fromHere(dayMove("every Sunday", "every Monday", 1)),
+      fromHere(stops),
+      fromHere(moved),
+      fromHere({ warning: "changes_lost", count: 1 }),
+      fromHere({ warning: "length_changes" }),
+      fromHere({ warning: "new_identity" }),
+    ]);
   });
 
   it("says a re-ask once per kind", () => {

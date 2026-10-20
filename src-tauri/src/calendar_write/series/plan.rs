@@ -59,7 +59,7 @@ use chrono_tz::Tz;
 use serde_json::{json, Map, Value};
 
 use crate::calendar_recur::expand::{is_occurrence, last_before};
-use crate::calendar_recur::lines::{self, recurrence_verdict, same_recurrence, Applied};
+use crate::calendar_recur::lines::{self, same_recurrence, Applied};
 use crate::calendar_recur::reanchor::DayMap;
 use crate::calendar_recur::remap::{exdate_lines, retime, RetimeError, Retimed};
 use crate::calendar_recur::split::{
@@ -78,10 +78,11 @@ use super::super::plan::{
 };
 use super::super::time;
 use super::diff::{Expect, Removes, SeriesDiff};
+use super::rule::{plan_all_rule, plan_split_rule, rule_ask};
 use super::scope::{is_first, zones_changed, Scope};
 use super::{
     attendee_set, classify_instance, excluded, google_before, guests_on, original_of, point_of,
-    Exceptions, FreshEvent, InstanceKind, Length, Listing, Master, SeriesRefusal,
+    Exceptions, FreshEvent, InstanceKind, LaterPart, Length, Listing, Master, SeriesRefusal,
 };
 
 /// Everything a series plan is built from. C9 makes the GETs; nothing here fetches.
@@ -99,6 +100,9 @@ pub struct SeriesInput<'a> {
     pub instances: Option<&'a Listing>,
     /// The mirror holds another part of the same series, split earlier (Google's own `<id>_R…`).
     pub sibling: bool,
+    /// Where the earliest later part of the series starts, which a new rule mustn't repeat over (C11
+    /// critique 1 H2).
+    pub later: LaterPart,
     /// Whether a series with guests may change: false until C12 brings invitations, whatever the
     /// occurrence shows. One whose guests were removed on its own passes the gate, and a split would
     /// invite the series' guests again (C8b review G5).
@@ -167,11 +171,16 @@ pub struct SeriesPlan {
     /// The mirror rows the plan removes (A14), as planned: the run's own are
     /// [`SeriesPlan::removes_for`].
     pub removes: Removes,
-    /// The series' start, for reading recurrence lines by what they mean.
-    start: SeriesStart,
+    /// The series' start, for reading recurrence lines by what they mean: what it held before the
+    /// plan, and what Google holds when a step didn't land.
+    pub(super) start: SeriesStart,
+    /// The start the series a step patches repeats from once it has landed: a rule rebuilt for every
+    /// occurrence starts on its own first day, maybe of another kind or in another zone, and what was
+    /// sent is read at it (C11; critique 2 M8). [`SeriesPlan::start`] for every other plan.
+    pub(super) rule_start: SeriesStart,
     /// Whether it was planned with guests allowed (C12): until then, a guest who appears before a
     /// step is sent again is a conflict ([`SeriesPlan::resend`]).
-    guests_allowed: bool,
+    pub(super) guests_allowed: bool,
 }
 
 /// One write.
@@ -499,7 +508,8 @@ pub enum SeriesWarning {
     /// whole weeks included. C9 words it from the rule and both dates: the new weekday, day of the
     /// month or date where the rule names one ("every Sunday → every Monday?"), and how far every
     /// occurrence moves wherever that is a week or more (a one-day weekly rule may move a week and a
-    /// day) or the rule names no day (daily). A split raises no `StartMoved`, so this is all it says.
+    /// day) or the rule names no day (daily). A split that keeps its rule raises no `StartMoved`, so
+    /// this is all it says; one with a new rule says where that starts too (C11).
     RepeatDayChanges { from: NaiveDate, to: NaiveDate },
     /// Every occurrence gets this occurrence's length.
     LengthChanges,
@@ -512,6 +522,12 @@ pub enum SeriesWarning {
     /// The new series is a new event in Google (a new iCal UID): links to the old one (a milestone,
     /// a reminder) stay with the part before the split.
     NewIdentity,
+    /// It stops repeating ("Does not repeat"): only the occurrence on `day` stays, as an event of its
+    /// own (C11).
+    BecomesOneEvent { day: NaiveDate },
+    /// This many occurrences changed on their own fall on days the new rule skips, so their changes
+    /// go with them (C11).
+    ChangesLost { count: u32 },
 }
 
 /// The fields a split's new series takes from the original, besides its times and rule.
@@ -534,7 +550,7 @@ const TAIL_COPY: &[&str] = &[
 /// Everything a split's new series takes from the original, its times and rule included: what may
 /// not have changed in Google before the split is planned, nor before its cut is sent again (R2,
 /// AS10). One list, so the two checks and the body can't drift (C8b review G1).
-const TAIL_WATCH: &[&str] = &[
+pub(super) const TAIL_WATCH: &[&str] = &[
     "recurrence",
     "start",
     "end",
@@ -698,14 +714,16 @@ impl SeriesPlan {
             // The event itself is gone: whatever was sent can't be there.
             (Shows::Fields { .. }, None) => Applied::No,
             (Shows::Fields { sent, old }, Some(v)) => {
-                let holds = |fields: &Map<String, Value>| {
+                // What was sent is read at the start it repeats from once landed, and what was
+                // there at the start it had: never one start for both (C11 critique 2 M8).
+                let holds = |fields: &Map<String, Value>, start: &SeriesStart| {
                     fields
                         .iter()
-                        .all(|(k, want)| self.same(k, Some(want), v.get(k.as_str())))
+                        .all(|(k, want)| self.same_at(k, Some(want), v.get(k.as_str()), start))
                 };
-                if holds(sent) {
+                if holds(sent, &self.rule_start) {
                     Applied::Yes
-                } else if !old.is_empty() && holds(old) {
+                } else if !old.is_empty() && holds(old, &self.start) {
                     Applied::No
                 } else {
                     Applied::Unknown
@@ -731,12 +749,15 @@ impl SeriesPlan {
         };
         let start_landed = when_eq(Some(new_start), fresh.get("start"));
         let start_kept = when_eq(old.get("start"), fresh.get("start"));
-        let verdict = recurrence_verdict(
-            &lines_of(Some(sent_rule)),
-            &lines_of(old.get("recurrence")),
-            &lines_of(fresh.get("recurrence")),
-            &self.start,
-        );
+        // The rule sent read at the start it repeats from once landed, the old one at its own.
+        let now = lines_of(fresh.get("recurrence"));
+        let verdict = if same_recurrence(&lines_of(Some(sent_rule)), &now, &self.rule_start) {
+            Applied::Yes
+        } else if same_recurrence(&lines_of(old.get("recurrence")), &now, &self.start) {
+            Applied::No
+        } else {
+            Applied::Unknown
+        };
         (start_landed && verdict == Applied::No) || (start_kept && verdict == Applied::Yes)
     }
 
@@ -860,10 +881,12 @@ impl SeriesPlan {
             "attachments",
             "eventLabelId",
         ];
+        // Its rule read at its own start, which a new rule may put in another kind or zone (C11).
+        let start = body.get("start").and_then(start_of).unwrap_or(self.start);
         !is_gone(fresh)
             && TAIL_FIELDS
                 .iter()
-                .all(|k| self.same(k, body.get(*k), fresh.get(*k)))
+                .all(|k| self.same_at(k, body.get(*k), fresh.get(*k), &start))
             && NEVER_SENT
                 .iter()
                 .all(|k| fresh.get(*k).is_none_or(Value::is_null))
@@ -897,14 +920,26 @@ impl SeriesPlan {
 
     /// Whether two values of `key` say the same: start and end as instants in a zone, a rule by what it
     /// means, guests by who they are, Google's defaults filled in, anything else by value. Never
-    /// text-only, which reads any two lists as equal (DS9, G4).
+    /// text-only, which reads any two lists as equal (DS9, G4). A rule is read at the series' start.
     fn same(&self, key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
+        self.same_at(key, a, b, &self.start)
+    }
+
+    /// [`SeriesPlan::same`], a rule read at `start`: both sides at one start, the one they repeat
+    /// from (C11 critique 2 M8).
+    fn same_at(
+        &self,
+        key: &str,
+        a: Option<&Value>,
+        b: Option<&Value>,
+        start: &SeriesStart,
+    ) -> bool {
         let or = |v: Option<&Value>, d: &str| v.and_then(Value::as_str).unwrap_or(d).to_string();
         match key {
             "start" | "end" => when_eq(a, b),
             // A guest's reply isn't a change to the guest list (C8b review EXEC-6).
             "attendees" => attendee_set(a) == attendee_set(b),
-            "recurrence" => same_recurrence(&lines_of(a), &lines_of(b), &self.start),
+            "recurrence" => same_recurrence(&lines_of(a), &lines_of(b), start),
             "status" => or(a, "confirmed") == or(b, "confirmed"),
             "transparency" => or(a, "opaque") == or(b, "opaque"),
             "visibility" => or(a, "default") == or(b, "default"),
@@ -970,7 +1005,7 @@ pub(crate) fn start_of(node: &Value) -> Option<SeriesStart> {
     })
 }
 
-/// A `recurrence` value's lines.
+/// A `recurrence` value's lines: none for `null`, `[]` or a value left out alike (C11 critique 1 L10).
 fn lines_of(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
         .into_iter()
@@ -981,7 +1016,7 @@ fn lines_of(v: Option<&Value>) -> Vec<String> {
 }
 
 /// The values `fresh` holds for `keys`, absent ones as `null`.
-fn snapshot(fresh: &Value, keys: &[&str]) -> Map<String, Value> {
+pub(super) fn snapshot(fresh: &Value, keys: &[&str]) -> Map<String, Value> {
     keys.iter()
         .map(|k| {
             (
@@ -1015,7 +1050,7 @@ fn before_split(
 
 /// The series' own stored exceptions: a listing by iCal UID also holds the master, and any other
 /// series split off it (C8b review G6).
-fn own_exceptions<'a>(
+pub(super) fn own_exceptions<'a>(
     master: &Master,
     exceptions: &'a Exceptions,
 ) -> impl Iterator<Item = &'a Value> {
@@ -1027,13 +1062,13 @@ fn own_exceptions<'a>(
 }
 
 /// A series cut just before one of its occurrences.
-struct SplitCut {
+pub(super) struct SplitCut {
     /// The original's new `recurrence`.
-    cut: Vec<String>,
+    pub(super) cut: Vec<String>,
     /// Its EXDATEs and RDATEs from the occurrence on, for the rest.
-    moved: Vec<lines::Line>,
+    pub(super) moved: Vec<lines::Line>,
     /// Google's count of what came before, when the rule has a COUNT.
-    before: Option<u32>,
+    pub(super) before: Option<u32>,
 }
 
 /// The original cut just before `at`, for "this and following": `None` when `at` is the series'
@@ -1057,7 +1092,7 @@ fn cut_at(master: &Master, input: &SeriesInput, at: Point) -> Result<Option<Spli
 }
 
 /// Exceptions on or after `at`, changed or cancelled, from a complete listing.
-fn exceptions_from<'a>(
+pub(super) fn exceptions_from<'a>(
     master: &Master,
     exceptions: &'a Exceptions,
     at: Point,
@@ -1082,7 +1117,7 @@ fn exceptions_from<'a>(
 /// occurrence (only those from it on are reached); `None` for the whole series. Only a complete
 /// listing can show there's none, so an incomplete one refuses too, a change of text included; the
 /// cross-check counts an occurrence with guests the listing lacks against it (C9a-2 review).
-fn no_guests_from(
+pub(super) fn no_guests_from(
     master: &Master,
     input: &SeriesInput,
     from: Option<Point>,
@@ -1108,7 +1143,10 @@ fn no_guests_from(
 
 /// The gate reads the occurrence's description; a draft for the series writes the series' own, and
 /// would save a formatted one as plain text (C9 design review L7).
-fn keeps_formatting(master_json: &Value, draft: &EventPatchDraft) -> Result<(), NotPlanned> {
+pub(super) fn keeps_formatting(
+    master_json: &Value,
+    draft: &EventPatchDraft,
+) -> Result<(), NotPlanned> {
     let formatted = master_json
         .get("description")
         .and_then(Value::as_str)
@@ -1122,7 +1160,7 @@ fn keeps_formatting(master_json: &Value, draft: &EventPatchDraft) -> Result<(), 
 /// A cleanup cancel of the original's own copy of the occurrence at `original`, which moved to the new
 /// series (or was cut off): done when Google already shows it cancelled or gone; re-sent on a 412
 /// only while nothing it would throw away has changed (DS10).
-fn cancel_exception(
+pub(super) fn cancel_exception(
     calendar: &str,
     item: &Value,
     original: Point,
@@ -1189,7 +1227,7 @@ fn plan_cut_delete(
 /// The PATCH that cuts the original. On a 412 it's sent again only if `watched` is as the plan saw
 /// it: its rule and times, and for a split every field the new series copied (AS10), or the new
 /// series would carry a value someone has just changed.
-fn cut_step(
+pub(super) fn cut_step(
     master: &Master,
     calendar: &str,
     master_json: &Value,
@@ -1273,6 +1311,7 @@ pub fn plan_series_delete(
                 series: master.id.clone(),
             },
             start: master.start,
+            rule_start: master.start,
             guests_allowed: input.guests_allowed,
         })
     };
@@ -1306,6 +1345,7 @@ pub fn plan_series_delete(
                 event: text(instance, "id"),
             },
             start: master.start,
+            rule_start: master.start,
             guests_allowed: input.guests_allowed,
         }),
         Scope::All => whole(warnings),
@@ -1329,6 +1369,7 @@ pub fn plan_series_delete(
                         left: Vec::new(),
                     },
                     start: master.start,
+                    rule_start: master.start,
                     guests_allowed: input.guests_allowed,
                 })
             }
@@ -1372,7 +1413,17 @@ fn new_time(draft: &EventPatchDraft, instance: &Value) -> Result<Option<NewTime>
 /// Google's `start` and `end` for a series starting at `first` with occurrences `length` long, in
 /// the master's own zones.
 fn when_nodes(master: &Master, first: Point, length: Length) -> Result<(Value, Value), NotPlanned> {
-    let zone = master.start.zone();
+    when_nodes_in(master.start.zone(), master.end_zone, first, length)
+}
+
+/// Google's `start` and `end` for a series starting at `first` with occurrences `length` long, its
+/// start in `zone` and its end in `end_zone`: a timed node always names its `timeZone` (G6).
+pub(super) fn when_nodes_in(
+    zone: Tz,
+    end_zone: Tz,
+    first: Point,
+    length: Length,
+) -> Result<(Value, Value), NotPlanned> {
     let timed = |t: DateTime<Utc>, zone: Tz| {
         json!({
             "dateTime": t.with_timezone(&zone).to_rfc3339_opts(SecondsFormat::Secs, false),
@@ -1381,7 +1432,7 @@ fn when_nodes(master: &Master, first: Point, length: Length) -> Result<(Value, V
     };
     let date = |d: NaiveDate| json!({ "date": d.format("%Y-%m-%d").to_string() });
     match (first, length) {
-        (Point::At(t), Length::Timed(len)) => Ok((timed(t, zone), timed(t + len, master.end_zone))),
+        (Point::At(t), Length::Timed(len)) => Ok((timed(t, zone), timed(t + len, end_zone))),
         (Point::Day(d), Length::AllDay(days)) => {
             let end = d
                 .checked_add_signed(chrono::TimeDelta::days(days))
@@ -1418,7 +1469,7 @@ fn with_cancelled(
 }
 
 /// The draft's touched text fields, as Google names them.
-fn draft_fields(draft: &EventPatchDraft) -> Vec<(&'static str, Value)> {
+pub(super) fn draft_fields(draft: &EventPatchDraft) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
     if let Some(v) = &draft.summary {
         out.push(("summary", Value::from(v.clone())));
@@ -1470,6 +1521,7 @@ impl SeriesPlan {
             expect: Vec::new(),
             removes: Removes::Nothing,
             start,
+            rule_start: start,
             guests_allowed: false,
         })
     }
@@ -1484,6 +1536,7 @@ fn probe(start: &SeriesStart) -> SeriesPlan {
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: *start,
+        rule_start: *start,
         guests_allowed: false,
     }
 }
@@ -1534,6 +1587,11 @@ fn plan_this(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let instance = input.fresh.instance.json();
+    // A new rule is the whole series' (scope.rs refuses the row; this is the planner's own guard). The
+    // rule the series already has is no change of rule, as the rows read it (C11 critique 1 L12).
+    if rule_ask(draft, master)?.is_some() {
+        return Err(SeriesRefusal::RuleIsSeriesWide.into());
+    }
     let body = build_patch(instance, draft)?;
     if body.is_empty() {
         return Err(NotPlanned::NoChange);
@@ -1572,6 +1630,7 @@ fn plan_this(
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: master.start,
+        rule_start: master.start,
         guests_allowed: input.guests_allowed,
     })
 }
@@ -1583,8 +1642,12 @@ fn plan_all(
     draft: &EventPatchDraft,
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
+    // A new rule, or none: the series is rebuilt from it (C11).
+    if let Some(ask) = rule_ask(draft, master)? {
+        return plan_all_rule(input, master, original, draft, ask, notify);
+    }
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
-    let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
+    input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     no_guests_from(master, input, None)?;
     keeps_formatting(master_json, draft)?;
     let text_only = EventPatchDraft {
@@ -1680,6 +1743,24 @@ fn plan_all(
             SeriesRefusal::OnlyThisDiffers.into()
         });
     }
+    all_plan(input, master, body, warnings, undo, notify, master.start)
+}
+
+/// The one PATCH of the series' master that "all events" sends, `body` being what it changes: what a
+/// 412 rechecks and what was changed in Google since the editor opened (R2), the warning for the
+/// occurrences changed on their own, after `warnings`, and `undo`. `rule_start`: the start it repeats
+/// from once it lands ([`SeriesPlan::rule_start`]).
+pub(super) fn all_plan(
+    input: &SeriesInput,
+    master: &Master,
+    body: Map<String, Value>,
+    mut warnings: Vec<SeriesWarning>,
+    undo: Option<Undo>,
+    notify: Notify,
+    rule_start: SeriesStart,
+) -> Result<SeriesPlan, NotPlanned> {
+    let master_json = input.fresh.master.json();
+    let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     // A new end is measured from the series' start, so it watches the start and rule too.
     let mut watched: Vec<String> = body.keys().cloned().collect();
     if ["start", "end", "recurrence"]
@@ -1739,12 +1820,16 @@ fn plan_all(
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: master.start,
+        rule_start,
         guests_allowed: input.guests_allowed,
     })
 }
 
 /// The original starts of the series' cancelled occurrences, from a complete listing.
-fn cancelled_points(master: &Master, exceptions: &Exceptions) -> Result<Vec<Point>, NotPlanned> {
+pub(super) fn cancelled_points(
+    master: &Master,
+    exceptions: &Exceptions,
+) -> Result<Vec<Point>, NotPlanned> {
     if !exceptions.complete {
         return Err(SeriesRefusal::Incomplete.into());
     }
@@ -1755,7 +1840,7 @@ fn cancelled_points(master: &Master, exceptions: &Exceptions) -> Result<Vec<Poin
 }
 
 /// A conflict when the occurrence no longer holds, on `keys`, what the user opened (R2).
-fn unchanged_since_opened(
+pub(super) fn unchanged_since_opened(
     master: &Master,
     input: &SeriesInput,
     keys: &[&str],
@@ -1778,11 +1863,16 @@ fn plan_split(
     input: &SeriesInput,
     master: &Master,
     at: Point,
-    SplitCut { cut, moved, before }: SplitCut,
+    cut: SplitCut,
     draft: &EventPatchDraft,
     tail_id: &str,
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
+    // A new rule, or none: the rest is rebuilt from it (C11).
+    if let Some(ask) = rule_ask(draft, master)? {
+        return plan_split_rule(input, master, at, cut, draft, tail_id, ask, notify);
+    }
+    let SplitCut { cut, moved, before } = cut;
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     keeps_formatting(master_json, draft)?;
@@ -1798,31 +1888,7 @@ fn plan_split(
     };
     let rest = tail_recurrence(&master.recurrence, remaining, &moved)?;
     let zone = master.start.zone();
-    // The rest repeats at the series' own wall time from the split's day. On a day the clocks skip
-    // that time, the occurrence sits an hour off it, and the rest can't start there: it would repeat
-    // an hour late, and every EXDATE after it would name nothing (C8b fix review).
-    let rest_start = match (master.start, at) {
-        (SeriesStart::Timed { local, .. }, Point::At(_)) => {
-            // The occurrence's own day: where the series' time, read as RFC 5545 reads a skipped
-            // hour, lands on `at`. A time in an evening's skipped hour lands on the next date.
-            let time = local.time();
-            let today = at.day_in(zone);
-            let day = [today, today.pred_opt().unwrap_or(today)]
-                .into_iter()
-                .find(|d| rfc_instant(zone, d.and_time(time)).map(Point::At) == Some(at))
-                .unwrap_or(today);
-            let start = SeriesStart::Timed {
-                local: day.and_time(time),
-                zone,
-            };
-            if start.point() != Some(at) {
-                return Err(SeriesRefusal::SplitInGap(day).into());
-            }
-            start
-        }
-        (SeriesStart::AllDay(_), Point::Day(d)) => SeriesStart::AllDay(d),
-        _ => return Err(RetimeError::KindChange.into()),
-    };
+    let rest_start = rest_start(master, at)?;
     let exceptions = exceptions_from(master, input.exceptions, at)?;
     no_guests_from(master, input, Some(at))?;
     let cancelled: Vec<Point> = exceptions
@@ -1888,122 +1954,16 @@ fn plan_split(
         });
     }
 
-    // The new series: the original's own fields (from Google's copy, never the mirror), the draft's
-    // over them, its times in the original's zones, and a private note of where it came from.
-    let mut body: Map<String, Value> = TAIL_COPY
-        .iter()
-        .filter_map(|k| master_json.get(*k).map(|v| ((*k).to_string(), v.clone())))
-        .collect();
-    if let Some(guests) = master_json.get("attendees").and_then(Value::as_array) {
-        let guests: Vec<Value> = guests
-            .iter()
-            .filter_map(|g| {
-                let mut kept = Map::new();
-                for k in ["email", "optional", "displayName"] {
-                    if let Some(v) = g.get(k) {
-                        kept.insert(k.to_string(), v.clone());
-                    }
-                }
-                kept.contains_key("email").then_some(Value::Object(kept))
-            })
-            .collect();
-        body.insert("attendees".into(), Value::from(guests));
-    }
-    let mut properties = master_json
-        .get("extendedProperties")
-        .cloned()
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    if let Some(obj) = properties.as_object_mut() {
-        let private = obj.entry("private").or_insert_with(|| json!({}));
-        if let Some(private) = private.as_object_mut() {
-            private.insert("pmSplitOf".into(), Value::from(master.id.clone()));
-            // And the occurrence it was split at, which an uncut original still holds whatever day
-            // the new part was moved to: what the overlap backstop measures from (review round 6).
-            private.insert("pmSplitAt".into(), Value::from(super::point_text(at)));
-        }
-    }
-    body.insert("extendedProperties".into(), properties);
-    for (k, v) in &touched {
-        body.insert((*k).to_string(), v.clone());
-    }
-    let (start, end) = when_nodes(master, first, length)?;
-    body.insert("start".into(), start);
-    body.insert("end".into(), end);
-    body.insert("recurrence".into(), Value::from(tail_lines));
-    // And a note of this plan, so its insert can't be read off another plan's tail (Shows::Tail).
-    let plan = plan_digest(&body);
-    if let Some(private) = body
-        .get_mut("extendedProperties")
-        .and_then(|p| p.get_mut("private"))
-        .and_then(Value::as_object_mut)
-    {
-        private.insert("pmSplitPlan".into(), Value::from(plan.clone()));
-    }
-    warnings.push(SeriesWarning::NotCarried {
-        attachments: master_json
-            .get("attachments")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty()),
-        conference: master_json.get("conferenceData").is_some()
-            || master_json.get("hangoutLink").is_some(),
-        label: master_json.get("eventLabelId").is_some(),
-    });
-    warnings.retain(|w| {
-        !matches!(
-            w,
-            SeriesWarning::NotCarried {
-                attachments: false,
-                conference: false,
-                label: false
-            }
-        )
-    });
+    let nodes = when_nodes(master, first, length)?;
+    let body = tail_body(master, master_json, at, &touched, nodes, Some(tail_lines));
+    warnings.extend(not_carried(master_json));
     warnings.push(SeriesWarning::NewIdentity);
     if input.sibling {
         warnings.push(SeriesWarning::SplitSibling);
     }
-
-    // Nothing the plan sends may have changed in Google since the editor opened (R2).
-    let watched: Vec<String> = TAIL_WATCH.iter().map(|k| (*k).to_string()).collect();
-    let changed = changed_since_opened(&master.start, opened.json(), master_json, &watched);
-    if !changed.is_empty() {
-        return Err(NotPlanned::Conflict(changed));
-    }
-    let instance_keys: Vec<String> = touched.iter().map(|(k, _)| (*k).to_string()).collect();
-    let changed = changed_since_opened(
-        &master.start,
-        input.opened.instance.json(),
-        instance,
-        &instance_keys,
-    );
-    if !changed.is_empty() {
-        return Err(NotPlanned::Conflict(changed));
-    }
-
+    split_unchanged_since_opened(master, input, opened, &touched)?;
     let mut steps = vec![
-        Step {
-            op: Op::Insert {
-                calendar: input.calendar.to_string(),
-                id: tail_id.to_string(),
-                body,
-            },
-            notify,
-            stage: Stage::Commit,
-            requires: None,
-            conflict: Recheck::Never,
-            shows: Shows::Tail {
-                of: master.id.clone(),
-                plan: plan.clone(),
-            },
-            gone_is_done: false,
-            undo: Some(Undo::DeleteInserted {
-                calendar: input.calendar.to_string(),
-                event: tail_id.to_string(),
-                split_of: master.id.clone(),
-                plan,
-            }),
-        },
+        insert_step(input, master, tail_id, body, notify),
         cut_step(master, input.calendar, master_json, cut, TAIL_WATCH, notify),
     ];
 
@@ -2105,15 +2065,202 @@ fn plan_split(
             left: Vec::new(),
         },
         start: master.start,
+        rule_start: master.start,
         guests_allowed: input.guests_allowed,
     })
+}
+
+/// Where the rest of a series split at `at` repeats from: the series' own wall time on that
+/// occurrence's day. On a day the clocks skip that time, the occurrence sits an hour off it, and the
+/// rest can't start there: it would repeat an hour late, and every EXDATE after it would name nothing
+/// (C8b fix review).
+pub(super) fn rest_start(master: &Master, at: Point) -> Result<SeriesStart, NotPlanned> {
+    let zone = master.start.zone();
+    match (master.start, at) {
+        (SeriesStart::Timed { local, .. }, Point::At(_)) => {
+            // The occurrence's own day: where the series' time, read as RFC 5545 reads a skipped
+            // hour, lands on `at`. A time in an evening's skipped hour lands on the next date.
+            let time = local.time();
+            let today = at.day_in(zone);
+            let day = [today, today.pred_opt().unwrap_or(today)]
+                .into_iter()
+                .find(|d| rfc_instant(zone, d.and_time(time)).map(Point::At) == Some(at))
+                .unwrap_or(today);
+            let start = SeriesStart::Timed {
+                local: day.and_time(time),
+                zone,
+            };
+            if start.point() != Some(at) {
+                return Err(SeriesRefusal::SplitInGap(day).into());
+            }
+            Ok(start)
+        }
+        (SeriesStart::AllDay(_), Point::Day(d)) => Ok(SeriesStart::AllDay(d)),
+        _ => Err(RetimeError::KindChange.into()),
+    }
+}
+
+/// A split's new series, or the one event a split that stops repeating makes (C11): the original's
+/// own fields (from Google's copy, never the mirror), its guests, `fields` over them, `start` and
+/// `end`, its `recurrence` if it repeats, and private notes of where it came from and of this plan,
+/// so its insert can't be read off another plan's (`Shows::Tail`).
+pub(super) fn tail_body(
+    master: &Master,
+    master_json: &Value,
+    at: Point,
+    fields: &[(&str, Value)],
+    (start, end): (Value, Value),
+    recurrence: Option<Vec<String>>,
+) -> Map<String, Value> {
+    let mut body: Map<String, Value> = TAIL_COPY
+        .iter()
+        .filter_map(|k| master_json.get(*k).map(|v| ((*k).to_string(), v.clone())))
+        .collect();
+    if let Some(guests) = master_json.get("attendees").and_then(Value::as_array) {
+        let guests: Vec<Value> = guests
+            .iter()
+            .filter_map(|g| {
+                let mut kept = Map::new();
+                for k in ["email", "optional", "displayName"] {
+                    if let Some(v) = g.get(k) {
+                        kept.insert(k.to_string(), v.clone());
+                    }
+                }
+                kept.contains_key("email").then_some(Value::Object(kept))
+            })
+            .collect();
+        body.insert("attendees".into(), Value::from(guests));
+    }
+    let mut properties = master_json
+        .get("extendedProperties")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = properties.as_object_mut() {
+        let private = obj.entry("private").or_insert_with(|| json!({}));
+        if let Some(private) = private.as_object_mut() {
+            private.insert("pmSplitOf".into(), Value::from(master.id.clone()));
+            // And the occurrence it was split at, which an uncut original still holds whatever day
+            // the new part was moved to: what the overlap backstop measures from (review round 6).
+            private.insert("pmSplitAt".into(), Value::from(super::point_text(at)));
+        }
+    }
+    body.insert("extendedProperties".into(), properties);
+    for (k, v) in fields {
+        body.insert((*k).to_string(), v.clone());
+    }
+    body.insert("start".into(), start);
+    body.insert("end".into(), end);
+    if let Some(lines) = recurrence {
+        body.insert("recurrence".into(), Value::from(lines));
+    }
+    let plan = plan_digest(&body);
+    if let Some(private) = body
+        .get_mut("extendedProperties")
+        .and_then(|p| p.get_mut("private"))
+        .and_then(Value::as_object_mut)
+    {
+        private.insert("pmSplitPlan".into(), Value::from(plan));
+    }
+    body
+}
+
+/// The new part doesn't take the original's attachments, video call or label: the warning, when it
+/// names one.
+pub(super) fn not_carried(master_json: &Value) -> Option<SeriesWarning> {
+    let warning = SeriesWarning::NotCarried {
+        attachments: master_json
+            .get("attachments")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+        conference: master_json.get("conferenceData").is_some()
+            || master_json.get("hangoutLink").is_some(),
+        label: master_json.get("eventLabelId").is_some(),
+    };
+    let none = SeriesWarning::NotCarried {
+        attachments: false,
+        conference: false,
+        label: false,
+    };
+    (warning != none).then_some(warning)
+}
+
+/// Nothing a split sends may have changed in Google since the editor opened (R2): every field the new
+/// part copies, on the series `opened` as the editor kept it, and the draft's `touched` fields on the
+/// occurrence.
+pub(super) fn split_unchanged_since_opened(
+    master: &Master,
+    input: &SeriesInput,
+    opened: &FreshEvent,
+    touched: &[(&str, Value)],
+) -> Result<(), NotPlanned> {
+    let watched: Vec<String> = TAIL_WATCH.iter().map(|k| (*k).to_string()).collect();
+    let changed = changed_since_opened(
+        &master.start,
+        opened.json(),
+        input.fresh.master.json(),
+        &watched,
+    );
+    if !changed.is_empty() {
+        return Err(NotPlanned::Conflict(changed));
+    }
+    let instance_keys: Vec<String> = touched.iter().map(|(k, _)| (*k).to_string()).collect();
+    let changed = changed_since_opened(
+        &master.start,
+        input.opened.instance.json(),
+        input.fresh.instance.json(),
+        &instance_keys,
+    );
+    if !changed.is_empty() {
+        return Err(NotPlanned::Conflict(changed));
+    }
+    Ok(())
+}
+
+/// The insert of a split's new part under `tail_id`, PM's own id: proved by its notes, undone by
+/// deleting it while it's still PM's.
+pub(super) fn insert_step(
+    input: &SeriesInput,
+    master: &Master,
+    tail_id: &str,
+    body: Map<String, Value>,
+    notify: Notify,
+) -> Step {
+    let plan = body
+        .get("extendedProperties")
+        .and_then(|p| p.pointer("/private/pmSplitPlan"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Step {
+        op: Op::Insert {
+            calendar: input.calendar.to_string(),
+            id: tail_id.to_string(),
+            body,
+        },
+        notify,
+        stage: Stage::Commit,
+        requires: None,
+        conflict: Recheck::Never,
+        shows: Shows::Tail {
+            of: master.id.clone(),
+            plan: plan.clone(),
+        },
+        gone_is_done: false,
+        undo: Some(Undo::DeleteInserted {
+            calendar: input.calendar.to_string(),
+            event: tail_id.to_string(),
+            split_of: master.id.clone(),
+            plan,
+        }),
+    }
 }
 
 /// The last occurrence the original keeps before `at`, a split's occurrence: its rule's latest that
 /// isn't deleted (an EXDATE, or among `cancelled`), else its start, which RFC 5545 and Google count
 /// even off its own rule. The rest can't start on that day or before (C8b reviews ADV-9). An extra
 /// date (RDATE) is an occurrence of its own, which the rest's rule can't double, so it doesn't count.
-fn last_kept(
+pub(super) fn last_kept(
     master: &Master,
     facts: &lines::RuleFacts,
     at: Point,

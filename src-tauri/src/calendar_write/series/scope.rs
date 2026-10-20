@@ -17,6 +17,7 @@ use crate::calendar_recur::{Point, RecurError};
 use super::super::dto::{EventPatchDraft, SeriesScope, TimeDraft};
 use super::super::patch::build_patch;
 use super::super::time::{self, TimeError};
+use super::rule::rule_change;
 use super::{original_of, point_of, FreshEvent, Length, Master, SeriesRefusal};
 
 /// The three choices.
@@ -44,7 +45,18 @@ pub struct Change {
     pub fields: bool,
     pub visibility: bool,
     pub time: Option<TimeChange>,
+    /// A new rule, or none at all (C11).
+    pub rule: Option<RuleChange>,
     pub delete: bool,
+}
+
+/// A change to how the series repeats, as far as the choice cares (C11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleChange {
+    /// A rule other than the series' own: a rule PM can't read is one too, and its planner says why.
+    New,
+    /// "Does not repeat".
+    Stop,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -79,6 +91,7 @@ impl Change {
                 .iter()
                 .any(|k| body.contains_key(*k)),
             visibility: body.contains_key("visibility"),
+            rule: rule_change(draft, master),
             ..Change::default()
         };
         if let (Some(draft_time), true) = (&draft.time, body.contains_key("start")) {
@@ -90,7 +103,8 @@ impl Change {
 }
 
 /// Whether a timed draft puts the occurrence's start or end in a zone other than its own (an end
-/// with no zone of its own is in the start's): a whole series can't follow it until C11.
+/// with no zone of its own is in the start's): a whole series follows it only when a new rule
+/// rebuilds the series (C11c), until C11d rebuilds it from its own rule too.
 pub(super) fn zones_changed(draft: &TimeDraft, instance: &Value) -> bool {
     let TimeDraft::Timed {
         start_zone,
@@ -151,9 +165,12 @@ pub enum ScopeReason {
     VisibilityIsSeriesWide,
     /// PM shows this series' rule as text only, so it can't move or cut it.
     TextOnly(TextOnly),
-    /// Between timed and all-day, or into another zone, for more than one occurrence (until C11).
+    /// Between timed and all-day, or into another zone, for more than one occurrence, with the
+    /// series' own rule (until C11d; a new rule rebuilds the series in any kind and zone).
     KindChange,
     ZoneChange,
+    /// A new rule, or none, can't apply to one occurrence (C11).
+    RuleIsSeriesWide,
 }
 
 /// Shown on the row as is, in the planners' own words for the same refusals.
@@ -164,6 +181,7 @@ impl fmt::Display for ScopeReason {
             ScopeReason::TextOnly(why) => RecurError::TextOnly(why.clone()).fmt(f),
             ScopeReason::KindChange => RetimeError::KindChange.fmt(f),
             ScopeReason::ZoneChange => SeriesRefusal::ZoneChange.fmt(f),
+            ScopeReason::RuleIsSeriesWide => SeriesRefusal::RuleIsSeriesWide.fmt(f),
         }
     }
 }
@@ -193,7 +211,14 @@ pub fn scope_options(change: &Change, first: bool, text_only: Option<&TextOnly>)
     if change.visibility {
         this = Row::Refused(ScopeReason::VisibilityIsSeriesWide);
     }
-    if let Some(t) = change.time {
+    // How the series repeats is the series' own: never one occurrence's (the plan's "This event is
+    // absent when the rule changes", shown refused with its reason instead, C11 §0.4).
+    if change.rule.is_some() {
+        this = Row::Refused(ScopeReason::RuleIsSeriesWide);
+    }
+    // A new rule replaces the old one whole, in any kind and zone, so the series' own rule (or a
+    // kind or zone it can't follow yet) doesn't stand in its way (C11 §9.2).
+    if let (Some(t), None) = (change.time, change.rule) {
         let series_wide = if t.kind_changed {
             Some(ScopeReason::KindChange)
         } else if t.zone_changed {
@@ -435,5 +460,131 @@ mod tests {
         assert!(ScopeReason::ZoneChange
             .to_string()
             .contains("another time zone"));
+        assert_eq!(
+            ScopeReason::RuleIsSeriesWide.to_string(),
+            "Changing how it repeats can't apply to just this occurrence."
+        );
+        assert_eq!(
+            ScopeReason::RuleIsSeriesWide.to_string(),
+            SeriesRefusal::RuleIsSeriesWide.to_string()
+        );
+    }
+
+    fn repeat(days: &[crate::calendar_recur::wire::DayCode]) -> EventPatchDraft {
+        use crate::calendar_recur::wire::{RepeatEnds, RepeatPattern, RepeatRule};
+        EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Rule {
+                rule: RepeatRule {
+                    pattern: RepeatPattern::Weekly {
+                        days: days.to_vec(),
+                    },
+                    interval: 1,
+                    ends: RepeatEnds::Never,
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The test moved here from C9 (c9-design:108): a change to how it repeats never offers "This
+    /// event", shown refused with its reason (C11 §0.4.5); a stop is one too.
+    #[test]
+    fn a_rule_change_refuses_this_event() {
+        use crate::calendar_recur::wire::DayCode;
+        let new = change(repeat(&[DayCode::Tue]));
+        assert_eq!(new.rule, Some(RuleChange::New));
+        let o = scope_options(&new, false, None);
+        assert_eq!(o.this, Row::Refused(ScopeReason::RuleIsSeriesWide));
+        assert_eq!((o.following, o.all), (Row::Offered, Row::Offered));
+        let stop = change(EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            ..Default::default()
+        });
+        assert_eq!(stop.rule, Some(RuleChange::Stop));
+        assert_eq!(
+            scope_options(&stop, false, None).this,
+            Row::Refused(ScopeReason::RuleIsSeriesWide)
+        );
+        // From the first occurrence, "this and following" is still every occurrence.
+        assert_eq!(scope_options(&new, true, None).following, Row::AsAll);
+    }
+
+    /// A rule PM can only show is replaced whole on every occurrence, but can't be cut, so "this and
+    /// following" stays refused; a new time with the new rule doesn't stand in the way either.
+    #[test]
+    fn a_new_rule_on_a_custom_rule_offers_all_but_not_following() {
+        let custom = TextOnly::Part("BYSETPOS".into());
+        for time in [None, Some(TimeChange::default())] {
+            let new = Change {
+                rule: Some(RuleChange::New),
+                time,
+                ..Default::default()
+            };
+            let o = scope_options(&new, false, Some(&custom));
+            assert_eq!(o.all, Row::Offered);
+            assert_eq!(
+                o.following,
+                Row::Refused(ScopeReason::TextOnly(custom.clone()))
+            );
+        }
+    }
+
+    /// C11c: a change between timed and all-day, or into another zone, goes to every occurrence only
+    /// with a new rule, which rebuilds the series in it.
+    #[test]
+    fn a_new_rule_with_a_kind_change_is_offered() {
+        for t in [
+            TimeChange {
+                kind_changed: true,
+                ..Default::default()
+            },
+            TimeChange {
+                zone_changed: true,
+                ..Default::default()
+            },
+        ] {
+            let o = scope_options(
+                &Change {
+                    time: Some(t),
+                    rule: Some(RuleChange::New),
+                    ..Default::default()
+                },
+                false,
+                None,
+            );
+            assert_eq!((o.following, o.all), (Row::Offered, Row::Offered));
+        }
+    }
+
+    /// Until C11d, the series' own rule doesn't follow it there.
+    #[test]
+    fn a_kind_change_alone_is_still_refused() {
+        let o = scope_options(
+            &Change {
+                time: Some(TimeChange {
+                    kind_changed: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+            None,
+        );
+        assert_eq!(o.this, Row::Offered);
+        assert_eq!(o.all, Row::Refused(ScopeReason::KindChange));
+        assert_eq!(o.following, Row::Refused(ScopeReason::KindChange));
+    }
+
+    /// The rule the series already has, sent back, is no change of rule: "This event" stays offered.
+    #[test]
+    fn the_same_rule_is_no_rule_change() {
+        use crate::calendar_recur::wire::DayCode;
+        let same = change(EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..repeat(&[DayCode::Mon])
+        });
+        assert_eq!(same.rule, None);
+        assert!(same.fields);
+        assert_eq!(scope_options(&same, false, None).this, Row::Offered);
     }
 }

@@ -183,7 +183,9 @@ export function againText(kind: ChoiceKind): string {
 
 const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
   "repeat_day_changes",
+  "becomes_one_event",
   "start_moved",
+  "changes_lost",
   "length_changes",
   "exceptions_may_reset",
   "not_carried",
@@ -221,7 +223,19 @@ export function seriesWarningText(
     case "repeat_day_changes":
       return repeatDayQuestion(title, w, scope);
     case "start_moved":
-      return `The first occurrence of ${t} moves from ${formatDateOnly(w.from)} to ${formatDateOnly(w.to)}.`;
+      // From one occurrence on, only a new repeat moves where the new part starts (C11).
+      return scope === "following"
+        ? `From this occurrence on, the new part of ${t} starts on ${formatDateOnly(w.to)}, the first day the new repeat allows.`
+        : `The first occurrence of ${t} moves from ${formatDateOnly(w.from)} to ${formatDateOnly(w.to)}.`;
+    case "becomes_one_event":
+      // "Does not repeat" (C11): never "a new repeating event" (C11 critique 2 M2).
+      return scope === "following"
+        ? `From this occurrence on, ${t} becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.`
+        : `Only the occurrence on ${formatDateOnly(w.day)} stays, as an event that doesn't repeat. Every other occurrence of ${t} goes.`;
+    case "changes_lost":
+      return w.count === 1
+        ? `One occurrence of ${t} you changed on its own falls on a day the new repeat skips, so that change goes.`
+        : `${w.count} occurrences of ${t} you changed on their own fall on days the new repeat skips, so those changes go.`;
     case "length_changes":
       return scope === "following"
         ? "Every occurrence from this one on will last as long as this one."

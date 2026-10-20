@@ -101,6 +101,18 @@ pub struct EventPatchDraft {
     pub time: Option<TimeDraft>,
     pub show_as: Option<ShowAs>,
     pub visibility: Option<Visibility>,
+    /// How it repeats from now on. `None` leaves the repeat as it is (C11).
+    pub recurrence: Option<RepeatDraft>,
+}
+
+/// A change to how an event repeats (C11): a rule from the editor's set, or none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepeatDraft {
+    /// Repeat by this rule from now on.
+    Rule { rule: RepeatRule },
+    /// Stop repeating ("Does not repeat").
+    Once,
 }
 
 /// A new event as the editor holds it (A22: defined with its first caller, the create command). No
@@ -423,8 +435,9 @@ pub enum EditLoad {
         seen: Option<SeenSummary>,
         /// Its series, when it's an occurrence of one and PM could read Google's copy of it. The
         /// session keeps that copy, so "all events" and "this and following" never overwrite a
-        /// change someone made to the series after the editor opened (G9).
-        series: Option<SeriesInfo>,
+        /// change someone made to the series after the editor opened (G9). Boxed, as its rule (C11)
+        /// makes it the outcome's largest part.
+        series: Option<Box<SeriesInfo>>,
     },
     Gone,
     Reauth,
@@ -440,6 +453,13 @@ pub struct SeriesInfo {
     pub first: bool,
     /// How the series repeats, as Google Calendar says it ("Weekly on Monday").
     pub repeats: String,
+    /// The rule as one from the editor's set, or `None` for one PM can only show (`repeats` says
+    /// it), which can only be replaced (C11).
+    pub rule: Option<RepeatRule>,
+    /// The series' first occurrence's day, `YYYY-MM-DD`, in the zone it repeats in.
+    pub starts: String,
+    /// The zone it repeats in; `None` for an all-day one, which repeats by days.
+    pub zone: Option<String>,
 }
 
 /// What the choices for a change to a repeating occurrence are asked for: an open editor's draft, or
@@ -537,6 +557,10 @@ pub enum SeriesWarningDto {
     },
     /// The new part is a new event in Google: links to the old one stay with the part before.
     NewIdentity,
+    /// It stops repeating: only the occurrence on `day` stays (C11).
+    BecomesOneEvent { day: String },
+    /// This many occurrences changed on their own fall on days the new rule skips: their changes go.
+    ChangesLost { count: u32 },
 }
 
 #[cfg(test)]
@@ -834,10 +858,51 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SeriesInfo {
                 first: false,
-                repeats: "Weekly on Monday".into()
+                repeats: "Weekly on Monday".into(),
+                rule: None,
+                starts: "2026-10-05".into(),
+                zone: Some("Europe/London".into()),
             })
             .unwrap(),
-            r#"{"first":false,"repeats":"Weekly on Monday"}"#
+            r#"{"first":false,"repeats":"Weekly on Monday","rule":null,"starts":"2026-10-05","zone":"Europe/London"}"#
+        );
+        for (warning, json) in [
+            (
+                SeriesWarningDto::BecomesOneEvent {
+                    day: "2026-10-05".into(),
+                },
+                r#"{"warning":"becomes_one_event","day":"2026-10-05"}"#,
+            ),
+            (
+                SeriesWarningDto::ChangesLost { count: 2 },
+                r#"{"warning":"changes_lost","count":2}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&warning).unwrap(), json);
+        }
+    }
+
+    /// C11: a draft's repeat, as the editor will send it; left out or null, the repeat is untouched.
+    #[test]
+    fn a_draft_names_a_new_repeat_or_none() {
+        let rule: EventPatchDraft = serde_json::from_str(
+            r#"{"recurrence":{"kind":"rule","rule":{"pattern":{"kind":"daily"},"interval":2,
+                "ends":{"kind":"never"}}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            rule.recurrence,
+            Some(RepeatDraft::Rule { rule }) if rule.interval == 2 && rule.to_spec().is_ok()
+        ));
+        let once: EventPatchDraft =
+            serde_json::from_str(r#"{"recurrence":{"kind":"once"}}"#).unwrap();
+        assert_eq!(once.recurrence, Some(RepeatDraft::Once));
+        for json in [r#"{"summary":"Gym"}"#, r#"{"recurrence":null}"#] {
+            let untouched: EventPatchDraft = serde_json::from_str(json).unwrap();
+            assert!(untouched.recurrence.is_none(), "{json}");
+        }
+        assert!(
+            serde_json::from_str::<EventPatchDraft>(r#"{"recurrence":{"kind":"weekly"}}"#).is_err()
         );
     }
 

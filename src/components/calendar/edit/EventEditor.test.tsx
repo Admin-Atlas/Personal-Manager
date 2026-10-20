@@ -800,7 +800,17 @@ describe("EventEditor, a repeating event", () => {
   it("asks when the editor knows its repeating event, whatever the row says", async () => {
     openForEdit.mockResolvedValue({
       ...ready(event()),
-      series: { first: false, repeats: "Weekly on Monday" },
+      series: {
+        first: false,
+        repeats: "Weekly on Monday",
+        rule: {
+          pattern: { kind: "weekly", days: ["mon"] },
+          interval: 1,
+          ends: { kind: "never" },
+        },
+        starts: "2026-10-05",
+        zone: "Europe/London",
+      },
     } as EditLoad);
     choicesForEdit.mockResolvedValue(choices());
     await open();
