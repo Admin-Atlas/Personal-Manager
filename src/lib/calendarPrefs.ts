@@ -79,6 +79,19 @@ export function writeHidden(hidden: Set<string>): void {
   }
 }
 
+/** The calendar the user last created an event in (its PM id), or null: where the next new event
+ *  starts, while it can still take one (`defaultTarget` checks). In `calendar_ui` beside `hidden`,
+ *  for the same reason: a calendar id is routinely an email address. */
+export function readLastCreate(): string | null {
+  const id = readStored(PREF_KEY).last_create;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** Remember the calendar an event was just created in. Only a create Google holds moves it. */
+export function writeLastCreate(calendarId: string): void {
+  writeStored(PREF_KEY, { last_create: calendarId });
+}
+
 const ROSTER_OPEN_KEY = "pm.calendar.rosterOpen";
 
 /** Is the sidebar's "Calendars" roster folded open? Open until the user says otherwise.

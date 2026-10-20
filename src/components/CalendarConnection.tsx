@@ -621,12 +621,12 @@ const EDITING_COPY: Record<
   { text: string; action: string; enable: boolean; paused?: boolean }
 > = {
   off: {
-    text: "Read-only. Turn on editing to change and delete this account’s events from PM. Google asks you to allow two things: leave both ticked.",
+    text: "Read-only. Turn on editing to create, change and delete this account’s events from PM. Google asks you to allow two things: leave both ticked.",
     action: "Turn on editing…",
     enable: true,
   },
   on: {
-    text: "Editing on: PM can change and delete events you organise without guests on this account’s calendars, repeating ones included.",
+    text: "Editing on: PM can create events on this account’s calendars, and change and delete events you organise without guests there, repeating ones included.",
     action: "Turn off editing",
     enable: false,
     paused: true,

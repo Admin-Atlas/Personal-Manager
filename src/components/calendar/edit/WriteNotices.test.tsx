@@ -103,4 +103,41 @@ describe("WriteNotices", () => {
     expect(gym.disabled).toBe(true);
     expect(standup.disabled).toBe(false);
   });
+
+  // A new event PM may already have made keeps Check again until Google shows how it ended (C10).
+  it("offers Check again on a new event PM may have made, off while it checks", () => {
+    const held = (id: number, summary: string, checking = false): WriteNotice => ({
+      id,
+      tone: "warn",
+      text: `PM may already have made “${summary}”.`,
+      create: {
+        token: `ref-${id}`,
+        sent: {
+          calendarId: "gcal:me@x.com:me@x.com",
+          draft: {
+            summary,
+            time: { kind: "all_day", first_day: "2026-10-12", last_day: "2026-10-12" },
+            location: "",
+            description: "",
+            show_as: "free",
+            visibility: "default",
+          },
+        },
+      },
+      checking,
+    });
+    const onCheckCreate = vi.fn();
+    const props = { onUndo: vi.fn(), onDismiss: vi.fn(), onCheckCreate };
+    const view = render(<WriteNotices notices={[held(1, "Gym")]} {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    expect(onCheckCreate).toHaveBeenCalledWith(1);
+    // Checking: its button off. Two up: each names its event.
+    view.rerender(<WriteNotices notices={[held(1, "Gym", true), held(2, " ")]} {...props} />);
+    const gym = screen.getByRole("button", { name: "Check again (“Gym”)" }) as HTMLButtonElement;
+    const untitled = screen.getByRole("button", {
+      name: "Check again (“(no title)”)",
+    }) as HTMLButtonElement;
+    expect(gym.disabled).toBe(true);
+    expect(untitled.disabled).toBe(false);
+  });
 });

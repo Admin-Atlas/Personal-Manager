@@ -16,10 +16,16 @@
 // couldn't finish. A change like that keeps a notice with its buttons until it's settled, in this
 // store, so it outlives the editor and the tab. A reload loses the notice, not the change: the
 // backend still holds it, and the dialog's pending row offers the same buttons on the next change.
+//
+// Creating an event comes through here too (C10). How a create ended is a notice whenever the editor
+// isn't there to say it: Created, or one PM can't tell was made, which keeps a Check again button
+// holding exactly what was sent until Google shows how it ended. A reload loses that notice; the
+// backend's record of it then lapses, and a copy that landed shows at the next sync.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   cancelCalendarDelete,
+  createCalendarEvent,
   deleteCalendarEvent,
   getCalendarEventForEdit,
   listHeldDeletes,
@@ -33,6 +39,7 @@ import type {
   DeleteSettled,
   EditLoad,
   EventPatchDraft,
+  NewEventDraft,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -40,13 +47,19 @@ import type {
   WriteOutcome,
 } from "../../../lib/types";
 import {
+  createdText,
+  createText,
   deleteChangedText,
   deleteText,
+  heldCreateText,
+  retryAfter,
   savedNotice,
   settleText,
+  type CreatedWhere,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import type { Picked } from "../../../lib/calendarEdit/saveChoices";
+import { writeLastCreate } from "../../../lib/calendarPrefs";
 import { isAnyDialogOpen } from "../../../lib/useDialogLayer";
 import { deviceTimeZoneOrNull } from "../../../theme";
 
@@ -63,6 +76,18 @@ export interface WriteNotice {
   split?: { token: string; offers: SplitAction[]; title: string };
   /** Its settle is on its way: the buttons are disabled. */
   settling?: boolean;
+  /** A new event PM may already have made: its retry token and exactly what was sent, which Check
+   *  again sends again (the backend looks for it first). */
+  create?: { token: string; sent: CreateSent };
+  /** Its Check again is on its way: the button is disabled. */
+  checking?: boolean;
+}
+
+/** What creating an event sent: the calendar (PM's id) and the draft, kept as they were so a Check
+ *  again re-sends them exactly (the backend refuses anything else). */
+export interface CreateSent {
+  calendarId: string;
+  draft: NewEventDraft;
 }
 
 /** A delete the backend is holding or sending. */
@@ -132,7 +157,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
  *  once a view has shown it; the timer only removes the notice it was set for, never a later one
  *  under the same id. A delete still held or being sent isn't done, though its notice has lost its
  *  Undo: that one stays until the delete settles. Nor is a change PM couldn't finish: its notice
- *  keeps its buttons until it's settled, whatever its tone. */
+ *  keeps its buttons until it's settled, whatever its tone; nor a new event PM may have made. */
 function put(notice: WriteNotice) {
   const shown = state.notices.some((n) => n.id === notice.id);
   update({
@@ -141,7 +166,7 @@ function put(notice: WriteNotice) {
       : [...state.notices, notice],
   });
   const inFlight = state.held.some((h) => h.noticeId === notice.id);
-  if (notice.tone === "ok" && !notice.undoToken && !notice.split && !inFlight) {
+  if (notice.tone === "ok" && !notice.undoToken && !notice.split && !notice.create && !inFlight) {
     if (subscribers.size > 0) expire(notice);
     else unseen.add(notice);
   }
@@ -495,6 +520,96 @@ export function noteSaved(
   put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from) });
 }
 
+// --- creating an event (C10) ---
+
+/** Create an event on one of PM's Google calendars; `retryToken` (from an earlier `ambiguous`
+ *  answer) has the backend look for that attempt before anything is sent again. Nobody is emailed:
+ *  new events have no guests. The outcome comes back as data; the caller says how it went. */
+export function createEvent(
+  calendarId: string,
+  draft: NewEventDraft,
+  retryToken: string | null,
+): Promise<WriteOutcome> {
+  return createCalendarEvent(calendarId, draft, retryToken);
+}
+
+/** The notice up for a held create's token, if one is. */
+const createNotice = (token: string) => state.notices.find((n) => n.create?.token === token);
+
+/** How a create ended, as a notice that outlives whatever sent it (the editor, closed or gone with
+ *  its tab; a notice's own Check again). `sentToken`: the retry token it was sent under, if any.
+ *  Saved says Created (and where PM's calendar won't show it), and remembers the calendar for the
+ *  next new event. An answer that leaves a token held (`retryAfter`) keeps Check again, holding
+ *  exactly what was sent, and never goes by itself; anything else says it wasn't created. `id`: the
+ *  notice this replaces (Check again's own); a notice already up for the token is replaced too. */
+export function noteCreateResult(
+  sent: CreateSent,
+  sentToken: string | null,
+  outcome: WriteOutcome,
+  where: CreatedWhere,
+  id?: number,
+) {
+  const title = sent.draft.summary;
+  const token = retryAfter(sentToken, outcome);
+  const shown =
+    (sentToken !== null ? createNotice(sentToken) : undefined) ??
+    (token !== null ? createNotice(token) : undefined);
+  const noticeId = id ?? shown?.id ?? nextNotice++;
+  if (shown && id !== undefined && shown.id !== id) dismissNotice(shown.id);
+  if (outcome.outcome === "saved") {
+    writeLastCreate(sent.calendarId);
+    put({ id: noticeId, ...createdText(title, outcome, where) });
+    return;
+  }
+  put({
+    id: noticeId,
+    ...createText(outcome, title, token !== null),
+    ...(token !== null ? { create: { token, sent } } : {}),
+  });
+}
+
+/** A surface closed (or went with its tab) while PM may already have made its new event: a notice
+ *  that keeps Check again, never "discarded". One per token. */
+export function noteHeldCreate(sent: CreateSent, token: string) {
+  put({
+    id: createNotice(token)?.id ?? nextNotice++,
+    ...heldCreateText(sent.draft.summary),
+    create: { token, sent },
+  });
+}
+
+/** Tokens with a Check again on its way, so a second press sends nothing. */
+const checking = new Set<string>();
+
+/** Check again from a notice: send exactly what was sent, under its token (the backend looks for
+ *  the event before anything goes again). `whereOf` says where the calendar shows now, for the
+ *  words if it was made. With no answer at all, the button stays. */
+export async function checkCreate(
+  id: number,
+  whereOf: (calendarId: string) => CreatedWhere,
+): Promise<void> {
+  const notice = state.notices.find((n) => n.id === id);
+  const held = notice?.create;
+  if (!notice || !held || checking.has(held.token)) return;
+  checking.add(held.token);
+  put({ ...notice, checking: true });
+  let outcome: WriteOutcome;
+  try {
+    outcome = await createEvent(held.sent.calendarId, held.sent.draft, held.token);
+  } catch (e) {
+    put({
+      id,
+      tone: "warn",
+      text: `${heldCreateText(held.sent.draft.summary).text} ${message(e)}`,
+      create: held,
+    });
+    return;
+  } finally {
+    checking.delete(held.token);
+  }
+  noteCreateResult(held.sent, held.token, outcome, whereOf(held.sent.calendarId), id);
+}
+
 /** The read mark: take it before a read of the mirror starts, and give it to `pruneRemoved` with
  *  what the read found. */
 export function readMark(): number {
@@ -638,6 +753,7 @@ export function useEventWrites() {
     undoDelete,
     undoLatest,
     settleSplit,
+    checkCreate,
     noteSeriesNotice,
     dismissNotice,
     pruneRemoved,

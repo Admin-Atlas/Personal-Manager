@@ -849,8 +849,6 @@ async fn save_event<W: Wire, H: Host>(
 
 // --- creating an event (C10) ---
 
-/// C10a only: release builds refuse creates until the UI ships (C10b).
-const CREATE_NOT_YET: &str = "Creating events from PM isn't available yet.";
 /// A calendar PM doesn't sync: a new event there would land nothing in the mirror.
 const NOT_SYNCED: &str = "PM doesn't sync this calendar, so it won't create events in it. Choose \
                           it in Settings › Connectors first.";
@@ -902,12 +900,6 @@ pub async fn create_calendar_event(
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
-    // C10a only (§16): no UI creates yet, so release builds refuse; C10b removes this.
-    if !cfg!(debug_assertions) {
-        return Ok(WriteOutcome::Failed {
-            message: CREATE_NOT_YET.into(),
-        });
-    }
     let state = app.state::<AppState>();
     let target = match resolve_calendar(
         &*state.conn()?,
@@ -14129,10 +14121,10 @@ mod tests {
         assert!(host.nothing_recorded());
     }
 
-    /// C10a ships the create command inert: a release build refuses it before reading anything,
-    /// and only after the window and owner checks every write makes (C10 §16).
+    /// Creating events ships in every build (C10b): the command makes the window and owner checks
+    /// every write makes before it reads anything or sends, and no build refuses it outright.
     #[test]
-    fn the_create_command_is_refused_in_release_builds_until_its_ui_ships() {
+    fn the_create_command_checks_the_window_and_owner_before_anything_else() {
         let source = include_str!("calendar_edit.rs");
         let shipped = source
             .split("#[cfg(test)]\nmod tests {")
@@ -14144,17 +14136,37 @@ mod tests {
         let shell = &shipped[start..];
         let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
         let at = |needle: &str| shell.find(needle).unwrap_or(usize::MAX);
-        let gate = at("if !cfg!(debug_assertions) {");
         assert!(
-            at("require_owner(&app)?;") < gate,
-            "the gate comes after the window and owner checks"
-        );
-        assert!(
-            gate < at("message: CREATE_NOT_YET.into()")
-                && at("message: CREATE_NOT_YET.into()") < at("state.conn()")
+            at("require_main_window(&window)?;") < at("require_owner(&app)?;")
+                && at("require_owner(&app)?;") < at("state.conn()")
                 && at("state.conn()") < at("create_event(&ctx"),
-            "a release build refuses before reading anything or sending"
+            "the window and owner checks come before reading anything or sending"
         );
+        assert!(
+            !shell.contains("if !cfg!(debug_assertions)"),
+            "no build refuses creating events outright"
+        );
+    }
+
+    /// The webview ends a retry token on two of the create's refusals, which it knows only by their
+    /// words: its copies of them must be these very strings (C10 critiques: the token drops only on
+    /// saved, gone, these two).
+    #[test]
+    fn the_webview_knows_the_words_that_end_a_retry_token() {
+        let words = include_str!("../../../src/lib/calendarEdit/editReasons.ts");
+        for (name, text) in [
+            ("CREATE_LOST", CREATE_LOST),
+            ("CREATE_CHANGED", CREATE_CHANGED),
+        ] {
+            let line = format!("export const {name} =");
+            let at = words.find(&line).expect("the webview names it");
+            let rest = &words[at..];
+            let decl = &rest[..rest.find(";\n").unwrap_or(rest.len())];
+            assert!(
+                decl.contains(&format!("\"{text}\"")),
+                "{name}: the webview's copy differs from the backend's"
+            );
+        }
     }
 
     /// The retry's table: two empty looks before a re-send, a cancelled copy gone, anything it

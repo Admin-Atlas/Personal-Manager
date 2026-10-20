@@ -15,9 +15,11 @@ import type {
   DeleteStart,
   EventPatchDraft,
   HeldDeleteInfo,
+  NewEventDraft,
   SeriesChoices,
   SplitAction,
   WriteOutcome,
+  WriteWarning,
 } from "../../../lib/types";
 
 type Scope = string | null;
@@ -31,9 +33,19 @@ const updateCalendarEvent =
   >();
 const seriesChoices = vi.fn<(request: ChoiceRequest) => Promise<SeriesChoices>>();
 const settleSeriesSplit = vi.fn<(token: string, action: SplitAction) => Promise<WriteOutcome>>();
+const createCalendarEvent =
+  vi.fn<(calendarId: string, draft: NewEventDraft, token: Scope) => Promise<WriteOutcome>>();
+const writeLastCreate = vi.fn<(calendarId: string) => void>();
 let settledHandler: ((s: DeleteSettled) => void) | null = null;
 
+vi.mock("../../../lib/calendarPrefs", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  writeLastCreate: (calendarId: string) => writeLastCreate(calendarId),
+}));
+
 vi.mock("../../../lib/ipc", () => ({
+  // Every argument passes through, so an extra one, or a dropped token, shows in the calls.
+  createCalendarEvent: (...a: [string, NewEventDraft, Scope]) => createCalendarEvent(...a),
   deleteCalendarEvent: (id: string, seen: unknown, scope: Scope, choice: Scope) =>
     deleteCalendarEvent(id, seen, scope, choice),
   cancelCalendarDelete: (token: string) => cancelCalendarDelete(token),
@@ -1008,5 +1020,198 @@ describe("a repeating event", () => {
     // A one-off's words are as they were.
     act(() => mod.noteSaved("Dentist", { outcome: "saved", warnings: [] }));
     expect(hook.result.current.notices[1].text).toBe("Saved “Dentist”.");
+  });
+});
+
+// --- creating an event (#884, C10) ---
+
+const CAL = "gcal:me@x.com:me@x.com";
+const draft: NewEventDraft = {
+  summary: "Dentist",
+  time: {
+    kind: "timed",
+    start_date: "2026-10-12",
+    start_time: "09:00",
+    start_zone: "Europe/London",
+    end_date: "2026-10-12",
+    end_time: "10:00",
+    end_zone: "Europe/London",
+  },
+  location: "",
+  description: "",
+  show_as: "busy",
+  visibility: "default",
+};
+const sent = { calendarId: CAL, draft };
+const shown = { name: "Me", hidden: false };
+const savedOutcome = (warnings: WriteWarning[] = []): WriteOutcome => ({
+  outcome: "saved",
+  warnings,
+  left_behind: [],
+});
+
+describe("creating an event", () => {
+  it("createEvent passes the calendar id, the draft and the token only", async () => {
+    const { mod } = await load();
+    createCalendarEvent.mockResolvedValue(savedOutcome());
+    await mod.createEvent(CAL, draft, null);
+    await mod.createEvent(CAL, draft, "ref-1");
+    expect(createCalendarEvent.mock.calls).toEqual([
+      [CAL, draft, null],
+      [CAL, draft, "ref-1"],
+    ]);
+  });
+
+  it("notes each way a create can end, and remembers the calendar only when it's made", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteCreateResult(sent, null, savedOutcome(), shown));
+    expect(hook.result.current.notices).toEqual([
+      { id: 1, tone: "ok", text: "Created “Dentist”." },
+    ]);
+    expect(writeLastCreate).toHaveBeenCalledWith(CAL);
+    act(() => mod.noteCreateResult(sent, null, savedOutcome(), { name: "Me", hidden: true }));
+    act(() => mod.noteCreateResult(sent, null, savedOutcome(["outside_mirror"]), shown));
+    act(() => mod.noteCreateResult(sent, null, savedOutcome(["mirror_refresh_pending"]), shown));
+    expect(hook.result.current.notices.slice(1).map((n) => [n.tone, n.text])).toEqual([
+      ["warn", "Created “Dentist” in Me, which is hidden here."],
+      [
+        "warn",
+        "Created “Dentist” in Google. It starts outside the months PM syncs, so it won't show here.",
+      ],
+      ["ok", "Created “Dentist” in Google. PM's calendar will show it after the next refresh."],
+    ]);
+    writeLastCreate.mockClear();
+    act(() =>
+      mod.noteCreateResult(
+        sent,
+        null,
+        { outcome: "failed", message: "PM couldn't reach Google." },
+        shown,
+      ),
+    );
+    const notices = hook.result.current.notices;
+    expect(notices[notices.length - 1]).toEqual({
+      id: 5,
+      tone: "error",
+      text: "“Dentist” wasn't created: PM couldn't reach Google.",
+    });
+    expect(writeLastCreate).not.toHaveBeenCalled();
+    // Done-and-fine notices go by themselves; the warnings stay.
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(hook.result.current.notices.map((n) => n.tone)).toEqual(["warn", "warn", "error"]);
+  });
+
+  it("keeps an ambiguous create with Check again, for good, holding what was sent", async () => {
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteCreateResult(sent, null, { outcome: "ambiguous", retry_token: "ref-1" }, shown),
+    );
+    const [notice] = hook.result.current.notices;
+    expect(notice.tone).toBe("warn");
+    expect(notice.text).toMatch(/^PM lost touch with Google while creating “Dentist”/);
+    expect(notice.create).toEqual({ token: "ref-1", sent });
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(hook.result.current.notices).toHaveLength(1);
+    // A surface closing over the same token doesn't say it twice.
+    act(() => mod.noteHeldCreate(sent, "ref-1"));
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: notice.id,
+        tone: "warn",
+        text: "PM may already have made “Dentist”. Check again: PM looks for it in Google first and sends it again only if it isn't there.",
+        create: { token: "ref-1", sent },
+      },
+    ]);
+  });
+
+  it("Check again sends exactly what was sent, under its token, once at a time", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteHeldCreate(sent, "ref-1"));
+    const id = hook.result.current.notices[0].id;
+    let answer: (o: WriteOutcome) => void = () => {};
+    createCalendarEvent.mockImplementation(
+      () => new Promise<WriteOutcome>((resolve) => (answer = resolve)),
+    );
+    const whereOf = vi.fn(() => shown);
+    let first: Promise<void> = Promise.resolve();
+    act(() => {
+      first = mod.checkCreate(id, whereOf);
+    });
+    expect(hook.result.current.notices[0].checking).toBe(true);
+    // A second press while it runs sends nothing.
+    await act(async () => {
+      await mod.checkCreate(id, whereOf);
+    });
+    expect(createCalendarEvent.mock.calls).toEqual([[CAL, draft, "ref-1"]]);
+    await act(async () => {
+      answer(savedOutcome());
+      await first;
+    });
+    expect(hook.result.current.notices).toEqual([{ id, tone: "ok", text: "Created “Dentist”." }]);
+    expect(writeLastCreate).toHaveBeenCalledWith(CAL);
+    expect(whereOf).toHaveBeenCalledWith(CAL);
+  });
+
+  it("keeps Check again on every answer that doesn't end the token", async () => {
+    for (const outcome of [
+      { outcome: "ambiguous", retry_token: "ref-1" },
+      { outcome: "reauth" },
+      { outcome: "busy" },
+      { outcome: "read_only", reason: "editing_off" },
+      {
+        outcome: "failed",
+        message: "PM has already sent this new event to Google more than once.",
+      },
+    ] as WriteOutcome[]) {
+      const { mod, hook, act } = await load();
+      act(() => mod.noteHeldCreate(sent, "ref-1"));
+      const id = hook.result.current.notices[0].id;
+      createCalendarEvent.mockResolvedValue(outcome);
+      await act(async () => {
+        await mod.checkCreate(id, () => shown);
+      });
+      const [notice] = hook.result.current.notices;
+      expect(notice.create).toEqual({ token: "ref-1", sent });
+      expect(notice.checking).toBeUndefined();
+      expect(notice.text).not.toMatch(/wasn't created/);
+    }
+  });
+
+  it("ends Check again on gone, or a token PM no longer holds", async () => {
+    const lostWords =
+      "PM lost touch with Google and can't tell whether this new event was made. Look for it in Google Calendar before creating it again, so it isn't made twice.";
+    for (const [outcome, text] of [
+      [{ outcome: "gone" }, "PM made “Dentist”, but it has since been deleted in Google."],
+      [
+        { outcome: "failed", message: lostWords },
+        "PM lost touch with Google and can't tell whether “Dentist” was made. Look for it in Google Calendar before creating it again, so it isn't made twice.",
+      ],
+    ] as [WriteOutcome, string][]) {
+      const { mod, hook, act } = await load();
+      act(() => mod.noteHeldCreate(sent, "ref-1"));
+      const id = hook.result.current.notices[0].id;
+      createCalendarEvent.mockResolvedValue(outcome);
+      await act(async () => {
+        await mod.checkCreate(id, () => shown);
+      });
+      expect(hook.result.current.notices).toEqual([{ id, tone: "warn", text }]);
+    }
+  });
+
+  it("keeps Check again when no answer comes at all", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteHeldCreate(sent, "ref-1"));
+    const id = hook.result.current.notices[0].id;
+    createCalendarEvent.mockRejectedValue(new Error("The app's channel closed."));
+    await act(async () => {
+      await mod.checkCreate(id, () => shown);
+    });
+    const [notice] = hook.result.current.notices;
+    expect(notice.create).toEqual({ token: "ref-1", sent });
+    expect(notice.text).toMatch(/The app's channel closed\.$/);
   });
 });

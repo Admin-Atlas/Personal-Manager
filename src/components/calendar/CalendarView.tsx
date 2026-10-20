@@ -9,7 +9,8 @@
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
 // on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. A synced event opens its
 // detail popover, where a Google event PM may change offers Edit and Delete (#884; every change goes
-// through `edit/useEventWrites`); everything else stays read-only. The two first-party overlays — project
+// through `edit/useEventWrites`); "+ New event" and `c` open the editor for a new one, on a calendar
+// the user picks (C10); everything else stays read-only. The two first-party overlays — project
 // milestones (click opens their project) and freeform pinboard timeline entries (click opens the
 // Pinboard) — are each an all-day event in its own hue, injected here and never written back to any
 // calendar.
@@ -28,10 +29,18 @@ import {
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import { reasonText } from "../../lib/calendarEdit/editReasons";
 import {
+  createdWhere,
+  createTargets,
+  defaultTarget,
+  lengthFor,
+} from "../../lib/calendarEdit/createTargets";
+import { newEventSeed, type EditorFields } from "../../lib/calendarEdit/eventDraft";
+import {
   clampDayCount,
   readCursorDay,
   readDayCount,
   readHidden,
+  readLastCreate,
   readOpenOn,
   readRange,
   readRangeBounds,
@@ -69,6 +78,7 @@ import {
 import { pinboardEntries, type PinboardEntry } from "../../lib/pinboard/calendarEntries";
 import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
 import {
+  deviceTimeZoneOrNull,
   milestoneColor,
   pinboardColor,
   sourceColors,
@@ -83,6 +93,7 @@ import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
 import { EventEditor } from "./edit/EventEditor";
+import { NewEventEditor } from "./edit/NewEventEditor";
 import { WriteNotices } from "./edit/WriteNotices";
 import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
 import { AgendaView } from "./views/AgendaView";
@@ -452,19 +463,58 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // The popover's own close, which hands focus back as its Escape does (it fills this in).
   const popoverCloseRef = useRef<(() => void) | null>(null);
 
+  // A new event being made (#884, C10): the editor's starting fields and calendar (null = closed).
+  const [creating, setCreating] = useState<{ seed: EditorFields; calendarId: string } | null>(null);
+  // The open editor's way to bring its title into focus: "+ New event" again focuses it, never
+  // replaces it.
+  const focusCreateRef = useRef<(() => void) | null>(null);
+  // Where a new event can go. With no Google account there's no button at all; with one but no
+  // calendar to take an event, the button says why.
+  const targets = useMemo(() => (overview ? createTargets(overview) : null), [overview]);
+  const hasGoogle = overview?.accounts.some((a) => a.provider === "google") ?? false;
+  const createReason =
+    !targets || targets.groups.length > 0
+      ? null
+      : overview?.accounts.some((a) => a.provider === "google" && overview.editing[a.id] === "on")
+        ? "None of your calendars can take new events."
+        : "Turn on editing for a Google account in Settings › Connectors to create events.";
+  // "+ New event" and `c`: the full editor, on the calendar last created in (else the primary), at
+  // the next half hour today when today is on screen, else at 09:00 on the day the view is on, for
+  // the account's own default length. Times are this computer's; without its zone, the calendar's
+  // (and then nothing can be saved, which the editor says).
+  const openCreate = useCallback(() => {
+    if (creating) {
+      focusCreateRef.current?.();
+      return;
+    }
+    if (!overview || !targets) return;
+    const target = defaultTarget(targets, readLastCreate());
+    if (!target) return;
+    const now = new Date();
+    const { start, end } = visibleRange(view, cursor, dayCount);
+    const today = startOfDay(now).getTime();
+    const day = today >= start.getTime() && today < end.getTime() ? now : cursor;
+    const zone = deviceTimeZoneOrNull() ?? target.calendar.time_zone ?? null;
+    setCreating({
+      seed: newEventSeed(dayKey(startOfDay(day)), now, zone, lengthFor(overview, target)),
+      calendarId: target.calendar.id,
+    });
+  }, [creating, overview, targets, view, cursor, dayCount]);
+
   // One step per swipe, in the direction of travel: a swipe left (positive deltaX) moves forward, by
   // the days Settings chooses (`swipeDays`, read at the swipe). Both gestures move the cursor and
   // nothing else — `writeCursorDay` above is what remembers it, and `openOn` decides whether that
-  // memory is ever read back. Not under an open popover, for the reason ← and → aren't (above).
+  // memory is ever read back. Not under an open popover, for the reason ← and → aren't (above), nor
+  // under a new event's editor.
   const gridRef = useHorizontalWheelShift(
     (dir) => setCursor((c) => addDays(c, dir * swipeDays(windowDays(view, dayCount)))),
-    (view === "day" || view === "week") && eventPopup === null,
+    (view === "day" || view === "week") && eventPopup === null && creating === null,
   );
 
-  // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
-  // field is focused, a modifier is held (so app shortcuts and text entry are untouched), or a dialog
-  // or the event popover is open over the tab (see `calendarNavKey`). Ctrl/Cmd+Z is the delete's Undo
-  // (`calendarUndoKey`).
+  // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today, `c` starts a
+  // new event (Shift+C too, until quick create comes). Ignored while a field is focused, a modifier is
+  // held (so app shortcuts and text entry are untouched), or a dialog or the event popover is open
+  // over the tab (see `calendarNavKey`). Ctrl/Cmd+Z is the delete's Undo (`calendarUndoKey`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Ctrl/Cmd+Z presses the newest Undo on screen (a delete still waiting). Unlike the arrows it
@@ -487,11 +537,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onNext();
       } else if (nav === "today") {
         onToday();
+      } else if (nav === "create" || nav === "quick-create") {
+        e.preventDefault();
+        openCreate();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onPrev, onNext, onToday]);
+  }, [onPrev, onNext, onToday, openCreate]);
 
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
@@ -873,6 +926,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onRefresh={onRefresh}
         syncing={syncing}
         lastSync={overview?.last_sync ?? null}
+        onCreate={hasGoogle ? openCreate : undefined}
+        createReason={createReason}
       />
 
       {isTerminal && <TerminalChrome view={view} label={label} count={chromeCount} />}
@@ -982,6 +1037,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           onClose={() => setEditing(null)}
         />
       )}
+      {creating && overview && targets && (
+        <NewEventEditor
+          seed={creating.seed}
+          targets={targets}
+          calendarId={creating.calendarId}
+          overview={overview}
+          hidden={hidden}
+          colorOf={colorOf}
+          shapeOf={shapeOf}
+          focusRef={focusCreateRef}
+          onClose={() => setCreating(null)}
+        />
+      )}
       <DeleteEventDialog
         event={confirmDelete}
         calendarName={
@@ -998,6 +1066,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onUndo={(token) => void writes.undoDelete(token)}
         onDismiss={writes.dismissNotice}
         onSettle={(token, action, title) => void writes.settleSplit(token, action, title)}
+        onCheckCreate={(id) =>
+          void writes.checkCreate(id, (calendarId) =>
+            overview
+              ? createdWhere(overview, hidden, calendarId)
+              : { name: "that calendar", hidden: false },
+          )
+        }
       />
     </div>
   );

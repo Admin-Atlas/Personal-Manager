@@ -5,7 +5,8 @@
 // They float over the grid, bottom centre, like the reader's notice, so each mixes its tone into
 // `--bg` (see Callout) rather than letting the events behind show through. The newest Undo is also
 // Ctrl+Z (⌘Z on a Mac), which its tooltip says. A "this and following" change PM couldn't finish
-// keeps its notice, with a button for each thing Google's state allows now, until it's settled.
+// keeps its notice, with a button for each thing Google's state allows now, until it's settled; a
+// new event PM can't tell was made keeps its Check again.
 
 import { IS_MAC } from "../../../lib/setupGuide";
 import { Button, Callout, TONE_MIX, TONE_TOKEN, Tooltip } from "../../ui";
@@ -21,13 +22,16 @@ interface Props {
   onDismiss: (id: number) => void;
   /** Settle a change PM couldn't finish (`token`, from its notice), naming its event `title`. */
   onSettle?: (token: string, action: SplitAction, title: string) => void;
+  /** Check again whether a new event PM may already have made was (the notice `id`). */
+  onCheckCreate?: (id: number) => void;
 }
 
-export function WriteNotices({ notices, onUndo, onDismiss, onSettle }: Props) {
+export function WriteNotices({ notices, onUndo, onDismiss, onSettle, onCheckCreate }: Props) {
   if (notices.length === 0) return null;
   const newest = latestUndo(notices);
   // With two such notices up, each button names its event, so "Finish" isn't said twice alike.
   const partials = notices.filter((n) => n.split).length;
+  const creates = notices.filter((n) => n.create).length;
   return (
     <div className="fixed bottom-4 left-1/2 z-50 flex w-max max-w-md -translate-x-1/2 flex-col gap-2">
       {notices.map((n) => {
@@ -42,7 +46,7 @@ export function WriteNotices({ notices, onUndo, onDismiss, onSettle }: Props) {
             // Only a notice with settle buttons wraps them under its words; the rest keep × beside
             // the text, as before.
             className={`flex items-center justify-between gap-3 text-ink2 shadow-lg${
-              n.split ? " flex-wrap" : ""
+              n.split || n.create ? " flex-wrap" : ""
             }`}
             style={{
               background: `color-mix(in oklab, var(${TONE_TOKEN[tone]}) ${TONE_MIX.surface}%, var(--bg))`,
@@ -71,6 +75,21 @@ export function WriteNotices({ notices, onUndo, onDismiss, onSettle }: Props) {
                     </Button>
                   );
                 })}
+              {n.create && onCheckCreate && (
+                <Button
+                  variant="secondary"
+                  size="xs"
+                  aria-label={
+                    creates > 1
+                      ? `Check again (“${n.create.sent.draft.summary.trim() || "(no title)"}”)`
+                      : undefined
+                  }
+                  disabled={n.checking}
+                  onClick={() => onCheckCreate(n.id)}
+                >
+                  Check again
+                </Button>
+              )}
               {/* Every Undo is the same Tooltip > Button, so when the newest goes and an older one
                   becomes it, only its label changes: a focused button isn't swapped for a new one. */}
               {n.undoToken && (

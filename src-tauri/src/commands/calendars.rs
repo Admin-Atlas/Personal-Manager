@@ -219,8 +219,13 @@ async fn do_connect_google_calendar(
         secrets::set_google_client_for_account(&email, id, secret)?;
     }
     google::save_consented_token(&google_calendar_token_key(&email), &token).await?;
+    // Google's default length for a new event, read now so a new account has it before its first
+    // full sync (C10b); one that can't be read leaves any stored one, and the editor uses an hour.
+    let default_length = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
+    // A nicety, so a store that can't take it never fails the connect.
+    let _ = calendar::remember_default_length(&conn, &email, default_length);
     // A read-only connect asked Google for reading only, so it turns editing off even when the
     // account had it: only the "Turn on editing" consent sets the choice.
     calendar_editing::set_choice(&conn, &email, None)?;
@@ -805,7 +810,8 @@ fn write_fetched_events(
 /// truncated page-run or an unreachable account can never delete a real calendar (its selected/quiet
 /// choices and mirrored events). Best-effort per account: a failed list fetch is skipped here, and the
 /// account's state is still settled by the event-sync pass. Never holds the DB lock across a fetch
-/// (rule #4). ICS feeds carry no separate list to reconcile (one feed is one calendar).
+/// (rule #4). ICS feeds carry no separate list to reconcile (one feed is one calendar). A Google
+/// account whose list came back also has its default event length read again, for new events.
 async fn reconcile_calendar_lists(app: &AppHandle) {
     let accounts: Vec<calendar::CalendarAccount> = {
         let state = app.state::<AppState>();
@@ -834,19 +840,37 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
         let Ok((items, complete)) = fetched else {
             continue;
         };
-        let state = app.state::<AppState>();
-        let Ok(conn) = state.conn() else {
-            continue;
-        };
-        let _ = calendar::register_calendars(
-            &conn,
-            &acc.id,
-            &acc.provider,
-            &items,
-            complete,
-            // A newly-discovered calendar is shown by default (selected); the user can untick it.
-            |_| true,
-        );
+        {
+            let state = app.state::<AppState>();
+            let Ok(conn) = state.conn() else {
+                continue;
+            };
+            let _ = calendar::register_calendars(
+                &conn,
+                &acc.id,
+                &acc.provider,
+                &items,
+                complete,
+                // A newly-discovered calendar is shown by default (selected); the user can untick it.
+                |_| true,
+            );
+        }
+        if acc.provider == "google" {
+            // Google's default length for a new event (A28, C10b): one more GET per account beside
+            // the list's, read with no lock held. A failed read keeps the last good value.
+            let read = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
+            let state = app.state::<AppState>();
+            let Ok(conn) = state.conn() else {
+                continue;
+            };
+            // Disconnected during the read: its length went with it, and stays gone.
+            let connected = calendar::list_sources(&conn, Some("google"))
+                .map(|sources| sources.iter().any(|a| a.id == acc.id))
+                .unwrap_or(false);
+            if connected {
+                let _ = calendar::remember_default_length(&conn, &email, read);
+            }
+        }
     }
 }
 
