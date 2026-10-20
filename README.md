@@ -78,8 +78,10 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   own working hours — with schedule-aware chat answers and an automatic "Due soon" when an
   event names a project. Your milestones and pinboard timelines show alongside as markers you
   can toggle off. PM only reads your calendars unless you turn on editing for a Google account;
-  then you can create events on its calendars (+ New event, or press c), and change and delete
-  events you organise without guests, repeating ones included. Every change goes straight to
+  then you can create events on its calendars (+ New event, or press c; Shift+C opens a quick box,
+  and in the day, week, month and agenda views the new event shows as you type, except in the
+  Terminal look), and change and
+  delete events you organise without guests, repeating ones included. Every change goes straight to
   Google, a save never overwrites a field someone changed there in the meantime, and a new
   event whose save loses the connection is looked for in Google before it's ever sent again.
 - **Bring your own model.** Choose your model through OpenRouter — separate chat and

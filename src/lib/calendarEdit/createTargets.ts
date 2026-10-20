@@ -14,6 +14,7 @@ import type {
   EditingStatus,
   TimeDraft,
 } from "../types";
+import { formatDateLocal } from "../format";
 import { wallInstant } from "../wallTime";
 import { DEFAULT_LENGTH_MS } from "./eventDraft";
 import type { CreatedWhere } from "./editReasons";
@@ -159,4 +160,30 @@ export function createdWhere(
       !hidden.has(c.id),
   );
   return { name: cal.name, hidden: !cal.selected || (hidden.has(cal.id) && !twinShows) };
+}
+
+/** What a new event's surfaces (the full editor and quick create) say before Save (C10 §15): a start
+ *  outside the months PM syncs, and a calendar hidden here with no twin showing it. */
+export function createNotes(
+  time: TimeDraft,
+  overview: CalendarOverview,
+  hidden: ReadonlySet<string>,
+  calendarId: string,
+): string[] {
+  const notes: string[] = [];
+  if (outsideMirror(time, overview)) {
+    const range = `${formatDateLocal(new Date(overview.mirror_start))} – ${formatDateLocal(
+      new Date(overview.mirror_end),
+    )}`;
+    notes.push(
+      `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
+    );
+  }
+  const where = createdWhere(overview, hidden, calendarId);
+  if (hidden.has(calendarId) && where.hidden) {
+    notes.push(
+      `${where.name} is hidden in your calendar list, so the new event won't show until you show that calendar again.`,
+    );
+  }
+  return notes;
 }

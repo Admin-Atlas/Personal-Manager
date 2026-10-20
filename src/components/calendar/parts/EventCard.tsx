@@ -14,7 +14,7 @@
 
 import type { CSSProperties } from "react";
 import { cn } from "../../ui";
-import { PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
+import { DRAFT_EVENT_CLASS, PAST_EVENT_CLASS, spokenName } from "../../../lib/calendar-layout";
 import { eventFill, eventHover, inkOn, type EventColour } from "../../../theme/eventPalette";
 
 interface Props {
@@ -37,6 +37,9 @@ interface Props {
   showLocation: boolean;
   /** The event has fully passed — grey it back so what's done recedes. */
   isPast?: boolean;
+  /** The new event being made (its ghost): the words its name starts with, saying so (`draftNote`).
+   *  Drawn dashed, never greyed as past. Null for any other event. */
+  ghost?: string | null;
   /** A piece of an event across days: it started on an earlier day (square top) or runs on into
    *  a later one (square bottom). */
   continuesBefore?: boolean;
@@ -66,6 +69,7 @@ export function EventCard({
   showTime,
   showLocation,
   isPast,
+  ghost = null,
   continuesBefore,
   continuesAfter,
   tabStop = true,
@@ -90,16 +94,18 @@ export function EventCard({
   const withTime = showTime && heightPx >= TIME_MIN_H;
   const withLoc = showLocation && !!location && heightPx >= LOC_MIN_H;
 
-  // A full accessible name (summary + time + place) even when the card is too short to show the meta.
-  const ariaLabel = [summary, timeLabel, location].filter(Boolean).join(", ");
+  // A full accessible name (summary + time + place) even when the card is too short to show the meta,
+  // the ghost's saying first that it's the new event.
+  const ariaLabel = spokenName(ghost, [summary, timeLabel, location].filter(Boolean).join(", "));
 
   return (
     <div
       className={cn(
         "absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] px-1.5 py-0.5",
         onSelect && `cursor-pointer ${eventHover(own)}`,
-        isPast && PAST_EVENT_CLASS,
+        ghost !== null ? DRAFT_EVENT_CLASS : isPast && PAST_EVENT_CLASS,
       )}
+      data-draft-event={ghost !== null ? "" : undefined}
       style={style}
       title={summary}
       aria-label={ariaLabel}

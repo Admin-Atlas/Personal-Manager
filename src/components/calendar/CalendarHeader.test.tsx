@@ -7,6 +7,7 @@
 // account is connected, and when no calendar can take an event it stays focusable and says why
 // rather than going grey and silent.
 
+import { createRef, type RefObject } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -21,11 +22,17 @@ afterEach(cleanup);
 
 const REASON = "None of your calendars can take new events.";
 
-function header(over: { onCreate?: () => void; createReason?: string | null } = {}) {
+interface Over {
+  onCreate?: () => void;
+  createReason?: string | null;
+  createRef?: RefObject<HTMLButtonElement | null>;
+}
+
+function header(over: Over = {}) {
   return render(element(over));
 }
 
-function element(over: { onCreate?: () => void; createReason?: string | null } = {}) {
+function element(over: Over = {}) {
   return (
     <CalendarHeader
       view="week"
@@ -80,7 +87,7 @@ describe("CalendarHeader", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  // One primary button on screen: the editor's Save (C1-L5).
+  // One primary button on screen: the editor's or quick create's Save (C1-L5).
   it("New event is a secondary button", () => {
     for (const createReason of [null, REASON]) {
       header({ onCreate: vi.fn(), createReason });
@@ -126,6 +133,12 @@ describe("CalendarHeader", () => {
     view.rerender(element({ onCreate, createReason: null }));
     view.rerender(element({ onCreate, createReason: REASON }));
     expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  it("hands quick create the New event button, to open under and give focus back to", () => {
+    const button = createRef<HTMLButtonElement>();
+    header({ onCreate: vi.fn(), createReason: null, createRef: button });
+    expect(button.current).toBe(screen.getByRole("button", { name: "+ New event" }));
   });
 
   it("has no New event without a Google account", () => {

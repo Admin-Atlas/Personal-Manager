@@ -8,6 +8,8 @@
 
 import { pad2 } from "./format";
 import type { CalendarEvent } from "./types";
+import type { EditorFields } from "./calendarEdit/eventDraft";
+import { wallInstant } from "./wallTime";
 
 // --- milestone overlay -----------------------------------------------------------------------------
 
@@ -34,6 +36,105 @@ export function isPinboardEvent(ev: CalendarEvent): boolean {
  *  to where it lives (its project, or the Pinboard); a click on a synced event opens its details. */
 export function isOverlayEvent(ev: CalendarEvent): boolean {
   return isMilestoneEvent(ev) || isPinboardEvent(ev);
+}
+
+// --- the new event's ghost (#884, C10c) ---------------------------------------------------------------
+
+/** The id of the event being created, drawn on the grid until it's saved or discarded. */
+export const DRAFT_EVENT_ID = "draft:new";
+
+/** True for the ghost of the event being created (vs anything synced or overlaid). */
+export function isDraftEvent(ev: CalendarEvent): boolean {
+  return ev.id === DRAFT_EVENT_ID;
+}
+
+/** A draft's look: a dashed edge, not quite solid. Tokens only. The dash is drawn inside the edge,
+ *  so a list that clips its children (a Month cell's chips) can't cut it away. The views leave the
+ *  past-event greying off a ghost, so only one opacity utility is ever on it. */
+export const DRAFT_EVENT_CLASS =
+  "opacity-80 outline-dashed outline-1 -outline-offset-1 outline-ink3";
+
+/** How far the new event has got: not sent, a save out, sent with no proof how it ended (an answer
+ *  that never arrived, or a retry token that ended unproven), or made and waiting for its row. */
+export type DraftState = "unsaved" | "saving" | "unsure" | "saved";
+
+/** The ghost row: a mirror-shaped event, and how far it has got. */
+export interface DraftEvent extends CalendarEvent {
+  draft_state: DraftState;
+}
+
+/** What a screen reader hears before a ghost's name. Never "not saved" once anything was sent: an
+ *  event PM may already have made is never described as not made. */
+const DRAFT_WORDS: Record<DraftState, string> = {
+  unsaved: "New event, not saved yet",
+  saving: "New event, saving",
+  unsure: "New event, PM may already have made it",
+  saved: "New event, saved",
+};
+
+/** The words that say an event is the new one and how far it has got, for the start of its
+ *  accessible name (the dashed edge says it to the eye); null for any other event. */
+export function draftNote(ev: CalendarEvent): string | null {
+  if (!isDraftEvent(ev)) return null;
+  return DRAFT_WORDS[(ev as Partial<DraftEvent>).draft_state ?? "unsaved"];
+}
+
+/** An event's accessible name, `note` (`draftNote`) first when it's the ghost. */
+export function spokenName(note: string | null, name: string): string {
+  return note ? `${note}: ${name}` : name;
+}
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The ghost row for `draft` on `calendarId`, in the mirror's own shapes: a UTC `…Z` instant for a
+ *  timed event, or `YYYY-MM-DD` with an exclusive end for an all-day one. Its uid is null, so it's
+ *  never deduped against a synced copy. Null when the draft's times don't resolve (a skipped hour, an
+ *  unreadable value, an end not after the start): then no ghost shows, and the live lines say why. */
+export function draftEvent(
+  draft: EditorFields,
+  calendarId: string,
+  state: DraftState = "unsaved",
+): DraftEvent | null {
+  const t = draft.time;
+  const ghost = {
+    id: DRAFT_EVENT_ID,
+    calendar_id: calendarId,
+    summary: draft.summary.trim() || "(no title)",
+    description: null,
+    location: draft.location.trim() || null,
+    html_link: null,
+    uid: null,
+    draft_state: state,
+  };
+  if (t.kind === "all_day") {
+    if (!ISO_DAY.test(t.first_day) || !ISO_DAY.test(t.last_day) || t.last_day < t.first_day) {
+      return null;
+    }
+    const [y, m, d] = t.last_day.split("-").map(Number);
+    const end = dayKey(new Date(y, m - 1, d + 1));
+    return { ...ghost, start: t.first_day, end, all_day: true };
+  }
+  // As a save reads them: the first of a repeated hour, and nothing for a skipped one.
+  const start = wallInstant(t.start_date, t.start_time, t.start_zone);
+  const end = wallInstant(t.end_date, t.end_time, t.end_zone);
+  if (!start || !end || end.getTime() <= start.getTime()) return null;
+  // Whole minutes, so no milliseconds: the mirror writes `…:00Z`.
+  const iso = (d: Date) => `${d.toISOString().slice(0, 19)}Z`;
+  return { ...ghost, start: iso(start), end: iso(end), all_day: false };
+}
+
+/** A saved quick create's ghost, kept so the event doesn't blink out between the box closing and
+ *  its row arriving: `after` is how many reads of the mirror had started at the save. */
+export interface LandedGhost {
+  ev: DraftEvent;
+  after: number;
+}
+
+/** A saved event's ghost once a read of the mirror lands, `started` being how many reads had started
+ *  by then (only the newest applies, so it's that one): a read begun after the save brings the row,
+ *  and the ghost goes; an older one may not have it yet, and the ghost stays. */
+export function ghostAfterRead(landed: LandedGhost | null, started: number): LandedGhost | null {
+  return landed && started > landed.after ? null : landed;
 }
 
 // --- occurrence identity ---------------------------------------------------------------------------
@@ -366,15 +467,30 @@ export interface BandPlacement extends BandInput {
 
 /** Greedy lane-pack multi-day/all-day spans into stacked rows: sort by start then longest-first
  *  (longer bands take lower lanes for stable stacking), and place each in the lowest lane free before
- *  it starts. Pure. */
-export function packBands(spans: BandInput[]): { bands: BandPlacement[]; laneCount: number } {
-  const sorted = [...spans].sort(
-    (a, b) => a.startDay - b.startDay || b.endDay - b.startDay - (a.endDay - a.startDay),
-  );
-  const laneLastDay: number[] = [];
-  const bands: BandPlacement[] = [];
+ *  it starts. `first` (the new event's ghost, in Month, where lanes past the cap fold into "+N more")
+ *  is placed before the rest, so it takes the top lane and never folds away as it's typed. It holds
+ *  that lane over its own days only, so a band clear of them may still take it. A band that reaches
+ *  its days is kept out of the top lane for its whole run, which can move the bands packed after it
+ *  too, so Month uses this packing only in the weeks the ghost touches and the packing without it
+ *  in every other (buildWeekRows). Pure. */
+export function packBands(
+  spans: BandInput[],
+  first?: string,
+): { bands: BandPlacement[]; laneCount: number } {
+  const ghost = first === undefined ? undefined : spans.find((s) => s.id === first);
+  const sorted = spans
+    .filter((s) => s !== ghost)
+    .sort((a, b) => a.startDay - b.startDay || b.endDay - b.startDay - (a.endDay - a.startDay));
+  const clearOfGhost = (s: BandInput) =>
+    !ghost || s.endDay < ghost.startDay || s.startDay > ghost.endDay;
+  // The ghost's lane tracks the bands put in it like any other; `clearOfGhost` keeps them off the
+  // ghost's own days.
+  const laneLastDay: number[] = ghost ? [-Infinity] : [];
+  const bands: BandPlacement[] = ghost
+    ? [{ id: ghost.id, startDay: ghost.startDay, endDay: ghost.endDay, lane: 0 }]
+    : [];
   for (const s of sorted) {
-    let lane = laneLastDay.findIndex((last) => last < s.startDay);
+    let lane = laneLastDay.findIndex((last, i) => last < s.startDay && (i > 0 || clearOfGhost(s)));
     if (lane === -1) {
       lane = laneLastDay.length;
       laneLastDay.push(s.endDay);

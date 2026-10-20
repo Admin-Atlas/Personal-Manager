@@ -5,7 +5,8 @@
 // MonthTable — a Monday-first 6×7 grid with single-day events bucketed as chips and multi-day events
 // packed into stacked bands. Extracted so the two Systems can't drift (a band-lane or overflow fix
 // lands once). Multi-day bands are packed ONCE across the whole grid, so a run keeps the same lane
-// row across week boundaries; bands past the lane cap are counted per covered day so the view can
+// row across week boundaries (while a new event is drafted, the weeks its ghost touches are packed
+// with the ghost on top); bands past the lane cap are counted per covered day so the view can
 // surface a "+N more" instead of silently dropping them.
 
 import { useMemo } from "react";
@@ -16,7 +17,9 @@ import {
   compareEventsForDay,
   dayDiff,
   dayKey,
+  DRAFT_EVENT_ID,
   eventDaySpan,
+  isDraftEvent,
   isMultiDay,
   packBands,
   parseLocal,
@@ -125,8 +128,16 @@ export function buildWeekRows(
       cutRight: clamped.continuesRight,
     });
   }
-  const { bands: globalBands } = packBands(bandInputs);
-  const laneOf = new Map(globalBands.map((b) => [b.id, b.lane]));
+  // The new event's ghost takes the top lane, so it never folds into "+N more" as it's typed. That
+  // packing is used only in the weeks the ghost's own days touch, and the packing without it in every
+  // other: a band that reaches the ghost's days is kept out of the top lane for its whole run, so
+  // weeks the ghost never touches would change as it moved. While the draft is open, a band may
+  // change lane where it runs into or out of the ghost's weeks.
+  const lanesOf = (first?: string) =>
+    new Map(packBands(bandInputs, first).bands.map((b) => [b.id, b.lane]));
+  const plainLanes = lanesOf();
+  const ghost = bandMeta.get(DRAFT_EVENT_ID);
+  const ghostLanes = ghost ? lanesOf(DRAFT_EVENT_ID) : plainLanes;
 
   const weeks: MonthWeekRow[] = [];
   for (let r = 0; r < rows; r++) {
@@ -136,6 +147,8 @@ export function buildWeekRows(
     const hiddenByCol = new Array(7).fill(0);
     const bars: MonthBandBar[] = [];
     let laneCount = 0;
+    const laneOf =
+      ghost && ghost.gEnd >= weekStartIdx && ghost.gStart <= weekEndIdx ? ghostLanes : plainLanes;
 
     for (const [id, { ev, gStart, gEnd, cutLeft, cutRight }] of bandMeta) {
       if (gEnd < weekStartIdx || gStart > weekEndIdx) continue; // band doesn't touch this week
@@ -173,6 +186,16 @@ export function buildWeekRows(
   }
 
   return weeks;
+}
+
+/** The chips a day draws when it has room for `max`, the rest counted as "+N more": the first `max`,
+ *  except that the new event's ghost is always among them. On a busy day it takes the last place
+ *  shown, so it never vanishes as it's typed, and the count stays the same. */
+export function chipsShown(chips: CalendarEvent[], max: number): CalendarEvent[] {
+  const shown = chips.slice(0, max);
+  const ghost = chips.find(isDraftEvent);
+  if (!ghost || max < 1 || shown.includes(ghost)) return shown;
+  return [...shown.slice(0, max - 1), ghost];
 }
 
 /** Monday-first weekday labels ("Mon"…"Sun"), for the grid/stream header. */

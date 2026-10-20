@@ -6,11 +6,13 @@
 // The full editor's create mode (#884, C10): one guard for every way to save (Save, Ctrl/Cmd+S,
 // Enter in the title), never on a repeat or while composing text, nothing editable or closable while
 // a save is out, an answer that never arrived shown locked as it was sent with Check again under the
-// same token, a token that ended unproven never called "nothing saved", a failure that keeps the
-// draft, the words that warn before a save PM's calendar won't show, a date it can't read refusing
-// every save until its own field is given one (that field named, marked, and where a save it stops
-// puts focus), and a calendar list the keyboard can reach.
+// same token, a token that ended unproven never called "nothing saved", what may be in Google left
+// as a notice once, when the editor really goes (under StrictMode too), a failure that keeps the
+// draft, the words that warn before a save PM's calendar won't show, a date it can't read (here or
+// in quick create) refusing every save until its own field is given one (that field named, marked,
+// and where a save it stops puts focus), and a calendar list the keyboard can reach.
 
+import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -49,7 +51,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
-import { NewEventEditor } from "./NewEventEditor";
+import { NewEventEditor, type CreateHandover } from "./NewEventEditor";
 
 const ME = "gcal:me@x.com";
 const WORK = "gcal:work@x.com";
@@ -164,9 +166,18 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-function open(over: { calendarId?: string; hidden?: Set<string>; onClose?: () => void } = {}) {
+function open(
+  over: {
+    calendarId?: string;
+    hidden?: Set<string>;
+    onClose?: () => void;
+    handover?: CreateHandover;
+    /** Inside <StrictMode>, as the app's development build runs: every effect set up twice. */
+    strict?: boolean;
+  } = {},
+) {
   const onClose = over.onClose ?? vi.fn();
-  const view = render(
+  const editor = (
     <NewEventEditor
       seed={seed}
       targets={createTargets(overview)}
@@ -175,11 +186,32 @@ function open(over: { calendarId?: string; hidden?: Set<string>; onClose?: () =>
       hidden={over.hidden ?? new Set()}
       colorOf={() => "var(--accent)"}
       shapeOf={() => undefined}
+      handover={over.handover}
       onClose={onClose}
-    />,
+    />
   );
+  const view = render(over.strict ? <StrictMode>{editor}</StrictMode> : editor);
   return { onClose, unmount: view.unmount };
 }
+
+/** Unmount, and let what the editor leaves as it really goes (after StrictMode's rehearsal of an
+ *  unmount can no longer be the one) be said. */
+async function leave(unmount: () => void) {
+  unmount();
+  await act(async () => {});
+}
+
+/** What quick create hands over for `draft`, with nothing held, unproven or refused. */
+const handed = (draft: EditorFields, over: Partial<CreateHandover> = {}): CreateHandover => ({
+  draft,
+  calendarId: PERSONAL,
+  held: null,
+  unproven: null,
+  showAsTouched: false,
+  timeTouched: false,
+  badDate: null,
+  ...over,
+});
 
 const title = () => screen.getByLabelText<HTMLInputElement>("Title");
 
@@ -395,8 +427,8 @@ describe("NewEventEditor", () => {
     expect(screen.queryByText("Discard this new event?")).toBeNull();
     expect(onClose).toHaveBeenCalled();
     expect(noteHeldCreate).not.toHaveBeenCalled();
-    unmount();
-    expect(noteHeldCreate).toHaveBeenCalledWith(sentFor("Dentist"), "ref-1");
+    await leave(unmount);
+    expect(noteHeldCreate.mock.calls).toEqual([[sentFor("Dentist"), "ref-1"]]);
   });
 
   it("an answer that arrives once the editor has gone is said as a notice", async () => {
@@ -406,13 +438,33 @@ describe("NewEventEditor", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     // Gone with its tab while the save is out.
-    unmount();
+    await leave(unmount);
     expect(noteHeldCreate).not.toHaveBeenCalled();
     await act(async () => answer.answer(ambiguous));
     expect(noteCreateResult).toHaveBeenCalledWith(sentFor("Dentist"), null, ambiguous, {
       name: "Personal",
       hidden: false,
     });
+  });
+
+  it("a first save with no answer at all once the editor has gone says it wasn't created", async () => {
+    const answer = later();
+    createEvent.mockReturnValue(answer.promise);
+    const { unmount } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await leave(unmount);
+    // Turned down before it was sent (this window, the owner or the vault), and no token to keep.
+    await act(async () => answer.fail(new Error("The vault is locked.")));
+    expect(noteCreateResult.mock.calls).toEqual([
+      [
+        sentFor("Dentist"),
+        null,
+        { outcome: "failed", message: "The vault is locked." },
+        { name: "Personal", hidden: false },
+      ],
+    ]);
+    expect(noteHeldCreate).not.toHaveBeenCalled();
   });
 
   it("the notice shows for a start outside the mirror and for a hidden calendar", () => {
@@ -459,6 +511,142 @@ describe("NewEventEditor", () => {
     fireEvent.change(end(), { target: { value: "11:00" } });
     pickCalendar("Personal", "Work");
     expect(end().value).toBe("11:00");
+  });
+
+  it("More options from quick create keeps the title, time and calendar", () => {
+    const draft: EditorFields = {
+      ...seed,
+      summary: "Dentist",
+      time: {
+        kind: "timed",
+        start_date: "2026-10-12",
+        start_time: "11:00",
+        start_zone: "Europe/London",
+        end_date: "2026-10-12",
+        end_time: "11:30",
+        end_zone: "Europe/London",
+      },
+    };
+    const { onClose } = open({
+      handover: handed(draft, { calendarId: WORK_CAL, timeTouched: true }),
+    });
+    expect(title().value).toBe("Dentist");
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("11:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:30");
+    expect(screen.getByRole("button", { name: "Calendar: Work" })).toBeTruthy();
+    // The time was the user's there, so the calendar's length leaves it alone here too.
+    pickCalendar("Work", "Personal");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:30");
+    // What was typed there counts as a change: closing asks first.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Discard this new event?")).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it("a retry token handed over opens locked on Check again under the same token", async () => {
+    createEvent.mockResolvedValue(saved);
+    const sent = sentFor("Dentist");
+    const { onClose } = open({
+      handover: handed({ ...seed, summary: "Dentist" }, { held: { token: "ref-1", sent } }),
+    });
+    expect(screen.getByText(/^PM may already have made “Dentist”/)).toBeTruthy();
+    expect(title().disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1"]]);
+  });
+
+  // Quick create's token ended unproven before More options: its words go on here, as they would
+  // have gone on there.
+  it("words handed over from a token that ended unproven are said, asked with, and left on close", async () => {
+    const sent = sentFor("Dentist");
+    const { onClose, unmount } = open({
+      handover: handed({ ...seed, summary: "Dentist" }, { unproven: { sent, outcome: lost } }),
+    });
+    const words =
+      "PM lost touch with Google and can't tell whether “Dentist” was made. Look for it in Google Calendar before creating it again, so it isn't made twice.";
+    expect(screen.getByText(words)).toBeTruthy();
+    expect(title().disabled).toBe(false);
+    fireEvent.keyDown(window, { key: "Escape" });
+    const confirm = screen.getByRole("dialog", { name: "Discard this new event?" });
+    expect(confirm.textContent).not.toContain("Nothing has been saved");
+    expect(within(confirm).getByText(words)).toBeTruthy();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
+    await leave(unmount);
+    expect(noteCreateResult.mock.calls).toEqual([
+      [sent, null, lost, { name: "Personal", hidden: false }],
+    ]);
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  // The app's development build runs every new mount's effects as setup, cleanup, setup. An editor
+  // opened on quick create's token or words holds them from its first render, so only a real unmount
+  // may leave them: once, and not while the editor still says them itself.
+  it("under StrictMode, a handed-over token is left as a notice once, and only when it goes", async () => {
+    const sent = sentFor("Dentist");
+    const { unmount } = open({
+      strict: true,
+      handover: handed({ ...seed, summary: "Dentist" }, { held: { token: "ref-1", sent } }),
+    });
+    await act(async () => {});
+    expect(screen.getByRole("button", { name: "Check again" })).toBeTruthy();
+    expect(noteHeldCreate).not.toHaveBeenCalled();
+    expect(noteCreateResult).not.toHaveBeenCalled();
+    await leave(unmount);
+    expect(noteHeldCreate.mock.calls).toEqual([[sent, "ref-1"]]);
+    expect(noteCreateResult).not.toHaveBeenCalled();
+  });
+
+  it("under StrictMode, handed-over words are left as a notice once, and only when it goes", async () => {
+    const sent = sentFor("Dentist");
+    const { unmount } = open({
+      strict: true,
+      handover: handed({ ...seed, summary: "Dentist" }, { unproven: { sent, outcome: lost } }),
+    });
+    await act(async () => {});
+    expect(screen.getByText(/^PM lost touch with Google/)).toBeTruthy();
+    expect(noteCreateResult).not.toHaveBeenCalled();
+    await leave(unmount);
+    expect(noteCreateResult.mock.calls).toEqual([
+      [sent, null, lost, { name: "Personal", hidden: false }],
+    ]);
+    expect(noteHeldCreate).not.toHaveBeenCalled();
+  });
+
+  // Quick create's date field refused what was typed and put its date back: More options carries the
+  // refusal here, on the start's field, so the date put back is never what's saved.
+  it("a date quick create couldn't read refuses every save here until the start is given one", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({
+      handover: handed(
+        { ...seed, summary: "Dentist" },
+        { badDate: "31-02-2026", timeTouched: true },
+      ),
+    });
+    const refused = () => screen.queryByText(/^Start date: “31-02-2026” isn't a date PM can read/);
+    expect(refused()).not.toBeNull();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    expect(start.getAttribute("aria-invalid")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    // The save it stopped put focus on the field it names.
+    expect(document.activeElement).toBe(start);
+    // The end's date is the other half: it doesn't end the start's refusal.
+    const end = screen.getByLabelText<HTMLInputElement>("End date");
+    end.focus();
+    fireEvent.change(end, { target: { value: "14-10-2026" } });
+    fireEvent.blur(end);
+    expect(refused()).not.toBeNull();
+    start.focus();
+    fireEvent.change(start, { target: { value: "13-10-2026" } });
+    fireEvent.blur(start);
+    expect(refused()).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].time).toMatchObject({ start_date: "2026-10-13" });
   });
 
   it("Private is disabled on a no-private calendar", () => {
@@ -510,7 +698,7 @@ describe("NewEventEditor", () => {
     fireEvent.click(within(confirm).getByRole("button", { name: "Discard" }));
     expect(onClose).toHaveBeenCalled();
     expect(noteCreateResult).not.toHaveBeenCalled();
-    unmount();
+    await leave(unmount);
     expect(noteCreateResult.mock.calls).toEqual([
       [sentFor("Dentist"), null, lost, { name: "Personal", hidden: false }],
     ]);
@@ -528,11 +716,10 @@ describe("NewEventEditor", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByText("Discard this new event?")).toBeNull();
     expect(onClose).toHaveBeenCalled();
-    unmount();
-    expect(noteCreateResult).toHaveBeenCalledWith(sentFor(""), null, gone, {
-      name: "Personal",
-      hidden: false,
-    });
+    await leave(unmount);
+    expect(noteCreateResult.mock.calls).toEqual([
+      [sentFor(""), null, gone, { name: "Personal", hidden: false }],
+    ]);
   });
 
   it("made again after the look-first words, it says Created and nothing more", async () => {
@@ -546,7 +733,7 @@ describe("NewEventEditor", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
     fireEvent.click(await screen.findByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    unmount();
+    await leave(unmount);
     // A new create, under no token, and only its Created.
     expect(createEvent.mock.calls.map((c) => c[2])).toEqual([null, "ref-1", null]);
     expect(noteCreateResult.mock.calls).toEqual([
@@ -563,7 +750,7 @@ describe("NewEventEditor", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
-    unmount();
+    await leave(unmount);
     // The save still out says how it ended, not the close.
     expect(noteHeldCreate).not.toHaveBeenCalled();
     await act(async () => check.answer(busy));
@@ -579,7 +766,7 @@ describe("NewEventEditor", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
-    unmount();
+    await leave(unmount);
     await act(async () => check.fail(new Error("The app's channel closed.")));
     expect(noteHeldCreate.mock.calls).toEqual([[sentFor("Dentist"), "ref-1"]]);
     expect(noteCreateResult).not.toHaveBeenCalled();
@@ -848,7 +1035,7 @@ describe("NewEventEditor", () => {
     expect(within(confirm).getByText("Nothing has been saved to Google yet.")).toBeTruthy();
     fireEvent.click(within(confirm).getByRole("button", { name: "Discard" }));
     expect(onClose).toHaveBeenCalled();
-    unmount();
+    await leave(unmount);
     expect(noteCreateResult).not.toHaveBeenCalled();
     expect(noteHeldCreate).not.toHaveBeenCalled();
   });

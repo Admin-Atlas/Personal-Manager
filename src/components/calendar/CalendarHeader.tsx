@@ -5,15 +5,16 @@
 // date-range label, the view switcher (active = accent), and Refresh-now.
 //
 // "+ New event" (#884, C10) is the one control here that changes a calendar: it opens the editor for
-// a new Google event, as `c` does, and sits first, where Google's Create does. It shows once a Google
-// account is connected; when no calendar can take an event it stays focusable and says why (its
-// tooltip, and a click), rather than going grey and silent. It's secondary, so the editor's Save stays
-// the one primary button on screen. Everything else here only changes what you see.
+// a new Google event, as `c` does, and sits first, where Google's Create does; Shift+C's quick create
+// opens under it (`createRef`). It shows once a Google account is connected; when no calendar can
+// take an event it stays focusable and says why (its tooltip, and a click), rather than going grey
+// and silent. It's secondary, so the editor's or quick create's Save stays the one primary button on
+// screen. Everything else here only changes what you see.
 //
 // The last-synced time rides ON the Refresh button rather than beside it: it is the one fact that
 // tells you whether pressing Refresh is worth it.
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useState, type Ref } from "react";
 import {
   DAY_COUNT_MAX,
   DAY_COUNT_MIN,
@@ -57,6 +58,8 @@ interface Props {
   onCreate?: () => void;
   /** Why no new event can be made now, or null when one can. */
   createReason?: string | null;
+  /** The "+ New event" button: quick create opens under it, and gives focus back to it. */
+  createRef?: Ref<HTMLButtonElement>;
 }
 
 /** How long a click's "why not" stays beside the button. */
@@ -92,6 +95,7 @@ export function CalendarHeader({
   lastSync,
   onCreate,
   createReason = null,
+  createRef,
 }: Props) {
   const { showMeta } = useDepth();
   const { system } = useTheme();
@@ -126,8 +130,9 @@ export function CalendarHeader({
     >
       {onCreate && (
         <div className="flex items-center gap-2">
-          <Tooltip label={createReason ?? "New event · c"}>
+          <Tooltip label={createReason ?? "New event · c, or Shift+C for a quick one"}>
             <Button
+              ref={createRef}
               variant="secondary"
               size="sm"
               aria-disabled={createReason !== null || undefined}

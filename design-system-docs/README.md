@@ -164,7 +164,7 @@ Drive it with a single `depth` value; gate optional blocks on it. Don't fork lay
   Slate = cards; Terminal = table. Depth scales it from name+status only → +meta → full table with cost/active.
 - **Project** — file list beside a project-scoped chat thread (two-pane). Treatment per System.
 - **Documents** — ingestion: a drop zone + recent items with type/date/index-state. Rules / cards / mono table per System.
-- **Calendar** — week/agenda; "+ New event" (or `c`) creates a Google event, and one you organise can be edited from its details. Serif agenda / day cards / mono list per System.
+- **Calendar** — week/agenda; "+ New event" (or `c`) creates a Google event, and one you organise can be edited from its details. Shift+C opens quick create, a small non-modal box under the button whose draft is drawn as a dashed ghost (`DRAFT_EVENT_CLASS`: `outline-ink3`, dashed inside the edge with `-outline-offset-1` so a clipping list can't cut it, never greyed as past; a dashed ring among Minimal's month dots) in the day, week, month and agenda views, except in the Terminal look, which draws only what's in the calendar; its accessible name starts with what it is (`draftNote`). Serif agenda / day cards / mono list per System.
 - **Review** — queue of proposed actions as inline approval cards (Approve / Edit / Dismiss).
 - **Settings** — appearance (System / Accent / Depth / Mode), models & keys (key field → keychain), help-mode toggle. Editorial = ruled sections, Slate = card panel, Terminal = key/value list.
 - **Command palette** (`⌘K`) — overlay with a query line + result rows.

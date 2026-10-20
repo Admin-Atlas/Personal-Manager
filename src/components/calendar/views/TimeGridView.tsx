@@ -19,6 +19,7 @@ import {
   assignColumns,
   dayKey,
   eventDaySpan,
+  draftNote,
   inTimeGridBand,
   isEventPast,
   minutesFromLocalMidnight,
@@ -452,6 +453,7 @@ export function TimeGridView({
                   showTime={!minimal}
                   showLocation={showPower}
                   isPast={isEventPast(card.ev, nowDate)}
+                  ghost={draftNote(card.ev)}
                   continuesBefore={card.continuesBefore}
                   continuesAfter={card.continuesAfter}
                   tabStop={card.tabStop}
