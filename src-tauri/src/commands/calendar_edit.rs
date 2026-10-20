@@ -854,6 +854,13 @@ const CREATE_NOT_YET: &str = "Creating events from PM isn't available yet.";
 /// A calendar PM doesn't sync: a new event there would land nothing in the mirror.
 const NOT_SYNCED: &str = "PM doesn't sync this calendar, so it won't create events in it. Choose \
                           it in Settings › Connectors first.";
+/// A retry into a calendar PM stopped syncing after the first send, which may have landed: the
+/// token stays, so choosing the calendar again lets Check again finish it.
+const CREATE_NOT_SYNCED: &str = "PM doesn't sync this calendar any more, so it won't send this \
+                                 new event again. PM may already have made it: choose the \
+                                 calendar in Settings › Connectors and Check again, or look for \
+                                 it in Google Calendar before creating it again, so it isn't made \
+                                 twice.";
 /// The retry token is unknown: PM restarted, or the eight hours passed. A constant, the title left
 /// to the webview's notice, so the webview can tell it apart (it ends the token, C10 critiques).
 const CREATE_LOST: &str = "PM lost touch with Google and can't tell whether this new event was \
@@ -1167,8 +1174,9 @@ enum RetryStep {
 
 /// A retry's next step after `look`, `first` saying whether it was the first of its two looks.
 /// Google's insert-then-get isn't guaranteed consistent, so one 404 proves nothing (DS5): only two,
-/// a second apart, let the same request go again, and the same id makes that safe (a copy that
-/// landed meanwhile turns it into a 409, which the run then looks up).
+/// a second apart, let the same request go again, and the same id normally makes that safe (a copy
+/// that landed meanwhile turns it into a 409, which the run then looks up; Google can't always catch
+/// a repeated id, hence [`MAX_POSTS`]).
 fn retry_next(look: RetryLook, first: bool) -> RetryStep {
     match look {
         RetryLook::Live(copy) => RetryStep::Land(copy),
@@ -1237,10 +1245,11 @@ async fn retry_create<W: Wire, H: Host>(
         };
     }
     // A re-send meets the refusals a first send does: a calendar PM stopped syncing since would
-    // land nothing. The create stays held, so a look can still find it.
+    // land nothing. The create stays held, so a look can still find it; the words say the first
+    // send may have landed.
     if !ctx.target.selected {
         return WriteOutcome::Failed {
-            message: NOT_SYNCED.into(),
+            message: CREATE_NOT_SYNCED.into(),
         };
     }
     if let Some(reason) = create_blocked(ctx, &held.body) {
@@ -14078,7 +14087,10 @@ mod tests {
             Some("ref-1"),
         )
         .await;
-        assert!(outcome == failed(NOT_SYNCED), "refused before a re-send");
+        assert!(
+            outcome == failed(CREATE_NOT_SYNCED),
+            "refused before a re-send"
+        );
         assert!(inserts(&script).is_empty());
         assert_eq!(held_posts(&host, "ref-1"), Some(2));
     }

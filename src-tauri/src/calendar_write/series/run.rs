@@ -37,7 +37,8 @@
 //!   as a rate limit on that retry, doesn't count, and leaves the once-more unspent), and If-Match
 //!   lets at most one per etag apply.
 //! - **A lost insert** is looked for, looked for again after a second, and only then sent again under
-//!   the same id, which Google refuses as a duplicate if the first copy landed (plan amendment A9).
+//!   the same id, which Google normally refuses as a duplicate if the first copy landed (plan
+//!   amendment A9; it can't always catch a repeated id, so the posts under one id are capped).
 //!   Its absence alone proves nothing.
 //! - **Creating an event** is a one-insert plan ([`SeriesPlan::create`]) run the same way. A copy
 //!   found cancelled under PM's own id was made and deleted since: gone, not unknown. A retry of one
@@ -760,7 +761,7 @@ impl Run {
                 self.apply(read)
             }
             // Still not there after a pause: post it again under the same id (A9). If the first
-            // copy landed after all, Google refuses this one as a duplicate.
+            // copy landed after all, Google normally refuses this one as a duplicate.
             Answer::Reply {
                 verdict: Verdict::Gone,
                 ..

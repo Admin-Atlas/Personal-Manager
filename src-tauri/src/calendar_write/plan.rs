@@ -170,8 +170,9 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
 
 /// Create an event under `id`, an id PM chose ([`client_event_id`]) and wrote into the body here,
 /// so an insert can't go out without one. After an answer that never arrived or a server error, the
-/// caller GETs that id before sending again (rule R2; Google warns it can't always catch a repeated
-/// id at creation), so a retry can't make a second event.
+/// caller GETs that id before sending again (rule R2). Google warns it can't always catch a repeated
+/// id at creation, so a retry very rarely makes a second event, and the posts under one id are
+/// capped.
 pub fn insert_event(
     calendar: &str,
     id: &str,
