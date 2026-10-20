@@ -63,7 +63,8 @@ function abbreviation(id: string, at: Date): string | null {
 function continentOf(id: string): string {
   return (id.split("/")[0] ?? id).replace(/_/g, " ");
 }
-function cityOf(id: string): string {
+/** A zone's city, as its label ends it: "New York" for America/New_York. */
+export function cityOf(id: string): string {
   return (id.split("/").pop() ?? id).replace(/_/g, " ");
 }
 

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.153.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "New events can repeat. Under the date and time, in the full editor and in quick create, pick one of Google's choices for that day, like “Weekly on Tuesday” or “Monthly on the second Tuesday”, or set your own with Custom…: every few days, weeks, months or years, on the days you choose, ending on a date or after a number of times.",
+      "If the days you pick don't include the start date, PM starts the event on the first day that fits and tells you which, and an event in another time zone says it repeats in that zone's time. Changing how an existing event repeats comes next.",
+    ],
+  },
+  {
     version: "3.152.1-alpha",
     date: "2026-10-20",
     highlights: [

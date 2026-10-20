@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { EventForEdit, FieldPermissions, TimeDraft } from "../types";
+import type { DayCode, EventForEdit, FieldPermissions, RepeatRule, TimeDraft } from "../types";
 import {
   NEW_EVENT_BASE,
   allDayOf,
@@ -17,6 +17,7 @@ import {
   endTimeChoices,
   endsAfterStart,
   firstEndOnItsDate,
+  followStart,
   halfInstant,
   newEventSeed,
   rebaseDraft,
@@ -105,6 +106,9 @@ describe("the event draft", () => {
     };
     expect(canEdit(perms, "summary")).toBe(false);
     expect(canEdit(perms, "show_as")).toBe(true);
+    // How it repeats goes with the time: Google locks both together.
+    expect(canEdit(perms, "recurrence")).toBe(false);
+    expect(canEdit({ ...perms, time: true }, "recurrence")).toBe(true);
   });
 });
 
@@ -457,6 +461,7 @@ describe("a new event's starting fields", () => {
       location: "",
       description: "Bring the form",
       time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
+      recurrence: { kind: "once" },
       show_as: "free",
       visibility: "private",
     };
@@ -472,6 +477,60 @@ describe("a new event's starting fields", () => {
     });
     // A copy: a later edit to the draft can't change what was sent.
     expect(sent.time).not.toBe(draft.time);
+  });
+
+  // --- repeating (C11) ---
+
+  const weeklyOn = (...days: DayCode[]): RepeatRule => ({
+    pattern: { kind: "weekly", days },
+    interval: 1,
+    ends: { kind: "never" },
+  });
+
+  it("toNewEvent sends the chosen repeat as a copy, and Does not repeat as null", () => {
+    const days: DayCode[] = ["mon", "wed"];
+    const rule: RepeatRule = { ...weeklyOn(), pattern: { kind: "weekly", days } };
+    const draft: EditorFields = {
+      ...NEW_EVENT_BASE,
+      time: timed("2026-10-13", "09:00", "2026-10-13", "10:00"),
+      recurrence: { kind: "rule", rule },
+    };
+    const sent = toNewEvent(draft);
+    expect(sent.recurrence).toEqual(rule);
+    // What was sent is kept for a retry: nothing the draft holds can change it.
+    days.push("fri");
+    expect(sent.recurrence).toEqual(weeklyOn("mon", "wed"));
+    expect(toNewEvent({ ...draft, recurrence: { kind: "once" } }).recurrence).toBeNull();
+    // A new event's seed doesn't repeat.
+    expect(newEventSeed("2026-10-13", new Date(), "Europe/London", HOUR).recurrence).toEqual({
+      kind: "once",
+    });
+  });
+
+  it("a changed repeat is a change, and a moved start takes the rule's own day with it", () => {
+    const tuesday: EditorFields = {
+      ...NEW_EVENT_BASE,
+      time: timed("2026-10-13", "09:00", "2026-10-13", "10:00"),
+      recurrence: { kind: "rule", rule: weeklyOn("tue") },
+    };
+    expect(changedFields(NEW_EVENT_BASE, tuesday)).toContain("recurrence");
+    // The same rule with its days in another order is no change.
+    const both = {
+      ...tuesday,
+      recurrence: { kind: "rule" as const, rule: weeklyOn("mon", "tue") },
+    };
+    expect(
+      changedFields(both, { ...both, recurrence: { kind: "rule", rule: weeklyOn("tue", "mon") } }),
+    ).toEqual([]);
+    // Weekly on Tuesday, started on a Tuesday, moved to Wednesday: weekly on Wednesday.
+    const moved = followStart(tuesday, {
+      ...tuesday,
+      time: timed("2026-10-14", "09:00", "2026-10-14", "10:00"),
+    });
+    expect(moved.recurrence).toEqual({ kind: "rule", rule: weeklyOn("wed") });
+    // Two days chosen don't come from the start: they stay.
+    const kept = { ...both, time: timed("2026-10-14", "09:00", "2026-10-14", "10:00") };
+    expect(followStart(both, kept)).toBe(kept);
   });
 
   it("switchNewKind keeps the day and length and follows Google's free/busy until touched", () => {

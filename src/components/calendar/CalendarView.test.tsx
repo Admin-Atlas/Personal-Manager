@@ -44,6 +44,8 @@ const ipc = vi.hoisted(() => ({
   updateCalendarEvent: vi.fn(),
   eventFlags: vi.fn(),
   openUrl: vi.fn(),
+  recurrencePresets: vi.fn(),
+  describeRecurrence: vi.fn(),
 }));
 // What the views and the header are shown: the System, the hidden calendars, and what the Year view
 // was handed (it lays nothing out without a measured pane, so it's a stand-in that keeps its events).
@@ -208,6 +210,8 @@ beforeEach(() => {
   ipc.listHeldDeletes.mockResolvedValue([]);
   ipc.onCalendarDeleteSettled.mockResolvedValue(() => {});
   ipc.eventFlags.mockResolvedValue([]);
+  // The Repeat row in quick create and the full editor: no ready-made rules, so just its own rows.
+  ipc.recurrencePresets.mockResolvedValue([]);
 });
 
 afterEach(() => {

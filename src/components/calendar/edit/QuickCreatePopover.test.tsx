@@ -12,7 +12,9 @@
 // save it stops puts focus; and it goes on refusing with More options), a titled draft that goes
 // with the tab is handed back to open on again, the keyboard comes back into the box even while it's
 // locked, the ghost is told how far the event has got, and the calendar list the keyboard can reach
-// stays inside the box.
+// stays inside the box. Repeating (C11): a ready-made rule is sent with the create, one the backend
+// refuses stops every save, a rule's own day follows a moved date, and Custom… carries on in the full
+// editor with its dialog open, sending nothing.
 
 import { createRef, StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -22,6 +24,10 @@ import type {
   CalendarAccount,
   CalendarOverview,
   NewEventDraft,
+  RepeatPreset,
+  RepeatRule,
+  RepeatStart,
+  RepeatView,
   WriteOutcome,
 } from "../../../lib/types";
 import { CREATE_LOST } from "../../../lib/calendarEdit/editReasons";
@@ -36,7 +42,16 @@ const createEvent =
   >();
 const noteCreateResult = vi.fn();
 const noteHeldCreate = vi.fn();
+const recurrencePresets = vi.fn<(day: string) => Promise<RepeatPreset[]>>();
+const describeRecurrence = vi.fn<(rule: RepeatRule, start: RepeatStart) => Promise<RepeatView>>();
 let deviceZone: string | null = "Europe/London";
+
+// The repeat menu's two reads, answered as the test says.
+vi.mock("../../../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  recurrencePresets: (day: string) => recurrencePresets(day),
+  describeRecurrence: (rule: RepeatRule, start: RepeatStart) => describeRecurrence(rule, start),
+}));
 
 vi.mock("./useEventWrites", async (importOriginal) => ({
   // The rest as it is, for the write notices drawn beside the box.
@@ -121,6 +136,7 @@ const seed: EditorFields = {
     end_time: "10:00",
     end_zone: "Europe/London",
   },
+  recurrence: { kind: "once" },
   show_as: "busy",
   visibility: "default",
 };
@@ -175,8 +191,28 @@ beforeAll(() => {
   }
 });
 
+const weeklyOn = (day: "mon" | "tue"): RepeatRule => ({
+  pattern: { kind: "weekly", days: [day] },
+  interval: 1,
+  ends: { kind: "never" },
+});
+
 beforeEach(() => {
   deviceZone = "Europe/London";
+  // The ready-made rules for the start date (the first two are enough), and a rule that starts where
+  // asked.
+  recurrencePresets.mockImplementation(async (day) => [
+    { label: "Daily", rule: { ...weeklyOn("mon"), pattern: { kind: "daily" } } },
+    day === "2026-10-13"
+      ? { label: "Weekly on Tuesday", rule: weeklyOn("tue") }
+      : { label: "Weekly on Monday", rule: weeklyOn("mon") },
+  ]);
+  describeRecurrence.mockImplementation(async (_rule, start) => ({
+    outcome: "ready",
+    summary: "Weekly on Monday",
+    starts: start.date,
+    moved: false,
+  }));
 });
 
 afterEach(() => {
@@ -327,6 +363,7 @@ describe("QuickCreatePopover", () => {
       showAsTouched: false,
       timeTouched: true,
       badDate: null,
+      openCustom: false,
     });
   });
 
@@ -1016,5 +1053,82 @@ describe("QuickCreatePopover", () => {
     fireEvent.keyDown(title(), { key: "Enter" });
     await screen.findByText("“Dentist” wasn't created: PM couldn't reach Google.");
     expect(onDraft.mock.lastCall![2]).toBe("unsaved");
+  });
+
+  // --- repeating (C11) ---
+
+  const repeat = () => screen.getByRole<HTMLSelectElement>("combobox", { name: "Repeat" });
+
+  /** Pick the Repeat row whose words are `label`, as a click picks it, once the menu has them. */
+  async function pickRepeat(label: string) {
+    await act(async () => {});
+    const option = Array.from(repeat().options).find((o) => o.text === label);
+    if (!option) throw new Error(`no row ${label}`);
+    fireEvent.change(repeat(), { target: { value: option.value } });
+    await act(async () => {});
+  }
+
+  it("a preset is sent with the create", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    expect(repeat().selectedOptions[0].text).toBe("Weekly on Monday");
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Standup").draft, recurrence: weeklyOn("mon") }, null],
+    ]);
+  });
+
+  it("a repeat the backend refuses stops every save, and says why", async () => {
+    const GAP =
+      "The first occurrence would be on 29-03-2027, when the clocks skip that time. Pick a time outside that hour.";
+    describeRecurrence.mockResolvedValue({ outcome: "refused", message: GAP });
+    open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    expect(screen.getByText(GAP)).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+    title().focus();
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(title());
+  });
+
+  it("moving the date moves a one-day weekly rule", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    const date = screen.getByLabelText<HTMLInputElement>("Date");
+    date.focus();
+    fireEvent.change(date, { target: { value: "13-10-2026" } });
+    fireEvent.blur(date);
+    await act(async () => {});
+    expect(repeat().selectedOptions[0].text).toBe("Weekly on Tuesday");
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls[0][1].recurrence).toEqual(weeklyOn("tue"));
+  });
+
+  it("Custom… hands over to the full editor with the custom dialog open, sending nothing", async () => {
+    const { onMore, onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    fireEvent.change(repeat(), { target: { value: "custom" } });
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onMore).toHaveBeenCalledWith({
+      draft: { ...seed, summary: "Standup", recurrence: { kind: "rule", rule: weeklyOn("mon") } },
+      calendarId: PERSONAL,
+      held: null,
+      unproven: null,
+      showAsTouched: false,
+      timeTouched: false,
+      badDate: null,
+      openCustom: true,
+    });
   });
 });

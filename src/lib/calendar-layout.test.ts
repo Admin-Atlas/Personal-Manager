@@ -216,6 +216,7 @@ describe("the new event's ghost (C10c)", () => {
       end_time: "10:30",
       end_zone: "America/New_York",
     },
+    recurrence: { kind: "once" },
     show_as: "busy",
     visibility: "default",
   };

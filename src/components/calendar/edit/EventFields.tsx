@@ -3,9 +3,11 @@
 
 // The event fields both editors share (#884): changing an event (`EventEditor`) and creating one
 // (`NewEventEditor`) show the same title, When, zone and choice controls, so they live here once.
+// The Repeat row is here too, for creating (C11): the full editor and quick create both draw it.
 //
 // Time fields never use `<input type="time">` (WebKitGTK has no widget): TimeField and DateField.
 
+import type { ReactNode } from "react";
 import type { EventVisibility, ShowAs, TimeDraft } from "../../../lib/types";
 import {
   dateFieldId,
@@ -14,10 +16,18 @@ import {
   type EndChoice,
 } from "../../../lib/calendarEdit/eventDraft";
 import { badDateText } from "../../../lib/calendarEdit/editReasons";
+import {
+  movedStartText,
+  startDateOf,
+  type RepeatValue,
+} from "../../../lib/calendarEdit/recurrenceDraft";
+import { cityOf } from "../../../lib/zoneLabel";
 import { Button, Input, SegmentedControl, Select, Textarea, Toggle, useFieldA11y } from "../../ui";
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { ZoneSearchList } from "../ZoneSearchList";
+import { RecurrenceSelect } from "./RecurrenceSelect";
+import type { RepeatState } from "./useRepeat";
 
 export type Timed = Extract<TimeDraft, { kind: "timed" }>;
 
@@ -198,6 +208,7 @@ export function WhenFields({
   onSwitchKind,
   canSwitchKind,
   onPickZone,
+  repeat,
 }: {
   /** What its date fields' ids start with (`dateFieldId`), so a save can find one. */
   id: string;
@@ -222,6 +233,9 @@ export function WhenFields({
   onSwitchKind: () => void;
   canSwitchKind: boolean;
   onPickZone: (which: "both" | "start" | "end") => void;
+  /** The Repeat row (`RepeatRow`), drawn last: Google puts "Does not repeat" under the date and
+   *  time, and inside this fieldset it is off whenever the times are. */
+  repeat?: ReactNode;
 }) {
   const t = draft.time;
   const names = DATE_FIELD[t.kind];
@@ -346,6 +360,62 @@ export function WhenFields({
           )
         );
       })}
+      {repeat}
     </fieldset>
+  );
+}
+
+/** The Repeat row (#884, C11): the repeat menu, and under it where the event really starts when its
+ *  rule moves it (A27), why the rule can't be saved, and the zone it repeats in when that isn't this
+ *  computer's (a weekly 09:00 in New York moves in London's weeks around the clocks changing). What
+ *  the backend says of the rule (`view`) is the editor's to ask, since it also stops the editor's
+ *  saves. */
+export function RepeatRow({
+  value,
+  view,
+  time,
+  deviceZone,
+  disabled,
+  compact,
+  onChange,
+  onCustom,
+}: {
+  value: RepeatValue;
+  view: RepeatState;
+  time: TimeDraft;
+  /** This computer's zone, which the zone note compares the event's with. */
+  deviceZone: string | null;
+  disabled: boolean;
+  compact?: boolean;
+  onChange: (value: RepeatValue) => void;
+  /** "Custom…" was picked. */
+  onCustom: () => void;
+}) {
+  // A rule repeats in its start's zone; an all-day one in none.
+  const zone = time.kind === "timed" ? time.start_zone : null;
+  const note =
+    value.kind === "rule" && zone !== null && deviceZone !== null && zone !== deviceZone
+      ? `Repeats in ${cityOf(zone)} time.`
+      : null;
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <RecurrenceSelect
+        value={value}
+        startDate={startDateOf(time) || null}
+        disabled={disabled}
+        compact={compact}
+        ruleWords={view.state === "ready" ? view.summary : null}
+        onChange={onChange}
+        onCustom={onCustom}
+      />
+      {/* Always mounted, so a screen reader hears where it starts, or why it can't be saved. */}
+      <div aria-live="polite" className="text-xs">
+        {view.state === "ready" && view.moved && (
+          <p className="text-ink4">{movedStartText(view.starts)}</p>
+        )}
+        {view.state === "refused" && <p className="text-st-due">{view.message}</p>}
+      </div>
+      {note && <p className="text-xs text-ink4">{note}</p>}
+    </div>
   );
 }
