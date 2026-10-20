@@ -208,7 +208,7 @@ describe("CalendarEventPopover", () => {
     const second = chip("Standup");
     first.focus();
 
-    const { rerender } = render(
+    const { rerender, getByRole } = render(
       <CalendarEventPopover
         event={calendarEvent()}
         anchor={rect(100)}
@@ -231,6 +231,8 @@ describe("CalendarEventPopover", () => {
       />,
     );
 
+    // Re-pointed, the panel takes focus again, as it did when it opened.
+    expect(getByRole("dialog").contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(document.activeElement).toBe(second);
   });
@@ -412,11 +414,13 @@ describe("CalendarEventPopover", () => {
       view.rerender(popover(occurrence("e2"), rect(300), ask));
       expect(view.queryByText("Weekly on Monday")).toBeNull();
       expect(view.getByText("Repeats")).toBeTruthy();
-      // And an answer for an event no longer shown is dropped.
+      // And an answer for an event no longer shown is dropped, even one that comes after the shown
+      // event's own (that one kept by the backend, the older one still out at Google).
       view.rerender(popover(occurrence("e3"), rect(500), ask));
+      await act(async () => answers[2].resolve("Daily"));
+      expect(view.getByText("Daily")).toBeTruthy();
       await act(async () => answers[1].resolve("Weekly on Tuesday"));
       expect(view.queryByText("Weekly on Tuesday")).toBeNull();
-      await act(async () => answers[2].resolve("Daily"));
       expect(view.getByText("Daily")).toBeTruthy();
     });
 

@@ -150,8 +150,15 @@ export function WriteNotices({
                   className={WAITING}
                   aria-label={n.move ? moveLabel(n.move) : moveBackLabel(milestone)}
                   aria-disabled={n.moving || undefined}
-                  onClick={() => {
-                    if (!n.moving) press(n.id);
+                  // A double-click on Move, or Enter held on it: the second click, or a repeat,
+                  // lands here once it's Move back, and mustn't undo the move it made. The store
+                  // also waits a moment before Move back takes a press, for a second Enter.
+                  onKeyDown={(e) => {
+                    if (e.repeat && e.key === "Enter") e.preventDefault();
+                  }}
+                  onClick={(e) => {
+                    if (n.moving || (!n.move && e.detail > 1)) return;
+                    press(n.id);
                   }}
                 >
                   {n.move ? "Move" : "Move back"}

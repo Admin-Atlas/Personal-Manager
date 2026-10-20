@@ -319,27 +319,17 @@ pub fn list_all(conn: &Connection, today: &str) -> Result<Vec<Milestone>> {
 }
 
 /// The unmet milestones linked to the calendar event `ical`, resolved as [`list_all`] resolves them
-/// (the soonest occurrence on or after `today`, else the latest past one, in the user's zone), whose
-/// date is on or after `day` (`YYYY-MM-DD`): what a "this and following" change offers to move to
-/// its new part (C9b-2). A ticked-off one isn't offered: moving it would change nothing the user
+/// (the soonest occurrence on or after `today`, else the latest past one, in the user's zone): what
+/// a "this and following" change may offer to move to its new part, each by the occurrence its
+/// date comes from (C9b-2). A ticked-off one isn't offered: moving it would change nothing the user
 /// sees.
-pub fn linked_on_or_after(
-    conn: &Connection,
-    ical: &str,
-    day: &str,
-    today: &str,
-) -> Result<Vec<Milestone>> {
+pub fn linked_unmet(conn: &Connection, ical: &str, today: &str) -> Result<Vec<Milestone>> {
     let dates = calendar_dates_by_uid(conn, today)?;
     Ok(load_rows(conn, None)?
         .into_iter()
         .filter(|r| r.event_uid.as_deref() == Some(ical))
         .map(|r| resolve(r, &dates))
         .filter(|m| !m.is_met())
-        .filter(|m| {
-            m.due_date
-                .as_deref()
-                .is_some_and(|d| d.get(..10).unwrap_or(d) >= day)
-        })
         .collect())
 }
 
@@ -877,11 +867,11 @@ mod tests {
         }
     }
 
-    /// C9b-2: a split offers the milestones whose date, resolved as the list resolves it (the
-    /// soonest occurrence from today), is on or after the day it starts; a ticked-off one, or one
-    /// on another event, never.
+    /// C9b-2: what a split may offer is each unmet milestone on the event, dated as the list dates
+    /// it (the soonest occurrence from today, else the latest past one); a ticked-off one, or one on
+    /// another event, never.
     #[test]
-    fn linked_on_or_after_resolves_as_the_list_does() {
+    fn linked_unmet_resolves_as_the_list_does() {
         let (_dir, conn) = store();
         let today = "2026-10-12";
         occurrences(
@@ -902,23 +892,19 @@ mod tests {
         let done = add(&conn, "Atlas", "Done", None, Some("gym@x".into())).unwrap();
         set_state(&conn, done, true).unwrap();
         add(&conn, "Atlas", "Other", None, Some("past@x".into())).unwrap();
-        let ids = |day: &str, uid: &str| -> Vec<(i64, Option<String>)> {
-            linked_on_or_after(&conn, uid, day, today)
+        let ids = |uid: &str| -> Vec<(i64, Option<String>)> {
+            linked_unmet(&conn, uid, today)
                 .unwrap()
                 .into_iter()
                 .map(|m| (m.id, m.due_date))
                 .collect()
         };
-        assert_eq!(
-            ids("2026-10-19", "gym@x"),
-            vec![(launch, Some("2026-10-19".into()))]
-        );
-        assert!(ids("2026-10-26", "gym@x").is_empty());
-        // Only past occurrences: the latest past one, which is before the day.
-        assert!(ids("2026-10-19", "past@x").is_empty());
-        let other = linked_on_or_after(&conn, "past@x", "2026-10-05", today).unwrap();
+        assert_eq!(ids("gym@x"), vec![(launch, Some("2026-10-19".into()))]);
+        // Only past occurrences: the latest past one.
+        let other = ids("past@x");
         assert_eq!(other.len(), 1);
-        assert_eq!(other[0].due_date.as_deref(), Some("2026-10-05"));
+        assert_eq!(other[0].1.as_deref(), Some("2026-10-05"));
+        assert!(ids("none@x").is_empty());
     }
 
     /// C9b-2: linking says whether a milestone had that id, so "Moved" is never said of nothing;

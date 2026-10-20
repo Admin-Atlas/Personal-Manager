@@ -24,7 +24,7 @@
 //
 // And two things beside the writes (C9b-2): how a repeating event repeats, for the event popover
 // (only a read), and, after a "this and following" change lands, a question per milestone linked to
-// it from that day on, whether to move it to the new part (DECISIONS 17-10 #2). Moving one changes
+// an occurrence it took, whether to move it to the new part (DECISIONS 17-10 #2). Moving one changes
 // PM's own milestone, never Google; Move back is offered for a few seconds after.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
@@ -574,8 +574,12 @@ export function describeSeries(eventId: string): Promise<string | null> {
  *  pointer or focus is on its notice. */
 export const MOVE_BACK_MS = 8000;
 
-/** After a "this and following" change landed: one question per milestone the backend read as dated
- *  on or after its first day, or, when PM couldn't find the new part, one notice per milestone
+/** How long Move back ignores a press once it shows. It takes Move's place, so a press meant for
+ *  Move (a second Enter, a quick double-click) lands on it, and would undo the move just made. */
+const MOVE_BACK_ARMS_MS = 500;
+
+/** After a "this and following" change landed: one question per milestone the backend found on an
+ *  occurrence the new part took, or, when PM couldn't find the new part, one notice per milestone
  *  saying it stayed. Nothing for any other outcome. */
 function offerMoves(outcome: WriteOutcome): void {
   if (outcome.outcome !== "saved" || !outcome.milestone_moves) return;
@@ -615,12 +619,13 @@ const held = (id: number) => {
 };
 
 /** A Move back window open now: the notice it closes, its timer (null while held), when it ends,
- *  and the time it had left when it was held. */
+ *  the time it had left when it was held, and when Move back first takes a press. */
 interface MoveBackWindow {
   notice: WriteNotice;
   timer: ReturnType<typeof setTimeout> | null;
   endsAt: number;
   left: number;
+  armsAt: number;
 }
 const moveBackWindows = new Map<number, MoveBackWindow>();
 
@@ -631,7 +636,13 @@ function runMoveBack(open: MoveBackWindow) {
 
 /** Offer Move back on `notice` for {@link MOVE_BACK_MS}, waiting first if it's held already. */
 function openMoveBack(notice: WriteNotice) {
-  const open: MoveBackWindow = { notice, timer: null, endsAt: 0, left: MOVE_BACK_MS };
+  const open: MoveBackWindow = {
+    notice,
+    timer: null,
+    endsAt: 0,
+    left: MOVE_BACK_MS,
+    armsAt: Date.now() + MOVE_BACK_ARMS_MS,
+  };
   moveBackWindows.set(notice.id, open);
   if (!held(notice.id)) runMoveBack(open);
 }
@@ -717,8 +728,10 @@ export function moveMilestone(noticeId: number): Promise<boolean> {
 }
 
 /** Move it back to the earlier part, while the moved notice offers that: only while it's still
- *  linked to the new part. Whether it moved. */
+ *  linked to the new part, and never in its first {@link MOVE_BACK_ARMS_MS}. Whether it moved. */
 export function moveMilestoneBack(noticeId: number): Promise<boolean> {
+  const open = moveBackWindows.get(noticeId);
+  if (open && Date.now() < open.armsAt) return Promise.resolve(false);
   return sendMove(
     noticeId,
     (n) => n.moveBack,

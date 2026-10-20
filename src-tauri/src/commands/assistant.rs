@@ -106,22 +106,34 @@ pub fn set_milestone_event(
     only_if_linked_to: Option<String>,
 ) -> Result<()> {
     let conn = state.conn()?;
-    if !milestones::set_event(
+    relink(
         &conn,
         id,
         event_uid,
         cached_date,
         only_if_linked_to.as_deref(),
-    )? {
-        let words = match milestones::project_of(&conn, id)? {
+    )?;
+    briefing::nudge(&state);
+    Ok(())
+}
+
+/// [`set_milestone_event`] but the briefing's nudge: a refusal is in the words the user sees, and
+/// changes nothing.
+fn relink(
+    conn: &Connection,
+    id: i64,
+    event_uid: Option<String>,
+    cached_date: Option<String>,
+    only_if_linked_to: Option<&str>,
+) -> Result<()> {
+    if !milestones::set_event(conn, id, event_uid, cached_date, only_if_linked_to)? {
+        let words = match milestones::project_of(conn, id)? {
             None => "That milestone no longer exists.",
             Some(_) => "That milestone changed since; nothing was moved.",
         };
         return Err(Error::Other(words.into()));
     }
-    touch_milestone_project(&conn, id)?;
-    briefing::nudge(&state);
-    Ok(())
+    touch_milestone_project(conn, id)
 }
 
 /// Mark a milestone met or unmet.
@@ -553,6 +565,85 @@ mod tests {
         assert_eq!(
             (project.as_str(), kind.as_str(), source_ref),
             ("Atlas", "milestone", Some(id))
+        );
+    }
+
+    /// C9b-2 review F6: a relink that finds no milestone with the id, or finds it linked elsewhere
+    /// since, is refused in the words the calendar shows, and changes nothing, its project's activity
+    /// included; the move as offered links it and seeds its date.
+    #[test]
+    fn a_relink_is_refused_in_the_users_words_and_changes_nothing() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let id = milestones::add(
+            &conn,
+            "Atlas",
+            "Launch",
+            Some("2026-10-12".into()),
+            Some("abc@x".into()),
+        )
+        .unwrap();
+        let row = || -> (Option<String>, Option<String>, i64) {
+            conn.query_row(
+                "SELECT event_uid, due_date, (SELECT COUNT(*) FROM project_activity) \
+                 FROM project_milestones WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let to_tail = |m: i64, only: &str| {
+            relink(
+                &conn,
+                m,
+                Some("tail@x".into()),
+                Some("2026-10-19".into()),
+                Some(only),
+            )
+        };
+        let refused = |result: Result<()>| match result {
+            Err(Error::Other(words)) => words,
+            _ => String::new(),
+        };
+        let before = row();
+        assert!(
+            refused(to_tail(id + 99, "abc@x")) == "That milestone no longer exists.",
+            "an id no milestone has"
+        );
+        assert!(
+            refused(to_tail(id, "other@x")) == "That milestone changed since; nothing was moved.",
+            "a link changed since"
+        );
+        assert!(row() == before, "neither changes anything");
+        assert!(to_tail(id, "abc@x").is_ok(), "the move as offered");
+        let after = row();
+        assert!(
+            after.0.as_deref() == Some("tail@x")
+                && after.1.as_deref() == Some("2026-10-19")
+                && after.2 == before.2 + 1,
+            "linked, dated, and its project touched"
+        );
+    }
+
+    /// The command nudges the briefing after [`relink`], and only once it's done: a refusal returns
+    /// first, and a relink moves the date that governs the project. No test can build the command's
+    /// state, so this reads the file's own text (the C9b-1 C1-M8 precedent).
+    #[test]
+    fn a_relink_nudges_the_briefing() {
+        let source = include_str!("assistant.rs");
+        let at = source
+            .find("pub fn set_milestone_event(")
+            .expect("the command is defined");
+        let body = &source[at..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let relinked = body.find("relink(").expect("the command relinks");
+        let nudged = body[relinked..]
+            .find("briefing::nudge(&state);")
+            .expect("then nudges the briefing");
+        assert!(
+            body[relinked..relinked + nudged].contains(")?;"),
+            "only once the relink is done"
         );
     }
 }

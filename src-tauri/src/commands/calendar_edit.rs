@@ -2946,7 +2946,7 @@ async fn send_series<W: Wire, H: Host>(
             &[planning.series.master.id.as_str()],
         )?;
         let movable = match &facts {
-            Some(facts) => read_movable(conn, ctx.host, planning, run.plan(), facts)?,
+            Some(facts) => read_movable(conn, ctx.host, planning, run.plan(), facts, &rows)?,
             None => None,
         };
         if let Some(entry) = &entry {
@@ -3630,45 +3630,74 @@ struct SplitFacts {
 }
 
 /// The milestones a split may offer to move to its new part, read before its first send: after the
-/// cut, the original's iCal UID resolves only to rows before the split, and the landing makes the
-/// calendar read milestones again before the save returns (C9b-2 §0.4.2).
+/// cut, the original's iCal UID resolves only to rows the earlier part keeps, and the landing makes
+/// the calendar read milestones again before the save returns (C9b-2 §0.4.2).
 #[derive(Clone)]
 struct Movable {
     /// The user's zone, the one the milestone list resolves dates in: every day here is in it.
     zone: chrono_tz::Tz,
-    /// The day the change starts, `YYYY-MM-DD`: a milestone dated from it on is offered (DECISIONS
-    /// 17-10 #2).
-    split_day: String,
     /// The original's title and the new part's, as the plan sends them.
     earlier_title: String,
     new_title: String,
     /// Never empty.
-    milestones: Vec<MilestoneOffer>,
+    milestones: Vec<MovableMilestone>,
 }
 
-/// What `facts`' split may offer to move, read under the DB lock the send's snapshot holds: unmet
-/// milestones on the original's iCal UID dated on or after the day the change starts. Both sides of
-/// the comparison are in the user's zone, the one the milestone list resolves dates in (the series'
-/// zone stays for the dialog's words, C9b-2 critique C1-L8).
+/// A milestone a split may offer to move, and where its occurrence sits in the series.
+#[derive(Clone)]
+struct MovableMilestone {
+    offer: MilestoneOffer,
+    /// The slots (`originalStartTime`) of the original's rows on its date that the split moves to
+    /// the new part: what the landing looks for on the earlier part. Empty when no row was on it.
+    slots: Vec<Point>,
+}
+
+/// What `facts`' split may offer to move, read under the DB lock the send's snapshot holds, `rows`
+/// being the original's rows then: the unmet milestones on its iCal UID whose occurrence the split
+/// moves to the new part. A linked milestone takes its date from an occurrence, so it goes with
+/// one: offered when a row on its date sits from the split on in the series (its
+/// `originalStartTime`), wherever that row was moved to, and not when every one sits before it
+/// (C9b-2 review F4). With no row on its date, the date decides: from the day the change starts on
+/// (DECISIONS 17-10 #2). Days are in the user's zone, the one the milestone list resolves dates in
+/// (the series' zone stays for the dialog's words, C9b-2 critique C1-L8).
 fn read_movable(
     conn: &Connection,
     host: &impl Host,
     planning: &Planning,
     plan: &SeriesPlan,
     facts: &SplitFacts,
+    rows: &[CalendarEvent],
 ) -> Result<Option<Movable>> {
     let zone = super::shared::resolve_zone(conn);
     let split_day = facts.at.day_in(zone).format("%Y-%m-%d").to_string();
-    let found =
-        milestones::linked_on_or_after(conn, &facts.ical, &split_day, &host.today_in(zone))?;
-    let milestones: Vec<MilestoneOffer> = found
+    let found = milestones::linked_unmet(conn, &facts.ical, &host.today_in(zone))?;
+    let milestones: Vec<MovableMilestone> = found
         .into_iter()
         .filter_map(|m| {
-            Some(MilestoneOffer {
-                date: m.due_date?.get(..10)?.to_string(),
-                id: m.id,
-                label: m.label,
-                project: m.project_name,
+            let date = m.due_date?.get(..10)?.to_string();
+            let on_date: Vec<Point> = rows
+                .iter()
+                .filter(|r| crate::clock::zone_date_of(&r.start, zone) == date)
+                .filter_map(diff::row_point)
+                .collect();
+            let slots: Vec<Point> = on_date
+                .iter()
+                .copied()
+                .filter(|p| !p.cmp_in(&facts.at, facts.zone).is_lt())
+                .collect();
+            let goes = if on_date.is_empty() {
+                date >= split_day
+            } else {
+                !slots.is_empty()
+            };
+            goes.then_some(MovableMilestone {
+                offer: MilestoneOffer {
+                    date,
+                    id: m.id,
+                    label: m.label,
+                    project: m.project_name,
+                },
+                slots,
             })
         })
         .collect();
@@ -3682,7 +3711,6 @@ fn read_movable(
     };
     Ok(Some(Movable {
         zone,
-        split_day,
         earlier_title: text(planning.series.master_fresh.json().get("summary")),
         new_title: text(inserted),
         milestones,
@@ -3692,11 +3720,12 @@ fn read_movable(
 /// A landed split's `Saved`, with the milestones it offers to move to its new part (C9b-2). The new
 /// part is named from what PM already holds (the insert's answer, then its landed rows), else by
 /// one GET of it; one PM can't name still lists the milestones, beside a warning that they stayed
-/// on the earlier part (C9b-2 critique C2-M1). A milestone dated on an occurrence left on the
-/// earlier part stays there unasked (C1-L9). Any other outcome, or nothing to offer, passes through.
+/// on the earlier part (C9b-2 critique C2-M1). A milestone whose occurrence the landing saw still on
+/// the earlier part stays there unasked (C1-L9); one PM couldn't see (a cleanup whose answer was
+/// lost, or a landing that couldn't read Google) is asked about, so none goes overdue unsaid (C9b-2
+/// review F5). Any other outcome, or nothing to offer, passes through.
 async fn with_moves<W: Wire, H: Host>(
     ctx: &SeriesWrite<'_, W, H>,
-    plan: &SeriesPlan,
     facts: &SplitFacts,
     ran: &Ran,
     outcome: WriteOutcome,
@@ -3713,24 +3742,6 @@ async fn with_moves<W: Wire, H: Host>(
         other => return other,
     };
     let zone = movable.zone;
-    let behind: Vec<String> = plan
-        .left_behind(&ran.skipped())
-        .iter()
-        .map(|p| p.day_in(zone).format("%Y-%m-%d").to_string())
-        .collect();
-    let milestones: Vec<MilestoneOffer> = movable
-        .milestones
-        .iter()
-        .filter(|m| !behind.contains(&m.date))
-        .cloned()
-        .collect();
-    if milestones.is_empty() {
-        return WriteOutcome::Saved {
-            warnings,
-            left_behind,
-            milestone_moves: None,
-        };
-    }
     let cal = ctx.target.calendar_id.as_str();
     // Each part's rows as landed (none when the landing couldn't show them).
     let (tail_rows, earlier_rows) = ctx
@@ -3742,6 +3753,26 @@ async fn with_moves<W: Wire, H: Host>(
             ))
         })
         .unwrap_or_default();
+    // Where the earlier part's rows sit in the series, when the landing read them from Google: one
+    // pending keeps rows PM can't vouch for.
+    let seen: Vec<Point> = if warnings.contains(&WriteWarning::MirrorRefreshPending) {
+        Vec::new()
+    } else {
+        earlier_rows.iter().filter_map(diff::row_point).collect()
+    };
+    let milestones: Vec<MilestoneOffer> = movable
+        .milestones
+        .iter()
+        .filter(|m| m.slots.is_empty() || m.slots.iter().any(|s| !seen.contains(s)))
+        .map(|m| m.offer.clone())
+        .collect();
+    if milestones.is_empty() {
+        return WriteOutcome::Saved {
+            warnings,
+            left_behind,
+            milestone_moves: None,
+        };
+    }
     let mut copy = inserted_copy(ran, facts.insert).cloned();
     let mut named = copy.as_ref().and_then(ical_of).or_else(|| {
         tail_rows
@@ -3762,20 +3793,20 @@ async fn with_moves<W: Wire, H: Host>(
     if new_series_ical.is_none() {
         warnings.push(WriteWarning::MilestoneNotOffered);
     }
-    // The new part's first occurrence, and the earlier part's last, as the user's calendar shows them.
-    let days = |rows: &[CalendarEvent]| -> Vec<String> {
-        rows.iter()
-            .map(|r| crate::clock::zone_date_of(&r.start, zone))
-            .filter(|d| is_day(d))
-            .collect()
-    };
-    let first_day = days(&tail_rows)
-        .into_iter()
+    // The new part's first occurrence, and the earlier part's last, as the user's calendar shows them:
+    // the earlier part's by where its rows sit in the series, so one left from the split on, which
+    // may still show, isn't its last.
+    let day_of =
+        |r: &CalendarEvent| Some(crate::clock::zone_date_of(&r.start, zone)).filter(|d| is_day(d));
+    let first_day = tail_rows
+        .iter()
+        .filter_map(day_of)
         .min()
         .or_else(|| copy.as_ref().and_then(|c| start_day(c, zone)));
-    let earlier_last_day = days(&earlier_rows)
-        .into_iter()
-        .filter(|d| *d < movable.split_day)
+    let earlier_last_day = earlier_rows
+        .iter()
+        .filter(|r| diff::row_point(r).is_some_and(|p| p.cmp_in(&facts.at, facts.zone).is_lt()))
+        .filter_map(day_of)
         .max();
     WriteOutcome::Saved {
         warnings,
@@ -4232,7 +4263,7 @@ async fn land_split<W: Wire, H: Host>(
     match &ran {
         Ran::Done { .. } => {
             let saved = land_split_done(ctx, mirror, &plan, &facts, &ran, snapshot).await;
-            with_moves(ctx, &plan, &facts, &ran, saved).await
+            with_moves(ctx, &facts, &ran, saved).await
         }
         Ran::NotDone {
             step,
@@ -5945,13 +5976,19 @@ impl<'a> InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        if let Ok(mut held) = self.edit.in_flight.lock() {
-            for key in &self.keys {
-                held.remove(key);
-            }
+        release_claims(self.edit, &self.keys);
+    }
+}
+
+/// Let go of `keys`, then, after the landing, forget the words of every series among them, so a
+/// popover opened from now on reads Google again. Both kinds of claim end here. The words go while
+/// the claims' lock is held, so an ask never finds the series let go before they have.
+fn release_claims(edit: &CalendarEditState, keys: &[String]) {
+    if let Ok(mut held) = edit.in_flight.lock() {
+        for key in keys {
+            held.remove(key);
         }
-        // After the landing: a popover opened from now on reads Google again.
-        series_written(&self.edit.summaries, &self.keys);
+        series_written(&edit.summaries, keys);
     }
 }
 
@@ -5963,13 +6000,10 @@ struct HeldClaim {
 
 impl Drop for HeldClaim {
     fn drop(&mut self) {
-        let edit = &self.app.state::<AppState>().inner().calendar_edit;
-        if let Ok(mut held) = edit.in_flight.lock() {
-            for key in &self.keys {
-                held.remove(key);
-            }
-        }
-        series_written(&edit.summaries, &self.keys);
+        release_claims(
+            &self.app.state::<AppState>().inner().calendar_edit,
+            &self.keys,
+        );
     }
 }
 
@@ -14809,6 +14843,49 @@ mod tests {
         assert!(at(SUMMARY_TTL + Duration::from_secs(1)).is_none());
     }
 
+    /// Past [`SUMMARY_KEEP`] series, every entry older than the TTL goes; with none that old, the
+    /// one read longest ago goes, and only that one.
+    #[test]
+    fn past_the_cap_the_stale_go_then_the_oldest() {
+        let edit = CalendarEditState::default();
+        let since = summary_writes(&edit);
+        let base = Instant::now();
+        let fresh = base + SUMMARY_TTL;
+        let secs = |n: usize| Duration::from_secs(n as u64);
+        let key = |name: &str| series_key(CALENDAR, name);
+        let keep = |name: &str, now: Instant| {
+            keep_summary(&edit, key(name), Some("\"e1\""), "Daily", since, now);
+        };
+        keep("stale-0", base);
+        keep("stale-1", base);
+        for n in 2..SUMMARY_KEEP {
+            keep(&format!("s{n}"), fresh + secs(n));
+        }
+        let held = |name: &str| {
+            edit.summaries
+                .lock()
+                .unwrap()
+                .known
+                .contains_key(&key(name))
+        };
+        let count = || edit.summaries.lock().unwrap().known.len();
+        assert!(count() == SUMMARY_KEEP, "full");
+        keep("new-a", fresh + secs(SUMMARY_KEEP));
+        assert!(
+            !held("stale-0") && !held("stale-1") && held("new-a"),
+            "both stale entries go"
+        );
+        assert!(count() == SUMMARY_KEEP - 1, "and only they");
+        keep("new-b", fresh + secs(SUMMARY_KEEP + 1));
+        assert!(count() == SUMMARY_KEEP, "full again, all of it fresh");
+        keep("new-c", fresh + secs(SUMMARY_KEEP + 2));
+        assert!(
+            !held("s2") && held("s3") && held("new-b") && held("new-c"),
+            "the one read longest ago goes"
+        );
+        assert!(count() == SUMMARY_KEEP, "and the cap holds");
+    }
+
     /// A row mirrored before etags were kept is asked about every time, and nothing is kept.
     #[tokio::test]
     async fn a_row_without_an_etag_is_never_kept() {
@@ -14969,6 +15046,37 @@ mod tests {
         assert!(known("other").is_some(), "another series' stay");
     }
 
+    /// A held delete's claim ends in [`HeldClaim`], which no test can build (it holds the app), so
+    /// its release is read from this file's own text (the C9b-1 C1-M8 precedent): it lets go the
+    /// way [`InFlight`] does, which the test above runs, the words going before the claims' lock
+    /// does, so an ask can't find the series let go and its words still standing.
+    #[test]
+    fn a_held_claim_lets_go_as_a_write_does() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body = |of: &str| {
+            let at = shipped.find(of).expect("the drop is defined");
+            let body = &shipped[at..];
+            body[..body.find("\n}\n").unwrap_or(body.len())].to_string()
+        };
+        for of in ["impl Drop for HeldClaim {", "impl Drop for InFlight<'_> {"] {
+            assert!(
+                body(of).contains("release_claims("),
+                "every claim ends in the one release"
+            );
+        }
+        // Inside the block that holds the claims' lock: its last line, before that block closes.
+        assert!(
+            body("fn release_claims(")
+                .trim_end()
+                .ends_with("series_written(&edit.summaries, keys);\n    }"),
+            "and the release forgets the series' words before the lock goes"
+        );
+    }
+
     /// C9b-2 critiques C1-M2, C2-L3: an ask a write overlaps keeps nothing, whether the write let go
     /// while the GET was out or still holds the series when it answers.
     #[tokio::test]
@@ -15027,19 +15135,29 @@ mod tests {
 
     // --- the milestones a "this and following" change offers to move (C9b-2) ---
 
-    /// The October series as Google lists its occurrences, each carrying the series' iCal UID, so a
-    /// milestone linked to it resolves through the mirror: 12-10, 19-10 and 26-10.
-    fn linked_october() -> Vec<Value> {
-        october()
+    /// The series' occurrences `events` as Google lists them, each carrying the series' iCal UID, so
+    /// a milestone linked to it resolves through the mirror.
+    fn linked(events: Vec<Value>) -> Vec<Value> {
+        events
             .into_iter()
             .map(|e| with(e, "iCalUID", json!("abc@google.com")))
             .collect()
     }
 
+    /// The October series, [`linked`]: 12-10, 19-10 and 26-10.
+    fn linked_october() -> Vec<Value> {
+        linked(october())
+    }
+
     /// A host whose mirror holds [`linked_october`] and resolves milestones on `today`, with
     /// "Launch" in "Atlas" linked to the series: its id.
     fn linked_host(today: &'static str) -> (Arc<TestHost>, i64) {
-        let host = TestHost::holding(&linked_october());
+        linked_host_holding(october(), today)
+    }
+
+    /// [`linked_host`], its mirror holding `events`, [`linked`].
+    fn linked_host_holding(events: Vec<Value>, today: &'static str) -> (Arc<TestHost>, i64) {
+        let host = TestHost::holding(&linked(events));
         *host.today.lock().unwrap() = today;
         let launch = host
             .with_conn(|conn| {
@@ -15122,11 +15240,12 @@ mod tests {
         let insert = tail_copy(&plan, "\"t1\"", SAVED_AT);
         let (outcome, _, _) = split_save(&host, landed_split(&plan, insert)).await;
         let after = host
-            .with_conn(|conn| {
-                milestones::linked_on_or_after(conn, "abc@google.com", "2026-10-19", "2026-10-13")
-            })
+            .with_conn(|conn| milestones::linked_unmet(conn, "abc@google.com", "2026-10-13"))
             .unwrap();
-        assert!(after.is_empty(), "a read after the landing finds nothing");
+        assert!(
+            after.len() == 1 && after[0].due_date.as_deref() == Some("2026-10-12"),
+            "a read after the landing finds it on the earlier part"
+        );
         let offered: Vec<i64> = moves_of(&outcome)
             .map(|m| m.milestones.iter().map(|o| o.id).collect())
             .unwrap_or_default();
@@ -15246,7 +15365,7 @@ mod tests {
             .unwrap()
             .values()
             .filter_map(|h| h.facts.movable.as_ref())
-            .flat_map(|m| m.milestones.iter().map(|o| o.id))
+            .flat_map(|m| m.milestones.iter().map(|o| o.offer.id))
             .collect();
         assert!(movable == [launch], "held with Launch");
     }
@@ -15339,6 +15458,374 @@ mod tests {
             matches!(&outcome, WriteOutcome::Saved { left_behind, milestone_moves: Some(m), .. }
                 if *left_behind == ["2026-11-02"] && m.milestones == [launch_offer(launch, "2026-10-26")]),
             "Launch offered; Prep, on the occurrence left behind, not"
+        );
+        // The occurrence left behind may still show, but it isn't where the earlier part ends.
+        assert!(
+            moves_of(&outcome).and_then(|m| m.earlier_last_day.as_deref()) == Some("2026-10-12"),
+            "the earlier part ended on 12-10"
+        );
+    }
+
+    /// "Launch"'s date as the milestone list resolves it on `today`.
+    fn launch_date(host: &TestHost, today: &str) -> Option<String> {
+        host.with_conn(|conn| milestones::list_all(conn, today))
+            .unwrap()
+            .into_iter()
+            .find(|m| m.label == "Launch")
+            .and_then(|m| m.due_date)
+    }
+
+    /// Save "this and following" retitled from Monday 19-10 against `host`, the series holding
+    /// `exception` and the mirror `events`, Google answering as `steps` say after the reads.
+    async fn split_with(
+        host: &TestHost,
+        exception: &Value,
+        events: Vec<Value>,
+        steps: Vec<Step>,
+    ) -> WriteOutcome {
+        let mut all = reads(
+            &monday_19(),
+            &weekly(),
+            vec![weekly(), exception.clone()],
+            events,
+        );
+        all.extend(steps);
+        let script = Script::new(all);
+        let (outcome, _) = save(
+            host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            title("Retro"),
+            Scope::Following,
+        )
+        .await;
+        script.asked_all();
+        outcome
+    }
+
+    /// C9b-2 review F4: the 12-10 occurrence moved to Wednesday 21-10, past the split from 19-10.
+    /// "Launch" takes it (today 20-10), but the split leaves it on the earlier part, so nothing is
+    /// asked, though its date is after the day the change starts.
+    #[tokio::test]
+    async fn a_milestone_on_an_earlier_occurrence_moved_past_the_split_stays() {
+        let moved_12 = moved(
+            "2026-10-12T09:00:00+01:00",
+            "2026-10-21T09:00:00+01:00",
+            "2026-10-21T10:00:00+01:00",
+        );
+        let events = vec![moved_12.clone(), monday_19(), plain("2026-10-26T09:00:00Z")];
+        let (host, _) = linked_host_holding(events.clone(), "2026-10-20");
+        assert!(
+            launch_date(&host, "2026-10-20").as_deref() == Some("2026-10-21"),
+            "the fixture's rows put Launch on 21-10"
+        );
+        let plan = split_plan(vec![moved_12.clone()]);
+        let steps = vec![
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(&plan))),
+            refetch_read(Scripted::Json(page(linked(vec![moved_12.clone()]), None))),
+            tail_refetch(Scripted::Json(page(tail_october(), None))),
+        ];
+        let outcome = split_with(&host, &moved_12, events, steps).await;
+        assert!(outcome == saved(), "saved, nothing offered");
+    }
+
+    /// The new part's 26-10 occurrence, as the carry looks it up.
+    fn tail_26_lookup(found: Vec<Value>) -> Step {
+        Step::get(
+            &format!("/events/{TAIL}/instances"),
+            "timeMin=2026-10-25T09%3A00%3A00Z timeMax=2026-10-27T09%3A00%3A00Z maxResults=10",
+            page(found, None),
+        )
+    }
+
+    /// The 26-10 occurrence, moved to `start`–`end` (RFC 3339).
+    fn moved_26(start: &str, end: &str) -> Value {
+        moved("2026-10-26T09:00:00Z", start, end)
+    }
+
+    /// The split carrying `exception` (the 26-10 occurrence, moved) onto the new part, then
+    /// cancelling it on the original as `cancel` answers, `then` following: the carry's lookup and
+    /// PATCH, and the cancel.
+    fn carry_26(plan: &SeriesPlan, exception: &Value, cancel: Scripted) -> Vec<Step> {
+        let found = tail_occurrence("2026-10-26T09:00:00Z", "\"q1\"");
+        let carried = written(
+            &found,
+            &[
+                ("start", exception["start"].clone()),
+                ("end", exception["end"].clone()),
+            ],
+            "\"q2\"",
+        );
+        vec![
+            insert_step(Scripted::Json(tail_copy(plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(plan))),
+            tail_26_lookup(vec![found]),
+            Step::write(
+                Method::Patch,
+                &format!("/events/{TAIL}_20261026T090000Z"),
+                "\"q1\"",
+                Scripted::Json(carried),
+            ),
+            Step::write(
+                Method::Patch,
+                "/events/abc_20261026T090000Z",
+                exception["etag"].as_str().unwrap(),
+                cancel,
+            ),
+        ]
+    }
+
+    /// The original and the new part re-fetched after a split carried the 26-10 occurrence, the
+    /// original listing `original` with its 12-10 occurrence.
+    fn refetch_after_carry(exception: &Value, original: Option<Value>) -> Vec<Step> {
+        let mut listed = linked(vec![plain("2026-10-12T09:00:00+01:00")]);
+        listed.extend(original);
+        let carried = written(
+            &tail_occurrence("2026-10-26T09:00:00Z", "\"q1\""),
+            &[
+                ("start", exception["start"].clone()),
+                ("end", exception["end"].clone()),
+            ],
+            "\"q2\"",
+        );
+        vec![
+            refetch_read(Scripted::Json(page(listed, None))),
+            tail_refetch(Scripted::Json(page(
+                vec![
+                    tail_occurrence("2026-10-19T09:00:00+01:00", "\"u0\""),
+                    carried,
+                ],
+                None,
+            ))),
+        ]
+    }
+
+    /// C9b-2 review F4, the other way: the 26-10 occurrence moved to Friday 16-10, before the split
+    /// from 19-10. "Launch" takes it (today 14-10), and the split carries it to the new part, so
+    /// it's offered, though its date is before the day the change starts.
+    #[tokio::test]
+    async fn a_milestone_on_a_later_occurrence_moved_before_the_split_is_offered() {
+        let exception = moved_26("2026-10-16T09:00:00+01:00", "2026-10-16T10:00:00+01:00");
+        let events = vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            monday_19(),
+            exception.clone(),
+        ];
+        let (host, launch) = linked_host_holding(events.clone(), "2026-10-14");
+        assert!(
+            launch_date(&host, "2026-10-14").as_deref() == Some("2026-10-16"),
+            "the fixture's rows put Launch on 16-10"
+        );
+        let plan = split_plan(vec![exception.clone()]);
+        let cancelled = written(
+            &with(exception.clone(), "status", json!("cancelled")),
+            &[],
+            "\"c2\"",
+        );
+        let mut steps = carry_26(&plan, &exception, Scripted::Json(cancelled));
+        steps.extend(refetch_after_carry(&exception, None));
+        let outcome = split_with(&host, &exception, events, steps).await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, milestone_moves: Some(m), .. }
+                if warnings.is_empty()
+                    && m.milestones == [launch_offer(launch, "2026-10-16")]
+                    && m.earlier_last_day.as_deref() == Some("2026-10-12")),
+            "Launch offered on its own date"
+        );
+    }
+
+    /// C9b-2 review F5: the 26-10 occurrence moved to Tuesday 27-10, and its carry never found, so
+    /// its old copy is left on the earlier part (left behind on 26-10, its place in the series).
+    /// "Launch" takes it (today 20-10) and follows it there: nothing is asked.
+    #[tokio::test]
+    async fn a_milestone_on_a_moved_occurrence_left_behind_isnt_offered() {
+        let exception = moved_26("2026-10-27T09:00:00Z", "2026-10-27T10:00:00Z");
+        let events = vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            monday_19(),
+            exception.clone(),
+        ];
+        let (host, _) = linked_host_holding(events.clone(), "2026-10-20");
+        assert!(
+            launch_date(&host, "2026-10-20").as_deref() == Some("2026-10-27"),
+            "the fixture's rows put Launch on 27-10"
+        );
+        let plan = split_plan(vec![exception.clone()]);
+        let mut steps = vec![
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(&plan))),
+        ];
+        steps.extend((0..3).map(|_| tail_26_lookup(Vec::new())));
+        let left = linked(vec![exception.clone()]).pop();
+        steps.extend(refetch_after_carry(&exception, left));
+        let outcome = split_with(&host, &exception, events, steps).await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None }
+                if *warnings == [WriteWarning::LeftOnOldSeries] && *left_behind == ["2026-10-26"]),
+            "saved with its occurrence left behind, nothing offered"
+        );
+    }
+
+    /// C9b-2 review F5: the same occurrence's cancel answered nothing PM could read, but the landing
+    /// sees Google cancelled it, so "Launch" would go overdue on the earlier part: it's asked about.
+    #[tokio::test]
+    async fn a_milestone_whose_cleanup_landed_unanswered_is_offered() {
+        let exception = moved_26("2026-10-27T09:00:00Z", "2026-10-27T10:00:00Z");
+        let events = vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            monday_19(),
+            exception.clone(),
+        ];
+        let (host, launch) = linked_host_holding(events.clone(), "2026-10-20");
+        let plan = split_plan(vec![exception.clone()]);
+        let mut steps = carry_26(&plan, &exception, Scripted::Lost { retried: true });
+        steps.push(event_read("abc_20261026T090000Z", lost()));
+        steps.extend(refetch_after_carry(&exception, None));
+        let outcome = split_with(&host, &exception, events, steps).await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { left_behind, milestone_moves: Some(m), .. }
+                if *left_behind == ["2026-10-26"]
+                    && m.milestones == [launch_offer(launch, "2026-10-27")]),
+            "Launch offered beside the occurrence PM couldn't say it cancelled"
+        );
+    }
+
+    /// C9b-2 review F5: the same cleanup unanswered, and a landing that couldn't read Google either.
+    /// The mirror keeps that occurrence on the earlier part, as PM can't say it went, which shows
+    /// nothing about where it is, so "Launch" is still asked about.
+    #[tokio::test]
+    async fn a_milestone_whose_cleanup_went_unanswered_is_offered_when_the_landing_couldnt_look() {
+        let exception = moved_26("2026-10-27T09:00:00Z", "2026-10-27T10:00:00Z");
+        let events = vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            monday_19(),
+            exception.clone(),
+        ];
+        let (host, launch) = linked_host_holding(events.clone(), "2026-10-20");
+        let plan = split_plan(vec![exception.clone()]);
+        let mut steps = carry_26(&plan, &exception, Scripted::Lost { retried: true });
+        steps.push(event_read("abc_20261026T090000Z", lost()));
+        for _ in 0..3 {
+            let earlier = linked(vec![plain("2026-10-12T09:00:00+01:00")]);
+            steps.push(refetch_read(Scripted::Json(page(earlier, None))));
+            steps.push(tail_refetch(Scripted::Json(page(Vec::new(), None))));
+        }
+        let outcome = split_with(&host, &exception, events, steps).await;
+        let kept = host
+            .with_conn(|conn| calendar::series_rows(conn, "cal", &["abc"]))
+            .unwrap()
+            .iter()
+            .any(|r| r.start.starts_with("2026-10-27"));
+        assert!(kept, "the mirror keeps the occurrence on the earlier part");
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m) }
+                if *warnings == [WriteWarning::MirrorRefreshPending, WriteWarning::LeftOnOldSeries]
+                    && *left_behind == ["2026-10-26"]
+                    && m.milestones == [launch_offer(launch, "2026-10-27")]),
+            "pending, the occurrence said to be left behind, and Launch offered"
+        );
+    }
+
+    /// C9b-2 review F5: a landing that couldn't read Google keeps the earlier part's rows as they
+    /// were, which shows nothing about where an occurrence went, so "Launch" is still asked about.
+    #[tokio::test]
+    async fn a_milestone_is_offered_when_the_landing_couldnt_look() {
+        let (host, launch) = linked_host("2026-10-13");
+        let plan = split_plan(Vec::new());
+        let mut steps = vec![
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(&plan))),
+        ];
+        for _ in 0..3 {
+            steps.push(refetch_read(Scripted::Json(page(
+                vec![linked_october()[0].clone()],
+                None,
+            ))));
+            steps.push(tail_refetch(Scripted::Json(page(Vec::new(), None))));
+        }
+        let (outcome, _, _) = split_save(&host, steps).await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, milestone_moves: Some(m), .. }
+                if *warnings == [WriteWarning::MirrorRefreshPending]
+                    && m.milestones == [launch_offer(launch, "2026-10-19")]),
+            "pending, and Launch offered"
+        );
+    }
+
+    /// A milestone whose event the mirror can't find keeps its own date, on no row of the series:
+    /// that date decides, from the day the change starts on (DECISIONS 17-10 #2).
+    #[tokio::test]
+    async fn a_milestone_on_no_row_goes_by_its_date() {
+        let host = TestHost::holding(&october());
+        *host.today.lock().unwrap() = "2026-10-13";
+        let later = host
+            .with_conn(|conn| {
+                let link = Some("abc@google.com".to_string());
+                milestones::add(
+                    conn,
+                    "Atlas",
+                    "Earlier",
+                    Some("2026-10-10".into()),
+                    link.clone(),
+                )?;
+                milestones::add(conn, "Atlas", "Later", Some("2026-10-28".into()), link)
+            })
+            .unwrap();
+        let plan = split_plan(Vec::new());
+        let insert = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let (outcome, _, _) = split_save(&host, landed_split(&plan, insert)).await;
+        let offered: Vec<i64> = moves_of(&outcome)
+            .map(|m| m.milestones.iter().map(|o| o.id).collect())
+            .unwrap_or_default();
+        assert!(offered == [later], "Later offered, Earlier not");
+    }
+
+    /// C9b-2 review F7: the one GET of the new part finds it deleted in Google: nothing can be moved
+    /// there, so the milestones are said to stay.
+    #[tokio::test]
+    async fn a_new_part_deleted_before_its_get_offers_nothing() {
+        let (host, launch) = linked_host("2026-10-13");
+        let plan = split_plan(Vec::new());
+        let quiet = with(tail_copy(&plan, "\"t1\"", SAVED_AT), "iCalUID", Value::Null);
+        let mut steps = landed_split(&plan, quiet);
+        let deleted = with(
+            tail_copy(&plan, "\"t2\"", SAVED_AT),
+            "status",
+            json!("cancelled"),
+        );
+        steps.push(event_read(TAIL, Scripted::Json(deleted)));
+        let (outcome, _, _) = split_save(&host, steps).await;
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, milestone_moves: Some(m), .. }
+                if *warnings == [WriteWarning::MilestoneNotOffered]
+                    && m.new_series_ical.is_none()
+                    && m.milestones == [launch_offer(launch, "2026-10-19")]),
+            "saved, the milestone said to stay"
+        );
+    }
+
+    /// C9b-2 critique C1-L8: the user's zone (Honolulu here, 10 hours behind) decides every day, not
+    /// the series' (London): the 19-10 occurrence, 08:00 UTC, falls on 18-10 there, so "Launch"
+    /// takes 18-10 and is offered, the new part starting that day and the earlier part ending on
+    /// 11-10.
+    #[tokio::test]
+    async fn a_split_offers_by_the_users_days() {
+        let (host, launch) = linked_host("2026-10-13");
+        host.with_conn(|conn| {
+            crate::db::set_setting(conn, crate::settings::TIME_ZONE_KEY, "Pacific/Honolulu")
+        })
+        .unwrap();
+        let plan = split_plan(Vec::new());
+        let insert = tail_copy(&plan, "\"t1\"", SAVED_AT);
+        let (outcome, _, _) = split_save(&host, landed_split(&plan, insert)).await;
+        assert!(
+            moves_of(&outcome)
+                .is_some_and(|m| m.milestones == [launch_offer(launch, "2026-10-18")]
+                    && m.first_day.as_deref() == Some("2026-10-18")
+                    && m.earlier_last_day.as_deref() == Some("2026-10-11")),
+            "Launch offered on the user's 18-10"
         );
     }
 

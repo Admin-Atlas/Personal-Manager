@@ -627,14 +627,15 @@ export function moveOfferText(m: MilestoneMove): string {
   return `Move the “${m.label}” milestone in ${m.project} to the new part of ${quote(m.newTitle)}${starts}? If you don't, it stays on the earlier part, ${ended(m.earlierLastDay)}, and shows as overdue.`;
 }
 
-/** The Move button's accessible name. */
+/** The Move button's accessible name. Each move button's name starts with the words it shows, so
+ *  saying "click Move back" or "click Keep it there" finds it (WCAG 2.5.3). */
 export function moveLabel(m: MilestoneMove): string {
   return `Move “${m.label}” to the new part of ${quote(m.newTitle)}`;
 }
 
 /** The Keep it there button's accessible name. */
 export function keepLabel(m: MilestoneMove): string {
-  return `Keep “${m.label}” on the earlier part of ${quote(m.earlierTitle)}`;
+  return `Keep it there: “${m.label}” stays on the earlier part of ${quote(m.earlierTitle)}`;
 }
 
 /** A move that landed; a new part PM's calendar doesn't show yet says when it will. */
@@ -645,7 +646,7 @@ export function movedText(m: MilestoneMove): string {
 
 /** The Move back button's accessible name. */
 export function moveBackLabel(m: MilestoneMove): string {
-  return `Move “${m.label}” back to the earlier part of ${quote(m.earlierTitle)}`;
+  return `Move back “${m.label}” to the earlier part of ${quote(m.earlierTitle)}`;
 }
 
 export function movedBackText(m: MilestoneMove): string {

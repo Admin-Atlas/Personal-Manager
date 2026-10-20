@@ -588,9 +588,9 @@ describe("move words", () => {
 
   it("names each part by its own title once the change retitled the new one", () => {
     expect(moveLabel(launch)).toBe("Move “Launch” to the new part of “Retro”");
-    expect(keepLabel(launch)).toBe("Keep “Launch” on the earlier part of “Gym”");
+    expect(keepLabel(launch)).toBe("Keep it there: “Launch” stays on the earlier part of “Gym”");
     expect(movedText(launch)).toBe("Moved “Launch” to the new part of “Retro”.");
-    expect(moveBackLabel(launch)).toBe("Move “Launch” back to the earlier part of “Gym”");
+    expect(moveBackLabel(launch)).toBe("Move back “Launch” to the earlier part of “Gym”");
     expect(movedBackText(launch)).toBe("“Launch” is back on the earlier part of “Gym”.");
   });
 

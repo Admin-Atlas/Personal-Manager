@@ -1378,6 +1378,9 @@ describe("how a repeating event repeats, and moving its milestones", () => {
   it("Move back sends the earlier part and the milestone's date", async () => {
     const { mod, act, id, notice } = await offered();
     await act(() => mod.moveMilestone(id));
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     await act(async () => {
       expect(await mod.moveMilestoneBack(id)).toBe(true);
     });
@@ -1457,6 +1460,45 @@ describe("how a repeating event repeats, and moving its milestones", () => {
     expect(notice()?.moving).toBeFalsy();
   });
 
+  it("Move back takes no press in its first moment, where one meant for Move lands", async () => {
+    const { mod, act, id, notice } = await offered();
+    await act(() => mod.moveMilestone(id));
+    await act(async () => {
+      expect(await mod.moveMilestoneBack(id)).toBe(false);
+    });
+    act(() => {
+      vi.advanceTimersByTime(499);
+    });
+    await act(async () => {
+      expect(await mod.moveMilestoneBack(id)).toBe(false);
+    });
+    expect(setMilestoneEvent).toHaveBeenCalledTimes(1);
+    expect(notice()?.moveBack).toBeDefined();
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    await act(async () => {
+      expect(await mod.moveMilestoneBack(id)).toBe(true);
+    });
+    expect(setMilestoneEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("a moved notice dismissed while Move back is offered stays gone", async () => {
+    const { mod, act, id, notice } = await offered();
+    await act(() => mod.moveMilestone(id));
+    act(() => mod.dismissNotice(id));
+    expect(notice()).toBeUndefined();
+    // Its window ends, and nothing comes back, then or later.
+    act(() => {
+      vi.advanceTimersByTime(8_000);
+    });
+    expect(notice()).toBeUndefined();
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(notice()).toBeUndefined();
+  });
+
   it("a failed move keeps the offer with the error", async () => {
     setMilestoneEvent.mockRejectedValueOnce(new Error("That milestone no longer exists."));
     const { mod, act, id, notice } = await offered();
@@ -1474,6 +1516,9 @@ describe("how a repeating event repeats, and moving its milestones", () => {
   it("a failed move back says the way out, with nothing to press", async () => {
     const { mod, act, id, notice } = await offered();
     await act(() => mod.moveMilestone(id));
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     setMilestoneEvent.mockRejectedValueOnce(
       new Error("That milestone changed since; nothing was moved."),
     );

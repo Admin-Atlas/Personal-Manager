@@ -223,7 +223,9 @@ describe("WriteNotices", () => {
     fireEvent.click(move);
     expect(props.onMove).toHaveBeenCalledWith(4);
     fireEvent.click(
-      screen.getByRole("button", { name: "Keep “Launch” on the earlier part of “Gym”" }),
+      screen.getByRole("button", {
+        name: "Keep it there: “Launch” stays on the earlier part of “Gym”",
+      }),
     );
     expect(props.onDismiss).toHaveBeenCalledWith(4);
     // Moving: still focusable (aria-disabled, never disabled), and a press does nothing.
@@ -237,11 +239,43 @@ describe("WriteNotices", () => {
     // Moved: the very button, now Move back, keeps the focus.
     view.rerender(<WriteNotices notices={[moved()]} {...props} />);
     const back = screen.getByRole("button", {
-      name: "Move “Launch” back to the earlier part of “Gym”",
+      name: "Move back “Launch” to the earlier part of “Gym”",
     });
     expect(back).toBe(move);
     expect(document.activeElement).toBe(move);
     expect(back.textContent).toBe("Move back");
+  });
+
+  // WCAG 2.5.3: saying "click Move back" or "click Keep it there" finds the button.
+  it("starts each move button's name with the words it shows", () => {
+    const props = { onUndo: vi.fn(), onDismiss: vi.fn(), onMove: vi.fn(), onMoveBack: vi.fn() };
+    const view = render(<WriteNotices notices={[offer()]} {...props} />);
+    const named = () =>
+      screen
+        .getAllByRole("button")
+        .filter((b) => b.textContent !== "×")
+        .map((b) => [b.textContent ?? "", b.getAttribute("aria-label") ?? ""]);
+    const offered = named();
+    view.rerender(<WriteNotices notices={[moved()]} {...props} />);
+    const all = [...offered, ...named()];
+    expect(all.map(([shown]) => shown)).toEqual(["Move", "Keep it there", "Move back"]);
+    for (const [shown, name] of all) expect(name).toMatch(new RegExp(`^${shown}\\b`));
+  });
+
+  // The second click of a double-click on Move, or Enter held on it, lands on the same button, by
+  // then Move back.
+  it("a double-click's second click, or a held Enter, never presses Move back", () => {
+    const props = { onUndo: vi.fn(), onDismiss: vi.fn(), onMove: vi.fn(), onMoveBack: vi.fn() };
+    render(<WriteNotices notices={[moved()]} {...props} />);
+    const back = screen.getByRole("button", { name: /^Move back/ });
+    fireEvent.click(back, { detail: 2 });
+    expect(props.onMoveBack).not.toHaveBeenCalled();
+    fireEvent.click(back, { detail: 1 });
+    expect(props.onMoveBack).toHaveBeenCalledWith(4);
+    // A repeat of a held Enter presses nothing (false: its default was prevented); a press does.
+    expect(fireEvent.keyDown(back, { key: "Enter", repeat: true })).toBe(false);
+    expect(fireEvent.keyDown(back, { key: "Enter" })).toBe(true);
+    expect(fireEvent.keyDown(back, { key: "Tab", repeat: true })).toBe(true);
   });
 
   it("Move back shows only on a moved notice, and holds its window while the pointer or focus is on it", () => {
@@ -253,10 +287,10 @@ describe("WriteNotices", () => {
       onHold: vi.fn(),
     };
     const view = render(<WriteNotices notices={[offer()]} {...props} />);
-    expect(screen.queryByRole("button", { name: /back to the earlier part/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Move back/ })).toBeNull();
     view.rerender(<WriteNotices notices={[moved()]} {...props} />);
     expect(screen.queryByRole("button", { name: /Keep/ })).toBeNull();
-    const back = screen.getByRole("button", { name: /back to the earlier part/ });
+    const back = screen.getByRole("button", { name: /^Move back/ });
     fireEvent.click(back);
     expect(props.onMoveBack).toHaveBeenCalledWith(4);
     const notice = screen.getByRole("status");
