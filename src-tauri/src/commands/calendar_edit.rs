@@ -14870,28 +14870,28 @@ mod tests {
         assert_eq!(held_creates(&host), 0);
     }
 
-    /// A28: a listing that lags shows nothing at first; the second look, a second later, lands it.
+    /// A28: a listing that lags shows nothing at first, or only its first page before the second is
+    /// refused; the second look, a second later, lands it.
     #[tokio::test]
     async fn a_created_series_whose_listing_lags_lands_on_the_second_look() {
-        let host = TestHost::holding(&[]);
-        let draft = weekly_dentist("2026-10-26", 3);
-        let copy = google_copy(&draft, "\"n1\"");
-        let (outcome, script) = create_on(
-            &host,
-            &new_target(),
-            EditingStatus::On,
-            vec![
-                insert_step(Scripted::Json(copy)),
-                new_listing(listed(Vec::new())),
-                new_listing(listed(three_mondays())),
-            ],
-            draft,
-            None,
-        )
-        .await;
-        assert!(outcome == saved(), "landed on the second look");
-        assert_eq!(script.waits(), vec![REFETCH_AGAIN[0]]);
-        assert_eq!(new_rows(&host), three_ids());
+        let empty = vec![new_listing(listed(Vec::new()))];
+        let half = vec![
+            new_listing(Scripted::Json(page(three_mondays(), Some("p2")))),
+            new_listing(Scripted::Status(503)),
+        ];
+        for first in [empty, half] {
+            let host = TestHost::holding(&[]);
+            let draft = weekly_dentist("2026-10-26", 3);
+            let copy = google_copy(&draft, "\"n1\"");
+            let mut steps = vec![insert_step(Scripted::Json(copy))];
+            steps.extend(first);
+            steps.push(new_listing(listed(three_mondays())));
+            let (outcome, script) =
+                create_on(&host, &new_target(), EditingStatus::On, steps, draft, None).await;
+            assert!(outcome == saved(), "landed on the second look");
+            assert_eq!(script.waits(), vec![REFETCH_AGAIN[0]]);
+            assert_eq!(new_rows(&host), three_ids());
+        }
     }
 
     /// Three looks that never show it whole: saved, the next sync to show it, and no guess landed.
