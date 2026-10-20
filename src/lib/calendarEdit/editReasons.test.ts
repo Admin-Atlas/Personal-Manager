@@ -568,6 +568,7 @@ describe("move words", () => {
     backIcal: "abc@google.com",
     backDate: "2026-10-19",
     earlierLastDay: "2026-10-12",
+    today: "2026-10-20",
     pending: false,
   };
 
@@ -612,6 +613,24 @@ describe("move words", () => {
   it("says which milestone stayed when PM couldn't find the new part", () => {
     expect(milestoneStayedText(launch)).toBe(
       "PM couldn't find the new part of “Retro” in Google, so “Launch” in Atlas stays on the earlier part, which ended on 12-10, and shows as overdue. Unlink it in Atlas to set its date yourself.",
+    );
+  });
+
+  // C9b-2 review round 3, R3-F3: the earlier part's last day still to come, as when an occurrence
+  // before the change was moved past it.
+  it("says an earlier part whose last day is today or later hasn't ended", () => {
+    expect(moveOfferText({ ...launch, earlierLastDay: "2026-10-21" })).toBe(
+      "Move the “Launch” milestone in Atlas to the new part of “Retro”, which starts on 19-10? If you don't, it stays on the earlier part, whose last day is 21-10, and shows as overdue after that.",
+    );
+    expect(milestoneStayedText({ ...launch, earlierLastDay: "2026-10-21" })).toBe(
+      "PM couldn't find the new part of “Retro” in Google, so “Launch” in Atlas stays on the earlier part, whose last day is 21-10, and shows as overdue after that. Unlink it in Atlas to set its date yourself.",
+    );
+    // Today is its last day; yesterday's has ended.
+    expect(moveOfferText({ ...launch, earlierLastDay: "2026-10-20" })).toMatch(
+      /stays on the earlier part, whose last day is 20-10, and shows as overdue after that\.$/,
+    );
+    expect(milestoneStayedText({ ...launch, earlierLastDay: "2026-10-19" })).toMatch(
+      /stays on the earlier part, which ended on 19-10, and shows as overdue\. Unlink/,
     );
   });
 });

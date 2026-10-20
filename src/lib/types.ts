@@ -1732,6 +1732,8 @@ export interface MilestoneMoves {
   first_day: string | null;
   /** The earlier part's last occurrence: a milestone left on it reads overdue from then. */
   earlier_last_day: string | null;
+  /** Today, as the change landed: whether that last day has passed yet, for the words. */
+  today: string;
   milestones: MilestoneOffer[];
 }
 
@@ -1751,8 +1753,9 @@ export interface MilestoneMove {
   /** Where Move back sends it, and its date before the change. */
   backIcal: string;
   backDate: string;
-  /** The earlier part's last day, for the words. */
+  /** The earlier part's last day, and today as the change landed, for the words. */
   earlierLastDay: string | null;
+  today: string;
   /** The new part wasn't in PM's calendar yet when the change landed. */
   pending: boolean;
 }

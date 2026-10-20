@@ -597,6 +597,7 @@ function offerMoves(outcome: WriteOutcome): void {
       backIcal: moves.earlier_series_ical,
       backDate: m.date,
       earlierLastDay: moves.earlier_last_day,
+      today: moves.today,
       pending,
     };
     put(

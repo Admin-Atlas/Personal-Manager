@@ -1234,6 +1234,7 @@ describe("how a repeating event repeats, and moving its milestones", () => {
     earlier_title: "Gym",
     first_day: "2026-10-19",
     earlier_last_day: "2026-10-12",
+    today: "2026-10-20",
     milestones: [
       { id: 7, label: "Launch", project: "Atlas", date: "2026-10-19" },
       { id: 8, label: "Review", project: "Atlas", date: "2026-10-26" },
@@ -1303,6 +1304,21 @@ describe("how a repeating event repeats, and moving its milestones", () => {
     });
     // The saved notice went by itself; the questions wait for an answer.
     expect(hook.result.current.notices.map((n) => n.move?.milestoneId)).toEqual([7, 8]);
+  });
+
+  // C9b-2 review round 3, R3-F3: whether the earlier part has ended goes by today as the backend
+  // read it in the user's zone, the day its dates are in, not this device's clock (20-10 here).
+  it("words the earlier part's end by the day the change landed", async () => {
+    const { mod, hook, act } = await load();
+    const ahead = { ...one, earlier_last_day: "2026-10-21", today: "2026-10-20" };
+    const ended = { ...one, earlier_last_day: "2026-10-21", today: "2026-10-22" };
+    act(() => mod.noteSaved("Retro", landed(ahead), "following", "2026-10-19"));
+    act(() => mod.noteSaved("Retro", landed(ended), "following", "2026-10-19"));
+    const offers = hook.result.current.notices.filter((n) => n.move).map((n) => n.text);
+    expect(offers).toEqual([
+      expect.stringMatching(/, whose last day is 21-10, and shows as overdue after that\.$/),
+      expect.stringMatching(/, which ended on 21-10, and shows as overdue\.$/),
+    ]);
   });
 
   it("no milestone_moves, no offer", async () => {

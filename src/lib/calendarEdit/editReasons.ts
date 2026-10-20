@@ -616,15 +616,22 @@ export function heldCreateText(title: string): { tone: Tone; text: string } {
 
 // --- moving a milestone after a "this and following" change (C9b-2) ---
 
-/** Where the earlier part ended, for the words: on its last day, or just ended. */
-const ended = (day: string | null) =>
-  day ? `which ended on ${formatDateOnly(day)}` : "which has ended";
+/** Where the earlier part ends and what a milestone left on it costs, for the words: a last day
+ *  before today has ended, so it shows as overdue now; one today or later, only after that (C9b-2
+ *  review round 3, R3-F3). With no last day PM can say, just that it ended. */
+const staysThere = (m: MilestoneMove) => {
+  const day = m.earlierLastDay;
+  if (!day) return "which has ended, and shows as overdue";
+  return day < m.today
+    ? `which ended on ${formatDateOnly(day)}, and shows as overdue`
+    : `whose last day is ${formatDateOnly(day)}, and shows as overdue after that`;
+};
 
 /** The question after a "this and following" change landed (DECISIONS 17-10 #2): the new part by
  *  its title and first day, and what saying no costs (C9b-2 critique C2-H1). */
 export function moveOfferText(m: MilestoneMove): string {
   const starts = m.toDate ? `, which starts on ${formatDateOnly(m.toDate)}` : "";
-  return `Move the “${m.label}” milestone in ${m.project} to the new part of ${quote(m.newTitle)}${starts}? If you don't, it stays on the earlier part, ${ended(m.earlierLastDay)}, and shows as overdue.`;
+  return `Move the “${m.label}” milestone in ${m.project} to the new part of ${quote(m.newTitle)}${starts}? If you don't, it stays on the earlier part, ${staysThere(m)}.`;
 }
 
 /** The Move button's accessible name. Each move button's name starts with the words it shows, so
@@ -665,7 +672,7 @@ export function moveBackFailedText(m: MilestoneMove, why: string): string {
 /** A milestone PM couldn't offer to move, because it couldn't find the new part (C9b-2 critique
  *  C2-M1): where it stays, what that costs, and the way out. */
 export function milestoneStayedText(m: MilestoneMove): string {
-  return `PM couldn't find the new part of ${quote(m.newTitle)} in Google, so “${m.label}” in ${m.project} stays on the earlier part, ${ended(m.earlierLastDay)}, and shows as overdue. Unlink it in ${m.project} to set its date yourself.`;
+  return `PM couldn't find the new part of ${quote(m.newTitle)} in Google, so “${m.label}” in ${m.project} stays on the earlier part, ${staysThere(m)}. Unlink it in ${m.project} to set its date yourself.`;
 }
 
 /** Why the editor couldn't open. */

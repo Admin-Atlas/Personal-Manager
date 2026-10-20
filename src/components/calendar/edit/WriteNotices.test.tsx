@@ -198,6 +198,7 @@ describe("WriteNotices", () => {
     backIcal: "abc@google.com",
     backDate: "2026-10-19",
     earlierLastDay: "2026-10-12",
+    today: "2026-10-20",
     pending: false,
   };
   const offer = (moving = false): WriteNotice => ({

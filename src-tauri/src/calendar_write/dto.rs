@@ -363,6 +363,9 @@ pub struct MilestoneMoves {
     /// The earlier part's last occurrence before the change: a milestone left on it reads overdue
     /// from then. `None` when PM can't say.
     pub earlier_last_day: Option<String>,
+    /// Today, as the change landed: whether that last day has passed yet, for the words (C9b-2
+    /// review round 3, R3-F3).
+    pub today: String,
     /// Never empty.
     pub milestones: Vec<MilestoneOffer>,
 }
@@ -691,6 +694,7 @@ mod tests {
             earlier_title: "Gym".into(),
             first_day: Some("2026-10-19".into()),
             earlier_last_day: Some("2026-10-12".into()),
+            today: "2026-10-13".into(),
             milestones: vec![MilestoneOffer {
                 id: 7,
                 label: "Launch".into(),
@@ -705,7 +709,7 @@ mod tests {
                 milestone_moves: Some(Box::new(moves.clone())),
             })
             .unwrap(),
-            r#"{"outcome":"saved","warnings":[],"milestone_moves":{"new_series_ical":"tail@google.com","earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":"2026-10-19","earlier_last_day":"2026-10-12","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
+            r#"{"outcome":"saved","warnings":[],"milestone_moves":{"new_series_ical":"tail@google.com","earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":"2026-10-19","earlier_last_day":"2026-10-12","today":"2026-10-13","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
         );
         assert_eq!(
             serde_json::to_string(&WriteOutcome::Saved {
@@ -719,7 +723,7 @@ mod tests {
                 })),
             })
             .unwrap(),
-            r#"{"outcome":"saved","warnings":["milestone_not_offered"],"milestone_moves":{"new_series_ical":null,"earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":null,"earlier_last_day":null,"milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
+            r#"{"outcome":"saved","warnings":["milestone_not_offered"],"milestone_moves":{"new_series_ical":null,"earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":null,"earlier_last_day":null,"today":"2026-10-13","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
         );
     }
 
