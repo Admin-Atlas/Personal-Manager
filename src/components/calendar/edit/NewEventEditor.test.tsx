@@ -7,8 +7,8 @@
 // Enter in the title), never on a repeat or while composing text, nothing editable or closable while
 // a save is out, an answer that never arrived shown locked as it was sent with Check again under the
 // same token, a token that ended unproven never called "nothing saved", a failure that keeps the
-// draft, the words that warn before a save PM's calendar won't show, and a calendar list the
-// keyboard can reach.
+// draft, the words that warn before a save PM's calendar won't show, a date it can't read refusing
+// every save until its own field is given one, and a calendar list the keyboard can reach.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -140,6 +140,7 @@ function later() {
 const lost: WriteOutcome = { outcome: "failed", message: CREATE_LOST };
 const unreachable: WriteOutcome = { outcome: "failed", message: "PM couldn't reach Google." };
 const LIST = { name: "Calendars that can take a new event" };
+const CTRL_S = { key: "s", code: "KeyS", ctrlKey: true };
 
 // jsdom ships no ResizeObserver, and the calendar list's popover (escapeClipping) builds one.
 beforeAll(() => {
@@ -641,6 +642,109 @@ describe("NewEventEditor", () => {
     await act(async () => {});
     expect(createEvent).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(title());
+  });
+
+  // A refused Ctrl+S puts focus back in the field that refused, now showing the date it had. The
+  // next Ctrl+S, or a press on Save, leaves that field again: the date it put back was given by
+  // nobody, or the event would be made on the very date the user was changing.
+  it("a date it can't read keeps refusing through Ctrl+S twice and then Save, until one is typed", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    const ctrlS = () => act(async () => void fireEvent.keyDown(window, CTRL_S));
+    start.focus();
+    fireEvent.change(start, { target: { value: "31-11-2026" } });
+    await ctrlS();
+    expect(document.activeElement).toBe(start);
+    expect(start.value).toBe("12-10-2026");
+    await ctrlS();
+    expect(document.activeElement).toBe(start);
+    // A press on Save takes focus out of the field before its click.
+    const save = screen.getByRole("button", { name: "Save" });
+    act(() => save.focus());
+    fireEvent.click(save);
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByText(/^“31-11-2026” isn't a date PM can read/)).toBeTruthy();
+    // A date typed there ends it, and that's the date sent.
+    start.focus();
+    fireEvent.change(start, { target: { value: "13-10-2026" } });
+    await ctrlS();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toHaveLength(1);
+    expect(createEvent.mock.calls[0][1].time).toMatchObject({
+      start_date: "2026-10-13",
+      end_date: "2026-10-13",
+    });
+  });
+
+  // Each refusal is its own field's: another field's date or refusal, a time or a Ctrl+S never ends
+  // it.
+  it("a refused date stands through a time and the other field's date, until its own is given one", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    const end = screen.getByLabelText<HTMLInputElement>("End date");
+    const endRefused = () => screen.queryByText(/^“99-99-2026” isn't a date PM can read/);
+    const startRefused = () => screen.queryByText(/^“31-11-2026” isn't a date PM can read/);
+    const ctrlS = async () => {
+      await act(async () => void fireEvent.keyDown(window, CTRL_S));
+    };
+    /** Type `text` over what `input` shows (a change to the same text is no change at all). */
+    const typeOver = (input: HTMLInputElement, text: string) => {
+      input.focus();
+      fireEvent.change(input, { target: { value: "" } });
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.blur(input);
+    };
+    typeOver(end, "99-99-2026");
+    expect(endRefused()).not.toBeNull();
+    await ctrlS();
+    expect(createEvent).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "09:30" } });
+    expect(endRefused()).not.toBeNull();
+    // A start date moves the end with it, and the end's refusal stays.
+    typeOver(start, "13-10-2026");
+    expect(end.value).toBe("13-10-2026");
+    expect(endRefused()).not.toBeNull();
+    // Both refused, both said.
+    typeOver(start, "31-11-2026");
+    expect(startRefused()).not.toBeNull();
+    expect(endRefused()).not.toBeNull();
+    // The end's own date, typed over: the one it shows counts too. The start's still stands.
+    typeOver(end, "13-10-2026");
+    expect(endRefused()).toBeNull();
+    expect(startRefused()).not.toBeNull();
+    await ctrlS();
+    expect(createEvent).not.toHaveBeenCalled();
+    typeOver(start, "13-10-2026");
+    expect(startRefused()).toBeNull();
+    await ctrlS();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].time).toMatchObject({
+      start_date: "2026-10-13",
+      start_time: "09:30",
+    });
+  });
+
+  // Only a held token that ended unproven keeps the look-first words: a fresh save refused outright
+  // made nothing, so discarding says so and nothing outlives the editor.
+  it("after a fresh save fails outright, discarding says nothing was saved and leaves no notice", async () => {
+    createEvent.mockResolvedValue(unreachable);
+    const { onClose, unmount } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("“Dentist” wasn't created: PM couldn't reach Google.");
+    fireEvent.keyDown(window, { key: "Escape" });
+    const confirm = screen.getByRole("dialog", { name: "Discard this new event?" });
+    expect(within(confirm).getByText("Nothing has been saved to Google yet.")).toBeTruthy();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
+    unmount();
+    expect(noteCreateResult).not.toHaveBeenCalled();
+    expect(noteHeldCreate).not.toHaveBeenCalled();
   });
 
   it("the calendar list closes for a save and stays closed after its answer", async () => {

@@ -188,10 +188,11 @@ export function WhenFields({
   endMin: string | undefined;
   disabled: boolean;
   onChange: (t: TimeDraft) => void;
-  /** A date field gave up on typed text it couldn't read, and showed its date again. */
-  onRejectDate: (text: string) => void;
-  /** A date field holds a date it read (typed, picked, or left as it was). */
-  onAcceptDate: () => void;
+  /** A date field gave up on typed text it couldn't read, and showed its date again: `half` is the
+   *  part of the event it sets (Start date or First day, End date or Last day). */
+  onRejectDate: (half: "start" | "end", text: string) => void;
+  /** That half's date field was given a date, typed or picked. */
+  onAcceptDate: (half: "start" | "end") => void;
   moveStart: (t: Timed, date: string, time: string) => Timed;
   moveEndDate: (t: Timed, date: string) => Timed;
   onSwitchKind: () => void;
@@ -199,13 +200,13 @@ export function WhenFields({
   onPickZone: (which: "both" | "start" | "end") => void;
 }) {
   const t = draft.time;
-  // What every date field here shares.
-  const dateProps = {
+  // What every date field here shares, for the half of the event it sets.
+  const dateProps = (half: "start" | "end") => ({
     clearable: false,
     disabled,
-    onReject: onRejectDate,
-    onAccept: onAcceptDate,
-  };
+    onReject: (text: string) => onRejectDate(half, text),
+    onAccept: () => onAcceptDate(half),
+  });
   return (
     <fieldset className="flex flex-col gap-2" disabled={disabled}>
       <legend className="text-sm text-ink2">When</legend>
@@ -221,7 +222,7 @@ export function WhenFields({
       {t.kind === "all_day" ? (
         <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
           <DateField
-            {...dateProps}
+            {...dateProps("start")}
             ariaLabel="First day"
             value={t.first_day}
             // Moving the first day moves the whole event; the last day alone changes its length.
@@ -235,7 +236,7 @@ export function WhenFields({
           />
           <span>to</span>
           <DateField
-            {...dateProps}
+            {...dateProps("end")}
             ariaLabel="Last day"
             value={t.last_day}
             min={t.first_day}
@@ -247,7 +248,7 @@ export function WhenFields({
           <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
             <span className="w-10">Starts</span>
             <DateField
-              {...dateProps}
+              {...dateProps("start")}
               ariaLabel="Start date"
               value={t.start_date}
               onCommit={(d) => onChange(moveStart(t, d, t.start_time))}
@@ -264,7 +265,7 @@ export function WhenFields({
           <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
             <span className="w-10">Ends</span>
             <DateField
-              {...dateProps}
+              {...dateProps("end")}
               ariaLabel="End date"
               value={t.end_date}
               min={endMin}

@@ -18,8 +18,8 @@
 // Every time carries its own zone; when this computer's zone can't be read, times can't be changed
 // at all rather than guessing UTC (plan rule R6). A typed date only counts once its field commits
 // it (on blur), so Save and Close blur the focused field first, and a date the field couldn't read
-// stops the save rather than vanishing. The fields themselves live in `EventFields`, shared with
-// creating an event (`NewEventEditor`).
+// stops the save rather than vanishing, until that field is given a date. The fields themselves
+// live in `EventFields`, shared with creating an event (`NewEventEditor`).
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -39,6 +39,7 @@ import type {
 } from "../../../lib/types";
 import {
   DEFAULT_LENGTH_MS,
+  NO_BAD_DATES,
   allDayOf,
   canEdit,
   changedFields,
@@ -49,13 +50,16 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   halfInstant,
+  hasBadDate,
   rebaseDraft,
   seedDraft,
   toChanges,
+  type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
+  badDateLines,
   CALLOUT_TONE,
   earlierChangeText,
   listFields,
@@ -160,12 +164,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   // The latest draft, readable synchronously: Save and Close blur the focused field first, and a
   // date typed but not yet committed commits in that blur, before React re-renders.
   const draftRef = useRef<EditorFields | null>(null);
-  // Text a date field couldn't read; a save is refused while it stands.
-  const badDateRef = useRef<string | null>(null);
-  const [badDate, setBadDateState] = useState<string | null>(null);
-  const setBadDate = (text: string | null) => {
-    badDateRef.current = text;
-    setBadDateState(text);
+  // Text a date field couldn't read, by the half it sets: no save until that field is given a date.
+  const badDatesRef = useRef<BadDates>(NO_BAD_DATES);
+  const [badDates, setBadDatesState] = useState<BadDates>(NO_BAD_DATES);
+  const setBadDates = (next: BadDates) => {
+    badDatesRef.current = next;
+    setBadDatesState(next);
   };
   // The event's length, kept while its start moves (and across a start that can't be read).
   const lengthRef = useRef<number | null>(null);
@@ -247,7 +251,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   const requestClose = () => {
     if (saving) return;
     commitFocused();
-    if (isDirty() || badDateRef.current) setAskDiscard("close");
+    if (isDirty() || hasBadDate(badDatesRef.current)) setAskDiscard("close");
     else onClose();
   };
 
@@ -346,8 +350,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     againRef.current = 0;
     heldNotice.current = null;
     // What stops this save is already said under When, as it happened; a banner repeating it would
-    // outlive the fix.
-    if (badDateRef.current || checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
+    // outlive the fix. Focus goes back where it was, a date field included: the text it put back is
+    // no date given, so this refusal stands.
+    if (
+      hasBadDate(badDatesRef.current) ||
+      checkDraft(loaded.base, current, loaded.event).problems.length > 0
+    ) {
       setBanner(null);
       refocus(focused);
       return;
@@ -647,12 +655,9 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               endChoices={endChoices}
               endMin={endMin}
               disabled={!timeEditable}
-              onChange={(time) => {
-                setBadDate(null);
-                setDraft({ ...draft, time });
-              }}
-              onRejectDate={setBadDate}
-              onAcceptDate={() => setBadDate(null)}
+              onChange={(time) => setDraft({ ...draft, time })}
+              onRejectDate={(half, text) => setBadDates({ ...badDatesRef.current, [half]: text })}
+              onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
               moveStart={moveStart}
               moveEndDate={moveEndDate}
               onSwitchKind={() =>
@@ -688,14 +693,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             {/* What would stop the save, shown as it happens rather than only on Save (each sentence
                 once: a start and an end in the same skipped hour say the same thing). */}
             {[
-              ...new Set([
-                ...(badDate
-                  ? [
-                      `“${badDate}” isn't a date PM can read. Type it as dd-mm-yyyy, or pick it from the calendar.`,
-                    ]
-                  : []),
-                ...(check?.problems.map(problemText) ?? []),
-              ]),
+              ...new Set([...badDateLines(badDates), ...(check?.problems.map(problemText) ?? [])]),
             ].map((text) => (
               <p key={text} className="text-xs text-st-due">
                 {text}

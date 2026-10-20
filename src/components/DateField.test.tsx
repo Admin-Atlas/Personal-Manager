@@ -4,7 +4,8 @@
 // @vitest-environment jsdom
 //
 // The date field's earliest allowed date (`min`): a date before it, typed or picked, becomes it, and
-// the picker greys the days before it. Without `min` nothing changes.
+// the picker greys the days before it. Without `min` nothing changes. And `onAccept`: only a date
+// typed or picked is given, never text the field showed on its own.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -73,5 +74,68 @@ describe("DateField with an earliest date", () => {
     render(<DateField value="2026-10-14" onCommit={onCommit} ariaLabel="Ends" />);
     typeInto(screen.getByLabelText<HTMLInputElement>("Ends"), "05-10-2026");
     expect(onCommit).toHaveBeenCalledWith("2026-10-05");
+  });
+});
+
+// A form holding a refusal (`onReject`) lets it go on `onAccept`. Its save blurs the focused field
+// first, so a blur on the date the field put back must not pass for one given.
+describe("DateField's onAccept", () => {
+  it("fires for a date typed, even the one it holds, never for text nobody typed", () => {
+    const onAccept = vi.fn();
+    const onReject = vi.fn();
+    render(
+      <DateField
+        value="2026-10-14"
+        onCommit={() => {}}
+        onReject={onReject}
+        onAccept={onAccept}
+        ariaLabel="Starts"
+      />,
+    );
+    const input = screen.getByLabelText<HTMLInputElement>("Starts");
+    // In and out on its own date.
+    input.focus();
+    fireEvent.blur(input);
+    expect(onAccept).not.toHaveBeenCalled();
+    // Refused, then in and out on the date it put back, by blur and by Enter.
+    typeInto(input, "31-11-2026");
+    expect(onReject).toHaveBeenCalledWith("31-11-2026");
+    expect(input.value).toBe("14-10-2026");
+    input.focus();
+    fireEvent.blur(input);
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).not.toHaveBeenCalled();
+    // The date it shows, typed over (a change to the same text is no change at all).
+    input.focus();
+    fireEvent.change(input, { target: { value: "" } });
+    typeInto(input, "14-10-2026");
+    expect(onAccept).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires for a date picked", () => {
+    const onAccept = vi.fn();
+    render(
+      <DateField value="2026-10-14" onCommit={() => {}} onAccept={onAccept} ariaLabel="Starts" />,
+    );
+    fireEvent.click(screen.getByLabelText("Starts"));
+    fireEvent.click(screen.getByRole("button", { name: "Today" }));
+    expect(onAccept).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays quiet when the date changed underneath what was typed", () => {
+    const onAccept = vi.fn();
+    const field = (value: string) => (
+      <DateField value={value} onCommit={() => {}} onAccept={onAccept} ariaLabel="Starts" />
+    );
+    const { rerender } = render(field("2026-10-14"));
+    const input = screen.getByLabelText<HTMLInputElement>("Starts");
+    input.focus();
+    fireEvent.change(input, { target: { value: "15-10-2026" } });
+    // The form moved it meanwhile: the typing is gone, and what shows is the form's own.
+    rerender(field("2026-10-20"));
+    expect(input.value).toBe("20-10-2026");
+    fireEvent.blur(input);
+    expect(onAccept).not.toHaveBeenCalled();
   });
 });

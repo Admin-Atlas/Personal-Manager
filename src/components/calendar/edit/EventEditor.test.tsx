@@ -338,6 +338,16 @@ describe("EventEditor", () => {
     expect(onClose).not.toHaveBeenCalled();
     // The field it was typed in keeps focus, rather than the page behind the dialog.
     expect(document.activeElement).toBe(start);
+    expect(start.value).toBe("12-10-2026");
+    // Saving again leaves that field on the date it put back, which nobody gave: still refused,
+    // pressed with the field focused and with the press taking focus to Save first.
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const save = screen.getByRole("button", { name: "Save" });
+    act(() => save.focus());
+    fireEvent.click(save);
+    await act(async () => {});
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(screen.getByText(/“31-13-2026” isn't a date PM can read/)).toBeTruthy();
   });
 
   it("asks before closing over a date typed but not yet committed", async () => {
@@ -570,18 +580,43 @@ describe("EventEditor", () => {
     expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("00:45");
   });
 
-  it("says at once when a typed date can't be read, until the field holds one again", async () => {
+  // A refusal is the field's that refused: only a date typed or picked there ends it, or Save would
+  // send the very date the user was changing.
+  it("says at once when a typed date can't be read, until that field is given a date", async () => {
     openForEdit.mockResolvedValue(ready(event()));
-    await open();
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
     const start = screen.getByLabelText<HTMLInputElement>("Start date");
+    const refused = () => screen.queryByText(/“31-13-2026” isn't a date PM can read/);
     start.focus();
     fireEvent.change(start, { target: { value: "31-13-2026" } });
     fireEvent.blur(start);
-    expect(screen.getByText(/“31-13-2026” isn't a date PM can read/)).toBeTruthy();
-    // Back in the field and out again, on the date it shows: that date stands.
+    expect(refused()).not.toBeNull();
+    // Back in the field and out again, on the date it put back: nobody gave that date.
     start.focus();
     fireEvent.blur(start);
-    expect(screen.queryByText(/isn't a date PM can read/)).toBeNull();
+    expect(refused()).not.toBeNull();
+    // Nor does a time, or a date given to the end.
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "09:30" } });
+    expect(refused()).not.toBeNull();
+    const end = screen.getByLabelText<HTMLInputElement>("End date");
+    end.focus();
+    fireEvent.change(end, { target: { value: "13-10-2026" } });
+    fireEvent.blur(end);
+    expect(end.value).toBe("13-10-2026");
+    expect(refused()).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {});
+    expect(saveEdit).not.toHaveBeenCalled();
+    // The date it shows, typed over in that field: given, so it stands and the save goes.
+    start.focus();
+    fireEvent.change(start, { target: { value: "" } });
+    fireEvent.change(start, { target: { value: "12-10-2026" } });
+    fireEvent.blur(start);
+    expect(refused()).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledTimes(1);
   });
 
   it("lets a description have several lines", async () => {

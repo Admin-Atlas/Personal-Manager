@@ -11,11 +11,22 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
+// The floating briefing, with something to show; its body isn't what these read.
+vi.mock("../../../lib/briefing", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useBriefing: () => ({ briefing: { briefing: "Stand-up at ten." }, busy: false }),
+}));
+vi.mock("../../Briefing", () => ({ Briefing: () => null }));
+
 import { Modal } from "../../ui";
+import { BriefingPanel } from "../../BriefingPanel";
 import { WriteNotices } from "./WriteNotices";
 import type { WriteNotice } from "./useEventWrites";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 const deleting = (id: number, summary: string): WriteNotice => ({
   id,
@@ -37,19 +48,25 @@ function zOf(el: Element | null): number {
 
 describe("WriteNotices", () => {
   // A notice that never goes (Check again) covered a new event's Cancel and Save on a short window,
-  // and sat outside the dialog's focus trap: notices stack under any open dialog's scrim.
-  it("sits under an open dialog's scrim, whichever comes later in the page", () => {
+  // and sat outside the dialog's focus trap: notices stack under any open dialog's scrim. Tied with
+  // the floating briefing, which comes after them in the page as here, they went under it instead:
+  // they sit strictly between the two.
+  it("sits under an open dialog's scrim and over the floating briefing", () => {
+    localStorage.setItem("pm.briefing.float", "inApp");
     render(
       <>
         <Modal open onClose={vi.fn()} label="New event">
           <button type="button">Save</button>
         </Modal>
         <WriteNotices notices={[deleting(1, "Gym")]} onUndo={vi.fn()} onDismiss={vi.fn()} />
+        <BriefingPanel />
       </>,
     );
     const scrim = screen.getByRole("dialog").parentElement;
+    const briefing = screen.getByRole("complementary", { name: "Today's briefing" });
     const stack = screen.getByText("Deleting “Gym”.").closest(".fixed");
     expect(zOf(stack)).toBeLessThan(zOf(scrim));
+    expect(zOf(stack)).toBeGreaterThan(zOf(briefing));
   });
 
   it("names the shortcut on the newest Undo only", () => {

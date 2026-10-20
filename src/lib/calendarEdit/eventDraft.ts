@@ -144,6 +144,16 @@ export interface DraftCheck {
   ambiguous: ("start" | "end")[];
 }
 
+/** Text a date field couldn't read, by the half of the event it sets (Start date or First day, End
+ *  date or Last day). Each stands until that half's field is given a date, typed or picked, and a
+ *  save is refused while either does: another date, a time or a blur never ends it, or the save
+ *  would go on the very date the user was changing. */
+export type BadDates = Readonly<Record<"start" | "end", string | null>>;
+
+export const NO_BAD_DATES: BadDates = { start: null, end: null };
+
+export const hasBadDate = (bad: BadDates) => bad.start !== null || bad.end !== null;
+
 /** Google's exact instants for the copy the base was seeded from (`EventForEdit` carries them). */
 export interface HeldTimes {
   start_at: string | null;

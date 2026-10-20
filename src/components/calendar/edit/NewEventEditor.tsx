@@ -24,6 +24,7 @@ import { flushSync } from "react-dom";
 import type { CalendarOverview, WriteOutcome } from "../../../lib/types";
 import {
   NEW_EVENT_BASE,
+  NO_BAD_DATES,
   changedFields,
   checkDraft,
   endAfterStart,
@@ -32,12 +33,15 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   halfInstant,
+  hasBadDate,
   switchNewKind,
   toNewEvent,
+  type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
+  badDateLines,
   CALLOUT_TONE,
   createText,
   problemText,
@@ -123,11 +127,12 @@ export function NewEventEditor({
   const draftRef = useRef<EditorFields>(seed);
   const [calendarId, setCalendarIdState] = useState(firstCalendar);
   const calendarRef = useRef(firstCalendar);
-  const badDateRef = useRef<string | null>(null);
-  const [badDate, setBadDateState] = useState<string | null>(null);
-  const setBadDate = (text: string | null) => {
-    badDateRef.current = text;
-    setBadDateState(text);
+  // Text a date field couldn't read, by the half it sets: no save until that field is given a date.
+  const badDatesRef = useRef<BadDates>(NO_BAD_DATES);
+  const [badDates, setBadDatesState] = useState<BadDates>(NO_BAD_DATES);
+  const setBadDates = (next: BadDates) => {
+    badDatesRef.current = next;
+    setBadDatesState(next);
   };
   // The event's length, kept while its start moves: the account's default to begin with.
   const lengthRef = useRef(lengthFor(overview, targetById(targets, firstCalendar)));
@@ -242,7 +247,7 @@ export function NewEventEditor({
     commitFocused();
     // Nothing to discard: what may be in Google stays in hand, as a notice.
     if (heldRef.current) onClose();
-    else if (isDirty() || badDateRef.current) setAskDiscard(true);
+    else if (isDirty() || hasBadDate(badDatesRef.current)) setAskDiscard(true);
     else onClose();
   };
 
@@ -312,8 +317,12 @@ export function NewEventEditor({
       fields = h.fields;
     } else {
       const current = draftRef.current;
-      // What stops it is already said under When, as it happened.
-      if (badDateRef.current || checkDraft(NEW_EVENT_BASE, current).problems.length > 0) {
+      // What stops it is already said under When, as it happened. Focus goes back where it was, a
+      // date field included: the text it put back is no date given, so this refusal stands.
+      if (
+        hasBadDate(badDatesRef.current) ||
+        checkDraft(NEW_EVENT_BASE, current).problems.length > 0
+      ) {
         setBanner(null);
         refocus(focused);
         return;
@@ -411,16 +420,7 @@ export function NewEventEditor({
   const range = `${formatDateLocal(new Date(overview.mirror_start))} – ${formatDateLocal(
     new Date(overview.mirror_end),
   )}`;
-  const lines = [
-    ...new Set([
-      ...(badDate
-        ? [
-            `“${badDate}” isn't a date PM can read. Type it as dd-mm-yyyy, or pick it from the calendar.`,
-          ]
-        : []),
-      ...check.problems.map(problemText),
-    ]),
-  ];
+  const lines = [...new Set([...badDateLines(badDates), ...check.problems.map(problemText)])];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
     ...(outside
@@ -516,12 +516,9 @@ export function NewEventEditor({
             endChoices={endChoices}
             endMin={endMin}
             disabled={!timeEditable}
-            onChange={(time) => {
-              setBadDate(null);
-              changeTime({ ...draft, time });
-            }}
-            onRejectDate={setBadDate}
-            onAcceptDate={() => setBadDate(null)}
+            onChange={(time) => changeTime({ ...draft, time })}
+            onRejectDate={(half, text) => setBadDates({ ...badDatesRef.current, [half]: text })}
+            onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
             moveStart={moveStart}
             moveEndDate={moveEndDate}
             onSwitchKind={() =>
