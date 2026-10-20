@@ -11,6 +11,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 import { DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
+import { formatClock } from "../../../lib/format";
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -34,6 +35,10 @@ const ev = (over: Partial<CalendarEvent>): CalendarEvent => ({
   uid: null,
   ...over,
 });
+
+// A row says its time in the reader's own clock (09:00 here, 09:00 AM on CI's runner), so the names
+// are built with the helper the view uses and hold in any locale.
+const clock = (h: number) => formatClock(new Date(2026, 9, 12, h));
 
 function agenda(events: CalendarEvent[]) {
   render(
@@ -59,13 +64,15 @@ describe("AgendaView", () => {
         start: "2026-10-12T11:00:00",
       }),
     ]);
-    const ghost = screen.getByRole("button", { name: "New event, not saved yet: 11:00, Dentist" });
+    const ghost = screen.getByRole("button", {
+      name: `New event, not saved yet: ${clock(11)}, Dentist`,
+    });
     expect(ghost.className).toContain("outline-dashed");
     expect(ghost.className).toContain("-outline-offset-1");
     expect(ghost.className).not.toContain("opacity-60");
     expect(ghost.hasAttribute("data-draft-event")).toBe(true);
     expect(ghost.style.borderLeftColor).toBe("rgb(51, 102, 153)");
-    const synced = screen.getByRole("button", { name: /^09:00\s*Synced$/ });
+    const synced = screen.getByRole("button", { name: new RegExp(`^${clock(9)}\\s*Synced$`) });
     expect(synced.className).not.toContain("outline-dashed");
     expect(synced.className).toContain("opacity-60");
     expect(synced.hasAttribute("data-draft-event")).toBe(false);
@@ -81,7 +88,7 @@ describe("AgendaView", () => {
     ]);
     expect(
       screen.getByRole("button", {
-        name: "New event, PM may already have made it: 09:00, Dentist",
+        name: `New event, PM may already have made it: ${clock(9)}, Dentist`,
       }),
     ).toBeTruthy();
   });

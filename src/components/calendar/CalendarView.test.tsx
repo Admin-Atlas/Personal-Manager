@@ -215,14 +215,18 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-/** The Calendar tab, fresh, once its first read has landed. `Calendar` mounts it again (the same
- *  module, as switching back to the tab does). */
+/** The Calendar tab, fresh, once its first reads have landed. `Calendar` mounts it again (the same
+ *  module, as switching back to the tab does). The events and the calendars are read side by side:
+ *  the rest of those reads, and the effects that rebind the keys to the calendars, are let finish
+ *  too, since a key pressed before them would reach a handler with no calendars yet and open
+ *  nothing (the source of an occasional failure here). */
 async function mount(Calendar?: typeof import("./CalendarView").CalendarView) {
   const View = Calendar ?? (await import("./CalendarView")).CalendarView;
   const onOpenProject = vi.fn();
   const onOpenPinboard = vi.fn();
   const view = render(<View onOpenProject={onOpenProject} onOpenPinboard={onOpenPinboard} />);
   await screen.findByRole("button", { name: /Standup/ });
+  await act(async () => {});
   return { onOpenProject, onOpenPinboard, unmount: view.unmount, View };
 }
 

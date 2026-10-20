@@ -12,6 +12,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 import { DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
+import { formatClock } from "../../../lib/format";
 
 let depth = "standard";
 
@@ -61,6 +62,10 @@ const ev = (over: Partial<CalendarEvent>): CalendarEvent => ({
   ...over,
 });
 
+// A chip says its time in the reader's own clock (09:00 here, 09:00 AM on CI's runner), so the names
+// are built with the helper the view uses and hold in any locale.
+const clock = (h: number) => formatClock(new Date(2026, 9, 13, h));
+
 function month(events: CalendarEvent[]) {
   render(
     <MonthView
@@ -87,14 +92,16 @@ describe("MonthView", () => {
       }),
     ]);
     // Named as the new event, not yet saved, so it isn't heard as one that's in the calendar.
-    const chip = screen.getByRole("button", { name: "New event, not saved yet: 11:00, Dentist" });
+    const chip = screen.getByRole("button", {
+      name: `New event, not saved yet: ${clock(11)}, Dentist`,
+    });
     // Dashed inside its edge: a cell's list clips its chips, and would take an outer dash away.
     expect(chip.className).toContain("outline-dashed");
     expect(chip.className).toContain("-outline-offset-1");
     expect(chip.className).not.toContain("opacity-60");
     expect(chip.hasAttribute("data-draft-event")).toBe(true);
     expect(chip.style.borderLeftColor).toBe("rgb(51, 102, 153)");
-    const synced = screen.getByRole("button", { name: "09:00, Synced" });
+    const synced = screen.getByRole("button", { name: `${clock(9)}, Synced` });
     expect(synced.className).not.toContain("outline-dashed");
     expect(synced.className).toContain("opacity-60");
     cleanup();
@@ -128,9 +135,9 @@ describe("MonthView", () => {
       ev({ id: DRAFT_EVENT_ID, summary: "Dentist", start: "2026-10-13T15:00:00" }),
     ]);
     expect(
-      screen.getByRole("button", { name: "New event, not saved yet: 15:00, Dentist" }),
+      screen.getByRole("button", { name: `New event, not saved yet: ${clock(15)}, Dentist` }),
     ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "10:00, Three" })).toBeNull();
+    expect(screen.queryByRole("button", { name: `${clock(10)}, Three` })).toBeNull();
     expect(screen.getByText("+1 more")).toBeTruthy();
   });
 
