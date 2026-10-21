@@ -1892,10 +1892,15 @@ mod tests {
 
     /// C12 decision 3: a guest list sent once more after a 412 is Google's list then with the user's
     /// guest changes, so A's reply, comment and extra guest that landed between PM's read and its
-    /// write stay, and B is still added: the series' list and one occurrence's alike.
+    /// write stay, and B is still added: the series' list and one occurrence's alike. The rebuilt
+    /// write still emails whom the user chose, as the first one did, whichever answer it was.
     #[test]
     fn a_guest_list_sent_once_more_keeps_what_guests_said_meanwhile() {
         use crate::calendar_write::dto::{EventPatchDraft, GuestOp, GuestState};
+        let send_updates = |url: &str| {
+            url.split_once("sendUpdates=")
+                .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_owned())
+        };
         let waiting = |event: Value| {
             let mut v = guests_on_it(event, &["a@example.com"]);
             v["attendees"][1]["responseStatus"] = json!("needsAction");
@@ -1909,13 +1914,18 @@ mod tests {
             }]),
             ..Default::default()
         };
-        for (scope, event) in [
-            (Scope::All, case.master.json()),
-            (Scope::This, case.instance.json()),
-        ] {
-            let plan = case
-                .edit_told(scope, add_b.clone(), Some(Notify::All))
-                .unwrap();
+        for (notify, (scope, event)) in [Notify::All, Notify::None, Notify::ExternalOnly]
+            .into_iter()
+            .flat_map(|n| {
+                [
+                    (Scope::All, case.master.json()),
+                    (Scope::This, case.instance.json()),
+                ]
+                .map(|s| (n, s))
+            })
+        {
+            let told = notify.as_param();
+            let plan = case.edit_told(scope, add_b.clone(), Some(notify)).unwrap();
             let mut replied = at_etag(event, "\"r2\"");
             replied["attendees"][1] = json!({ "email": "a@example.com", "responseStatus": "accepted",
                                               "comment": "On my way", "additionalGuests": 1 });
@@ -1934,7 +1944,7 @@ mod tests {
                 }
                 _ => ok(replied.clone()),
             });
-            assert!(matches!(ran, Ran::Done { .. }), "{scope:?}: landed");
+            assert!(matches!(ran, Ran::Done { .. }), "{scope:?}, {told}: landed");
             assert!(sent.len() == 3 && sent[1].method == Method::Get);
             assert!(sent[2].if_match.as_deref() == Some("\"r2\""));
             let mut want = replied["attendees"].clone();
@@ -1943,7 +1953,15 @@ mod tests {
                 .push(json!({ "email": "b@example.com" }));
             assert!(
                 sent[2].body.as_ref().map(|b| &b["attendees"]) == Some(&want),
-                "{scope:?}: A's reply kept, B still added"
+                "{scope:?}, {told}: A's reply kept, B still added"
+            );
+            assert!(
+                send_updates(&sent[0].url).as_deref() == Some(told),
+                "{scope:?}, {told}: the first write emails whom the user chose"
+            );
+            assert!(
+                send_updates(&sent[2].url) == send_updates(&sent[0].url),
+                "{scope:?}, {told}: the rebuilt write emails whom the first one did"
             );
         }
     }
