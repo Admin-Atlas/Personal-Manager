@@ -146,7 +146,7 @@ export function writeWarningText(
         ? `Some occurrences you changed on their own may still be on the earlier part, or hidden by Google${days}; check them in Google Calendar.`
         : `Some occurrences changed on their own may still show${days}; check them in Google Calendar.`;
     }
-    // Only a new event comes back with it.
+    // A new event comes back with it, and a repeating event saved as one that doesn't repeat.
     case "outside_mirror":
       return "It starts outside the months PM syncs, so PM's calendar won't show it.";
     // A notice per milestone names each one (`milestoneStayedText`); this is the short form.
@@ -421,15 +421,21 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
 /** A save that landed, said once the editor has closed. `scope` names the occurrences of a
  *  repeating event it was for: there's no Undo after one (DECISIONS 17-10 #4), so the notice says
  *  how to change it back, and for "this and following", which makes a repeating event of its own
- *  from `from` (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). */
+ *  from `from` (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). `stops`:
+ *  the save made it "Does not repeat", so from `from` on it's one event, not a repeating one. One
+ *  that left the event outside the months PM syncs says so, and never to edit it again here
+ *  (C11c review). */
 export function savedNotice(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
   scope: SeriesScope | null,
   from?: string,
+  stops = false,
 ): { tone: Tone; text: string } {
   const t = quote(title);
-  const pending = outcome.warnings.includes("mirror_refresh_pending");
+  const outside = outcome.warnings.includes("outside_mirror");
+  // Off PM's calendar, there's nothing for a refresh to show.
+  const pending = outcome.warnings.includes("mirror_refresh_pending") && !outside;
   const left = outcome.warnings.includes("left_on_old_series");
   let first: string;
   let back: string | null;
@@ -442,11 +448,16 @@ export function savedNotice(
       first = `Saved ${t} for this occurrence.`;
       back = "To change it back, edit it again.";
       break;
-    case "following":
-      first = `Saved ${t} from ${from ? formatDateOnly(from) : "this occurrence"} on, as a repeating event of its own.`;
-      back =
-        "There's no Undo: editing it again changes that part, but won't join it back to the earlier one.";
+    case "following": {
+      const day = from ? formatDateOnly(from) : "this occurrence";
+      first = stops
+        ? `Saved ${t} from ${day} on, as one event that doesn't repeat.`
+        : `Saved ${t} from ${day} on, as a repeating event of its own.`;
+      back = stops
+        ? "There's no Undo: editing it again changes that event, but won't join it back to the earlier ones."
+        : "There's no Undo: editing it again changes that part, but won't join it back to the earlier one.";
       break;
+    }
     case "all":
       first = `Saved ${t} for every occurrence.`;
       back = "To change it back, edit it again.";
@@ -455,11 +466,13 @@ export function savedNotice(
       return unreachable(scope);
   }
   const parts = [first];
+  if (outside) parts.push(writeWarningText("outside_mirror", "save"));
   if (pending) parts.push(writeWarningText("mirror_refresh_pending", "save"));
-  // Occurrences left on the earlier part come first: changing it back isn't the whole story.
+  // Occurrences left on the earlier part come first: changing it back isn't the whole story. An
+  // event PM's calendar won't show can't be edited again here.
   if (left) parts.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
-  else if (back) parts.push(back);
-  return { tone: left ? "warn" : "ok", text: parts.join(" ") };
+  else if (back && !outside) parts.push(back);
+  return { tone: left || outside ? "warn" : "ok", text: parts.join(" ") };
 }
 
 // --- creating an event (C10) ---

@@ -65,7 +65,7 @@ use crate::calendar_write::series::run::{
     Why,
 };
 use crate::calendar_write::series::scope::{
-    is_first, scope_options, Change, Row, Scope, ScopeReason,
+    is_first, scope_options, Change, Row, RuleChange, Scope, ScopeReason,
 };
 use crate::calendar_write::series::{
     later_part, original_of, parts_overlap, text_only, Exceptions, FreshEvent, LaterPart, Listing,
@@ -2320,8 +2320,14 @@ async fn gather<W: Wire>(
         &master,
         &window,
     );
-    // The same parts, and Google's own `_R` ones the mirror holds, as where a new rule must stop.
-    let later = later_part(&parts, &master, &mirror.series_ids);
+    // PM's note says this series is itself a part of one split earlier.
+    let noted_part = master_fresh
+        .json()
+        .pointer("/extendedProperties/private/pmSplitOf")
+        .is_some();
+    // The same parts, and Google's own `_R` ones the mirror holds, as where a new rule must stop; a
+    // part itself, where its own rule ends now.
+    let later = later_part(&parts, &master, noted_part, &mirror.series_ids);
     let parts = parts_overlap(&parts, &master, &window, &exceptions);
     // Google's count of what comes before a split, for a rule that ends after so many (A7): every
     // occurrence, unwindowed, only the fields counting reads.
@@ -2356,10 +2362,7 @@ async fn gather<W: Wire>(
             .series_ids
             .iter()
             .any(|id| *id != master.id && base(id) == base(&master.id))
-        || master_fresh
-            .json()
-            .pointer("/extendedProperties/private/pmSplitOf")
-            .is_some();
+        || noted_part;
     Ok(Some(Series {
         master_fresh,
         master,
@@ -2771,6 +2774,11 @@ const PUT_BACK: &str = "PM put this repeating event's times and repeat back as t
                         shows it after the next refresh. Open the event again to change it.";
 const RETIME_UNSURE: &str = "PM lost touch with Google while moving the occurrences, so they may \
                              have moved, or moved only partly. Check them in Google Calendar.";
+const RULE_UNSURE: &str = "PM lost touch with Google while changing how this event repeats, so it \
+                           may still repeat as before, or have changed only partly. Check it in \
+                           Google Calendar.";
+const STOP_UNSURE: &str = "PM lost touch with Google while making this an event that doesn't \
+                           repeat, so it may still repeat. Check it in Google Calendar.";
 
 /// Whether a scoped write may leave out the dialog's choice: dev builds only, for the devtools
 /// probes. The one release gate for it, which every shell's [`SeriesWrite`] takes (a settle, which
@@ -3294,9 +3302,15 @@ async fn land_series<W: Wire, H: Host>(
                 .steps
                 .get(step)
                 .is_some_and(|s| matches!(s.undo, Some(Undo::RestoreMaster { .. })));
+            // What may be half done is what was asked: a new rule, or none, moves nothing as such.
+            let message = match planning.change.rule {
+                None => RETIME_UNSURE,
+                Some(RuleChange::New) => RULE_UNSURE,
+                Some(RuleChange::Stop) => STOP_UNSURE,
+            };
             return if moving {
                 WriteOutcome::Failed {
-                    message: RETIME_UNSURE.into(),
+                    message: message.into(),
                 }
             } else {
                 WriteOutcome::Unconfirmed
@@ -5244,11 +5258,20 @@ fn journal_entry(
     facts: &SplitFacts,
     start: &Value,
 ) -> Option<Entry> {
-    let Shows::Tail { plan: digest, .. } = &plan.steps.get(facts.insert)?.shows else {
+    let insert = plan.steps.get(facts.insert)?;
+    let Shows::Tail { plan: digest, .. } = &insert.shows else {
         return None;
     };
     let Shows::Fields { sent, old } = &plan.steps.get(facts.insert + 1)?.shows else {
         return None;
+    };
+    // "Does not repeat" from here inserts one event: no rule goes with it.
+    let one_off = match &insert.op {
+        Op::Insert { body, .. } => body
+            .get("recurrence")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        _ => false,
     };
     let lines = |v: Option<&Value>| -> Option<Vec<String>> {
         v?.as_array()?
@@ -5268,6 +5291,7 @@ fn journal_entry(
         before: lines(old.get("recurrence"))?,
         cut: lines(sent.get("recurrence"))?,
         cleanup: plan.steps.len() > facts.insert + 2,
+        one_off,
     })
 }
 
@@ -5327,6 +5351,18 @@ impl Orphaned {
     fn words(&self) -> String {
         let day = day_words(&self.entry.from);
         match self.orphan {
+            // "Does not repeat" from here: the event PM made in its place has no "All events" to
+            // delete, and the occurrences after it were to go, not move.
+            Orphan::Twice if self.entry.one_off => format!(
+                "PM closed while it was making this repeating event stop repeating from {day}: it \
+                 still repeats from then, and the event PM made in its place is there too. In \
+                 Google Calendar, delete that event, the one that doesn't repeat, then try again."
+            ),
+            Orphan::CutLanded if self.entry.one_off => format!(
+                "PM closed before it finished making this repeating event stop repeating from \
+                 {day}: occurrences you changed on their own from then may still show. If they \
+                 do, delete them in Google Calendar."
+            ),
             Orphan::Twice => format!(
                 "PM closed while it was changing this repeating event, so it shows twice from {day}. \
                  In Google Calendar, delete the newer copy (Delete › All events on it), then try \
@@ -9583,6 +9619,37 @@ mod tests {
         }
     }
 
+    /// C11c review: a new rule, or "Does not repeat", whose answers prove nothing says what may be
+    /// half done, never that occurrences moved.
+    #[tokio::test]
+    async fn an_unknown_rule_change_says_what_may_be_half_done() {
+        let look = || Step::get("/events/abc", "", weekly());
+        for (draft, message) in [
+            (on_tuesdays(), RULE_UNSURE),
+            (stop_repeating(), STOP_UNSURE),
+        ] {
+            let host = TestHost::holding(&october());
+            let mut steps = october_reads();
+            steps.extend([
+                series_patch(Scripted::Lost { retried: false }),
+                look(),
+                series_patch(Scripted::Lost { retried: false }),
+                look(),
+            ]);
+            let script = Script::new(steps);
+            let (outcome, _) =
+                save(&host, &script, &monday_19(), &weekly(), draft, Scope::All).await;
+            script.asked_all();
+            assert_eq!(
+                outcome,
+                WriteOutcome::Failed {
+                    message: message.into()
+                }
+            );
+            assert!(host.nothing_recorded() && host.hash_dropped());
+        }
+    }
+
     /// §2.3: "this and following" without a new series cuts the series, then cancels the stored
     /// occurrences after the cut. One changed in Google since is left, said, and its row stays.
     #[tokio::test]
@@ -10118,6 +10185,50 @@ mod tests {
         assert!(following == past && all == past, "both refused in words");
     }
 
+    /// C11c review, through the reads: a series that PM's note says is itself a part of another,
+    /// cut before Monday 02-11 when a later part was made from there, can't see that part among its
+    /// own; it isn't made to repeat past Monday 26-10, where it ends now.
+    #[tokio::test]
+    async fn a_part_is_not_made_to_repeat_past_where_it_ends() {
+        let part = with(
+            master(&["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261102T085959Z"]),
+            "extendedProperties",
+            json!({ "private": { "pmSplitOf": "root", "pmSplitAt": "2026-10-05T08:00:00+00:00" } }),
+        );
+        let instance = monday_19();
+        let opened = Some((&instance, Some(&part)));
+        let script = Script::new(reads(&instance, &part, vec![part.clone()], october()));
+        let (_, following, all) = ask(
+            &script,
+            &instance,
+            edit(repeating(every_day())),
+            opened,
+            &["abc"],
+        )
+        .await;
+        let past = ScopeRow::Refused {
+            message: "An earlier “this and following” change made this repeating event from part \
+                      of another, and PM can't check the parts after it, so it won't make it \
+                      repeat past 26-10-2026. Pick an end date on or before then."
+                .into(),
+        };
+        assert!(following == past && all == past, "both refused in words");
+        // Ending by then, it's offered.
+        let by_then = repeating(RepeatRule {
+            ends: crate::calendar_recur::wire::RepeatEnds::OnDate {
+                date: "2026-10-26".into(),
+            },
+            ..every_day()
+        });
+        let script = Script::new(reads(&instance, &part, vec![part.clone()], october()));
+        let (_, following, all) = ask(&script, &instance, edit(by_then), opened, &["abc"]).await;
+        assert!(
+            matches!(following, ScopeRow::Offered { .. })
+                && matches!(all, ScopeRow::Offered { .. }),
+            "both offered"
+        );
+    }
+
     /// Made daily with this occurrence moved a day on, every occurrence says where it now starts,
     /// and nothing asks about Mondays becoming Tuesdays: a daily rule names no day.
     #[tokio::test]
@@ -10307,8 +10418,14 @@ mod tests {
             .unwrap();
         let before = Instant::now();
         let mut steps = october_reads();
+        let at_insert = Arc::clone(&host);
         steps.extend([
-            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))).then(move || {
+                // Its record says the new part is one event, for the words after a restart.
+                let journal = at_insert.journal();
+                let entry = journal.get(&journal::key(CALENDAR, "abc"));
+                assert!(entry.is_some_and(|e| e.one_off), "recorded as one event");
+            }),
             series_patch(Scripted::Json(cut_copy(&plan))),
             refetch_read(Scripted::Json(page(vec![october()[0].clone()], None))),
         ]);
@@ -12173,6 +12290,7 @@ mod tests {
             before: lines(&old["recurrence"]),
             cut: lines(&sent["recurrence"]),
             cleanup,
+            one_off: false,
         }
     }
 
@@ -12280,6 +12398,31 @@ mod tests {
         assert!(host.journal().is_empty());
     }
 
+    /// C11c review: a "Does not repeat" from one occurrence on, left from before a restart, is worded
+    /// as that: the event PM made has no "All events" to delete, and the occurrences changed on their
+    /// own after it were to go, not move.
+    #[test]
+    fn a_stop_left_from_before_a_restart_says_what_to_delete() {
+        let entry = Entry {
+            one_off: true,
+            ..orphan_entry(&split_plan(Vec::new()), true)
+        };
+        let words = |orphan: Orphan| {
+            Orphaned {
+                entry: entry.clone(),
+                orphan,
+            }
+            .words()
+        };
+        let twice = words(Orphan::Twice);
+        assert!(twice.contains("stop repeating from 19-10-2026"));
+        assert!(twice.contains("delete that event, the one that doesn't repeat"));
+        assert!(!twice.contains("All events"));
+        let cut = words(Orphan::CutLanded);
+        assert!(cut.contains("may still show") && cut.contains("delete them in Google Calendar"));
+        assert!(!cut.contains("new part"));
+    }
+
     /// C1-H1: after a restart, a new part that's there while the original provably still holds
     /// its rule as before shows twice: every change it reaches is refused with what to do, the
     /// occurrences before the split stay open to "this event", and nothing is deleted.
@@ -12295,6 +12438,7 @@ mod tests {
         }
         .words();
         assert!(twice.contains("shows twice from 19-10-2026"));
+        assert!(twice.contains("Delete › All events"));
         let ask_at = |instance: Value| {
             let (host, tail) = (Arc::clone(&host), tail.clone());
             async move {
@@ -14384,6 +14528,7 @@ mod tests {
                 SeriesRefusal::RuleIsSeriesWide,
                 SeriesRefusal::RepeatsPastPart(day),
                 SeriesRefusal::LaterPartUnread,
+                SeriesRefusal::RepeatsPastItsEnd(day),
                 SeriesRefusal::NothingToKeep,
                 SeriesRefusal::KeptHasOwn(day),
             ])
@@ -14420,7 +14565,11 @@ mod tests {
         ];
         let mut lines: Vec<String> = refusals.iter().map(ToString::to_string).collect();
         lines.extend(reasons.iter().map(|r| read_only_message(*r).to_string()));
-        lines.extend([PUT_BACK.to_string(), RETIME_UNSURE.to_string()]);
+        lines.extend(
+            [PUT_BACK, RETIME_UNSURE, RULE_UNSURE, STOP_UNSURE]
+                .iter()
+                .map(|l| l.to_string()),
+        );
         for line in &lines {
             let lower = line.to_lowercase();
             for word in ["series", "split", "instance", "exception", "master"] {
@@ -14438,6 +14587,7 @@ mod tests {
             .contains("19-10-2026"));
         for dated in [
             SeriesRefusal::RepeatsPastPart(day),
+            SeriesRefusal::RepeatsPastItsEnd(day),
             SeriesRefusal::KeptHasOwn(day),
         ] {
             assert!(dated.to_string().contains("19-10-2026"));

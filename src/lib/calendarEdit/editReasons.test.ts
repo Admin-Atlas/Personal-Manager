@@ -332,6 +332,35 @@ describe("a repeating event's save, said once the editor has closed", () => {
       text: "Saved “Gym” from 21-10 on, as a repeating event of its own. Some occurrences you changed on their own may still be on the earlier part, or hidden by Google (02-11); check them in Google Calendar.",
     });
   });
+
+  // C11c review: "Does not repeat" from one occurrence on makes one event, never a repeating one.
+  it("words a 'this and following' save that stops it repeating as one event", () => {
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-21", true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” from 21-10 on, as one event that doesn't repeat. There's no Undo: editing it again changes that event, but won't join it back to the earlier ones.",
+    });
+  });
+
+  // C11c review: a save that leaves its one event outside the months PM syncs says so, warns, and
+  // never says to edit it again here, where it no longer shows.
+  it("says a save left outside the months PM syncs won't show, and nothing of editing it again", () => {
+    expect(savedNotice("Standup", saved(["outside_mirror"]), "all")).toEqual({
+      tone: "warn",
+      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it.",
+    });
+    expect(
+      savedNotice(
+        "Standup",
+        saved(["outside_mirror", "mirror_refresh_pending"]),
+        "following",
+        "2026-12-06",
+        true,
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "Saved “Standup” from 06-12 on, as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it.",
+    });
+  });
 });
 
 describe("settling a change PM couldn't finish", () => {

@@ -540,15 +540,16 @@ export function noteSeriesNotice(text: string) {
 
 /** A save that landed, said once the editor has closed. `scope`: a repeating event's occurrences
  *  saved, which have no Undo, so the notice says how to change them back; `from` (YYYY-MM-DD) is
- *  where a "this and following" save starts. */
+ *  where a "this and following" save starts; `stops`: the save made it "Does not repeat". */
 export function noteSaved(
   summary: string,
   outcome: WriteOutcome,
   scope: SeriesScope | null = null,
   from?: string,
+  stops = false,
 ) {
   if (outcome.outcome !== "saved") return;
-  put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from) });
+  put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from, stops) });
   offerMoves(outcome);
 }
 

@@ -287,6 +287,21 @@ pub fn last_before(
     Ok(last)
 }
 
+/// The last occurrence a rule that ends (a COUNT or an UNTIL) makes, deleted or not; `None` when it
+/// makes none. Only for a rule that ends: one that never does walks to its limit and is
+/// [`RecurError::CannotCount`].
+pub fn last_occurrence(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+) -> Result<Option<Point>, RecurError> {
+    let mut last = None;
+    walk(facts, start, |p| {
+        last = Some(p);
+        true
+    })?;
+    Ok(last)
+}
+
 /// The rule's first occurrence that `kept` keeps (one not deleted, say), no later than `until`: the
 /// one a series that stops repeating still shows (C11 critique 1 H1). `None` when there's none by
 /// then.

@@ -203,6 +203,7 @@ describe("EventEditor", () => {
       { outcome: "saved", warnings: [] },
       null,
       "2026-10-12",
+      false,
     );
     expect(choicesForEdit).not.toHaveBeenCalled();
   });
@@ -794,6 +795,7 @@ describe("EventEditor, a repeating event", () => {
       { outcome: "saved", warnings: [] },
       "all",
       "2026-10-12",
+      false,
     );
   });
 

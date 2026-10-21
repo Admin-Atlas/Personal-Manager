@@ -47,6 +47,10 @@ pub struct Entry {
     pub cut: Vec<String>,
     /// The change also moves or cancels occurrences changed on their own after the split.
     pub cleanup: bool,
+    /// The new part is one event that doesn't repeat ("Does not repeat", C11), for the words. A
+    /// record from before there was such a change has none: a new part that repeats.
+    #[serde(default)]
+    pub one_off: bool,
 }
 
 impl Entry {
@@ -183,6 +187,7 @@ mod tests {
             before: vec!["RRULE:FREQ=WEEKLY;BYDAY=MO".into()],
             cut: vec!["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261018T225959Z".into()],
             cleanup: true,
+            one_off: false,
         }
     }
 
@@ -307,6 +312,12 @@ mod tests {
         assert!(read(Some("not json")).is_empty());
         assert!(read(None).is_empty());
         assert_ne!(key("a", "bc"), key("ab", "c"));
+        // A record kept before a new part could be one event still reads, as a part that repeats.
+        let mut older: Value = serde_json::from_str(&stored).unwrap();
+        for e in older.as_object_mut().unwrap().values_mut() {
+            e.as_object_mut().unwrap().remove("one_off");
+        }
+        assert_eq!(read(Some(&older.to_string())), journal);
     }
 
     #[test]

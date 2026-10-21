@@ -38,7 +38,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Utc};
 use chrono_tz::Tz;
 use serde_json::Value;
 
-use crate::calendar_recur::expand::{crate_agrees, is_occurrence};
+use crate::calendar_recur::expand::{crate_agrees, is_occurrence, last_occurrence};
 use crate::calendar_recur::lines::{self, Kind, TextOnly};
 use crate::calendar_recur::remap::RetimeError;
 use crate::calendar_recur::spec::SpecError;
@@ -637,6 +637,9 @@ pub enum SeriesRefusal {
     RepeatsPastPart(NaiveDate),
     /// A later part of this series whose start PM can't read.
     LaterPartUnread,
+    /// The series is itself a part of one split earlier, and the new rule would repeat past this day,
+    /// where its own rule ends now ([`LaterPart::Through`]).
+    RepeatsPastItsEnd(NaiveDate),
     /// Stopping it repeating would keep no occurrence PM can name.
     NothingToKeep,
     /// The occurrence that would stay once it stops repeating has something of its own PM can't keep.
@@ -745,6 +748,13 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "PM can't tell where a later part of this repeating event starts, so it won't \
                  change how it repeats."
+            ),
+            SeriesRefusal::RepeatsPastItsEnd(day) => write!(
+                f,
+                "An earlier “this and following” change made this repeating event from part of \
+                 another, and PM can't check the parts after it, so it won't make it repeat past {}. \
+                 Pick an end date on or before then.",
+                day.format("%d-%m-%Y")
             ),
             SeriesRefusal::NothingToKeep => write!(
                 f,
@@ -888,6 +898,10 @@ pub enum LaterPart {
     None,
     /// The earliest later part's split point.
     At(Point),
+    /// The series is itself a part of one split earlier, whose other parts PM doesn't read: it may
+    /// repeat up to this day, its last occurrence's now, and no further (C11c review). Its rule ends
+    /// before any later part, as every split leaves it, unless it is made to repeat on.
+    Through(NaiveDate),
     /// There's a later part PM can't place: its listing didn't run to its end, or Google's id for it
     /// doesn't name its start.
     Unread,
@@ -896,11 +910,29 @@ pub enum LaterPart {
 /// The later parts of `master`: those PM split off it (`parts`, as [`parts_overlap`] reads them), and
 /// those Google split off it, which the mirror's `series` ids name `<id>_R<start>` (a later stamp than
 /// `master`'s own, when it is one of Google's parts itself; its original has no stamp).
-pub fn later_part(parts: &Listing, master: &Master, series: &[String]) -> LaterPart {
+///
+/// A series that is itself a part (Google's `_R` id, or PM's note: `noted_part`) may have later parts
+/// of the series it came from, which neither names: PM's, or Google's split of the original after a
+/// part of PM's. Every split leaves the part before it ending first, so such a series is held to where
+/// its own rule ends now ([`LaterPart::Through`]), and one that repeats for ever has none after it.
+pub fn later_part(
+    parts: &Listing,
+    master: &Master,
+    noted_part: bool,
+    series: &[String],
+) -> LaterPart {
     if !parts.complete {
         return LaterPart::Unread;
     }
     let zone = master.start.zone();
+    let through = if noted_part || google_part_of(&master.id).1.is_some() {
+        match own_end(master) {
+            Ok(end) => end,
+            Err(_) => return LaterPart::Unread,
+        }
+    } else {
+        None
+    };
     let mut points = split_points(parts, master);
     let (base, own) = google_part_of(&master.id);
     let own = match own {
@@ -922,10 +954,39 @@ pub fn later_part(parts: &Listing, master: &Master, series: &[String]) -> LaterP
             points.push(p);
         }
     }
-    points
-        .into_iter()
-        .min_by(|a, b| a.cmp_in(b, zone))
-        .map_or(LaterPart::None, LaterPart::At)
+    let first = points.into_iter().min_by(|a, b| a.cmp_in(b, zone));
+    match (first, through) {
+        (Some(p), Some(day)) if p.day_in(zone) > day => LaterPart::Through(day),
+        (Some(p), _) => LaterPart::At(p),
+        (None, Some(day)) => LaterPart::Through(day),
+        (None, None) => LaterPart::None,
+    }
+}
+
+/// The day `master`'s last occurrence falls on now, its rule's or an extra date's, `None` for a rule
+/// that never ends; an error when PM can't read the rule or walk it.
+fn own_end(master: &Master) -> Result<Option<NaiveDate>, RecurError> {
+    let parsed = lines::parse(&master.recurrence);
+    let (_, facts) = lines::series_rule(&parsed).map_err(RecurError::TextOnly)?;
+    if facts.count.is_none() && facts.until.is_none() {
+        return Ok(None);
+    }
+    let zone = master.start.zone();
+    // Its start counts even off its own rule (RFC 5545), and the rule's occurrences come after it.
+    let mut last = last_occurrence(&facts, &master.start)?.unwrap_or(master.first);
+    for line in &parsed {
+        if let Kind::RDate(dates) = &line.kind {
+            for value in &dates.values {
+                let p = dates
+                    .point(value, &master.start)
+                    .ok_or(RecurError::CannotCount)?;
+                if p.cmp_in(&last, zone).is_gt() {
+                    last = p;
+                }
+            }
+        }
+    }
+    Ok(Some(last.day_in(zone)))
 }
 
 /// A series id as Google's split names it: its base, and the stamp after `_R` when it has one.
@@ -1727,7 +1788,7 @@ mod tests {
         let weekly_m = Master::read(&fresh(master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]))).unwrap();
         let none: Vec<String> = Vec::new();
         assert_eq!(
-            later_part(&parts(Vec::new()), &weekly_m, &none),
+            later_part(&parts(Vec::new()), &weekly_m, false, &none),
             LaterPart::None
         );
         // The earlier of two of PM's, a cancelled one none.
@@ -1741,7 +1802,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            later_part(&two, &weekly_m, &none),
+            later_part(&two, &weekly_m, false, &none),
             LaterPart::At(point("2026-10-19T08:00:00Z"))
         );
         // Google's own, from its id; another series' and the master's own aren't.
@@ -1750,16 +1811,22 @@ mod tests {
             later_part(
                 &parts(Vec::new()),
                 &weekly_m,
+                false,
                 &series(&["abc", "xyz_R20261019T080000", "abc_R20261102T090000"])
             ),
             LaterPart::At(point("2026-11-02T09:00:00Z"))
         );
         assert_eq!(
-            later_part(&two, &weekly_m, &series(&["abc_R20261012T080000Z"])),
+            later_part(&two, &weekly_m, false, &series(&["abc_R20261012T080000Z"])),
             LaterPart::At(point("2026-10-12T08:00:00Z"))
         );
         assert_eq!(
-            later_part(&parts(Vec::new()), &weekly_m, &series(&["abc_R20261102"])),
+            later_part(
+                &parts(Vec::new()),
+                &weekly_m,
+                false,
+                &series(&["abc_R20261102"])
+            ),
             LaterPart::At(Point::Day(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()))
         );
         // A Google part itself: only a later stamp is a later part, and its original none.
@@ -1773,6 +1840,7 @@ mod tests {
             later_part(
                 &parts(Vec::new()),
                 &google_part,
+                false,
                 &series(&["abc", "abc_R20261005T080000", "abc_R20261019T080000"])
             ),
             LaterPart::None
@@ -1781,19 +1849,115 @@ mod tests {
             later_part(
                 &parts(Vec::new()),
                 &google_part,
+                false,
                 &series(&["abc", "abc_R20261102T090000"])
             ),
             LaterPart::At(point("2026-11-02T09:00:00Z"))
         );
         // A stamp PM can't read, or parts not listed whole: it can't say.
         assert_eq!(
-            later_part(&parts(Vec::new()), &weekly_m, &series(&["abc_Rsoon"])),
+            later_part(
+                &parts(Vec::new()),
+                &weekly_m,
+                false,
+                &series(&["abc_Rsoon"])
+            ),
             LaterPart::Unread
         );
         let short = Listing {
             items: Vec::new(),
             complete: false,
         };
-        assert_eq!(later_part(&short, &weekly_m, &none), LaterPart::Unread);
+        assert_eq!(
+            later_part(&short, &weekly_m, false, &none),
+            LaterPart::Unread
+        );
+    }
+
+    /// C11c review: a series that is itself a part, by PM's note or Google's `_R` id, may have later
+    /// parts of the series it came from that neither names, so it's held to where its own rule ends
+    /// now: its last occurrence's day, by its UNTIL or its COUNT, or a later extra date. One that
+    /// repeats for ever has none after it, and an original is held only by its own parts.
+    #[test]
+    fn a_part_is_held_to_where_it_ends_now() {
+        let read = |recurrence: &[&str], id: &str| {
+            Master::read(&fresh(with(master(recurrence), "id", json!(id)))).unwrap()
+        };
+        let parts = |items: Vec<Value>| Listing {
+            items,
+            complete: true,
+        };
+        let none: Vec<String> = Vec::new();
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        // Cut before Monday 02-11, as the split that made a later part left it: Monday 26-10.
+        let until = ["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261102T085959Z"];
+        for (m, noted) in [
+            (read(&until, "p1"), true),
+            (read(&until, "abc_R20261005T080000"), false),
+        ] {
+            assert_eq!(
+                later_part(&parts(Vec::new()), &m, noted, &none),
+                LaterPart::Through(day(26))
+            );
+        }
+        // An original with the same rule is held only by its own parts.
+        assert_eq!(
+            later_part(&parts(Vec::new()), &read(&until, "abc"), false, &none),
+            LaterPart::None
+        );
+        // Four times from 05-10, its last Monday 26-10; an extra date after it, Wednesday 28-10.
+        let counted = read(&["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4"], "p1");
+        assert_eq!(
+            later_part(&parts(Vec::new()), &counted, true, &none),
+            LaterPart::Through(day(26))
+        );
+        let extra = read(
+            &[until[0], "RDATE;TZID=Europe/London:20261028T090000"],
+            "p1",
+        );
+        assert_eq!(
+            later_part(&parts(Vec::new()), &extra, true, &none),
+            LaterPart::Through(day(28))
+        );
+        // A part that repeats for ever has none.
+        let forever = read(&["RRULE:FREQ=WEEKLY;BYDAY=MO"], "p1");
+        assert_eq!(
+            later_part(&parts(Vec::new()), &forever, true, &none),
+            LaterPart::None
+        );
+        // Its own later part counts where it's earlier than where it ends, never after.
+        let own = |at: &str| {
+            json!({
+                "id": "p9",
+                "status": "confirmed",
+                "start": { "dateTime": at },
+                "extendedProperties": { "private": { "pmSplitOf": "p1", "pmSplitAt": at } },
+            })
+        };
+        let p1 = read(&until, "p1");
+        assert_eq!(
+            later_part(
+                &parts(vec![own("2026-10-19T08:00:00+00:00")]),
+                &p1,
+                true,
+                &none
+            ),
+            LaterPart::At(point("2026-10-19T08:00:00Z"))
+        );
+        assert_eq!(
+            later_part(
+                &parts(vec![own("2026-11-09T09:00:00+00:00")]),
+                &p1,
+                true,
+                &none
+            ),
+            LaterPart::Through(day(26))
+        );
+        // A rule PM can't walk can't say where it ends.
+        let custom = read(&["RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2;COUNT=3"], "p1");
+        assert_eq!(
+            later_part(&parts(Vec::new()), &custom, true, &none),
+            LaterPart::Unread
+        );
     }
 }
