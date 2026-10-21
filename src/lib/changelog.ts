@@ -27,7 +27,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "3.153.1-alpha",
     date: "2026-10-20",
     highlights: [
-      "Under the hood, PM can now change how a repeating event repeats, for every occurrence or from one on, or stop it repeating, ready for the editor in the next update.",
+      "Under the hood, PM can now change how a repeating event repeats, for every occurrence or from one on, ready for the editor in the next update. Stopping a repeat comes after that.",
     ],
   },
   {
