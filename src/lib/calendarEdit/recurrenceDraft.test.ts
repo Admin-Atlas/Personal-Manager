@@ -17,6 +17,7 @@ import {
   monthlyLabel,
   movedStartText,
   repeatProblemText,
+  repeatingStartOf,
   repeatStartOf,
   ruleFromForm,
   sameRepeat,
@@ -311,6 +312,40 @@ describe("the start a rule is read against", () => {
       date: T2,
     });
     expect(repeatStartOf({ kind: "all_day", first_day: "", last_day: "" })).toBeNull();
+  });
+
+  // C11 critique 2 M6: a new rule for a repeating event is read from its first day, at this
+  // occurrence's time and zone; a yearly one on its own date from this occurrence's.
+  it("is the repeating event's first day for its new rule, this date for a yearly one", () => {
+    const time = {
+      kind: "timed" as const,
+      start_date: T2,
+      start_time: "09:00",
+      start_zone: "America/New_York",
+      end_date: T2,
+      end_time: "10:00",
+      end_zone: "America/New_York",
+    };
+    expect(repeatingStartOf(weekly(["tue"]), "2026-10-06", time)).toEqual({
+      kind: "timed",
+      date: "2026-10-06",
+      time: "09:00",
+      zone: "America/New_York",
+    });
+    const yearly: RepeatRule = {
+      pattern: { kind: "yearly_date" },
+      interval: 1,
+      ends: { kind: "never" },
+    };
+    expect(repeatingStartOf(yearly, "2026-10-06", time)).toEqual(repeatStartOf(time));
+    expect(
+      repeatingStartOf(weekly(["tue"]), "2026-10-06", {
+        kind: "all_day",
+        first_day: T2,
+        last_day: T2,
+      }),
+    ).toEqual({ kind: "all_day", date: "2026-10-06" });
+    expect(repeatingStartOf(weekly(["tue"]), "2026-10-06", { ...time, start_date: "" })).toBeNull();
   });
 
   it("says where a moved start falls", () => {

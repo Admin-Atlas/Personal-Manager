@@ -21,6 +21,7 @@ import {
   halfInstant,
   newEventSeed,
   rebaseDraft,
+  repeatSeed,
   seedDraft,
   switchNewKind,
   toChanges,
@@ -109,6 +110,83 @@ describe("the event draft", () => {
     // How it repeats goes with the time: Google locks both together.
     expect(canEdit(perms, "recurrence")).toBe(false);
     expect(canEdit({ ...perms, time: true }, "recurrence")).toBe(true);
+  });
+});
+
+describe("how an existing event repeats (C11)", () => {
+  const MONDAYS: RepeatRule = {
+    pattern: { kind: "weekly", days: ["mon"] },
+    interval: 1,
+    ends: { kind: "never" },
+  };
+  const series = (rule: RepeatRule | null) => ({
+    first: false,
+    repeats: rule ? "Weekly on Monday" : "Repeats (custom rule)",
+    rule,
+    starts: "2026-10-05",
+    zone: "Europe/London",
+  });
+
+  it("recurrence counts as a change only when it differs", () => {
+    const weekly = seedDraft(event, repeatSeed(series(MONDAYS), true));
+    // The same rule, its days listed again, is no change.
+    const same = {
+      ...weekly,
+      recurrence: {
+        kind: "rule" as const,
+        rule: {
+          ...MONDAYS,
+          pattern: { kind: "weekly" as const, days: ["mon", "mon"] as DayCode[] },
+        },
+      },
+    };
+    expect(changedFields(weekly, same)).toEqual([]);
+    expect(toChanges(weekly, same)).toEqual({});
+    const daily: RepeatRule = { ...MONDAYS, pattern: { kind: "daily" } };
+    const other = { ...weekly, recurrence: { kind: "rule" as const, rule: daily } };
+    expect(changedFields(weekly, other)).toEqual(["recurrence"]);
+    expect(toChanges(weekly, other)).toEqual({ recurrence: { kind: "rule", rule: daily } });
+    // What is sent shares nothing with the draft: the choices bind the very object sent.
+    const sent = toChanges(weekly, other).recurrence;
+    expect(sent?.kind === "rule" && sent.rule).not.toBe(daily);
+    const stop = { ...weekly, recurrence: { kind: "once" as const } };
+    expect(toChanges(weekly, stop)).toEqual({ recurrence: { kind: "once" } });
+    // A one-off given a rule.
+    const oneOff = base();
+    expect(toChanges(oneOff, { ...oneOff, recurrence: { kind: "rule", rule: MONDAYS } })).toEqual({
+      recurrence: { kind: "rule", rule: MONDAYS },
+    });
+  });
+
+  it("repeatSeed never gives once for a repeating event", () => {
+    expect(repeatSeed(series(MONDAYS), true)).toEqual({ kind: "rule", rule: MONDAYS });
+    // Even when the row didn't say it repeats: its series did.
+    expect(repeatSeed(series(MONDAYS), false)).toEqual({ kind: "rule", rule: MONDAYS });
+    expect(repeatSeed(series(null), true)).toEqual({
+      kind: "kept",
+      words: "Repeats (custom rule)",
+    });
+    expect(repeatSeed(null, true)).toEqual({ kind: "kept", words: "Repeats" });
+    expect(repeatSeed(null, false)).toEqual({ kind: "once" });
+    // Its own copy: the draft can't change the series it came from.
+    const seeded = repeatSeed(series(MONDAYS), true);
+    expect(seeded.kind === "rule" && seeded.rule).not.toBe(MONDAYS);
+  });
+
+  it("a rebase over a changed rule keeps Google's and says repeat", () => {
+    const old = seedDraft(event, repeatSeed(series(MONDAYS), true));
+    const daily: RepeatRule = { ...MONDAYS, pattern: { kind: "daily" } };
+    const tuesdays: RepeatRule = { ...MONDAYS, pattern: { kind: "weekly", days: ["tue"] } };
+    const theirs = seedDraft(event, { kind: "rule", rule: daily });
+    const mine = { ...old, recurrence: { kind: "rule" as const, rule: tuesdays } };
+    const r = rebaseDraft(old, theirs, mine);
+    expect(r.draft.recurrence).toEqual({ kind: "rule", rule: daily });
+    expect(r.overwritten).toEqual(["recurrence"]);
+    // Only Google changed it: taken, said nowhere.
+    const untouched = rebaseDraft(old, theirs, { ...old, summary: "Gym" });
+    expect(untouched.draft.recurrence).toEqual({ kind: "rule", rule: daily });
+    expect(untouched.draft.summary).toBe("Gym");
+    expect(untouched.overwritten).toEqual([]);
   });
 });
 

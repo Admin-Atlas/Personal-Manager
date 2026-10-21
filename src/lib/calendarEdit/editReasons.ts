@@ -79,6 +79,7 @@ export function conflictFields(keys: readonly string[]): EditorField[] {
     summary: "summary",
     start: "time",
     end: "time",
+    recurrence: "recurrence",
     location: "location",
     description: "description",
     transparency: "show_as",
@@ -146,7 +147,8 @@ export function writeWarningText(
         ? `Some occurrences you changed on their own may still be on the earlier part, or hidden by Google${days}; check them in Google Calendar.`
         : `Some occurrences changed on their own may still show${days}; check them in Google Calendar.`;
     }
-    // A new event comes back with it, and a repeating event saved as one that doesn't repeat.
+    // A new event comes back with it, a one-off made to repeat, and a repeating event saved as one
+    // that doesn't repeat (C11).
     case "outside_mirror":
       return "It starts outside the months PM syncs, so PM's calendar won't show it.";
     // A notice per milestone names each one (`milestoneStayedText`); this is the short form.
@@ -433,6 +435,7 @@ export function savedNotice(
   asAll = false,
 ): { tone: Tone; text: string } {
   const t = quote(title);
+  const outside = outcome.warnings.includes("outside_mirror");
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const day = from ? formatDateOnly(from) : null;
   const saved: SeriesScope | null = asAll && scope === "following" ? "all" : scope;
@@ -440,7 +443,7 @@ export function savedNotice(
   let back: string | null;
   switch (saved) {
     case null:
-      first = pending ? `Saved ${t} to Google.` : `Saved ${t}.`;
+      first = pending || outside ? `Saved ${t} to Google.` : `Saved ${t}.`;
       back = null;
       break;
     case "this":

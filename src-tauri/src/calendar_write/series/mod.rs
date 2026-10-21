@@ -620,8 +620,9 @@ pub enum SeriesRefusal {
     /// On this day the series' time falls in the hour the clocks skip, so the rest of it can't
     /// start there.
     SplitInGap(NaiveDate),
-    /// A whole series moved into another zone.
-    ZoneChange,
+    /// Every occurrence between all-day and timed, or into another zone, and to another day, in one
+    /// save: rebuilt from its own rule, which names its days, it can't move them too (C11 §12.4).
+    KindAndDay,
     /// A part PM split off this series from this day is still there, and the series still repeats
     /// past it ([`parts_overlap`]).
     SplitOverlap(NaiveDate),
@@ -718,10 +719,11 @@ impl fmt::Display for SeriesRefusal {
                  start the new part there. Change this occurrence on its own.",
                 day.format("%d-%m-%Y")
             ),
-            SeriesRefusal::ZoneChange => write!(
+            SeriesRefusal::KindAndDay => write!(
                 f,
-                "PM can't move every occurrence of a repeating event into another time zone. \
-                 Change this occurrence on its own."
+                "PM can't move every occurrence to another day and change them between all-day and \
+                 timed, or into another time zone, in one save. Change the day in one save and the \
+                 rest in another."
             ),
             SeriesRefusal::SplitOverlap(day) => write!(
                 f,

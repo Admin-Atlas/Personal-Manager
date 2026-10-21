@@ -28,6 +28,7 @@ import {
   earlierChangeText,
   keepLabel,
   leftBehindText,
+  fieldLabel,
   listFields,
   loadText,
   milestoneStayedText,
@@ -85,6 +86,10 @@ describe("edit reasons", () => {
     ]);
     expect(listFields(["summary"])).toBe("title");
     expect(listFields(["summary", "time", "location"])).toBe("title, time and location");
+    // How it repeats, in Google's word for it (C11).
+    expect(conflictFields(["recurrence", "start"])).toEqual(["recurrence", "time"]);
+    expect(fieldLabel("recurrence")).toBe("repeat");
+    expect(listFields(["time", "recurrence"])).toBe("time and repeat");
   });
 
   it("explains every outcome, promising on a conflict only that nothing was saved over it", () => {
@@ -317,6 +322,15 @@ describe("a repeating event's save, said once the editor has closed", () => {
     expect(savedNotice("Gym", saved(["mirror_refresh_pending"]), "all").text).toBe(
       "Saved “Gym” for every occurrence. PM's calendar will show it after the next refresh. To change it back, edit it again.",
     );
+  });
+
+  // C11 §10: a one-off made to repeat whose occurrences all fall outside the months PM syncs is in
+  // Google but won't show here, which the notice says, and keeps.
+  it("says when a one-off made to repeat won't show here", () => {
+    expect(savedNotice("Gym", saved(["outside_mirror"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” to Google. It starts outside the months PM syncs, so PM's calendar won't show it.",
+    });
   });
 
   // C2-H2: a "this and following" save makes a repeating event of its own; editing it again never

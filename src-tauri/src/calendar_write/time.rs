@@ -171,6 +171,63 @@ pub fn last_day_covered(start: NaiveDate, exclusive_end: NaiveDate) -> NaiveDate
         .unwrap_or(start)
 }
 
+/// A start or end node as the editor's date, `HH:MM` and zone: the node's own zone, else
+/// `fallback`.
+fn wall_parts(node: &Value, fallback: &str) -> Option<(String, String, String)> {
+    let at = DateTime::parse_from_rfc3339(node.get("dateTime")?.as_str()?.trim()).ok()?;
+    let zone_name = node
+        .get("timeZone")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback);
+    let zone = parse_zone(zone_name)
+        .or_else(|_| parse_zone(fallback))
+        .ok()?;
+    let local = at.with_timezone(&zone);
+    Some((
+        local.format("%Y-%m-%d").to_string(),
+        local.format("%H:%M").to_string(),
+        zone.name().to_string(),
+    ))
+}
+
+/// An event's times as the editor shows them: an all-day one's first and last days covered, a
+/// timed one's wall times, each half in its node's own zone, else `fallback_zone` (the calendar's,
+/// else this computer's; never a guessed UTC, R6). The editor opens on this, and a one-off given a
+/// repeat starts from it when the user left its time alone (C11 §10), so both read it alike.
+/// `None` when its start or end can't be read.
+pub fn time_draft_of(event: &Value, fallback_zone: &str) -> Option<TimeDraft> {
+    let start = event.get("start")?;
+    let end = event.get("end")?;
+    match start.get("date").and_then(Value::as_str) {
+        Some(first) => {
+            let first_day = NaiveDate::parse_from_str(first, "%Y-%m-%d").ok()?;
+            let end_day = end
+                .get("date")
+                .and_then(Value::as_str)
+                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .unwrap_or(first_day);
+            Some(TimeDraft::AllDay {
+                first_day: first.to_string(),
+                last_day: last_day_covered(first_day, end_day)
+                    .format("%Y-%m-%d")
+                    .to_string(),
+            })
+        }
+        None => {
+            let (start_date, start_time, start_zone) = wall_parts(start, fallback_zone)?;
+            let (end_date, end_time, end_zone) = wall_parts(end, &start_zone)?;
+            Some(TimeDraft::Timed {
+                start_date,
+                start_time,
+                start_zone,
+                end_date,
+                end_time,
+                end_zone,
+            })
+        }
+    }
+}
+
 /// Start and end as Google's event resource holds them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoogleWhen {

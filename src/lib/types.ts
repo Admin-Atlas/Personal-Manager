@@ -1580,8 +1580,9 @@ export interface EventPatchDraft {
   time?: TimeDraft | null;
   show_as?: ShowAs | null;
   visibility?: EventVisibility | null;
-  /** How it repeats from now on; omitted or null leaves it as it is (C11). The editor sends none
-   *  yet: changing how an event repeats is the next step. */
+  /** How it repeats from now on; omitted or null leaves it as it is (C11). A one-off given a rule
+   *  starts repeating; for an occurrence, the rule is the whole repeating event's, never this
+   *  occurrence's alone. */
   recurrence?: RepeatDraft | null;
 }
 
@@ -1777,8 +1778,8 @@ export type SeriesChoices =
 /** Which occurrences of a repeating event a save or delete is for. */
 export type SeriesScope = "this" | "following" | "all";
 
-/** `outside_mirror`: a new event saved in Google that starts outside the months PM mirrors, so
- *  PM's calendar won't show it. `milestone_not_offered`: a "this and following" change landed, but
+/** `outside_mirror`: a new event saved in Google, or a one-off made to repeat, that starts outside
+ *  the months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and following" change landed, but
  *  PM couldn't tell which repeating event Google made of the new part, so the milestones
  *  `milestone_moves` lists stay on the earlier part. */
 export type WriteWarning =

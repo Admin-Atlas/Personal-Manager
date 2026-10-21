@@ -89,11 +89,14 @@ impl fmt::Display for RetimeError {
         match self {
             RetimeError::Recur(e) => e.fmt(f),
             RetimeError::Reanchor(e) => e.fmt(f),
-            // Shown on the dialog's rows: no "series" or "split" (C9b-1 critique 2 M4).
+            // Shown on the dialog's rows: no "series" or "split" (C9b-1 critique 2 M4). A change of
+            // kind or zone rebuilds every occurrence from the rule (C11 §12.4), which needs one PM
+            // can read; a move alone never meets this.
             RetimeError::KindChange => write!(
                 f,
-                "PM can't change every occurrence of a repeating event between all-day and timed. \
-                 Change this occurrence on its own."
+                "PM can only change every occurrence between all-day and timed, or into another \
+                 time zone, when it can read how the event repeats. Change this occurrence on its \
+                 own."
             ),
             RetimeError::HasExtraDates => write!(
                 f,
