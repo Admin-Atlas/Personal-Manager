@@ -3166,6 +3166,65 @@ mod tests {
         }
     }
 
+    /// C11c review round 4: a timed series made all-day is read by its own wall days, never by the
+    /// all-day start's zone. Weekly on Monday at 00:30 in London, Monday 12-10 deleted (Sunday 11-10
+    /// 23:30 UTC), Monday 19-10 opened and made all-day on 19-10, "Weekly on Sunday and Monday": the
+    /// user moved no day, so nothing warns that the repeat day changes, and the deletion stays on
+    /// Monday 12-10, never on Sunday 11-10, which the new rule makes. From this one on, Monday 26-10,
+    /// changed on its own, goes onto the new part's Monday 26-10.
+    #[test]
+    fn a_timed_series_made_all_day_keeps_its_own_days() {
+        let half_past_midnight = || {
+            master_with(
+                &["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+                "2026-10-05T00:30:00+01:00",
+                "2026-10-05T01:30:00+01:00",
+            )
+        };
+        let all_day = EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-10-19".into(),
+                last_day: "2026-10-19".into(),
+            }),
+            recurrence: Some(RepeatDraft::Rule {
+                rule: weekly_on(&[DayCode::Sun, DayCode::Mon]),
+            }),
+            ..Default::default()
+        };
+        let no_day_move = |plan: &SeriesPlan| {
+            !plan
+                .warnings
+                .iter()
+                .any(|w| matches!(w, SeriesWarning::RepeatDayChanges { .. }))
+        };
+        let case = Case::new(half_past_midnight(), plain("2026-10-19T00:30:00+01:00"))
+            .exceptions(vec![cancelled("2026-10-12T00:30:00+01:00")]);
+        let plan = case.edit(Scope::All, all_day.clone()).unwrap();
+        let sent = body(&plan, 0);
+        assert_eq!(
+            sent["start"],
+            json!({ "date": "2026-10-05", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(
+            sent["recurrence"],
+            json!([
+                "RRULE:FREQ=WEEKLY;BYDAY=MO,SU",
+                "EXDATE;VALUE=DATE:20261012"
+            ])
+        );
+        assert!(no_day_move(&plan));
+        let review = with(plain("2026-10-26T00:30:00Z"), "summary", json!("Review"));
+        let case = Case::new(half_past_midnight(), plain("2026-10-19T00:30:00+01:00"))
+            .exceptions(vec![review]);
+        let plan = case.edit(Scope::Following, all_day).unwrap();
+        assert_eq!(body(&plan, 0)["start"], json!({ "date": "2026-10-19" }));
+        assert_eq!(
+            carries(&plan),
+            [(Point::Day(day(2026, 10, 26)), json!("Review"))]
+        );
+        assert!(no_day_move(&plan));
+    }
+
     /// Q3: "after n times" the user set is n occurrences of the new part, whatever the old count.
     #[test]
     fn following_with_a_new_rule_writes_after_n_as_set() {
