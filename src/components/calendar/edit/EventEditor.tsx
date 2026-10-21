@@ -505,6 +505,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             picked?.scope ?? null,
             what.from,
             what.changes.recurrence?.kind === "once",
+            picked?.asAll ?? false,
           );
           stayOpen = false;
           onClose();

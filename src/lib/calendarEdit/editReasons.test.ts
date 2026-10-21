@@ -348,18 +348,42 @@ describe("a repeating event's save, said once the editor has closed", () => {
       tone: "warn",
       text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it.",
     });
-    expect(
-      savedNotice(
-        "Standup",
-        saved(["outside_mirror", "mirror_refresh_pending"]),
-        "following",
-        "2026-12-06",
-        true,
-      ),
-    ).toEqual({
+  });
+
+  // C11c review round 2: the old occurrences still show until the next refresh, so the calendar
+  // catching up is still said. The pair "Does not repeat" for every occurrence answers when Google's
+  // list of what's left stops short, and from one occurrence on when PM's calendar couldn't be
+  // written.
+  it("says the calendar catches up when the old occurrences still show beside an event outside", () => {
+    const both = saved(["outside_mirror", "mirror_refresh_pending"]);
+    expect(savedNotice("Standup", both, "all", "2026-10-19", true)).toEqual({
       tone: "warn",
-      text: "Saved “Standup” from 06-12 on, as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it.",
+      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
     });
+    expect(savedNotice("Standup", both, "following", "2026-12-06", true)).toEqual({
+      tone: "warn",
+      text: "Saved “Standup” from 06-12 on, as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+    });
+  });
+
+  // C11c review round 2: "This and following" on the first occurrence saves every occurrence, so its
+  // notice is All's: no part made, no earlier one, and a stop names the one event left.
+  it("words a 'this and following' save from the first occurrence as every occurrence", () => {
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-05", false, true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    });
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-06", true, true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” as one event that doesn't repeat, on 06-10. To change it back, edit it again.",
+    });
+    // Only that row: All's own stop keeps its words, and so does any other row picked.
+    expect(savedNotice("Gym", saved([]), "all", "2026-10-19", true, false).text).toBe(
+      "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    );
+    expect(savedNotice("Gym", saved([]), "this", "2026-10-19", false, true).text).toBe(
+      "Saved “Gym” for this occurrence. To change it back, edit it again.",
+    );
   });
 });
 

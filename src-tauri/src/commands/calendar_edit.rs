@@ -3564,7 +3564,7 @@ async fn land_one_event<W: Wire, H: Host>(
         record(conn, host.edit(), cal, upserts, &created, gone)
     });
     if landed.is_err() {
-        return pending();
+        return said_outside(pending(), outside);
     }
     host.landed(cal);
     let mut warnings = Vec::new();
@@ -4742,7 +4742,7 @@ async fn land_split_done<W: Wire, H: Host>(
         }
     }
     if stale {
-        return stale_saved(host, cal, removal, left_behind);
+        return said_outside(stale_saved(host, cal, removal, left_behind), outside);
     }
     let landed = host.with_conn(|conn| {
         let now = calendar::series_rows(conn, cal, &[facts.master.as_str(), facts.tail.as_str()])?;
@@ -4776,17 +4776,28 @@ async fn land_split_done<W: Wire, H: Host>(
         deletes.retain(|d| !upserts.iter().any(|u| u.id == d.row_id));
         record(conn, host.edit(), cal, upserts, &created, deletes)
     });
-    let outside = outside.then_some(WriteWarning::OutsideMirror);
-    match landed {
+    let saved = match landed {
         Ok(()) => {
             host.landed(cal);
-            series_saved(outside.into_iter().collect(), left_behind)
+            series_saved(Vec::new(), left_behind)
         }
         Err(_) => {
             drop_hash(host, cal);
             series_saved(vec![WriteWarning::MirrorRefreshPending], left_behind)
         }
+    };
+    said_outside(saved, outside)
+}
+
+/// `outcome`, saying first that the one event a save made is `outside` the months PM mirrors: known
+/// before the mirror is written, it stands whatever the writing came to (C11c review).
+fn said_outside(mut outcome: WriteOutcome, outside: bool) -> WriteOutcome {
+    if let (true, WriteOutcome::Saved { warnings, .. }) = (outside, &mut outcome) {
+        let rest = std::mem::take(warnings);
+        warnings.push(WriteWarning::OutsideMirror);
+        warnings.extend(rest);
     }
+    outcome
 }
 
 /// The series a landed split re-fetched: the original, and the new part unless it's one event
@@ -10406,6 +10417,36 @@ mod tests {
         assert!(outcome == pending(), "saved, the calendar to catch up");
         assert_eq!(host.ids().len(), 3);
         assert_eq!(host.row("abc").start, "2026-10-05T08:00:00Z");
+        // Outside the mirror and a mirror that can't be written: said to be outside all the same,
+        // beside the calendar catching up (C11c review).
+        let host = TestHost::holding(&october());
+        let refusing = Arc::clone(&host);
+        let mut steps = october_reads();
+        steps.push(series_patch(Scripted::Json(long_ago.clone())));
+        steps.push(
+            ical_listing(
+                "iCalUID=abc%40google.com",
+                Scripted::Json(page(vec![long_ago], None)),
+            )
+            .then(move || mirror_refuses_removals(&refusing)),
+        );
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &instance,
+            &series,
+            stop_repeating(),
+            Scope::All,
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, .. }
+                if *warnings == [WriteWarning::OutsideMirror, WriteWarning::MirrorRefreshPending]),
+            "outside, the calendar to catch up"
+        );
+        assert_eq!(host.ids().len(), 3);
     }
 
     /// C11 §9.7: "Does not repeat" from this occurrence on lands the one event from the insert's own
@@ -10495,6 +10536,81 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(split_rows(&host).0, ["cal:abc_20261012T080000Z"]);
+    }
+
+    /// The mirror refuses every removal from now on, as a full disk would.
+    fn mirror_refuses_removals(host: &TestHost) {
+        host.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER no_removal BEFORE DELETE ON calendar_events \
+                 BEGIN SELECT RAISE(ABORT, 'full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// C11c review: the one event put past the months PM mirrors is said to be outside whatever the
+    /// landing came to, a re-fetch that never shows the cut or a mirror that can't be written, beside
+    /// the calendar catching up.
+    #[tokio::test]
+    async fn does_not_repeat_on_following_outside_the_mirror_says_so_when_pending() {
+        let far = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            ..at("09:00", "2027-12-06")
+        };
+        let plan = Case::new(weekly(), monday_19())
+            .edit(Scope::Following, far.clone())
+            .unwrap();
+        let outside_pending = |outcome: &WriteOutcome| {
+            matches!(outcome, WriteOutcome::Saved { warnings, .. }
+                if *warnings == [WriteWarning::OutsideMirror, WriteWarning::MirrorRefreshPending])
+        };
+        // The re-fetch never shows the cut.
+        let host = TestHost::holding(&october());
+        let mut steps = october_reads();
+        steps.extend([
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(&plan))),
+        ]);
+        for _ in 0..3 {
+            steps.push(refetch_read(Scripted::Status(404)));
+        }
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            far.clone(),
+            Scope::Following,
+        )
+        .await;
+        script.asked_all();
+        assert!(outside_pending(&outcome), "never shown: outside, pending");
+        // The mirror can't be written.
+        let host = TestHost::holding(&october());
+        let refusing = Arc::clone(&host);
+        let mut steps = october_reads();
+        steps.extend([
+            insert_step(Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            series_patch(Scripted::Json(cut_copy(&plan))),
+            refetch_read(Scripted::Json(page(vec![october()[0].clone()], None)))
+                .then(move || mirror_refuses_removals(&refusing)),
+        ]);
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            far,
+            Scope::Following,
+        )
+        .await;
+        script.asked_all();
+        assert!(outside_pending(&outcome), "not written: outside, pending");
+        assert!(host.hash_dropped());
     }
 
     /// C11 §9.7: a new rule for every occurrence gives each a new id, so the whole series is
@@ -14531,6 +14647,7 @@ mod tests {
                 SeriesRefusal::RepeatsPastItsEnd(day),
                 SeriesRefusal::NothingToKeep,
                 SeriesRefusal::KeptHasOwn(day),
+                SeriesRefusal::DeletedDayUnread(day),
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -14589,6 +14706,7 @@ mod tests {
             SeriesRefusal::RepeatsPastPart(day),
             SeriesRefusal::RepeatsPastItsEnd(day),
             SeriesRefusal::KeptHasOwn(day),
+            SeriesRefusal::DeletedDayUnread(day),
         ] {
             assert!(dated.to_string().contains("19-10-2026"));
         }

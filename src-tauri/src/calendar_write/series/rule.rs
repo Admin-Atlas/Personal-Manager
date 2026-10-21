@@ -105,8 +105,12 @@ pub(super) struct RebuildAsk<'a> {
     /// The old series' rule, read; `None` when PM can only show it as text.
     pub old_rule: Option<RuleFacts>,
     /// How many days the change moves every occurrence (a day move with the new rule, C11 critique
-    /// 2 M4): a deleted day the new rule doesn't make is looked for that much later ([`lands_at`]).
+    /// 2 M4), counted in the days [`day_zone`] reads: a deleted day the new rule doesn't make is
+    /// looked for that much later ([`Landing`]).
     pub shift: i64,
+    /// The day the draft puts the occurrence opened on, in `start`'s terms: where the new rule makes
+    /// it, that slot is the opened occurrence's alone (C11c review).
+    pub opened: NaiveDate,
     /// The old series' RDATE lines, as Google wrote them.
     pub extra: &'a [String],
 }
@@ -126,6 +130,11 @@ pub(super) struct Rebuilt {
     pub extra: Vec<Point>,
     /// The start isn't on the day asked.
     pub moved: bool,
+    /// The zone an old occurrence's day is read in ([`day_zone`]).
+    pub frame: Tz,
+    /// Where the draft puts the occurrence opened, when the new rule makes that slot: nothing else
+    /// lands there ([`Landing`]).
+    pub opened: Option<Point>,
 }
 
 /// The series `ask` describes, refused in words where it can't be written: a rule outside the
@@ -157,18 +166,29 @@ pub(super) fn rebuild(ask: &RebuildAsk) -> Result<Rebuilt, NotPlanned> {
             }
         }
     }
+    let opened = match on_its_day(&synced, ask.opened) {
+        Some(q) if is_occurrence(&facts, &synced, q)? => Some(q),
+        _ => None,
+    };
+    let frame = day_zone(ask.old_start, &synced);
     // A deleted day stays deleted wherever the new rule still makes it (from its start on), and a
     // deleted extra date wherever it's kept (RM1). An EXDATE neither makes is never written: Google
     // refuses one that "doesn't point to a valid instance".
-    let old_zone = ask.old_start.zone();
-    let old = ask.old_rule.as_ref().map(|f| (f, ask.old_start));
+    let landing = Landing {
+        facts: &facts,
+        start: &synced,
+        old: ask.old_rule.as_ref().map(|f| (f, ask.old_start)),
+        shift: ask.shift,
+        frame,
+        opened,
+    };
     let mut deleted = Vec::new();
     for p in ask.deleted {
         if extra_points.contains(p) {
             deleted.push(*p);
             continue;
         }
-        if let Some(q) = lands_at(&facts, &synced, old, p.day_in(old_zone), ask.shift)? {
+        if let Some(q) = landing.at(*p)? {
             deleted.push(q);
         }
     }
@@ -184,7 +204,20 @@ pub(super) fn rebuild(ask: &RebuildAsk) -> Result<Rebuilt, NotPlanned> {
         lines: out,
         facts,
         extra: extra_points,
+        frame,
+        opened,
     })
+}
+
+/// The zone an old occurrence's day is read in, to place it in the series rebuilt from `new`: the
+/// rebuilt series' own when both are timed, so a move into another zone that keeps every moment
+/// moves no day (C11c review); the old series' across a change between timed and all-day, whose
+/// day is its wall day.
+fn day_zone(old: &SeriesStart, new: &SeriesStart) -> Tz {
+    match (old, new) {
+        (SeriesStart::Timed { .. }, SeriesStart::Timed { zone, .. }) => *zone,
+        _ => old.zone(),
+    }
 }
 
 /// The day a yearly rule "on its own date" should start on: the first day on or after `from` with
@@ -225,38 +258,76 @@ fn on_its_day(start: &SeriesStart, day: NaiveDate) -> Option<Point> {
     }
 }
 
-/// Where an occurrence the old series had on `day`, deleted or changed on its own, is in the series
-/// rebuilt from `start` under `facts` (C11c review): on its own day where the new rule still makes
-/// it, so it stays as the user left it there; else, when the change moves the day (`shift`), that
-/// many days on, but only where the old series (`old`, its rule and start) had no occurrence of its
-/// own, since which of the two it is would then be a guess; else nowhere.
-fn lands_at(
-    facts: &RuleFacts,
-    start: &SeriesStart,
-    old: Option<(&RuleFacts, &SeriesStart)>,
-    day: NaiveDate,
+/// Where the old series' occurrences, deleted or changed on their own, land in a series rebuilt under
+/// a new rule (C11c review).
+struct Landing<'a> {
+    /// The rebuilt series' rule and start.
+    facts: &'a RuleFacts,
+    start: &'a SeriesStart,
+    /// The old series' rule, read, and its start; `None` when PM can only show the rule as text.
+    old: Option<(&'a RuleFacts, &'a SeriesStart)>,
+    /// How many days the change moves every occurrence, in `frame`'s days.
     shift: i64,
-) -> Result<Option<Point>, RecurError> {
-    let made = |d: NaiveDate| -> Result<Option<Point>, RecurError> {
-        match on_its_day(start, d) {
-            Some(q) if is_occurrence(facts, start, q)? => Ok(Some(q)),
+    /// The zone an occurrence's day is read in ([`day_zone`]).
+    frame: Tz,
+    /// Where the draft puts the occurrence opened: never another's.
+    opened: Option<Point>,
+}
+
+impl Landing<'_> {
+    /// Where the old occurrence at `p` is: on its own day where the new rule still makes it, so it
+    /// stays as the user left it there; else, when the change moves the day, that many days on, but
+    /// only where the old series had no occurrence of its own, since which of the two it is would
+    /// then be a guess; else nowhere. Never where the draft puts the occurrence opened, which the user
+    /// put there. An old rule PM can't read can't say whether the day moved to had one of its own:
+    /// refused in words where the new rule makes it, rather than guessed.
+    fn at(&self, p: Point) -> Result<Option<Point>, NotPlanned> {
+        let day = p.day_in(self.frame);
+        let landed = match self.made(day)? {
+            Some(q) => Some(q),
+            None => match moved_day(day, self.shift) {
+                None => None,
+                Some(moved) => match self.old {
+                    Some((facts, start)) if has_day(facts, start, moved, self.frame)? => None,
+                    Some(_) => self.made(moved)?,
+                    None => match self.made(moved)? {
+                        Some(_) => return Err(SeriesRefusal::DeletedDayUnread(day).into()),
+                        None => None,
+                    },
+                },
+            },
+        };
+        Ok(landed.filter(|q| Some(*q) != self.opened))
+    }
+
+    /// The rebuilt series' occurrence on `day`, if its rule makes one.
+    fn made(&self, day: NaiveDate) -> Result<Option<Point>, RecurError> {
+        match on_its_day(self.start, day) {
+            Some(q) if is_occurrence(self.facts, self.start, q)? => Ok(Some(q)),
             _ => Ok(None),
         }
-    };
-    if let Some(q) = made(day)? {
-        return Ok(Some(q));
     }
-    let (Some((old_facts, old_start)), Some(moved)) = (old, moved_day(day, shift)) else {
-        return Ok(None);
+}
+
+/// Whether the series from `start` under `facts` has an occurrence on `day`, read in `frame`. A day
+/// PM can't place counts as one, so nothing lands there on a guess.
+fn has_day(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+    day: NaiveDate,
+    frame: Tz,
+) -> Result<bool, RecurError> {
+    let from = match start {
+        SeriesStart::AllDay(_) => Point::Day(day),
+        SeriesStart::Timed { .. } => match rfc_instant(frame, day.and_time(chrono::NaiveTime::MIN))
+        {
+            Some(t) => Point::At(t),
+            None => return Ok(true),
+        },
     };
-    let taken = match on_its_day(old_start, moved) {
-        Some(q) => is_occurrence(old_facts, old_start, q)?,
-        None => true,
-    };
-    if taken {
-        return Ok(None);
-    }
-    made(moved)
+    Ok(occurrences_from(facts, start, from, 1)?
+        .first()
+        .is_some_and(|q| q.day_in(frame) == day))
 }
 
 /// Where one event that doesn't repeat starts, at `start`: a time the clocks skip that day is refused
@@ -459,17 +530,19 @@ pub(super) fn plan_all_rule(
     let mut body = build_patch(master_json, &text)?;
     let zone = master.start.zone();
     let asked = asked_time(draft, instance)?;
-    // A move of this occurrence to another day moves every occurrence as far, as a move of the
-    // series does (C11 critique 2 M4), measured from where it first was.
-    let from = original.day_in(zone);
-    let shift = asked
-        .as_ref()
-        .map_or(0, |a| (a.start.date() - from).num_days());
     let (wall, length, end_zone) = match &asked {
         Some(a) => (a.start, a.length, a.end_zone),
         None => (master.start, master.length, master.end_zone),
     };
-    let first_day = master.first.day_in(zone);
+    // A move of this occurrence to another day moves every occurrence as far, as a move of the
+    // series does (C11 critique 2 M4), measured from where it first was, in the days of the zone it
+    // moves into (C11c review).
+    let frame = day_zone(&master.start, &wall);
+    let from = original.day_in(frame);
+    let shift = asked
+        .as_ref()
+        .map_or(0, |a| (a.start.date() - from).num_days());
+    let first_day = master.first.day_in(frame);
     let deleted = deleted_points(master, input)?;
     let mut warnings = Vec::new();
     let undo = Some(Undo::RestoreMaster {
@@ -503,6 +576,7 @@ pub(super) fn plan_all_rule(
                     .ok()
                     .map(|(_, facts)| facts),
                 shift,
+                opened: asked_day,
                 extra: &extra,
             })?;
             clear_of_later(input.later, &rebuilt, zone)?;
@@ -578,6 +652,7 @@ pub(super) fn plan_all_rule(
                 own_time,
                 asked: asked.as_ref(),
                 shift,
+                frame,
                 warnings,
                 undo,
                 notify,
@@ -608,6 +683,8 @@ struct StopAsk<'a> {
     own_time: Option<&'a Value>,
     asked: Option<&'a Asked>,
     shift: i64,
+    /// The zone `shift`'s days are read in ([`day_zone`]).
+    frame: Tz,
     warnings: Vec<SeriesWarning>,
     undo: Option<Undo>,
     notify: Notify,
@@ -625,6 +702,7 @@ fn stop_body(ask: StopAsk) -> Result<SeriesPlan, NotPlanned> {
         own_time,
         asked,
         shift,
+        frame,
         mut warnings,
         undo,
         notify,
@@ -633,7 +711,7 @@ fn stop_body(ask: StopAsk) -> Result<SeriesPlan, NotPlanned> {
     let zone = master.start.zone();
     let (first, start_zone, end_zone, length) = match (asked, own_time) {
         (Some(a), _) => {
-            let day = moved_day(kept.day_in(zone), shift).ok_or(SeriesRefusal::Unreadable)?;
+            let day = moved_day(kept.day_in(frame), shift).ok_or(SeriesRefusal::Unreadable)?;
             let start = on_day(&a.start, day);
             (one_event_at(&start)?, start.zone(), a.end_zone, a.length)
         }
@@ -651,7 +729,7 @@ fn stop_body(ask: StopAsk) -> Result<SeriesPlan, NotPlanned> {
     // says it leaves its own day (`shift` is the draft's, 0 without one).
     if shift != 0 {
         warnings.push(SeriesWarning::StartMoved {
-            from: kept.day_in(zone),
+            from: kept.day_in(frame),
             to: rule_start.date(),
         });
     }
@@ -719,7 +797,9 @@ pub(super) fn plan_split_rule(
         None => (rest, master.length, master.end_zone),
     };
     let at_day = at.day_in(zone);
-    let shift = (start.date() - at_day).num_days();
+    // In the days of the zone the rest moves into, as for every occurrence (C11c review).
+    let frame = day_zone(&master.start, &start);
+    let shift = (start.date() - at.day_in(frame)).num_days();
     // Deleted from here on: its cancelled occurrences, and the EXDATEs the cut hands the rest; its
     // extra dates are the rest's too.
     let mut deleted: Vec<Point> = exceptions
@@ -773,6 +853,7 @@ pub(super) fn plan_split_rule(
                 old_start: &master.start,
                 old_rule: Some(facts.clone()),
                 shift,
+                opened: start.date(),
                 extra: &extra,
             })?;
             // The rest can't start where the part before it still reaches (A29): both days read in
@@ -891,24 +972,21 @@ pub(super) fn plan_split_rule(
                     carried_fields(item, &carry, split_itself, &draft_keys, moved_time, all_day);
                 // An extra date kept is still an occurrence where it was (RM1); the occurrence split
                 // at goes where the draft put it; any later one where the new rule still has its own
-                // day, else where the day move takes it ([`lands_at`]).
+                // day, else where the day move takes it, never onto the one split at ([`Landing`]).
                 let target = if rebuilt.extra.contains(p) {
                     Some(*p)
                 } else if split_itself {
-                    match moved_day(p.day_in(zone), shift)
-                        .and_then(|day| on_its_day(&rebuilt.start, day))
-                    {
-                        Some(q) if is_occurrence(&rebuilt.facts, &rebuilt.start, q)? => Some(q),
-                        _ => None,
-                    }
+                    rebuilt.opened
                 } else {
-                    lands_at(
-                        &rebuilt.facts,
-                        &rebuilt.start,
-                        Some((&facts, &master.start)),
-                        p.day_in(zone),
+                    Landing {
+                        facts: &rebuilt.facts,
+                        start: &rebuilt.start,
+                        old: Some((&facts, &master.start)),
                         shift,
-                    )?
+                        frame: rebuilt.frame,
+                        opened: rebuilt.opened,
+                    }
+                    .at(*p)?
                 };
                 match (carried.is_empty(), target) {
                     (true, _) => None,
@@ -1039,7 +1117,7 @@ mod tests {
     use super::super::{Exceptions, Listing};
     use super::*;
     use crate::calendar_recur::lines::Applied;
-    use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
+    use crate::calendar_recur::wire::{DayCode, NthCode, RepeatEnds, RepeatPattern, RepeatRule};
     use chrono::NaiveDateTime;
     use chrono_tz::Europe::London;
     use serde_json::json;
@@ -1118,7 +1196,8 @@ mod tests {
     }
 
     /// `ask` for `spec` from `start` an hour long, the old series starting at `old` (weekly on
-    /// Monday), with `deleted`, no extra dates and no shift.
+    /// Monday), with `deleted`, no extra dates and no shift, the occurrence opened put on its first
+    /// day.
     fn ask<'a>(
         spec: &'a RecurrenceSpec,
         start: SeriesStart,
@@ -1135,6 +1214,7 @@ mod tests {
             old_start: old,
             old_rule: lines::series_rule(&mondays).ok().map(|(_, facts)| facts),
             shift: 0,
+            opened: start.date(),
             extra: &[],
         }
     }
@@ -1217,15 +1297,27 @@ mod tests {
             rebuild(&guessed).unwrap().lines,
             ["RRULE:FREQ=WEEKLY;BYDAY=WE"]
         );
-        // Nor when PM can't read the old rule.
+        // When PM can't read the old rule, it can't tell whether the day moved to had one of its own:
+        // refused in words where the new rule makes that day (C11c review), never dropped.
         let unread = RebuildAsk {
             shift: 1,
             old_rule: None,
             ..ask(&tuesdays, london(2026, 10, 6, 9), &deleted, &old)
         };
+        assert!(matches!(
+            rebuild(&unread),
+            Err(NotPlanned::Refused(SeriesRefusal::DeletedDayUnread(d))) if d == day(2026, 10, 19)
+        ));
+        // Where it doesn't make the day moved to either, the deletion has nowhere to go.
+        let thursdays = spec_of_rule(&weekly_on(&[DayCode::Thu]));
+        let nowhere = RebuildAsk {
+            shift: 1,
+            old_rule: None,
+            ..ask(&thursdays, london(2026, 10, 8, 9), &deleted, &old)
+        };
         assert_eq!(
-            rebuild(&unread).unwrap().lines,
-            ["RRULE:FREQ=WEEKLY;BYDAY=TU"]
+            rebuild(&nowhere).unwrap().lines,
+            ["RRULE:FREQ=WEEKLY;BYDAY=TH"]
         );
     }
 
@@ -1550,6 +1642,51 @@ mod tests {
             Err(NotPlanned::Refused(SeriesRefusal::Recur(
                 RecurError::TextOnly(TextOnly::Unreadable)
             )))
+        );
+    }
+
+    /// C11c review: the second Tuesday from 08-09, November's deleted, moved a day on and made "the
+    /// second Wednesday". Spelt BYSETPOS, a rule PM can only show as text, PM can't tell whether
+    /// Wednesday 11-11 had an occurrence of its own, so it refuses in words rather than bring
+    /// November's back; spelt 2TU, the deletion moves to 11-11.
+    #[test]
+    fn a_moved_day_under_a_custom_rule_refuses_rather_than_bring_a_deletion_back() {
+        let second_tuesday = |rule: &str| {
+            master_with(
+                &[rule, "EXDATE;TZID=Europe/London:20261110T090000"],
+                "2026-09-08T09:00:00+01:00",
+                "2026-09-08T10:00:00+01:00",
+            )
+        };
+        let second_wednesday = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Rule {
+                rule: rule(
+                    RepeatPattern::MonthlyWeekday {
+                        nth: NthCode::Second,
+                        weekday: DayCode::Wed,
+                    },
+                    1,
+                    RepeatEnds::Never,
+                ),
+            }),
+            ..at("09:00", "2026-10-14")
+        };
+        let october = plain("2026-10-13T09:00:00+01:00");
+        let custom = Case::new(
+            second_tuesday("RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2"),
+            october.clone(),
+        );
+        assert_eq!(
+            custom.edit(Scope::All, second_wednesday.clone()),
+            Err(NotPlanned::Refused(SeriesRefusal::DeletedDayUnread(day(
+                2026, 11, 10
+            ))))
+        );
+        let read = Case::new(second_tuesday("RRULE:FREQ=MONTHLY;BYDAY=2TU"), october);
+        let plan = read.edit(Scope::All, second_wednesday).unwrap();
+        assert_eq!(
+            body(&plan, 0)["recurrence"],
+            json!(["RRULE:FREQ=MONTHLY;BYDAY=2WE", "EXDATE:20261111T090000Z"])
         );
     }
 
@@ -2354,6 +2491,183 @@ mod tests {
             Op::Carry { original, body, .. }
                 if *original == point("2026-10-18T08:00:00Z") && body["summary"] == "Retro"
         ));
+    }
+
+    /// Every carry a plan makes: where it goes, and the title it carries.
+    fn carries(plan: &SeriesPlan) -> Vec<(Point, Value)> {
+        plan.steps
+            .iter()
+            .filter_map(|s| match &s.op {
+                Op::Carry { original, body, .. } => Some((*original, body["summary"].clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// C11c review: Mondays and Tuesdays, Monday 19-10 opened and moved onto Tuesday 20-10, made
+    /// "Weekly on Tuesday". That slot is the occurrence opened's: Tuesday 20-10 deleted, by an EXDATE
+    /// or cancelled, writes no EXDATE there, for every occurrence or from this one on; changed on its
+    /// own, its changes go, counted, rather than land on the one the user just moved there.
+    #[test]
+    fn the_occurrence_opened_keeps_the_slot_the_draft_gives_it() {
+        let mon_tue = |more: &[&str]| {
+            let mut lines = vec!["RRULE:FREQ=WEEKLY;BYDAY=MO,TU"];
+            lines.extend_from_slice(more);
+            master(&lines)
+        };
+        let to_tuesday = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Rule {
+                rule: weekly_on(&[DayCode::Tue]),
+            }),
+            ..at("09:00", "2026-10-20")
+        };
+        let exdated = Case::new(
+            mon_tue(&["EXDATE;TZID=Europe/London:20261020T090000"]),
+            monday_19(),
+        );
+        let cancelled_one = Case::new(mon_tue(&[]), monday_19())
+            .exceptions(vec![cancelled("2026-10-20T09:00:00+01:00")]);
+        for case in [exdated, cancelled_one] {
+            let plan = case.edit(Scope::Following, to_tuesday.clone()).unwrap();
+            let inserted = body(&plan, 0);
+            assert_eq!(inserted["start"], timed_node("2026-10-20T09:00:00+01:00"));
+            assert_eq!(
+                inserted["recurrence"],
+                json!(["RRULE:FREQ=WEEKLY;BYDAY=TU"])
+            );
+            let plan = case.edit(Scope::All, to_tuesday.clone()).unwrap();
+            assert_eq!(
+                body(&plan, 0)["recurrence"],
+                json!(["RRULE:FREQ=WEEKLY;BYDAY=TU"])
+            );
+        }
+        // Tuesday 20-10 retitled and moved to 11:00 on its own; Monday 19-10, opened, retitled too.
+        let review = with(
+            moved(
+                "2026-10-20T09:00:00+01:00",
+                "2026-10-20T11:00:00+01:00",
+                "2026-10-20T12:00:00+01:00",
+            ),
+            "summary",
+            json!("Review"),
+        );
+        let retro = with(monday_19(), "summary", json!("Retro"));
+        let case = Case::new(mon_tue(&[]), retro.clone()).exceptions(vec![retro, review]);
+        let plan = case.edit(Scope::Following, to_tuesday).unwrap();
+        assert_eq!(
+            carries(&plan),
+            [(point("2026-10-20T08:00:00Z"), json!("Retro"))]
+        );
+        assert!(plan
+            .warnings
+            .contains(&SeriesWarning::ChangesLost { count: 1 }));
+        assert!(plan.steps.iter().any(|s| matches!(
+            &s.op,
+            Op::Cancel { original, .. } if *original == point("2026-10-20T08:00:00Z")
+        )));
+    }
+
+    /// Mondays and Tuesdays at 23:30 in London, Monday 19-10 opened and moved into Tokyo at the same
+    /// moment, Tuesday 20-10 07:30, made "Tuesdays and Wednesdays", as the days read there.
+    fn into_tokyo() -> (Value, EventPatchDraft) {
+        let late = master_with(
+            &["RRULE:FREQ=WEEKLY;BYDAY=MO,TU"],
+            "2026-10-05T23:30:00+01:00",
+            "2026-10-06T00:30:00+01:00",
+        );
+        let draft = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-10-20".into(),
+                start_time: "07:30".into(),
+                start_zone: "Asia/Tokyo".into(),
+                end_date: "2026-10-20".into(),
+                end_time: "08:30".into(),
+                end_zone: "Asia/Tokyo".into(),
+            }),
+            recurrence: Some(RepeatDraft::Rule {
+                rule: weekly_on(&[DayCode::Tue, DayCode::Wed]),
+            }),
+            ..Default::default()
+        };
+        (late, draft)
+    }
+
+    fn tokyo_node(at: &str) -> Value {
+        json!({ "dateTime": at, "timeZone": "Asia/Tokyo" })
+    }
+
+    /// C11c review: a move into another zone that keeps every moment moves no day. Tuesday 20-10
+    /// 23:30 in London, deleted, is Wednesday 21-10 07:30 in Tokyo: it stays deleted there, never on
+    /// the Tuesday before it, which is the occurrence opened; and nothing asks about the days.
+    #[test]
+    fn all_into_another_zone_keeps_each_deletion_at_its_moment() {
+        let (late, draft) = into_tokyo();
+        let case = Case::new(late, plain("2026-10-19T23:30:00+01:00"))
+            .exceptions(vec![cancelled("2026-10-20T23:30:00+01:00")]);
+        let plan = case.edit(Scope::All, draft).unwrap();
+        let sent = body(&plan, 0);
+        assert_eq!(sent["start"], tokyo_node("2026-10-06T07:30:00+09:00"));
+        assert_eq!(sent["end"], tokyo_node("2026-10-06T08:30:00+09:00"));
+        assert_eq!(
+            sent["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=TU,WE", "EXDATE:20261020T223000Z"])
+        );
+        assert!(!plan.warnings.iter().any(|w| matches!(
+            w,
+            SeriesWarning::RepeatDayChanges { .. } | SeriesWarning::StartMoved { .. }
+        )));
+        // A day move there is read in Tokyo's days too. Moved on to Wednesday 21-10 and made
+        // "Wednesdays and Thursdays": Monday 12-10 deleted, Tuesday 13-10 in Tokyo, which the new rule
+        // skips, would move to Wednesday 14-10 there; but that's Tuesday 13-10 23:30 in London, an
+        // occurrence of its own, so nothing is deleted on it.
+        let (late, _) = into_tokyo();
+        let wednesday = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-10-21".into(),
+                start_time: "07:30".into(),
+                start_zone: "Asia/Tokyo".into(),
+                end_date: "2026-10-21".into(),
+                end_time: "08:30".into(),
+                end_zone: "Asia/Tokyo".into(),
+            }),
+            recurrence: Some(RepeatDraft::Rule {
+                rule: weekly_on(&[DayCode::Wed, DayCode::Thu]),
+            }),
+            ..Default::default()
+        };
+        let case = Case::new(late, plain("2026-10-19T23:30:00+01:00"))
+            .exceptions(vec![cancelled("2026-10-12T23:30:00+01:00")]);
+        let plan = case.edit(Scope::All, wednesday).unwrap();
+        assert_eq!(
+            body(&plan, 0)["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=WE,TH"])
+        );
+    }
+
+    /// The same from this occurrence on: the deletion stays at its moment, and a change made on its
+    /// own (Tuesday 27-10, London on GMT again) goes onto the new part's occurrence on its own day
+    /// there, Wednesday 28-10, never onto the one before it.
+    #[test]
+    fn following_into_another_zone_keeps_each_occurrence_on_its_own_day() {
+        let (late, draft) = into_tokyo();
+        let review = with(plain("2026-10-27T23:30:00Z"), "summary", json!("Review"));
+        let case = Case::new(late, plain("2026-10-19T23:30:00+01:00"))
+            .exceptions(vec![cancelled("2026-10-20T23:30:00+01:00"), review]);
+        let plan = case.edit(Scope::Following, draft).unwrap();
+        let inserted = body(&plan, 0);
+        assert_eq!(inserted["start"], tokyo_node("2026-10-20T07:30:00+09:00"));
+        assert_eq!(
+            inserted["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=TU,WE", "EXDATE:20261020T223000Z"])
+        );
+        assert_eq!(
+            carries(&plan),
+            [(point("2026-10-27T22:30:00Z"), json!("Review"))]
+        );
+        assert!(!plan
+            .warnings
+            .iter()
+            .any(|w| matches!(w, SeriesWarning::ChangesLost { .. })));
     }
 
     /// RM1: an extra date kept is still an occurrence where it was, so its own changes go onto it

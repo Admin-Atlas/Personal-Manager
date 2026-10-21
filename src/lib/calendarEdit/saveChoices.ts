@@ -23,6 +23,10 @@ export type ReadyChoices = Extract<SeriesChoices, { outcome: "ready" }>;
 export interface Picked {
   scope: SeriesScope;
   token: string;
+  /** The row was "this and following" from the first occurrence (`RowView.asAll`): what saves is
+   *  every occurrence's plan, so the notice after it speaks as All. Never sent: the write names
+   *  `scope` and `token` only. */
+  asAll?: boolean;
 }
 
 function unreachable(value: never): never {

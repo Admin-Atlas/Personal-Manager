@@ -422,24 +422,28 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
  *  repeating event it was for: there's no Undo after one (DECISIONS 17-10 #4), so the notice says
  *  how to change it back, and for "this and following", which makes a repeating event of its own
  *  from `from` (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). `stops`:
- *  the save made it "Does not repeat", so from `from` on it's one event, not a repeating one. One
- *  that left the event outside the months PM syncs says so, and never to edit it again here
- *  (C11c review). */
+ *  the save made it "Does not repeat", so from `from` on it's one event, not a repeating one.
+ *  `asAll`: the "this and following" row was the first occurrence's, which saves every occurrence
+ *  (`RowView.asAll`), so it's worded as All, a stop naming the day of the one event left, `from`
+ *  (C11c review). One that left the event outside the months PM syncs says so, and never to edit it
+ *  again here (C11c review). */
 export function savedNotice(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
   scope: SeriesScope | null,
   from?: string,
   stops = false,
+  asAll = false,
 ): { tone: Tone; text: string } {
   const t = quote(title);
   const outside = outcome.warnings.includes("outside_mirror");
-  // Off PM's calendar, there's nothing for a refresh to show.
-  const pending = outcome.warnings.includes("mirror_refresh_pending") && !outside;
+  const pending = outcome.warnings.includes("mirror_refresh_pending");
   const left = outcome.warnings.includes("left_on_old_series");
+  const day = from ? formatDateOnly(from) : null;
+  const saved: SeriesScope | null = asAll && scope === "following" ? "all" : scope;
   let first: string;
   let back: string | null;
-  switch (scope) {
+  switch (saved) {
     case null:
       first = pending ? `Saved ${t} to Google.` : `Saved ${t}.`;
       back = null;
@@ -449,25 +453,31 @@ export function savedNotice(
       back = "To change it back, edit it again.";
       break;
     case "following": {
-      const day = from ? formatDateOnly(from) : "this occurrence";
+      const since = day ?? "this occurrence";
       first = stops
-        ? `Saved ${t} from ${day} on, as one event that doesn't repeat.`
-        : `Saved ${t} from ${day} on, as a repeating event of its own.`;
+        ? `Saved ${t} from ${since} on, as one event that doesn't repeat.`
+        : `Saved ${t} from ${since} on, as a repeating event of its own.`;
       back = stops
         ? "There's no Undo: editing it again changes that event, but won't join it back to the earlier ones."
         : "There's no Undo: editing it again changes that part, but won't join it back to the earlier one.";
       break;
     }
     case "all":
-      first = `Saved ${t} for every occurrence.`;
+      // From the first occurrence, the one event left is the one opened, where the draft put it.
+      first =
+        stops && asAll
+          ? `Saved ${t} as one event that doesn't repeat${day ? `, on ${day}` : ""}.`
+          : `Saved ${t} for every occurrence.`;
       back = "To change it back, edit it again.";
       break;
     default:
-      return unreachable(scope);
+      return unreachable(saved);
   }
   const parts = [first];
   if (outside) parts.push(writeWarningText("outside_mirror", "save"));
-  if (pending) parts.push(writeWarningText("mirror_refresh_pending", "save"));
+  // Off PM's calendar the saved event won't show after a refresh, but what it replaced still does
+  // until then: the calendar catches up, in a delete's words (C11c review).
+  if (pending) parts.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
   // Occurrences left on the earlier part come first: changing it back isn't the whole story. An
   // event PM's calendar won't show can't be edited again here.
   if (left) parts.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));

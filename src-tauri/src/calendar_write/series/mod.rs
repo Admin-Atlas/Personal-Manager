@@ -644,6 +644,9 @@ pub enum SeriesRefusal {
     NothingToKeep,
     /// The occurrence that would stay once it stops repeating has something of its own PM can't keep.
     KeptHasOwn(NaiveDate),
+    /// The occurrence deleted on this day would move with the days it repeats on, and PM can't read
+    /// the old rule to tell whether the day it moves to had an occurrence of its own (C11c review).
+    DeletedDayUnread(NaiveDate),
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -766,6 +769,13 @@ impl fmt::Display for SeriesRefusal {
                 "The occurrence on {}, the one that would stay, has its own colour, reminders, \
                  attachments, video call, label or who can see it, which PM can't keep when it \
                  stops repeating.",
+                day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::DeletedDayUnread(day) => write!(
+                f,
+                "PM can't read how this event repeats well enough to tell where the occurrence \
+                 deleted on {} would move to. Change the days it repeats on in Google Calendar, or \
+                 keep this occurrence on its own day.",
                 day.format("%d-%m-%Y")
             ),
         }
@@ -967,7 +977,13 @@ pub fn later_part(
 /// that never ends; an error when PM can't read the rule or walk it.
 fn own_end(master: &Master) -> Result<Option<NaiveDate>, RecurError> {
     let parsed = lines::parse(&master.recurrence);
-    let (_, facts) = lines::series_rule(&parsed).map_err(RecurError::TextOnly)?;
+    let facts = match lines::series_rule(&parsed) {
+        Ok((_, facts)) => facts,
+        // A rule PM can only show as text still says whether it ends: one that repeats for ever
+        // has none after it (C11c review). A line PM can't read at all may be where it ends.
+        Err(_) if never_ends(&parsed) => return Ok(None),
+        Err(why) => return Err(RecurError::TextOnly(why)),
+    };
     if facts.count.is_none() && facts.until.is_none() {
         return Ok(None);
     }
@@ -987,6 +1003,14 @@ fn own_end(master: &Master) -> Result<Option<NaiveDate>, RecurError> {
         }
     }
     Ok(Some(last.day_in(zone)))
+}
+
+/// Every line read, and one of its rules repeats for ever: no COUNT, no UNTIL.
+fn never_ends(parsed: &[lines::Line]) -> bool {
+    parsed.iter().all(|l| l.kind != Kind::Unreadable)
+        && parsed
+            .iter()
+            .any(|l| matches!(&l.kind, Kind::Rule(rule) if !rule.ends()))
 }
 
 /// A series id as Google's split names it: its base, and the stamp after `_R` when it has one.
@@ -1957,6 +1981,29 @@ mod tests {
         let custom = read(&["RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2;COUNT=3"], "p1");
         assert_eq!(
             later_part(&parts(Vec::new()), &custom, true, &none),
+            LaterPart::Unread
+        );
+        // But one that repeats for ever says so, walked or not: a part of either kind has none
+        // after it (C11c review); unless a line PM can't read at all may be where it ends.
+        let custom_forever = ["RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2"];
+        for (m, noted) in [
+            (read(&custom_forever, "p1"), true),
+            (read(&custom_forever, "abc_R20261005T080000"), false),
+        ] {
+            assert_eq!(
+                later_part(&parts(Vec::new()), &m, noted, &none),
+                LaterPart::None
+            );
+        }
+        let unreadable = read(
+            &[
+                custom_forever[0],
+                "EXDATE;TZID=Mars/Olympus:20261013T090000",
+            ],
+            "p1",
+        );
+        assert_eq!(
+            later_part(&parts(Vec::new()), &unreadable, true, &none),
             LaterPart::Unread
         );
     }
