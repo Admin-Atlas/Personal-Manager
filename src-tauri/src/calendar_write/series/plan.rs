@@ -3545,6 +3545,43 @@ mod tests {
         );
     }
 
+    /// Weekly on Monday at 01:00 in London, which is Sunday evening in New York. Put in New York at
+    /// 01:00 on the same Monday, it stays on Mondays, for every occurrence and from this one on: the
+    /// day the series' own rule names is the one on the clock, wherever the rebuild reads days from
+    /// (C11c review). Kept at the same moment, Sunday in New York, its day moves: refused in words.
+    #[test]
+    fn a_zone_change_past_midnight_keeps_the_rules_own_day() {
+        let late = master_with(
+            &["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+            "2026-10-05T01:00:00+01:00",
+            "2026-10-05T02:00:00+01:00",
+        );
+        let case = Case::new(late, plain("2026-10-19T01:00:00+01:00"));
+        let monday = timed_in("2026-10-19", "01:00", "02:00", "America/New_York");
+        let all = case.edit(Scope::All, monday.clone()).unwrap();
+        assert_eq!(
+            body(&all.steps[0])["start"],
+            json!({ "dateTime": "2026-10-05T01:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        let rest = case.edit(Scope::Following, monday).unwrap();
+        let new_part =
+            json!({ "dateTime": "2026-10-19T01:00:00-04:00", "timeZone": "America/New_York" });
+        let mondays = json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]);
+        let starts_monday =
+            |b: &Map<String, Value>| b["start"] == new_part && b["recurrence"] == mondays;
+        assert!(rest
+            .steps
+            .iter()
+            .any(|s| s.op.body().is_some_and(starts_monday)));
+        let sunday = timed_in("2026-10-18", "20:00", "21:00", "America/New_York");
+        for scope in [Scope::All, Scope::Following] {
+            assert!(
+                case.edit(scope, sunday.clone())
+                    == Err(NotPlanned::Refused(SeriesRefusal::KindAndDay))
+            );
+        }
+    }
+
     /// The series' own rule names its days, so it can't move them and change kind or zone in one save:
     /// refused in words, for every occurrence and from this one on alike.
     #[test]

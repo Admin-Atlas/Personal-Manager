@@ -1553,8 +1553,10 @@ async fn land_new_series<W: Wire, H: Host>(
         return series_pending(host, cal.calendar_id, gone);
     };
     if series_in_window(&master, window) == Some(false) {
-        if !gone.is_empty() {
-            let _ = land_on(host, cal.calendar_id, Vec::new(), &[], gone);
+        // A row PM couldn't remove stays until the next sync, which the notice says, beside the
+        // event being outside (C11d review 3).
+        if !gone.is_empty() && land_on(host, cal.calendar_id, Vec::new(), &[], gone).is_err() {
+            return said_outside(series_pending(host, cal.calendar_id, Vec::new()), true);
         }
         return WriteOutcome::Saved {
             warnings: vec![WriteWarning::OutsideMirror],
@@ -14936,6 +14938,38 @@ mod tests {
             .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
             .unwrap();
         assert!(row.is_none());
+        // A mirror that can't remove the row: outside, and the calendar to catch up (C11d review 3).
+        let host = TestHost::holding(std::slice::from_ref(&far));
+        let refusing = Arc::clone(&host);
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &far,
+            target(&far),
+            &weekly_on(&[DayCode::Mon]),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(written(
+                    &far,
+                    &[("recurrence", json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]))],
+                    "\"s2\"",
+                )),
+            )
+            .then(move || mirror_refuses_removals(&refusing))],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            matches!(&outcome, WriteOutcome::Saved { warnings, .. }
+                if *warnings == [WriteWarning::OutsideMirror, WriteWarning::MirrorRefreshPending]),
+            "outside, the calendar to catch up"
+        );
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap();
+        assert!(row.is_some(), "the one-off's row is still there");
+        assert!(host.hash_dropped());
         // Three empty looks: saved, the next sync to show it, the one-off gone meanwhile.
         let event = dentist();
         let host = TestHost::holding(std::slice::from_ref(&event));
