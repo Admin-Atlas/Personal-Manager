@@ -58,6 +58,9 @@ pub const CREATABLE: &[&str] = &[
 pub enum InsertError {
     Time(TimeError),
     Rule(SpecError),
+    /// A one-off given a repeat, its time left alone, whose start or end has no zone, with none to
+    /// read it in: not the calendar's, nor this computer's (C11d review 1).
+    NoEventZone,
 }
 
 impl fmt::Display for InsertError {
@@ -65,6 +68,10 @@ impl fmt::Display for InsertError {
         match self {
             InsertError::Time(e) => e.fmt(f),
             InsertError::Rule(e) => e.fmt(f),
+            InsertError::NoEventZone => write!(
+                f,
+                "PM can't tell which time zone this event is in, so it can't make it repeat."
+            ),
         }
     }
 }
@@ -138,11 +145,12 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
 
 /// Make a one-off repeat by `rule` (C11 §10): its `start`, `end` and `recurrence` into `body`, and
 /// the start it repeats from. The times are the draft's (`time`), or the event's own as the editor
-/// showed them ([`time::time_draft_of`]: each node's zone, else the calendar's, `fallback_zone`;
-/// never UTC, R6), moved to the first day the rule makes ([`sync_start`]) with their length kept, as
-/// a new repeating event's are. Both nodes are always sent, a timed one naming its `timeZone` (G6):
-/// Google's own node, which a save hands back for a half the user left alone, may have none. A
-/// switch between timed and all-day sends the other kind's keys as `null`, as any save does.
+/// showed them ([`time::time_draft_of`]: each node's zone, else `fallback_zone`, the calendar's or
+/// else this computer's as the editor had it; never UTC, R6), moved to the first day the rule makes
+/// ([`sync_start`]) with their length kept, as a new repeating event's are. Both nodes are always
+/// sent, a timed one naming its `timeZone` (G6): Google's own node, which a save hands back for a
+/// half the user left alone, may have none. A switch between timed and all-day sends the other
+/// kind's keys as `null`, as any save does.
 pub fn add_repeat(
     body: &mut Map<String, Value>,
     fresh: &Value,
@@ -153,11 +161,11 @@ pub fn add_repeat(
     let own;
     let time = match time {
         Some(time) => time,
-        // The editor opened on these very nodes, so only a node with no zone, on a calendar with
-        // none, can't be read here.
+        // The editor opened on these very nodes in this very zone, so only a node with no zone, and
+        // no zone to read it in, can't be read here.
         None => {
-            own =
-                time::time_draft_of(fresh, fallback_zone.unwrap_or("")).ok_or(TimeError::NoZone)?;
+            own = time::time_draft_of(fresh, fallback_zone.unwrap_or(""))
+                .ok_or(InsertError::NoEventZone)?;
             &own
         }
     };
@@ -1097,11 +1105,56 @@ mod tests {
                 "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=WE"],
             })
         );
-        // A node with no zone, on a calendar with none, is never read as UTC (R6).
+        // A node with no zone, and no zone to read it in, is never read as UTC (R6), and says so of
+        // the event, not this computer (C11d review 1).
         let mut body = Map::new();
         let refused = add_repeat(&mut body, &bare, None, &weekly_rule(&[DayCode::Wed]), None);
-        assert!(refused == Err(InsertError::Time(TimeError::NoZone)));
+        assert!(refused == Err(InsertError::NoEventZone));
         assert!(body.is_empty(), "nothing built");
+        assert_eq!(
+            InsertError::NoEventZone.to_string(),
+            "PM can't tell which time zone this event is in, so it can't make it repeat."
+        );
+    }
+
+    /// C11d review 1: an all-day one-off given a repeat and a time clears its dates, as any save's
+    /// switch does.
+    #[test]
+    fn a_repeat_given_with_a_switch_to_timed_clears_the_other_kind() {
+        let mut all_day = fresh();
+        all_day["start"] = json!({ "date": "2026-10-12" });
+        all_day["end"] = json!({ "date": "2026-10-13" });
+        let at_ten = timed("2026-10-12", "10:00", "2026-10-12", "11:00");
+        let draft = EventPatchDraft {
+            time: Some(at_ten.clone()),
+            ..Default::default()
+        };
+        let mut body = build_patch(&all_day, &draft).unwrap();
+        add_repeat(
+            &mut body,
+            &all_day,
+            Some(&at_ten),
+            &weekly_rule(&[DayCode::Mon]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({
+                "dateTime": "2026-10-12T10:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(
+            body["end"],
+            json!({
+                "dateTime": "2026-10-12T11:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]));
     }
 
     /// The draft's own time wins, and a switch to all day clears the timed keys, as any save's does.

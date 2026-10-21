@@ -26,7 +26,7 @@ import { Button, Input, SegmentedControl, Select, Textarea, Toggle, useFieldA11y
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { ZoneSearchList } from "../ZoneSearchList";
-import { RecurrenceSelect } from "./RecurrenceSelect";
+import { RecurrenceSelect, type Standing } from "./RecurrenceSelect";
 import type { RepeatState } from "./useRepeat";
 
 export type Timed = Extract<TimeDraft, { kind: "timed" }>;
@@ -381,6 +381,7 @@ export function RepeatRow({
   skippedTime,
   judge = true,
   offReason,
+  standing,
   disabled,
   compact,
   onChange,
@@ -401,6 +402,8 @@ export function RepeatRow({
   judge?: boolean;
   /** Why the row is off, said under it: PM couldn't read how this event repeats. */
   offReason?: string;
+  /** An existing repeating event's own rule, which the list always keeps a row for. */
+  standing?: Standing | null;
   disabled: boolean;
   compact?: boolean;
   onChange: (value: RepeatValue) => void;
@@ -421,6 +424,7 @@ export function RepeatRow({
         disabled={disabled || offReason !== undefined}
         compact={compact}
         ruleWords={view.state === "ready" ? view.summary : null}
+        standing={standing}
         onChange={onChange}
         onCustom={onCustom}
       />

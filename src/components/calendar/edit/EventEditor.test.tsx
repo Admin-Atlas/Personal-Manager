@@ -1363,8 +1363,17 @@ describe("EventEditor, how it repeats", () => {
     expect(saveEdit).toHaveBeenCalledWith(
       "s1",
       { recurrence: { kind: "once" } },
-      { scope: "all", token: "t-all" },
+      { scope: "all", token: "t-all", asAll: false },
       "Dentist",
+    );
+    // Its notice says one event is left (C11d review 1).
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Dentist",
+      { outcome: "saved", warnings: [] },
+      "all",
+      "2026-10-12",
+      true,
+      false,
     );
   });
 
@@ -1549,6 +1558,74 @@ describe("EventEditor, how it repeats", () => {
     openForEdit.mockResolvedValue(repeatingLoad({ zone: null }));
     await open(vi.fn(), undefined, occurrence);
     expect(screen.queryByText(/^Repeats in /)).toBeNull();
+    cleanup();
+    // A rule PM can only show repeats in its event's zone too (C11d review 1).
+    openForEdit.mockResolvedValue(
+      repeatingLoad({ rule: null, repeats: "Repeats (custom rule)", zone: "America/New_York" }),
+    );
+    await open(vi.fn(), undefined, occurrence);
+    expect(shownRepeat()).toBe("Repeats (custom rule)");
+    expect(screen.getByText("Repeats in New York time.")).toBeTruthy();
+  });
+
+  // C11d review 1: the event's own rule keeps its row once the list has closed on another, as in
+  // Google's list, so picking it again changes nothing.
+  it("the event's own rule can be picked again after the list closed on another", async () => {
+    for (const over of [
+      { repeats: "Every 2 weeks on Monday", rule: ruleOf({ kind: "weekly", days: ["mon"] }, 2) },
+      { repeats: "Repeats (custom rule)", rule: null },
+    ]) {
+      openForEdit.mockResolvedValue(repeatingLoad(over));
+      choicesForEdit.mockResolvedValue(choices({ this: offered("t-this") }));
+      await open(vi.fn(), undefined, occurrence);
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+      await act(async () => {});
+      fireEvent.click(repeat());
+      // An arrow key moves the choice to "Does not repeat" (a click no pointer made); Escape closes.
+      const once = within(screen.getByRole("group", { name: "Repeat" })).getByRole("radio", {
+        name: "Does not repeat",
+      });
+      once.focus();
+      fireEvent.click(once, { detail: 0 });
+      fireEvent.keyDown(once, { key: "Escape" });
+      expect(screen.queryByRole("group", { name: "Repeat" })).toBeNull();
+      expect(shownRepeat()).toBe("Does not repeat");
+      await pickRepeat(over.repeats);
+      expect(shownRepeat()).toBe(over.repeats);
+      fireEvent.click(editorSave());
+      await screen.findByRole("dialog", { name: "Edit repeating event" });
+      expect(choicesForEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" });
+      cleanup();
+      vi.clearAllMocks();
+    }
+  });
+
+  // C11d review 1: switched back to the kind Google holds, the time is Google's again, and a rule
+  // picked here follows the date it lands on, as it follows any other time change.
+  it("a picked rule follows the date switching All day back restores", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    await pickRepeat("Weekly on Monday");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    const first = screen.getByLabelText<HTMLInputElement>("First day");
+    first.focus();
+    fireEvent.change(first, { target: { value: "13-10-2026" } });
+    fireEvent.blur(first);
+    await act(async () => {});
+    expect(shownRepeat()).toBe("Weekly on Tuesday");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    await act(async () => {});
+    expect(screen.getByLabelText<HTMLInputElement>("Start date").value).toBe("12-10-2026");
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    // Google's time again, so only the rule goes, on the day it shows.
+    fireEvent.click(editorSave());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { recurrence: { kind: "rule", rule: MONDAYS } },
+      ...UNSCOPED,
+    );
   });
 
   it("moving the date doesn't rewrite an untouched series rule", async () => {

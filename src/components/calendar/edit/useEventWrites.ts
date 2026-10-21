@@ -540,8 +540,9 @@ export function noteSeriesNotice(text: string) {
 
 /** A save that landed, said once the editor has closed. `scope`: a repeating event's occurrences
  *  saved, which have no Undo, so the notice says how to change them back; `from` (YYYY-MM-DD) is
- *  where a "this and following" save starts; `stops`: the save made it "Does not repeat"; `asAll`:
- *  the "this and following" row picked saved every occurrence (`Picked.asAll`). */
+ *  where a "this and following" save starts; `stops`: the save made it "Does not repeat", which
+ *  leaves one event; `asAll`: the "this and following" row picked saved every occurrence
+ *  (`Picked.asAll`). */
 export function noteSaved(
   summary: string,
   outcome: WriteOutcome,

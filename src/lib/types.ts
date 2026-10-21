@@ -1778,10 +1778,11 @@ export type SeriesChoices =
 /** Which occurrences of a repeating event a save or delete is for. */
 export type SeriesScope = "this" | "following" | "all";
 
-/** `outside_mirror`: a new event saved in Google, or a one-off made to repeat, that starts outside
- *  the months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and following" change landed, but
- *  PM couldn't tell which repeating event Google made of the new part, so the milestones
- *  `milestone_moves` lists stay on the earlier part. */
+/** `outside_mirror`: a new event saved in Google, a one-off made to repeat, or the one event "Does
+ *  not repeat" leaves of a repeating one (for all events or from one on), that starts outside the
+ *  months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and
+ *  following" change landed, but PM couldn't tell which repeating event Google made of the new
+ *  part, so the milestones `milestone_moves` lists stay on the earlier part. */
 export type WriteWarning =
   "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror" | "milestone_not_offered";
 

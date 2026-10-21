@@ -347,21 +347,51 @@ describe("a repeating event's save, said once the editor has closed", () => {
     });
   });
 
-  // C11c review: "Does not repeat" from one occurrence on makes one event, never a repeating one.
-  it("words a 'this and following' save that stops it repeating as one event", () => {
-    expect(savedNotice("Gym", saved([]), "following", "2026-10-21", true)).toEqual({
+  // C11c review and C11d review 1: "Does not repeat" leaves one event, never a repeating one, nor
+  // every occurrence. From one occurrence on it's a separate event, as the choices said; for every
+  // occurrence, the one kept is the first still there, so no day is named.
+  it("says a stop left one event that doesn't repeat", () => {
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-19", true)).toEqual({
       tone: "ok",
-      text: "Saved “Gym” from 21-10 on, as one event that doesn't repeat. There's no Undo: editing it again changes that event, but won't join it back to the earlier ones.",
+      text: "Saved “Gym” from 19-10 on, as a separate event that doesn't repeat. There's no Undo: editing it again changes that event, but won't join it back to the earlier one.",
+    });
+    expect(savedNotice("Gym", saved([]), "all", "2026-10-19", true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” as one event that doesn't repeat. There's no Undo: to make it repeat again, edit it and pick a repeat.",
     });
   });
 
-  // C11c review: a save that leaves its one event outside the months PM syncs says so, warns, and
-  // never says to edit it again here, where it no longer shows.
-  it("says a save left outside the months PM syncs won't show, and nothing of editing it again", () => {
+  // C11c review and C11d review 1: a save that leaves its one event outside the months PM syncs
+  // says so and warns. PM's calendar won't show it, so it can't be edited again here: the notice
+  // points to Google Calendar, after a stop as after any other save.
+  it("never says to edit again what PM won't show", () => {
+    expect(savedNotice("Gym", saved(["outside_mirror"]), "all", "2026-10-19", true)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. To change it back, use Google Calendar.",
+    });
     expect(savedNotice("Standup", saved(["outside_mirror"]), "all")).toEqual({
       tone: "warn",
-      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it.",
+      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it. To change it back, use Google Calendar.",
     });
+    expect(savedNotice("Gym", saved(["outside_mirror"]), "following", "2026-10-19", true)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” from 19-10 on, as a separate event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. There's no Undo: to change it, use Google Calendar.",
+    });
+    for (const scope of ["this", "following", "all"] as const) {
+      for (const stops of [false, true]) {
+        for (const asAll of [false, true]) {
+          const said = savedNotice(
+            "Gym",
+            saved(["outside_mirror"]),
+            scope,
+            "2026-10-19",
+            stops,
+            asAll,
+          );
+          expect(said.text, `${scope} ${stops} ${asAll}`).not.toMatch(/edit(ing)? it again/);
+        }
+      }
+    }
   });
 
   // C11c review round 2: the old occurrences still show until the next refresh, so the calendar
@@ -372,11 +402,11 @@ describe("a repeating event's save, said once the editor has closed", () => {
     const both = saved(["outside_mirror", "mirror_refresh_pending"]);
     expect(savedNotice("Standup", both, "all", "2026-10-19", true)).toEqual({
       tone: "warn",
-      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+      text: "Saved “Standup” as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh. To change it back, use Google Calendar.",
     });
     expect(savedNotice("Standup", both, "following", "2026-12-06", true)).toEqual({
       tone: "warn",
-      text: "Saved “Standup” from 06-12 on, as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+      text: "Saved “Standup” from 06-12 on, as a separate event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh. There's no Undo: to change it, use Google Calendar.",
     });
   });
 
@@ -389,11 +419,17 @@ describe("a repeating event's save, said once the editor has closed", () => {
     });
     expect(savedNotice("Gym", saved([]), "following", "2026-10-06", true, true)).toEqual({
       tone: "ok",
-      text: "Saved “Gym” as one event that doesn't repeat, on 06-10. To change it back, edit it again.",
+      text: "Saved “Gym” as one event that doesn't repeat, on 06-10. There's no Undo: to make it repeat again, edit it and pick a repeat.",
     });
-    // Only that row: All's own stop keeps its words, and so does any other row picked.
+    // Outside the months PM syncs, it points to Google Calendar as All does.
+    expect(
+      savedNotice("Gym", saved(["outside_mirror"]), "following", "2026-10-06", true, true).text,
+    ).toBe(
+      "Saved “Gym” as one event that doesn't repeat, on 06-10. It starts outside the months PM syncs, so PM's calendar won't show it. To change it back, use Google Calendar.",
+    );
+    // Only that row: All's own stop names no day, and any other row picked keeps its words.
     expect(savedNotice("Gym", saved([]), "all", "2026-10-19", true, false).text).toBe(
-      "Saved “Gym” for every occurrence. To change it back, edit it again.",
+      "Saved “Gym” as one event that doesn't repeat. There's no Undo: to make it repeat again, edit it and pick a repeat.",
     );
     expect(savedNotice("Gym", saved([]), "this", "2026-10-19", false, true).text).toBe(
       "Saved “Gym” for this occurrence. To change it back, edit it again.",

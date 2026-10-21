@@ -122,6 +122,9 @@ struct EditSession {
     /// An occurrence's series as Google held it when the editor opened, if PM could read it: what
     /// "all events" and "this and following" check against (G9).
     master: Option<Value>,
+    /// This computer's zone when the editor opened, if it could tell: with the calendar's, the zone
+    /// a start or end Google sent without one was shown in ([`shown_zone`]).
+    device_zone: Option<chrono_tz::Tz>,
     opened: Instant,
 }
 
@@ -131,13 +134,14 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 /// Lapsed after hours open, or PM restarted since it was opened.
 const SESSION_ENDED: &str = "This editor's session has ended. Open the event again.";
 
-/// Keep a new editor's copies (the event, and an occurrence's series) under a fresh session id, and
-/// let lapsed sessions go.
+/// Keep a new editor's copies (the event, and an occurrence's series) and the computer's zone it
+/// opened in under a fresh session id, and let lapsed sessions go.
 fn keep_session(
     edit: &CalendarEditState,
     target: Target,
     base: Value,
     master: Option<Value>,
+    device_zone: Option<chrono_tz::Tz>,
 ) -> Result<String> {
     let session = new_session_id();
     let mut sessions = edit
@@ -151,6 +155,7 @@ fn keep_session(
             target,
             base,
             master,
+            device_zone,
             opened: Instant::now(),
         },
     );
@@ -562,13 +567,7 @@ async fn open_editor<W: Wire>(
         .and_then(|m| series_info(&fresh, m))
         .map(Box::new);
     let permissions = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
-    // Only for a start or end Google sent without a zone: the calendar's zone, else this computer's.
-    // Never a guessed UTC (rule R6).
-    let fallback = target
-        .facts
-        .time_zone
-        .clone()
-        .or_else(|| device_zone.map(|z| z.name().to_string()));
+    let fallback = shown_zone(&target.facts, device_zone);
     let Some(event) = event_for_edit(&fresh, fallback.as_deref().unwrap_or("")) else {
         return Ok(EditLoad::Failed {
             message: match fallback {
@@ -578,7 +577,7 @@ async fn open_editor<W: Wire>(
         });
     };
     let seen = seen_of(&target.calendar_id, &fresh);
-    let session = keep_session(edit, target, fresh, master)?;
+    let session = keep_session(edit, target, fresh, master, device_zone)?;
     Ok(EditLoad::Ready {
         session,
         event: Box::new(event),
@@ -601,6 +600,16 @@ async fn open_series<W: Wire>(wire: &W, target: &Target, fresh: Value) -> (Value
         Fetched::Event(again) if !patch::is_gone(&again) => (again, Some(master)),
         _ => (fresh, None),
     }
+}
+
+/// The zone a start or end Google sent without one is read in: the calendar's, else this computer's
+/// (`device_zone`), never a guessed UTC (rule R6). The editor shows it in this zone, and a one-off
+/// given a repeat with its time left alone is saved in it (C11d review 1).
+fn shown_zone(facts: &CalendarFacts, device_zone: Option<chrono_tz::Tz>) -> Option<String> {
+    facts
+        .time_zone
+        .clone()
+        .or_else(|| device_zone.map(|z| z.name().to_string()))
 }
 
 /// The series of the occurrence `fresh`, as Google holds it now, or `None` for a one-off or a series
@@ -797,6 +806,80 @@ async fn land_repeating_save<W: Wire, H: Host>(
     land_new_series(wire, host, &cal, copy, Some(gone_row(target, Some(copy)))).await
 }
 
+/// What holds a save on the one-off `target` (Google's copy of it `fresh`) when it is the new part of
+/// a "this and following" change PM couldn't finish, made by "Does not repeat": that change held now
+/// (or being sent or settled), or left in the journal from before PM restarted and read against
+/// Google's copies, as it holds every save on a new part that repeats (review M1; C11d review 1). Changing it now would lay a new
+/// repeat over an original never cut, or leave the change nothing to settle against. Reads only.
+async fn held_new_part<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    fresh: &Value,
+) -> Option<WriteOutcome> {
+    let (remote, event) = (
+        target.remote_calendar.as_str(),
+        target.remote_event.as_str(),
+    );
+    // That change being sent or settled now: a save on a new part that repeats meets its claim, and
+    // this one waits alike.
+    if host.edit().splitting(&series_key(remote, event)) {
+        return Some(WriteOutcome::Busy);
+    }
+    if let Some(view) = host
+        .edit()
+        .held_on(remote, event)
+        .filter(|v| v.tail == event)
+    {
+        return Some(WriteOutcome::PartialSplit {
+            token: view.token,
+            offers: view.offers,
+            from: view.from,
+            note: None,
+        });
+    }
+    let failed = |e: Error| WriteOutcome::Failed {
+        message: e.to_string(),
+    };
+    let left = match host.with_conn(stored_journal) {
+        Ok(all) => all
+            .values()
+            .any(|entry| entry.calendar == remote && entry.tail == event),
+        Err(e) => return Some(failed(e)),
+    };
+    if !left {
+        return None;
+    }
+    let mirror = match host.mirror(&target.calendar_id) {
+        Ok(mirror) => mirror,
+        Err(e) => return Some(failed(e)),
+    };
+    // Whether it repeats past a part split off it is moot: only entries whose new part it is count.
+    let orphans = match orphans_on(wire, host, remote, &mirror, event, fresh, Parts::Unread).await {
+        Ok(orphans) => orphans,
+        Err(e) => return Some(failed(e)),
+    };
+    for found in orphans.into_iter().filter(|f| f.entry.tail == event) {
+        let e = &found.entry;
+        match found.orphan {
+            Orphan::Clear => forget(host, &e.calendar, &e.series, &e.tail),
+            // Said once, then it goes.
+            Orphan::CutLanded | Orphan::Changed => {
+                forget(host, &e.calendar, &e.series, &e.tail);
+                return Some(WriteOutcome::Failed {
+                    message: found.words(),
+                });
+            }
+            Orphan::Twice | Orphan::Unknown => {
+                return Some(WriteOutcome::Failed {
+                    message: found.words(),
+                })
+            }
+        }
+    }
+    None
+}
+
 /// [`update_calendar_event`] for one event, past its shell: Google through `wire`, the mirror and
 /// the claims through `host`.
 async fn save_event<W: Wire, H: Host>(
@@ -835,6 +918,11 @@ async fn save_event<W: Wire, H: Host>(
         if fresh.get("recurringEventId").is_some() {
             return WriteOutcome::NeedsChoice;
         }
+        // The one-off new part of a change PM couldn't finish waits until that change is settled.
+        // Only reads have gone out.
+        if let Some(held) = held_new_part(wire, host, target, &fresh).await {
+            return held;
+        }
         let mut body = match patch::build_patch(&fresh, draft) {
             Ok(body) => body,
             Err(e) => {
@@ -844,15 +932,15 @@ async fn save_event<W: Wire, H: Host>(
             }
         };
         // A one-off given a repeat (C11 §10): its times and its rule go with the rest, started on the
-        // first day the rule makes; where it repeats from is kept to read Google's copy by. "Does not
-        // repeat" is what a one-off already does.
+        // first day the rule makes, read in the zone the editor showed them in; where it repeats from
+        // is kept to read Google's copy by. "Does not repeat" is what a one-off already does.
         let repeats = match &draft.recurrence {
             Some(RepeatDraft::Rule { rule }) => match patch::add_repeat(
                 &mut body,
                 &fresh,
                 draft.time.as_ref(),
                 rule,
-                target.facts.time_zone.as_deref(),
+                shown_zone(&target.facts, open.device_zone).as_deref(),
             ) {
                 Ok(start) => Some(start),
                 Err(e) => {
@@ -5528,8 +5616,28 @@ async fn orphaned<W: Wire, H: Host>(
     mirror: &MirrorFacts,
     planning: &Planning,
 ) -> Result<Vec<Orphaned>> {
-    let series = planning.series.master.id.as_str();
-    let this = planning.series.master_fresh.json();
+    let series = &planning.series;
+    // Its exceptions read whole, as the new part's side requires (review round 3).
+    let own = if series.exceptions.complete {
+        series.parts
+    } else {
+        Parts::Unread
+    };
+    let this = series.master_fresh.json();
+    orphans_on(wire, host, remote, mirror, &series.master.id, this, own).await
+}
+
+/// [`orphaned`] for the event `series`, Google's copy of it `this`: `own` is whether it still repeats
+/// past a part split off it, for an entry whose original it is.
+async fn orphans_on<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    remote: &str,
+    mirror: &MirrorFacts,
+    series: &str,
+    this: &Value,
+    own: Parts,
+) -> Result<Vec<Orphaned>> {
     let edit = host.edit();
     let mut found = Vec::new();
     for entry in host.with_conn(stored_journal)?.into_values() {
@@ -5566,9 +5674,7 @@ async fn orphaned<W: Wire, H: Host>(
             // Shown twice only while the original still repeats from the split on: read off the
             // occurrences, as the backstop reads them (review round 1).
             let overlap = match &original {
-                // Its exceptions read whole, as the new part's side requires (review round 3).
-                None if !planning.series.exceptions.complete => Parts::Unread,
-                None => planning.series.parts,
+                None => own,
                 Some(Fetched::Event(copy)) => {
                     original_overlap(wire, remote, mirror, copy, this).await
                 }
@@ -9083,6 +9189,7 @@ mod tests {
             target(instance),
             instance.clone(),
             Some(series.clone()),
+            None,
         )
         .unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
@@ -13794,7 +13901,8 @@ mod tests {
         let host = TestHost::holding(std::slice::from_ref(&one_off));
         let target = target(&one_off);
         let script = Script::new(Vec::new());
-        let session = keep_session(&host.edit, target.clone(), one_off.clone(), None).unwrap();
+        let session =
+            keep_session(&host.edit, target.clone(), one_off.clone(), None, None).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let ctx = writer(&script, &host, &target);
         assert_eq!(
@@ -14379,7 +14487,8 @@ mod tests {
         ];
         for (answers, expected, title_now) in cases {
             let host = TestHost::holding(std::slice::from_ref(&event));
-            let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+            let session =
+                keep_session(&host.edit, target.clone(), event.clone(), None, None).unwrap();
             let open = open_session(&host.edit, &session).unwrap().unwrap();
             let mut steps = vec![Step::get("/events/solo", "", event.clone())];
             steps.extend(answers);
@@ -14442,7 +14551,7 @@ mod tests {
         let (event, turned) = (dentist(), dentist_turned_series());
         let target = target(&event);
         let host = TestHost::holding(std::slice::from_ref(&event));
-        let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+        let session = keep_session(&host.edit, target.clone(), event.clone(), None, None).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let script = Script::new(vec![Step::get("/events/solo", "", turned)]);
         let outcome = save_event(
@@ -14512,7 +14621,7 @@ mod tests {
         let event = dentist_occurrence();
         let target = target(&event);
         let host = TestHost::holding(std::slice::from_ref(&event));
-        let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+        let session = keep_session(&host.edit, target.clone(), event.clone(), None, None).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let script = Script::new(vec![Step::get("/events/solo", "", event)]);
         let outcome = save_event(
@@ -14617,7 +14726,19 @@ mod tests {
         draft: &EventPatchDraft,
         answers: Vec<Step>,
     ) -> (WriteOutcome, Script, String) {
-        let session = keep_session(&host.edit, target, event.clone(), None).unwrap();
+        save_one_off_in(host, event, target, draft, answers, None).await
+    }
+
+    /// [`save_one_off`] from an editor opened on a computer in `device_zone`.
+    async fn save_one_off_in(
+        host: &TestHost,
+        event: &Value,
+        target: Target,
+        draft: &EventPatchDraft,
+        answers: Vec<Step>,
+        device_zone: Option<chrono_tz::Tz>,
+    ) -> (WriteOutcome, Script, String) {
+        let session = keep_session(&host.edit, target, event.clone(), None, device_zone).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let mut steps = vec![Step::get("/events/solo", "", event.clone())];
         steps.extend(answers);
@@ -14864,7 +14985,9 @@ mod tests {
         );
     }
 
-    /// R6: a node with no zone on a calendar with none is never read as UTC; nothing is sent.
+    /// R6: a node with no zone on a calendar with none is read in this computer's zone, as the editor
+    /// showed it (C11d review 1); with no zone anywhere it's never read as UTC, nothing is sent, and
+    /// the words say it's the event's zone PM can't tell.
     #[tokio::test]
     async fn a_one_off_with_no_zone_anywhere_refuses_a_repeat() {
         let event = dentist();
@@ -14874,7 +14997,7 @@ mod tests {
         let (outcome, script, _) = save_one_off(
             &host,
             &event,
-            zoneless,
+            zoneless.clone(),
             &weekly_on(&[DayCode::Mon]),
             Vec::new(),
         )
@@ -14883,8 +15006,37 @@ mod tests {
         assert!(
             outcome
                 == WriteOutcome::Failed {
-                    message: time::TimeError::NoZone.to_string()
+                    message: patch::InsertError::NoEventZone.to_string()
                 }
+        );
+        // Shown in New York's time on this computer, it repeats there.
+        let shown = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off_in(
+            &shown,
+            &event,
+            zoneless,
+            &weekly_on(&[DayCode::Mon]),
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(dentist_weekly("RRULE:FREQ=WEEKLY;BYDAY=MO")),
+                ),
+                dentist_listing(dentist_mondays()),
+            ],
+            Some(chrono_tz::America::New_York),
+        )
+        .await;
+        assert!(outcome == saved());
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-12T04:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "dateTime": "2026-10-12T05:00:00-04:00", "timeZone": "America/New_York" })
         );
         // With the user's own time, its zones are theirs.
         let draft = EventPatchDraft {
@@ -14980,6 +15132,23 @@ mod tests {
                 vec![patch(lost()), Step::get("/events/solo", "", event.clone())],
                 not_there,
             ),
+            // The same rule, but not at the times sent: its start still names no zone (C11d review
+            // 1).
+            (
+                vec![
+                    patch(lost()),
+                    Step::get(
+                        "/events/solo",
+                        "",
+                        written(
+                            &event,
+                            &[("recurrence", json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]))],
+                            "\"s2\"",
+                        ),
+                    ),
+                ],
+                WriteOutcome::Unconfirmed,
+            ),
         ];
         for (answers, expected) in cases {
             let host = TestHost::holding(std::slice::from_ref(&event));
@@ -14997,6 +15166,34 @@ mod tests {
             let ended = open_session(&host.edit, &session).unwrap().is_none();
             assert_eq!(ended, expected == saved());
         }
+        // A Tuesday one-off given Monday and Wednesday is sent from the Wednesday: a copy with that
+        // rule still starting on the Tuesday isn't the save.
+        let on_tuesday = |date: &str| json!({ "dateTime": format!("{date}+01:00"), "timeZone": "Europe/London" });
+        let tuesday = written(
+            &event,
+            &[
+                ("start", on_tuesday("2026-10-13T09:00:00")),
+                ("end", on_tuesday("2026-10-13T10:00:00")),
+            ],
+            "\"s1\"",
+        );
+        let still_tuesday = written(
+            &tuesday,
+            &[("recurrence", json!(["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"]))],
+            "\"s2\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&tuesday));
+        let (outcome, script, session) = save_one_off(
+            &host,
+            &tuesday,
+            target(&tuesday),
+            &weekly_on(&[DayCode::Mon, DayCode::Wed]),
+            vec![patch(lost()), Step::get("/events/solo", "", still_tuesday)],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == WriteOutcome::Unconfirmed, "never read as landed");
+        assert!(open_session(&host.edit, &session).unwrap().is_some());
     }
 
     /// Saved, but with a reply PM can't read: the next sync shows it, and the editor's copy, a
@@ -15040,6 +15237,123 @@ mod tests {
         .await;
         assert!(outcome == pending());
         assert!(open_session(&host.edit, &kept).unwrap().is_some());
+    }
+
+    /// "Does not repeat" from Monday 19-10 of the October series: the plan, whose new part is a
+    /// one-off.
+    fn stop_plan() -> SeriesPlan {
+        Case::new(weekly(), monday_19())
+            .edit(Scope::Following, stop_repeating())
+            .unwrap()
+    }
+
+    /// Google's copy of `plan`'s one-off new part, its organizer the user, as the next sync shows it.
+    fn one_off_part(plan: &SeriesPlan) -> Value {
+        let organizer = json!({ "email": "me@example.com", "self": true });
+        with(tail_copy(plan, "\"t1\"", SAVED_AT), "organizer", organizer)
+    }
+
+    /// Save `draft` on the one-off new part `copy` (Google's copy, read by the save's own GET), then
+    /// `answers`.
+    async fn save_new_part(
+        host: &TestHost,
+        copy: &Value,
+        draft: &EventPatchDraft,
+        answers: Vec<Step>,
+    ) -> (WriteOutcome, Script) {
+        let session = keep_session(&host.edit, target(copy), copy.clone(), None, None).unwrap();
+        let open = open_session(&host.edit, &session).unwrap().unwrap();
+        let mut steps = vec![event_read(TAIL, Scripted::Json(copy.clone()))];
+        steps.extend(answers);
+        let script = Script::new(steps);
+        let outcome = save_event(&script, host, &session, &open, draft, EditingStatus::On).await;
+        (outcome, script)
+    }
+
+    /// C11d review 1 (review M1 for a one-off new part): while "Does not repeat" from 19-10 is held,
+    /// its new part, a one-off, can't be given a repeat or a new title: only its GET goes out, the
+    /// answer is the held change, and it stays held.
+    #[tokio::test]
+    async fn a_held_changes_one_off_new_part_waits_for_it() {
+        let host = TestHost::holding(&october());
+        let plan = stop_plan();
+        let one_off = one_off_part(&plan);
+        let mut steps = october_reads();
+        steps.extend([
+            insert_step(Scripted::Json(one_off.clone())),
+            series_patch(Scripted::Lost { retried: true }),
+            event_read("abc", lost()),
+            event_read("abc", lost()),
+        ]);
+        let script = Script::new(steps);
+        let (held, _) = save(
+            &host,
+            &script,
+            &monday_19(),
+            &weekly(),
+            stop_repeating(),
+            Scope::Following,
+        )
+        .await;
+        script.asked_all();
+        let token = held_token(&held);
+        for draft in [weekly_on(&[DayCode::Mon]), title("Gym")] {
+            let (outcome, script) = save_new_part(&host, &one_off, &draft, Vec::new()).await;
+            script.finished();
+            assert_eq!(held_token(&outcome), token);
+        }
+        assert!(host.edit.held_split(&token).is_some(), "still held");
+        // Running, as while it's settled: the save meets Busy, sending only its GET.
+        let running = Splitting::mark(&host.edit, series_key(CALENDAR, TAIL));
+        let (outcome, script) = save_new_part(&host, &one_off, &title("Gym"), Vec::new()).await;
+        script.finished();
+        assert!(outcome == WriteOutcome::Busy);
+        drop(running);
+    }
+
+    /// The same left from before PM restarted, read against Google's copies: a change that can't be
+    /// checked now refuses with its words, sending only reads; one Google shows finished goes, and
+    /// the save with it.
+    #[tokio::test]
+    async fn a_one_off_new_part_left_from_before_a_restart_is_read_first() {
+        let plan = stop_plan();
+        let one_off = one_off_part(&plan);
+        let entry = orphan_entry(&plan, false);
+        let host = restarted_with(&entry);
+        let unknown = Orphaned {
+            entry: entry.clone(),
+            orphan: Orphan::Unknown,
+        }
+        .words();
+        let (outcome, script) = save_new_part(
+            &host,
+            &one_off,
+            &title("Gym"),
+            vec![event_read("abc", lost())],
+        )
+        .await;
+        script.finished();
+        assert_eq!(outcome, WriteOutcome::Failed { message: unknown });
+        assert_eq!(host.journal().len(), 1);
+        // The original holds the cut: nothing shows twice, the record goes and the title saves.
+        let (outcome, script) = save_new_part(
+            &host,
+            &one_off,
+            &title("Gym"),
+            vec![
+                event_read("abc", Scripted::Json(cut_copy(&plan))),
+                Step::write(
+                    Method::Patch,
+                    &format!("/events/{TAIL}"),
+                    "\"t1\"",
+                    Scripted::Json(written(&one_off, &[("summary", json!("Gym"))], "\"t2\"")),
+                ),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(outcome, saved());
+        assert!(host.journal().is_empty());
     }
 
     /// C11 critique 1 L11: a one-off given a repeat becomes a whole repeating event, so a dev build's
@@ -15098,7 +15412,7 @@ mod tests {
         );
         let target = target(&event);
         let host = TestHost::holding(std::slice::from_ref(&event));
-        let session = keep_session(&host.edit, target.clone(), event.clone(), None).unwrap();
+        let session = keep_session(&host.edit, target.clone(), event.clone(), None, None).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let script = Script::new(vec![Step::get("/events/solo", "", event)]);
         let outcome = save_event(
@@ -15271,6 +15585,7 @@ mod tests {
                 SeriesRefusal::OnlyThisTimeDiffers,
                 SeriesRefusal::SplitInGap(day),
                 SeriesRefusal::KindAndDay,
+                SeriesRefusal::KindFromMovedDay,
                 SeriesRefusal::SplitOverlap(day),
                 SeriesRefusal::PartsUnread,
                 SeriesRefusal::RuleIsSeriesWide,

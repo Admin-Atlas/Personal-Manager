@@ -569,6 +569,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       if (outcome.outcome !== "needs_choice") heldNotice.current = null;
       switch (outcome.outcome) {
         case "saved":
+          // "Does not repeat" leaves one event, never a repeating one.
           noteSaved(
             what.title,
             outcome,
@@ -676,6 +677,10 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     ownRule && series
       ? { state: "ready", summary: series.repeats, starts: series.starts, moved: false }
       : repeat.state;
+  // Its own rule keeps a row in the list whatever was picked since, so picking it again changes
+  // nothing (C11d review 1).
+  const standing =
+    loaded && series ? { value: loaded.base.recurrence, words: series.repeats } : null;
   const repeatHolds =
     !repeating && (repeat.state.state === "loading" || repeat.state.state === "refused");
 
@@ -754,9 +759,13 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
               moveStart={moveStart}
               moveEndDate={moveEndDate}
+              // A time change like any other: a rule picked here follows the date it lands on.
               onSwitchKind={() =>
                 zoneFallback &&
-                setDraft({ ...draft, time: switchKind(draft.time, loaded.base.time, zoneFallback) })
+                changeTime({
+                  ...draft,
+                  time: switchKind(draft.time, loaded.base.time, zoneFallback),
+                })
               }
               canSwitchKind={!!zoneFallback}
               onPickZone={setZonePick}
@@ -771,6 +780,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
                   skippedTime={!!check?.problems.some((p) => p.kind === "gap")}
                   judge={!repeating}
                   offReason={repeating && !series ? UNREADABLE_REPEAT : undefined}
+                  standing={standing}
                   disabled={!timeEditable}
                   onChange={(recurrence) =>
                     draftRef.current && setDraft({ ...draftRef.current, recurrence })

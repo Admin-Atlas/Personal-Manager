@@ -147,8 +147,8 @@ export function writeWarningText(
         ? `Some occurrences you changed on their own may still be on the earlier part, or hidden by Google${days}; check them in Google Calendar.`
         : `Some occurrences changed on their own may still show${days}; check them in Google Calendar.`;
     }
-    // A new event comes back with it, a one-off made to repeat, and a repeating event saved as one
-    // that doesn't repeat (C11).
+    // A new event comes back with it, a one-off made to repeat, or the one event "Does not repeat"
+    // leaves of a repeating one, for every occurrence or from one on (C11).
     case "outside_mirror":
       return "It starts outside the months PM syncs, so PM's calendar won't show it.";
     // A notice per milestone names each one (`milestoneStayedText`); this is the short form.
@@ -419,13 +419,15 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
 
 /** A save that landed, said once the editor has closed. `scope` names the occurrences of a
  *  repeating event it was for: there's no Undo after one (DECISIONS 17-10 #4), so the notice says
- *  how to change it back, and for "this and following", which makes a repeating event of its own
- *  from `from` (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). `stops`:
- *  the save made it "Does not repeat", so from `from` on it's one event, not a repeating one.
- *  `asAll`: the "this and following" row was the first occurrence's, which saves every occurrence
- *  (`RowView.asAll`), so it's worded as All, a stop naming the day of the one event left, `from`
- *  (C11c review). One that left the event outside the months PM syncs says so, and never to edit it
- *  again here (C11c review). */
+ *  how to change it back, and for "this and following", which makes an event of its own from `from`
+ *  (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). `stops`: "Does not
+ *  repeat" was saved, so one event is left, never a repeating one nor every occurrence (C11c review,
+ *  C11d review 1). `asAll`: the "this and following" row was the first occurrence's, which saves
+ *  every occurrence (`RowView.asAll`), so it's worded as All, a stop naming the day of the one event
+ *  left, `from` (C11c review); All's own stop names none, since the one it keeps is the first
+ *  occurrence still there, which the choices named. One that left the event outside the months PM
+ *  syncs says so, and points to Google Calendar, never to editing it again here (C11c review, C11d
+ *  review 1). */
 export function savedNotice(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
@@ -435,6 +437,8 @@ export function savedNotice(
   asAll = false,
 ): { tone: Tone; text: string } {
   const t = quote(title);
+  // A new event or a one-off made to repeat whose occurrences all fall outside the months PM syncs
+  // (C11 §10), or the one event "Does not repeat" leaves there.
   const outside = outcome.warnings.includes("outside_mirror");
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const day = from ? formatDateOnly(from) : null;
@@ -451,31 +455,38 @@ export function savedNotice(
       back = "To change it back, edit it again.";
       break;
     case "following": {
+      // Like the choices' own line: a separate event from the part before it.
       const since = day ?? "this occurrence";
       first = stops
-        ? `Saved ${t} from ${since} on, as one event that doesn't repeat.`
+        ? `Saved ${t} from ${since} on, as a separate event that doesn't repeat.`
         : `Saved ${t} from ${since} on, as a repeating event of its own.`;
-      back = stops
-        ? "There's no Undo: editing it again changes that event, but won't join it back to the earlier ones."
-        : "There's no Undo: editing it again changes that part, but won't join it back to the earlier one.";
+      back = `There's no Undo: editing it again changes that ${stops ? "event" : "part"}, but won't join it back to the earlier one.`;
       break;
     }
     case "all":
-      // From the first occurrence, the one event left is the one opened, where the draft put it.
-      first =
-        stops && asAll
-          ? `Saved ${t} as one event that doesn't repeat${day ? `, on ${day}` : ""}.`
-          : `Saved ${t} for every occurrence.`;
-      back = "To change it back, edit it again.";
+      // A stop keeps one event: from the first occurrence, the one opened, where the draft put it;
+      // from any other, the first occurrence still there, which `from` isn't.
+      first = stops
+        ? `Saved ${t} as one event that doesn't repeat${asAll && day ? `, on ${day}` : ""}.`
+        : `Saved ${t} for every occurrence.`;
+      back = stops
+        ? "There's no Undo: to make it repeat again, edit it and pick a repeat."
+        : "To change it back, edit it again.";
       break;
     default:
       return unreachable(saved);
   }
+  // PM's calendar won't show it, so it can't be edited again here: Google Calendar can.
+  if (outside && saved !== null) {
+    back =
+      saved === "following"
+        ? "There's no Undo: to change it, use Google Calendar."
+        : "To change it back, use Google Calendar.";
+  }
   const said = savedWarnings(outcome);
   const parts = [first, ...said.words];
-  // With occurrences left on the earlier part, changing it back isn't the whole story; an event
-  // PM's calendar won't show can't be edited again here.
-  if (back && !said.warn) parts.push(back);
+  // With occurrences left on the earlier part, changing it back isn't the whole story.
+  if (back && !outcome.warnings.includes("left_on_old_series")) parts.push(back);
   return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
 }
 
