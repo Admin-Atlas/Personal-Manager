@@ -5563,11 +5563,14 @@ impl Orphaned {
         let day = day_words(&self.entry.from);
         match self.orphan {
             // "Does not repeat" from here: the event PM made in its place has no "All events" to
-            // delete, and the occurrences after it were to go, not move.
+            // delete, and the occurrences after it were to go, not move. Said on that event's own
+            // editor too, so what comes after the delete is the change, not this save (C11d
+            // review 2).
             Orphan::Twice if self.entry.one_off => format!(
                 "PM closed while it was making this repeating event stop repeating from {day}: it \
                  still repeats from then, and the event PM made in its place is there too. In \
-                 Google Calendar, delete that event, the one that doesn't repeat, then try again."
+                 Google Calendar, delete that event, the one that doesn't repeat, then make the \
+                 change again."
             ),
             Orphan::CutLanded if self.entry.one_off => format!(
                 "PM closed before it finished making this repeating event stop repeating from \
@@ -12738,6 +12741,14 @@ mod tests {
         assert!(host.journal().is_empty());
     }
 
+    /// A "Does not repeat" from Monday 19-10 left from before a restart, its original never cut, in
+    /// full: no "All events", nothing "shows twice from" it, and what's made again after the delete
+    /// is the change, since the event being saved may be the one deleted (C11d review 2).
+    const STOP_TWICE: &str = "PM closed while it was making this repeating event stop repeating \
+                              from 19-10-2026: it still repeats from then, and the event PM made \
+                              in its place is there too. In Google Calendar, delete that event, \
+                              the one that doesn't repeat, then make the change again.";
+
     /// C11c review: a "Does not repeat" from one occurrence on, left from before a restart, is worded
     /// as that: the event PM made has no "All events" to delete, and the occurrences changed on their
     /// own after it were to go, not move.
@@ -12757,7 +12768,8 @@ mod tests {
         let twice = words(Orphan::Twice);
         assert!(twice.contains("stop repeating from 19-10-2026"));
         assert!(twice.contains("delete that event, the one that doesn't repeat"));
-        assert!(!twice.contains("All events"));
+        assert!(!twice.contains("All events") && !twice.contains("try again"));
+        assert_eq!(twice, STOP_TWICE);
         let cut = words(Orphan::CutLanded);
         assert!(cut.contains("may still show") && cut.contains("delete them in Google Calendar"));
         assert!(!cut.contains("new part"));
@@ -15313,47 +15325,102 @@ mod tests {
 
     /// The same left from before PM restarted, read against Google's copies: a change that can't be
     /// checked now refuses with its words, sending only reads; one Google shows finished goes, and
-    /// the save with it.
+    /// the save with it. One whose original was never cut shows twice: refused in its words, read
+    /// off the original's occurrences, and kept. One whose original changed in Google since is said
+    /// once, then forgotten, so the next save goes (C11d review 2).
     #[tokio::test]
     async fn a_one_off_new_part_left_from_before_a_restart_is_read_first() {
         let plan = stop_plan();
         let one_off = one_off_part(&plan);
-        let entry = orphan_entry(&plan, false);
+        // As the stop's own record holds it: its new part is one event.
+        let entry = Entry {
+            one_off: true,
+            ..orphan_entry(&plan, false)
+        };
         let host = restarted_with(&entry);
-        let unknown = Orphaned {
-            entry: entry.clone(),
-            orphan: Orphan::Unknown,
-        }
-        .words();
-        let (outcome, script) = save_new_part(
-            &host,
-            &one_off,
-            &title("Gym"),
-            vec![event_read("abc", lost())],
-        )
+        let words = |orphan: Orphan| {
+            Orphaned {
+                entry: entry.clone(),
+                orphan,
+            }
+            .words()
+        };
+        let gym = title("Gym");
+        let retitle = |answers: Vec<Step>| save_new_part(&host, &one_off, &gym, answers);
+        let (outcome, script) = retitle(vec![event_read("abc", lost())]).await;
+        script.finished();
+        assert_eq!(
+            outcome,
+            WriteOutcome::Failed {
+                message: words(Orphan::Unknown)
+            }
+        );
+        assert_eq!(host.journal().len(), 1);
+        // The original never cut, its Mondays from 19-10 still there: it shows twice. Refused in the
+        // stop's words, only reads sent, and the record stays.
+        let (outcome, script) = retitle(vec![
+            event_read("abc", Scripted::Json(weekly())),
+            ical_listing(
+                "iCalUID=abc%40google.com",
+                Scripted::Json(page(vec![weekly()], None)),
+            ),
+            window_read(october()),
+        ])
         .await;
         script.finished();
-        assert_eq!(outcome, WriteOutcome::Failed { message: unknown });
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: STOP_TWICE.into()
+                },
+            "shows twice, in the stop's words"
+        );
+        assert_eq!(words(Orphan::Twice), STOP_TWICE);
         assert_eq!(host.journal().len(), 1);
         // The original holds the cut: nothing shows twice, the record goes and the title saves.
-        let (outcome, script) = save_new_part(
-            &host,
-            &one_off,
-            &title("Gym"),
-            vec![
-                event_read("abc", Scripted::Json(cut_copy(&plan))),
-                Step::write(
-                    Method::Patch,
-                    &format!("/events/{TAIL}"),
-                    "\"t1\"",
-                    Scripted::Json(written(&one_off, &[("summary", json!("Gym"))], "\"t2\"")),
-                ),
-            ],
-        )
+        let patch = || {
+            Step::write(
+                Method::Patch,
+                &format!("/events/{TAIL}"),
+                "\"t1\"",
+                Scripted::Json(written(&one_off, &[("summary", json!("Gym"))], "\"t2\"")),
+            )
+        };
+        let (outcome, script) = retitle(vec![
+            event_read("abc", Scripted::Json(cut_copy(&plan))),
+            patch(),
+        ])
         .await;
         script.asked_all();
         assert_eq!(outcome, saved());
         assert!(host.journal().is_empty());
+        // The original's repeat changed in Google since: said once, the record forgotten, and the
+        // next save goes with only its own read before it.
+        let host = restarted_with(&entry);
+        let changed = with(
+            weekly(),
+            "recurrence",
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=TU"]),
+        );
+        let (outcome, script) = save_new_part(
+            &host,
+            &one_off,
+            &gym,
+            vec![event_read("abc", Scripted::Json(changed))],
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: words(Orphan::Changed)
+                },
+            "changed since, in its words"
+        );
+        assert!(host.journal().is_empty(), "said once, then forgotten");
+        let (outcome, script) = save_new_part(&host, &one_off, &gym, vec![patch()]).await;
+        script.asked_all();
+        assert!(outcome == saved(), "the next save goes");
     }
 
     /// C11 critique 1 L11: a one-off given a repeat becomes a whole repeating event, so a dev build's
@@ -15586,6 +15653,7 @@ mod tests {
                 SeriesRefusal::SplitInGap(day),
                 SeriesRefusal::KindAndDay,
                 SeriesRefusal::KindFromMovedDay,
+                SeriesRefusal::KindStartNotOnRule(day),
                 SeriesRefusal::SplitOverlap(day),
                 SeriesRefusal::PartsUnread,
                 SeriesRefusal::RuleIsSeriesWide,
@@ -15656,6 +15724,7 @@ mod tests {
             .to_string()
             .contains("19-10-2026"));
         for dated in [
+            SeriesRefusal::KindStartNotOnRule(day),
             SeriesRefusal::RepeatsPastPart(day),
             SeriesRefusal::RepeatsPastItsEnd(day),
             SeriesRefusal::KeptHasOwn(day),

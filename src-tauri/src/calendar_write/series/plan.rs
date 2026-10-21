@@ -1693,12 +1693,13 @@ fn plan_all(
     if let Some(ask) = own_rule_rebuild(draft, input.fresh.instance.json(), master, original)? {
         // The rebuild starts on the first day the rule makes: a first occurrence the rule doesn't
         // make would go, and with "after n times" one more would come at the end, on a save that
-        // changed no day. A move refuses the same series (RM14; C11d review 1).
+        // changed no day. A move refuses the same series (RM14; C11d review 1), in words of its own:
+        // here nothing was moved (C11d review 2).
         let parsed = lines::parse(&master.recurrence);
         let (_, facts) = lines::series_rule(&parsed).map_err(RecurError::TextOnly)?;
         if !is_occurrence(&facts, &master.start, master.first)? {
             let first = master.first.day_in(master.start.zone());
-            return Err(RetimeError::StartNotOnRule(first).into());
+            return Err(SeriesRefusal::KindStartNotOnRule(first).into());
         }
         return plan_all_rule(input, master, original, draft, ask, notify);
     }
@@ -3635,8 +3636,9 @@ mod tests {
 
     /// C11d review 1: weekly on Monday, ten times, from a Sunday its rule doesn't make (Google counts
     /// that Sunday). Rebuilt from its rule, the Sunday would go and an eleventh Monday would come, so
-    /// a change of kind for every occurrence is refused in words, from the Sunday as from any other.
-    /// Its rest, from a Monday, still goes: the new part starts on an occurrence the rule makes.
+    /// a change of kind or zone for every occurrence is refused in words, from the Sunday as from any
+    /// other: words of its own, naming no move, since the user moved nothing (C11d review 2). Its
+    /// rest, from a Monday, still goes: the new part starts on an occurrence the rule makes.
     #[test]
     fn a_kind_change_on_all_refuses_a_series_starting_off_its_rule() {
         let from_sunday = |rule: &str| {
@@ -3654,11 +3656,19 @@ mod tests {
             ..Default::default()
         };
         let counted = from_sunday("RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10");
-        let refused = Err(NotPlanned::Refused(SeriesRefusal::Retime(
-            RetimeError::StartNotOnRule(day(2026, 10, 4)),
-        )));
+        let refused = Err(NotPlanned::Refused(SeriesRefusal::KindStartNotOnRule(day(
+            2026, 10, 4,
+        ))));
         let case = Case::new(counted.clone(), monday_19());
         assert!(case.edit(Scope::All, all_day_on("2026-10-19")) == refused);
+        let in_new_york = timed_in("2026-10-19", "09:00", "10:00", "America/New_York");
+        assert!(case.edit(Scope::All, in_new_york) == refused);
+        assert_eq!(
+            SeriesRefusal::KindStartNotOnRule(day(2026, 10, 4)).to_string(),
+            "This repeating event starts on 04-10-2026, a day its own rule doesn't repeat on, so \
+             PM can't change every occurrence between all-day and timed, or into another time \
+             zone. Change this occurrence on its own."
+        );
         let sunday = Case::new(counted, plain("2026-10-04T09:00:00+01:00"));
         for scope in [Scope::All, Scope::Following] {
             assert!(sunday.edit(scope, all_day_on("2026-10-04")) == refused);

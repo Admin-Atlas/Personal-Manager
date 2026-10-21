@@ -626,6 +626,10 @@ pub enum SeriesRefusal {
     /// The same from an occurrence moved to another day on its own and left there: the user moved
     /// no day, but the rule's own days still can't follow it (C11d review 1).
     KindFromMovedDay,
+    /// Every occurrence between all-day and timed, or into another zone, of a series whose first
+    /// occurrence, on this day, is one its own rule doesn't make: rebuilt from that rule, it would
+    /// lose that occurrence. Only every occurrence's plan reaches it (C11d review 2).
+    KindStartNotOnRule(NaiveDate),
     /// A part PM split off this series from this day is still there, and the series still repeats
     /// past it ([`parts_overlap`]).
     SplitOverlap(NaiveDate),
@@ -735,6 +739,14 @@ impl fmt::Display for SeriesRefusal {
                 "This occurrence was moved to another day on its own, so PM can't change other \
                  occurrences from it between all-day and timed, or into another time zone. Change \
                  it on its own, or from an occurrence on its usual day."
+            ),
+            // The user moved nothing: unlike a move's own refusal, it names only the change asked.
+            SeriesRefusal::KindStartNotOnRule(day) => write!(
+                f,
+                "This repeating event starts on {}, a day its own rule doesn't repeat on, so PM \
+                 can't change every occurrence between all-day and timed, or into another time \
+                 zone. Change this occurrence on its own.",
+                day.format("%d-%m-%Y")
             ),
             SeriesRefusal::SplitOverlap(day) => write!(
                 f,
