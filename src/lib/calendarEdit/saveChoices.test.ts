@@ -162,6 +162,29 @@ describe("the rows", () => {
       "Changed in Google since you opened it.",
     );
   });
+
+  // C12: the dialog asks Send or Don't send for a row exactly when it carries who would be emailed.
+  it("carries who an offered row would email, and nobody for the rest", () => {
+    const guests = {
+      updated: 2,
+      invited: 0,
+      removed: 0,
+      cancelled: false,
+      people: 2,
+      emails: 2,
+      complete: true,
+    };
+    const rows = rowsOf(
+      ready(
+        { row: "offered", warnings: [], token: "t", guests },
+        { row: "as_all", warnings: [], token: "f", guests },
+        { row: "refused", message: VISIBILITY },
+      ),
+      "save",
+    );
+    expect(rows.map((r) => r.guests)).toEqual([guests, guests, null]);
+    expect(rowsOf(ready(offered("t")), "save").map((r) => r.guests)).toEqual([null, null, null]);
+  });
 });
 
 describe("an earlier change PM couldn't finish", () => {
@@ -312,6 +335,7 @@ describe("the warnings", () => {
       asAll: false,
       token: "f",
       warnings: [...every].reverse(),
+      guests: null,
     };
     const lines = warningLines(row, "save", "Gym");
     expect(lines).toEqual(every.map((w) => seriesWarningText(w, "save", "following", "Gym")));
@@ -366,6 +390,7 @@ describe("the warnings", () => {
         stops,
         dayMove("every Sunday", "every Monday", 1),
       ],
+      guests: null,
     };
     const fromHere = (w: SeriesWarning) => say(w, "following");
     expect(warningLines(row, "save", "Gym")).toEqual([

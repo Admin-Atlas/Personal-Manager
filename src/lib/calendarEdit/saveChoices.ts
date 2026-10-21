@@ -9,6 +9,7 @@
 import { formatDateOnly } from "../format";
 import type {
   CalendarEvent,
+  GuestNotice,
   ScopeRow,
   SeriesChoices,
   SeriesScope,
@@ -55,6 +56,8 @@ export interface RowView {
   /** The row's token when selectable. */
   token: string | null;
   warnings: SeriesWarning[];
+  /** Who Google would email with Send, when anyone (C12): choosing the row asks it. */
+  guests: GuestNotice | null;
 }
 
 const SCOPES: readonly SeriesScope[] = ["this", "following", "all"];
@@ -89,7 +92,7 @@ function offeredDetail(scope: SeriesScope, asAll: boolean, kind: ChoiceKind, day
 }
 
 function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: string): RowView {
-  const base = { scope, label: LABEL[scope], asAll: false };
+  const base = { scope, label: LABEL[scope], asAll: false, guests: null };
   switch (row.row) {
     case "offered":
     case "as_all":
@@ -100,6 +103,7 @@ function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: stri
         asAll: row.row === "as_all",
         token: row.token,
         warnings: row.warnings,
+        guests: row.guests ?? null,
       };
     case "refused":
       return { ...base, detail: row.message, selectable: false, token: null, warnings: [] };

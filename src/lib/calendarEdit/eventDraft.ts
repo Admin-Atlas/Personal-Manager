@@ -16,18 +16,27 @@
 // Creating an event uses the same fields: `newEventSeed` starts one, it's judged against
 // `NEW_EVENT_BASE` (nothing to keep, so every half is checked), and `toNewEvent` sends all of it,
 // its repeat included (C11).
+//
+// Guests are fields too (C12): the list, compared by who is on it and who is optional (a reply is
+// never a change), sent as changes to Google's own list, never the list; and the three guest
+// permissions. A rebase merges the guest list rather than taking Google's whole (`rebaseDraft`).
 
 import type {
   EventForEdit,
   EventPatchDraft,
   EventVisibility,
   FieldPermissions,
+  GuestForEdit,
+  GuestNotice,
+  GuestOp,
+  GuestState,
   NewEventDraft,
   SeriesInfo,
   ShowAs,
   TimeDraft,
 } from "../types";
 import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
+import { addressKey, changeNotice, isEmail } from "./guests";
 import {
   copyRule,
   followStartDate,
@@ -38,6 +47,21 @@ import {
 } from "./recurrenceDraft";
 import { durationLabel, timeChoices } from "./timeSlots";
 
+/** One guest as the editor holds it: Google's entry as the editor opened it, or one the user added
+ *  (no name or reply yet). */
+export type GuestDraft = GuestForEdit;
+
+/** What guests may do, Google's three "Guest permissions" boxes: change the event, invite others,
+ *  see the guest list. */
+export interface GuestPerms {
+  modify: boolean;
+  invite_others: boolean;
+  see_others: boolean;
+}
+
+/** Google's own: guests may invite others and see the list, not change the event. */
+const GOOGLE_PERMS: GuestPerms = { modify: false, invite_others: true, see_others: true };
+
 /** What the editor's fields hold. */
 export interface EditorFields {
   summary: string;
@@ -46,17 +70,23 @@ export interface EditorFields {
   time: TimeDraft;
   /** How it repeats: the Repeat row. */
   recurrence: RepeatValue;
+  /** Who is on it, the organiser and the user included, in Google's order then the order added. */
+  guests: GuestDraft[];
+  guest_perms: GuestPerms;
   show_as: ShowAs;
   visibility: EventVisibility;
 }
 
 export type EditorField = keyof EditorFields;
 
-/** Every field, in the order the editor shows them. */
+/** Every field, in the order the editor shows them: guests after the time, as Google's quick
+ *  create has them (INFERRED). */
 export const EDITOR_FIELDS: readonly EditorField[] = [
   "summary",
   "time",
   "recurrence",
+  "guests",
+  "guest_perms",
   "location",
   "description",
   "show_as",
@@ -72,6 +102,12 @@ export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): Edit
     description: event.description,
     time: { ...event.time },
     recurrence: repeat,
+    guests: event.guests.map((g) => ({ ...g })),
+    guest_perms: {
+      modify: event.guests_can_modify,
+      invite_others: event.guests_can_invite_others,
+      see_others: event.guests_can_see_other_guests,
+    },
     show_as: event.show_as,
     visibility: event.visibility,
   };
@@ -109,6 +145,20 @@ function sameTime(a: TimeDraft, b: TimeDraft): boolean {
   return false;
 }
 
+/** Who is on a guest list, as `address|optional` (lower-cased), sorted and once each: replies,
+ *  names and order never count (R2: someone's reply is not a change). */
+function guestSet(guests: readonly GuestDraft[]): string[] {
+  return [...new Set(guests.map((g) => `${addressKey(g.email)}|${g.optional}`))].sort();
+}
+
+const sameGuests = (a: readonly GuestDraft[], b: readonly GuestDraft[]) => {
+  const x = guestSet(a);
+  const y = guestSet(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+};
+
+const PERMS: readonly (keyof GuestPerms)[] = ["modify", "invite_others", "see_others"];
+
 /** Whether `field` holds the same value in `a` and `b`. */
 export function sameField(field: EditorField, a: EditorFields, b: EditorFields): boolean {
   switch (field) {
@@ -120,10 +170,40 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
       return sameTime(a.time, b.time);
     case "recurrence":
       return sameRepeat(a.recurrence, b.recurrence);
+    case "guests":
+      return sameGuests(a.guests, b.guests);
+    case "guest_perms":
+      return PERMS.every((p) => a.guest_perms[p] === b.guest_perms[p]);
     case "show_as":
     case "visibility":
       return a[field] === b[field];
   }
+}
+
+const stateOf = (g: GuestDraft | undefined): GuestState =>
+  g === undefined ? "absent" : g.optional ? "optional" : "required";
+
+const byAddress = (guests: readonly GuestDraft[]) =>
+  new Map(guests.map((g) => [addressKey(g.email), g] as const));
+
+/** The guest list's changes from `base` to `draft`, as Google's list should end up: one op per
+ *  address added, taken off or made optional or required, in the base's spelling where it has one,
+ *  sorted by lower-cased address so the same change always reads the same. Never one on the
+ *  organiser's or the user's own entry: the field can't make one, and Google's copy would refuse it
+ *  (the backend's `check`). */
+function guestOps(base: readonly GuestDraft[], draft: readonly GuestDraft[]): GuestOp[] {
+  const before = byAddress(base);
+  const after = byAddress(draft);
+  const ops: GuestOp[] = [];
+  for (const key of [...new Set([...before.keys(), ...after.keys()])].sort()) {
+    const was = before.get(key);
+    const now = after.get(key);
+    const entry = was ?? now;
+    if (!entry || was?.organizer || was?.self || now?.organizer || now?.self) continue;
+    const to = stateOf(now);
+    if (to !== stateOf(was)) ops.push({ email: entry.email.trim(), to });
+  }
+  return ops;
 }
 
 /** The fields `draft` changed from `base`, in editor order. */
@@ -152,6 +232,25 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
         else if (r.kind === "once") changes.recurrence = { kind: "once" };
         break;
       }
+      // Changes to Google's own list, never the list (R1): the backend applies them to its fresh
+      // copy, so a reply that landed meanwhile is kept.
+      case "guests": {
+        const ops = guestOps(base.guests, draft.guests);
+        if (ops.length > 0) changes.guests = ops;
+        break;
+      }
+      // Only the boxes that changed.
+      case "guest_perms": {
+        const [was, now] = [base.guest_perms, draft.guest_perms];
+        if (was.modify !== now.modify) changes.guests_can_modify = now.modify;
+        if (was.invite_others !== now.invite_others) {
+          changes.guests_can_invite_others = now.invite_others;
+        }
+        if (was.see_others !== now.see_others) {
+          changes.guests_can_see_other_guests = now.see_others;
+        }
+        break;
+      }
       case "show_as":
         changes.show_as = draft.show_as;
         break;
@@ -163,10 +262,34 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
   return changes;
 }
 
+/** Who saving `draft` over `base` would email, judged as the backend judges it (its
+ *  `notify_required`, the same table in both tests): null when nobody. A change to busy or free
+ *  alone is the user's own and emails nobody. `omitted`: Google cut the list short, so "at least".
+ *  `me`: the account saving, never a guest even where Google's copy doesn't mark it. The backend
+ *  has the last word; this only lets the editor ask before a round trip. */
+export function guestNotice(
+  base: EditorFields,
+  draft: EditorFields,
+  omitted: boolean,
+  me: string | null = null,
+): GuestNotice | null {
+  const shared = changedFields(base, draft).some((f) => f !== "show_as");
+  return changeNotice(base.guests, draft.guests, shared, omitted, me);
+}
+
 /** Whether the editor may change `field` (the permission names match the fields). How it repeats is
- *  the time's right: Google locks `recurrence` exactly when it locks the start. */
+ *  the time's right: Google locks `recurrence` exactly when it locks the start. The guest list and
+ *  its permissions are one right. */
 export function canEdit(permissions: FieldPermissions, field: EditorField): boolean {
-  return field === "recurrence" ? permissions.time : permissions[field];
+  switch (field) {
+    case "recurrence":
+      return permissions.time;
+    case "guests":
+    case "guest_perms":
+      return permissions.guests;
+    default:
+      return permissions[field];
+  }
 }
 
 /** Something that stops a save before it is sent. */
@@ -174,7 +297,10 @@ export type DraftProblem =
   | { kind: "end_before_start" }
   /** The clocks skip that time in that zone. */
   | { kind: "gap"; half: "start" | "end"; zone: string; time: string }
-  | { kind: "unreadable"; half: "start" | "end"; what: "zone" | "date" | "time" };
+  | { kind: "unreadable"; half: "start" | "end"; what: "zone" | "date" | "time" }
+  /** A guest added whose address isn't one (the field never adds one; a paste or a hand-over
+   *  could). */
+  | { kind: "bad_guest"; email: string };
 
 export interface DraftCheck {
   problems: DraftProblem[];
@@ -210,6 +336,7 @@ export interface HeldTimes {
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** What would stop `draft` saving, judged as the backend will judge it:
+ *  - a guest added whose address isn't one (Google's own entries are never judged);
  *  - a time the user didn't change isn't sent, so it can't stop a save (a 0-minute event, or a zone
  *    this webview doesn't know, never blocks a title edit);
  *  - a half left as Google holds it keeps Google's exact instant (`held`, from the base's
@@ -219,6 +346,12 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 export function checkDraft(base: EditorFields, draft: EditorFields, held?: HeldTimes): DraftCheck {
   const problems: DraftProblem[] = [];
   const ambiguous: ("start" | "end")[] = [];
+  const had = byAddress(base.guests);
+  for (const g of draft.guests) {
+    if (!had.has(addressKey(g.email)) && !isEmail(g.email)) {
+      problems.push({ kind: "bad_guest", email: g.email });
+    }
+  }
   if (sameTime(base.time, draft.time)) return { problems, ambiguous };
   const t = draft.time;
   if (t.kind === "all_day") {
@@ -434,25 +567,88 @@ export interface Rebased {
 
 /** Carry `draft` (made against `oldBase`) onto `newBase`, Google's copy now. A field only the user
  *  changed keeps the user's value; a field only Google changed takes Google's; a field both changed
- *  takes Google's (it can't be saved over unseen) and is listed, unless both made the same change. */
+ *  takes Google's (it can't be saved over unseen) and is listed, unless both made the same change.
+ *  The guest list and its permissions merge instead (`rebaseGuests`, `rebasePerms`). */
 export function rebaseDraft(
   oldBase: EditorFields,
   newBase: EditorFields,
   draft: EditorFields,
 ): Rebased {
-  const next: EditorFields = { ...newBase, time: { ...newBase.time } };
+  const next: EditorFields = {
+    ...newBase,
+    time: { ...newBase.time },
+    guests: newBase.guests.map((g) => ({ ...g })),
+    guest_perms: { ...newBase.guest_perms },
+  };
   const overwritten: EditorField[] = [];
   for (const f of EDITOR_FIELDS) {
     const mine = !sameField(f, oldBase, draft);
     if (!mine) continue;
     const theirs = !sameField(f, oldBase, newBase);
-    if (!theirs) {
+    if (f === "guests") {
+      if (rebaseGuests(oldBase, newBase, draft, theirs, next)) overwritten.push(f);
+    } else if (f === "guest_perms") {
+      rebasePerms(oldBase, draft, next);
+    } else if (!theirs) {
       setField(next, f, draft);
     } else if (!sameField(f, draft, newBase)) {
       overwritten.push(f);
     }
   }
   return { base: newBase, draft: next, overwritten };
+}
+
+/** The user's guest list carried onto Google's newer one, into `next`; true when a change of the
+ *  user's was dropped. Only the user changed it: the user's list, each name and reply as Google has
+ *  them now (someone's reply is no conflict). Both changed it: the user's changes made again on
+ *  Google's list, except one to a guest Google changed too, which is dropped (Google's stands, R2);
+ *  a guest the user added keeps the name the user saw. */
+function rebaseGuests(
+  oldBase: EditorFields,
+  newBase: EditorFields,
+  draft: EditorFields,
+  theirs: boolean,
+  next: EditorFields,
+): boolean {
+  const fresh = byAddress(newBase.guests);
+  if (!theirs) {
+    next.guests = draft.guests.map((g) => {
+      const now = fresh.get(addressKey(g.email));
+      return now ? { ...g, name: now.name, response: now.response } : { ...g };
+    });
+    return false;
+  }
+  const old = byAddress(oldBase.guests);
+  const mine = byAddress(draft.guests);
+  let lost = false;
+  for (const op of guestOps(oldBase.guests, draft.guests)) {
+    const key = addressKey(op.email);
+    const google = stateOf(fresh.get(key));
+    if (google !== stateOf(old.get(key)) && google !== op.to) {
+      lost = true;
+      continue;
+    }
+    if (op.to === "absent") {
+      next.guests = next.guests.filter((g) => addressKey(g.email) !== key);
+    } else if (fresh.has(key)) {
+      next.guests = next.guests.map((g) =>
+        addressKey(g.email) === key ? { ...g, optional: op.to === "optional" } : g,
+      );
+    } else {
+      const added = mine.get(key);
+      if (added) next.guests = [...next.guests, { ...added, optional: op.to === "optional" }];
+    }
+  }
+  return lost;
+}
+
+/** The guest permissions, each as a field of its own, into `next` (Google's): a box the user
+ *  changed takes the user's state. A box has two states, so one both sides changed was changed
+ *  the same way, and nothing of the user's is lost. */
+function rebasePerms(oldBase: EditorFields, draft: EditorFields, next: EditorFields) {
+  for (const p of PERMS) {
+    if (draft.guest_perms[p] !== oldBase.guest_perms[p]) next.guest_perms[p] = draft.guest_perms[p];
+  }
 }
 
 /** `date` (`YYYY-MM-DD`) moved by `days`. */
@@ -484,6 +680,8 @@ export const NEW_EVENT_BASE: EditorFields = {
   description: "",
   time: { kind: "all_day", first_day: "", last_day: "" },
   recurrence: ONCE,
+  guests: [],
+  guest_perms: { ...GOOGLE_PERMS },
   show_as: "busy",
   visibility: "default",
 };
@@ -505,9 +703,9 @@ function firstShown(date: string, time: string, zone: string): string | null {
 /** A new event's starting fields, on `day` (`YYYY-MM-DD`, in `zone`): on today the next half hour
  *  strictly after `now` (14:10 → 14:30, 14:30 → 15:00, 23:40 → 00:00 the next day), on any other day
  *  09:00, stepping past a time the clocks skip; `lengthMs` long (`endAfterStart`, so a repeated hour
- *  never gives an end before the start). Busy, the calendar's default visibility, not repeating. With
- *  no zone at all there's no time to show, so it starts as an all-day event on `day`, free as
- *  Google's are. */
+ *  never gives an end before the start). Busy, the calendar's default visibility, not repeating, no
+ *  guests and Google's guest permissions. With no zone at all there's no time to show, so it starts
+ *  as an all-day event on `day`, free as Google's are. */
 export function newEventSeed(
   day: string,
   now: Date,
@@ -519,6 +717,8 @@ export function newEventSeed(
     location: "",
     description: "",
     recurrence: ONCE,
+    guests: [],
+    guest_perms: { ...GOOGLE_PERMS },
     visibility: "default" as const,
   };
   if (zone === null) {
@@ -631,6 +831,7 @@ function setField(target: EditorFields, field: EditorField, from: EditorFields) 
     case "recurrence":
       target.recurrence = from.recurrence;
       break;
+    // The guest list and its permissions merge (`rebaseGuests`, `rebasePerms`): never set whole.
     case "show_as":
       target.show_as = from.show_as;
       break;

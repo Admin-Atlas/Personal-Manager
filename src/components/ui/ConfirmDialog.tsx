@@ -29,6 +29,12 @@ export interface ConfirmDialogProps {
   danger?: boolean;
   /** Disable the buttons + block dismissal while the action runs. */
   busy?: boolean;
+  /** The confirm waits for something in the body to be answered first (a choice with no default),
+   *  so it can't be confirmed unanswered. */
+  confirmDisabled?: boolean;
+  /** "cancel": focus starts on the cancel button, so Enter on open goes back rather than confirming
+   *  (and never lands on a choice in the body). Without it, the first control takes focus. */
+  initialFocus?: "cancel";
   onConfirm: () => void;
   onClose: () => void;
 }
@@ -41,6 +47,8 @@ export function ConfirmDialog({
   cancelLabel = "Cancel",
   danger,
   busy,
+  confirmDisabled,
+  initialFocus,
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
@@ -52,10 +60,19 @@ export function ConfirmDialog({
       widthClassName="max-w-md"
       footer={
         <>
-          <Button variant="tertiary" onClick={onClose} disabled={busy}>
+          <Button
+            variant="tertiary"
+            onClick={onClose}
+            disabled={busy}
+            data-autofocus={initialFocus === "cancel" ? true : undefined}
+          >
             {cancelLabel}
           </Button>
-          <Button variant={danger ? "danger" : "primary"} onClick={onConfirm} disabled={busy}>
+          <Button
+            variant={danger ? "danger" : "primary"}
+            onClick={onConfirm}
+            disabled={busy || confirmDisabled}
+          >
             {busy ? "Working…" : confirmLabel}
           </Button>
         </>

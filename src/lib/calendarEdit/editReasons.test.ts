@@ -91,11 +91,22 @@ describe("edit reasons", () => {
   });
 
   it("names conflicting fields in the editor's words", () => {
-    expect(conflictFields(["start", "end", "summary", "transparency", "attendees"])).toEqual([
+    // A key the editor has no field for (the colour, say) names nothing.
+    expect(conflictFields(["start", "end", "summary", "transparency", "colorId"])).toEqual([
       "time",
       "summary",
       "show_as",
     ]);
+    // The guest list and its three permissions (C12), each said once.
+    expect(
+      conflictFields([
+        "attendees",
+        "guestsCanModify",
+        "guestsCanInviteOthers",
+        "guestsCanSeeOtherGuests",
+      ]),
+    ).toEqual(["guests", "guest_perms"]);
+    expect(listFields(["guests", "guest_perms"])).toBe("guests and guest permissions");
     expect(listFields(["summary"])).toBe("title");
     expect(listFields(["summary", "time", "location"])).toBe("title, time and location");
     // How it repeats, in Google's word for it (C11).
@@ -266,6 +277,9 @@ describe("edit reasons", () => {
     );
     expect(problemText({ kind: "unreadable", half: "end", what: "zone" })).toBe(
       "The end time zone isn't one PM knows.",
+    );
+    expect(problemText({ kind: "bad_guest", email: "bob at x" })).toBe(
+      "“bob at x” isn't an email address.",
     );
   });
 });

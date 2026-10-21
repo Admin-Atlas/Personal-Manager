@@ -29,6 +29,7 @@ import {
   type ReactNode,
 } from "react";
 import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
+import { responseLabel } from "../../../lib/calendarEdit/guests";
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
@@ -87,27 +88,6 @@ function showAsLabel(v: string): string {
       return "Working elsewhere";
     default:
       return "Busy";
-  }
-}
-
-/** attendee response → a friendly label (Google/Graph terms). */
-function responseLabel(v: string | null): string | null {
-  switch (v) {
-    case "accepted":
-      return "accepted";
-    case "declined":
-      return "declined";
-    case "tentative":
-    case "tentativelyAccepted":
-      return "maybe";
-    case "needsAction":
-    case "notResponded":
-    case "none":
-      return "no reply";
-    case "organizer":
-      return "organiser";
-    default:
-      return null;
   }
 }
 

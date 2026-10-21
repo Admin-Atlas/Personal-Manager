@@ -60,6 +60,10 @@ export function fieldLabel(field: EditorField): string {
     // Google's word for it.
     case "recurrence":
       return "repeat";
+    case "guests":
+      return "guests";
+    case "guest_perms":
+      return "guest permissions";
     case "location":
       return "location";
     case "description":
@@ -80,6 +84,10 @@ export function conflictFields(keys: readonly string[]): EditorField[] {
     start: "time",
     end: "time",
     recurrence: "recurrence",
+    attendees: "guests",
+    guestsCanModify: "guest_perms",
+    guestsCanInviteOthers: "guest_perms",
+    guestsCanSeeOtherGuests: "guest_perms",
     location: "location",
     description: "description",
     transparency: "show_as",
@@ -764,6 +772,8 @@ export function problemText(problem: DraftProblem): string {
         ? `The ${half} time zone isn't one PM knows.`
         : `The ${half} ${problem.what} isn't one PM can read.`;
     }
+    case "bad_guest":
+      return `“${problem.email}” isn't an email address.`;
     default:
       return unreachable(problem);
   }
