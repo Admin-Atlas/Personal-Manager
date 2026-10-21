@@ -693,8 +693,10 @@ pub(super) fn plan_all_rule(
                     {
                         return Err(SeriesRefusal::KeptHasOwn(kept.day_in(zone)).into());
                     }
-                    let draft_keys: Vec<&str> =
-                        draft_fields(draft).iter().map(|(k, _)| *k).collect();
+                    let draft_keys: Vec<&str> = draft_fields(draft, master_json)
+                        .iter()
+                        .map(|(k, _)| *k)
+                        .collect();
                     for field in carry {
                         if field == "time" {
                             own_time = Some(item);
@@ -892,7 +894,7 @@ pub(super) fn plan_split_rule(
             _ => {}
         }
     }
-    let touched = draft_fields(draft);
+    let touched = draft_fields(draft, master_json);
     let draft_keys: Vec<&str> = touched.iter().map(|(k, _)| *k).collect();
     let mut warnings = Vec::new();
     let mut lost: u32 = 0;
@@ -1136,7 +1138,8 @@ pub(super) fn plan_split_rule(
         },
         start: master.start,
         rule_start: master.start,
-        guests_allowed: input.guests_allowed,
+        guests: None,
+        chosen: None,
     })
 }
 
@@ -3562,7 +3565,7 @@ mod tests {
                         &case.input(),
                         &draft,
                         id,
-                        Notify::None
+                        None
                     ),
                     Err(NotPlanned::Refused(SeriesRefusal::Unreadable)),
                     "{id}"

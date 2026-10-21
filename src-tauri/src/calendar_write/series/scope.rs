@@ -40,9 +40,11 @@ impl From<SeriesScope> for Scope {
 /// What a change does to the occurrence, as far as the choice cares.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Change {
-    /// Title, place, description or busy/free.
+    /// Title, place, description, busy/free, or guests (C12).
     pub fields: bool,
     pub visibility: bool,
+    /// What guests may do, which is the whole series', like visibility (C12).
+    pub guest_permissions: bool,
     pub time: Option<TimeChange>,
     /// A new rule, or none at all (C11).
     pub rule: Option<RuleChange>,
@@ -84,11 +86,24 @@ impl Change {
     ) -> Result<Change, TimeError> {
         let it = instance.json();
         let body = build_patch(it, draft)?;
+        let permissions = [
+            "guestsCanModify",
+            "guestsCanInviteOthers",
+            "guestsCanSeeOtherGuests",
+        ];
         let mut change = Change {
-            fields: ["summary", "location", "description", "transparency"]
-                .iter()
-                .any(|k| body.contains_key(*k)),
+            fields: [
+                "summary",
+                "location",
+                "description",
+                "transparency",
+                "attendees",
+            ]
+            .iter()
+            .chain(&permissions)
+            .any(|k| body.contains_key(*k)),
             visibility: body.contains_key("visibility"),
+            guest_permissions: permissions.iter().any(|k| body.contains_key(*k)),
             rule: rule_change(draft, master),
             ..Change::default()
         };
@@ -152,6 +167,8 @@ pub enum ScopeReason {
     TextOnly(TextOnly),
     /// A new rule, or none, can't apply to one occurrence (C11).
     RuleIsSeriesWide,
+    /// What guests may do is the whole series' (C12 critiques C1-M7, C2-L11).
+    GuestPermissionsAreSeriesWide,
 }
 
 /// Shown on the row as is, in the planners' own words for the same refusals.
@@ -161,6 +178,9 @@ impl fmt::Display for ScopeReason {
             ScopeReason::VisibilityIsSeriesWide => SeriesRefusal::VisibilityIsSeriesWide.fmt(f),
             ScopeReason::TextOnly(why) => RecurError::TextOnly(why.clone()).fmt(f),
             ScopeReason::RuleIsSeriesWide => SeriesRefusal::RuleIsSeriesWide.fmt(f),
+            ScopeReason::GuestPermissionsAreSeriesWide => {
+                SeriesRefusal::GuestPermissionsAreSeriesWide.fmt(f)
+            }
         }
     }
 }
@@ -189,6 +209,10 @@ pub fn scope_options(change: &Change, first: bool, text_only: Option<&TextOnly>)
     let mut all = Row::Offered;
     if change.visibility {
         this = Row::Refused(ScopeReason::VisibilityIsSeriesWide);
+    }
+    // Until a probe shows Google applies them to one occurrence (C12 critique C1-M7).
+    if change.guest_permissions {
+        this = Row::Refused(ScopeReason::GuestPermissionsAreSeriesWide);
     }
     // How the series repeats is the series' own: never one occurrence's (the plan's "This event is
     // absent when the rule changes", shown refused with its reason instead, C11 §0.4).
@@ -424,6 +448,48 @@ mod tests {
             ScopeReason::RuleIsSeriesWide.to_string(),
             SeriesRefusal::RuleIsSeriesWide.to_string()
         );
+        assert_eq!(
+            ScopeReason::GuestPermissionsAreSeriesWide.to_string(),
+            SeriesRefusal::GuestPermissionsAreSeriesWide.to_string()
+        );
+    }
+
+    /// C12 §6.8: a guest list change is a change of fields like a title's, offered on every row;
+    /// what guests may do is the whole series', so never for "This event" (critiques C1-M7,
+    /// C2-L11). One Google already holds changes nothing.
+    #[test]
+    fn guests_are_fields_and_what_they_may_do_is_the_whole_series() {
+        use crate::calendar_write::dto::{GuestOp, GuestState};
+        let guests = change(EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: "b@example.com".into(),
+                to: GuestState::Required,
+            }]),
+            ..Default::default()
+        });
+        assert!(
+            guests
+                == Change {
+                    fields: true,
+                    ..Default::default()
+                },
+            "a change of fields"
+        );
+        assert!(scope_options(&guests, false, None).this == Row::Offered);
+        let modify = change(EventPatchDraft {
+            guests_can_modify: Some(true),
+            ..Default::default()
+        });
+        assert!(modify.fields && modify.guest_permissions);
+        let options = scope_options(&modify, false, None);
+        assert!(options.this == Row::Refused(ScopeReason::GuestPermissionsAreSeriesWide));
+        assert!(options.following == Row::Offered && options.all == Row::Offered);
+        // Google's default, already so.
+        let invite = change(EventPatchDraft {
+            guests_can_invite_others: Some(true),
+            ..Default::default()
+        });
+        assert!(invite == Change::default(), "nothing changes");
     }
 
     fn repeat(days: &[crate::calendar_recur::wire::DayCode]) -> EventPatchDraft {

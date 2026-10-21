@@ -394,7 +394,13 @@ impl Run {
         let fits = plan.steps.iter().all(|s| {
             s.op.fits() && (matches!(s.op, Op::Carry { .. }) || s.op.request(s.notify).is_some())
         });
-        if !fits || ends.len() != plan.steps.len() || ends.contains(&End::Undone) {
+        // R9: a plan that would email someone and has no Send / Don't send behind it never starts,
+        // whatever its steps hold in the meantime (C12 §6.6): a second lock behind the command's own.
+        if !fits
+            || plan.needs_notify()
+            || ends.len() != plan.steps.len()
+            || ends.contains(&End::Undone)
+        {
             return Err(Unfit);
         }
         let at = ends
@@ -1570,10 +1576,11 @@ impl Machine for Settle {
     }
 }
 
-/// The fence write: PM's private note `pmFence` on the series `original`, on its etag, notify none.
-/// Every existing private and shared property goes back with it, so it can't wipe another app's
-/// whether Google merges or replaces the maps on a PATCH. Built here, not as an [`Op`]: a series
-/// PATCH may not send `extendedProperties` (`Op::fits`).
+/// The fence write: PM's private note `pmFence` on the series `original`, on its etag, notify none
+/// (R7: a private property, nobody to tell, whatever the user answered for the change). Every
+/// existing private and shared property goes back with it, so it can't wipe another app's whether
+/// Google merges or replaces the maps on a PATCH. Built here, not as an [`Op`]: a series PATCH may
+/// not send `extendedProperties` (`Op::fits`).
 pub fn fence_request(calendar: &str, original: &Value, marker: &str) -> Option<RequestPlan> {
     let id = original
         .get("id")
@@ -1757,10 +1764,32 @@ mod tests {
     #[test]
     fn a_plan_with_a_key_its_write_may_not_send_never_starts() {
         let (_, mut plan) = this_case();
+        // Guests are a key a save may send now (C12); a video call isn't.
         if let Op::Patch { body, .. } = &mut plan.steps[0].op {
-            body.insert("attendees".into(), json!([]));
+            body.insert("conferenceData".into(), json!({}));
         }
         assert_eq!(Run::new(plan).err(), Some(Unfit));
+    }
+
+    /// C12 §6.6: a plan that would email someone and has no answer never starts, on every way in.
+    #[test]
+    fn a_plan_with_guests_and_no_answer_wont_run() {
+        let case = Case::new(
+            guests_on_it(weekly(), &["a@example.com"]),
+            guests_on_it(monday_19(), &["a@example.com"]),
+        )
+        .guests();
+        let unanswered = case.edit(Scope::All, title("Retro")).unwrap();
+        assert!(unanswered.needs_notify());
+        assert_eq!(Run::new(unanswered).err(), Some(Unfit));
+        let answered = case
+            .edit_told(Scope::All, title("Retro"), Some(Notify::None))
+            .unwrap();
+        assert!(!answered.needs_notify());
+        assert!(Run::new(answered).is_ok());
+        // Nobody to email, nothing to answer.
+        let (_, solo) = this_case();
+        assert!(!solo.needs_notify() && Run::new(solo).is_ok());
     }
 
     #[test]
@@ -3210,18 +3239,22 @@ mod tests {
 
     // --- Run: who Google emails ---
 
-    /// A3, R7b: every step, and every undo, sends the `sendUpdates` its plan stamped on it.
+    /// A3, R7b: every step, and every undo, sends the `sendUpdates` its plan stamped on it: a series
+    /// with a guest, since a step that reaches nobody sends `none` whatever was chosen (C12 §6.10).
     #[test]
     fn every_step_and_undo_sends_its_own_send_updates() {
+        let guest = |event: Value| guests_on_it(event, &["a@example.com"]);
         for notify in [Notify::All, Notify::ExternalOnly, Notify::None] {
             let param = format!("sendUpdates={}", notify.as_param());
-            let case = Case::new(weekly(), monday_19()).exceptions(vec![renamed()]);
+            let case =
+                Case::new(guest(weekly()), guest(monday_19())).exceptions(vec![guest(renamed())]);
+            let case = case.guests();
             let plan = plan_series_edit(
                 Scope::Following,
                 &case.input(),
                 &title("Standup v2"),
                 TAIL,
-                notify,
+                Some(notify),
             )
             .unwrap();
             // Rolled back: the insert, the cut and the undo.
@@ -3276,9 +3309,10 @@ mod tests {
             assert!(sent.last().unwrap().url.contains(&param));
 
             // A half-landed move put back, on a series retimed with this `sendUpdates`.
-            let case = Case::new(weekly(), monday_19());
+            let case = Case::new(guest(weekly()), guest(monday_19())).guests();
             let draft = at("09:00", "2026-10-20");
-            let plan = plan_series_edit(Scope::All, &case.input(), &draft, TAIL, notify).unwrap();
+            let plan =
+                plan_series_edit(Scope::All, &case.input(), &draft, TAIL, Some(notify)).unwrap();
             let old = case.master.json().clone();
             let mut half = landed(&old, &plan.steps[0], "\"m2\"");
             half["recurrence"] = old["recurrence"].clone();

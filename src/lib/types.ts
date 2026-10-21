@@ -1584,6 +1584,50 @@ export interface EventPatchDraft {
    *  starts repeating; for an occurrence, the rule is the whole repeating event's, never this
    *  occurrence's alone. */
   recurrence?: RepeatDraft | null;
+  /** Guests the user added, took off or marked optional, as changes to Google's own list, never
+   *  the list itself (C12). An empty list is no change. */
+  guests?: GuestOp[] | null;
+  /** What guests may do: change the event, invite others, see the guest list. */
+  guests_can_modify?: boolean | null;
+  guests_can_invite_others?: boolean | null;
+  guests_can_see_other_guests?: boolean | null;
+}
+
+/** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
+ *  "external_only" is never offered. */
+export type Notify = "all" | "none" | "external_only";
+
+/** What the user wants for one guest after the save: on it, required or optional, or off it. */
+export type GuestState = "absent" | "required" | "optional";
+
+/** One guest the user added, took off or marked optional, matched by address whatever its case. */
+export interface GuestOp {
+  email: string;
+  to: GuestState;
+}
+
+/** Who Google would email with Send, in numbers only: never the user, never a room. `people` are
+ *  different guests, `emails` one per guest per event written; `complete` false: "at least". */
+export interface GuestNotice {
+  updated: number;
+  invited: number;
+  removed: number;
+  cancelled: boolean;
+  people: number;
+  emails: number;
+  complete: boolean;
+}
+
+/** One guest as the editor shows it, from Google's fresh copy. `response` as Google says it
+ *  (accepted, declined, tentative, needsAction); `self` is the calendar this copy is on. */
+export interface GuestForEdit {
+  email: string;
+  name: string | null;
+  response: string | null;
+  optional: boolean;
+  organizer: boolean;
+  self: boolean;
+  room: boolean;
 }
 
 /** A change to how an event repeats: a rule from the editor's set, or "Does not repeat". */
@@ -1674,6 +1718,8 @@ export interface FieldPermissions {
   description: boolean;
   show_as: boolean;
   visibility: boolean;
+  /** The guest list and what guests may do (C12). */
+  guests: boolean;
   delete: boolean;
   reasons: ReadOnlyReason[];
 }
@@ -1693,6 +1739,15 @@ export interface EventForEdit {
   visibility: EventVisibility;
   attachments: string[];
   html_link: string | null;
+  /** Every guest on Google's list with an address, the user and the organiser included, in
+   *  Google's order (C12). */
+  guests: GuestForEdit[];
+  /** What guests may do, Google's defaults filled in. */
+  guests_can_modify: boolean;
+  guests_can_invite_others: boolean;
+  guests_can_see_other_guests: boolean;
+  /** Google didn't send the whole guest list, so it can't change. */
+  guests_omitted: boolean;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
@@ -1755,11 +1810,12 @@ export type SeriesWarning =
   /** This many occurrences changed on their own fall on days a new repeat skips: their changes go. */
   | { warning: "changes_lost"; count: number };
 
-/** One of "This event", "This and following" and "All events". `token` names the plan in the save. */
+/** One of "This event", "This and following" and "All events". `token` names the plan in the save;
+ *  `guests`, who Google would email with Send, left out when nobody (C12). */
 export type ScopeRow =
-  | { row: "offered"; warnings: SeriesWarning[]; token: string }
+  | { row: "offered"; warnings: SeriesWarning[]; token: string; guests?: GuestNotice }
   /** "This and following" from the first occurrence: every occurrence, as "All events". */
-  | { row: "as_all"; warnings: SeriesWarning[]; token: string }
+  | { row: "as_all"; warnings: SeriesWarning[]; token: string; guests?: GuestNotice }
   | { row: "refused"; message: string }
   | { row: "conflict"; fields: string[] }
   /** A change PM couldn't finish holds this series: settle it first (as `partial_split` says). */
@@ -1849,8 +1905,10 @@ export type WriteOutcome =
       milestone_moves?: MilestoneMoves;
     }
   | { outcome: "no_change" }
-  /** The repeating event's plan changed since the user chose: ask again; nothing was sent. */
-  | { outcome: "needs_choice" }
+  /** Something must be chosen first; nothing was sent. `scope`: which occurrences (none was named,
+   *  or the plan changed since the user chose). `guests`: whether Google emails these guests, which
+   *  has no default (C12); `again`: an answer came, given for other numbers. */
+  | { outcome: "needs_choice"; scope: boolean; guests?: GuestNotice; again?: boolean }
   /** Google answered success and kept what was there; `split`: the new part a "this and
    *  following" change made was removed too. */
   | { outcome: "ignored_by_google"; split: boolean }

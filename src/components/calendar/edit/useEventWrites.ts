@@ -311,7 +311,8 @@ export function watchHeldDeletes() {
 /** Ask to delete `event` (for `picked`, when it repeats). The backend holds it for an Undo window;
  *  hidden meanwhile are the row and every row a delete of several occurrences reaches. "ask": the
  *  backend wants the occurrences chosen first, or chosen again (R9), and nothing was held or said;
- *  the caller opens the choices. */
+ *  the caller opens the choices. Whether Google emails the guests is no choice of occurrences: it
+ *  is said, never asked by reopening them (C12). */
 export async function startDelete(
   event: CalendarEvent,
   picked: Picked | null = null,
@@ -328,7 +329,7 @@ export async function startDelete(
     );
     if (start.outcome === "refused") {
       const result = start.result;
-      if (result.outcome === "needs_choice") return "ask";
+      if (result.outcome === "needs_choice" && result.scope) return "ask";
       if (result.outcome === "partial_split") {
         holdPartial(event.summary, result, deleteText(result, event.summary).text);
         return "refused";
@@ -956,7 +957,7 @@ export function useDeleteDialog(openElsewhere: () => boolean) {
           noteSeriesNotice(
             picked
               ? deleteChangedText(event.summary).text
-              : deleteText({ outcome: "needs_choice" }, event.summary).text,
+              : deleteText({ outcome: "needs_choice", scope: true }, event.summary).text,
           );
           return;
         }

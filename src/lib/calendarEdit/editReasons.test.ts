@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  GuestNotice,
   MilestoneMove,
   ReadOnlyReason,
   SplitAction,
@@ -48,6 +49,17 @@ import {
   splitActionLabel,
   writeWarningText,
 } from "./editReasons";
+
+/** One guest Google would email with Send (C12). */
+const ONE_GUEST: GuestNotice = {
+  updated: 1,
+  invited: 0,
+  removed: 0,
+  cancelled: false,
+  people: 1,
+  emails: 1,
+  complete: true,
+};
 
 // Dates drop their year inside the current one, so every DD-MM below is read on a fixed day.
 beforeEach(() => {
@@ -98,7 +110,8 @@ describe("edit reasons", () => {
       { outcome: "saved", warnings: ["mirror_refresh_pending"] },
       { outcome: "saved", warnings: ["left_on_old_series"], left_behind: ["2026-11-02"] },
       { outcome: "no_change" },
-      { outcome: "needs_choice" },
+      { outcome: "needs_choice", scope: true },
+      { outcome: "needs_choice", scope: false, guests: ONE_GUEST },
       { outcome: "ignored_by_google", split: false },
       { outcome: "ignored_by_google", split: true },
       { outcome: "partial_split", token: "t", offers: ["finish"], from: "2026-11-02" },
@@ -118,6 +131,15 @@ describe("edit reasons", () => {
       expect(outcomeText(o).text.length).toBeGreaterThan(0);
       expect(deleteText(o, "Dentist").text).toContain("“Dentist”");
     }
+    // Whether Google emails the guests is never worded as a choice of occurrences (C12): the
+    // editor says this rather than asking which occurrences, which would loop.
+    expect(outcomeText({ outcome: "needs_choice", scope: false, guests: ONE_GUEST })).toEqual({
+      tone: "warn",
+      text: "Choose whether Google emails the guests. Nothing was saved.",
+    });
+    expect(outcomeText({ outcome: "needs_choice", scope: true }).text).toMatch(
+      /^This repeating event changed since you chose which occurrences/,
+    );
     // The named fields are the ones the editor will show Google's version of, so the line doesn't
     // promise the user's edits to them survive.
     expect(outcomeText({ outcome: "conflict", fields: ["summary", "start"] })).toEqual({
@@ -204,9 +226,16 @@ describe("edit reasons", () => {
     });
     // A delete the backend wants the occurrences chosen for, first or again, deleted nothing; a
     // held one can't reopen the dialog, so the words say to delete again.
-    expect(deleteText({ outcome: "needs_choice" }, "Standup")).toEqual({
+    expect(deleteText({ outcome: "needs_choice", scope: true }, "Standup")).toEqual({
       tone: "warn",
       text: "“Standup” wasn't deleted. PM needs to ask which occurrences first. Delete it again to choose.",
+    });
+    // Whether Google emails the guests is no choice of occurrences (C12).
+    expect(
+      deleteText({ outcome: "needs_choice", scope: false, guests: ONE_GUEST }, "Standup"),
+    ).toEqual({
+      tone: "warn",
+      text: "“Standup” wasn't deleted. Choose whether Google emails the guests first.",
     });
     expect(deleteText({ outcome: "ignored_by_google", split: false }, "Standup").text).toMatch(
       /^“Standup” wasn't deleted\./,
@@ -453,7 +482,7 @@ describe("settling a change PM couldn't finish", () => {
       { outcome: "saved", warnings: [] },
       { outcome: "saved", warnings: ["left_on_old_series"], left_behind: ["2026-11-02"] },
       { outcome: "no_change" },
-      { outcome: "needs_choice" },
+      { outcome: "needs_choice", scope: true },
       { outcome: "ignored_by_google", split: true },
       { outcome: "partial_split", token: "t", offers: ["finish"], from: "2026-11-02" },
       { outcome: "split_removed" },

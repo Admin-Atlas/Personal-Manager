@@ -6,6 +6,8 @@
 //! call into it; nothing here can reach Google by itself, which is why it needs no fence.
 //!
 //! - [`dto`]: what crosses the IPC boundary and what a save returns.
+//! - [`attendees`]: guests, as changes to Google's own guest list, and who a write would email
+//!   (C12): Send / Don't send is the user's every time (R9).
 //! - [`gate`]: what PM may change about an event, and why not.
 //! - [`time`]: wall-clock times in a named zone, DST included, and Google's start/end shapes.
 //! - [`patch`]: the PATCH body built from a fresh copy of the event, and the rules for a changed one.
@@ -19,6 +21,7 @@
 //! diffed against a fresh GET, never the mirror (R1); a change Google made meanwhile is a conflict,
 //! never overwritten (R2); the mirror is only ever written from Google's reply (R3).
 
+pub mod attendees;
 pub mod classify;
 pub mod dto;
 pub mod gate;

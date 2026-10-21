@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.154.1-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "Under the hood, PM can now work out who a change to an event would email and ask you first, with no answer picked for you, and it keeps every guest's reply when a guest list changes. Events with guests stay read-only until guest editing arrives in a later update.",
+    ],
+  },
+  {
     version: "3.154.0-alpha",
     date: "2026-10-21",
     highlights: [
