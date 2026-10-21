@@ -10118,6 +10118,34 @@ mod tests {
         assert!(following == past && all == past, "both refused in words");
     }
 
+    /// Made daily with this occurrence moved a day on, every occurrence says where it now starts,
+    /// and nothing asks about Mondays becoming Tuesdays: a daily rule names no day.
+    #[tokio::test]
+    async fn a_daily_rule_with_a_moved_day_asks_nothing_of_its_days() {
+        let (series, instance) = (weekly(), monday_19());
+        let script = Script::new(october_reads());
+        let daily_from_tuesday = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Rule { rule: every_day() }),
+            ..at("09:00", "2026-10-20")
+        };
+        let (_, _, all) = ask(
+            &script,
+            &instance,
+            edit(daily_from_tuesday),
+            Some((&instance, Some(&series))),
+            &["abc"],
+        )
+        .await;
+        assert!(
+            warnings(&all)
+                == [SeriesWarningDto::StartMoved {
+                    from: "2026-10-05".into(),
+                    to: "2026-10-06".into()
+                }],
+            "where it starts, and no question"
+        );
+    }
+
     /// The choice's token binds the rule: chosen for one, saved for another (whose plan is
     /// otherwise the same), it's asked again, with nothing but reads sent.
     #[tokio::test]

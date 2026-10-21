@@ -748,8 +748,8 @@ impl fmt::Display for SeriesRefusal {
             ),
             SeriesRefusal::NothingToKeep => write!(
                 f,
-                "PM can't tell which occurrence should stay once it stops repeating. Change this \
-                 occurrence on its own."
+                "Every occurrence of its repeat up to this one was deleted, so PM can't tell which \
+                 one should stay. Change it in Google Calendar."
             ),
             SeriesRefusal::KeptHasOwn(day) => write!(
                 f,

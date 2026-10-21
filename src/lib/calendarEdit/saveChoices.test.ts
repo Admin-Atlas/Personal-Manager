@@ -309,6 +309,7 @@ describe("the warnings", () => {
       label: "This and following events",
       detail: "",
       selectable: true,
+      asAll: false,
       token: "f",
       warnings: [...every].reverse(),
     };
@@ -355,6 +356,7 @@ describe("the warnings", () => {
       label: "This and following events",
       detail: "",
       selectable: true,
+      asAll: false,
       token: "f",
       warnings: [
         { warning: "new_identity" },
@@ -373,6 +375,27 @@ describe("the warnings", () => {
       fromHere({ warning: "changes_lost", count: 1 }),
       fromHere({ warning: "length_changes" }),
       fromHere({ warning: "new_identity" }),
+    ]);
+  });
+
+  it("words a 'this and following' row that changes every occurrence as All", () => {
+    // From the first occurrence: no new part, so never "the new part starts" or "from this one on".
+    const warnings: SeriesWarning[] = [
+      { warning: "start_moved", from: "2026-10-05", to: "2026-10-06" },
+      { warning: "becomes_one_event", day: "2026-10-06" },
+    ];
+    const [, asAll] = rowsOf(ready(offered("t"), { row: "as_all", warnings, token: "x" }), "save");
+    expect(asAll).toMatchObject({ scope: "following", asAll: true, token: "x" });
+    expect(warningLines(asAll, "save", "Gym")).toEqual([
+      "Only the occurrence on 06-10 stays, as an event that doesn't repeat. Every other occurrence of “Gym” goes.",
+      "The first occurrence of “Gym” moves from 05-10 to 06-10.",
+    ]);
+    // The same warnings on a row that makes a new part keep that row's words.
+    const [, split] = rowsOf(ready(offered("t"), offered("f", warnings)), "save");
+    expect(split.asAll).toBe(false);
+    expect(warningLines(split, "save", "Gym")).toEqual([
+      "From this occurrence on, “Gym” becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.",
+      "From this occurrence on, the new part of “Gym” starts on 06-10, the first day the new repeat allows.",
     ]);
   });
 

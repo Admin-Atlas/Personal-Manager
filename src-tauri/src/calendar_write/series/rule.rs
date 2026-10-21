@@ -25,7 +25,7 @@ use crate::calendar_recur::expand::{first_kept, is_occurrence, occurrences_from,
 use crate::calendar_recur::lines::{self, Kind, RuleFacts, TextOnly};
 use crate::calendar_recur::remap::{exdate_lines, RetimeError};
 use crate::calendar_recur::spec::{
-    rule_from_spec, spec_of, Ends, Pattern, RecurrenceSpec, SpecError, YearlyOn,
+    day_phrase, rule_from_spec, spec_of, Ends, Pattern, RecurrenceSpec, SpecError, YearlyOn,
 };
 use crate::calendar_recur::split::remaining_count;
 use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
@@ -134,12 +134,35 @@ pub(super) fn rebuild(ask: &RebuildAsk) -> Result<Rebuilt, NotPlanned> {
     let rule = rule_from_spec(ask.spec, &synced).map_err(SeriesRefusal::Spec)?;
     let parsed = lines::parse(std::slice::from_ref(&rule));
     let (_, facts) = lines::series_rule(&parsed).map_err(RecurError::TextOnly)?;
-    // A deleted day stays deleted wherever the new rule still makes it (from its start on). An
-    // EXDATE it doesn't make is never written: Google refuses one that "doesn't point to a valid
-    // instance".
+    // An extra date names a moment of the old series: it stays only where that is still one of
+    // this series' times, as a move refuses it today.
+    let same_times = ask.shift == 0 && same_wall_time(ask.old_start, &synced);
+    if !ask.extra.is_empty() && !same_times {
+        return Err(RetimeError::HasExtraDates.into());
+    }
+    // So each one kept is still an occurrence where it was.
+    let mut extra_points = Vec::new();
+    for line in lines::parse(ask.extra) {
+        if let Kind::RDate(dates) = &line.kind {
+            for value in &dates.values {
+                extra_points.push(
+                    dates
+                        .point(value, ask.old_start)
+                        .ok_or(RecurError::CannotCount)?,
+                );
+            }
+        }
+    }
+    // A deleted day stays deleted wherever the new rule still makes it (from its start on), and a
+    // deleted extra date wherever it's kept (RM1). An EXDATE neither makes is never written: Google
+    // refuses one that "doesn't point to a valid instance".
     let old_zone = ask.old_start.zone();
     let mut deleted = Vec::new();
     for p in ask.deleted {
+        if extra_points.contains(p) {
+            deleted.push(*p);
+            continue;
+        }
         let Some(day) = moved_day(p.day_in(old_zone), ask.shift) else {
             continue;
         };
@@ -149,12 +172,6 @@ pub(super) fn rebuild(ask: &RebuildAsk) -> Result<Rebuilt, NotPlanned> {
         if is_occurrence(&facts, &synced, candidate)? {
             deleted.push(candidate);
         }
-    }
-    // An extra date names a moment of the old series: it stays only where that is still one of
-    // this series' times, as a move refuses it today.
-    let same_times = ask.shift == 0 && same_wall_time(ask.old_start, &synced);
-    if !ask.extra.is_empty() && !same_times {
-        return Err(RetimeError::HasExtraDates.into());
     }
     let mut out = vec![rule];
     out.extend(exdate_lines(&deleted).into_iter().map(|l| l.raw));
@@ -425,9 +442,11 @@ pub(super) fn plan_all_rule(
     match ask {
         RuleAsk::New(spec) => {
             let asked_day = moved_day(from, shift).ok_or_else(out_of_range)?;
+            let shifted = moved_day(first_day, shift).ok_or_else(out_of_range)?;
             let day = match spec.pattern {
-                Pattern::Yearly(YearlyOn::Date) => yearly_anchor(first_day, asked_day),
-                _ => moved_day(first_day, shift).ok_or_else(out_of_range)?,
+                // From the first day, or from where the move puts it when that's earlier.
+                Pattern::Yearly(YearlyOn::Date) => yearly_anchor(first_day.min(shifted), asked_day),
+                _ => shifted,
             };
             let extra: Vec<String> = lines::parse(&master.recurrence)
                 .into_iter()
@@ -458,7 +477,8 @@ pub(super) fn plan_all_rule(
             if !same {
                 body.insert("recurrence".into(), Value::from(rebuilt.lines.clone()));
             }
-            if shift != 0 {
+            // A new rule that names no day (daily) has none to move: where it starts says it all.
+            if shift != 0 && day_phrase(&rebuilt.lines, &rebuilt.start).is_some() {
                 warnings.push(SeriesWarning::RepeatDayChanges {
                     from,
                     to: asked_day,
@@ -585,11 +605,35 @@ fn stop_body(ask: StopAsk) -> Result<SeriesPlan, NotPlanned> {
     warnings.push(SeriesWarning::BecomesOneEvent {
         day: rule_start.date(),
     });
+    // The draft moved this occurrence to another day, so the one kept moves as far: no other line
+    // says it leaves its own day (`shift` is the draft's, 0 without one).
+    if shift != 0 {
+        warnings.push(SeriesWarning::StartMoved {
+            from: kept.day_in(zone),
+            to: rule_start.date(),
+        });
+    }
     let mut plan = all_plan(input, master, body, warnings, undo, notify, rule_start)?;
-    // Every other occurrence goes, as its own words say; what Google does with the ones changed on
-    // their own is P-R2's to show, and their landing keeps any it still shows.
+    // Every other occurrence goes, as its own words say; but what Google does with the ones changed
+    // on their own is P-R2's to show, and their landing keeps any it still shows, so the hedge stays
+    // for them. Never for the one kept: this PATCH carries its changes.
+    let others = own_exceptions(master, input.exceptions)
+        .filter(|item| original_of(item) != Some(kept))
+        .filter(|item| {
+            matches!(
+                classify_instance(master_json, master, item),
+                InstanceKind::Modified { .. }
+            )
+        })
+        .count();
     plan.warnings
         .retain(|w| !matches!(w, SeriesWarning::ExceptionsMayReset { .. }));
+    if others > 0 {
+        plan.warnings.push(SeriesWarning::ExceptionsMayReset {
+            count: u32::try_from(others).unwrap_or(u32::MAX),
+            complete: input.exceptions.complete,
+        });
+    }
     Ok(plan)
 }
 
@@ -1128,6 +1172,38 @@ mod tests {
         }
     }
 
+    /// RM1: a deleted extra date kept as Google wrote it is still an occurrence where it was, so it
+    /// stays deleted there, whatever the new rule makes; and only there, never at the rule's time.
+    #[test]
+    fn rebuild_keeps_a_deleted_extra_date_deleted() {
+        let old = old();
+        // Friday 23-10 at the series' time, Friday 30-10 (London on GMT again) at 14:00.
+        let extra = ["RDATE;TZID=Europe/London:20261023T090000,20261030T140000".to_string()];
+        let deleted = [point("2026-10-23T08:00:00Z"), point("2026-10-30T14:00:00Z")];
+        for (rule, first) in [
+            (
+                weekly_on(&[DayCode::Mon, DayCode::Wed]),
+                "RRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+            ),
+            (daily(), "RRULE:FREQ=DAILY"),
+        ] {
+            let spec = spec_of_rule(&rule);
+            let rebuilt = rebuild(&RebuildAsk {
+                extra: &extra,
+                ..ask(&spec, london(2026, 10, 5, 9), &deleted, &old)
+            })
+            .unwrap();
+            assert_eq!(
+                rebuilt.lines,
+                [
+                    first,
+                    "EXDATE:20261023T080000Z,20261030T140000Z",
+                    "RDATE;TZID=Europe/London:20261023T090000,20261030T140000"
+                ]
+            );
+        }
+    }
+
     /// A first day whose time the clocks skip is refused, never moved to another hour.
     #[test]
     fn rebuild_refuses_a_gap_start() {
@@ -1219,12 +1295,29 @@ mod tests {
             plain("2026-10-12T09:00:00+01:00"),
         );
         let yearly = rule(RepeatPattern::YearlyDate, 1, RepeatEnds::Never);
-        let plan = case.edit(Scope::All, repeat(yearly)).unwrap();
+        let plan = case.edit(Scope::All, repeat(yearly.clone())).unwrap();
         assert_eq!(
             body(&plan, 0)["start"],
             timed_node("2026-10-12T09:00:00+01:00")
         );
         assert_eq!(body(&plan, 0)["recurrence"], json!(["RRULE:FREQ=YEARLY"]));
+        // The first occurrence moved two days earlier, to Saturday 03-10: it repeats from there,
+        // never from a year on.
+        let first = Case::new(weekly(), plain("2026-10-05T09:00:00+01:00"));
+        let earlier = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Rule { rule: yearly }),
+            ..at("09:00", "2026-10-03")
+        };
+        let plan = first.edit(Scope::All, earlier).unwrap();
+        assert_eq!(
+            body(&plan, 0)["start"],
+            timed_node("2026-10-03T09:00:00+01:00")
+        );
+        assert_eq!(body(&plan, 0)["recurrence"], json!(["RRULE:FREQ=YEARLY"]));
+        assert!(plan.warnings.contains(&SeriesWarning::StartMoved {
+            from: day(2026, 10, 5),
+            to: day(2026, 10, 3)
+        }));
     }
 
     const PROBE: &str = "PM_RULE_ZONE_PROBE";
@@ -1403,6 +1496,15 @@ mod tests {
             sent["recurrence"],
             json!(["RRULE:FREQ=DAILY", "EXDATE:20261027T090000Z"])
         );
+        // No question of which days it repeats on, as if Mondays became Tuesdays: where it starts
+        // says it all.
+        assert_eq!(
+            plan.warnings,
+            [SeriesWarning::StartMoved {
+                from: day(2026, 10, 5),
+                to: day(2026, 10, 6)
+            }]
+        );
         // On the first occurrence it's the same plan, the move its own.
         let first = Case::new(weekly(), plain("2026-10-05T09:00:00+01:00"));
         let from_first = EventPatchDraft {
@@ -1436,6 +1538,59 @@ mod tests {
             ])
         );
         assert!(plan.warnings.is_empty());
+    }
+
+    /// RM1: an extra date deleted, by an EXDATE or cancelled, stays deleted wherever it's kept, for
+    /// every occurrence and from one on, though the new rule doesn't make its day.
+    #[test]
+    fn a_new_rule_keeps_a_deleted_extra_date_deleted() {
+        let both = |extra: &str| {
+            let exdate = extra.replacen("RDATE", "EXDATE", 1);
+            [
+                Case::new(
+                    master(&["RRULE:FREQ=WEEKLY;BYDAY=MO", extra, exdate.as_str()]),
+                    monday_19(),
+                ),
+                Case::new(master(&["RRULE:FREQ=WEEKLY;BYDAY=MO", extra]), monday_19()),
+            ]
+        };
+        // Every occurrence: Friday 23-10, made Mondays and Wednesdays.
+        let friday = "RDATE;TZID=Europe/London:20261023T090000";
+        let [exdated, cancelled_one] = both(friday);
+        let cancelled_one = cancelled_one.exceptions(vec![cancelled("2026-10-23T09:00:00+01:00")]);
+        for case in [exdated, cancelled_one] {
+            let plan = case
+                .edit(Scope::All, repeat(weekly_on(&[DayCode::Mon, DayCode::Wed])))
+                .unwrap();
+            assert_eq!(
+                body(&plan, 0)["recurrence"],
+                json!([
+                    "RRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+                    "EXDATE:20261023T080000Z",
+                    friday
+                ])
+            );
+        }
+        // From Monday 19-10 on: Wednesday 28-10 (London on GMT again), made Mondays and Fridays.
+        let wednesday = "RDATE;TZID=Europe/London:20261028T090000";
+        let [exdated, cancelled_one] = both(wednesday);
+        let cancelled_one = cancelled_one.exceptions(vec![cancelled("2026-10-28T09:00:00Z")]);
+        for case in [exdated, cancelled_one] {
+            let plan = case
+                .edit(
+                    Scope::Following,
+                    repeat(weekly_on(&[DayCode::Mon, DayCode::Fri])),
+                )
+                .unwrap();
+            assert_eq!(
+                body(&plan, 0)["recurrence"],
+                json!([
+                    "RRULE:FREQ=WEEKLY;BYDAY=MO,FR",
+                    "EXDATE:20261028T090000Z",
+                    wednesday
+                ])
+            );
+        }
     }
 
     /// A deleted occurrence PM can't see could come back: an incomplete listing refuses.
@@ -1518,6 +1673,90 @@ mod tests {
         assert_eq!(
             Case::new(only_extra, extra).edit(Scope::All, stop()),
             Err(NotPlanned::Refused(SeriesRefusal::NothingToKeep))
+        );
+        // Its words point where it can be done: "This event" can't change how it repeats.
+        assert_eq!(
+            SeriesRefusal::NothingToKeep.to_string(),
+            "Every occurrence of its repeat up to this one was deleted, so PM can't tell which one \
+             should stay. Change it in Google Calendar."
+        );
+    }
+
+    /// Every other occurrence goes, but Google may keep those changed on their own, so the hedge
+    /// counts them; never the one kept, whose own changes go with it.
+    #[test]
+    fn all_does_not_repeat_hedges_on_the_others_changed_on_their_own() {
+        let kick_off = with(
+            plain("2026-10-05T09:00:00+01:00"),
+            "summary",
+            json!("Kick-off"),
+        );
+        let planning = with(plain("2026-10-26T09:00:00Z"), "summary", json!("Planning"));
+        let replied = plain("2026-11-02T09:00:00Z");
+        let case =
+            Case::new(weekly(), monday_19()).exceptions(vec![kick_off.clone(), planning, replied]);
+        let plan = case.edit(Scope::All, stop()).unwrap();
+        assert_eq!(body(&plan, 0)["summary"], "Kick-off");
+        assert_eq!(
+            plan.warnings,
+            [
+                SeriesWarning::BecomesOneEvent {
+                    day: day(2026, 10, 5)
+                },
+                SeriesWarning::ExceptionsMayReset {
+                    count: 1,
+                    complete: true
+                }
+            ]
+        );
+        // Only the one kept was changed: nothing to hedge on.
+        let plan = Case::new(weekly(), monday_19())
+            .exceptions(vec![kick_off])
+            .edit(Scope::All, stop())
+            .unwrap();
+        assert_eq!(
+            plan.warnings,
+            [SeriesWarning::BecomesOneEvent {
+                day: day(2026, 10, 5)
+            }]
+        );
+    }
+
+    /// With this occurrence moved a day on, the one kept moves as far, and the dialog says it leaves
+    /// its own day; a new time on the same day moves nothing.
+    #[test]
+    fn all_does_not_repeat_with_a_moved_day_says_the_first_moves() {
+        let case = Case::new(weekly(), monday_19());
+        let a_day_on = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Once),
+            ..at("09:00", "2026-10-20")
+        };
+        let plan = case.edit(Scope::All, a_day_on).unwrap();
+        assert_eq!(
+            body(&plan, 0)["start"],
+            timed_node("2026-10-06T09:00:00+01:00")
+        );
+        assert_eq!(
+            plan.warnings,
+            [
+                SeriesWarning::BecomesOneEvent {
+                    day: day(2026, 10, 6)
+                },
+                SeriesWarning::StartMoved {
+                    from: day(2026, 10, 5),
+                    to: day(2026, 10, 6)
+                }
+            ]
+        );
+        let an_hour_on = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Once),
+            ..at("10:00", "2026-10-19")
+        };
+        assert_eq!(
+            case.edit(Scope::All, an_hour_on).unwrap().warnings,
+            [SeriesWarning::BecomesOneEvent {
+                day: day(2026, 10, 5)
+            }]
         );
     }
 
@@ -1865,6 +2104,114 @@ mod tests {
         );
     }
 
+    /// Monday 19-10 moved on its own to 11:00.
+    fn monday_19_at_eleven() -> Value {
+        moved(
+            "2026-10-19T09:00:00+01:00",
+            "2026-10-19T11:00:00+01:00",
+            "2026-10-19T12:00:00+01:00",
+        )
+    }
+
+    /// The occurrence split at keeps its own time on the new part's same occurrence, but never over
+    /// a time the draft gives it.
+    #[test]
+    fn following_with_a_new_rule_carries_this_ones_time_unless_the_draft_moves_it() {
+        let eleven = monday_19_at_eleven();
+        let case = Case::new(weekly(), eleven.clone()).exceptions(vec![eleven]);
+        let plan = case
+            .edit(
+                Scope::Following,
+                repeat(weekly_on(&[DayCode::Mon, DayCode::Wed])),
+            )
+            .unwrap();
+        assert!(matches!(
+            &plan.steps[2].op,
+            Op::Carry { original, .. } if *original == point("2026-10-19T08:00:00Z")
+        ));
+        assert_eq!(
+            body(&plan, 2)["start"],
+            timed_node("2026-10-19T11:00:00+01:00")
+        );
+        // Moved to 14:00 in the draft: the new part starts then, and nothing puts 11:00 back.
+        let two_pm = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Rule {
+                rule: weekly_on(&[DayCode::Mon, DayCode::Wed]),
+            }),
+            ..at("14:00", "2026-10-19")
+        };
+        let plan = case.edit(Scope::Following, two_pm).unwrap();
+        assert_eq!(
+            body(&plan, 0)["start"],
+            timed_node("2026-10-19T14:00:00+01:00")
+        );
+        assert!(!plan.steps.iter().any(|s| matches!(s.op, Op::Carry { .. })));
+    }
+
+    /// A later occurrence moved on its own keeps its time on the new part; onto a new part made
+    /// all-day, with the other kind's key `null`, as Google merges nodes (C11 critique 1 L9).
+    #[test]
+    fn following_with_a_new_rule_carries_a_later_ones_own_time() {
+        let eleven = moved(
+            "2026-10-26T09:00:00Z",
+            "2026-10-26T11:00:00Z",
+            "2026-10-26T12:00:00Z",
+        );
+        let case = Case::new(weekly(), monday_19()).exceptions(vec![eleven]);
+        let plan = case.edit(Scope::Following, repeat(daily())).unwrap();
+        assert!(matches!(
+            &plan.steps[2].op,
+            Op::Carry { original, .. } if *original == point("2026-10-26T09:00:00Z")
+        ));
+        let node = |at: &str| json!({ "dateTime": at, "timeZone": "Europe/London" });
+        assert_eq!(body(&plan, 2)["start"], node("2026-10-26T11:00:00Z"));
+        assert_eq!(body(&plan, 2)["end"], node("2026-10-26T12:00:00Z"));
+        let all_day = EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-10-19".into(),
+                last_day: "2026-10-19".into(),
+            }),
+            recurrence: Some(RepeatDraft::Rule { rule: daily() }),
+            ..Default::default()
+        };
+        let plan = case.edit(Scope::Following, all_day).unwrap();
+        assert!(matches!(
+            &plan.steps[2].op,
+            Op::Carry { original, .. } if *original == Point::Day(day(2026, 10, 26))
+        ));
+        let crossed =
+            |at: &str| json!({ "dateTime": at, "timeZone": "Europe/London", "date": null });
+        assert_eq!(body(&plan, 2)["start"], crossed("2026-10-26T11:00:00Z"));
+        assert_eq!(body(&plan, 2)["end"], crossed("2026-10-26T12:00:00Z"));
+    }
+
+    /// C11 critique 1 L3: an all-day rule is measured by days, so it can't repeat on the day a timed
+    /// later part starts, nor past it.
+    #[test]
+    fn an_all_day_rule_never_repeats_into_a_timed_later_part() {
+        let all_day = |ends: RepeatEnds| EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-10-19".into(),
+                last_day: "2026-10-19".into(),
+            }),
+            recurrence: Some(RepeatDraft::Rule {
+                rule: rule(RepeatPattern::Daily, 1, ends),
+            }),
+            ..Default::default()
+        };
+        let until = |date: &str| RepeatEnds::OnDate { date: date.into() };
+        let mut case = Case::new(weekly(), monday_19());
+        case.later = LaterPart::At(point("2026-11-02T09:00:00Z"));
+        let past = Err(NotPlanned::Refused(SeriesRefusal::RepeatsPastPart(day(
+            2026, 11, 2,
+        ))));
+        for scope in [Scope::All, Scope::Following] {
+            assert_eq!(case.edit(scope, all_day(RepeatEnds::Never)), past);
+            assert_eq!(case.edit(scope, all_day(until("2026-11-02"))), past);
+            assert!(case.edit(scope, all_day(until("2026-11-01"))).is_ok());
+        }
+    }
+
     /// Q3: "after n times" the user set is n occurrences of the new part, whatever the old count.
     #[test]
     fn following_with_a_new_rule_writes_after_n_as_set() {
@@ -1984,6 +2331,24 @@ mod tests {
         assert_eq!(
             body(&case.edit(Scope::Following, renamed).unwrap(), 0)["summary"],
             "Wrap-up"
+        );
+    }
+
+    /// "Does not repeat" from an occurrence moved on its own to 11:00 keeps it at 11:00.
+    #[test]
+    fn following_does_not_repeat_keeps_this_ones_own_time() {
+        let eleven = monday_19_at_eleven();
+        let case = Case::new(weekly(), eleven.clone()).exceptions(vec![eleven]);
+        let plan = case.edit(Scope::Following, stop()).unwrap();
+        let inserted = body(&plan, 0);
+        assert_eq!(inserted["start"], timed_node("2026-10-19T11:00:00+01:00"));
+        assert_eq!(inserted["end"], timed_node("2026-10-19T12:00:00+01:00"));
+        assert!(inserted.get("time").is_none());
+        assert_eq!(
+            plan.warnings,
+            [SeriesWarning::BecomesOneEvent {
+                day: day(2026, 10, 19)
+            }]
         );
     }
 

@@ -45,6 +45,9 @@ export interface RowView {
   detail: string;
   /** Offered, or "this and following" from the first occurrence (every occurrence). */
   selectable: boolean;
+  /** "This and following" from the first occurrence: its warnings are every occurrence's plan's,
+   *  and are worded as All's. */
+  asAll: boolean;
   /** The row's token when selectable. */
   token: string | null;
   warnings: SeriesWarning[];
@@ -82,7 +85,7 @@ function offeredDetail(scope: SeriesScope, asAll: boolean, kind: ChoiceKind, day
 }
 
 function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: string): RowView {
-  const base = { scope, label: LABEL[scope] };
+  const base = { scope, label: LABEL[scope], asAll: false };
   switch (row.row) {
     case "offered":
     case "as_all":
@@ -90,6 +93,7 @@ function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: stri
         ...base,
         detail: offeredDetail(scope, row.row === "as_all", kind, day),
         selectable: true,
+        asAll: row.row === "as_all",
         token: row.token,
         warnings: row.warnings,
       };
@@ -194,13 +198,15 @@ const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
 ];
 
 /** The selected row's lines, the question first; equal kinds keep the backend's order. A warning
- *  with nothing to say (a "not carried" naming nothing) has no line. */
+ *  with nothing to say (a "not carried" naming nothing) has no line. Each is worded by the plan the
+ *  row was made from: a "this and following" row that changes every occurrence speaks as All. */
 export function warningLines(row: RowView, kind: ChoiceKind, title: string): string[] {
   const rank = (w: SeriesWarning) => WARNING_ORDER.indexOf(w.warning);
+  const scope: SeriesScope = row.asAll ? "all" : row.scope;
   return [...row.warnings]
     .map((w, i) => ({ w, i }))
     .sort((a, b) => rank(a.w) - rank(b.w) || a.i - b.i)
-    .map(({ w }) => seriesWarningText(w, kind, row.scope, title))
+    .map(({ w }) => seriesWarningText(w, kind, scope, title))
     .filter((line) => line !== "");
 }
 

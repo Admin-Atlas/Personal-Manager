@@ -505,7 +505,8 @@ pub enum SeriesWarning {
     /// The days the series falls on move, as the occurrence at `from` moves to `to`: measured from
     /// where the occurrence first was, so retiming one that was already moved on its own moves the
     /// series' days too (AS2a). Raised for any move to another day, whatever the rule, a move of
-    /// whole weeks included. C9 words it from the rule and both dates: the new weekday, day of the
+    /// whole weeks included; but not with a new rule that names no day, whose start says it all
+    /// (C11). C9 words it from the rule and both dates: the new weekday, day of the
     /// month or date where the rule names one ("every Sunday → every Monday?"), and how far every
     /// occurrence moves wherever that is a week or more (a one-day weekly rule may move a week and a
     /// day) or the rule names no day (daily). A split that keeps its rule raises no `StartMoved`, so
