@@ -122,16 +122,30 @@ fn fixed(event: &Value) -> BTreeSet<String> {
     out
 }
 
-/// Whether `ops` can be applied to `event` (Google's copy now): every address one, none twice (by
-/// address, whatever the case), none changing the organiser's or the user's own entry, and a whole
-/// list to apply them to. An empty `ops` always can.
+/// The addresses on Google's `list`, lower-cased.
+fn listed(list: Option<&Value>) -> BTreeSet<String> {
+    entries(list).filter_map(address_of).collect()
+}
+
+/// Whether PM may send `op`: an address already on Google's list (`listed`) is matched by address
+/// and goes back as Google has it, so only one PM adds is held to [`is_address`]. A calendar Google
+/// lists as a guest can have more than 64 characters before its `@` (C12a review), and the user
+/// can still take it off or make it optional.
+fn sendable(op: &GuestOp, listed: &BTreeSet<String>) -> bool {
+    listed.contains(&key(&op.email)) || is_address(&op.email)
+}
+
+/// Whether `ops` can be applied to `event` (Google's copy now): every address one PM may send, none
+/// twice (by address, whatever the case), none changing the organiser's or the user's own entry, and
+/// a whole list to apply them to. An empty `ops` always can.
 pub fn check(event: &Value, ops: &[GuestOp]) -> Result<(), GuestError> {
     if ops.is_empty() {
         return Ok(());
     }
+    let listed = listed(event.get("attendees"));
     let mut seen = BTreeSet::new();
     for op in ops {
-        if !is_address(&op.email) {
+        if !sendable(op, &listed) {
             return Err(GuestError::NotAnAddress);
         }
         if !seen.insert(key(&op.email)) {
@@ -148,11 +162,12 @@ pub fn check(event: &Value, ops: &[GuestOp]) -> Result<(), GuestError> {
     Ok(())
 }
 
-/// What each op wants, by address: the first op for an address that is one ([`check`] refuses the
-/// rest).
-fn wanted(ops: &[GuestOp]) -> BTreeMap<String, GuestState> {
+/// What each op wants, by address: the first op for an address PM may send to `list` ([`check`]
+/// refuses the rest).
+fn wanted(list: Option<&Value>, ops: &[GuestOp]) -> BTreeMap<String, GuestState> {
+    let listed = listed(list);
     let mut wanted = BTreeMap::new();
-    for op in ops.iter().filter(|op| is_address(&op.email)) {
+    for op in ops.iter().filter(|op| sendable(op, &listed)) {
         wanted.entry(key(&op.email)).or_insert(op.to);
     }
     wanted
@@ -186,7 +201,7 @@ fn as_wanted(entry: &Value, to: GuestState) -> Option<Value> {
 /// order the ops name them. An op asking for what an entry already is changes nothing. Ops [`check`]
 /// would refuse are skipped (call it first).
 pub fn apply(list: Option<&Value>, ops: &[GuestOp]) -> Vec<Value> {
-    let wanted = wanted(ops);
+    let wanted = wanted(list, ops);
     let mut present = BTreeSet::new();
     let mut out: Vec<Value> = entries(list)
         .filter_map(|entry| {
@@ -296,9 +311,10 @@ fn recipients(list: Option<&Value>, own: &Own) -> BTreeSet<String> {
 }
 
 /// Whether Google's copy `event` has anyone it would email about a change, or a list it cut short:
-/// the 412 rule's test (C12 critique C1-M6: never the user, never a room).
-pub fn reaches_anyone(event: &Value) -> bool {
-    omitted(event) || !recipients(event.get("attendees"), &Own::of(&[], &[event])).is_empty()
+/// the 412 rule's test (C12 critique C1-M6: never the user, never a room). `own` is the plan's, so
+/// the rule and the plan's counts agree on who the user is (C12a review).
+pub fn reaches_anyone(event: &Value, own: &Own) -> bool {
+    omitted(event) || !recipients(event.get("attendees"), own).is_empty()
 }
 
 /// Who one write reaches, by address: built per write, merged for a plan. Counts come from who was on
@@ -554,6 +570,15 @@ mod tests {
         Value::from(entries)
     }
 
+    /// A team calendar Google lists as a guest: 66 characters before its `@`, more than PM types.
+    fn team() -> String {
+        format!("c_{}@group.calendar.google.com", "0".repeat(64))
+    }
+
+    fn team_guest() -> Value {
+        json!({ "email": team(), "responseStatus": "accepted" })
+    }
+
     /// One table: Google's list, the ops, and the list sent (O1-O8, C12 §2.4).
     #[test]
     fn guest_ops_apply_to_googles_own_list() {
@@ -615,6 +640,18 @@ mod tests {
                 None,
                 vec![op("b@x.org", Required)],
                 list(vec![json!({ "email": "b@x.org" })]),
+            ),
+            (
+                "O9 a guest Google holds that PM wouldn't take typed, taken off",
+                Some(list(vec![me(), team_guest()])),
+                vec![op(&team(), Absent)],
+                list(vec![me()]),
+            ),
+            (
+                "O10 the same guest made optional",
+                Some(list(vec![me(), team_guest()])),
+                vec![op(&team(), Optional)],
+                list(vec![me(), optional(team_guest())]),
             ),
         ];
         for (name, before, ops, want) in rows {
@@ -697,6 +734,24 @@ mod tests {
                 invitation,
                 vec![op("a@x.org", Optional), op("c@x.org", Required)],
                 Ok(()),
+            ),
+            (
+                "a guest Google holds that PM wouldn't take typed, taken off",
+                event(&[me(), team_guest()]),
+                vec![op(&team(), Absent)],
+                Ok(()),
+            ),
+            (
+                "the same guest made optional, in another case",
+                event(&[me(), team_guest()]),
+                vec![op(&team().to_uppercase(), Optional)],
+                Ok(()),
+            ),
+            (
+                "the same address, added by PM",
+                event(&[me(), a()]),
+                vec![op(&team(), Required)],
+                Err(GuestError::NotAnAddress),
             ),
         ];
         for (name, event, ops, want) in rows {
@@ -943,11 +998,16 @@ mod tests {
             .notice()
             .is_none());
         // Who is there to email at all, for the 412 rule: never the user, never a room.
-        assert!(!reaches_anyone(&event(&[me(), room()])));
-        assert!(reaches_anyone(&event(&[me(), a()])));
+        let none = Own::default();
+        assert!(!reaches_anyone(&event(&[me(), room()]), &none));
+        assert!(reaches_anyone(&event(&[me(), a()]), &none));
         let mut cut_short = event(&[me()]);
         cut_short["attendeesOmitted"] = json!(true);
-        assert!(reaches_anyone(&cut_short));
+        assert!(reaches_anyone(&cut_short, &none));
+        // The user's address the list doesn't mark is still the user.
+        let unmarked = event(&[json!({ "email": "Me@x.org" })]);
+        assert!(reaches_anyone(&unmarked, &none));
+        assert!(!reaches_anyone(&unmarked, &mine));
     }
 
     /// The editor's isEmail runs the same table (guests.test.ts, C12b): a row added to one is added to
@@ -1003,6 +1063,6 @@ mod tests {
         assert!(!is_room_address("resource.calendar.google.com@x.org"));
         // A room the mirror's flag misses is still a room by its address.
         let unflagged = json!({ "email": "room2@resource.calendar.google.com" });
-        assert!(!reaches_anyone(&event(&[me(), unflagged])));
+        assert!(!reaches_anyone(&event(&[me(), unflagged]), &Own::default()));
     }
 }

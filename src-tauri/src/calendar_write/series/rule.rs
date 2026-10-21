@@ -30,6 +30,7 @@ use crate::calendar_recur::spec::{
 use crate::calendar_recur::split::remaining_count;
 use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
+use super::super::attendees::Own;
 use super::super::dto::{EventPatchDraft, Notify, RepeatDraft, TimeDraft};
 use super::super::patch::{build_patch, drop_other_kind, is_gone, when_eq};
 use super::super::plan::is_plain_segment;
@@ -1085,6 +1086,8 @@ pub(super) fn plan_split_rule(
                             },
                             gone_is_done: false,
                             undo: None,
+                            guest_ops: Vec::new(),
+                            reach: None,
                         });
                         Some(steps.len() - 1)
                     }
@@ -1140,6 +1143,7 @@ pub(super) fn plan_split_rule(
         rule_start: master.start,
         guests: None,
         chosen: None,
+        own: Own::default(),
     })
 }
 

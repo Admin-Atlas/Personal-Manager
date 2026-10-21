@@ -392,6 +392,18 @@ impl GuestAnswer {
             _ => Err(WriteOutcome::needs_notify_again(guests)),
         }
     }
+
+    /// Whether a delete may be held for the Undo window, `row` being who the mirror's row says it
+    /// would tell: asked now when that's someone and nobody answered, rather than held and asked 8 s
+    /// later (C12 §5.1). The numbers an answer was given for are compared only at the send, on
+    /// Google's copy: the mirror can't say a list was cut short, so comparing them here could refuse
+    /// every answer to such an event (C12a review).
+    fn before_hold(&self, row: Option<GuestNotice>) -> std::result::Result<(), WriteOutcome> {
+        match (row, self.notify) {
+            (Some(guests), None) => Err(WriteOutcome::needs_notify(guests)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Each row's list-level edit block (see [`facts_from_row`]): the one reason nothing about it may
@@ -1921,10 +1933,10 @@ pub async fn delete_calendar_event(
         )
         .await;
     }
-    // Guests the row shows, and no answer, or one given for other numbers: asked now, rather than
-    // held and asked 8 s later. The answer is checked again on Google's copy at the send.
+    // Guests the row shows, and no answer: asked now, rather than held and asked 8 s later. The answer
+    // is checked against Google's copy at the send.
     let answer = GuestAnswer { notify, asked };
-    if let Err(ask) = answer.for_write(guests) {
+    if let Err(ask) = answer.before_hold(guests) {
         return refused(ask);
     }
     let Some(flight) = InFlight::claim(&state.calendar_edit, &target.row_id) else {
@@ -7659,9 +7671,9 @@ mod tests {
             .is_none());
     }
 
-    /// C12 §5.1: the delete shell asks about the row's guests before it holds anything, an answer
-    /// given for other numbers included. The shell needs the app, so its order is read from the
-    /// source, as for the dev allow-list.
+    /// C12 §5.1: the delete shell asks about the row's guests before it holds anything, when nobody
+    /// answered. The shell needs the app, so its order is read from the source, as for the dev
+    /// allow-list.
     #[test]
     fn a_delete_asks_about_the_rows_guests_before_its_hold() {
         let source = include_str!("calendar_edit.rs");
@@ -7678,7 +7690,7 @@ mod tests {
             shell.contains("let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;")
         );
         let ask = shell
-            .find("if let Err(ask) = answer.for_write(guests) {\n        return refused(ask);")
+            .find("if let Err(ask) = answer.before_hold(guests) {\n        return refused(ask);")
             .expect("asked before the hold");
         let hold = shell.find("held_deletes.hold(").expect("the hold");
         let series = shell
@@ -8057,6 +8069,84 @@ mod tests {
             &answered(Notify::All, at_least),
         )
         .await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, as chosen");
+    }
+
+    /// C12a review: the mirror can't say Google cut a guest list short, so before the hold only a
+    /// missing answer is asked about, and the numbers wait for Google's copy at the send. Here the
+    /// row still shows A, Google's copy lists only the user and is cut short, and the answer was
+    /// given for Google's numbers: it gets past the check before the hold and is deleted, rather
+    /// than asked about on every try.
+    #[tokio::test]
+    async fn a_cut_short_list_answered_with_googles_numbers_gets_past_the_hold_and_is_deleted() {
+        let event = dentist();
+        let shown = written(
+            &event,
+            &[(
+                "attendees",
+                json!([
+                    { "email": "me@example.com", "self": true, "organizer": true },
+                    { "email": "a@x.org", "responseStatus": "accepted" }
+                ]),
+            )],
+            "\"s1\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&shown));
+        let target = target(&event);
+        let row = host
+            .with_conn(|conn| row_guests(conn, &target.row_id, &own_of(&target, &[])))
+            .unwrap();
+        let mirrors = GuestNotice {
+            updated: 1,
+            people: 1,
+            emails: 1,
+            cancelled: true,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(row == Some(mirrors.clone()), "the row shows A");
+        let at_least = GuestNotice {
+            cancelled: true,
+            complete: false,
+            ..Default::default()
+        };
+        let answer = answered(Notify::All, at_least);
+        assert!(
+            answer.before_hold(row.clone()) == Ok(()),
+            "past the check before the hold"
+        );
+        assert!(
+            GuestAnswer::default().before_hold(row) == Err(WriteOutcome::needs_notify(mirrors)),
+            "with no answer, asked before the hold"
+        );
+        assert!(
+            GuestAnswer::default().before_hold(None) == Ok(()),
+            "nobody to tell"
+        );
+        let cut_short = written(
+            &event,
+            &[
+                (
+                    "attendees",
+                    json!([{ "email": "me@example.com", "self": true }]),
+                ),
+                ("attendeesOmitted", json!(true)),
+            ],
+            "\"s2\"",
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", cut_short),
+            told(
+                Method::Delete,
+                "/events/solo",
+                "\"s2\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+        ]);
+        let seen = seen_by_user(&fresh_event(shown.clone()));
+        let outcome = send_delete(&script, &*host, &target, &seen, &answer).await;
         script.asked_all();
         assert!(outcome == saved(), "deleted, as chosen");
     }

@@ -246,8 +246,10 @@ enum Read {
     Check,
     /// Send the same request once more on this etag (one a copy already went out on).
     Again(String),
-    /// Send it on Google's newer etag: no copy of it can land any more.
-    OnNewer(String),
+    /// Send it on Google's newer etag: no copy of it can land any more. With the write to send when
+    /// it isn't the last copy as it went: one whose guest list is built again on Google's newer copy
+    /// ([`SeriesPlan::again_on`]).
+    OnNewer(String, Option<Op>),
     /// Put the series' times and rule back on this etag: Google took half the move.
     Restore(String),
     /// A lost insert's new series isn't there yet: look again after a pause.
@@ -759,7 +761,7 @@ impl Run {
         // Google is at an etag no copy went out on: none of them can land.
         match self.plan.resend(self.at, &fresh) {
             Resend::Proceed if self.copies.moved_on => Read::NotDone(Why::Conflict(Vec::new())),
-            Resend::Proceed => Read::OnNewer(etag),
+            Resend::Proceed => Read::OnNewer(etag, self.plan.again_on(self.at, &fresh)),
             Resend::Gone if self.step_gone_is_done() => Read::Done(None, None),
             Resend::Gone => Read::NotDone(Why::Gone),
             Resend::Conflict(fields) => Read::NotDone(Why::Conflict(fields)),
@@ -811,8 +813,14 @@ impl Run {
                 self.copies.resent_on.push(etag);
                 Some(self.send(request))
             }
-            Read::OnNewer(etag) => {
-                let Some(request) = self.copies.last.clone().map(|r| on_etag(r, &etag)) else {
+            Read::OnNewer(etag, again) => {
+                // A guest list goes as Google's list now with the step's guest changes, never as the
+                // plan read it, so a reply that landed meanwhile stays (C12 decision 3).
+                let request = match again {
+                    Some(op) => op.request(self.plan.steps[self.at].notify),
+                    None => self.copies.last.clone(),
+                };
+                let Some(request) = request.map(|r| on_etag(r, &etag)) else {
                     return Some(self.stop_unknown());
                 };
                 self.copies.in_doubt = false;
@@ -1880,6 +1888,64 @@ mod tests {
         assert_eq!(sent[0].if_match, Some(instance_etag(&case)));
         assert_eq!(sent[2].if_match.as_deref(), Some("\"i9\""));
         assert_eq!(sent[2].body, sent[0].body);
+    }
+
+    /// C12 decision 3: a guest list sent once more after a 412 is Google's list then with the user's
+    /// guest changes, so A's reply, comment and extra guest that landed between PM's read and its
+    /// write stay, and B is still added: the series' list and one occurrence's alike.
+    #[test]
+    fn a_guest_list_sent_once_more_keeps_what_guests_said_meanwhile() {
+        use crate::calendar_write::dto::{EventPatchDraft, GuestOp, GuestState};
+        let waiting = |event: Value| {
+            let mut v = guests_on_it(event, &["a@example.com"]);
+            v["attendees"][1]["responseStatus"] = json!("needsAction");
+            v
+        };
+        let case = Case::new(waiting(weekly()), waiting(monday_19())).guests();
+        let add_b = EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: "b@example.com".into(),
+                to: GuestState::Required,
+            }]),
+            ..Default::default()
+        };
+        for (scope, event) in [
+            (Scope::All, case.master.json()),
+            (Scope::This, case.instance.json()),
+        ] {
+            let plan = case
+                .edit_told(scope, add_b.clone(), Some(Notify::All))
+                .unwrap();
+            let mut replied = at_etag(event, "\"r2\"");
+            replied["attendees"][1] = json!({ "email": "a@example.com", "responseStatus": "accepted",
+                                              "comment": "On my way", "additionalGuests": 1 });
+            let mut patches = 0;
+            let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+                Method::Patch => {
+                    patches += 1;
+                    match (patches, &r.body) {
+                        (1, _) => status(Verdict::Conflict),
+                        (_, Some(body)) => ok(at_etag(
+                            &with(replied.clone(), "attendees", body["attendees"].clone()),
+                            "\"r3\"",
+                        )),
+                        _ => status(Verdict::BadRequest("no body".into())),
+                    }
+                }
+                _ => ok(replied.clone()),
+            });
+            assert!(matches!(ran, Ran::Done { .. }), "{scope:?}: landed");
+            assert!(sent.len() == 3 && sent[1].method == Method::Get);
+            assert!(sent[2].if_match.as_deref() == Some("\"r2\""));
+            let mut want = replied["attendees"].clone();
+            want.as_array_mut()
+                .unwrap()
+                .push(json!({ "email": "b@example.com" }));
+            assert!(
+                sent[2].body.as_ref().map(|b| &b["attendees"]) == Some(&want),
+                "{scope:?}: A's reply kept, B still added"
+            );
+        }
     }
 
     /// C9 design review: the cut watches every field the new series copied (AS10), so one changed
