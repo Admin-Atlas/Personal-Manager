@@ -468,6 +468,21 @@ describe("settling a change PM couldn't finish", () => {
     });
   });
 
+  // C11c review round 3: a Finish words what landed as a save does. Outside the months PM syncs,
+  // PM's calendar won't show it, so it catches up rather than shows it, and that's a warning.
+  it("words a Finish that lands outside the months PM syncs as a save says it", () => {
+    const both = saved(["outside_mirror", "mirror_refresh_pending"]);
+    expect(settleText(both, "Standup")).toEqual({
+      tone: "warn",
+      text: "Finished the change to “Standup”. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+    });
+    expect(settleText(saved(["outside_mirror"]), "Standup").tone).toBe("warn");
+    expect(settleText(saved(["mirror_refresh_pending"]), "Standup")).toEqual({
+      tone: "ok",
+      text: "Finished the change to “Standup”. PM's calendar will show it after the next refresh.",
+    });
+  });
+
   it("says an earlier change blocks this one, hinting at deleting only when Remove is offered", () => {
     const cases: [SplitAction[], RegExp][] = [
       [["finish", "remove"], /Finish it or remove the new part first\.$/],

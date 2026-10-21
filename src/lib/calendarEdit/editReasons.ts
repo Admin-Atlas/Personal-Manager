@@ -372,13 +372,10 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
   const t = quote(title);
   switch (result.outcome) {
     case "saved": {
-      // A milestone that stayed has a notice of its own, naming it.
-      const warnings = result.warnings
-        .filter((w) => w !== "milestone_not_offered")
-        .map((w) => writeWarningText(w, "save", result.left_behind));
+      const said = savedWarnings(result);
       return {
-        tone: result.warnings.includes("left_on_old_series") ? "warn" : "ok",
-        text: [`Finished the change to ${t}.`, ...warnings].join(" "),
+        tone: said.warn ? "warn" : "ok",
+        text: [`Finished the change to ${t}.`, ...said.words].join(" "),
       };
     }
     case "split_removed":
@@ -436,9 +433,7 @@ export function savedNotice(
   asAll = false,
 ): { tone: Tone; text: string } {
   const t = quote(title);
-  const outside = outcome.warnings.includes("outside_mirror");
   const pending = outcome.warnings.includes("mirror_refresh_pending");
-  const left = outcome.warnings.includes("left_on_old_series");
   const day = from ? formatDateOnly(from) : null;
   const saved: SeriesScope | null = asAll && scope === "following" ? "all" : scope;
   let first: string;
@@ -473,16 +468,32 @@ export function savedNotice(
     default:
       return unreachable(saved);
   }
-  const parts = [first];
-  if (outside) parts.push(writeWarningText("outside_mirror", "save"));
-  // Off PM's calendar the saved event won't show after a refresh, but what it replaced still does
-  // until then: the calendar catches up, in a delete's words (C11c review).
-  if (pending) parts.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
-  // Occurrences left on the earlier part come first: changing it back isn't the whole story. An
-  // event PM's calendar won't show can't be edited again here.
-  if (left) parts.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
-  else if (back && !outside) parts.push(back);
-  return { tone: left || outside ? "warn" : "ok", text: parts.join(" ") };
+  const said = savedWarnings(outcome);
+  const parts = [first, ...said.words];
+  // With occurrences left on the earlier part, changing it back isn't the whole story; an event
+  // PM's calendar won't show can't be edited again here.
+  if (back && !said.warn) parts.push(back);
+  return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
+}
+
+/** A saved outcome's warnings in words, in one order for every notice that says a save landed
+ *  (`savedNotice`, and `settleText` for a Finish): outside the months PM syncs; then PM's calendar
+ *  catching up, which beside an event outside is in a delete's words, since the saved event won't
+ *  show after a refresh but what it replaced still does until then (C11c review); then occurrences
+ *  left on the earlier part. A milestone that stayed has a notice of its own, naming it. `warn`: the
+ *  user should look, and nothing says to edit it again here. */
+function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
+  words: string[];
+  warn: boolean;
+} {
+  const outside = outcome.warnings.includes("outside_mirror");
+  const pending = outcome.warnings.includes("mirror_refresh_pending");
+  const left = outcome.warnings.includes("left_on_old_series");
+  const words: string[] = [];
+  if (outside) words.push(writeWarningText("outside_mirror", "save"));
+  if (pending) words.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
+  if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
+  return { words, warn: outside || left };
 }
 
 // --- creating an event (C10) ---
