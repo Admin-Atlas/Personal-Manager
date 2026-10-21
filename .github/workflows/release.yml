@@ -339,10 +339,13 @@ jobs:
   # interpreter is a prebuilt binary, so the build runners still need no Python
   # toolchain to compile.)
   #
-  # Installs exactly as the app does — `--require-hashes -r sidecar/requirements.lock`
-  # — so this is also the proof that the universal lock's markers select correctly on
-  # all three platforms, and that every artifact each one needs is covered by a hash.
-  # It used to install requirements.txt, which left the shipped resolution untested.
+  # Installs exactly as the app does — `--require-hashes --no-deps -r
+  # sidecar/requirements.lock` — so this is also the proof that the universal lock's
+  # markers select correctly on all three platforms, and that every artifact each one
+  # needs is covered by a hash. It used to install requirements.txt, which left the
+  # shipped resolution untested. `--no-deps` because the lock overrides fastembed's
+  # pillow cap (sidecar.rs `provision` says why); it also means pip no longer reports a
+  # dependency the markers failed to select, so the import line is what catches one.
   python-smoke:
     needs: guards
     strategy:
@@ -370,7 +373,7 @@ jobs:
             source .smoke-venv/bin/activate
           fi
           python -m pip install --upgrade pip
-          pip install --require-hashes -r sidecar/requirements.lock
+          pip install --require-hashes --no-deps -r sidecar/requirements.lock
           python -c "import markitdown, fastembed, faster_whisper; print('sidecar deps import OK')"
 
   publish:

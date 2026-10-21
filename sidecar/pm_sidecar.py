@@ -1215,10 +1215,37 @@ def get_ocr_engine():
     return _ocr_engine
 
 
+# The photo extensions (PHOTO_EXTS in ingest.rs routes exactly these to `analyze_image`), each with
+# the Pillow format it names, and together the only formats a photo is ever decoded as. Left to
+# itself, `Image.open` picks the decoder from the file's CONTENT out of every format Pillow knows,
+# so a TIFF, FlashPix, EPS or any of its ~40 others renamed `holiday.jpg` reached that format's
+# decoder, and most of the advisories published against Pillow from 2026-10-17 are in exactly
+# those decoders. A photo is therefore opened as one of these four photo formats, the one its own
+# extension names tried first. Not as that one alone: a PNG or a WebP saved as .jpg, or a JPEG as
+# .png, is common, refusing it would block nothing (naming the file correctly reaches the same
+# decoder), and it would stay unread for good, because ingest skips content it has indexed already.
+# MPO, the multi-picture JPEG some cameras write, is not listed because it cannot be: Pillow
+# registers no opener of its own for it (asking for "MPO" raises KeyError), and its JPEG opener
+# hands a multi-picture file over to MPO by itself. HEIF exists only once pi-heif has registered
+# it; without it a .heic is tried as the other three, so a JPEG saved as .heic still reads, and a
+# real HEIC matches none of them and is refused.
+_PHOTO_FORMATS = {
+    ".jpg": ("JPEG",),
+    ".jpeg": ("JPEG",),
+    ".png": ("PNG",),
+    ".webp": ("WEBP",),
+    ".heic": ("HEIF",),
+}
+_ANY_PHOTO_FORMAT = tuple(dict.fromkeys(f for own in _PHOTO_FORMATS.values() for f in own))
+
+
 def _open_image(path):
-    """Open an image with Pillow, registering the HEIC opener if pi-heif is available. Pillow is
-    already present (a markitdown dependency); pi-heif ships in the optional OCR component, so
-    HEIC decoding needs that component installed — a non-HEIC image opens regardless.
+    """Open a photo with Pillow, ONLY as a photo format (see `_PHOTO_FORMATS`), the one its
+    extension names first, registering the HEIC opener if pi-heif is available. Pillow is already
+    present (a markitdown dependency); pi-heif ships in the optional OCR component, so HEIC decoding
+    needs that component installed — a non-HEIC image opens regardless. Raises on anything else: an
+    extension that is not a photo's, and a file whose content is not one of the photo formats
+    registered (a TIFF named .jpg, or a real HEIC without pi-heif).
 
     pi-heif rather than pillow-heif: same bindings, same author, same repository, but the
     decode-only build. See OPTIONAL_OCR_PINS in sidecar.rs for why the encoder build had to go.
@@ -1234,9 +1261,21 @@ def _open_image(path):
 
             register_heif_opener()
         except Exception:
-            pass  # pi-heif absent → HEIC won't open, every other format still does
+            pass  # pi-heif absent → HEIC won't open (Pillow knows no "HEIF"), the rest still do
         _heif_registered = True
-    return Image.open(path)
+    # Every plugin's opener registered (Pillow loads WEBP's lazily), so a format missing from OPEN
+    # now is one Pillow cannot open at all: HEIF without pi-heif.
+    Image.init()
+    ext = os.path.splitext(str(path))[1].lower()
+    # An extension that is not a photo's is refused here, by name. A photo's own format may be
+    # missing (HEIF without pi-heif): it is then tried as the formats that are registered, never as
+    # Pillow's every format. Never `Image.open` without a list: that is the very thing this
+    # function exists to refuse.
+    if ext not in _PHOTO_FORMATS:
+        raise ValueError("not a photo type PM can open")
+    own = tuple(f for f in _PHOTO_FORMATS[ext] if f in Image.OPEN)
+    others = tuple(f for f in _ANY_PHOTO_FORMAT if f in Image.OPEN and f not in own)
+    return Image.open(path, formats=own + others)
 
 
 def _gps_to_decimal(value, ref):
@@ -1297,23 +1336,30 @@ def _exif_meta(img):
     return capture_date, lat, lon
 
 
-def _run_ocr(engine, img, path):
-    """Recognise text in an image, returning the joined lines (newest rapidocr returns an object
-    with a `.txts` tuple; tolerate the older list-of-[box,text,score] shape too). Pass a decoded RGB
-    array when we already opened the image (HEIC works); else hand rapidocr the path directly.
+def _decode_pixels(img):
+    """The RGB pixels of an image `_open_image` opened, as the array rapidocr takes. Opening reads
+    only the header, so this is where a damaged file (a JPEG cut off by an interrupted download or a
+    half-synced folder) first fails, with Pillow's "image file is truncated"."""
+    import numpy as np
+
+    return np.array(img.convert("RGB"))
+
+
+def _run_ocr(engine, pixels):
+    """Recognise text in pixels PM decoded itself (`_decode_pixels`). Never a path: given one,
+    rapidocr opens the file itself with a bare `Image.open`, which is every decoder Pillow has — the
+    route `_PHOTO_FORMATS` exists to close.
 
     rapidocr prints init/inference chatter, which would corrupt the reply channel. `main()` now
     redirects stdout around EVERY handler, so this call — and the engine construction — no longer
     carry a guard of their own.
     """
-    if img is not None:
-        import numpy as np
+    return _ocr_lines(engine(pixels))
 
-        target = np.array(img.convert("RGB"))
-    else:
-        target = path  # let rapidocr read the file itself (non-HEIC)
-    result = engine(target)
 
+def _ocr_lines(result):
+    """rapidocr's result as the joined lines: newest rapidocr returns an object with a `.txts`
+    tuple; tolerate the older list-of-[box,text,score] shape too."""
     txts = getattr(result, "txts", None)
     if txts:
         return "\n".join(t for t in txts if t)
@@ -1331,8 +1377,11 @@ def do_analyze_image(params):
     """Analyse one image for photo ingestion: EXIF capture metadata (always) + OCR text (only when
     `run_ocr`). The Rust side sets `run_ocr` from whether the optional component is installed, so
     a user who declined OCR still gets dimensions + EXIF (date/location) for the metadata chunk.
-    OCR output is untrusted text — `clean_text`-ed like every other string we return. An unreadable
-    image (e.g. HEIC without pi-heif) yields nulls; Rust falls back to a filename/ingest date.
+    OCR output is untrusted text — `clean_text`-ed like every other string we return. An image PM
+    cannot open (damaged, not a photo format, HEIC without pi-heif) yields null metadata and no OCR
+    at all; Rust reads the null size as "could not open", tells the user, and falls back to a
+    filename/ingest date. One that opens but whose pixels will not decode for OCR comes back the
+    same way, keeping any EXIF its header held.
     """
     path = params["path"]
     _guard_file_size(path)
@@ -1345,13 +1394,32 @@ def do_analyze_image(params):
         width, height = img.size
         capture_date, lat, lon = _exif_meta(img)
     except Exception:
-        pass  # unreadable / HEIC without codec — metadata stays null, OCR may still try the path
+        pass  # could not open it as a photo — metadata stays null, and OCR is skipped below
 
     ocr_text = ""
     ocr_ran = False
-    if run_ocr:
+    pixels = None
+    # Only an image PM itself opened goes to OCR. There used to be a fallback that handed rapidocr
+    # the path when PM's own open failed, and rapidocr opens a path with no format restriction.
+    if run_ocr and img is not None:
+        # Decoded on its own, before the engine is even loaded: a file whose pixels will not decode
+        # is the FILE's fault, and inside the OCR call below it read as ocr_ran=false, so the row
+        # blamed text recognition and sent the user to repair a component that works. No size goes
+        # back instead, which Rust reports as "could not open"; the EXIF from the header stays.
+        # With OCR off nothing needs the pixels, so nothing decodes them, as before.
         try:
-            ocr_text = _run_ocr(get_ocr_engine(), img, path)
+            pixels = _decode_pixels(img)
+        except Exception as exc:
+            sys.stderr.write(f"pm_sidecar: could not decode {path!r}, so no OCR: {exc}\n")
+            sys.stderr.flush()
+            width = height = None
+    if img is not None:
+        # Everything is read from the file by now. Pillow keeps it open until the pixels are, which
+        # with OCR off is never, so it lingered until garbage collection.
+        img.close()
+    if pixels is not None:
+        try:
+            ocr_text = _run_ocr(get_ocr_engine(), pixels)
             ocr_ran = True
         except ModelNotCached:
             # NOT a broken component: the offline worker just needs the fetcher to download

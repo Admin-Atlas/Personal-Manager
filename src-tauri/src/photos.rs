@@ -225,7 +225,10 @@ pub fn ocr_text_from_body(body: &str) -> Option<String> {
 /// run) plus best-effort EXIF capture metadata. `ocr_ran` distinguishes "OCR ran and found nothing"
 /// from "OCR was not requested" (the user declined the optional component). Any EXIF field is `None`
 /// when absent or unreadable (e.g. a HEIC opened without the pi-heif codec) — the caller then
-/// falls back to a filename- or ingest-time capture date.
+/// falls back to a filename- or ingest-time capture date. The sidecar opens a photo only as a photo
+/// format, and an image it could not open comes back with no size and no OCR attempted, as does one
+/// whose pixels would not decode for OCR (a file cut off halfway; its header's EXIF is kept): ingest
+/// reads the missing size as "could not open" and says so on the file's row.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImageAnalysis {
     /// Recognised text, joined by newlines. Empty string when OCR found nothing or was not run.

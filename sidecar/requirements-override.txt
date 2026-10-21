@@ -1,0 +1,20 @@
+# Overrides for the base lock: each line REPLACES every requirement on that package in the
+# resolution, a dependency's declared bounds included. `just lock-regen` passes this file to
+# `uv pip compile --override` for sidecar/requirements.lock only, and stamps its hash in the lock's
+# header, so `just requirements-lock` fails if it changes without a regeneration.
+#
+# An override is a hole in a dependency's own metadata, so keep this file to the pins that need
+# one, each also pinned at the same version in requirements.txt (the gate checks that), with the
+# reason and the condition for removing it. This is NOT requirements.txt: overriding with every
+# top-level pin would silently replace every transitive bound on them.
+#
+# Because the lock is resolved past a declared bound, pip installs it with `--no-deps` (sidecar.rs,
+# pr.yml, release.yml): pip's own resolver would read fastembed's cap again and refuse the lock.
+# The lock is still complete, since uv resolved every dependency, and every line is still
+# hash-checked.
+#
+#   pillow — 13.0.0 carries the fixes for the image-decoder advisories published from 2026-10-17;
+#     fastembed 0.9.0 declares `pillow<13` on every Python, though its code runs on 13 and PM calls
+#     only its text models. Remove this line once a fastembed release allows pillow 13
+#     (qdrant/fastembed#830, open and unmerged at 0.9.0). Keep the file even when it is empty.
+pillow==13.0.0

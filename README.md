@@ -128,12 +128,13 @@ For a full tour of the architecture and the rules for working in this repo, see
 ## Prerequisites
 
 - **Node.js** 24+ (LTS) and **Rust** (stable)
-- **Python** 3.10+ — needed for development (`tauri dev`) and as the base for the
+- **Python** 3.11+ — needed for development (`tauri dev`) and as the base for the
   document sidecar's managed virtual environment, built on first use. PM finds a suitable
-  interpreter automatically: `PM_PYTHON`, then versioned names (`python3.12` … `python3.10`),
-  `python3`/`python`, and common macOS locations (Homebrew, python.org) — so even a
-  Finder-launched app finds one off its stripped PATH. It also rebuilds the venv if that
-  interpreter is older than 3.10. Set `PM_PYTHON` only for an unusual setup. (Packaged
+  interpreter automatically: `PM_PYTHON`, then versioned names newest-first (`python3.16` …
+  `python3.11`), `python3`/`python`, and common macOS locations (Homebrew, python.org) — so even
+  a Finder-launched app finds one off its stripped PATH. It also rebuilds the venv if that
+  interpreter is older than 3.11 (the floor was 3.10 until Pillow 13, which needs 3.11). Set
+  `PM_PYTHON` only for an unusual setup. (Packaged
   **Windows and Linux** release builds **bundle** a standalone interpreter at build time —
   `npm run tauri build` fetches it via [`scripts/fetch-python.mjs`](scripts/fetch-python.mjs)
   — so end users need no Python install. On **macOS**, packaged apps instead **download** a
@@ -143,7 +144,7 @@ For a full tour of the architecture and the rules for working in this repo, see
   build-time bundling into the signed `.app` is gated on the Apple-signing pipeline, whereas a
   runtime download picks the right per-arch build and isn't gated on signing — see
   [`docs/MACOS-SIGNING.md`](docs/MACOS-SIGNING.md). Development from source still needs Python
-  3.10+ on your machine on every platform.)
+  3.11+ on your machine on every platform.)
 - **Tauri OS prerequisites:** see <https://tauri.app/start/prerequisites/>
   - Windows: Microsoft C++ Build Tools + WebView2 (preinstalled on Win 11)
   - macOS: Xcode Command Line Tools

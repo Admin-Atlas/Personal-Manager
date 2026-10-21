@@ -38,8 +38,10 @@ def _needs_fastembed(reason):
     """Skip a real-fastembed test where fastembed is absent (a plain `just sidecar-test` on a system
     Python, locally or in CI) — unless `PM_REQUIRE_FASTEMBED=1`, which makes the absence a FAILURE
     instead, so a run meant to exercise the pinned fastembed can't pass by skipping. pr.yml's
-    python job sets it for its second run, against a venv built from `sidecar/requirements.lock
-    --require-hashes`, on any PR that touches sidecar/. Locally:
+    python job sets it for its second run, against a venv built with `pip install --require-hashes
+    --no-deps -r sidecar/requirements.lock`, on any PR that touches sidecar/. `--no-deps` is not
+    optional: the lock overrides fastembed's `pillow<13` (sidecar/requirements-override.txt), so
+    without it pip refuses the lock. Locally, build the venv the same way, then
     `PM_REQUIRE_FASTEMBED=1 <venv>/bin/python sidecar/test_pm_sidecar.py`, inside the capped
     systemd-run scope on the Linux dev machine."""
     if os.environ.get("PM_REQUIRE_FASTEMBED") == "1":
@@ -217,10 +219,57 @@ class _FakeOcrEngine:
         return self._result
 
 
+class _RecordingOcrEngine:
+    """A fake rapidocr that keeps what it was handed: whether OCR ran, and on what."""
+
+    def __init__(self):
+        self.targets = []
+
+    def __call__(self, target):
+        self.targets.append(target)
+        return _OcrResultObj(("TOTAL 12.50",))
+
+
+class _FakeOpenedImage:
+    """What `_open_image` returns, to the extent `do_analyze_image` reads it — no Pillow needed."""
+
+    size = (4, 3)
+
+    def getexif(self):
+        return {}
+
+    def close(self):
+        pass
+
+
+_needs_pillow = unittest.skipUnless(
+    importlib.util.find_spec("PIL") is not None,
+    "Pillow not installed (image decode is a local-only check)",
+)
+
+
+def _exif_with_date_and_place():
+    """EXIF the way a phone writes it: DateTimeOriginal in the Exif sub-IFD, a position in the GPS
+    sub-IFD (55°57'0"N, 3°11'24"W)."""
+    from PIL import Image
+    from PIL.TiffImagePlugin import IFDRational
+
+    exif = Image.Exif()
+    exif.get_ifd(0x8769)[0x9003] = "2023:01:02 03:04:05"
+    gps = exif.get_ifd(0x8825)
+    gps[1] = "N"
+    gps[2] = (IFDRational(55, 1), IFDRational(57, 1), IFDRational(0, 1))
+    gps[3] = "W"
+    gps[4] = (IFDRational(3, 1), IFDRational(11, 1), IFDRational(24, 1))
+    return exif
+
+
 class AnalyzeImageTest(unittest.TestCase):
-    """Photo analysis: EXIF GPS/date parsing (pure), OCR result-shape tolerance (fake engine), and
-    the EXIF-only path when OCR is declined. The OCR engine and HEIC codec are OPTIONAL components,
-    so nothing here installs or downloads anything."""
+    """Photo analysis: EXIF GPS/date parsing (pure), OCR result-shape tolerance (fake engine), the
+    EXIF-only path when OCR is declined, and the format allow-list: a photo opens only as a photo
+    format, its extension's own first, and OCR never sees an image PM could not open or decode. The
+    OCR engine and HEIC codec are OPTIONAL components, so nothing here installs or downloads
+    anything."""
 
     def test_gps_to_decimal_signs_and_malformed(self):
         # 55°57'00"N, 3°11'24"W (Edinburgh-ish). N/E positive, S/W negated.
@@ -253,15 +302,285 @@ class AnalyzeImageTest(unittest.TestCase):
         fallback = json.dumps({"id": 1, "ok": False, "error": "non-finite number in result"})
         self.assertEqual(json.loads(fallback)["ok"], False)
 
-    def test_run_ocr_parses_object_and_list_shapes(self):
+    def test_ocr_lines_parses_object_and_list_shapes(self):
         # New rapidocr: object with a .txts tuple.
-        obj = _OcrResultObj(("hello", "world"))
-        self.assertEqual(S._run_ocr(_FakeOcrEngine(obj), None, "x.png"), "hello\nworld")
+        self.assertEqual(S._ocr_lines(_OcrResultObj(("hello", "world"))), "hello\nworld")
         # Older rapidocr: ([[box, text, score], ...], elapse).
         old = ([[[0, 0], "line one", 0.9], [[1, 1], "line two", 0.8]], 0.1)
-        self.assertEqual(S._run_ocr(_FakeOcrEngine(old), None, "x.png"), "line one\nline two")
+        self.assertEqual(S._ocr_lines(old), "line one\nline two")
         # Nothing recognised → empty string, not an error.
-        self.assertEqual(S._run_ocr(_FakeOcrEngine(_OcrResultObj(())), None, "x.png"), "")
+        self.assertEqual(S._ocr_lines(_OcrResultObj(())), "")
+
+    @_needs_pillow
+    def test_a_tiff_renamed_jpg_is_refused(self):
+        # Pillow picks a decoder from the file's CONTENT, so before the allow-list this opened as a
+        # TIFF — and TIFF, FlashPix, EPS and friends are where most of the 2026-10-17 advisories
+        # are. Pillow alone still opens it; PM must not.
+        import tempfile
+
+        from PIL import Image, UnidentifiedImageError
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/holiday.jpg"
+            Image.new("RGB", (20, 10), (200, 100, 50)).save(path, format="TIFF")
+            with Image.open(path) as unrestricted:
+                self.assertEqual(unrestricted.format, "TIFF", "the fixture really is a TIFF")
+            with self.assertRaises(UnidentifiedImageError):
+                S._open_image(path)
+            out = S.do_analyze_image({"path": path, "run_ocr": False})
+        self.assertIsNone(out["width"], "no size: Rust reads that as 'could not open'")
+        self.assertIsNone(out["height"])
+        self.assertIsNone(out["capture_date"])
+        self.assertEqual(out["ocr_ran"], False)
+
+    @_needs_pillow
+    def test_a_gif_renamed_png_is_refused(self):
+        # A real format that is not a photo's stays refused under any photo extension, not just
+        # under its own: the other photo formats are tried, nothing beyond them.
+        import tempfile
+
+        from PIL import Image, UnidentifiedImageError
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/meme.png"
+            Image.new("RGB", (20, 10), (200, 100, 50)).save(path, format="GIF")
+            with Image.open(path) as unrestricted:
+                self.assertEqual(unrestricted.format, "GIF", "the fixture really is a GIF")
+            with self.assertRaises(UnidentifiedImageError):
+                S._open_image(path)
+
+    @_needs_pillow
+    def test_a_real_photo_with_the_wrong_photo_extension_still_reads(self):
+        # A PNG or a WebP saved as .jpg, a JPEG saved as .png: common, and refusing them blocked
+        # nothing (naming the file correctly reaches the same decoder). Refused, such a photo stayed
+        # unread for good, because ingest skips content it has indexed already.
+        import tempfile
+
+        from PIL import Image
+
+        exif = _exif_with_date_and_place().tobytes()
+        cases = (
+            ("screenshot.jpg", "PNG"),
+            ("download.jpg", "WEBP"),
+            ("camera.png", "JPEG"),
+            ("camera.webp", "JPEG"),
+            ("export.png", "WEBP"),
+        )
+        for name, fmt in cases:
+            with self.subTest(name=name, content=fmt), tempfile.TemporaryDirectory() as d:
+                path = f"{d}/{name}"
+                Image.new("RGB", (40, 30), (10, 20, 30)).save(path, format=fmt, exif=exif)
+                with S._open_image(path) as img:
+                    self.assertEqual(img.format, fmt)
+                out = S.do_analyze_image({"path": path, "run_ocr": False})
+                self.assertEqual((out["width"], out["height"]), (40, 30))
+                self.assertEqual(out["capture_date"], "2023-01-02")
+
+    @_needs_pillow
+    def test_the_extensions_own_format_is_tried_first(self):
+        import tempfile
+
+        from PIL import Image
+
+        tried = []
+        real_open = Image.open
+
+        def _recording_open(fp, mode="r", formats=None):
+            tried.append(formats)
+            return real_open(fp, mode, formats)
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a.png", "b.webp", "c.jpeg"):
+                Image.new("RGB", (4, 3)).save(f"{d}/{name}")
+            with mock.patch.object(Image, "open", _recording_open):
+                for name in ("a.png", "b.webp", "c.jpeg"):
+                    S._open_image(f"{d}/{name}").close()
+        self.assertEqual([f[0] for f in tried], ["PNG", "WEBP", "JPEG"])
+        for formats in tried:
+            self.assertEqual(set(formats) - {"JPEG", "PNG", "WEBP", "HEIF"}, set())
+
+    @_needs_pillow
+    def test_an_extension_pm_does_not_route_here_opens_as_nothing(self):
+        # Rust only sends PHOTO_EXTS, but the fallback for an unknown extension must be "refuse",
+        # never `formats=None` — which is Pillow's "try every format it knows".
+        import tempfile
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/scan.tif"
+            Image.new("RGB", (20, 10)).save(path)
+            with self.assertRaises(ValueError):
+                S._open_image(path)
+
+    @_needs_pillow
+    @unittest.skipIf(
+        importlib.util.find_spec("pi_heif") is not None,
+        "pi-heif installed (this pins the venv without the OCR component)",
+    )
+    def test_a_heic_without_pi_heif_is_tried_as_the_other_photo_formats(self):
+        # Pillow raises a bare KeyError when asked for a format nobody registered, so HEIF is left
+        # out of the list without pi-heif. A JPEG saved as .heic still reads; a TIFF or a GIF saved
+        # as .heic matches none of the photo formats and is refused, never a KeyError.
+        import tempfile
+
+        from PIL import Image, UnidentifiedImageError
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/photo.heic"
+            Image.new("RGB", (20, 10), (200, 100, 50)).save(path, format="JPEG")
+            with S._open_image(path) as img:
+                self.assertEqual(img.format, "JPEG")
+            out = S.do_analyze_image({"path": path, "run_ocr": False})
+            self.assertEqual((out["width"], out["height"]), (20, 10))
+            for fmt in ("TIFF", "GIF"):
+                other = f"{d}/{fmt.lower()}.heic"
+                Image.new("RGB", (20, 10)).save(other, format=fmt)
+                with self.assertRaises(UnidentifiedImageError):
+                    S._open_image(other)
+
+    @_needs_pillow
+    def test_a_real_png_and_jpeg_still_read(self):
+        import tempfile
+
+        from PIL import Image
+
+        # As bytes: PNG's writer drops an Exif whose tags are all in sub-IFDs (the object is falsy).
+        exif = _exif_with_date_and_place().tobytes()
+        for name, fmt in (("shot.jpg", "JPEG"), ("SHOT.JPEG", "JPEG"), ("shot.png", "PNG")):
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                path = f"{d}/{name}"
+                Image.new("RGB", (40, 30), (10, 20, 30)).save(path, format=fmt, exif=exif)
+                out = S.do_analyze_image({"path": path, "run_ocr": False})
+                self.assertEqual((out["width"], out["height"]), (40, 30))
+                self.assertEqual(out["capture_date"], "2023-01-02")
+                self.assertAlmostEqual(out["lat"], 55.95, places=4)
+                self.assertAlmostEqual(out["lon"], -3.19, places=4)
+
+    @_needs_pillow
+    def test_a_multi_picture_jpeg_still_reads(self):
+        # MPO is not in the allow-list (Pillow has no opener for it to name); it arrives through
+        # JPEG's, which hands a multi-picture file over by itself. Some cameras write these as .jpg.
+        import tempfile
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/stereo.jpg"
+            left, right = Image.new("RGB", (32, 24), "red"), Image.new("RGB", (32, 24), "blue")
+            left.save(path, format="MPO", save_all=True, append_images=[right])
+            with S._open_image(path) as img:
+                self.assertEqual(img.format, "MPO")
+            out = S.do_analyze_image({"path": path, "run_ocr": False})
+        self.assertEqual((out["width"], out["height"]), (32, 24))
+
+    @_needs_pillow
+    def test_ocr_is_not_attempted_on_an_image_pm_could_not_open(self):
+        # The old fallback handed rapidocr the PATH when PM's own open failed, and rapidocr opens a
+        # path with a bare `Image.open` — every decoder, the allow-list undone one call later.
+        import tempfile
+
+        from PIL import Image
+
+        engine = _RecordingOcrEngine()
+        asked = []
+
+        def _engine():
+            asked.append(True)
+            return engine
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/receipt.jpg"
+            Image.new("RGB", (20, 10)).save(path, format="TIFF")
+            with mock.patch.object(S, "get_ocr_engine", _engine):
+                out = S.do_analyze_image({"path": path, "run_ocr": True})
+        self.assertEqual(asked, [], "the OCR engine was not even loaded")
+        self.assertEqual(engine.targets, [])
+        self.assertEqual(out["ocr_ran"], False)
+        self.assertEqual(out["ocr_text"], "")
+        self.assertIsNone(out["width"])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("PIL") is not None
+        and importlib.util.find_spec("numpy") is not None,
+        "Pillow/numpy not installed (image decode is a local-only check)",
+    )
+    def test_ocr_reads_the_pixels_pm_opened(self):
+        import tempfile
+
+        import numpy as np
+        from PIL import Image
+
+        engine = _RecordingOcrEngine()
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/receipt.png"
+            Image.new("RGB", (40, 30), (255, 255, 255)).save(path)
+            with mock.patch.object(S, "get_ocr_engine", lambda: engine):
+                out = S.do_analyze_image({"path": path, "run_ocr": True})
+        self.assertEqual(out["ocr_ran"], True)
+        self.assertEqual(out["ocr_text"], "TOTAL 12.50")
+        (target,) = engine.targets
+        self.assertIsInstance(target, np.ndarray, "pixels, never a path rapidocr would open itself")
+        self.assertEqual(target.shape, (30, 40, 3))
+
+    @staticmethod
+    def _half_a_jpeg(d):
+        """A JPEG cut off halfway, as an interrupted download or a half-synced folder leaves one:
+        the header (size, EXIF) is whole, the pixels are not. Noise, so the cut lands in the scan
+        data."""
+        from PIL import Image
+
+        path = f"{d}/receipt.jpg"
+        noise = Image.frombytes("RGB", (160, 120), os.urandom(160 * 120 * 3))
+        noise.save(path, format="JPEG", exif=_exif_with_date_and_place().tobytes())
+        with open(path, "rb") as f:
+            whole = f.read()
+        with open(path, "wb") as f:
+            f.write(whole[: len(whole) // 2])
+        return path
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("PIL") is not None
+        and importlib.util.find_spec("numpy") is not None,
+        "Pillow/numpy not installed (image decode is a local-only check)",
+    )
+    def test_a_truncated_photo_is_the_files_fault_not_ocrs(self):
+        # Opening reads only the header, so this used to come back WITH a size and fail inside the
+        # OCR call instead, as ocr_ran=false: the row then blamed text recognition, a component that
+        # works. No size is what Rust reports as "could not open"; the header's EXIF is still true.
+        import tempfile
+
+        engine = _RecordingOcrEngine()
+        asked = []
+
+        def _engine():
+            asked.append(True)
+            return engine
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._half_a_jpeg(d)
+            with S._open_image(path) as img:
+                self.assertEqual(img.size, (160, 120), "the fixture's header is whole")
+            with mock.patch.object(S, "get_ocr_engine", _engine):
+                out = S.do_analyze_image({"path": path, "run_ocr": True})
+        self.assertIsNone(out["width"], "no size: Rust reads that as 'could not open'")
+        self.assertIsNone(out["height"])
+        self.assertEqual(out["ocr_ran"], False)
+        self.assertEqual(asked, [], "a file that will not decode never loads the OCR engine")
+        self.assertEqual(out["capture_date"], "2023-01-02", "the header's EXIF is kept")
+        self.assertAlmostEqual(out["lat"], 55.95, places=4)
+
+    @_needs_pillow
+    def test_a_truncated_photo_with_ocr_off_reads_its_header_as_before(self):
+        # With OCR off nothing needs the pixels, so nothing decodes them: the size and EXIF in the
+        # header are what PM read before, and no new note appears on the row.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            out = S.do_analyze_image({"path": self._half_a_jpeg(d), "run_ocr": False})
+        self.assertEqual((out["width"], out["height"]), (160, 120))
+        self.assertEqual(out["capture_date"], "2023-01-02")
+        self.assertEqual(out["ocr_ran"], False)
 
     @unittest.skipUnless(
         importlib.util.find_spec("PIL") is not None,
@@ -284,6 +603,26 @@ class AnalyzeImageTest(unittest.TestCase):
         self.assertIsNone(out["capture_date"])
         self.assertIsNone(out["lat"])
 
+    @_needs_pillow
+    def test_the_photo_is_closed_when_analysis_returns(self):
+        # With OCR off nothing reads the pixels, and Pillow holds the file open until something
+        # does, so every photo's handle lingered until garbage collection.
+        import gc
+        import tempfile
+        import warnings
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/shot.jpg"
+            Image.new("RGB", (8, 6)).save(path)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                S.do_analyze_image({"path": path, "run_ocr": False})
+                gc.collect()
+        leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(leaks, [], "the photo's file was left open")
+
     def test_analyze_image_unreadable_path_is_null_not_crash(self):
         out = S.do_analyze_image({"path": "/no/such/image.png", "run_ocr": False})
         self.assertEqual(out["ocr_ran"], False)
@@ -291,12 +630,15 @@ class AnalyzeImageTest(unittest.TestCase):
         self.assertIsNone(out["capture_date"])
 
     @unittest.skipUnless(
-        importlib.util.find_spec("PIL") is not None,
-        "Pillow not installed (image decode is a local-only check)",
+        importlib.util.find_spec("PIL") is not None
+        and importlib.util.find_spec("numpy") is not None,
+        "Pillow/numpy not installed (image decode is a local-only check)",
     )
     def test_broken_ocr_degrades_to_exif_only(self):
         # F-56: if the OCR component is broken/offline (engine load or call raises), photo ingest
-        # must still return dimensions/EXIF with ocr_ran=false, not fail the whole file.
+        # must still return dimensions/EXIF with ocr_ran=false, not fail the whole file. The pixels
+        # are decoded (into a numpy array) before the engine is asked for, so numpy is needed to
+        # reach the engine at all; every venv has it (fastembed and rapidocr both depend on it).
         import tempfile
 
         from PIL import Image
@@ -321,9 +663,13 @@ class AnalyzeImageTest(unittest.TestCase):
         def _cold():
             raise S.ModelNotCached("rapidocr models are not downloaded yet")
 
-        with mock.patch.object(S, "get_ocr_engine", _cold):
-            with self.assertRaises(S.ModelNotCached):
-                S.do_analyze_image({"path": "/no/such/image.png", "run_ocr": True})
+        # OCR only runs on an image PM opened and decoded, so stand both in (no Pillow or numpy
+        # needed for that).
+        with mock.patch.object(S, "_open_image", lambda _path: _FakeOpenedImage()):
+            with mock.patch.object(S, "_decode_pixels", lambda _img: object()):
+                with mock.patch.object(S, "get_ocr_engine", _cold):
+                    with self.assertRaises(S.ModelNotCached):
+                        S.do_analyze_image({"path": "/no/such/image.png", "run_ocr": True})
 
 
 def _fake_rapidocr(captured, model_file="/pm/models/rapidocr/det.onnx", lazy=True):

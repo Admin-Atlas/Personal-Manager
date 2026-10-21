@@ -16,6 +16,8 @@
 // What it proves:
 //   * every lock is stamped for the CURRENT sidecar/requirements.txt, requirements-optional.txt
 //     and (for the optional components) the current base lock;
+//   * the base lock was resolved WITH the current sidecar/requirements-override.txt, and that file
+//     only overrides packages requirements.txt pins at the same version;
 //   * the resolution targets the MIN_PYTHON floor Rust actually enforces;
 //   * every entry is pinned with `==` — no range can slip in;
 //   * every entry carries at least one sha256, so `--require-hashes` has something to check;
@@ -32,6 +34,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SIDECAR_RS = "src-tauri/src/sidecar.rs";
 const BASE_INPUT = "sidecar/requirements.txt";
+const BASE_OVERRIDE = "sidecar/requirements-override.txt";
 const BASE_LOCK = "sidecar/requirements.lock";
 const OPTIONAL_INPUT = "sidecar/requirements-optional.txt";
 
@@ -81,14 +84,57 @@ export function parseHeader(text) {
   const rawConstraint = stamp("constraint");
   const constraint = rawConstraint ? source(rawConstraint) : null;
   if (rawConstraint && !constraint) problems.push("malformed `# pm-constraint:` stamp");
+  const rawOverride = stamp("override");
+  const override = rawOverride ? source(rawOverride) : null;
+  if (rawOverride && !override) problems.push("malformed `# pm-override:` stamp");
   const rawPins = stamp("pins");
   return {
     floor: stamp("python-floor"),
     input,
     constraint,
+    override,
     pins: rawPins ? rawPins.split(/\s+/).filter(Boolean) : null,
     problems,
   };
+}
+
+/**
+ * The base lock's override file: stamped, and narrow. Each line of it REPLACES every requirement on
+ * that package in the resolution, a dependency's declared bounds included — that is its whole job
+ * (fastembed's `pillow<13`). So a base lock resolved without it must fail, and the file may only
+ * name packages requirements.txt pins at the same version: a range, or a package nobody pins by
+ * name, would be a silent hole in bounds that nobody reviews.
+ */
+export function overrideProblems({ header, overrideText, requirementsText }) {
+  const problems = [];
+  if (!header.override) {
+    problems.push(
+      `no \`# pm-override:\` stamp — this lock was resolved without ${BASE_OVERRIDE}; run \`just lock-regen\``,
+    );
+  } else if (header.override.path !== BASE_OVERRIDE) {
+    problems.push(
+      `\`# pm-override:\` names ${header.override.path}, but the base lock's override is ${BASE_OVERRIDE}`,
+    );
+  }
+  const pinned = new Map(
+    parseRequirements(requirementsText).map((p) => [normalise(p.name), p.version]),
+  );
+  for (const line of overrideText.replace(/\r\n/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const [pin] = parseRequirements(trimmed);
+    if (!pin) {
+      problems.push(
+        `${BASE_OVERRIDE}: \`${trimmed}\` is not an exact \`==\` pin — an override may only pin`,
+      );
+    } else if (pinned.get(normalise(pin.name)) !== pin.version) {
+      problems.push(
+        `${BASE_OVERRIDE}: \`${pin.raw}\` is not pinned at ${pin.version} in ${BASE_INPUT} — an override ` +
+          `lifts every declared bound on a package, so it may only name one PM pins at that version`,
+      );
+    }
+  }
+  return problems;
 }
 
 /** Every pinned entry in a lock, with the hashes attached to it. */
@@ -162,7 +208,7 @@ export function problemsForLock({ path, text, floor, inputs, expectedPins }) {
     );
   }
 
-  for (const key of ["input", "constraint"]) {
+  for (const key of ["input", "constraint", "override"]) {
     const stamped = header[key];
     if (!stamped) continue;
     const actual = inputs[stamped.path];
@@ -226,14 +272,16 @@ export function problemsForLock({ path, text, floor, inputs, expectedPins }) {
   return problems;
 }
 
-export function scan(root) {
-  const read = (rel) => readFileSync(join(root, rel), "utf8");
+/** `read` is injectable so a test can run the whole scan over the real tree with one file altered. */
+export function scan(root, read = (rel) => readFileSync(join(root, rel), "utf8")) {
   const { floor, pins } = readRustFacts(read(SIDECAR_RS));
   const baseInput = read(BASE_INPUT);
+  const baseOverride = read(BASE_OVERRIDE);
   const optionalInput = read(OPTIONAL_INPUT);
   const baseLock = read(BASE_LOCK);
   const inputs = {
     [BASE_INPUT]: baseInput,
+    [BASE_OVERRIDE]: baseOverride,
     [OPTIONAL_INPUT]: optionalInput,
     [BASE_LOCK]: baseLock,
   };
@@ -251,6 +299,14 @@ export function scan(root) {
       floor,
       inputs,
       expectedPins: parseRequirements(baseInput),
+    }),
+  );
+  record(
+    BASE_LOCK,
+    overrideProblems({
+      header: parseHeader(baseLock),
+      overrideText: baseOverride,
+      requirementsText: baseInput,
     }),
   );
 
