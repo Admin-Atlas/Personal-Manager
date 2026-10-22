@@ -86,6 +86,29 @@ pub fn edit_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
     }
 }
 
+/// Why PM may not create an event with `visibility` on a calendar, or `None` when it may: the account
+/// and calendar rules of [`edit_rights`], for an event that would be a solo one-off you organise.
+/// Q1: a `writerWithoutPrivateAccess` calendar takes every event but a private one. `google` holds
+/// already: the caller resolved the calendar, and a feed or an Outlook calendar never gets here.
+pub fn create_block(
+    editing: EditingStatus,
+    access_role: Option<&str>,
+    visibility: Option<&str>,
+) -> Option<ReadOnlyReason> {
+    blanket_reason(&EditFacts {
+        google: true,
+        editing,
+        access_role,
+        event_type: None,
+        organizer_self: true,
+        locked: false,
+        visibility,
+        series_master: false,
+        has_guests: false,
+        html_description: false,
+    })
+}
+
 /// The reason nothing at all may change, checked account first, then calendar, then the event
 /// itself; the first one found is the one shown.
 fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
@@ -337,6 +360,58 @@ mod tests {
                 ..editable()
             };
             assert_eq!(edit_block(&facts), None, "{visibility:?}");
+        }
+    }
+
+    /// Who may create where (C10): the account's editing first, then the calendar's role, with Q1's
+    /// one exception for a private event on a calendar that can't hold one.
+    #[test]
+    fn create_block_follows_q1() {
+        let on = EditingStatus::On;
+        let cases = [
+            (on, Some("owner"), None, None),
+            (on, Some("owner"), Some("private"), None),
+            (on, Some("writer"), Some("confidential"), None),
+            (on, Some("writerWithoutPrivateAccess"), None, None),
+            (
+                on,
+                Some("writerWithoutPrivateAccess"),
+                Some("default"),
+                None,
+            ),
+            (on, Some("writerWithoutPrivateAccess"), Some("public"), None),
+            (
+                on,
+                Some("writerWithoutPrivateAccess"),
+                Some("private"),
+                Some(PrivateEvent),
+            ),
+            (
+                on,
+                Some("writerWithoutPrivateAccess"),
+                Some("confidential"),
+                Some(PrivateEvent),
+            ),
+            (on, Some("reader"), None, Some(CalendarReadOnly)),
+            (on, Some("freeBusyReader"), None, Some(CalendarReadOnly)),
+            (on, None, None, Some(CalendarReadOnly)),
+            (on, Some("someNewRole"), None, Some(CalendarReadOnly)),
+            // Editing comes before the role: an account that can't write says so first.
+            (EditingStatus::Paused, Some("owner"), None, Some(EditingOff)),
+            (
+                EditingStatus::NeedsConsent,
+                Some("owner"),
+                None,
+                Some(EditingOff),
+            ),
+            (EditingStatus::Off, Some("reader"), None, Some(EditingOff)),
+        ];
+        for (editing, role, visibility, want) in cases {
+            assert_eq!(
+                create_block(editing, role, visibility),
+                want,
+                "{editing:?} {role:?} {visibility:?}"
+            );
         }
     }
 

@@ -947,6 +947,9 @@ export interface CalendarOverview {
   mirror_end: string;
   /** Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`). */
   editing: Record<string, EditingStatus>;
+  /** Google's default length for a new event, in minutes, keyed by account id like `editing`. An
+   *  account missing here has none stored yet: a new event then lasts an hour. */
+  default_length: Record<string, number>;
 }
 
 /** Calendar editing for one Google account (`calendar_editing::EditingStatus`). `paused` is the
@@ -1579,6 +1582,17 @@ export interface EventPatchDraft {
   visibility?: EventVisibility | null;
 }
 
+/** A new event, for creating an event: every field as the editor holds it (empty text is left out
+ *  of what goes to Google). No repeat, guests, reminders or colour yet. */
+export interface NewEventDraft {
+  summary: string;
+  time: TimeDraft;
+  location: string;
+  description: string;
+  show_as: ShowAs;
+  visibility: EventVisibility;
+}
+
 /** What the user saw of an event when they chose to delete it, from the row they clicked. */
 export interface SeenSummary {
   summary: string;
@@ -1689,7 +1703,9 @@ export type SeriesChoices =
 /** Which occurrences of a repeating event a save or delete is for. */
 export type SeriesScope = "this" | "following" | "all";
 
-export type WriteWarning = "mirror_refresh_pending" | "left_on_old_series";
+/** `outside_mirror`: a new event saved in Google that starts outside the months PM mirrors, so
+ *  PM's calendar won't show it. */
+export type WriteWarning = "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror";
 
 /** What a save came to. `saved` and `no_change` are the successes. */
 export type WriteOutcome =
@@ -1715,6 +1731,10 @@ export type WriteOutcome =
   | { outcome: "reauth" }
   /** The answer never arrived and PM couldn't look afterwards: it may or may not have happened. */
   | { outcome: "unconfirmed" }
+  /** A new event whose answer never arrived: creating it again with `retry_token` looks for it
+   *  first and sends it again, under the same id, only if Google still doesn't show it, so a
+   *  second copy is very unlikely. PM's own token, never the event's id. */
+  | { outcome: "ambiguous"; retry_token: string }
   | { outcome: "failed"; message: string };
 
 /** A delete still waiting out its Undo window, for a webview that reloaded. */

@@ -83,6 +83,7 @@ describe("edit reasons", () => {
       { outcome: "busy" },
       { outcome: "reauth" },
       { outcome: "unconfirmed" },
+      { outcome: "ambiguous", retry_token: "ref-1" },
       { outcome: "failed", message: "Google didn't accept the change: Invalid start" },
     ];
     for (const o of outcomes) {
@@ -184,6 +185,19 @@ describe("edit reasons", () => {
     );
   });
 
+  it("ambiguous has words", () => {
+    // A new event whose answer never arrived: it may be there, and Check again looks before it
+    // sends. Never "wasn't created", never a promise that no second copy can be made (Google can't
+    // always catch a repeated id), and never the token in the words.
+    const said = outcomeText({ outcome: "ambiguous", retry_token: "ref-1" });
+    expect(said).toEqual({
+      tone: "warn",
+      text: "PM lost touch with Google while creating this event, so it may already be in your calendar. Check again: PM looks for it first and sends it again only if Google still doesn't show it.",
+    });
+    expect(said.text).not.toContain("ref-1");
+    expect(settleText({ outcome: "ambiguous", retry_token: "ref-1" }, "Dentist").tone).toBe("warn");
+  });
+
   it("explains an editor that couldn't open, and a draft that can't be saved", () => {
     // A 404 can also mean the calendar stopped being visible, so "gone" doesn't claim a deletion.
     expect(loadText({ outcome: "gone" })).toBe(
@@ -204,7 +218,7 @@ const saved = (warnings: WriteWarning[], left_behind?: string[]) =>
 
 describe("a write's warnings", () => {
   it("words every warning, for a save and for a delete", () => {
-    const all: WriteWarning[] = ["mirror_refresh_pending", "left_on_old_series"];
+    const all: WriteWarning[] = ["mirror_refresh_pending", "left_on_old_series", "outside_mirror"];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
         expect(writeWarningText(w, kind)).toMatch(/^[A-Z].*\.$/);

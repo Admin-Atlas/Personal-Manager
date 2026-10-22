@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.149.1-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Under the hood, PM can now create events on your Google calendars. If PM loses touch with Google while saving a new event, it looks for it there before sending it again, so a dropped connection is very unlikely to make a second copy. Nothing you can see changes yet: the way to create events in the app comes in a later update.",
+    ],
+  },
+  {
     version: "3.149.0-alpha",
     date: "2026-10-19",
     highlights: [

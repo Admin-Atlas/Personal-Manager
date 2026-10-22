@@ -70,7 +70,7 @@ use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 use super::super::dto::{EventPatchDraft, Notify, ReadOnlyReason, SeenSummary};
 use super::super::patch::{
     build_patch, delete_still_matches, description_is_html, drop_other_kind, is_gone, update_check,
-    when_eq,
+    when_eq, CREATABLE,
 };
 use super::super::patch::{DeleteCheck, UpdateCheck};
 use super::super::plan::{
@@ -204,9 +204,10 @@ pub enum Stage {
 /// The request a step sends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    /// A new series under PM's own id, minted for this plan and kept for every retry of it:
-    /// re-sending the same id can't make a second series, and a 409 means it's there (DS5). A new
-    /// plan gets a new id.
+    /// A new event under PM's own id, minted for this plan and kept for every retry of it:
+    /// re-sending the same id normally can't make a second one (Google warns it can't always
+    /// catch a repeated id, so the sends stay few), and a 409 means it's there (DS5). A new plan
+    /// gets a new id. A split's new series, or a new event ([`SeriesPlan::create`]).
     Insert {
         calendar: String,
         id: String,
@@ -392,6 +393,11 @@ pub enum Shows {
     /// GET that finds this mean it landed; a tail another plan left under a reused id reads as
     /// unknown, never as this one (C8b fix review). Its absence once proves nothing (DS5).
     Tail { of: String, plan: String },
+    /// There at all, under PM's own id: a new event (C10). The id is 128 random bits, so a live copy
+    /// under it is this create's, whatever has been changed on it since, and a cancelled one is this
+    /// create's too, deleted in Google since: proof it isn't there to land (C10 critique 1 L11). None
+    /// proves nothing on its own (DS5).
+    Created,
 }
 
 /// The compensation for a step, sent with the step's own `notify`, on the etag of the step's reply.
@@ -684,6 +690,10 @@ impl SeriesPlan {
                 Applied::Yes
             }
             (Shows::Tail { .. }, _) => Applied::Unknown,
+            (Shows::Created, Some(v)) if !is_gone(v) => Applied::Yes,
+            // Made, then deleted in Google: the run reads it as gone ([`super::run`]).
+            (Shows::Created, Some(_)) => Applied::No,
+            (Shows::Created, None) => Applied::Unknown,
             (Shows::Fields { .. }, None) if step.gone_is_done => Applied::Yes,
             // The event itself is gone: whatever was sent can't be there.
             (Shows::Fields { .. }, None) => Applied::No,
@@ -1426,6 +1436,43 @@ fn draft_fields(draft: &EventPatchDraft) -> Vec<(&'static str, Value)> {
         out.push(("visibility", Value::from(v.as_param())));
     }
     out
+}
+
+impl SeriesPlan {
+    /// One new event under `id`, PM's own (`plan::client_event_id`), for creating an event (C10):
+    /// the insert step and nothing else, so a lost answer gets the A9 handling every insert gets
+    /// (look, wait, look, post again once under the same id; a 409 means look). `None` when the body
+    /// holds a key a create may not send (G5), the id isn't one path segment, or the body has no
+    /// start PM can read (never an invented one).
+    pub fn create(calendar: &str, id: &str, body: Map<String, Value>) -> Option<SeriesPlan> {
+        if body.keys().any(|k| !CREATABLE.contains(&k.as_str())) || !is_plain_segment(id) {
+            return None;
+        }
+        let start = body.get("start").and_then(start_of)?;
+        Some(SeriesPlan {
+            scope: Scope::All,
+            steps: vec![Step {
+                op: Op::Insert {
+                    calendar: calendar.into(),
+                    id: id.into(),
+                    body,
+                },
+                // R7: a new event has no guests (C12), so nobody is emailed.
+                notify: Notify::None,
+                stage: Stage::Commit,
+                requires: None,
+                conflict: Recheck::Never,
+                shows: Shows::Created,
+                gone_is_done: false,
+                undo: None,
+            }],
+            warnings: Vec::new(),
+            expect: Vec::new(),
+            removes: Removes::Nothing,
+            start,
+            guests_allowed: false,
+        })
+    }
 }
 
 /// An empty plan, for comparing values the way a plan does.
@@ -3948,5 +3995,96 @@ mod tests {
                 .new_rule(&weekly_rule),
             None
         );
+    }
+
+    // --- creating an event (C10) ---
+
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
+
+    /// What the editor sends for a new event, as the create command builds it.
+    fn new_body() -> Map<String, Value> {
+        super::super::super::patch::insert_body(&crate::calendar_write::dto::NewEventDraft {
+            summary: "Dentist".into(),
+            time: TimeDraft::Timed {
+                start_date: "2026-10-26".into(),
+                start_time: "10:00".into(),
+                start_zone: "Europe/London".into(),
+                end_date: "2026-10-26".into(),
+                end_time: "11:00".into(),
+                end_zone: "Europe/London".into(),
+            },
+            location: String::new(),
+            description: String::new(),
+            show_as: Some(ShowAs::Busy),
+            visibility: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_create_plan_is_one_commit_step_under_pms_id_with_no_one_notified() {
+        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        let step = &plan.steps[0];
+        assert!(matches!(&step.op, Op::Insert { calendar, id, body }
+            if calendar == CALENDAR && id == NEW && *body == new_body()));
+        assert_eq!(step.notify, Notify::None);
+        assert_eq!(step.stage, Stage::Commit);
+        assert!(step.requires.is_none() && step.undo.is_none() && !step.gone_is_done);
+        assert_eq!(step.conflict, Recheck::Never);
+        assert_eq!(step.shows, Shows::Created);
+        assert!(step.op.fits());
+        let request = step.op.request(step.notify).unwrap();
+        assert_eq!(request.method, Method::Insert);
+        assert!(request
+            .url
+            .ends_with("/events?sendUpdates=none&conferenceDataVersion=1"));
+        assert_eq!(request.body.unwrap()["id"], NEW);
+        assert!(plan.expect.is_empty() && plan.warnings.is_empty());
+        assert_eq!(plan.removes, Removes::Nothing);
+    }
+
+    /// G5: a key a create may not send, a body with no start PM can read, or an id that isn't one
+    /// path segment builds no plan at all.
+    #[test]
+    fn a_create_plan_refuses_a_key_a_create_may_not_send() {
+        for key in [
+            "attendees",
+            "recurrence",
+            "extendedProperties",
+            "reminders",
+            "conferenceData",
+            "colorId",
+            "id",
+        ] {
+            let mut body = new_body();
+            body.insert(key.into(), json!([]));
+            assert!(SeriesPlan::create(CALENDAR, NEW, body).is_none(), "{key}");
+        }
+        let mut no_start = new_body();
+        no_start.insert("start".into(), json!({ "dateTime": "soon" }));
+        assert!(SeriesPlan::create(CALENDAR, NEW, no_start).is_none());
+        for id in ["", "..", "a\nb"] {
+            assert!(
+                SeriesPlan::create(CALENDAR, id, new_body()).is_none(),
+                "{id:?}"
+            );
+        }
+    }
+
+    /// A live copy under PM's id is this create's, renamed or not; a cancelled one is this create's,
+    /// deleted since; none proves nothing.
+    #[test]
+    fn created_reads_a_live_copy_as_landed_a_cancelled_one_as_not_and_none_as_unknown() {
+        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        let mut copy = Value::Object(new_body());
+        copy["id"] = json!(NEW);
+        copy["status"] = json!("confirmed");
+        assert_eq!(plan.verdict(0, Some(&copy)), Applied::Yes);
+        let renamed = with(copy.clone(), "summary", json!("Dentist (moved)"));
+        assert_eq!(plan.verdict(0, Some(&renamed)), Applied::Yes);
+        let cancelled = with(copy, "status", json!("cancelled"));
+        assert_eq!(plan.verdict(0, Some(&cancelled)), Applied::No);
+        assert_eq!(plan.verdict(0, None), Applied::Unknown);
     }
 }

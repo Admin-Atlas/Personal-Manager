@@ -67,6 +67,9 @@ pub struct CalendarOverview {
     /// Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`).
     /// Computed here only, from the stored choice and the account's calendar token.
     pub editing: BTreeMap<String, EditingStatus>,
+    /// Google's default length for a new event, in minutes, keyed by account id (`gcal:<email>`)
+    /// like `editing`. An account with none stored is missing: the editor then uses an hour.
+    pub default_length: BTreeMap<String, u32>,
 }
 
 /// The unified calendar state across every provider. Runs the one-time legacy Google migration first
@@ -75,7 +78,7 @@ pub struct CalendarOverview {
 pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     let _ = migrate_legacy_google_calendar(&app).await;
     let state = app.state::<AppState>();
-    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices) = {
+    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices, lengths) = {
         let conn = state.conn()?;
         (
             calendar::list_sources(&conn, None)?,
@@ -83,8 +86,17 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
             calendar::last_sync(&conn)?,
             calendar::time_window(&conn)?,
             calendar_editing::choices(&conn)?,
+            calendar::default_lengths(&conn)?,
         )
     };
+    let default_length = accounts
+        .iter()
+        .filter(|a| a.provider == "google")
+        .filter_map(|a| {
+            let email = a.email.as_deref()?.trim().to_lowercase();
+            Some((a.id.clone(), *lengths.get(&email)?))
+        })
+        .collect();
     // Token scopes come from the keychain, read with the DB lock released. Only an account with a
     // stored choice needs one: without it, editing is off whatever the token holds.
     let editing = accounts
@@ -112,6 +124,7 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         mirror_start,
         mirror_end,
         editing,
+        default_length,
     })
 }
 
@@ -279,6 +292,7 @@ pub async fn disconnect_google_calendar_account(
     }
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
     calendar_editing::set_choice(&conn, &email, None)?;
+    calendar::set_default_length(&conn, &email, None)?;
     // A grant Google keeps still carries the write scope if editing was ever granted; a revoke ends it.
     let calendar_write = !plan.revoke && calendar_editing::write_granted(&conn, &email)?;
     if plan.revoke {
@@ -650,6 +664,7 @@ pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     calendar_editing::clear_all(&conn)?;
+    calendar::clear_default_lengths(&conn)?;
     drive::forget_all_accounts(&conn)?;
     // A backup-only account has no Drive row, so the loop above never saw its sign-in. Clear it before
     // the destination below forgets which account it was.
