@@ -1598,6 +1598,24 @@ export type TimeDraft =
     }
   | { kind: "all_day"; first_day: string; last_day: string };
 
+/** What the user saw of an event's time when they dragged it: the mirror row's start, end and kind,
+ *  exactly as the mirror holds them (a date for an all-day event, else a UTC `…Z` instant). A move
+ *  changes only times, so only times decide whether a version Google changed since may still be
+ *  moved. Added ahead of the backend's own (C15; the backend gains it with moving, C16a). */
+export interface SeenTimes {
+  start: string;
+  end: string | null;
+  all_day: boolean;
+}
+
+/** Where a drag put an event, in this computer's wall time: dates `YYYY-MM-DD`, times `HH:MM`, and
+ *  `last_day` the last day covered (inclusive), as `TimeDraft` holds them. The backend says it again
+ *  in the event's own zone, so moving an event never changes which zone it is in (C15; the backend
+ *  gains it with moving, C16a). */
+export type MoveTo =
+  | { kind: "timed"; start_date: string; start_time: string; end_date: string; end_time: string }
+  | { kind: "all_day"; first_day: string; last_day: string };
+
 /** The fields the user touched. Omitted or null means untouched; `""` clears location/description. */
 export interface EventPatchDraft {
   summary?: string | null;
