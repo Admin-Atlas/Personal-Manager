@@ -47,7 +47,9 @@ const updateCalendarEvent =
 const seriesChoices = vi.fn<(request: ChoiceRequest) => Promise<SeriesChoices>>();
 const settleSeriesSplit = vi.fn<(token: string, action: SplitAction) => Promise<WriteOutcome>>();
 const createCalendarEvent =
-  vi.fn<(calendarId: string, draft: NewEventDraft, token: Scope) => Promise<WriteOutcome>>();
+  vi.fn<
+    (calendarId: string, draft: NewEventDraft, token: Scope, ...told: Told) => Promise<WriteOutcome>
+  >();
 const writeLastCreate = vi.fn<(calendarId: string) => void>();
 const getSeriesSummary = vi.fn<(eventId: string) => Promise<string | null>>();
 const setMilestoneEvent =
@@ -63,7 +65,7 @@ vi.mock("../../../lib/calendarPrefs", async (importOriginal) => ({
 
 vi.mock("../../../lib/ipc", () => ({
   // Every argument passes through, so an extra one, or a dropped token, shows in the calls.
-  createCalendarEvent: (...a: [string, NewEventDraft, Scope]) => createCalendarEvent(...a),
+  createCalendarEvent: (...a: [string, NewEventDraft, Scope, ...Told]) => createCalendarEvent(...a),
   getSeriesSummary: (eventId: string) => getSeriesSummary(eventId),
   setMilestoneEvent: (id: number, uid: string | null, date: string | null, only: string | null) =>
     setMilestoneEvent(id, uid, date, only),
@@ -1263,6 +1265,9 @@ const draft: NewEventDraft = {
   show_as: "busy",
   visibility: "default",
   recurrence: null,
+  guests: [],
+  reminders: null,
+  colour: null,
 };
 const sent = { calendarId: CAL, draft };
 const shown = { name: "Me", hidden: false };
@@ -1271,17 +1276,45 @@ const savedOutcome = (warnings: WriteWarning[] = []): WriteOutcome => ({
   warnings,
   left_behind: [],
 });
+/** One guest new to the event, invited. */
+const ONE_INVITED: GuestNotice = {
+  updated: 0,
+  invited: 1,
+  removed: 0,
+  told_cancelled: 0,
+  cancelled: false,
+  people: 1,
+  emails: 1,
+  complete: true,
+};
 
 describe("creating an event", () => {
-  it("createEvent passes the calendar id, the draft and the token only", async () => {
+  // C12d: and the Send or Don't send for its guests, with the numbers it was given for; none
+  // without one.
+  it("createEvent passes the calendar id, the draft, the token and the answer", async () => {
     const { mod } = await load();
     createCalendarEvent.mockResolvedValue(savedOutcome());
     await mod.createEvent(CAL, draft, null);
     await mod.createEvent(CAL, draft, "ref-1");
+    await mod.createEvent(CAL, draft, null, { notify: "all", asked: ONE_INVITED });
     expect(createCalendarEvent.mock.calls).toEqual([
-      [CAL, draft, null],
-      [CAL, draft, "ref-1"],
+      [CAL, draft, null, null, null],
+      [CAL, draft, "ref-1", null, null],
+      [CAL, draft, null, "all", ONE_INVITED],
     ]);
+  });
+
+  // The held create keeps its answer: Check again sends it with the draft (C12d).
+  it("Check again sends the answer a new event with guests was sent with", async () => {
+    const { mod, hook, act } = await load();
+    const answered = { ...sent, answer: { notify: "none" as const, asked: ONE_INVITED } };
+    act(() => mod.noteHeldCreate(answered, "ref-1"));
+    const id = hook.result.current.notices[0].id;
+    createCalendarEvent.mockResolvedValue(savedOutcome());
+    await act(async () => {
+      await mod.checkCreate(id, () => shown);
+    });
+    expect(createCalendarEvent.mock.calls).toEqual([[CAL, draft, "ref-1", "none", ONE_INVITED]]);
   });
 
   it("notes each way a create can end, and remembers the calendar only when it's made", async () => {
@@ -1368,7 +1401,8 @@ describe("creating an event", () => {
     await act(async () => {
       await mod.checkCreate(id, whereOf);
     });
-    expect(createCalendarEvent.mock.calls).toEqual([[CAL, draft, "ref-1"]]);
+    // No guests, no answer (C12d).
+    expect(createCalendarEvent.mock.calls).toEqual([[CAL, draft, "ref-1", null, null]]);
     await act(async () => {
       answer(savedOutcome());
       await first;

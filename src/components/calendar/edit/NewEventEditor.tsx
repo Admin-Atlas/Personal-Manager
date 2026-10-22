@@ -26,6 +26,21 @@
 // never written into the date fields; the save moves it), or why it can't be saved. Until it has
 // said so for exactly the rule and start on screen, nothing saves, by any way to save. A rule whose
 // day came from the start date follows the start when it moves.
+//
+// It can have guests (C12d): the guest box sits under When, as in the editor of an existing event,
+// with suggestions from people already in the user's calendars and the three guest permissions.
+// Send or Don't send has no default: a new event with guests asks first, from the editor's own
+// count, before anything is sent, and again with the backend's numbers if they differ. The question
+// sits inside this dialog, so Escape closes only it, and no way to save or close goes from behind
+// it. What was sent keeps its answer: Check again sends it again with the draft (the backend sends
+// the answer first sent whatever comes). Quick create has no guest box: More options opens this.
+//
+// Notifications and colour (C13) sit under the location, as when editing: left as the calendar's,
+// nothing is sent for them and Google gives the event the calendar's own. Another calendar keeps a
+// list the user made (the defaults shown are the new calendar's). Switching between timed and
+// all-day puts a list of the event's own back to the defaults, and says so. A notification row that
+// can't be committed stops every way to save, as a date a field couldn't read does. Quick create has
+// neither row, as Google's has none (INFERRED).
 
 import {
   useCallback,
@@ -37,7 +52,7 @@ import {
   type MutableRefObject,
 } from "react";
 import { flushSync } from "react-dom";
-import type { CalendarOverview, WriteOutcome } from "../../../lib/types";
+import type { CalendarOverview, GuestNotice, Notify, WriteOutcome } from "../../../lib/types";
 import {
   NEW_EVENT_BASE,
   NO_BAD_DATES,
@@ -49,14 +64,17 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   followStart,
+  guestNotice,
   halfInstant,
   hasBadDate,
   refusedDateId,
+  remindersAfterKindSwitch,
   switchNewKind,
   toNewEvent,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
+import { kindNoteText, type KindSwitchNote } from "../../../lib/calendarEdit/reminders";
 import {
   ambiguousText,
   CALLOUT_TONE,
@@ -73,12 +91,17 @@ import {
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
+import { sameAddress, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { repeatStartOf, startDateOf } from "../../../lib/calendarEdit/recurrenceDraft";
 import { isLetterKey } from "../../../lib/letterKey";
 import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { EventColorPicker } from "./EventColorPicker";
+import { GuestField } from "./GuestField";
+import { NotifyPrompt } from "./NotifyPrompt";
+import { ReminderList } from "./ReminderList";
 import {
   NO_ZONE_CREATE,
   RepeatRow,
@@ -102,6 +125,9 @@ interface Props {
   overview: CalendarOverview;
   /** Calendars hidden in the calendar list. */
   hidden: ReadonlySet<string>;
+  /** People already in the user's calendars, for the guest box (worked out by the calendar).
+   *  Required, so a caller can't leave the box without them unnoticed. */
+  suggestions: readonly GuestSuggestion[];
   colorOf: (calendarId: string) => string;
   shapeOf: (calendarId: string) => number | undefined;
   /** Filled in with a way to bring this editor's title into focus: a second "+ New event" focuses
@@ -152,7 +178,21 @@ export interface Unproven {
   outcome: WriteOutcome;
 }
 
+/** The email question, open: the new event it is for (as it will be sent, with no answer yet, and
+ *  the fields it came from), the numbers, and `again` when the backend asked after an answer. */
+interface Prompt {
+  sent: CreateSent;
+  fields: EditorFields;
+  notice: GuestNotice;
+  again: boolean;
+}
+
 const PRIVATE_OFF = "This calendar's sharing doesn't let you make private events on it.";
+
+/** Said under the guest box when the calendar picked was on the list as a guest: it organises the
+ *  event now, as Google lists it (C13 review round 1). */
+const organiserLeftText = (address: string) =>
+  `${address} organises this event now, so it came off the guest list.`;
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -162,6 +202,7 @@ export function NewEventEditor({
   calendarId: firstCalendar,
   overview,
   hidden,
+  suggestions,
   colorOf,
   shapeOf,
   focusRef,
@@ -221,6 +262,22 @@ export function NewEventEditor({
   const startCustom: CustomFrom | null = handover?.openCustom ? "handover" : null;
   const customRef = useRef<CustomFrom | null>(startCustom);
   const [custom, setCustomState] = useState<CustomFrom | null>(startCustom);
+  // The email question (null = closed), readable at once: no save or close goes from behind it.
+  const promptRef = useRef<Prompt | null>(null);
+  const [prompt, setPromptState] = useState<Prompt | null>(null);
+  // Times the backend asked this Save whether Google sends the invitations: once, then it says so.
+  const guestAskRef = useRef(0);
+  // Text left in the guest box that isn't an address: no save until it's cleared or fixed.
+  const badGuestRef = useRef<string | null>(null);
+  const [badGuest, setBadGuestState] = useState<string | null>(null);
+  // A notification row holding something it can't commit (said under it): no save meanwhile.
+  const badRemindersRef = useRef(false);
+  // The kind switch put the defaults back: said under the list until it next changes, naming the
+  // calendar picked when it's said (the defaults are that calendar's).
+  const [remindersNote, setRemindersNote] = useState<KindSwitchNote | null>(null);
+  // A guest another calendar's address took off the list when that calendar was picked, since it
+  // organises the event now: said under the guest box until the list next changes.
+  const [guestNote, setGuestNote] = useState<string | null>(null);
   const saveButton = useRef<HTMLButtonElement>(null);
   const titleBox = useRef<HTMLDivElement>(null);
   // The latest overview and hidden set, for the words an answer gets after the props moved on.
@@ -259,6 +316,17 @@ export function NewEventEditor({
     customRef.current = from;
     setCustomState(from);
   };
+  const setPrompt = (next: Prompt | null) => {
+    promptRef.current = next;
+    setPromptState(next);
+  };
+  const setBadGuest = (text: string | null) => {
+    badGuestRef.current = text;
+    setBadGuestState(text);
+  };
+  /** The account a new event on `id` is saved through: who Google sends its invitations from, and
+   *  never suggested as a guest. */
+  const accountOf = (id: string) => targetById(targets, id)?.account.email ?? null;
   const focusTitle = useCallback(
     () => titleBox.current?.querySelector<HTMLInputElement>("input")?.focus(),
     [],
@@ -325,12 +393,20 @@ export function NewEventEditor({
     changedFields(seed, draftRef.current).length > 0 || calendarRef.current !== firstCalendar;
 
   const requestClose = () => {
-    if (savingRef.current) return;
+    if (savingRef.current || promptRef.current) return;
     commitFocused();
-    // Nothing to discard: what may be in Google stays in hand, as a notice.
+    // Nothing to discard: what may be in Google stays in hand, as a notice. Text in the guest box
+    // that isn't an address, or a notification row that can't be committed, never reached the
+    // draft: it would be lost too.
     if (heldRef.current) onClose();
-    else if (isDirty() || hasBadDate(badDatesRef.current)) setAskDiscard(true);
-    else onClose();
+    else if (
+      isDirty() ||
+      hasBadDate(badDatesRef.current) ||
+      badGuestRef.current !== null ||
+      badRemindersRef.current
+    ) {
+      setAskDiscard(true);
+    } else onClose();
   };
 
   /** The event's length now, kept for the next start move, or the last it had (never under a
@@ -380,17 +456,40 @@ export function NewEventEditor({
     setDraft(followStart(draftRef.current, next));
   }
 
+  /** All day ↔ timed, as a time change, with the notifications fitted to the new kind. */
+  function changeKind(zone: string) {
+    const was = draftRef.current;
+    const switched = switchNewKind(was, seed, zone, lengthRef.current, showAsTouched.current);
+    // The seed is on the calendar's defaults (`newEventSeed`), so defaults on the draft stay the
+    // defaults whoever put them there: no switch's reset to remember.
+    const r = remindersAfterKindSwitch(seed, switched, true, false);
+    changeTime(r.draft);
+    setRemindersNote(r.note);
+  }
+
   /** Another calendar. While the time is still the seed's, the end follows that account's length
-   *  (and back again), as Google's own length would. */
+   *  (and back again), as Google's own length would. The calendar organises the event, so its own
+   *  address typed as a guest on another one comes off the list, said under the box: GuestField
+   *  refuses adding it, and the backend counts it as the event's own, never one Google invites (C13
+   *  review round 1). */
   function pickCalendar(id: string) {
     setCalendarId(id);
-    if (timeTouched.current) return;
-    const length = lengthFor(overviewRef.current, targetById(targets, id));
-    lengthRef.current = length;
-    const t = draftRef.current.time;
-    if (t.kind === "timed") {
-      setDraft({ ...draftRef.current, time: endAfterStart(NEW_EVENT_BASE, t, length) });
+    const target = targetById(targets, id);
+    const organiser = target?.calendar.remote_id ?? null;
+    const was = draftRef.current;
+    const left = organiser
+      ? was.guests.filter((g) => !sameAddress(g.email, organiser))
+      : was.guests;
+    const dropped = left.length !== was.guests.length;
+    let next = dropped ? { ...was, guests: left } : was;
+    setGuestNote(dropped && organiser ? organiserLeftText(organiser) : null);
+    if (!timeTouched.current) {
+      const length = lengthFor(overviewRef.current, target);
+      lengthRef.current = length;
+      const t = next.time;
+      if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
     }
+    if (next !== was) setDraft(next);
   }
 
   /** Whether the backend has said `fields`' repeat can be saved, for exactly its rule and start (a
@@ -399,47 +498,83 @@ export function NewEventEditor({
     repeat.saveable(fields.recurrence, repeatStartOf(fields.time));
 
   async function save() {
-    // Refused before anything is blurred: focus stays put (in the discard question, and the Custom
-    // dialog, too).
-    if (savingRef.current || askDiscardRef.current || customRef.current) return;
+    // Refused before anything is blurred: focus stays put (in the discard question, the Custom
+    // dialog and the email question, too).
+    if (savingRef.current || askDiscardRef.current || customRef.current || promptRef.current) {
+      return;
+    }
     const h = heldRef.current;
     // Without a zone a new draft can't go (that's said under the fields); a held one goes as sent.
     if (!h && deviceZone === null) return;
     const focused = document.activeElement;
     commitFocused();
-    let sent: CreateSent;
-    let fields: EditorFields;
+    // A new Save: no earlier one's ask of the email question carries into it.
+    guestAskRef.current = 0;
     if (h) {
-      // Check again: exactly what was sent, under its token.
-      sent = h.sent;
-      fields = h.fields;
-    } else {
-      const current = draftRef.current;
-      // What stops it is already said under When, as it happened. A date a field couldn't read puts
-      // focus on that field, which the line names and only a date typed or picked there clears (a
-      // blur gives it nothing, so the refusal stands); anything else puts focus back where it was.
-      if (hasBadDate(badDatesRef.current)) {
-        setBanner(null);
-        refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
-        return;
-      }
-      // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row too.
-      if (checkDraft(NEW_EVENT_BASE, current).problems.length > 0 || !repeatReady(current)) {
-        setBanner(null);
-        refocus(focused);
-        return;
-      }
-      sent = { calendarId: calendarRef.current, draft: toNewEvent(current) };
-      fields = current;
+      // Check again: exactly what was sent, its answer included, under its token.
+      await send(h.sent, h.fields, h.token);
+      return;
     }
-    const token = h?.token ?? null;
+    const current = draftRef.current;
+    // What stops it is already said under When, as it happened. A date a field couldn't read puts
+    // focus on that field, which the line names and only a date typed or picked there clears (a
+    // blur gives it nothing, so the refusal stands); anything else puts focus back where it was.
+    if (hasBadDate(badDatesRef.current)) {
+      setBanner(null);
+      refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
+      return;
+    }
+    // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row too;
+    // text in the guest box that isn't an address, under the box and in the problem lines; a
+    // notification that can't be committed, under its row.
+    if (
+      checkDraft(NEW_EVENT_BASE, current).problems.length > 0 ||
+      !repeatReady(current) ||
+      badGuestRef.current !== null ||
+      badRemindersRef.current
+    ) {
+      setBanner(null);
+      refocus(focused);
+      return;
+    }
+    const sent: CreateSent = { calendarId: calendarRef.current, draft: toNewEvent(current) };
+    // Who it would invite, counted as the backend counts: asked before anything is sent, as
+    // Google's own question is. Nobody, and it goes (the backend has the last word either way).
+    const notice = guestNotice(NEW_EVENT_BASE, current, false, accountOf(sent.calendarId));
+    if (notice) {
+      setZonePick(null);
+      setBanner(null);
+      setPrompt({ sent, fields: current, notice, again: false });
+      return;
+    }
+    await send(sent, current, null);
+  }
+
+  /** The email question answered: it closes and the new event goes with the answer, for its
+   *  numbers. */
+  function onNotify(n: Notify) {
+    const p = promptRef.current;
+    if (!p) return;
+    setPrompt(null);
+    void send({ ...p.sent, answer: { notify: n, asked: p.notice } }, p.fields, null);
+  }
+
+  /** Back (or Escape) from the email question: nothing was sent, and the draft stays. */
+  function onNotifyBack() {
+    setPrompt(null);
+    refocusSave();
+  }
+
+  /** Send `sent` (`fields` being what it was made from), under `token` when it's Check again, and
+   *  act on what came back. */
+  async function send(sent: CreateSent, fields: EditorFields, token: string | null) {
     savingRef.current = true;
     setSaving(true);
     setZonePick(null);
     setBanner(null);
     let outcome: WriteOutcome;
     try {
-      outcome = await createEvent(sent.calendarId, sent.draft, token);
+      outcome = await createEvent(sent.calendarId, sent.draft, token, sent.answer ?? null);
     } catch (e) {
       // No answer at all (the app's own channel failed): nothing says how it ended, so a held token
       // stays held.
@@ -474,6 +609,25 @@ export function NewEventEditor({
       onClose();
       return;
     }
+    // Whether Google sends the invitations (C12d): asked with the backend's numbers when they aren't
+    // the ones answered (or the editor counted nobody), once per Save; a second ask is said instead.
+    // Nothing was sent or held. Check again never asks: it sends the answer first sent.
+    if (
+      outcome.outcome === "needs_choice" &&
+      outcome.guests &&
+      !outcome.scope &&
+      token === null &&
+      ++guestAskRef.current <= 1
+    ) {
+      setPrompt({
+        sent: { calendarId: sent.calendarId, draft: sent.draft },
+        fields,
+        notice: outcome.guests,
+        // "Again" only when an answer was given: the numbers differ from the ones answered.
+        again: sent.answer !== undefined,
+      });
+      return;
+    }
     const next = retryAfter(token, outcome);
     if (next !== null) {
       // It may be in Google: show exactly what was sent, locked, for Check again.
@@ -483,7 +637,7 @@ export function NewEventEditor({
     } else {
       setHeld(null);
       // A held token ended without Google showing it made: it may still be there.
-      if (h) setUnproven({ sent, outcome });
+      if (token !== null) setUnproven({ sent, outcome });
     }
     setBanner(createText(outcome, fields.summary, next !== null));
     refocusSave();
@@ -518,8 +672,15 @@ export function NewEventEditor({
   const endChoices = useMemo(() => (timed ? endTimeChoices(NEW_EVENT_BASE, timed) : []), [timed]);
   const endMin = useMemo(() => (timed ? endDateMin(NEW_EVENT_BASE, timed) : undefined), [timed]);
   const repeatHolds = repeat.state.state === "loading" || repeat.state.state === "refused";
-  // A date a field couldn't read is said under When, naming the field.
-  const lines = [...new Set(check.problems.map(problemText))];
+  // A date a field couldn't read is said under When, naming the field. Text left in the guest box
+  // that isn't an address is one too, beside the box's own line under it.
+  const lines = [
+    ...new Set([
+      ...check.problems.map(problemText),
+      ...(badGuest !== null ? [problemText({ kind: "bad_guest", email: badGuest })] : []),
+    ]),
+  ];
+  const account = target?.account.email ?? null;
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
     ...createNotes(draft.time, draft.recurrence.kind === "rule", overview, hidden, calendarId),
@@ -614,12 +775,7 @@ export function NewEventEditor({
             onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
             moveStart={moveStart}
             moveEndDate={moveEndDate}
-            onSwitchKind={() =>
-              deviceZone &&
-              changeTime(
-                switchNewKind(draft, seed, deviceZone, lengthRef.current, showAsTouched.current),
-              )
-            }
+            onSwitchKind={() => deviceZone && changeKind(deviceZone)}
             canSwitchKind={!timeOff}
             onPickZone={setZonePick}
             repeat={
@@ -665,12 +821,65 @@ export function NewEventEditor({
             </p>
           ))}
 
+          {/* The organiser of a new event is the calendar it goes to: never added as a guest. */}
+          <GuestField
+            guests={draft.guests}
+            base={NEW_EVENT_BASE.guests}
+            perms={draft.guest_perms}
+            suggestions={suggestions}
+            me={account}
+            organizer={target?.calendar.remote_id ?? null}
+            disabled={locked}
+            omitted={false}
+            notice={guestNote}
+            onChange={(guests) => {
+              setGuestNote(null);
+              setDraft({ ...draftRef.current, guests });
+            }}
+            onPerms={(guest_perms) => setDraft({ ...draftRef.current, guest_perms })}
+            onReject={setBadGuest}
+          />
+
           <TextRow
             label="Location"
             value={draft.location}
             disabled={locked}
             onChange={(location) => setDraft({ ...draft, location })}
           />
+
+          <ReminderList
+            value={draft.reminders}
+            allDay={draft.time.kind === "all_day"}
+            calendar={target?.calendar ?? null}
+            disabled={locked}
+            note={
+              remindersNote &&
+              kindNoteText(
+                remindersNote,
+                target?.calendar.name ?? null,
+                draft.time.kind === "all_day",
+              )
+            }
+            onChange={(reminders) => {
+              setRemindersNote(null);
+              setDraft({ ...draftRef.current, reminders });
+            }}
+            onInvalid={(bad) => {
+              badRemindersRef.current = bad;
+            }}
+          />
+
+          <div className="flex flex-col items-start gap-1">
+            <span className="text-sm text-ink2">Colour</span>
+            <EventColorPicker
+              value={draft.colour}
+              calendarColour={colorOf(calendarId)}
+              labelled={false}
+              disabled={locked}
+              onChange={(colour) => setDraft({ ...draftRef.current, colour })}
+            />
+          </div>
+
           <TextRow
             label="Description"
             multiline
@@ -713,6 +922,17 @@ export function NewEventEditor({
               closeCustom();
             }}
             onClose={closeCustom}
+          />
+        )}
+        {/* The email question, nested the same way: Escape and Back close only it. */}
+        {prompt && (
+          <NotifyPrompt
+            kind="create"
+            notice={prompt.notice}
+            from={accountOf(prompt.sent.calendarId)}
+            again={prompt.again}
+            onSend={onNotify}
+            onBack={onNotifyBack}
           />
         )}
       </Dialog>

@@ -1552,9 +1552,23 @@ export type ReadOnlyReason =
   | "became_repeating"
   | "special_type"
   | "locked"
-  | "html_description";
+  | "html_description"
+  /** A Google Calendar label sets its colour, and PM doesn't change labels (C13). */
+  | "label_read_only"
+  /** Google holds a notification PM can't read, so the list stays as it is (C13). */
+  | "reminders_unreadable";
 
 export type ShowAs = "busy" | "free";
+
+/** An event's notifications: the calendar's defaults, or its own list, sent whole (C13). */
+export interface RemindersDraft {
+  use_default: boolean;
+  overrides: Reminder[];
+}
+
+/** An event's colour: its calendar's, or one of Google's eleven by id ("1" to "11") (C13). A
+ *  Google Calendar label isn't PM's to set. */
+export type ColourChoice = { kind: "calendar" } | { kind: "colour"; id: string };
 export type EventVisibility = "default" | "public" | "private" | "confidential";
 
 /** When an event happens, as the editor holds it: wall-clock times in named zones, or whole days.
@@ -1590,6 +1604,10 @@ export interface EventPatchDraft {
   guests_can_modify?: boolean | null;
   guests_can_invite_others?: boolean | null;
   guests_can_see_other_guests?: boolean | null;
+  /** Its notifications, the whole list or the calendar's defaults (C13). */
+  reminders?: RemindersDraft | null;
+  /** Its colour (C13). */
+  colour?: ColourChoice | null;
 }
 
 /** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
@@ -1635,8 +1653,14 @@ export interface GuestForEdit {
 /** A change to how an event repeats: a rule from the editor's set, or "Does not repeat". */
 export type RepeatDraft = { kind: "rule"; rule: RepeatRule } | { kind: "once" };
 
+/** A guest on a new event: who, and whether they're optional. */
+export interface NewGuest {
+  email: string;
+  optional: boolean;
+}
+
 /** A new event, for creating an event: every field as the editor holds it (empty text is left out
- *  of what goes to Google). No guests, reminders or colour yet. */
+ *  of what goes to Google). */
 export interface NewEventDraft {
   summary: string;
   time: TimeDraft;
@@ -1647,6 +1671,17 @@ export interface NewEventDraft {
   /** How it repeats; null doesn't repeat. The backend starts it on the first day the rule makes
    *  (the repeat menu's words say which) and moves the end with it. */
   recurrence: RepeatRule | null;
+  /** Who it invites, in the order added: each gets an invitation if the user chooses Send. */
+  guests: NewGuest[];
+  /** What guests may do, only where it isn't Google's own (they may invite others and see the
+   *  list, not change the event): left out, Google's applies. */
+  guests_can_modify?: boolean;
+  guests_can_invite_others?: boolean;
+  guests_can_see_other_guests?: boolean;
+  /** Its own notifications (C13): null on the defaults, and Google gives it the calendar's. */
+  reminders: RemindersDraft | null;
+  /** One of Google's eleven colours (C13): null on the calendar's, and it has none of its own. */
+  colour: ColourChoice | null;
 }
 
 // --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---
@@ -1722,6 +1757,9 @@ export interface FieldPermissions {
   visibility: boolean;
   /** The guest list and what guests may do (C12). */
   guests: boolean;
+  /** Its notifications and its colour (C13). */
+  reminders: boolean;
+  colour: boolean;
   delete: boolean;
   reasons: ReadOnlyReason[];
 }
@@ -1753,6 +1791,11 @@ export interface EventForEdit {
   /** The organiser's address, on the guest list or not: no guest change may touch it (the
    *  backend's `check`). */
   organizer_email: string | null;
+  /** Its notifications as Google holds them; none at all reads as the calendar's defaults (C13). */
+  reminders: RemindersDraft;
+  /** Google's colour id and label id, null when unset. A label sets the colour Google draws. */
+  color_id: string | null;
+  label_id: string | null;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
@@ -1844,9 +1887,15 @@ export type SeriesScope = "this" | "following" | "all";
  *  not repeat" leaves of a repeating one (for all events or from one on), that starts outside the
  *  months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and
  *  following" change landed, but PM couldn't tell which repeating event Google made of the new
- *  part, so the milestones `milestone_moves` lists stay on the earlier part. */
+ *  part, so the milestones `milestone_moves` lists stay on the earlier part. `partly_applied`: Google
+ *  applied a one-event save without keeping all of it (a colour it wouldn't clear beside a new
+ *  title, say), so the event is as Google holds it (C13 review round 1). */
 export type WriteWarning =
-  "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror" | "milestone_not_offered";
+  | "mirror_refresh_pending"
+  | "left_on_old_series"
+  | "outside_mirror"
+  | "milestone_not_offered"
+  | "partly_applied";
 
 /** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
  *  change. */

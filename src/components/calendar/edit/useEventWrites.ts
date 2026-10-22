@@ -107,10 +107,19 @@ export interface WriteNotice {
 }
 
 /** What creating an event sent: the calendar (PM's id) and the draft, kept as they were so a Check
- *  again re-sends them exactly (the backend refuses anything else). */
+ *  again re-sends them exactly (the backend refuses anything else); and, for a new event with
+ *  guests, the user's Send or Don't send with the numbers it was given for, sent again with them
+ *  (the backend sends the answer first sent whatever comes). */
 export interface CreateSent {
   calendarId: string;
   draft: NewEventDraft;
+  answer?: CreateAnswer;
+}
+
+/** Send or Don't send for a new event's guests, and the numbers the question showed. */
+export interface CreateAnswer {
+  notify: Notify;
+  asked: GuestNotice;
 }
 
 /** A delete the backend is holding or sending. */
@@ -805,14 +814,23 @@ export function moveMilestoneBack(noticeId: number): Promise<boolean> {
 // --- creating an event (C10) ---
 
 /** Create an event on one of PM's Google calendars; `retryToken` (from an earlier `ambiguous`
- *  answer) has the backend look for that attempt before anything is sent again. Nobody is emailed:
- *  new events have no guests. The outcome comes back as data; the caller says how it went. */
+ *  answer) has the backend look for that attempt before anything is sent again. `answer`: Send or
+ *  Don't send for its guests, for the numbers the question showed; one with guests and none is
+ *  answered `needs_choice`, nothing sent. The outcome comes back as data; the caller says how it
+ *  went. */
 export function createEvent(
   calendarId: string,
   draft: NewEventDraft,
   retryToken: string | null,
+  answer: CreateAnswer | null = null,
 ): Promise<WriteOutcome> {
-  return createCalendarEvent(calendarId, draft, retryToken);
+  return createCalendarEvent(
+    calendarId,
+    draft,
+    retryToken,
+    answer?.notify ?? null,
+    answer?.asked ?? null,
+  );
 }
 
 /** The notice up for a held create's token, if one is. */
@@ -877,7 +895,12 @@ export async function checkCreate(
   put({ ...notice, checking: true });
   let outcome: WriteOutcome;
   try {
-    outcome = await createEvent(held.sent.calendarId, held.sent.draft, held.token);
+    outcome = await createEvent(
+      held.sent.calendarId,
+      held.sent.draft,
+      held.token,
+      held.sent.answer ?? null,
+    );
   } catch (e) {
     put({
       id,

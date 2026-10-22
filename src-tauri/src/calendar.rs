@@ -194,7 +194,7 @@ pub struct CalendarFacts {
 }
 
 /// One notification: `popup` or `email`, so many minutes before the start.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reminder {
     pub method: String,
     pub minutes: i64,

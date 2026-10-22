@@ -46,6 +46,22 @@ const EVENT_COLOURS: Readonly<Record<string, EventColour>> = Object.freeze({
   "11": { name: "Tomato", hex: "#d50000", ink: WHITE },
 });
 
+/** The eleven ids in the order Google's colour menu lists them (INFERRED from Google web; live probe
+ *  E15 checks it): the editor's colour picker (C13). */
+export const PICKER_ORDER: readonly string[] = Object.freeze([
+  "11",
+  "4",
+  "6",
+  "5",
+  "2",
+  "10",
+  "7",
+  "9",
+  "1",
+  "3",
+  "8",
+]);
+
 /** The colour an event was given in Google, or `null` when it has none of its own (it shows in its
  *  calendar's colour) or an id PM doesn't know. */
 export function eventColour(colorId: string | null | undefined): EventColour | null {

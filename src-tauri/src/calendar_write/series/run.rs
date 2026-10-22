@@ -1797,6 +1797,22 @@ mod tests {
         // Nobody to email, nothing to answer.
         let (_, solo) = this_case();
         assert!(!solo.needs_notify() && Run::new(solo).is_ok());
+        // A new event with a guest and nobody's answer, sent or sent again (C12d).
+        let Some(Op::Insert { calendar, id, body }) =
+            create_plan().steps.first().map(|s| s.op.clone())
+        else {
+            panic!("a create plan inserts");
+        };
+        let mut invited = body;
+        invited.insert("attendees".into(), json!([{ "email": "a@example.com" }]));
+        let own = crate::calendar_write::attendees::Own::default();
+        let unanswered = SeriesPlan::create(&calendar, &id, invited.clone(), &own, None).unwrap();
+        assert!(unanswered.needs_notify());
+        assert_eq!(Run::new(unanswered.clone()).err(), Some(Unfit));
+        assert_eq!(Run::retry_insert(unanswered).err(), Some(Unfit));
+        let answered =
+            SeriesPlan::create(&calendar, &id, invited, &own, Some(Notify::All)).unwrap();
+        assert!(Run::new(answered).is_ok());
     }
 
     #[test]
@@ -2886,9 +2902,16 @@ mod tests {
                 show_as: None,
                 visibility: None,
                 recurrence: None,
+                guests: Vec::new(),
+                guests_can_modify: None,
+                guests_can_invite_others: None,
+                guests_can_see_other_guests: None,
+                reminders: None,
+                colour: None,
             })
             .unwrap();
-        SeriesPlan::create(CALENDAR, NEW, body).unwrap()
+        let own = crate::calendar_write::attendees::Own::default();
+        SeriesPlan::create(CALENDAR, NEW, body, &own, None).unwrap()
     }
 
     /// Google's copy of the new event.

@@ -37,6 +37,13 @@
 // repeating event's: the row only names it, the choices then say what each would do (never "This
 // event" alone), and a rule left as it was never stops a save. Moving the date carries along only a
 // rule picked here, never the repeating event's own, whose move is the choices' question.
+//
+// Notifications and colour (C13) sit under the location, as on Google's event page: the whole list
+// goes when it changed, and a colour is the calendar's or one of Google's eleven. Both are the
+// user's own, so they never ask about emails, and a locked event keeps them. Switching between timed
+// and all-day puts a list of the event's own back to the calendar's defaults, as Google does, and
+// says so; back on the kind Google holds, the event's own list returns. A notification row that
+// can't be committed stops the save, as a date a field couldn't read does.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -74,12 +81,14 @@ import {
   hasBadDate,
   rebaseDraft,
   refusedDateId,
+  remindersAfterKindSwitch,
   repeatSeed,
   seedDraft,
   toChanges,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
+import { kindNoteText, sameReminders } from "../../../lib/calendarEdit/reminders";
 import {
   ONCE,
   repeatingStartOf,
@@ -105,8 +114,10 @@ import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
 import { NotifyPrompt } from "./NotifyPrompt";
+import { ReminderList } from "./ReminderList";
 import {
   NO_ZONE,
   RepeatRow,
@@ -140,6 +151,8 @@ interface Props {
   suggestions: readonly GuestSuggestion[];
   /** A milestone linked to this event, which moves with it. */
   milestone: Milestone | null;
+  /** The colour PM draws a calendar in: the colour list's "Calendar colour". */
+  colorOf: (calendarId: string) => string;
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
    *  passed carries what the editor showed (Google's fresh copy), which the delete compares. */
   onDelete?: (row: CalendarEvent) => void;
@@ -213,6 +226,7 @@ export function EventEditor({
   account,
   suggestions,
   milestone,
+  colorOf,
   onDelete,
   onClose,
 }: Props) {
@@ -272,6 +286,13 @@ export function EventEditor({
     badGuestRef.current = text;
     setBadGuestState(text);
   };
+  // A notification row holding something it can't commit (said under it): no save meanwhile.
+  const badRemindersRef = useRef(false);
+  // The kind switch put the defaults back: said under the list until it next changes.
+  const [remindersNote, setRemindersNote] = useState<string | null>(null);
+  // The draft's defaults are the ones a kind switch put there, untouched since: switching back
+  // puts the event's list back (`remindersAfterKindSwitch`). Defaults the user picked stay.
+  const kindResetRef = useRef(false);
   // The Custom dialog, while open: no save goes from behind it.
   const customRef = useRef(false);
   const [customOpen, setCustomOpenState] = useState(false);
@@ -358,8 +379,14 @@ export function EventEditor({
   const requestClose = () => {
     if (saving || promptRef.current) return;
     commitFocused();
-    // Text in the guest box that isn't an address never reached the draft: it would be lost too.
-    if (isDirty() || hasBadDate(badDatesRef.current) || badGuestRef.current !== null) {
+    // Text in the guest box that isn't an address, or a notification row that can't be
+    // committed, never reached the draft: it would be lost too.
+    if (
+      isDirty() ||
+      hasBadDate(badDatesRef.current) ||
+      badGuestRef.current !== null ||
+      badRemindersRef.current
+    ) {
       setAskDiscard("close");
     } else onClose();
   };
@@ -443,7 +470,30 @@ export function EventEditor({
       return;
     }
     const seed = repeatSeed(fresh.series, rowRepeats || !!fresh.series);
-    const r = rebaseDraft(loaded.base, seedDraft(fresh.event, seed), draftRef.current);
+    const was = draftRef.current;
+    const r = rebaseDraft(loaded.base, seedDraft(fresh.event, seed), was);
+    let next = r.draft;
+    // Google's time won over a switch of the user's between all-day and timed: the notifications
+    // that switch replaced come back with it, as switching back would (C13 review round 1), so a
+    // save never sends a reset whose reason is gone. Defaults the user picked are no reset, and
+    // stay (review round 2). A list the rebase changed otherwise leaves the switch's line saying
+    // nothing true, and is no longer the switch's.
+    let note: string | null | undefined;
+    if (was.time.kind !== loaded.base.time.kind && next.time.kind !== was.time.kind) {
+      const k = remindersAfterKindSwitch(
+        r.base,
+        next,
+        canEdit(fresh.permissions, "reminders"),
+        kindResetRef.current,
+      );
+      next = k.draft;
+      kindResetRef.current = k.reset;
+      const allDay = next.time.kind === "all_day";
+      note = k.note && kindNoteText(k.note, calendar?.name ?? null, allDay);
+    } else if (!sameReminders(next.reminders, was.reminders)) {
+      kindResetRef.current = false;
+      note = null;
+    }
     setLoaded({
       session: fresh.session,
       event: fresh.event,
@@ -452,7 +502,8 @@ export function EventEditor({
       seen: fresh.seen,
       series: fresh.series,
     });
-    setDraft(r.draft);
+    setDraft(next);
+    if (note !== undefined) setRemindersNote(note);
     setBanner({ tone: "warn", text: rebasedText(head, r.overwritten, r.lost_guests) });
   }
 
@@ -463,6 +514,24 @@ export function EventEditor({
     const was = draftRef.current;
     if (!loaded || !was || sameRepeat(next.recurrence, loaded.base.recurrence)) setDraft(next);
     else setDraft(followStart(was, next));
+  }
+
+  /** All day ↔ timed, as a time change, with the notifications fitted to the new kind. */
+  function changeKind(zone: string) {
+    const was = draftRef.current;
+    if (!loaded || !was) return;
+    const switched = { ...was, time: switchKind(was.time, loaded.base.time, zone) };
+    const r = remindersAfterKindSwitch(
+      loaded.base,
+      switched,
+      may("reminders"),
+      kindResetRef.current,
+    );
+    kindResetRef.current = r.reset;
+    changeTime(r.draft);
+    setRemindersNote(
+      r.note && kindNoteText(r.note, calendar?.name ?? null, switched.time.kind === "all_day"),
+    );
   }
 
   /** Whether a one-off's repeat may be saved: no repeat, or a rule the backend called ready at
@@ -493,11 +562,13 @@ export function EventEditor({
       return;
     }
     // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row; text in
-    // the guest box that isn't an address, under the box and in the problem lines.
+    // the guest box that isn't an address, under the box and in the problem lines; a notification
+    // that can't be committed, under its row.
     if (
       checkDraft(loaded.base, current, loaded.event).problems.length > 0 ||
       !repeatReady(current) ||
-      badGuestRef.current !== null
+      badGuestRef.current !== null ||
+      badRemindersRef.current
     ) {
       setBanner(null);
       refocus(focused);
@@ -871,13 +942,7 @@ export function EventEditor({
               moveStart={moveStart}
               moveEndDate={moveEndDate}
               // A time change like any other: a rule picked here follows the date it lands on.
-              onSwitchKind={() =>
-                zoneFallback &&
-                changeTime({
-                  ...draft,
-                  time: switchKind(draft.time, loaded.base.time, zoneFallback),
-                })
-              }
+              onSwitchKind={() => zoneFallback && changeKind(zoneFallback)}
               canSwitchKind={!!zoneFallback}
               onPickZone={setZonePick}
               repeat={
@@ -960,6 +1025,34 @@ export function EventEditor({
               disabled={!may("location")}
               onChange={(location) => setDraft({ ...draft, location })}
             />
+
+            <ReminderList
+              value={draft.reminders}
+              allDay={draft.time.kind === "all_day"}
+              calendar={calendar}
+              disabled={!may("reminders")}
+              unreadable={perms?.reasons.includes("reminders_unreadable")}
+              note={remindersNote}
+              onChange={(reminders) => {
+                setRemindersNote(null);
+                kindResetRef.current = false;
+                if (draftRef.current) setDraft({ ...draftRef.current, reminders });
+              }}
+              onInvalid={(bad) => {
+                badRemindersRef.current = bad;
+              }}
+            />
+
+            <div className="flex flex-col items-start gap-1">
+              <span className="text-sm text-ink2">Colour</span>
+              <EventColorPicker
+                value={draft.colour}
+                calendarColour={colorOf(row.calendar_id)}
+                labelled={!!loaded.event.label_id}
+                disabled={!may("colour")}
+                onChange={(colour) => draftRef.current && setDraft({ ...draftRef.current, colour })}
+              />
+            </div>
 
             {loaded.event.description_html ? (
               <div className="flex flex-col gap-1">

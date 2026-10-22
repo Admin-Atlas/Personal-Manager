@@ -18,7 +18,7 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
-use super::dto::{GuestNotice, GuestOp, GuestState};
+use super::dto::{GuestNotice, GuestOp, GuestState, NewGuest};
 use crate::calendar::Attendee;
 
 /// The domain Google gives rooms and other bookable resources.
@@ -268,6 +268,31 @@ pub fn for_new_event(entry: &Value) -> Option<Value> {
     .filter_map(|k| entry.get(*k).map(|v| ((*k).to_string(), v.clone())))
     .collect();
     Some(Value::Object(kept))
+}
+
+/// A new event's guest list from the editor's (C12d): each guest as `{"email": …}` (+ `"optional":
+/// true`), trimmed, in the order added. Every one must be an address ([`is_address`]) and none listed
+/// twice (by address, whatever the case): Google would refuse the rest anyway. The editor never adds
+/// the user's own address (theirs is the organiser's); one that comes anyway goes as typed and is
+/// never counted as someone emailed ([`Reach::of_insert`]).
+pub fn new_list(guests: &[NewGuest]) -> Result<Vec<Value>, GuestError> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for guest in guests {
+        if !is_address(&guest.email) {
+            return Err(GuestError::NotAnAddress);
+        }
+        if !seen.insert(key(&guest.email)) {
+            return Err(GuestError::Repeated);
+        }
+        let mut entry = Map::new();
+        entry.insert("email".into(), Value::from(guest.email.trim()));
+        if guest.optional {
+            entry.insert("optional".into(), Value::Bool(true));
+        }
+        out.push(Value::Object(entry));
+    }
+    Ok(out)
 }
 
 /// The calendar's own addresses, lower-cased: never a guest Google emails.
@@ -1176,6 +1201,48 @@ mod tests {
                 == Some(json!({ "email": "c@x.org", "displayName": "C", "optional": true }))
         );
         assert!(for_new_event(&json!({ "displayName": "Nobody" })).is_none());
+    }
+
+    fn new_guest(email: &str, optional: bool) -> NewGuest {
+        NewGuest {
+            email: email.into(),
+            optional,
+        }
+    }
+
+    /// C12d: a new event's guests go as new entries, trimmed and in the order added, `optional`
+    /// only where it's so; an address that isn't one, or one listed twice in any case, is refused
+    /// with words that name no address.
+    #[test]
+    fn a_new_events_guests_go_as_new_entries() {
+        let list = new_list(&[
+            new_guest(" b@x.org ", false),
+            new_guest("A@x.org", true),
+            new_guest("room1@resource.calendar.google.com", false),
+        ]);
+        assert!(
+            list == Ok(vec![
+                json!({ "email": "b@x.org" }),
+                json!({ "email": "A@x.org", "optional": true }),
+                json!({ "email": "room1@resource.calendar.google.com" }),
+            ]),
+            "every guest, in order, optional only where it's so"
+        );
+        assert!(new_list(&[]) == Ok(Vec::new()));
+        assert!(
+            new_list(&[new_guest("b@x.org", false), new_guest("bob at x", false)])
+                == Err(GuestError::NotAnAddress)
+        );
+        assert!(
+            new_list(&[new_guest("b@x.org", false), new_guest(" B@X.org", true)])
+                == Err(GuestError::Repeated)
+        );
+        for refused in [GuestError::NotAnAddress, GuestError::Repeated] {
+            assert!(
+                !refused.to_string().contains('@'),
+                "no address in the words"
+            );
+        }
     }
 
     #[test]

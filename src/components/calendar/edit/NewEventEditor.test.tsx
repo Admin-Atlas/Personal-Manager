@@ -27,6 +27,7 @@ import type {
   Calendar,
   CalendarAccount,
   CalendarOverview,
+  GuestNotice,
   NewEventDraft,
   RepeatPreset,
   RepeatRule,
@@ -37,10 +38,17 @@ import type {
 import { CREATE_LOST } from "../../../lib/calendarEdit/editReasons";
 import { toNewEvent, type EditorFields } from "../../../lib/calendarEdit/eventDraft";
 import { createTargets } from "../../../lib/calendarEdit/createTargets";
+import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
+import type { CreateAnswer } from "./useEventWrites";
 
 const createEvent =
   vi.fn<
-    (calendarId: string, draft: NewEventDraft, token: string | null) => Promise<WriteOutcome>
+    (
+      calendarId: string,
+      draft: NewEventDraft,
+      token: string | null,
+      answer: CreateAnswer | null,
+    ) => Promise<WriteOutcome>
   >();
 const noteCreateResult = vi.fn();
 const noteHeldCreate = vi.fn();
@@ -50,7 +58,8 @@ let deviceZone: string | null = "Europe/London";
 
 vi.mock("./useEventWrites", () => ({
   // Every argument passes through, so an extra one, or a dropped token, shows in the calls.
-  createEvent: (...a: [string, NewEventDraft, string | null]) => createEvent(...a),
+  createEvent: (...a: [string, NewEventDraft, string | null, CreateAnswer | null]) =>
+    createEvent(...a),
   noteCreateResult: (...a: unknown[]) => noteCreateResult(...a),
   noteHeldCreate: (...a: unknown[]) => noteHeldCreate(...a),
 }));
@@ -112,7 +121,12 @@ const overview: CalendarOverview = {
   accounts: [account(ME), account(WORK)],
   calendars: [
     calendar(ME, "me@x.com", { name: "Personal", is_primary: true }),
-    calendar(ME, "family", { name: "Family", access_role: "writerWithoutPrivateAccess" }),
+    calendar(ME, "family", {
+      name: "Family",
+      access_role: "writerWithoutPrivateAccess",
+      // Its default notifications, which a new event on it shows (C13).
+      default_reminders: [{ method: "popup", minutes: 10 }],
+    }),
     calendar(WORK, "work@x.com", { name: "Work", is_primary: true }),
   ],
   last_sync: null,
@@ -140,6 +154,8 @@ const seed: EditorFields = {
   recurrence: { kind: "once" },
   guests: [],
   guest_perms: { modify: false, invite_others: true, see_others: true },
+  reminders: { use_default: true, overrides: [] },
+  colour: { kind: "calendar" },
   show_as: "busy",
   visibility: "default",
 };
@@ -147,7 +163,8 @@ const seed: EditorFields = {
 /** What the editor sends for the seed titled `summary`, on `calendarId`. */
 const sentFor = (summary: string, calendarId = PERSONAL) => ({
   calendarId,
-  // Every field the seed has but its guests, which a create doesn't send yet (C12d).
+  // Every field the seed has: no guests, and Google's own guest permissions, unsaid (C12d); the
+  // calendar's notifications and colour, as null (C13).
   draft: {
     summary,
     time: seed.time,
@@ -156,6 +173,9 @@ const sentFor = (summary: string, calendarId = PERSONAL) => ({
     show_as: seed.show_as,
     visibility: seed.visibility,
     recurrence: null,
+    guests: [],
+    reminders: null,
+    colour: null,
   } as NewEventDraft,
 });
 
@@ -238,6 +258,7 @@ function open(
     handover?: CreateHandover;
     /** Inside <StrictMode>, as the app's development build runs: every effect set up twice. */
     strict?: boolean;
+    suggestions?: GuestSuggestion[];
   } = {},
 ) {
   const onClose = over.onClose ?? vi.fn();
@@ -248,6 +269,7 @@ function open(
       calendarId={over.calendarId ?? PERSONAL}
       overview={overview}
       hidden={over.hidden ?? new Set()}
+      suggestions={over.suggestions ?? []}
       colorOf={() => "var(--accent)"}
       shapeOf={() => undefined}
       handover={over.handover}
@@ -330,12 +352,16 @@ describe("NewEventEditor", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    // The calendar, every field of the draft, and no token: nobody to notify, no repeat, no guests.
-    expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null]]);
+    // The calendar, every field of the draft, and no token: nobody to notify, no repeat, no guests,
+    // the calendar's notifications and colour (C13).
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
+      "colour",
       "description",
+      "guests",
       "location",
       "recurrence",
+      "reminders",
       "show_as",
       "summary",
       "time",
@@ -438,8 +464,8 @@ describe("NewEventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Check again" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls).toEqual([
-      [PERSONAL, sentFor("Dentist").draft, null],
-      [PERSONAL, sentFor("Dentist").draft, "ref-1"],
+      [PERSONAL, sentFor("Dentist").draft, null, null],
+      [PERSONAL, sentFor("Dentist").draft, "ref-1", null],
     ]);
     expect(noteCreateResult).toHaveBeenCalledWith(sentFor("Dentist"), "ref-1", saved, {
       name: "Personal",
@@ -620,7 +646,7 @@ describe("NewEventEditor", () => {
     expect(title().disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Check again" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1"]]);
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1", null]]);
   });
 
   // Quick create's token ended unproven before More options: its words go on here, as they would
@@ -1216,7 +1242,7 @@ describe("NewEventEditor", () => {
     fireEvent.click(saveButton());
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls).toEqual([
-      [PERSONAL, { ...sentFor("Dentist").draft, recurrence: MONDAYS }, null],
+      [PERSONAL, { ...sentFor("Dentist").draft, recurrence: MONDAYS }, null, null],
     ]);
   });
 
@@ -1251,7 +1277,7 @@ describe("NewEventEditor", () => {
     expect(screen.queryByRole("group", REPEATS)).toBeNull();
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls).toEqual([
-      [PERSONAL, { ...sentFor("Standup").draft, recurrence: MONDAYS }, null],
+      [PERSONAL, { ...sentFor("Standup").draft, recurrence: MONDAYS }, null, null],
     ]);
   });
 
@@ -1344,7 +1370,7 @@ describe("NewEventEditor", () => {
     await pickRepeat("Does not repeat");
     fireEvent.click(saveButton());
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null]]);
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null, null]]);
   });
 
   it("Weekly Mon, Wed chosen on a Tuesday says it starts Wednesday", async () => {
@@ -1593,7 +1619,7 @@ describe("NewEventEditor", () => {
     // With the words still to come, it sends the held body, rule and all, under the same token.
     fireEvent.click(again);
     await waitFor(() => expect(first.onClose).toHaveBeenCalled());
-    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1"]]);
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1", null]]);
     cleanup();
     // Ctrl+S too.
     createEvent.mockClear();
@@ -1601,6 +1627,523 @@ describe("NewEventEditor", () => {
     await act(async () => {});
     await ctrlS();
     await waitFor(() => expect(second.onClose).toHaveBeenCalled());
-    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1"]]);
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sent.draft, "ref-1", null]]);
+  });
+});
+
+// --- guests (#884, C12d) ---
+
+/** One guest new to the event, invited: what the question shows for one. */
+const ONE_INVITED: GuestNotice = {
+  updated: 0,
+  invited: 1,
+  removed: 0,
+  told_cancelled: 0,
+  cancelled: false,
+  people: 1,
+  emails: 1,
+  complete: true,
+};
+
+/** The dentist inviting b@example.org, as a create sends it. */
+const withGuest = (): NewEventDraft => ({
+  ...sentFor("Dentist").draft,
+  guests: [{ email: "b@example.org", optional: false }],
+});
+
+const question = () => screen.queryByRole("dialog", { name: "Send invitation emails to guests?" });
+
+/** Type `email` into the guest box and add it. */
+function addGuest(email: string) {
+  const box = screen.getByRole("combobox", { name: "Add guests" });
+  fireEvent.change(box, { target: { value: email } });
+  fireEvent.keyDown(box, { key: "Enter" });
+}
+
+/** Title a new event "Dentist", invite b@example.org, and Save: the question that opens. */
+async function inviteAndSave() {
+  const opened = open();
+  fireEvent.change(title(), { target: { value: "Dentist" } });
+  addGuest("b@example.org");
+  const save = screen.getByRole("button", { name: "Save" });
+  fireEvent.click(save);
+  const prompt = await screen.findByRole("dialog", { name: "Send invitation emails to guests?" });
+  return { ...opened, save, prompt };
+}
+
+describe("NewEventEditor guests (C12d)", () => {
+  it("a new event with a guest asks before creating; Back keeps the draft; Send creates with all", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose, save, prompt } = await inviteAndSave();
+    const p = within(prompt);
+    expect(p.getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    expect(p.getByText("Google sends the emails from me@x.com.")).toBeTruthy();
+    // No default: focus starts on Back, and nothing is sent before an answer.
+    expect(document.activeElement).toBe(p.getByRole("button", { name: "Back" }));
+    expect(createEvent).not.toHaveBeenCalled();
+    fireEvent.click(p.getByRole("button", { name: "Back" }));
+    expect(question()).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(save));
+    expect(title().value).toBe("Dentist");
+    const rows = within(screen.getByRole("list", { name: "Guests" })).getAllByRole("listitem");
+    expect(rows).toHaveLength(1);
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    // Asked again, and Send: created with all, for the numbers the question showed.
+    fireEvent.click(save);
+    const again = within(
+      await screen.findByRole("dialog", { name: "Send invitation emails to guests?" }),
+    );
+    fireEvent.click(again.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(again.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    const answer = { notify: "all", asked: ONE_INVITED };
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, withGuest(), null, answer]]);
+    expect(noteCreateResult).toHaveBeenCalledWith(
+      { calendarId: PERSONAL, draft: withGuest(), answer },
+      null,
+      saved,
+      { name: "Personal", hidden: false },
+    );
+  });
+
+  // Nothing goes from behind the question (C12 critique C2-L3): the editor's own Save, Ctrl+S,
+  // Enter in the title and Cancel do nothing while it's open.
+  it("Create stays disabled until answered, and nothing goes from behind the question", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose, save, prompt } = await inviteAndSave();
+    const p = within(prompt);
+    const create = p.getByRole<HTMLButtonElement>("button", { name: "Create" });
+    expect(create.disabled).toBe(true);
+    expect(p.getAllByRole<HTMLInputElement>("radio").some((r) => r.checked)).toBe(false);
+    fireEvent.click(create);
+    fireEvent.click(save);
+    await ctrlS();
+    fireEvent.keyDown(title(), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await act(async () => {});
+    expect(
+      screen.getAllByRole("dialog", { name: "Send invitation emails to guests?" }),
+    ).toHaveLength(1);
+    expect(screen.queryByRole("dialog", { name: "Discard this new event?" })).toBeNull();
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(p.getByRole("radio", { name: /^Don't send/ }));
+    expect(create.disabled).toBe(false);
+    fireEvent.click(create);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, withGuest(), null, { notify: "none", asked: ONE_INVITED }],
+    ]);
+  });
+
+  it("Escape closes only the email question", async () => {
+    const { onClose, prompt } = await inviteAndSave();
+    fireEvent.keyDown(prompt, { key: "Escape" });
+    expect(question()).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Discard this new event?" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "New event" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it("a new event without guests never asks", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null, null]]);
+  });
+
+  // The organiser of a new event is its calendar (yours, on your own calendar), and a room is no
+  // one Google emails.
+  it("inviting only a room never asks, and your own address isn't added", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("me@x.com");
+    expect(screen.getByText("That's the organiser, who is on it already.")).toBeTruthy();
+    addGuest("room1@resource.calendar.google.com");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    const room = { email: "room1@resource.calendar.google.com", optional: false };
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Dentist").draft, guests: [room] }, null, null],
+    ]);
+  });
+
+  // C13 review round 1: on a calendar that isn't your primary one, your own address is a guest,
+  // counted as the backend counts it: as the account's own, never one Google invites.
+  it("on another of your calendars, your own address goes but is never counted", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ calendarId: FAMILY });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("me@x.com");
+    addGuest("b@example.org");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const p = within(
+      await screen.findByRole("dialog", { name: "Send invitation emails to guests?" }),
+    );
+    expect(p.getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    fireEvent.click(p.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(p.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    const guests = [
+      { email: "me@x.com", optional: false },
+      { email: "b@example.org", optional: false },
+    ];
+    expect(createEvent.mock.calls).toEqual([
+      [
+        FAMILY,
+        { ...sentFor("Dentist", FAMILY).draft, guests },
+        null,
+        { notify: "all", asked: ONE_INVITED },
+      ],
+    ]);
+    cleanup();
+    createEvent.mockClear();
+    // Only you: nobody to invite, so nothing is asked.
+    const alone = open({ calendarId: FAMILY });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("me@x.com");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(alone.onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    expect(createEvent.mock.calls).toEqual([
+      [
+        FAMILY,
+        { ...sentFor("Dentist", FAMILY).draft, guests: [{ email: "me@x.com", optional: false }] },
+        null,
+        null,
+      ],
+    ]);
+  });
+
+  // C13 review round 1: the calendar picked organises the event, so its address typed as a guest
+  // on another one comes off the list, saying so: never a row stuck as "Organiser", sent, and
+  // counted where the backend doesn't count it.
+  it("picking the calendar a guest's address names takes that guest off, and says so", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("work@x.com");
+    addGuest("b@example.org");
+    pickCalendar("Personal", "Work");
+    expect(
+      screen.getByText("work@x.com organises this event now, so it came off the guest list."),
+    ).toBeTruthy();
+    const rows = within(screen.getByRole("list", { name: "Guests" })).getAllByRole("listitem");
+    expect(rows).toHaveLength(1);
+    expect(screen.queryByText("Organiser")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const p = within(
+      await screen.findByRole("dialog", { name: "Send invitation emails to guests?" }),
+    );
+    expect(p.getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    fireEvent.click(p.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(p.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [calendarId, draft, , answer] = createEvent.mock.calls[0];
+    expect(calendarId).toBe(WORK_CAL);
+    expect(draft.guests).toEqual([{ email: "b@example.org", optional: false }]);
+    expect(answer).toEqual({ notify: "all", asked: ONE_INVITED });
+  });
+
+  it("the backend's numbers ask again, and the answer goes for them", async () => {
+    const two: GuestNotice = { ...ONE_INVITED, invited: 2, people: 2, emails: 2 };
+    createEvent
+      .mockResolvedValueOnce({ outcome: "needs_choice", scope: false, guests: two, again: true })
+      .mockResolvedValueOnce(saved);
+    const { onClose, prompt } = await inviteAndSave();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    const line = await screen.findByText("2 guests new to it will get an invitation.");
+    const again = within(line.closest('[role="dialog"]') as HTMLElement);
+    expect(
+      again.getByText("PM checked with Google before saving, and these are the numbers it found."),
+    ).toBeTruthy();
+    // Asked afresh: nothing picked, nothing sent meanwhile, the editor still open.
+    expect(again.getAllByRole<HTMLInputElement>("radio").some((r) => r.checked)).toBe(false);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+    // A save from behind it (Ctrl+S, the editor's Save) never swaps Google's numbers for the
+    // editor's own count.
+    await ctrlS();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {});
+    expect(again.getByText("2 guests new to it will get an invitation.")).toBeTruthy();
+    expect(screen.queryByText("1 guest new to it will get an invitation.")).toBeNull();
+    fireEvent.click(again.getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(again.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, withGuest(), null, { notify: "all", asked: ONE_INVITED }],
+      [PERSONAL, withGuest(), null, { notify: "none", asked: two }],
+    ]);
+  });
+
+  it("a second ask in one Save is said rather than asked, and nothing is held", async () => {
+    createEvent.mockResolvedValue({
+      outcome: "needs_choice",
+      scope: false,
+      guests: ONE_INVITED,
+      again: true,
+    });
+    const { onClose, save, prompt } = await inviteAndSave();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    const reasked = await waitFor(() => {
+      const open = question();
+      expect(open).not.toBeNull();
+      return within(open as HTMLElement);
+    });
+    fireEvent.click(reasked.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(reasked.getByRole("button", { name: "Create" }));
+    expect(
+      await screen.findByText(
+        "“Dentist” wasn't created: PM's count of who Google would invite differs from the one you answered. Save it again to choose whether Google sends the invitations.",
+      ),
+    ).toBeTruthy();
+    expect(question()).toBeNull();
+    expect(createEvent).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(save));
+    expect(onClose).not.toHaveBeenCalled();
+    // A new Save starts its count afresh: the backend's ask opens the question again.
+    fireEvent.click(save);
+    const own = within(await screen.findByRole("dialog", { name: /^Send invitation/ }));
+    fireEvent.click(own.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(own.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(createEvent).toHaveBeenCalledTimes(3));
+    expect(await screen.findByText(/PM checked with Google before saving/)).toBeTruthy();
+  });
+
+  // Check again sends the answer first sent; were the backend ever to ask, a fresh answer would go
+  // without the token, as a second new event, so it's said instead and the token kept.
+  it("Check again never asks the email question", async () => {
+    createEvent.mockResolvedValue({
+      outcome: "needs_choice",
+      scope: false,
+      guests: ONE_INVITED,
+    });
+    const draft: EditorFields = {
+      ...seed,
+      summary: "Dentist",
+      guests: [
+        {
+          email: "b@example.org",
+          name: null,
+          response: null,
+          optional: false,
+          organizer: false,
+          self: false,
+          room: false,
+        },
+      ],
+    };
+    const sent = {
+      calendarId: PERSONAL,
+      draft: toNewEvent(draft),
+      answer: { notify: "all" as const, asked: ONE_INVITED },
+    };
+    open({ handover: handed(draft, { held: { token: "ref-1", sent } }) });
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(createEvent).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(question()).toBeNull();
+    expect(createEvent.mock.calls).toEqual([[PERSONAL, withGuest(), "ref-1", sent.answer]]);
+    expect(screen.getByRole("button", { name: "Check again" })).toBeTruthy();
+  });
+
+  // The held create keeps its answer (C12 §9.3): Check again sends it with the draft, under the
+  // token, and asks nothing; closing leaves it with the notice's Check again.
+  it("an answer that never arrived keeps the answer for Check again, here and as a notice", async () => {
+    createEvent.mockResolvedValueOnce(ambiguous).mockResolvedValueOnce(saved);
+    const { onClose, prompt } = await inviteAndSave();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    const check = await screen.findByRole("button", { name: "Check again" });
+    // Locked on what was sent, the guest box too.
+    expect(screen.getByRole<HTMLInputElement>("combobox", { name: "Add guests" }).disabled).toBe(
+      true,
+    );
+    fireEvent.click(check);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    const answer = { notify: "all", asked: ONE_INVITED };
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, withGuest(), null, answer],
+      [PERSONAL, withGuest(), "ref-1", answer],
+    ]);
+    cleanup();
+    // Closed while held: the notice keeps exactly what was sent, its answer included.
+    createEvent.mockReset();
+    createEvent.mockResolvedValue(ambiguous);
+    const second = await inviteAndSave();
+    fireEvent.click(within(second.prompt).getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(within(second.prompt).getByRole("button", { name: "Create" }));
+    await screen.findByRole("button", { name: "Check again" });
+    // The footer's Close or the title bar's: both close without asking while one is held.
+    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+    expect(second.onClose).toHaveBeenCalled();
+    await leave(second.unmount);
+    expect(noteHeldCreate).toHaveBeenCalledWith(
+      {
+        calendarId: PERSONAL,
+        draft: withGuest(),
+        answer: { notify: "none", asked: ONE_INVITED },
+      },
+      "ref-1",
+    );
+  });
+
+  it("text in the guest box that isn't an address stops the save, and closing asks first", async () => {
+    // Nothing else typed: the draft is as it opened, so only the box's text stops either.
+    const { onClose } = open();
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    fireEvent.change(box, { target: { value: "bob at example" } });
+    fireEvent.blur(box);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(question()).toBeNull();
+    expect(screen.getAllByText("“bob at example” isn't an email address.").length).toBeGreaterThan(
+      0,
+    );
+    // It never reached the draft, so closing would lose it: asked first.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+// Notifications and colour (#884, C13): left as the calendar's they go as null; a list or a colour
+// goes as chosen; Ctrl+S sends a number typed but not committed, and a row it can't commit holds
+// every way to save; another calendar keeps a list the user made; the kind switch says so.
+describe("NewEventEditor, notifications and colour", () => {
+  const count = (words: string) =>
+    screen.getByRole<HTMLInputElement>("textbox", { name: `How many: ${words}` });
+
+  it("sends the list and colour chosen", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    expect(screen.getByText("Personal has no default notifications.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    // Focus goes to the new row's number (C13 critique C2-M6).
+    await waitFor(() => expect(document.activeElement).toBe(count("30 minutes before")));
+    fireEvent.click(screen.getByRole("button", { name: "Colour: Calendar colour" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Tomato" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [
+        PERSONAL,
+        {
+          ...sentFor("Dentist").draft,
+          reminders: { use_default: false, overrides: [{ method: "popup", minutes: 30 }] },
+          colour: { kind: "colour", id: "11" },
+        },
+        null,
+        null,
+      ],
+    ]);
+  });
+
+  it("Ctrl+S with an uncommitted row saves the typed value (C13 critique C2-M5)", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    const row = count("30 minutes before");
+    row.focus();
+    fireEvent.change(row, { target: { value: "45" } });
+    await ctrlS();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].reminders).toEqual({
+      use_default: false,
+      overrides: [{ method: "popup", minutes: 45 }],
+    });
+  });
+
+  it("a row it can't commit holds Save, Ctrl+S and Enter, and closing asks first", async () => {
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    const unit = screen.getByRole("combobox", { name: "Unit: 30 minutes before" });
+    // 30 weeks: past Google's four.
+    fireEvent.change(unit, { target: { value: "weeks" } });
+    expect(screen.getByText("Google allows notifications up to 4 weeks before.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await ctrlS();
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("text a default row can't take asks before closing, though the draft never changed", async () => {
+    const { onClose } = open({ calendarId: FAMILY });
+    const row = count("10 minutes before");
+    row.focus();
+    fireEvent.change(row, { target: { value: "ten" } });
+    fireEvent.blur(row);
+    expect(screen.getByText("Use a whole number.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("another calendar keeps the list made, and shows its own defaults otherwise", async () => {
+    open();
+    pickCalendar("Personal", "Family");
+    expect(screen.getByText("Family's default notifications:")).toBeTruthy();
+    expect(count("10 minutes before")).toBeTruthy();
+    pickCalendar("Family", "Personal");
+    expect(screen.getByText("Personal has no default notifications.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    pickCalendar("Personal", "Family");
+    expect(screen.queryByText("Family's default notifications:")).toBeNull();
+    expect(count("30 minutes before")).toBeTruthy();
+  });
+
+  it("switching to all day puts a list made back to the calendar's defaults, and says so", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Personal's defaults for all-day events."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].reminders).toBeNull();
+  });
+
+  // C13 review round 1: switching back over a list made on the other kind says so too, and the
+  // line names the calendar picked since, whose defaults the event is on.
+  it("switching back over a list made says so, naming the calendar picked", async () => {
+    open();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(count("1 day before at 09:00")).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Personal's defaults for timed events."),
+    ).toBeTruthy();
+    pickCalendar("Personal", "Family");
+    expect(
+      screen.getByText("Notifications went back to Family's defaults for timed events."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Personal's defaults/)).toBeNull();
   });
 });
