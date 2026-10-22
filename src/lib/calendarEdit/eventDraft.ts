@@ -12,7 +12,8 @@
 // changed the same field, where Google's value wins and the editor says so.
 //
 // Creating an event uses the same fields: `newEventSeed` starts one, it's judged against
-// `NEW_EVENT_BASE` (nothing to keep, so every half is checked), and `toNewEvent` sends all of it.
+// `NEW_EVENT_BASE` (nothing to keep, so every half is checked), and `toNewEvent` sends all of it,
+// its repeat included (C11).
 
 import type {
   EventForEdit,
@@ -24,6 +25,14 @@ import type {
   TimeDraft,
 } from "../types";
 import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
+import {
+  copyRule,
+  followStartDate,
+  ONCE,
+  sameRepeat,
+  startDateOf,
+  type RepeatValue,
+} from "./recurrenceDraft";
 import { durationLabel, timeChoices } from "./timeSlots";
 
 /** What the editor's fields hold. */
@@ -32,6 +41,8 @@ export interface EditorFields {
   location: string;
   description: string;
   time: TimeDraft;
+  /** How it repeats: the Repeat row, which only creating draws so far. */
+  recurrence: RepeatValue;
   show_as: ShowAs;
   visibility: EventVisibility;
 }
@@ -42,19 +53,23 @@ export type EditorField = keyof EditorFields;
 export const EDITOR_FIELDS: readonly EditorField[] = [
   "summary",
   "time",
+  "recurrence",
   "location",
   "description",
   "show_as",
   "visibility",
 ];
 
-/** The editor's starting fields: Google's copy as it is. */
+/** The editor's starting fields: Google's copy as it is. Its repeat starts as "Does not repeat",
+ *  even for an occurrence of a repeating event: the editor has no Repeat row for an existing event
+ *  yet, so nothing reads it and nothing can change it. */
 export function seedDraft(event: EventForEdit): EditorFields {
   return {
     summary: event.summary,
     location: event.location,
     description: event.description,
     time: { ...event.time },
+    recurrence: ONCE,
     show_as: event.show_as,
     visibility: event.visibility,
   };
@@ -91,6 +106,8 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
       return sameText(a[field], b[field]);
     case "time":
       return sameTime(a.time, b.time);
+    case "recurrence":
+      return sameRepeat(a.recurrence, b.recurrence);
     case "show_as":
     case "visibility":
       return a[field] === b[field];
@@ -115,6 +132,9 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
       case "time":
         changes.time = { ...draft.time };
         break;
+      // An existing event's repeat can't change yet (`seedDraft`), so there is none to send.
+      case "recurrence":
+        break;
       case "show_as":
         changes.show_as = draft.show_as;
         break;
@@ -126,9 +146,10 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
   return changes;
 }
 
-/** Whether the editor may change `field` (the permission names match the fields). */
+/** Whether the editor may change `field` (the permission names match the fields). How it repeats is
+ *  the time's right: Google locks `recurrence` exactly when it locks the start. */
 export function canEdit(permissions: FieldPermissions, field: EditorField): boolean {
-  return permissions[field];
+  return field === "recurrence" ? permissions.time : permissions[field];
 }
 
 /** Something that stops a save before it is sent. */
@@ -445,6 +466,7 @@ export const NEW_EVENT_BASE: EditorFields = {
   location: "",
   description: "",
   time: { kind: "all_day", first_day: "", last_day: "" },
+  recurrence: ONCE,
   show_as: "busy",
   visibility: "default",
 };
@@ -466,15 +488,22 @@ function firstShown(date: string, time: string, zone: string): string | null {
 /** A new event's starting fields, on `day` (`YYYY-MM-DD`, in `zone`): on today the next half hour
  *  strictly after `now` (14:10 → 14:30, 14:30 → 15:00, 23:40 → 00:00 the next day), on any other day
  *  09:00, stepping past a time the clocks skip; `lengthMs` long (`endAfterStart`, so a repeated hour
- *  never gives an end before the start). Busy, the calendar's default visibility. With no zone at all
- *  there's no time to show, so it starts as an all-day event on `day`, free as Google's are. */
+ *  never gives an end before the start). Busy, the calendar's default visibility, not repeating. With
+ *  no zone at all there's no time to show, so it starts as an all-day event on `day`, free as
+ *  Google's are. */
 export function newEventSeed(
   day: string,
   now: Date,
   zone: string | null,
   lengthMs: number,
 ): EditorFields {
-  const fields = { summary: "", location: "", description: "", visibility: "default" as const };
+  const fields = {
+    summary: "",
+    location: "",
+    description: "",
+    recurrence: ONCE,
+    visibility: "default" as const,
+  };
   if (zone === null) {
     return { ...fields, time: { kind: "all_day", first_day: day, last_day: day }, show_as: "free" };
   }
@@ -546,8 +575,19 @@ export function switchNewKind(
   };
 }
 
-/** What creating an event sends: every field, as the editor holds it. The editor has no repeat menu
- *  yet, so nothing it creates repeats. */
+/** `next`, a draft whose time just changed from `was`'s, with its rule following the start date
+ *  (`followStartDate`): weekly on the old start's weekday becomes weekly on the new one's, and so on
+ *  for a rule whose day came from the start. */
+export function followStart(was: EditorFields, next: EditorFields): EditorFields {
+  const r = next.recurrence;
+  if (r.kind !== "rule") return next;
+  const rule = followStartDate(r.rule, startDateOf(was.time), startDateOf(next.time));
+  return rule === r.rule ? next : { ...next, recurrence: { kind: "rule", rule } };
+}
+
+/** What creating an event sends: every field, as the editor holds it, sharing nothing with the draft
+ *  (what was sent is kept for a retry, and must not change with it). Its repeat is the rule chosen,
+ *  or null for "Does not repeat"; the backend starts it on the first day the rule makes. */
 export function toNewEvent(draft: EditorFields): NewEventDraft {
   return {
     summary: draft.summary,
@@ -556,7 +596,8 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
     description: draft.description,
     show_as: draft.show_as,
     visibility: draft.visibility,
-    recurrence: null,
+    // A rule PM can only show (`kept`) belongs to an existing event, never a new one.
+    recurrence: draft.recurrence.kind === "rule" ? copyRule(draft.recurrence.rule) : null,
   };
 }
 
@@ -569,6 +610,9 @@ function setField(target: EditorFields, field: EditorField, from: EditorFields) 
       break;
     case "time":
       target.time = { ...from.time };
+      break;
+    case "recurrence":
+      target.recurrence = from.recurrence;
       break;
     case "show_as":
       target.show_as = from.show_as;

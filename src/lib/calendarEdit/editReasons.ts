@@ -57,6 +57,9 @@ export function fieldLabel(field: EditorField): string {
       return "title";
     case "time":
       return "time";
+    // Google's word for it.
+    case "recurrence":
+      return "repeat";
     case "location":
       return "location";
     case "description":

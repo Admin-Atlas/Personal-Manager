@@ -211,20 +211,20 @@ describe("outsideMirror", () => {
     last_day: last,
   });
 
-  it("outsideMirror reads both edges", () => {
-    // Ends exactly at the window's start: outside. A minute into it: inside.
-    expect(outsideMirror(timed("2026-09-30T23:00", "2026-10-01T00:00"), o)).toBe(true);
-    expect(outsideMirror(timed("2026-09-30T23:00", "2026-10-01T00:01"), o)).toBe(false);
-    // Starts exactly at the window's end: outside. A minute before: inside.
-    expect(outsideMirror(timed("2026-12-01T00:00", "2026-12-01T01:00"), o)).toBe(true);
-    expect(outsideMirror(timed("2026-11-30T23:59", "2026-12-01T01:00"), o)).toBe(false);
+  it("outsideMirror reads both edges, and which side it's on", () => {
+    // Ends exactly at the window's start: outside, before it. A minute into it: inside.
+    expect(outsideMirror(timed("2026-09-30T23:00", "2026-10-01T00:00"), o)).toBe("before");
+    expect(outsideMirror(timed("2026-09-30T23:00", "2026-10-01T00:01"), o)).toBeNull();
+    // Starts exactly at the window's end: outside, after it. A minute before: inside.
+    expect(outsideMirror(timed("2026-12-01T00:00", "2026-12-01T01:00"), o)).toBe("after");
+    expect(outsideMirror(timed("2026-11-30T23:59", "2026-12-01T01:00"), o)).toBeNull();
     // All day: the last day before the end is in; the day the window ends on is out.
-    expect(outsideMirror(allDay("2026-11-30", "2026-11-30"), o)).toBe(false);
-    expect(outsideMirror(allDay("2026-12-01", "2026-12-01"), o)).toBe(true);
-    expect(outsideMirror(allDay("2026-09-30", "2026-09-30"), o)).toBe(true);
-    expect(outsideMirror(allDay("2026-09-30", "2026-10-01"), o)).toBe(false);
+    expect(outsideMirror(allDay("2026-11-30", "2026-11-30"), o)).toBeNull();
+    expect(outsideMirror(allDay("2026-12-01", "2026-12-01"), o)).toBe("after");
+    expect(outsideMirror(allDay("2026-09-30", "2026-09-30"), o)).toBe("before");
+    expect(outsideMirror(allDay("2026-09-30", "2026-10-01"), o)).toBeNull();
     // Far ahead: the probe's 13+ months out.
-    expect(outsideMirror(allDay("2028-01-01", "2028-01-01"), o)).toBe(true);
+    expect(outsideMirror(allDay("2028-01-01", "2028-01-01"), o)).toBe("after");
   });
 
   it("says nothing about a time it can't read", () => {
@@ -233,10 +233,10 @@ describe("outsideMirror", () => {
         { ...timed("2028-01-01T10:00", "2028-01-01T11:00"), start_zone: "Nowhere/Here" },
         o,
       ),
-    ).toBe(false);
+    ).toBeNull();
     expect(
       outsideMirror(timed("2028-01-01T10:00", "2028-01-01T11:00"), { ...o, mirror_end: "" }),
-    ).toBe(false);
+    ).toBeNull();
   });
 });
 
@@ -271,20 +271,41 @@ describe("createNotes", () => {
   it("says before Save when PM won't show the event: outside the months it syncs, or hidden", () => {
     const o = overview();
     const day = (d: string) => ({ kind: "all_day" as const, first_day: d, last_day: d });
-    expect(createNotes(day("2026-10-12"), o, new Set(), `${ME}:alpha`)).toEqual([]);
+    expect(createNotes(day("2026-10-12"), false, o, new Set(), `${ME}:alpha`)).toEqual([]);
     // The window's ends as this computer's dates, DD-MM.
     const range = `${formatDateLocal(new Date(o.mirror_start))} – ${formatDateLocal(new Date(o.mirror_end))}`;
-    expect(createNotes(day("2028-01-01"), o, new Set(), `${ME}:alpha`)).toEqual([
+    expect(createNotes(day("2028-01-01"), false, o, new Set(), `${ME}:alpha`)).toEqual([
       `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
     ]);
-    expect(createNotes(day("2026-10-12"), o, new Set([`${ME}:alpha`]), `${ME}:alpha`)).toEqual([
+    expect(
+      createNotes(day("2026-10-12"), false, o, new Set([`${ME}:alpha`]), `${ME}:alpha`),
+    ).toEqual([
       "Alpha is hidden in your calendar list, so the new event won't show until you show that calendar again.",
     ]);
     // A twin on show will show it, so there's nothing to say.
     const twin = calendar(OFF, "alpha", { name: "Alpha (shared)" });
     const withTwin = overview({ calendars: [...o.calendars, twin] });
     expect(
-      createNotes(day("2026-10-12"), withTwin, new Set([`${ME}:alpha`]), `${ME}:alpha`),
+      createNotes(day("2026-10-12"), false, withTwin, new Set([`${ME}:alpha`]), `${ME}:alpha`),
     ).toEqual([]);
+  });
+
+  // The backend lands a repeating event's occurrences inside the months PM syncs, whenever it
+  // starts; only one that starts after them has none there.
+  it("a repeating event from before the months PM syncs shows inside them", () => {
+    const o = overview();
+    const day = (d: string) => ({ kind: "all_day" as const, first_day: d, last_day: d });
+    const range = `${formatDateLocal(new Date(o.mirror_start))} – ${formatDateLocal(new Date(o.mirror_end))}`;
+    expect(createNotes(day("2020-01-06"), true, o, new Set(), `${ME}:alpha`)).toEqual([
+      `This starts before the months PM syncs (${range}), so only its occurrences within them will show here.`,
+    ]);
+    // Once, it won't show at all.
+    expect(createNotes(day("2020-01-06"), false, o, new Set(), `${ME}:alpha`)).toEqual([
+      `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
+    ]);
+    // After them, repeating or not, none of it does.
+    expect(createNotes(day("2028-01-03"), true, o, new Set(), `${ME}:alpha`)).toEqual([
+      `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
+    ]);
   });
 });

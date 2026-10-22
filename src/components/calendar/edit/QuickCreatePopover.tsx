@@ -27,6 +27,11 @@
 // goes, or go on to the full editor with More options, until a save that's made. A date the field
 // couldn't read refuses every save until that field is given a date: its line names the field, a
 // save it stops puts focus there, and it goes on refusing in the full editor with More options.
+//
+// It can repeat (C11): a compact Repeat row offers Google's ready-made rules in place, and says where
+// the event really starts or why its rule can't be saved, which stops every save as in the full
+// editor. Custom… carries on in the full editor with its dialog open, sending nothing: a modal
+// dialog over this box would fight its click-outside rule.
 
 import {
   useCallback,
@@ -48,11 +53,13 @@ import {
   dateFieldId,
   endAfterStart,
   endTimeChoices,
+  followStart,
   halfInstant,
   switchNewKind,
   toNewEvent,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
+import { repeatStartOf } from "../../../lib/calendarEdit/recurrenceDraft";
 import {
   ambiguousText,
   badDateText,
@@ -76,9 +83,10 @@ import { Button, Callout, IconButton, Input, Toggle } from "../../ui";
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { CalendarPicker } from "./CalendarPicker";
-import { NO_ZONE_CREATE, type Timed } from "./EventFields";
+import { NO_ZONE_CREATE, RepeatRow, type Timed } from "./EventFields";
 import type { CreateHandover, Unproven } from "./NewEventEditor";
 import { createEvent, noteCreateResult, noteHeldCreate, type CreateSent } from "./useEventWrites";
+import { useRepeatView } from "./useRepeat";
 
 interface Props {
   /** The "+ New event" button's rect: the box opens under it. */
@@ -218,6 +226,8 @@ export function QuickCreatePopover({
   const handedOver = useRef(false);
   // Closed from inside (saved, ✕, a click outside or Escape): nothing to hand back.
   const closed = useRef(false);
+  // What the backend says of the repeat at this start; until it says it can be saved, nothing saves.
+  const repeat = useRepeatView(draft.recurrence, repeatStartOf(draft.time));
 
   // A dialog layer while open: Ctrl+K, the calendar's keys and its swipe stand down.
   useDialogLayer(true, panelRef);
@@ -424,10 +434,11 @@ export function QuickCreatePopover({
   const moveStart = (t: Timed, date: string, time: string): Timed =>
     endAfterStart(NEW_EVENT_BASE, { ...t, start_date: date, start_time: time }, lengthOf(t));
 
-  /** A time change by the user: from now on the time is theirs, whatever the calendar. */
+  /** A time change by the user: from now on the time is theirs, whatever the calendar. A rule whose
+   *  day came from the start date follows it. */
   function changeTime(time: TimeDraft) {
     timeTouched.current = true;
-    setDraft({ ...draftRef.current, time });
+    setDraft(followStart(draftRef.current, { ...draftRef.current, time }));
   }
 
   /** Another calendar. While the time is still the seed's, the end follows that account's length. */
@@ -449,9 +460,10 @@ export function QuickCreatePopover({
     setDraft(switchNewKind(draftRef.current, seed, deviceZone, lengthRef.current, false));
   }
 
-  /** More options: the full editor carries on with this draft. Never while a save is out: the
-   *  editor would start a second event under a new id while the first may still land. */
-  function more() {
+  /** More options: the full editor carries on with this draft (with the Custom dialog open, for the
+   *  Repeat row's Custom…). Never while a save is out: the editor would start a second event under
+   *  a new id while the first may still land. */
+  function more(openCustom = false) {
     if (savingRef.current) return;
     commitFocused();
     handedOver.current = true;
@@ -467,8 +479,14 @@ export function QuickCreatePopover({
       // Read after the blur above, so a date typed and not yet read is refused there too: the field
       // put back the date it had, which the full editor must not save in its place.
       badDate: badDateRef.current,
+      openCustom,
     });
   }
+
+  /** Whether the backend has said `fields`' repeat can be saved, for exactly its rule and start (a
+   *  date the blur before a save just committed is a new start, not yet asked about). */
+  const repeatReady = (fields: EditorFields) =>
+    repeat.saveable(fields.recurrence, repeatStartOf(fields.time));
 
   async function save() {
     // Refused before anything is blurred: focus stays put.
@@ -495,7 +513,8 @@ export function QuickCreatePopover({
         refocus(document.getElementById(dateId));
         return;
       }
-      if (checkDraft(NEW_EVENT_BASE, current).problems.length > 0) {
+      // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row too.
+      if (checkDraft(NEW_EVENT_BASE, current).problems.length > 0 || !repeatReady(current)) {
         setBanner(null);
         refocus(focused);
         return;
@@ -568,11 +587,12 @@ export function QuickCreatePopover({
   const endChoices = useMemo(() => (timed ? endTimeChoices(NEW_EVENT_BASE, timed) : []), [timed]);
   // The one date field's name, on screen and in its refusal.
   const dateName = timed ? "Date" : "Day";
+  const repeatHolds = repeat.state.state === "loading" || repeat.state.state === "refused";
   // A date the field couldn't read is said under the times, naming the field.
   const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...createNotes(t, overview, hidden, calendarId),
+    ...createNotes(t, draft.recurrence.kind === "rule", overview, hidden, calendarId),
   ];
 
   return (
@@ -691,6 +711,17 @@ export function QuickCreatePopover({
           />
           All day
         </label>
+        <RepeatRow
+          compact
+          value={draft.recurrence}
+          view={repeat.state}
+          time={t}
+          deviceZone={deviceZone}
+          skippedTime={check.problems.some((p) => p.kind === "gap")}
+          disabled={!timeEditable}
+          onChange={(recurrence) => setDraft({ ...draftRef.current, recurrence })}
+          onCustom={() => more(true)}
+        />
         {/* A date the field couldn't read, said as it happens and naming the field it points at. */}
         {badDate !== null && (
           <p id={refusedLineId} role="alert" className="text-xs text-st-due">
@@ -729,7 +760,7 @@ export function QuickCreatePopover({
           disabled={locked}
         />
         <div className="ml-auto flex items-center gap-2">
-          <Button variant="tertiary" size="sm" onClick={more} disabled={saving}>
+          <Button variant="tertiary" size="sm" onClick={() => more()} disabled={saving}>
             More options
           </Button>
           <Button
@@ -741,7 +772,7 @@ export function QuickCreatePopover({
             onKeyDown={(e) => {
               if (e.key === "Enter" && e.repeat) e.preventDefault();
             }}
-            disabled={saving || timeOff}
+            disabled={saving || timeOff || repeatHolds}
           >
             {saving ? (held ? "Checking…" : "Saving…") : held ? "Check again" : "Save"}
           </Button>

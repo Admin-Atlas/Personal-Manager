@@ -12,7 +12,11 @@
 // save it stops puts focus; and it goes on refusing with More options), a titled draft that goes
 // with the tab is handed back to open on again, the keyboard comes back into the box even while it's
 // locked, the ghost is told how far the event has got, and the calendar list the keyboard can reach
-// stays inside the box.
+// stays inside the box. Repeating (C11): a ready-made rule is sent with the create, one the backend
+// refuses stops every save (a start the clocks skip said once), one from before the months PM syncs
+// is said to show inside them, a rule's own day follows a moved date, the Repeat list stays inside
+// the box (Escape there closing only it), and Custom…, clicked or reached by the keyboard, carries
+// on in the full editor with its dialog open, sending nothing.
 
 import { createRef, StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -22,6 +26,10 @@ import type {
   CalendarAccount,
   CalendarOverview,
   NewEventDraft,
+  RepeatPreset,
+  RepeatRule,
+  RepeatStart,
+  RepeatView,
   WriteOutcome,
 } from "../../../lib/types";
 import { CREATE_LOST } from "../../../lib/calendarEdit/editReasons";
@@ -36,7 +44,16 @@ const createEvent =
   >();
 const noteCreateResult = vi.fn();
 const noteHeldCreate = vi.fn();
+const recurrencePresets = vi.fn<(day: string) => Promise<RepeatPreset[]>>();
+const describeRecurrence = vi.fn<(rule: RepeatRule, start: RepeatStart) => Promise<RepeatView>>();
 let deviceZone: string | null = "Europe/London";
+
+// The repeat menu's two reads, answered as the test says.
+vi.mock("../../../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  recurrencePresets: (day: string) => recurrencePresets(day),
+  describeRecurrence: (rule: RepeatRule, start: RepeatStart) => describeRecurrence(rule, start),
+}));
 
 vi.mock("./useEventWrites", async (importOriginal) => ({
   // The rest as it is, for the write notices drawn beside the box.
@@ -121,6 +138,7 @@ const seed: EditorFields = {
     end_time: "10:00",
     end_zone: "Europe/London",
   },
+  recurrence: { kind: "once" },
   show_as: "busy",
   visibility: "default",
 };
@@ -175,8 +193,28 @@ beforeAll(() => {
   }
 });
 
+const weeklyOn = (day: "mon" | "tue"): RepeatRule => ({
+  pattern: { kind: "weekly", days: [day] },
+  interval: 1,
+  ends: { kind: "never" },
+});
+
 beforeEach(() => {
   deviceZone = "Europe/London";
+  // The ready-made rules for the start date (the first two are enough), and a rule that starts where
+  // asked.
+  recurrencePresets.mockImplementation(async (day) => [
+    { label: "Daily", rule: { ...weeklyOn("mon"), pattern: { kind: "daily" } } },
+    day === "2026-10-13"
+      ? { label: "Weekly on Tuesday", rule: weeklyOn("tue") }
+      : { label: "Weekly on Monday", rule: weeklyOn("mon") },
+  ]);
+  describeRecurrence.mockImplementation(async (_rule, start) => ({
+    outcome: "ready",
+    summary: "Weekly on Monday",
+    starts: start.date,
+    moved: false,
+  }));
 });
 
 afterEach(() => {
@@ -327,6 +365,7 @@ describe("QuickCreatePopover", () => {
       showAsTouched: false,
       timeTouched: true,
       badDate: null,
+      openCustom: false,
     });
   });
 
@@ -747,7 +786,7 @@ describe("QuickCreatePopover", () => {
     // Enter or Space on a button is its click, with no pointer behind it.
     fireEvent.click(trigger, { detail: 0 });
     const list = screen.getByRole("group", LIST);
-    expect(screen.getByRole("dialog", { name: "New event" }).contains(list)).toBe(true);
+    expect(list.parentElement).toBe(screen.getByRole("dialog", { name: "New event" }));
     const picked = within(list).getByRole("radio", { name: "Personal" });
     await waitFor(() => expect(document.activeElement).toBe(picked));
     fireEvent.keyDown(picked, { key: "Tab" });
@@ -1016,5 +1055,176 @@ describe("QuickCreatePopover", () => {
     fireEvent.keyDown(title(), { key: "Enter" });
     await screen.findByText("“Dentist” wasn't created: PM couldn't reach Google.");
     expect(onDraft.mock.lastCall![2]).toBe("unsaved");
+  });
+
+  // --- repeating (C11) ---
+
+  const repeat = () => screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / });
+  /** The rule the Repeat button names. */
+  const shownRepeat = () =>
+    repeat()
+      .getAttribute("aria-label")
+      ?.replace(/^Repeat: /, "");
+  const REPEATS = { name: "Repeat" };
+
+  /** Open the Repeat list, once the menu has its ready-made rules. */
+  async function openRepeat() {
+    await act(async () => {});
+    fireEvent.click(repeat());
+    return screen.getByRole("group", REPEATS);
+  }
+
+  /** Click the Repeat row whose words are `label`. */
+  async function pickRepeat(label: string) {
+    const list = await openRepeat();
+    fireEvent.click(within(list).getByRole("radio", { name: label }), { detail: 1 });
+    await act(async () => {});
+  }
+
+  it("a preset is sent with the create", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    // It starts on the day picked, so nothing says it moved.
+    expect(screen.queryByText(/the first day this repeat allows/)).toBeNull();
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Standup").draft, recurrence: weeklyOn("mon") }, null],
+    ]);
+  });
+
+  it("a repeat the backend refuses stops every save, and says why", async () => {
+    const GAP =
+      "The first occurrence would be on 29-03-2027, when the clocks skip that time. Pick a time outside that hour.";
+    describeRecurrence.mockResolvedValue({ outcome: "refused", message: GAP });
+    open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    expect(screen.getByText(GAP)).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+    title().focus();
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(title());
+  });
+
+  /** Give the Date field `text`, as typed and left. */
+  function typeDate(text: string) {
+    const date = screen.getByLabelText<HTMLInputElement>("Date");
+    date.focus();
+    fireEvent.change(date, { target: { value: text } });
+    fireEvent.blur(date);
+  }
+
+  // The time line already refuses a start the clocks skip, and the backend refuses a first
+  // occurrence on it in other words: said once.
+  it("a start the clocks skip is refused once, not again under Repeat", async () => {
+    const SKIPPED =
+      "The first occurrence would be on 28-03-2027, when the clocks skip that time. Pick a time outside that hour.";
+    describeRecurrence.mockResolvedValue({ outcome: "refused", message: SKIPPED });
+    open();
+    fireEvent.change(title(), { target: { value: "Swim" } });
+    typeDate("28-03-2027");
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "01:30" } });
+    await pickRepeat("Daily");
+    expect(screen.getAllByText(/the clocks skip/)).toHaveLength(1);
+    expect(screen.getByText(/^01:30 doesn't happen in Europe\/London that night/)).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+  });
+
+  // The backend lists and lands its occurrences inside the months PM syncs, wherever it starts.
+  it("a repeat that starts before the months PM syncs says only its occurrences there show", async () => {
+    open();
+    fireEvent.change(title(), { target: { value: "Gym" } });
+    typeDate("06-07-2026");
+    await pickRepeat("Weekly on Monday");
+    expect(
+      screen.getByText(
+        /^This starts before the months PM syncs \(.+\), so only its occurrences within them will show here\.$/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/won't show here/)).toBeNull();
+  });
+
+  it("moving the date moves a one-day weekly rule", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    const date = screen.getByLabelText<HTMLInputElement>("Date");
+    date.focus();
+    fireEvent.change(date, { target: { value: "13-10-2026" } });
+    fireEvent.blur(date);
+    await act(async () => {});
+    expect(shownRepeat()).toBe("Weekly on Tuesday");
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls[0][1].recurrence).toEqual(weeklyOn("tue"));
+  });
+
+  // The Repeat list stays inside the box, as in the full editor's dialog, and Escape there closes
+  // the list, never the box (even an empty one, which Escape in the box itself would close).
+  it("the Repeat list is inside the box, and Escape closes only it", async () => {
+    const { onClose } = open();
+    const list = await openRepeat();
+    expect(list.parentElement).toBe(screen.getByRole("dialog", { name: "New event" }));
+    const picked = within(list).getByRole("radio", { name: "Does not repeat" });
+    await waitFor(() => expect(document.activeElement).toBe(picked));
+    fireEvent.keyDown(picked, { key: "Escape" });
+    expect(screen.queryByRole("group", REPEATS)).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(repeat());
+  });
+
+  it("Custom… reached by the keyboard hands over on Enter, and an arrow key never does", async () => {
+    const { onMore } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    const list = await openRepeat();
+    const picked = within(list).getByRole("radio", { name: "Does not repeat" });
+    await waitFor(() => expect(document.activeElement).toBe(picked));
+    // The arrow keys go round the rules only: up from the first is the last.
+    fireEvent.keyDown(picked, { key: "ArrowUp" });
+    const last = within(list).getByRole("radio", { name: "Weekly on Monday" });
+    last.focus();
+    fireEvent.click(last, { detail: 0 });
+    await act(async () => {});
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    expect(onMore).not.toHaveBeenCalled();
+    // Tab reaches Custom…, and Enter (its click) hands over.
+    fireEvent.keyDown(last, { key: "Tab" });
+    const custom = within(list).getByRole("button", { name: "Custom…" });
+    expect(document.activeElement).toBe(custom);
+    expect(fireEvent.keyDown(custom, { key: "Enter" })).toBe(true);
+    fireEvent.click(custom, { detail: 0 });
+    expect(onMore).toHaveBeenCalledTimes(1);
+    expect(onMore.mock.lastCall![0]).toMatchObject({
+      draft: { recurrence: { kind: "rule", rule: weeklyOn("mon") } },
+      openCustom: true,
+    });
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it("Custom… hands over to the full editor with the custom dialog open, sending nothing", async () => {
+    const { onMore, onClose } = open();
+    fireEvent.change(title(), { target: { value: "Standup" } });
+    await pickRepeat("Weekly on Monday");
+    const list = await openRepeat();
+    fireEvent.click(within(list).getByRole("button", { name: "Custom…" }), { detail: 1 });
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onMore).toHaveBeenCalledWith({
+      draft: { ...seed, summary: "Standup", recurrence: { kind: "rule", rule: weeklyOn("mon") } },
+      calendarId: PERSONAL,
+      held: null,
+      unproven: null,
+      showAsTouched: false,
+      timeTouched: false,
+      badDate: null,
+      openCustom: true,
+    });
   });
 });

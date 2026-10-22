@@ -19,6 +19,13 @@
 //
 // Times are in this computer's zone (plan rule R6): when it can't be read, the times can't be
 // changed and nothing can be saved, rather than guessing UTC.
+//
+// It can repeat (C11): the Repeat row under When offers Google's ready-made rules for the start
+// date and Custom…, whose dialog opens inside this one. The backend says what a rule means at the
+// start: its words, the day it really starts on when the rule doesn't allow the one typed (said,
+// never written into the date fields; the save moves it), or why it can't be saved. Until it has
+// said so for exactly the rule and start on screen, nothing saves, by any way to save. A rule whose
+// day came from the start date follows the start when it moves.
 
 import {
   useCallback,
@@ -41,6 +48,7 @@ import {
   endTimeChoices,
   endsAfterStart,
   firstEndOnItsDate,
+  followStart,
   halfInstant,
   hasBadDate,
   refusedDateId,
@@ -65,12 +73,15 @@ import {
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
+import { repeatStartOf, startDateOf } from "../../../lib/calendarEdit/recurrenceDraft";
 import { isLetterKey } from "../../../lib/letterKey";
 import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
+import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
 import {
   NO_ZONE_CREATE,
+  RepeatRow,
   ShowAsControl,
   TextRow,
   VisibilitySelect,
@@ -79,6 +90,7 @@ import {
   type Timed,
 } from "./EventFields";
 import { createEvent, noteCreateResult, noteHeldCreate, type CreateSent } from "./useEventWrites";
+import { useRepeatView } from "./useRepeat";
 
 interface Props {
   /** The fields it starts with (`newEventSeed`): closing unchanged from these asks nothing. */
@@ -117,7 +129,14 @@ export interface CreateHandover {
   /** Text quick create's date field couldn't read: it stands here as the start's (Start date or
    *  First day), refusing a save until that field is given a date, as it did there. */
   badDate: string | null;
+  /** Quick create's Repeat row picked Custom…: the dialog opens here, over the full editor, since a
+   *  modal dialog over quick create's box would fight its click-outside rule. */
+  openCustom: boolean;
 }
+
+/** Where the Custom dialog was opened from: the Repeat row here (focus goes back to it), or quick
+ *  create's hand-over (focus goes to the title). */
+type CustomFrom = "row" | "handover";
 
 /** An answer that never arrived: its retry token, exactly what was sent, and the fields that were. */
 interface Held {
@@ -198,6 +217,10 @@ export function NewEventEditor({
   const [askDiscard, setAskDiscardState] = useState(false);
   const askDiscardRef = useRef(false);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
+  // The Custom dialog, while open: no save goes from behind it (Ctrl+S included).
+  const startCustom: CustomFrom | null = handover?.openCustom ? "handover" : null;
+  const customRef = useRef<CustomFrom | null>(startCustom);
+  const [custom, setCustomState] = useState<CustomFrom | null>(startCustom);
   const saveButton = useRef<HTMLButtonElement>(null);
   const titleBox = useRef<HTMLDivElement>(null);
   // The latest overview and hidden set, for the words an answer gets after the props moved on.
@@ -209,6 +232,8 @@ export function NewEventEditor({
   });
   // Whether this editor is still showing: an answer after it has gone is said as a notice instead.
   const alive = useRef(true);
+  // What the backend says of the repeat at this start; until it says it can be saved, nothing saves.
+  const repeat = useRepeatView(draft.recurrence, repeatStartOf(draft.time));
 
   const setDraft = (next: EditorFields) => {
     draftRef.current = next;
@@ -230,6 +255,10 @@ export function NewEventEditor({
     askDiscardRef.current = open;
     setAskDiscardState(open);
   };
+  const setCustom = (from: CustomFrom | null) => {
+    customRef.current = from;
+    setCustomState(from);
+  };
   const focusTitle = useCallback(
     () => titleBox.current?.querySelector<HTMLInputElement>("input")?.focus(),
     [],
@@ -237,9 +266,10 @@ export function NewEventEditor({
   const refocusSave = () => setTimeout(() => saveButton.current?.focus(), 0);
   const whereOf = (id: string) => createdWhere(overviewRef.current, hiddenRef.current, id);
 
-  // The title takes focus first (after the dialog's own first focus, which this runs after).
+  // The title takes focus first (after the dialog's own first focus, which this runs after), unless
+  // quick create handed over with the Custom dialog open, which has it.
   useEffect(() => {
-    focusTitle();
+    if (!customRef.current) focusTitle();
   }, [focusTitle]);
 
   useEffect(() => {
@@ -334,10 +364,20 @@ export function NewEventEditor({
     return endAfterStart(NEW_EVENT_BASE, moved, length);
   }
 
-  /** A time change by the user: from now on the time is theirs, whatever the calendar. */
+  /** The Custom dialog closed (Done, Cancel or Escape). Opened from the Repeat row, its focus trap
+   *  hands focus back to that row; opened by quick create's hand-over, there's nothing here it came
+   *  from, so the title takes it, as it would have on open. */
+  function closeCustom() {
+    const from = customRef.current;
+    setCustom(null);
+    if (from === "handover") setTimeout(focusTitle, 0);
+  }
+
+  /** A time change by the user: from now on the time is theirs, whatever the calendar. A rule whose
+   *  day came from the start date follows it. */
   function changeTime(next: EditorFields) {
     timeTouched.current = true;
-    setDraft(next);
+    setDraft(followStart(draftRef.current, next));
   }
 
   /** Another calendar. While the time is still the seed's, the end follows that account's length
@@ -353,9 +393,15 @@ export function NewEventEditor({
     }
   }
 
+  /** Whether the backend has said `fields`' repeat can be saved, for exactly its rule and start (a
+   *  date the blur before a save just committed is a new start, not yet asked about). */
+  const repeatReady = (fields: EditorFields) =>
+    repeat.saveable(fields.recurrence, repeatStartOf(fields.time));
+
   async function save() {
-    // Refused before anything is blurred: focus stays put (in the discard question too).
-    if (savingRef.current || askDiscardRef.current) return;
+    // Refused before anything is blurred: focus stays put (in the discard question, and the Custom
+    // dialog, too).
+    if (savingRef.current || askDiscardRef.current || customRef.current) return;
     const h = heldRef.current;
     // Without a zone a new draft can't go (that's said under the fields); a held one goes as sent.
     if (!h && deviceZone === null) return;
@@ -377,7 +423,8 @@ export function NewEventEditor({
         refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
         return;
       }
-      if (checkDraft(NEW_EVENT_BASE, current).problems.length > 0) {
+      // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row too.
+      if (checkDraft(NEW_EVENT_BASE, current).problems.length > 0 || !repeatReady(current)) {
         setBanner(null);
         refocus(focused);
         return;
@@ -470,11 +517,12 @@ export function NewEventEditor({
   // The End list resolves every quarter hour, so it's worked out once per time change.
   const endChoices = useMemo(() => (timed ? endTimeChoices(NEW_EVENT_BASE, timed) : []), [timed]);
   const endMin = useMemo(() => (timed ? endDateMin(NEW_EVENT_BASE, timed) : undefined), [timed]);
+  const repeatHolds = repeat.state.state === "loading" || repeat.state.state === "refused";
   // A date a field couldn't read is said under When, naming the field.
   const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...createNotes(draft.time, overview, hidden, calendarId),
+    ...createNotes(draft.time, draft.recurrence.kind === "rule", overview, hidden, calendarId),
     ...(noPrivate ? [PRIVATE_OFF] : []),
   ];
 
@@ -502,7 +550,8 @@ export function NewEventEditor({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && e.repeat) e.preventDefault();
               }}
-              disabled={saving || timeOff}
+              // Check again sends exactly what was sent, whatever the Repeat row says now.
+              disabled={saving || timeOff || (!held && repeatHolds)}
             >
               {saving ? (held ? "Checking…" : "Saving…") : held ? "Check again" : "Save"}
             </Button>
@@ -573,6 +622,18 @@ export function NewEventEditor({
             }
             canSwitchKind={!timeOff}
             onPickZone={setZonePick}
+            repeat={
+              <RepeatRow
+                value={draft.recurrence}
+                view={repeat.state}
+                time={draft.time}
+                deviceZone={deviceZone}
+                skippedTime={check.problems.some((p) => p.kind === "gap")}
+                disabled={!timeEditable}
+                onChange={(recurrence) => setDraft({ ...draftRef.current, recurrence })}
+                onCustom={() => setCustom("row")}
+              />
+            }
           />
           {zonePick && timeEditable && draft.time.kind === "timed" && (
             <ZonePanel
@@ -641,6 +702,19 @@ export function NewEventEditor({
             </p>
           ))}
         </div>
+        {/* Inside the editor's dialog, not beside it: nested, it alone is topmost, so one Escape
+            closes only it and Tab stays in it. */}
+        {custom && (
+          <CustomRecurrenceDialog
+            rule={draft.recurrence.kind === "rule" ? draft.recurrence.rule : null}
+            startDate={startDateOf(draft.time)}
+            onDone={(rule) => {
+              setDraft({ ...draftRef.current, recurrence: { kind: "rule", rule } });
+              closeCustom();
+            }}
+            onClose={closeCustom}
+          />
+        )}
       </Dialog>
 
       <ConfirmDialog

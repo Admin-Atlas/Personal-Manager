@@ -111,7 +111,12 @@ export function CalendarPicker({
           aria-label={`Calendar: ${label}`}
           aria-expanded={expanded}
           disabled={disabled}
-          onClick={toggle}
+          onClick={() => {
+            // A click on a Mac leaves focus where it was. The button takes it, so the list's Escape
+            // hands it back here.
+            triggerRef.current?.focus();
+            toggle();
+          }}
         >
           {picked && (
             <SourceDot
