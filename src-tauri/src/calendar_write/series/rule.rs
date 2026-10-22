@@ -647,16 +647,26 @@ pub(super) fn plan_all_rule(
             if !same {
                 body.insert("recurrence".into(), Value::from(rebuilt.lines.clone()));
             }
-            // A new rule that names no day (daily) has none to move: where it starts says it all.
-            if shift != 0 && day_phrase(&rebuilt.lines, &rebuilt.start).is_some() {
+            // A day moves only when it moves both ways of reading it: in the new series' days, as
+            // `shift` counts it (a move into another zone at the same moment moves none), and on
+            // the series' own wall, where the dialog reads its dates (the same time on the same
+            // day in another zone moves none either, though the zones' days differ at that
+            // moment; C11d review 4). Worded in the series' own wall days. A new rule that names
+            // no day (daily) has none to move: where it starts says it all.
+            let own_from = original.day_in(zone);
+            if shift != 0
+                && asked_day != own_from
+                && day_phrase(&rebuilt.lines, &rebuilt.start).is_some()
+            {
                 warnings.push(SeriesWarning::RepeatDayChanges {
-                    from,
+                    from: own_from,
                     to: asked_day,
                 });
             }
-            if rebuilt.start.date() != first_day {
+            let own_first = master.first.day_in(zone);
+            if rebuilt.start.date() != first_day && rebuilt.start.date() != own_first {
                 warnings.push(SeriesWarning::StartMoved {
-                    from: first_day,
+                    from: own_first,
                     to: rebuilt.start.date(),
                 });
             }

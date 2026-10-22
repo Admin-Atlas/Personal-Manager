@@ -3548,7 +3548,9 @@ mod tests {
     /// Weekly on Monday at 01:00 in London, which is Sunday evening in New York. Put in New York at
     /// 01:00 on the same Monday, it stays on Mondays, for every occurrence and from this one on: the
     /// day the series' own rule names is the one on the clock, wherever the rebuild reads days from
-    /// (C11c review). Kept at the same moment, Sunday in New York, its day moves: refused in words.
+    /// (C11c review). No day moved, so nothing asks to move every occurrence a day or says the
+    /// series' start moves (C11d review 4). Kept at the same moment, Sunday in New York, its day
+    /// moves: refused in words.
     #[test]
     fn a_zone_change_past_midnight_keeps_the_rules_own_day() {
         let late = master_with(
@@ -3563,6 +3565,38 @@ mod tests {
             body(&all.steps[0])["start"],
             json!({ "dateTime": "2026-10-05T01:00:00-04:00", "timeZone": "America/New_York" })
         );
+        assert!(!all.warnings.iter().any(|w| matches!(
+            w,
+            SeriesWarning::RepeatDayChanges { .. } | SeriesWarning::StartMoved { .. }
+        )));
+        // Moved on to Tuesday there too and made "Weekly on Tuesday", a day moves: both are said,
+        // in the series' own days, Monday to Tuesday and 05-10 to 06-10.
+        let tuesday = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Rule {
+                rule: crate::calendar_recur::wire::RepeatRule {
+                    pattern: crate::calendar_recur::wire::RepeatPattern::Weekly {
+                        days: vec![crate::calendar_recur::wire::DayCode::Tue],
+                    },
+                    interval: 1,
+                    ends: crate::calendar_recur::wire::RepeatEnds::Never,
+                },
+            }),
+            ..timed_in("2026-10-20", "01:00", "02:00", "America/New_York")
+        };
+        let moved = case.edit(Scope::All, tuesday).unwrap();
+        assert_eq!(
+            body(&moved.steps[0])["start"],
+            json!({ "dateTime": "2026-10-06T01:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        let day = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        assert!(moved.warnings.contains(&SeriesWarning::RepeatDayChanges {
+            from: day(19),
+            to: day(20)
+        }));
+        assert!(moved.warnings.contains(&SeriesWarning::StartMoved {
+            from: day(5),
+            to: day(6)
+        }));
         let rest = case.edit(Scope::Following, monday).unwrap();
         let new_part =
             json!({ "dateTime": "2026-10-19T01:00:00-04:00", "timeZone": "America/New_York" });
