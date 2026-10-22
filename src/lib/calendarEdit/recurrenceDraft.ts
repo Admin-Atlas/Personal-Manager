@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// A new event's repeat, as pure functions (#884, C11): the Repeat row's value, the Custom dialog's
+// An event's repeat, as pure functions (#884, C11): the Repeat row's value, the Custom dialog's
 // fields and the checks they get before anything is asked of the backend. A rule's words and the
 // ready-made rules come from the backend (the repeat menu's reads), so nothing here says a rule in
 // words except the dialog's own labels: its monthly choices and its yearly line, built from the same
@@ -409,6 +409,22 @@ export function repeatStartOf(time: TimeDraft): RepeatStart | null {
     zone: time.start_zone,
     end: { date: time.end_date, time: time.end_time, zone: time.end_zone },
   };
+}
+
+/** Where a new rule for an existing repeating event is read from (C11 critique 2 M6): the day its
+ *  first occurrence is on (`starts`, YYYY-MM-DD), at this occurrence's time and zone, since every
+ *  occurrence is rebuilt from there; a yearly rule on its own date from this occurrence's date, the
+ *  date it names. Null while a date is empty. */
+export function repeatingStartOf(
+  rule: RepeatRule,
+  starts: string,
+  time: TimeDraft,
+): RepeatStart | null {
+  const start = repeatStartOf(time);
+  if (!start || rule.pattern.kind === "yearly_date") return start;
+  return start.kind === "all_day"
+    ? { kind: "all_day", date: starts }
+    : { kind: "timed", date: starts, time: start.time, zone: start.zone };
 }
 
 /** The first day an event's time covers (YYYY-MM-DD): where a rule's own days are read from. */

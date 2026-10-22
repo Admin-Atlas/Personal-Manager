@@ -35,6 +35,11 @@ interface Props {
   /** The event's start date (YYYY-MM-DD): the defaults, the monthly choices and the yearly date
    *  come from it. */
   startDate: string;
+  /** The repeating event's first day (YYYY-MM-DD), when it's opened at a later occurrence: the end
+   *  date is checked against that, as a change to every occurrence would be (Google lets every
+   *  occurrence end before the one opened), and each choice then says whether it can (C11d review
+   *  5). Without it, against `startDate`. */
+  earliestEnd?: string;
   onDone: (rule: RepeatRule) => void;
   onClose: () => void;
 }
@@ -51,7 +56,7 @@ const NUMBER =
   "w-16 rounded-[var(--radius-sm)] border border-border2 bg-surface px-2 py-1 text-sm text-ink2 outline-none transition focus:border-accent disabled:cursor-not-allowed disabled:bg-transparent disabled:text-ink3";
 
 /** Rendered only while open (the parent mounts it), so its fields start afresh each time. */
-export function CustomRecurrenceDialog({ rule, startDate, onDone, onClose }: Props) {
+export function CustomRecurrenceDialog({ rule, startDate, earliestEnd, onDone, onClose }: Props) {
   const [first] = useState(() => formFromRule(rule, startDate));
   const [form, setForm] = useState<RepeatForm>(first);
   // Text the end date field couldn't read: it shows its date again, so Done waits until it's given
@@ -60,7 +65,11 @@ export function CustomRecurrenceDialog({ rule, startDate, onDone, onClose }: Pro
   const id = useId();
   const set = (patch: Partial<RepeatForm>) => setForm((f) => ({ ...f, ...patch }));
 
-  const made = ruleFromForm(form, startDate);
+  // ISO dates compare as strings; never later than `startDate`, so never stricter than it.
+  const made = ruleFromForm(
+    form,
+    earliestEnd !== undefined && earliestEnd < startDate ? earliestEnd : startDate,
+  );
   const problem =
     form.ends === "on_date" && badEnd !== null
       ? badDateText("End date", badEnd)

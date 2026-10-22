@@ -1054,7 +1054,8 @@ describe("QuickCreatePopover", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.keyDown(title(), { key: "Enter" });
     await screen.findByText("“Dentist” wasn't created: PM couldn't reach Google.");
-    expect(onDraft.mock.lastCall![2]).toBe("unsaved");
+    // The ghost hears of it from an effect that may run after the words are on screen.
+    await waitFor(() => expect(onDraft.mock.lastCall![2]).toBe("unsaved"));
   });
 
   // --- repeating (C11) ---

@@ -20,10 +20,12 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
-use super::dto::{EventPatchDraft, NewEventDraft, SeenSummary, Visibility};
+use super::dto::{EventPatchDraft, NewEventDraft, SeenSummary, TimeDraft, Visibility};
 use super::time::{self, TimeError};
 use crate::calendar_recur::expand::sync_start;
 use crate::calendar_recur::spec::{rule_from_spec, SpecError};
+use crate::calendar_recur::wire::RepeatRule;
+use crate::calendar_recur::SeriesStart;
 
 /// The only fields a single-event save sends.
 pub const PATCHABLE: &[&str] = &[
@@ -56,6 +58,9 @@ pub const CREATABLE: &[&str] = &[
 pub enum InsertError {
     Time(TimeError),
     Rule(SpecError),
+    /// A one-off given a repeat, its time left alone, whose start or end has no zone, with none to
+    /// read it in: not the calendar's, nor this computer's (C11d review 1).
+    NoEventZone,
 }
 
 impl fmt::Display for InsertError {
@@ -63,6 +68,10 @@ impl fmt::Display for InsertError {
         match self {
             InsertError::Time(e) => e.fmt(f),
             InsertError::Rule(e) => e.fmt(f),
+            InsertError::NoEventZone => write!(
+                f,
+                "PM can't tell which time zone this event is in, so it can't make it repeat."
+            ),
         }
     }
 }
@@ -132,6 +141,51 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
         body.insert("recurrence".into(), Value::from(vec![line]));
     }
     Ok(body)
+}
+
+/// Make a one-off repeat by `rule` (C11 §10): its `start`, `end` and `recurrence` into `body`, and
+/// the start it repeats from. The times are the draft's (`time`), or the event's own as the editor
+/// showed them ([`time::time_draft_of`]: each node's zone, else `fallback_zone`, the calendar's or
+/// else this computer's as the editor had it; never UTC, R6), moved to the first day the rule makes
+/// ([`sync_start`]) with their length kept, as a new repeating event's are. Both nodes are always
+/// sent, a timed one naming its `timeZone` (G6): Google's own node, which a save hands back for a
+/// half the user left alone, may have none. A switch between timed and all-day sends the other
+/// kind's keys as `null`, as any save does.
+pub fn add_repeat(
+    body: &mut Map<String, Value>,
+    fresh: &Value,
+    time: Option<&TimeDraft>,
+    rule: &RepeatRule,
+    fallback_zone: Option<&str>,
+) -> Result<SeriesStart, InsertError> {
+    let own;
+    let time = match time {
+        Some(time) => time,
+        // The editor opened on these very nodes in this very zone, so only a node with no zone, and
+        // no zone to read it in, can't be read here.
+        None => {
+            own = time::time_draft_of(fresh, fallback_zone.unwrap_or(""))
+                .ok_or(InsertError::NoEventZone)?;
+            &own
+        }
+    };
+    let spec = rule.to_spec()?;
+    let asked = time::series_start(time)?;
+    let synced = sync_start(&spec, &asked)?;
+    let moved = (synced.date() - asked.date()).num_days();
+    let when = time::resolve(&time::shifted(time, moved)?)?;
+    let line = rule_from_spec(&spec, &synced)?;
+    let (mut start, mut end) = (when.start, when.end);
+    let was_all_day = fresh.get("start").is_some_and(|s| s.get("date").is_some());
+    if was_all_day != when.all_day {
+        for node in [&mut start, &mut end] {
+            drop_other_kind(node);
+        }
+    }
+    body.insert("start".into(), start);
+    body.insert("end".into(), end);
+    body.insert("recurrence".into(), Value::from(vec![line]));
+    Ok(synced)
 }
 
 /// The PATCH body for `draft` against `fresh`, Google's current copy. Empty means Google already
@@ -1013,6 +1067,136 @@ mod tests {
         assert!(
             insert_body(&bad_time) == Err(InsertError::Time(TimeError::BadTime("late".into())))
         );
+    }
+
+    fn weekly_rule(days: &[DayCode]) -> RepeatRule {
+        RepeatRule {
+            pattern: RepeatPattern::Weekly {
+                days: days.to_vec(),
+            },
+            interval: 1,
+            ends: RepeatEnds::Never,
+        }
+    }
+
+    /// C11 §10: a one-off given a repeat, its time left alone, starts on the first day the rule
+    /// makes at its own wall time and length, both nodes naming their zone even where Google's own
+    /// had none; it repeats from there.
+    #[test]
+    fn a_repeat_given_to_a_one_off_starts_on_the_rules_first_day_with_its_zone() {
+        let mut bare = fresh();
+        bare["start"] = json!({ "dateTime": "2026-10-12T10:00:00+01:00" });
+        bare["end"] = json!({ "dateTime": "2026-10-12T11:30:00+01:00" });
+        let mut body = build_patch(&bare, &EventPatchDraft::default()).unwrap();
+        let start = add_repeat(
+            &mut body,
+            &bare,
+            None,
+            &weekly_rule(&[DayCode::Wed]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(start.date(), day(2026, 10, 14));
+        assert_eq!(
+            Value::Object(body),
+            json!({
+                "start": { "dateTime": "2026-10-14T10:00:00+01:00", "timeZone": "Europe/London" },
+                "end": { "dateTime": "2026-10-14T11:30:00+01:00", "timeZone": "Europe/London" },
+                "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=WE"],
+            })
+        );
+        // A node with no zone, and no zone to read it in, is never read as UTC (R6), and says so of
+        // the event, not this computer (C11d review 1).
+        let mut body = Map::new();
+        let refused = add_repeat(&mut body, &bare, None, &weekly_rule(&[DayCode::Wed]), None);
+        assert!(refused == Err(InsertError::NoEventZone));
+        assert!(body.is_empty(), "nothing built");
+        assert_eq!(
+            InsertError::NoEventZone.to_string(),
+            "PM can't tell which time zone this event is in, so it can't make it repeat."
+        );
+    }
+
+    /// C11d review 1: an all-day one-off given a repeat and a time clears its dates, as any save's
+    /// switch does.
+    #[test]
+    fn a_repeat_given_with_a_switch_to_timed_clears_the_other_kind() {
+        let mut all_day = fresh();
+        all_day["start"] = json!({ "date": "2026-10-12" });
+        all_day["end"] = json!({ "date": "2026-10-13" });
+        let at_ten = timed("2026-10-12", "10:00", "2026-10-12", "11:00");
+        let draft = EventPatchDraft {
+            time: Some(at_ten.clone()),
+            ..Default::default()
+        };
+        let mut body = build_patch(&all_day, &draft).unwrap();
+        add_repeat(
+            &mut body,
+            &all_day,
+            Some(&at_ten),
+            &weekly_rule(&[DayCode::Mon]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({
+                "dateTime": "2026-10-12T10:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(
+            body["end"],
+            json!({
+                "dateTime": "2026-10-12T11:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]));
+    }
+
+    /// The draft's own time wins, and a switch to all day clears the timed keys, as any save's does.
+    #[test]
+    fn a_repeat_given_with_a_switch_to_all_day_clears_the_other_kind() {
+        let all_day = TimeDraft::AllDay {
+            first_day: "2026-10-12".into(),
+            last_day: "2026-10-12".into(),
+        };
+        let draft = EventPatchDraft {
+            time: Some(all_day.clone()),
+            ..Default::default()
+        };
+        let mut body = build_patch(&fresh(), &draft).unwrap();
+        add_repeat(
+            &mut body,
+            &fresh(),
+            Some(&all_day),
+            &weekly_rule(&[DayCode::Mon]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "date": "2026-10-12", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "date": "2026-10-13", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]));
+        // A rule outside the limits builds nothing.
+        let mut body = Map::new();
+        let too_many = RepeatRule {
+            ends: RepeatEnds::After { count: 731 },
+            ..weekly_rule(&[DayCode::Mon])
+        };
+        assert!(
+            add_repeat(&mut body, &fresh(), None, &too_many, Some("Europe/London"))
+                == Err(InsertError::Rule(SpecError::TooMany))
+        );
+        assert!(body.is_empty());
     }
 
     /// Blank text is left out, so Google stores no empty strings; text with words in is sent as

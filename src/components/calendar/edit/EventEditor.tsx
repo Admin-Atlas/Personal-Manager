@@ -21,6 +21,14 @@
 // stops the save rather than vanishing, until that field is given a date: its line names it, and a
 // save it stops puts focus there. The fields themselves live in `EventFields`, shared with creating
 // an event (`NewEventEditor`).
+//
+// How it repeats can change here too (C11): the Repeat row starts as the repeating event's rule (or
+// its words, for one the menu can't make), and Custom… opens inside this dialog. A one-off given a
+// rule saves alone, once the backend has said where that rule really starts, or why it can't be
+// saved, for exactly the rule and start on screen. For an occurrence, the rule is the whole
+// repeating event's: the row only names it, the choices then say what each would do (never "This
+// event" alone), and a rule left as it was never stops a save. Moving the date carries along only a
+// rule picked here, never the repeating event's own, whose move is the choices' question.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -50,15 +58,24 @@ import {
   endTimeChoices,
   endsAfterStart,
   firstEndOnItsDate,
+  followStart,
   halfInstant,
   hasBadDate,
   rebaseDraft,
   refusedDateId,
+  repeatSeed,
   seedDraft,
   toChanges,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
+import {
+  ONCE,
+  repeatingStartOf,
+  repeatStartOf,
+  sameRepeat,
+  startDateOf,
+} from "../../../lib/calendarEdit/recurrenceDraft";
 import {
   ambiguousText,
   CALLOUT_TONE,
@@ -74,8 +91,10 @@ import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
+import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
 import {
   NO_ZONE,
+  RepeatRow,
   ShowAsControl,
   TextRow,
   VisibilitySelect,
@@ -84,6 +103,7 @@ import {
   type Timed,
 } from "./EventFields";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
+import { useRepeatView, type RepeatState } from "./useRepeat";
 import {
   choicesForEdit,
   noteSaved,
@@ -156,9 +176,15 @@ function unreachable(value: never): never {
 /** The first day a draft's time covers. */
 const firstDay = (t: TimeDraft) => (t.kind === "timed" ? t.start_date : t.first_day);
 
+/** Said under the Repeat row of an occurrence whose repeating event PM couldn't read. */
+export const UNREADABLE_REPEAT = "PM couldn't read how this repeats, so it can't change it here.";
+
 export function EventEditor({ row, calendar, account, milestone, onDelete, onClose }: Props) {
   const { showPower } = useDepth();
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
+  // The row is the safer sign of a repeating event: the series is null when Google's copy of it
+  // couldn't be read.
+  const rowRepeats = isRepeating(row);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [draft, setDraftState] = useState<EditorFields | null>(null);
@@ -193,6 +219,9 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   // Times this Save was asked again because the plan changed: once, then it says so.
   const againRef = useRef(0);
   const [settlingSplit, setSettlingSplit] = useState(false);
+  // The Custom dialog, while open: no save goes from behind it.
+  const customRef = useRef(false);
+  const [customOpen, setCustomOpenState] = useState(false);
   // Focus returns here whenever the choices close or a save stays open: the button was blurred
   // before the dialog opened, so the dialog's own restore has nowhere to go back to.
   const saveRef = useRef<HTMLButtonElement>(null);
@@ -202,6 +231,28 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     draftRef.current = next;
     setDraftState(next);
   };
+  const setCustomOpen = (open: boolean) => {
+    customRef.current = open;
+    setCustomOpenState(open);
+  };
+
+  // A repeating event: its row says so, or Google sent its series.
+  const repeating = rowRepeats || !!loaded?.series;
+  // What the backend is asked of the Repeat row's rule. A one-off's, at its own start: where it
+  // really starts, or why it can't be saved, and nothing saves until it has said so. A repeating
+  // event's own rule isn't asked (its words came with it); another one is, for its words only, from
+  // where the repeating event starts (C11 critique 2 M6).
+  const value = draft?.recurrence ?? ONCE;
+  const ownRule = repeating && !!loaded && sameRepeat(value, loaded.base.recurrence);
+  const askedStart =
+    !draft || ownRule
+      ? null
+      : !repeating
+        ? repeatStartOf(draft.time)
+        : value.kind === "rule" && loaded?.series
+          ? repeatingStartOf(value.rule, loaded.series.starts, draft.time)
+          : null;
+  const repeat = useRepeatView(value, askedStart);
 
   useEffect(() => {
     let alive = true;
@@ -212,7 +263,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           setLoadError(loadText(load));
           return;
         }
-        const base = seedDraft(load.event);
+        const base = seedDraft(load.event, repeatSeed(load.series, rowRepeats || !!load.series));
         setLoaded({
           session: load.session,
           event: load.event,
@@ -230,7 +281,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     return () => {
       alive = false;
     };
-  }, [row.id]);
+  }, [row.id, rowRepeats]);
 
   /** Commit whatever the focused field holds, so the draft read next is the one on screen. */
   function commitFocused() {
@@ -324,7 +375,8 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       setBanner({ tone: "error", text: loadText(fresh) });
       return;
     }
-    const r = rebaseDraft(loaded.base, seedDraft(fresh.event), draftRef.current);
+    const seed = repeatSeed(fresh.series, rowRepeats || !!fresh.series);
+    const r = rebaseDraft(loaded.base, seedDraft(fresh.event, seed), draftRef.current);
     setLoaded({
       session: fresh.session,
       event: fresh.event,
@@ -342,9 +394,24 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     });
   }
 
+  /** A time change by the user. A rule picked in this editor whose day came from the start date
+   *  follows it; the repeating event's own rule stays as it is, since its move is the choices'
+   *  question (`RepeatDayChanges`). */
+  function changeTime(next: EditorFields) {
+    const was = draftRef.current;
+    if (!loaded || !was || sameRepeat(next.recurrence, loaded.base.recurrence)) setDraft(next);
+    else setDraft(followStart(was, next));
+  }
+
+  /** Whether a one-off's repeat may be saved: no repeat, or a rule the backend called ready at
+   *  exactly the start of `fields` (a date the blur before a save just committed is a new start,
+   *  not yet asked about). A repeating event's never stops a save: each choice says what it does. */
+  const repeatReady = (fields: EditorFields) =>
+    repeating || repeat.saveable(fields.recurrence, repeatStartOf(fields.time));
+
   async function save() {
-    // Refused before anything is blurred, so focus stays put.
-    if (!loaded || saving || asking) return;
+    // Refused before anything is blurred, so focus stays put (in the Custom dialog too).
+    if (!loaded || saving || asking || customRef.current) return;
     const focused = document.activeElement;
     commitFocused();
     const current = draftRef.current;
@@ -361,7 +428,11 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
       return;
     }
-    if (checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
+    // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row.
+    if (
+      checkDraft(loaded.base, current, loaded.event).problems.length > 0 ||
+      !repeatReady(current)
+    ) {
       setBanner(null);
       refocus(focused);
       return;
@@ -379,8 +450,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       title: current.summary,
       from: firstDay(current.time),
     };
-    // The row is the safer trigger: the series is null when Google's copy of it couldn't be read.
-    if (isRepeating(row) || loaded.series !== null) void ask(what, false);
+    if (repeating) void ask(what, false);
     else await send(what, null);
   }
 
@@ -499,6 +569,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       if (outcome.outcome !== "needs_choice") heldNotice.current = null;
       switch (outcome.outcome) {
         case "saved":
+          // "Does not repeat" leaves one event, never a repeating one.
           noteSaved(
             what.title,
             outcome,
@@ -599,6 +670,19 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     () => (loaded && timed ? endDateMin(loaded.base, timed, loaded.event) : undefined),
     [loaded, timed],
   );
+  // The Repeat row's words: a repeating event's own rule in the words it came with, any other rule
+  // in the backend's. Only a one-off's repeat holds Save (`repeatReady`).
+  const series = loaded?.series ?? null;
+  const repeatView: RepeatState =
+    ownRule && series
+      ? { state: "ready", summary: series.repeats, starts: series.starts, moved: false }
+      : repeat.state;
+  // Its own rule keeps a row in the list whatever was picked since, so picking it again changes
+  // nothing (C11d review 1).
+  const standing =
+    loaded && series ? { value: loaded.base.recurrence, words: series.repeats } : null;
+  const repeatHolds =
+    !repeating && (repeat.state.state === "loading" || repeat.state.state === "refused");
 
   return (
     <>
@@ -630,7 +714,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               ref={saveRef}
               variant="primary"
               onClick={() => void save()}
-              disabled={!loaded || saving}
+              disabled={!loaded || saving || repeatHolds}
             >
               {saving ? "Saving…" : "Save"}
             </Button>
@@ -670,17 +754,40 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               endChoices={endChoices}
               endMin={endMin}
               disabled={!timeEditable}
-              onChange={(time) => setDraft({ ...draft, time })}
+              onChange={(time) => changeTime({ ...draft, time })}
               onRejectDate={(half, text) => setBadDates({ ...badDatesRef.current, [half]: text })}
               onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
               moveStart={moveStart}
               moveEndDate={moveEndDate}
+              // A time change like any other: a rule picked here follows the date it lands on.
               onSwitchKind={() =>
                 zoneFallback &&
-                setDraft({ ...draft, time: switchKind(draft.time, loaded.base.time, zoneFallback) })
+                changeTime({
+                  ...draft,
+                  time: switchKind(draft.time, loaded.base.time, zoneFallback),
+                })
               }
               canSwitchKind={!!zoneFallback}
               onPickZone={setZonePick}
+              repeat={
+                <RepeatRow
+                  value={draft.recurrence}
+                  view={repeatView}
+                  time={draft.time}
+                  // A repeating event repeats in its own zone, whichever this occurrence shows.
+                  zone={repeating ? (series?.zone ?? null) : undefined}
+                  deviceZone={deviceZone}
+                  skippedTime={!!check?.problems.some((p) => p.kind === "gap")}
+                  judge={!repeating}
+                  offReason={repeating && !series ? UNREADABLE_REPEAT : undefined}
+                  standing={standing}
+                  disabled={!timeEditable}
+                  onChange={(recurrence) =>
+                    draftRef.current && setDraft({ ...draftRef.current, recurrence })
+                  }
+                  onCustom={() => setCustomOpen(true)}
+                />
+              }
             />
             {zonePick && timeEditable && draft.time.kind === "timed" && (
               <ZonePanel
@@ -791,7 +898,22 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           </div>
         )}
         {/* Inside the editor's dialog, not beside it: nested, it alone is topmost, so one Escape
-            closes only it and Tab stays in it (C9b-1 critiques 1 M3, 2 L9). */}
+            closes only it and Tab stays in it (C9b-1 critiques 1 M3, 2 L9). Its focus goes back to
+            the Repeat row when it closes. */}
+        {customOpen && draft && (
+          <CustomRecurrenceDialog
+            rule={draft.recurrence.kind === "rule" ? draft.recurrence.rule : null}
+            startDate={startDateOf(draft.time)}
+            earliestEnd={repeating && loaded?.series ? loaded.series.starts : undefined}
+            onDone={(rule) => {
+              if (draftRef.current) {
+                setDraft({ ...draftRef.current, recurrence: { kind: "rule", rule } });
+              }
+              setCustomOpen(false);
+            }}
+            onClose={() => setCustomOpen(false)}
+          />
+        )}
         {asking && (
           <SaveChoicesDialog
             kind="save"

@@ -175,7 +175,14 @@ beforeEach(() => {
     pending_restore: null,
   });
   onBackupProgress.mockReturnValue(Promise.resolve(() => {}));
-  scorePassphrase.mockResolvedValue({ score: 4, acceptable: true, feedback: [] });
+  scorePassphrase.mockResolvedValue({
+    score: 4,
+    acceptable: true,
+    too_short: false,
+    padded: false,
+    warning: null,
+    suggestions: [],
+  });
   forgetBackupPassphrase.mockResolvedValue(undefined);
   protonDisconnect.mockResolvedValue(undefined);
   backupGdriveDisconnect.mockResolvedValue(undefined);

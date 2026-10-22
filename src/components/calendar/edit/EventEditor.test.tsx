@@ -9,7 +9,7 @@
 // before it goes, and what can't change is greyed out with a reason (no device zone included).
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CalendarEvent,
   EditLoad,
@@ -17,8 +17,13 @@ import type {
   EventPatchDraft,
   FieldPermissions,
   Milestone,
+  RepeatPreset,
+  RepeatRule,
+  RepeatStart,
+  RepeatView,
   ScopeRow,
   SeriesChoices,
+  SeriesInfo,
   SplitAction,
   WriteOutcome,
 } from "../../../lib/types";
@@ -40,6 +45,8 @@ const settleSplit =
   vi.fn<(token: string, action: SplitAction, title: string) => Promise<WriteOutcome | null>>();
 const noteSaved = vi.fn();
 const noteSeriesNotice = vi.fn();
+const recurrencePresets = vi.fn<(day: string) => Promise<RepeatPreset[]>>();
+const describeRecurrence = vi.fn<(rule: RepeatRule, start: RepeatStart) => Promise<RepeatView>>();
 let deviceZone: string | null = "Europe/London";
 
 vi.mock("./useEventWrites", () => ({
@@ -51,6 +58,13 @@ vi.mock("./useEventWrites", () => ({
     settleSplit(token, action, title),
   noteSaved: (...a: unknown[]) => noteSaved(...a),
   noteSeriesNotice: (text: string) => noteSeriesNotice(text),
+}));
+
+// The repeat menu's two reads, answered as each test says.
+vi.mock("../../../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  recurrencePresets: (day: string) => recurrencePresets(day),
+  describeRecurrence: (rule: RepeatRule, start: RepeatStart) => describeRecurrence(rule, start),
 }));
 
 vi.mock("../../../theme/timezones", async (importOriginal) => ({
@@ -67,7 +81,7 @@ vi.mock("../../../lib/markdown", () => ({
   Markdown: ({ children }: { children: string }) => <div>{children}</div>,
 }));
 
-import { EventEditor } from "./EventEditor";
+import { EventEditor, UNREADABLE_REPEAT } from "./EventEditor";
 
 const row: CalendarEvent = {
   id: "gcal:me@x.com:me@x.com:abc",
@@ -155,8 +169,50 @@ async function open(
 /** A one-off's save: no scope, and the draft's title for its notices. */
 const UNSCOPED = [null, "Dentist"] as const;
 
+/** A rule from the repeat menu's set: `pattern`, every week or day, never ending. */
+const ruleOf = (pattern: RepeatRule["pattern"], interval = 1): RepeatRule => ({
+  pattern,
+  interval,
+  ends: { kind: "never" },
+});
+const DAILY = ruleOf({ kind: "daily" });
+const MONDAYS = ruleOf({ kind: "weekly", days: ["mon"] });
+const TUESDAYS = ruleOf({ kind: "weekly", days: ["tue"] });
+const MON_WED = ruleOf({ kind: "weekly", days: ["mon", "wed"] });
+
+/** The ready-made rules for a start date, as the backend gives them (the first two are enough). */
+function presetsFor(day: string): RepeatPreset[] {
+  return [
+    { label: "Daily", rule: DAILY },
+    day === "2026-10-13"
+      ? { label: "Weekly on Tuesday", rule: TUESDAYS }
+      : { label: "Weekly on Monday", rule: MONDAYS },
+  ];
+}
+
+/** The backend's answer for a rule that starts where asked. */
+const readyAt = (start: RepeatStart, summary = "Weekly on Monday"): RepeatView => ({
+  outcome: "ready",
+  summary,
+  starts: start.date,
+  moved: false,
+});
+
+// jsdom ships no ResizeObserver, and the Repeat list's popover (escapeClipping) builds one.
+beforeAll(() => {
+  if (!("ResizeObserver" in globalThis)) {
+    (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  }
+});
+
 beforeEach(() => {
   deviceZone = "Europe/London";
+  recurrencePresets.mockImplementation(async (day) => presetsFor(day));
+  describeRecurrence.mockImplementation(async (_rule, start) => readyAt(start));
 });
 
 afterEach(() => {
@@ -1185,6 +1241,463 @@ describe("EventEditor, a repeating event", () => {
     expect(saveEdit).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
     await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+});
+
+// Changing how it repeats (C11d): a one-off given a rule saves alone once the backend has said where
+// it starts; an occurrence's rule is its repeating event's, so the choices ask, with "This event"
+// refused for a new one, and the event's own rule, in its own words, never stops a save or follows a
+// moved date.
+describe("EventEditor, how it repeats", () => {
+  const occurrence: CalendarEvent = { ...row, series_id: "abc", recurring: true };
+  const offered = (token: string): ScopeRow => ({ row: "offered", warnings: [], token });
+  const RULE_IS_SERIES_WIDE = "Changing how it repeats can't apply to just this occurrence.";
+  const choices = (over: Partial<Extract<SeriesChoices, { outcome: "ready" }>> = {}) =>
+    ({
+      outcome: "ready",
+      this: { row: "refused", message: RULE_IS_SERIES_WIDE },
+      following: offered("t-following"),
+      all: offered("t-all"),
+      ...over,
+    }) as SeriesChoices;
+  const series = (over: Partial<SeriesInfo> = {}): SeriesInfo => ({
+    first: false,
+    repeats: "Weekly on Monday",
+    rule: MONDAYS,
+    starts: "2026-10-05",
+    zone: "Europe/London",
+    ...over,
+  });
+  const repeatingLoad = (over: Partial<SeriesInfo> = {}, ev = event()) =>
+    ({ ...ready(ev), series: series(over) }) as EditLoad;
+  /** A timed event on `date`, 09:00 to 10:00 in London. */
+  const timedOn = (date: string): EventForEdit["time"] => ({
+    kind: "timed",
+    start_date: date,
+    start_time: "09:00",
+    start_zone: "Europe/London",
+    end_date: date,
+    end_time: "10:00",
+    end_zone: "Europe/London",
+  });
+
+  const repeat = () => screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / });
+  const editorSave = () => screen.getByRole<HTMLButtonElement>("button", { name: "Save" });
+  /** The rule the Repeat button names. */
+  const shownRepeat = () =>
+    repeat()
+      .getAttribute("aria-label")
+      ?.replace(/^Repeat: /, "");
+
+  /** Click the Repeat row whose words are `label`, once the menu has its ready-made rules, and let
+   *  the backend's words for it land. */
+  async function pickRepeat(label: string) {
+    await act(async () => {});
+    fireEvent.click(repeat());
+    const list = screen.getByRole("group", { name: "Repeat" });
+    fireEvent.click(within(list).getByRole("radio", { name: label }), { detail: 1 });
+    await act(async () => {});
+  }
+
+  it("a rule change on an occurrence asks with This event refused and nothing pre-selected", async () => {
+    openForEdit.mockResolvedValue(repeatingLoad());
+    choicesForEdit.mockResolvedValue(choices());
+    // The words for the new rule never come: an occurrence's save doesn't wait for them.
+    describeRecurrence.mockReturnValue(new Promise<RepeatView>(() => {}));
+    await open(vi.fn(), undefined, occurrence);
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    await pickRepeat("Daily");
+    // Read from where the repeating event starts, at this occurrence's time.
+    expect(describeRecurrence).toHaveBeenLastCalledWith(DAILY, {
+      kind: "timed",
+      date: "2026-10-05",
+      time: "09:00",
+      zone: "Europe/London",
+    });
+    expect(editorSave().disabled).toBe(false);
+    fireEvent.click(editorSave());
+    const d = within(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    await d.findByRole("radio", { name: /^All events/ });
+    expect(choicesForEdit).toHaveBeenCalledWith("s1", {
+      recurrence: { kind: "rule", rule: DAILY },
+    });
+    expect(d.getByRole<HTMLInputElement>("radio", { name: /^This event/ }).disabled).toBe(true);
+    expect(d.getAllByRole<HTMLInputElement>("radio").some((r) => r.checked)).toBe(false);
+    expect(
+      d.getAllByText((_, el) => !!el?.textContent?.endsWith(RULE_IS_SERIES_WIDE)).length,
+    ).toBeGreaterThan(0);
+    expect(d.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+  });
+
+  // Where a new rule starts, or why it can't, depends on which occurrences it's for: each choice says
+  // it, never the Repeat row.
+  it("a repeating event's new rule says nothing of where it starts under the row", async () => {
+    const GAP =
+      "The first occurrence would be on 29-03-2027, when the clocks skip that time. Pick a time outside that hour.";
+    for (const view of [
+      { outcome: "refused", message: GAP },
+      { outcome: "ready", summary: "Daily", starts: "2026-10-06", moved: true },
+    ] as RepeatView[]) {
+      openForEdit.mockResolvedValue(repeatingLoad());
+      describeRecurrence.mockResolvedValue(view);
+      await open(vi.fn(), undefined, occurrence);
+      await pickRepeat("Daily");
+      expect(screen.queryByText(GAP)).toBeNull();
+      expect(screen.queryByText(/^Starts on /)).toBeNull();
+      expect(editorSave().disabled).toBe(false);
+      cleanup();
+    }
+  });
+
+  it("Does not repeat on an occurrence sends the once draft with the picked scope", async () => {
+    openForEdit.mockResolvedValue(repeatingLoad());
+    choicesForEdit.mockResolvedValue(choices());
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), undefined, occurrence);
+    await pickRepeat("Does not repeat");
+    fireEvent.click(editorSave());
+    const d = within(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    fireEvent.click(await d.findByRole("radio", { name: /^All events/ }));
+    fireEvent.click(d.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { recurrence: { kind: "once" } },
+      { scope: "all", token: "t-all", asAll: false },
+      "Dentist",
+    );
+    // Its notice says one event is left (C11d review 1).
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Dentist",
+      { outcome: "saved", warnings: [] },
+      "all",
+      "2026-10-12",
+      true,
+      false,
+    );
+  });
+
+  // Google lets every occurrence end before the one opened: Custom… checks the end date against the
+  // repeating event's first day, never this occurrence's, and the choices say what each would do
+  // (C11d review 5).
+  it("Custom… on a later occurrence takes an end date between the first and it", async () => {
+    openForEdit.mockResolvedValue(repeatingLoad());
+    choicesForEdit.mockResolvedValue(choices());
+    await open(vi.fn(), undefined, occurrence);
+    await act(async () => {});
+    fireEvent.click(repeat());
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Repeat" })).getByRole("button", {
+        name: "Custom…",
+      }),
+      { detail: 1 },
+    );
+    const custom = within(await screen.findByRole("dialog", { name: "Custom recurrence" }));
+    fireEvent.click(custom.getByLabelText("On"));
+    const end = custom.getByLabelText<HTMLInputElement>("End date");
+    // Before the first occurrence, Monday 05-10: said, and Done waits.
+    for (const [text, refused] of [
+      ["04-10-2026", true],
+      ["08-10-2026", false],
+    ] as const) {
+      end.focus();
+      fireEvent.change(end, { target: { value: text } });
+      fireEvent.blur(end);
+      expect(!!custom.queryByText("The end date is before the first occurrence.")).toBe(refused);
+      expect(custom.getByRole<HTMLButtonElement>("button", { name: "Done" }).disabled).toBe(
+        refused,
+      );
+    }
+    // After the first, before this one (Monday 12-10): it goes.
+    fireEvent.click(custom.getByRole("button", { name: "Done" }));
+    await act(async () => {});
+    expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
+    fireEvent.click(editorSave());
+    await screen.findByRole("dialog", { name: "Edit repeating event" });
+    expect(choicesForEdit).toHaveBeenCalledWith("s1", {
+      recurrence: {
+        kind: "rule",
+        rule: { ...MONDAYS, ends: { kind: "on_date", date: "2026-10-08" } },
+      },
+    });
+  });
+
+  it("a one-off given a preset saves without the dialog", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    expect(shownRepeat()).toBe("Does not repeat");
+    await pickRepeat("Weekly on Monday");
+    // Read at the event's own start, with where it ends.
+    expect(describeRecurrence).toHaveBeenLastCalledWith(MONDAYS, {
+      kind: "timed",
+      date: "2026-10-12",
+      time: "09:00",
+      zone: "Europe/London",
+      end: { date: "2026-10-12", time: "10:00", zone: "Europe/London" },
+    });
+    fireEvent.click(editorSave());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { recurrence: { kind: "rule", rule: MONDAYS } },
+      ...UNSCOPED,
+    );
+    expect(choicesForEdit).not.toHaveBeenCalled();
+  });
+
+  it("a one-off given Mon, Wed on a Tuesday says it starts Wednesday", async () => {
+    openForEdit.mockResolvedValue(ready(event({ time: timedOn("2026-10-13") })));
+    describeRecurrence.mockResolvedValue({
+      outcome: "ready",
+      summary: "Weekly on Monday and Wednesday",
+      starts: "2026-10-14",
+      moved: true,
+    });
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    await act(async () => {});
+    fireEvent.click(repeat());
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Repeat" })).getByRole("button", {
+        name: "Custom…",
+      }),
+      { detail: 1 },
+    );
+    const custom = within(await screen.findByRole("dialog", { name: "Custom recurrence" }));
+    // Weekly on the start's own Tuesday to begin with: Monday and Wednesday instead.
+    for (const day of ["Tuesday", "Monday", "Wednesday"]) {
+      fireEvent.click(custom.getByRole("button", { name: day }));
+    }
+    fireEvent.click(custom.getByRole("button", { name: "Done" }));
+    await act(async () => {});
+    expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
+    expect(shownRepeat()).toBe("Weekly on Monday and Wednesday");
+    expect(
+      screen.getByText(/^Starts on Wed 14-10(-2026)?, the first day this repeat allows\.$/),
+    ).toBeTruthy();
+    // Said, never written into the date: the save moves it.
+    expect(screen.getByLabelText<HTMLInputElement>("Start date").value).toBe("13-10-2026");
+    fireEvent.click(editorSave());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { recurrence: { kind: "rule", rule: MON_WED } },
+      ...UNSCOPED,
+    );
+  });
+
+  it("a one-off's repeat the backend refuses holds Save, and one it hasn't said yet too", async () => {
+    const GAP =
+      "The first occurrence would be on 29-03-2027, when the clocks skip that time. Pick a time outside that hour.";
+    openForEdit.mockResolvedValue(ready(event()));
+    describeRecurrence.mockResolvedValue({ outcome: "refused", message: GAP });
+    await open();
+    await pickRepeat("Weekly on Monday");
+    expect(screen.getByText(GAP)).toBeTruthy();
+    expect(editorSave().disabled).toBe(true);
+    // A start typed and saved at once was never asked about: the save waits for its words.
+    let answer: (v: RepeatView) => void = () => {};
+    describeRecurrence.mockImplementation((_rule, start) =>
+      start.date === "2026-10-19"
+        ? new Promise<RepeatView>((r) => (answer = r))
+        : Promise.resolve(readyAt(start)),
+    );
+    await pickRepeat("Daily");
+    expect(editorSave().disabled).toBe(false);
+    const date = screen.getByLabelText<HTMLInputElement>("Start date");
+    date.focus();
+    fireEvent.change(date, { target: { value: "19-10-2026" } });
+    fireEvent.click(editorSave());
+    await act(async () => {});
+    expect(saveEdit).not.toHaveBeenCalled();
+    await act(async () => answer({ outcome: "refused", message: GAP }));
+    expect(saveEdit).not.toHaveBeenCalled();
+    // Not repeating, it saves as any change does.
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    await pickRepeat("Does not repeat");
+    expect(editorSave().disabled).toBe(false);
+  });
+
+  it("holds every save while the Custom dialog is open", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    await act(async () => {});
+    fireEvent.click(repeat());
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Repeat" })).getByRole("button", {
+        name: "Custom…",
+      }),
+      { detail: 1 },
+    );
+    await screen.findByRole("dialog", { name: "Custom recurrence" });
+    // Behind the dialog, so out of reach but for a click that gets there anyway.
+    fireEvent.click(screen.getByRole("button", { name: "Save", hidden: true }));
+    await act(async () => {});
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Custom recurrence" })).toBeTruthy();
+    // Escape closes only it: the editor stays, asking nothing, its repeat as it was.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Edit event" })).toBeTruthy();
+    expect(screen.queryByText("Discard your changes?")).toBeNull();
+    expect(shownRepeat()).toBe("Does not repeat");
+    await waitFor(() => expect(document.activeElement).toBe(repeat()));
+  });
+
+  it("an unreadable repeating event disables Repeat with the reason", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open(vi.fn(), undefined, occurrence);
+    expect(shownRepeat()).toBe("Repeats");
+    expect(repeat().disabled).toBe(true);
+    expect(screen.getByText(UNREADABLE_REPEAT)).toBeTruthy();
+    // Everything else still changes.
+    expect(screen.getByLabelText<HTMLInputElement>("Title").disabled).toBe(false);
+  });
+
+  it("a custom rule shows its words and stays unless replaced", async () => {
+    // One from the menu's set that no ready-made rule is, and one PM can only show.
+    for (const over of [
+      { repeats: "Every 2 weeks on Monday", rule: ruleOf({ kind: "weekly", days: ["mon"] }, 2) },
+      { repeats: "Repeats (custom rule)", rule: null },
+    ]) {
+      openForEdit.mockResolvedValue(repeatingLoad(over));
+      choicesForEdit.mockResolvedValue(choices({ this: offered("t-this") }));
+      await open(vi.fn(), undefined, occurrence);
+      await act(async () => {});
+      expect(shownRepeat()).toBe(over.repeats);
+      // Its own words came with it: nothing to ask.
+      expect(describeRecurrence).not.toHaveBeenCalled();
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+      fireEvent.click(editorSave());
+      await screen.findByRole("dialog", { name: "Edit repeating event" });
+      expect(choicesForEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" });
+      cleanup();
+      vi.clearAllMocks();
+    }
+    // Replaced, the new rule is sent.
+    openForEdit.mockResolvedValue(repeatingLoad({ repeats: "Repeats (custom rule)", rule: null }));
+    choicesForEdit.mockResolvedValue(choices());
+    await open(vi.fn(), undefined, occurrence);
+    await pickRepeat("Weekly on Monday");
+    fireEvent.click(editorSave());
+    await screen.findByRole("dialog", { name: "Edit repeating event" });
+    expect(choicesForEdit).toHaveBeenLastCalledWith("s1", {
+      recurrence: { kind: "rule", rule: MONDAYS },
+    });
+  });
+
+  it("the zone note uses the repeating event's zone", async () => {
+    // Shown in London here, it repeats in New York's.
+    openForEdit.mockResolvedValue(repeatingLoad({ zone: "America/New_York" }));
+    await open(vi.fn(), undefined, occurrence);
+    expect(screen.getByText("Repeats in New York time.")).toBeTruthy();
+    cleanup();
+    deviceZone = "America/New_York";
+    await open(vi.fn(), undefined, occurrence);
+    expect(screen.queryByText(/^Repeats in /)).toBeNull();
+    cleanup();
+    // One that repeats by days has no zone to say.
+    deviceZone = "Europe/London";
+    openForEdit.mockResolvedValue(repeatingLoad({ zone: null }));
+    await open(vi.fn(), undefined, occurrence);
+    expect(screen.queryByText(/^Repeats in /)).toBeNull();
+    cleanup();
+    // A rule PM can only show repeats in its event's zone too (C11d review 1).
+    openForEdit.mockResolvedValue(
+      repeatingLoad({ rule: null, repeats: "Repeats (custom rule)", zone: "America/New_York" }),
+    );
+    await open(vi.fn(), undefined, occurrence);
+    expect(shownRepeat()).toBe("Repeats (custom rule)");
+    expect(screen.getByText("Repeats in New York time.")).toBeTruthy();
+  });
+
+  // C11d review 1: the event's own rule keeps its row once the list has closed on another, as in
+  // Google's list, so picking it again changes nothing.
+  it("the event's own rule can be picked again after the list closed on another", async () => {
+    for (const over of [
+      { repeats: "Every 2 weeks on Monday", rule: ruleOf({ kind: "weekly", days: ["mon"] }, 2) },
+      { repeats: "Repeats (custom rule)", rule: null },
+    ]) {
+      openForEdit.mockResolvedValue(repeatingLoad(over));
+      choicesForEdit.mockResolvedValue(choices({ this: offered("t-this") }));
+      await open(vi.fn(), undefined, occurrence);
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+      await act(async () => {});
+      fireEvent.click(repeat());
+      // An arrow key moves the choice to "Does not repeat" (a click no pointer made); Escape closes.
+      const once = within(screen.getByRole("group", { name: "Repeat" })).getByRole("radio", {
+        name: "Does not repeat",
+      });
+      once.focus();
+      fireEvent.click(once, { detail: 0 });
+      fireEvent.keyDown(once, { key: "Escape" });
+      expect(screen.queryByRole("group", { name: "Repeat" })).toBeNull();
+      expect(shownRepeat()).toBe("Does not repeat");
+      await pickRepeat(over.repeats);
+      expect(shownRepeat()).toBe(over.repeats);
+      fireEvent.click(editorSave());
+      await screen.findByRole("dialog", { name: "Edit repeating event" });
+      expect(choicesForEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" });
+      cleanup();
+      vi.clearAllMocks();
+    }
+  });
+
+  // C11d review 1: switched back to the kind Google holds, the time is Google's again, and a rule
+  // picked here follows the date it lands on, as it follows any other time change.
+  it("a picked rule follows the date switching All day back restores", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    await pickRepeat("Weekly on Monday");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    const first = screen.getByLabelText<HTMLInputElement>("First day");
+    first.focus();
+    fireEvent.change(first, { target: { value: "13-10-2026" } });
+    fireEvent.blur(first);
+    await act(async () => {});
+    expect(shownRepeat()).toBe("Weekly on Tuesday");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    await act(async () => {});
+    expect(screen.getByLabelText<HTMLInputElement>("Start date").value).toBe("12-10-2026");
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    // Google's time again, so only the rule goes, on the day it shows.
+    fireEvent.click(editorSave());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { recurrence: { kind: "rule", rule: MONDAYS } },
+      ...UNSCOPED,
+    );
+  });
+
+  it("moving the date doesn't rewrite an untouched series rule", async () => {
+    openForEdit.mockResolvedValue(repeatingLoad());
+    choicesForEdit.mockResolvedValue(choices({ this: offered("t-this") }));
+    await open(vi.fn(), undefined, occurrence);
+    const date = screen.getByLabelText<HTMLInputElement>("Start date");
+    date.focus();
+    fireEvent.change(date, { target: { value: "13-10-2026" } });
+    fireEvent.blur(date);
+    await act(async () => {});
+    // Its own rule, in its own words, whatever the day.
+    expect(shownRepeat()).toBe("Weekly on Monday");
+    fireEvent.click(editorSave());
+    await screen.findByRole("dialog", { name: "Edit repeating event" });
+    expect(choicesForEdit.mock.calls[0][1]).not.toHaveProperty("recurrence");
+    cleanup();
+    // A rule picked here follows the date, as a new event's does.
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    await pickRepeat("Weekly on Monday");
+    const moved = screen.getByLabelText<HTMLInputElement>("Start date");
+    moved.focus();
+    fireEvent.change(moved, { target: { value: "13-10-2026" } });
+    fireEvent.blur(moved);
+    await act(async () => {});
+    expect(shownRepeat()).toBe("Weekly on Tuesday");
   });
 });
 

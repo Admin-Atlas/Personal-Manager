@@ -3,7 +3,7 @@
 
 // The event fields both editors share (#884): changing an event (`EventEditor`) and creating one
 // (`NewEventEditor`) show the same title, When, zone and choice controls, so they live here once.
-// The Repeat row is here too, for creating (C11): the full editor and quick create both draw it.
+// The Repeat row is here too (C11): both editors and quick create draw it.
 //
 // Time fields never use `<input type="time">` (WebKitGTK has no widget): TimeField and DateField.
 
@@ -26,7 +26,7 @@ import { Button, Input, SegmentedControl, Select, Textarea, Toggle, useFieldA11y
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { ZoneSearchList } from "../ZoneSearchList";
-import { RecurrenceSelect } from "./RecurrenceSelect";
+import { RecurrenceSelect, type Standing } from "./RecurrenceSelect";
 import type { RepeatState } from "./useRepeat";
 
 export type Timed = Extract<TimeDraft, { kind: "timed" }>;
@@ -370,13 +370,18 @@ export function WhenFields({
  *  rule moves it (A27), why the rule can't be saved, and the zone it repeats in when that isn't this
  *  computer's (a weekly 09:00 in New York moves in London's weeks around the clocks changing). What
  *  the backend says of the rule (`view`) is the editor's to ask, since it also stops the editor's
- *  saves. */
+ *  saves. For an existing repeating event the row only names the rule (`judge` off): where each
+ *  choice of occurrences starts, or why it can't, is that choice's to say. */
 export function RepeatRow({
   value,
   view,
   time,
+  zone: repeatsIn,
   deviceZone,
   skippedTime,
+  judge = true,
+  offReason,
+  standing,
   disabled,
   compact,
   onChange,
@@ -385,11 +390,20 @@ export function RepeatRow({
   value: RepeatValue;
   view: RepeatState;
   time: TimeDraft;
+  /** The zone it repeats in, for the note, when that isn't its start's: an existing repeating
+   *  event's own (null for one that repeats by days). */
+  zone?: string | null;
   /** This computer's zone, which the zone note compares the event's with. */
   deviceZone: string | null;
   /** The editor already refuses a start or end the clocks skip. The rule's own refusal then waits
    *  until the time is fixed: for a first occurrence on that day it says the same in other words. */
   skippedTime: boolean;
+  /** Say where the rule really starts, and why it can't be saved (a new event, a one-off). */
+  judge?: boolean;
+  /** Why the row is off, said under it: PM couldn't read how this event repeats. */
+  offReason?: string;
+  /** An existing repeating event's own rule, which the list always keeps a row for. */
+  standing?: Standing | null;
   disabled: boolean;
   compact?: boolean;
   onChange: (value: RepeatValue) => void;
@@ -397,9 +411,9 @@ export function RepeatRow({
   onCustom: () => void;
 }) {
   // A rule repeats in its start's zone; an all-day one in none.
-  const zone = time.kind === "timed" ? time.start_zone : null;
+  const zone = repeatsIn !== undefined ? repeatsIn : time.kind === "timed" ? time.start_zone : null;
   const note =
-    value.kind === "rule" && zone !== null && deviceZone !== null && zone !== deviceZone
+    value.kind !== "once" && zone !== null && deviceZone !== null && zone !== deviceZone
       ? `Repeats in ${cityOf(zone)} time.`
       : null;
   return (
@@ -407,19 +421,23 @@ export function RepeatRow({
       <RecurrenceSelect
         value={value}
         startDate={startDateOf(time) || null}
-        disabled={disabled}
+        disabled={disabled || offReason !== undefined}
         compact={compact}
         ruleWords={view.state === "ready" ? view.summary : null}
+        standing={standing}
         onChange={onChange}
         onCustom={onCustom}
       />
       {/* Always mounted, so a screen reader hears where it starts, or why it can't be saved. */}
       <div aria-live="polite" className="text-xs">
-        {view.state === "ready" && view.moved && (
+        {judge && view.state === "ready" && view.moved && (
           <p className="text-ink4">{movedStartText(view.starts)}</p>
         )}
-        {view.state === "refused" && !skippedTime && <p className="text-st-due">{view.message}</p>}
+        {judge && view.state === "refused" && !skippedTime && (
+          <p className="text-st-due">{view.message}</p>
+        )}
       </div>
+      {offReason && <p className="text-xs text-ink4">{offReason}</p>}
       {note && <p className="text-xs text-ink4">{note}</p>}
     </div>
   );

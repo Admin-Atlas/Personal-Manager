@@ -620,8 +620,16 @@ pub enum SeriesRefusal {
     /// On this day the series' time falls in the hour the clocks skip, so the rest of it can't
     /// start there.
     SplitInGap(NaiveDate),
-    /// A whole series moved into another zone.
-    ZoneChange,
+    /// Every occurrence between all-day and timed, or into another zone, and to another day, in one
+    /// save: rebuilt from its own rule, which names its days, it can't move them too (C11 §12.4).
+    KindAndDay,
+    /// The same from an occurrence moved to another day on its own and left there: the user moved
+    /// no day, but the rule's own days still can't follow it (C11d review 1).
+    KindFromMovedDay,
+    /// Every occurrence between all-day and timed, or into another zone, of a series whose first
+    /// occurrence, on this day, is one its own rule doesn't make: rebuilt from that rule, it would
+    /// lose that occurrence. Only every occurrence's plan reaches it (C11d review 2).
+    KindStartNotOnRule(NaiveDate),
     /// A part PM split off this series from this day is still there, and the series still repeats
     /// past it ([`parts_overlap`]).
     SplitOverlap(NaiveDate),
@@ -718,10 +726,27 @@ impl fmt::Display for SeriesRefusal {
                  start the new part there. Change this occurrence on its own.",
                 day.format("%d-%m-%Y")
             ),
-            SeriesRefusal::ZoneChange => write!(
+            // Both shown on the "this and following" row as well as "all events": no "every
+            // occurrence" (C11d review 1).
+            SeriesRefusal::KindAndDay => write!(
                 f,
-                "PM can't move every occurrence of a repeating event into another time zone. \
-                 Change this occurrence on its own."
+                "PM can't move these occurrences to another day and change them between all-day \
+                 and timed, or into another time zone, in one save. Change the day in one save and \
+                 the rest in another."
+            ),
+            SeriesRefusal::KindFromMovedDay => write!(
+                f,
+                "This occurrence was moved to another day on its own, so PM can't change other \
+                 occurrences from it between all-day and timed, or into another time zone. Change \
+                 it on its own, or from an occurrence on its usual day."
+            ),
+            // The user moved nothing: unlike a move's own refusal, it names only the change asked.
+            SeriesRefusal::KindStartNotOnRule(day) => write!(
+                f,
+                "This repeating event starts on {}, a day its own rule doesn't repeat on, so PM \
+                 can't change every occurrence between all-day and timed, or into another time \
+                 zone. Change this occurrence on its own.",
+                day.format("%d-%m-%Y")
             ),
             SeriesRefusal::SplitOverlap(day) => write!(
                 f,

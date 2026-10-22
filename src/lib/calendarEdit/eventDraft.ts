@@ -9,7 +9,9 @@
 // `checkDraft` catches what can be caught before a round trip (an end before its start, a time the
 // clocks skip), mirroring the backend's `calendar_write::time`, which has the final say. `rebaseDraft`
 // carries a draft onto a newer copy after a conflict: the user's edits stay, except where Google
-// changed the same field, where Google's value wins and the editor says so.
+// changed the same field, where Google's value wins and the editor says so. How an event repeats is
+// one more field (C11): it starts as its repeating event's rule (`repeatSeed`), and a change to it is
+// sent as the rule chosen or "Does not repeat".
 //
 // Creating an event uses the same fields: `newEventSeed` starts one, it's judged against
 // `NEW_EVENT_BASE` (nothing to keep, so every half is checked), and `toNewEvent` sends all of it,
@@ -21,6 +23,7 @@ import type {
   EventVisibility,
   FieldPermissions,
   NewEventDraft,
+  SeriesInfo,
   ShowAs,
   TimeDraft,
 } from "../types";
@@ -41,7 +44,7 @@ export interface EditorFields {
   location: string;
   description: string;
   time: TimeDraft;
-  /** How it repeats: the Repeat row, which only creating draws so far. */
+  /** How it repeats: the Repeat row. */
   recurrence: RepeatValue;
   show_as: ShowAs;
   visibility: EventVisibility;
@@ -60,19 +63,28 @@ export const EDITOR_FIELDS: readonly EditorField[] = [
   "visibility",
 ];
 
-/** The editor's starting fields: Google's copy as it is. Its repeat starts as "Does not repeat",
- *  even for an occurrence of a repeating event: the editor has no Repeat row for an existing event
- *  yet, so nothing reads it and nothing can change it. */
-export function seedDraft(event: EventForEdit): EditorFields {
+/** The editor's starting fields: Google's copy as it is, and how it repeats (`repeatSeed`), which a
+ *  one-off has none of. */
+export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): EditorFields {
   return {
     summary: event.summary,
     location: event.location,
     description: event.description,
     time: { ...event.time },
-    recurrence: ONCE,
+    recurrence: repeat,
     show_as: event.show_as,
     visibility: event.visibility,
   };
+}
+
+/** How the Repeat row of an existing event starts (C11): its repeating event's rule when it is one
+ *  of the menu's, else that event's own words, which can only be replaced; "Repeats" for an
+ *  occurrence whose repeating event PM couldn't read. A repeating event never starts as "Does not
+ *  repeat", which would read as a change to it; only a one-off does. */
+export function repeatSeed(series: SeriesInfo | null, repeating: boolean): RepeatValue {
+  if (series?.rule) return { kind: "rule", rule: copyRule(series.rule) };
+  if (series) return { kind: "kept", words: series.repeats };
+  return repeating ? { kind: "kept", words: "Repeats" } : ONCE;
 }
 
 /** A textarea hands back `\n` whatever Google stored, so `\r\n` and `\n` are the same text: without
@@ -132,9 +144,14 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
       case "time":
         changes.time = { ...draft.time };
         break;
-      // An existing event's repeat can't change yet (`seedDraft`), so there is none to send.
-      case "recurrence":
+      // The rule chosen, or "Does not repeat". A rule PM can only show is the event's own, never
+      // one changed to, so there's nothing of it to send.
+      case "recurrence": {
+        const r = draft.recurrence;
+        if (r.kind === "rule") changes.recurrence = { kind: "rule", rule: copyRule(r.rule) };
+        else if (r.kind === "once") changes.recurrence = { kind: "once" };
         break;
+      }
       case "show_as":
         changes.show_as = draft.show_as;
         break;

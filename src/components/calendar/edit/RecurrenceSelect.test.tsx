@@ -27,7 +27,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
-import { RecurrenceSelect } from "./RecurrenceSelect";
+import { RecurrenceSelect, type Standing } from "./RecurrenceSelect";
 
 const rule = (pattern: RepeatRule["pattern"]): RepeatRule => ({
   pattern,
@@ -79,10 +79,12 @@ interface Opts {
   words?: (value: RepeatValue) => string | null;
   /** The parent takes every change, as the editors do; otherwise it keeps its value. */
   follow?: boolean;
+  /** An existing event's own rule, as the event editor gives it. */
+  standing?: Standing;
 }
 
 /** The menu inside a dialog, as both editors hold it, with the value it's given. */
-function mount(start: RepeatValue, { words = () => null, follow = true }: Opts = {}) {
+function mount(start: RepeatValue, { words = () => null, follow = true, standing }: Opts = {}) {
   const onChange = vi.fn();
   const onCustom = vi.fn();
   let setValue: (v: RepeatValue) => void = () => {};
@@ -96,6 +98,7 @@ function mount(start: RepeatValue, { words = () => null, follow = true }: Opts =
           startDate="2026-10-13"
           disabled={disabled}
           ruleWords={words(value)}
+          standing={standing}
           onChange={(v) => {
             onChange(v);
             if (follow) set(v);
@@ -436,6 +439,39 @@ describe("RecurrenceSelect", () => {
     expect(shown()).toBe("Daily");
     await openList();
     expect(rows()).not.toContain("Repeats (custom rule)");
+  });
+
+  // C11d review 1: an existing event's own rule, when no ready-made rule is it, keeps a row of its
+  // own whatever the list closed on, as Google keeps it, so it can be picked back as it was.
+  it("an existing event's own rule keeps its row after the list closes on another", async () => {
+    const kept: RepeatValue = { kind: "kept", words: "Repeats (custom rule)" };
+    for (const [own, words] of [
+      [kept, "Repeats (custom rule)"],
+      [monWed, MON_WED],
+    ] as const) {
+      const { onChange } = mount(own, { standing: { value: own, words } });
+      await openList();
+      arrowTo("Does not repeat");
+      fireEvent.keyDown(checked()!, { key: "Escape" });
+      expect(list()).toBeNull();
+      expect(shown()).toBe("Does not repeat");
+      await openList();
+      expect(rows()).toEqual(["Does not repeat", ...PRESETS.map((p) => p.label), words]);
+      fireEvent.click(radio(words), { detail: 1 });
+      expect(onChange).toHaveBeenLastCalledWith(own);
+      expect(shown()).toBe(words);
+      // Closed on a ready-made rule, it's still there, once.
+      await openList();
+      fireEvent.click(radio("Daily"), { detail: 1 });
+      await openList();
+      expect(rows().filter((r) => r === words)).toHaveLength(1);
+      cleanup();
+    }
+    // A ready-made rule of its own has that rule's row and no other.
+    const weekly: RepeatValue = { kind: "rule", rule: PRESETS[1].rule };
+    mount(weekly, { standing: { value: weekly, words: "Weekly on Tuesday" } });
+    await openList();
+    expect(rows()).toHaveLength(6);
   });
 
   it("presets still loading never show Does not repeat as picked for a rule", async () => {

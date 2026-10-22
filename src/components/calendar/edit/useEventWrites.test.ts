@@ -1041,7 +1041,7 @@ describe("a repeating event", () => {
       ),
     );
     expect(hook.result.current.notices[2].text).toBe(
-      "Saved “Gym” as one event that doesn't repeat, on 05-10. To change it back, edit it again.",
+      "Saved “Gym” as one event that doesn't repeat, on 05-10. There's no Undo: to make it repeat again, edit it and pick a repeat.",
     );
   });
 });

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.154.0-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "You can now change how an event repeats. Open an event that happens once and pick a repeat under its date and time, and it repeats from then on. On a repeating event, pick a new repeat and choose whether it applies from that occurrence on or to every occurrence, as Google Calendar asks.",
+      "You can also switch every occurrence of a repeating event between all-day and timed, or move them all into another time zone, from any one of them. Occurrences you deleted stay deleted, and PM says before saving where a new repeat starts if it moves. Stopping a repeating event from repeating comes in a later update.",
+    ],
+  },
+  {
     version: "3.153.1-alpha",
     date: "2026-10-20",
     highlights: [

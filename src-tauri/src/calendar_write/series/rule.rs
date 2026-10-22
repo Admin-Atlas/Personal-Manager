@@ -647,16 +647,26 @@ pub(super) fn plan_all_rule(
             if !same {
                 body.insert("recurrence".into(), Value::from(rebuilt.lines.clone()));
             }
-            // A new rule that names no day (daily) has none to move: where it starts says it all.
-            if shift != 0 && day_phrase(&rebuilt.lines, &rebuilt.start).is_some() {
+            // A day moves only when it moves both ways of reading it: in the new series' days, as
+            // `shift` counts it (a move into another zone at the same moment moves none), and on
+            // the series' own wall, where the dialog reads its dates (the same time on the same
+            // day in another zone moves none either, though the zones' days differ at that
+            // moment; C11d review 4). Worded in the series' own wall days. A new rule that names
+            // no day (daily) has none to move: where it starts says it all.
+            let own_from = original.day_in(zone);
+            if shift != 0
+                && asked_day != own_from
+                && day_phrase(&rebuilt.lines, &rebuilt.start).is_some()
+            {
                 warnings.push(SeriesWarning::RepeatDayChanges {
-                    from,
+                    from: own_from,
                     to: asked_day,
                 });
             }
-            if rebuilt.start.date() != first_day {
+            let own_first = master.first.day_in(zone);
+            if rebuilt.start.date() != first_day && rebuilt.start.date() != own_first {
                 warnings.push(SeriesWarning::StartMoved {
-                    from: first_day,
+                    from: own_first,
                     to: rebuilt.start.date(),
                 });
             }
@@ -782,10 +792,13 @@ fn stop_body(ask: StopAsk) -> Result<SeriesPlan, NotPlanned> {
         day: rule_start.date(),
     });
     // The draft moved this occurrence to another day, so the one kept moves as far: no other line
-    // says it leaves its own day (`shift` is the draft's, 0 without one).
-    if shift != 0 {
+    // says it leaves its own day (`shift` is the draft's, 0 without one). As for a new rule, a day
+    // moves only when it moves on the series' own wall too, where the dialog reads its dates, and
+    // it's worded in those days (C11d review 5).
+    let own_kept = kept.day_in(zone);
+    if shift != 0 && rule_start.date() != own_kept {
         warnings.push(SeriesWarning::StartMoved {
-            from: kept_day,
+            from: own_kept,
             to: rule_start.date(),
         });
     }
@@ -2945,7 +2958,8 @@ mod tests {
 
     /// C11c review round 3: "Does not repeat" for every occurrence moved into Tokyo keeps the first
     /// at its own moment, in the draft's days. Monday 05-10 23:30 in London is Tuesday 06-10 07:30
-    /// there, and nothing says it moves; moved a day on there, it moves from that Tuesday.
+    /// there, and nothing says it moves; moved a day on there, it moves, worded in the series' own
+    /// days as the dialog reads them: from Monday 05-10 (C11d review 5).
     #[test]
     fn all_does_not_repeat_into_another_zone_keeps_the_first_at_its_moment() {
         let once = |time: TimeDraft| EventPatchDraft {
@@ -2988,7 +3002,7 @@ mod tests {
                     day: day(2026, 10, 7)
                 },
                 SeriesWarning::StartMoved {
-                    from: day(2026, 10, 6),
+                    from: day(2026, 10, 5),
                     to: day(2026, 10, 7)
                 }
             ]

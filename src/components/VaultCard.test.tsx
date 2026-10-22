@@ -37,7 +37,14 @@ vi.mock("../lib/ipc", () => ({
   makeVaultPrivate: (...args: unknown[]) => makeVaultPrivate(...(args as [])),
   vaultStatus: () => vaultStatus(),
   // Children.
-  scorePassphrase: vi.fn(async () => ({ score: 4, acceptable: true, feedback: [] })),
+  scorePassphrase: vi.fn(async () => ({
+    score: 4,
+    acceptable: true,
+    too_short: false,
+    padded: false,
+    warning: null,
+    suggestions: [],
+  })),
   acknowledgeDeletedSharedVault: vi.fn(),
   repairVaultAccess: vi.fn(),
   vaultFaultOf: () => null,

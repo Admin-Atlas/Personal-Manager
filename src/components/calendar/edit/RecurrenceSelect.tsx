@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The Repeat menu (#884, C11): a button naming the rule the Repeat value holds, opening a list in
-// Google Calendar's order: "Does not repeat", the ready-made rules for the event's start date and the
-// current rule when it is none of them (in the backend's words), as radios, then "Custom…", a button
-// of its own. Google's Repeat control is a list of this kind too. A native select can't be trusted
-// here: WebKit and Chromium track its changes differently, so it could show a rule the draft didn't
-// hold, or open Custom… on an arrow key passing over it (C11 critique 2 M9).
+// Google Calendar's order: "Does not repeat", the ready-made rules for the event's start date, the
+// rule an existing event repeats by when it is none of them (always there, in its own words, as
+// Google keeps it), and the current rule when it is none of these (in the backend's words), as
+// radios, then "Custom…", a button of its own. Google's Repeat control is a list of this kind too. A
+// native select can't be trusted here: WebKit and Chromium track its changes differently, so it
+// could show a rule the draft didn't hold, or open Custom… on an arrow key passing over it (C11
+// critique 2 M9).
 //
 // It works as the calendar list does (CalendarPicker). The list stays inside the editor's dialog,
 // where its focus trap and screen readers reach it, and opening puts focus on the rule picked. The
@@ -29,9 +31,18 @@ interface Props {
   compact?: boolean;
   /** The words for a rule that isn't a ready-made one (the backend's), shown as its own row. */
   ruleWords: string | null;
+  /** The rule an existing event repeats by, in its own words: a row of its own whatever the list
+   *  last closed on, unless a ready-made rule is it, so picking it again puts it back as it was. */
+  standing?: Standing | null;
   onChange: (value: RepeatValue) => void;
   /** "Custom…" was picked: the parent opens the dialog. The value stays as it was. */
   onCustom: () => void;
+}
+
+/** An existing event's own rule, and its words. */
+export interface Standing {
+  value: RepeatValue;
+  words: string;
 }
 
 /** A row of the list: its words, and the value picking it gives. */
@@ -62,6 +73,7 @@ export function RecurrenceSelect({
   disabled,
   compact = false,
   ruleWords,
+  standing = null,
   onChange,
   onCustom,
 }: Props) {
@@ -83,22 +95,29 @@ export function RecurrenceSelect({
 
   const isPreset = (v: RepeatValue) =>
     v.kind === "rule" && !!presets?.some((p) => sameRule(p.rule, v.rule));
-  // A rule that is no ready-made one (or whose ready-made ones are still loading, so it never
+  // The event's own rule, when no ready-made rule is it: always a row, so a list closed on another
+  // never loses it, as Google keeps it (C11d review 1).
+  const standingRow: Row | null =
+    standing && standing.value.kind !== "once" && !isPreset(standing.value)
+      ? { key: "standing", value: standing.value, words: standing.words }
+      : null;
+  const listed = (v: RepeatValue) =>
+    v.kind === "once" || isPreset(v) || (!!standingRow && same(standingRow.value, v));
+  // A rule that is none of those rows (or whose ready-made ones are still loading, so it never
   // flickers to "Does not repeat"), or one PM can only show: its own row. Moved off it, the rule held
   // when the list opened keeps its row until the list closes.
-  const own: Row | null =
-    value.kind === "once" || isPreset(value)
-      ? held && !isPreset(held.value)
-        ? held
-        : null
-      : {
-          key: "own",
-          value,
-          words:
-            value.kind === "kept"
-              ? value.words
-              : (ruleWords ?? (held && same(held.value, value) ? held.words : "Repeats")),
-        };
+  const own: Row | null = listed(value)
+    ? held && !listed(held.value)
+      ? held
+      : null
+    : {
+        key: "own",
+        value,
+        words:
+          value.kind === "kept"
+            ? value.words
+            : (ruleWords ?? (held && same(held.value, value) ? held.words : "Repeats")),
+      };
   const rows: Row[] = [
     { key: "once", words: "Does not repeat", value: ONCE },
     ...(presets ?? []).map((p, i): Row => ({
@@ -106,6 +125,7 @@ export function RecurrenceSelect({
       words: p.label,
       value: { kind: "rule", rule: p.rule },
     })),
+    ...(standingRow ? [standingRow] : []),
     ...(own ? [own] : []),
   ];
   // The button names the rule held, worked out from the value alone, so it can never show another.

@@ -11,7 +11,6 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::calendar_recur::lines::TextOnly;
-use crate::calendar_recur::remap::RetimeError;
 use crate::calendar_recur::{Point, RecurError};
 
 use super::super::dto::{EventPatchDraft, SeriesScope, TimeDraft};
@@ -59,15 +58,14 @@ pub enum RuleChange {
     Stop,
 }
 
+/// A new time, as far as the choice cares. A move between all-day and timed, or into another zone,
+/// is one like any other here: every occurrence follows it, rebuilt from the series' rule (C11
+/// §12.4), and its planner says where that can't be done.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TimeChange {
     /// Measured from where the occurrence came from, not where it is now (T7).
     pub date_moved: bool,
     pub length_changed: bool,
-    /// Between timed and all-day.
-    pub kind_changed: bool,
-    /// The user picked another zone for the start.
-    pub zone_changed: bool,
 }
 
 impl Change {
@@ -96,15 +94,15 @@ impl Change {
         };
         if let (Some(draft_time), true) = (&draft.time, body.contains_key("start")) {
             let when = time::resolve_against(draft_time, it.get("start"), it.get("end"))?;
-            change.time = Some(time_change(draft_time, &when.start, &when.end, it, master));
+            change.time = Some(time_change(&when.start, &when.end, it, master));
         }
         Ok(change)
     }
 }
 
 /// Whether a timed draft puts the occurrence's start or end in a zone other than its own (an end
-/// with no zone of its own is in the start's): a whole series follows it only when a new rule
-/// rebuilds the series (C11c), until C11d rebuilds it from its own rule too.
+/// with no zone of its own is in the start's): the series' rule can't follow it, so every occurrence
+/// is rebuilt from it in the new zone (C11 §12.4).
 pub(super) fn zones_changed(draft: &TimeDraft, instance: &Value) -> bool {
     let TimeDraft::Timed {
         start_zone,
@@ -125,20 +123,9 @@ pub(super) fn zones_changed(draft: &TimeDraft, instance: &Value) -> bool {
     own_start.is_some_and(|own| own != start_zone) || own_end.is_some_and(|own| own != end_zone)
 }
 
-fn time_change(
-    draft: &TimeDraft,
-    start: &Value,
-    end: &Value,
-    instance: &Value,
-    master: &Master,
-) -> TimeChange {
+fn time_change(start: &Value, end: &Value, instance: &Value, master: &Master) -> TimeChange {
     let (new_start, new_end) = (point_of(Some(start)), point_of(Some(end)));
     let zone = master.start.zone();
-    let kind_changed = matches!(
-        (master.length, new_start),
-        (Length::Timed(_), Some(Point::Day(_))) | (Length::AllDay(_), Some(Point::At(_)))
-    );
-    let zone_changed = zones_changed(draft, instance);
     let date_moved = match (original_of(instance), new_start) {
         (Some(o), Some(n)) => o.day_in(zone) != n.day_in(zone),
         _ => true,
@@ -153,8 +140,6 @@ fn time_change(
     TimeChange {
         date_moved,
         length_changed,
-        kind_changed,
-        zone_changed,
     }
 }
 
@@ -165,10 +150,6 @@ pub enum ScopeReason {
     VisibilityIsSeriesWide,
     /// PM shows this series' rule as text only, so it can't move or cut it.
     TextOnly(TextOnly),
-    /// Between timed and all-day, or into another zone, for more than one occurrence, with the
-    /// series' own rule (until C11d; a new rule rebuilds the series in any kind and zone).
-    KindChange,
-    ZoneChange,
     /// A new rule, or none, can't apply to one occurrence (C11).
     RuleIsSeriesWide,
 }
@@ -179,8 +160,6 @@ impl fmt::Display for ScopeReason {
         match self {
             ScopeReason::VisibilityIsSeriesWide => SeriesRefusal::VisibilityIsSeriesWide.fmt(f),
             ScopeReason::TextOnly(why) => RecurError::TextOnly(why.clone()).fmt(f),
-            ScopeReason::KindChange => RetimeError::KindChange.fmt(f),
-            ScopeReason::ZoneChange => SeriesRefusal::ZoneChange.fmt(f),
             ScopeReason::RuleIsSeriesWide => SeriesRefusal::RuleIsSeriesWide.fmt(f),
         }
     }
@@ -216,20 +195,13 @@ pub fn scope_options(change: &Change, first: bool, text_only: Option<&TextOnly>)
     if change.rule.is_some() {
         this = Row::Refused(ScopeReason::RuleIsSeriesWide);
     }
-    // A new rule replaces the old one whole, in any kind and zone, so the series' own rule (or a
-    // kind or zone it can't follow yet) doesn't stand in its way (C11 §9.2).
-    if let (Some(t), None) = (change.time, change.rule) {
-        let series_wide = if t.kind_changed {
-            Some(ScopeReason::KindChange)
-        } else if t.zone_changed {
-            Some(ScopeReason::ZoneChange)
-        } else {
-            text_only.cloned().map(ScopeReason::TextOnly)
-        };
-        if let Some(why) = series_wide {
-            following = Row::Refused(why.clone());
-            all = Row::Refused(why);
-        }
+    // A new time moves the series' rule, which a rule PM can only show can't be. A new rule replaces
+    // the old one whole, so it doesn't stand in the way then (C11 §9.2). A move between all-day and
+    // timed, or into another zone, rebuilds every occurrence from the rule (C11 §12.4): offered like
+    // any move, its planner refusing in words what it can't rebuild.
+    if let (Some(_), None, Some(why)) = (change.time, change.rule, text_only) {
+        following = Row::Refused(ScopeReason::TextOnly(why.clone()));
+        all = Row::Refused(ScopeReason::TextOnly(why.clone()));
     }
     // Cutting a series needs its rule, whatever the change.
     if let Some(why) = text_only {
@@ -315,8 +287,6 @@ mod tests {
             Some(TimeChange {
                 date_moved: false,
                 length_changed: false,
-                kind_changed: false,
-                zone_changed: false
             })
         );
         let next_day_longer = change(EventPatchDraft {
@@ -328,28 +298,9 @@ mod tests {
             Some(TimeChange {
                 date_moved: true,
                 length_changed: true,
-                kind_changed: false,
-                zone_changed: false
             })
         );
-        let elsewhere = change(EventPatchDraft {
-            time: Some(timed("2026-10-12", "04:00", "05:00", "America/New_York")),
-            ..Default::default()
-        });
-        assert!(elsewhere.time.unwrap().zone_changed);
-        // C8b review G7: an end put in another zone is a zone change too.
-        let end_elsewhere = change(EventPatchDraft {
-            time: Some(TimeDraft::Timed {
-                start_date: "2026-10-12".into(),
-                start_time: "10:00".into(),
-                start_zone: "Europe/London".into(),
-                end_date: "2026-10-12".into(),
-                end_time: "12:00".into(),
-                end_zone: "Europe/Paris".into(),
-            }),
-            ..Default::default()
-        });
-        assert!(end_elsewhere.time.unwrap().zone_changed);
+        // Another zone, or the other kind, is a new time like any other here (C11 §12.4).
         let all_day = change(EventPatchDraft {
             time: Some(TimeDraft::AllDay {
                 first_day: "2026-10-12".into(),
@@ -357,7 +308,31 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert!(all_day.time.unwrap().kind_changed);
+        assert!(all_day.time.is_some());
+        // Which the planners rebuild every occurrence for, as they read it. C8b review G7: an end
+        // put in another zone is a zone change too.
+        let instance = plain("2026-10-12T09:00:00+01:00");
+        let end_in_paris = TimeDraft::Timed {
+            start_date: "2026-10-12".into(),
+            start_time: "10:00".into(),
+            start_zone: "Europe/London".into(),
+            end_date: "2026-10-12".into(),
+            end_time: "12:00".into(),
+            end_zone: "Europe/Paris".into(),
+        };
+        for (draft, zoned) in [
+            (
+                timed("2026-10-12", "04:00", "05:00", "America/New_York"),
+                true,
+            ),
+            (end_in_paris, true),
+            (
+                timed("2026-10-12", "10:00", "11:00", "Europe/London"),
+                false,
+            ),
+        ] {
+            assert_eq!(zones_changed(&draft, &instance), zoned);
+        }
     }
 
     /// T10.
@@ -386,35 +361,22 @@ mod tests {
             scope_options(&visibility, false, None).this,
             Row::Refused(ScopeReason::VisibilityIsSeriesWide)
         );
-        // Timed ↔ all-day, or another zone, for one occurrence only.
-        for (t, why) in [
-            (
-                TimeChange {
-                    kind_changed: true,
-                    ..Default::default()
-                },
-                ScopeReason::KindChange,
-            ),
-            (
-                TimeChange {
-                    zone_changed: true,
-                    ..Default::default()
-                },
-                ScopeReason::ZoneChange,
-            ),
-        ] {
-            let o = scope_options(
-                &Change {
-                    time: Some(t),
-                    ..Default::default()
-                },
-                false,
-                None,
-            );
-            assert_eq!(o.this, Row::Offered);
-            assert_eq!(o.following, Row::Refused(why.clone()));
-            assert_eq!(o.all, Row::Refused(why));
-        }
+        // A new time, of either kind and in any zone (C11 §12.4), on every row.
+        let moved = Change {
+            time: Some(TimeChange {
+                date_moved: true,
+                length_changed: true,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            scope_options(&moved, false, None),
+            ScopeOptions {
+                this: Row::Offered,
+                following: Row::Offered,
+                all: Row::Offered
+            }
+        );
         // A rule PM shows as text: its time and its cut can't change, its text can.
         let custom = TextOnly::Part("BYSETPOS".into());
         let o = scope_options(&text, false, Some(&custom));
@@ -454,12 +416,6 @@ mod tests {
             "PM can't change how this event repeats: its rule uses BYSETPOS, which PM doesn't \
              change."
         );
-        assert!(ScopeReason::KindChange
-            .to_string()
-            .contains("between all-day and timed"));
-        assert!(ScopeReason::ZoneChange
-            .to_string()
-            .contains("another time zone"));
         assert_eq!(
             ScopeReason::RuleIsSeriesWide.to_string(),
             "Changing how it repeats can't apply to just this occurrence."
@@ -529,50 +485,45 @@ mod tests {
         }
     }
 
-    /// C11c: a change between timed and all-day, or into another zone, goes to every occurrence only
-    /// with a new rule, which rebuilds the series in it.
+    /// C11 §12.4: a change between timed and all-day, or into another zone, goes to every occurrence
+    /// or from this one on, with the series' own rule or a new one, rebuilt in it. A rule PM can only
+    /// show still can't be moved there.
     #[test]
-    fn a_new_rule_with_a_kind_change_is_offered() {
-        for t in [
-            TimeChange {
-                kind_changed: true,
-                ..Default::default()
-            },
-            TimeChange {
-                zone_changed: true,
-                ..Default::default()
-            },
-        ] {
-            let o = scope_options(
-                &Change {
-                    time: Some(t),
-                    rule: Some(RuleChange::New),
+    fn scope_rows_no_longer_refuse_kind_or_zone() {
+        use crate::calendar_recur::wire::DayCode;
+        let all_day = TimeDraft::AllDay {
+            first_day: "2026-10-12".into(),
+            last_day: "2026-10-12".into(),
+        };
+        let new_york = timed("2026-10-12", "09:00", "10:00", "America/New_York");
+        let custom = TextOnly::Part("BYSETPOS".into());
+        for time in [all_day, new_york] {
+            for draft in [
+                EventPatchDraft {
+                    time: Some(time.clone()),
                     ..Default::default()
                 },
-                false,
-                None,
-            );
-            assert_eq!((o.following, o.all), (Row::Offered, Row::Offered));
+                EventPatchDraft {
+                    time: Some(time.clone()),
+                    ..repeat(&[DayCode::Tue])
+                },
+            ] {
+                let c = change(draft);
+                assert!(c.time.is_some());
+                let o = scope_options(&c, false, None);
+                assert_eq!((o.following, o.all), (Row::Offered, Row::Offered));
+                // Its own rule unreadable, only a new one can take it there.
+                let o = scope_options(&c, false, Some(&custom));
+                let refused = Row::Refused(ScopeReason::TextOnly(custom.clone()));
+                assert_eq!(o.following, refused);
+                let all = if c.rule.is_some() {
+                    Row::Offered
+                } else {
+                    refused
+                };
+                assert_eq!(o.all, all);
+            }
         }
-    }
-
-    /// Until C11d, the series' own rule doesn't follow it there.
-    #[test]
-    fn a_kind_change_alone_is_still_refused() {
-        let o = scope_options(
-            &Change {
-                time: Some(TimeChange {
-                    kind_changed: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            false,
-            None,
-        );
-        assert_eq!(o.this, Row::Offered);
-        assert_eq!(o.all, Row::Refused(ScopeReason::KindChange));
-        assert_eq!(o.following, Row::Refused(ScopeReason::KindChange));
     }
 
     /// The rule the series already has, sent back, is no change of rule: "This event" stays offered.
