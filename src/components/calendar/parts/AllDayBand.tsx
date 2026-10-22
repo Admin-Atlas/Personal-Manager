@@ -13,10 +13,13 @@ import type { CalendarEvent } from "../../../lib/types";
 import {
   clampSpanToRange,
   dayDiff,
+  DRAFT_EVENT_CLASS,
+  draftNote,
   eventDaySpan,
   isEventPast,
   packBands,
   PAST_EVENT_CLASS,
+  spokenName,
   type BandInput,
 } from "../../../lib/calendar-layout";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
@@ -113,14 +116,16 @@ export function AllDayBand({
           const widthPct = ((b.endDay - b.startDay + 1) / ndays) * 100;
           const clickable = !!onEventClick;
           const past = isEventPast(b.ev, nowRef);
+          const ghost = draftNote(b.ev);
           return (
             <div
               key={b.ev.id}
               className={cn(
                 "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[1.125rem]",
                 clickable && `cursor-pointer ${eventHover(own)}`,
-                past && PAST_EVENT_CLASS,
+                ghost !== null ? DRAFT_EVENT_CLASS : past && PAST_EVENT_CLASS,
               )}
+              data-draft-event={ghost !== null ? "" : undefined}
               style={{
                 top: `${b.lane * LANE_H}px`,
                 left: `${leftPct}%`,
@@ -134,7 +139,7 @@ export function AllDayBand({
                 borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
               }}
               title={b.ev.summary}
-              aria-label={b.ev.summary}
+              aria-label={spokenName(ghost, b.ev.summary)}
               role={clickable ? "button" : undefined}
               tabIndex={clickable ? 0 : undefined}
               onClick={

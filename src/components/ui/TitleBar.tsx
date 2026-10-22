@@ -18,6 +18,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { useTheme } from "../../theme";
 import { subscribeUntilCleanup } from "../../lib/subscribe";
+import { isKeyForADialog } from "../../lib/useDialogLayer";
 import { cn } from "./cn";
 import { useEdgeResizeCursor } from "./useEdgeResizeCursor";
 
@@ -163,8 +164,10 @@ export function TitleBar() {
       if (e.repeat) return; // holding a key shouldn't interleave async fullscreen toggles
       // Let an open dialog own Escape — Modal has its own window listener, so don't also
       // exit fullscreen on the same keystroke (or yank the user out from under a busy
-      // ConfirmDialog they can't dismiss).
-      if (e.key === "Escape" && document.querySelector('[role="dialog"]')) return;
+      // ConfirmDialog they can't dismiss). The calendar's quick create owns only a key
+      // pressed inside it, and stays open while a title is typed: beside it, Esc still
+      // leaves fullscreen.
+      if (e.key === "Escape" && isKeyForADialog(e.target)) return;
       if (e.key === "F11") {
         e.preventDefault();
         getCurrentWindow()

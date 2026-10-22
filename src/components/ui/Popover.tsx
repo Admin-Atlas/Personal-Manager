@@ -10,7 +10,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNo
 import { createPortal } from "react-dom";
 import { cn } from "./cn";
 import { useRestoreFocus } from "../../lib/useRestoreFocus";
-import { isCoveredByDialog } from "../../lib/useDialogLayer";
+import { isKeyForDialogOver } from "../../lib/useDialogLayer";
 
 /** Breathing room kept between a clipping-escaped panel and the window edge. */
 const MARGIN = 8;
@@ -170,7 +170,10 @@ export function Popover({
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       // A dialog opened OVER this popover owns the key: leave it alone (and stay open underneath).
-      if (isCoveredByDialog(rootRef.current)) return;
+      // A non-modal layer (the calendar's quick create) owns only a key pressed inside it: it takes
+      // no focus away, so a popover opened beside it, focus on its trigger, its panel or the page, is
+      // still the one in use.
+      if (isKeyForDialogOver(rootRef.current, e.target)) return;
       // This listens on `document` and a dialog's Escape on `window`, so the key reaches here first.
       // Stop it: one Escape closes the innermost thing open (the picker), not the dialog around it.
       e.stopPropagation();
@@ -189,6 +192,9 @@ export function Popover({
       ref={panelRef}
       role="group"
       aria-label={ariaLabel}
+      // Marks every popover panel, portalled or not, so a surface with its own outside-click rule
+      // (the calendar's quick create) can tell a click in a picker it opened from one outside it.
+      data-popover-panel=""
       className={cn(
         "min-w-[15rem] rounded-[var(--radius-sm)] border border-border2 bg-panel p-1 shadow-lg",
         // The z-index is part of the same conditional as `fixed`/`absolute`, NOT a constant above

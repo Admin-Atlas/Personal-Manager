@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listModels } from "../lib/ipc";
-import { isCoveredByDialog } from "../lib/useDialogLayer";
+import { isKeyForDialogOver } from "../lib/useDialogLayer";
 import type { ModelInfo } from "../lib/types";
 import { Button, Input, Skeleton } from "./ui";
 
@@ -52,9 +52,11 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      // Same rule as the Popover primitive: a dialog opened over this menu owns the key; otherwise
-      // the menu closes and the key stops here, so the Settings dialog around it stays open.
-      if (isCoveredByDialog(rootRef.current)) return;
+      // Same rule as the Popover primitive: a modal dialog opened over this menu owns the key, and a
+      // non-modal layer beside it (the calendar's quick create, left open behind Settings) only a key
+      // pressed inside it; otherwise the menu closes and the key stops here, so the Settings dialog
+      // around it stays open.
+      if (isKeyForDialogOver(rootRef.current, e.target)) return;
       e.stopPropagation();
       setOpen(false);
     };

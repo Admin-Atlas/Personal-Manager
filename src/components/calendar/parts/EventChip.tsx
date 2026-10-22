@@ -9,7 +9,7 @@
 // to dots.
 
 import { cn } from "../../ui";
-import { PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
+import { DRAFT_EVENT_CLASS, PAST_EVENT_CLASS, spokenName } from "../../../lib/calendar-layout";
 import { eventFill, eventHover, inkOn, type EventColour } from "../../../theme/eventPalette";
 
 interface Props {
@@ -23,6 +23,9 @@ interface Props {
   showTime: boolean;
   /** The event has fully passed — grey it back so what's done recedes. */
   isPast?: boolean;
+  /** The new event being made (its ghost): the words its name starts with, saying so (`draftNote`).
+   *  Drawn dashed, never greyed as past. Null for any other event. */
+  ghost?: string | null;
   /** When set, the chip is interactive — click / Enter / Space opens the event's detail popup,
    *  anchored at the chip's on-screen rect. */
   onClick?: (anchor: DOMRect) => void;
@@ -35,6 +38,7 @@ export function EventChip({
   timeLabel,
   showTime,
   isPast,
+  ghost = null,
   onClick,
 }: Props) {
   return (
@@ -42,14 +46,15 @@ export function EventChip({
       className={cn(
         "flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[0.6875rem] leading-tight",
         onClick && `cursor-pointer ${eventHover(own)}`,
-        isPast && PAST_EVENT_CLASS,
+        ghost !== null ? DRAFT_EVENT_CLASS : isPast && PAST_EVENT_CLASS,
       )}
+      data-draft-event={ghost !== null ? "" : undefined}
       style={{
         background: eventFill(own, color, 16),
         borderLeftColor: color,
       }}
       title={summary}
-      aria-label={[timeLabel, summary].filter(Boolean).join(", ")}
+      aria-label={spokenName(ghost, [timeLabel, summary].filter(Boolean).join(", "))}
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
       onClick={onClick ? (e) => onClick(e.currentTarget.getBoundingClientRect()) : undefined}

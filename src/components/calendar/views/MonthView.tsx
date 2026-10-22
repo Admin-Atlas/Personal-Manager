@@ -13,8 +13,11 @@ import type { CalendarEvent } from "../../../lib/types";
 import {
   addDays,
   dayKey,
+  DRAFT_EVENT_CLASS,
+  draftNote,
   isEventPast,
   PAST_EVENT_CLASS,
+  spokenName,
   startOfDay,
 } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
@@ -25,6 +28,7 @@ import { EventChip } from "../parts/EventChip";
 import { SourceDot } from "../parts/SourceDot";
 import {
   buildWeekRows,
+  chipsShown,
   weekStartMonday,
   weekdayLabels,
   type MonthWeekRow,
@@ -267,15 +271,29 @@ export function MonthView({
 
                     {minimal ? (
                       <div className="flex flex-wrap items-center gap-0.5">
-                        {cell.chips.slice(0, MAX_DOTS).map((ev) => (
-                          <SourceDot
-                            key={ev.id}
-                            // The event's own colour when it has one; the shape stays its calendar's.
-                            color={eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id)}
-                            shapeIndex={shapeOf?.(ev.calendar_id)}
-                            className="h-2 w-2"
-                          />
-                        ))}
+                        {chipsShown(cell.chips, MAX_DOTS).map((ev) => {
+                          const note = draftNote(ev);
+                          const dot = (
+                            <SourceDot
+                              key={ev.id}
+                              // The event's own colour when it has one; the shape stays its
+                              // calendar's.
+                              color={eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id)}
+                              shapeIndex={shapeOf?.(ev.calendar_id)}
+                              ghost={note !== null}
+                              className="h-2 w-2"
+                            />
+                          );
+                          if (note === null) return dot;
+                          // The ghost's ring keeps a click on it from closing quick create, and is
+                          // the one dot with a name: the others are saved events, this isn't one.
+                          return (
+                            <span key={ev.id} data-draft-event="" className="inline-flex">
+                              {dot}
+                              <span className="sr-only">{spokenName(note, ev.summary)}</span>
+                            </span>
+                          );
+                        })}
                         {dotsHidden > 0 && (
                           <span className="font-mono text-[0.5625rem] text-ink4">
                             +{dotsHidden}
@@ -284,7 +302,7 @@ export function MonthView({
                       </div>
                     ) : (
                       <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
-                        {cell.chips.slice(0, maxChips).map((ev) => (
+                        {chipsShown(cell.chips, maxChips).map((ev) => (
                           <EventChip
                             key={ev.id}
                             summary={ev.summary}
@@ -293,6 +311,7 @@ export function MonthView({
                             timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
                             showTime={showMeta}
                             isPast={isEventPast(ev, nowDate)}
+                            ghost={draftNote(ev)}
                             onClick={onEventClick ? (rect) => onEventClick(ev, rect) : undefined}
                           />
                         ))}
@@ -317,6 +336,7 @@ export function MonthView({
                   const own = eventColour(b.ev.color_id);
                   const leftPct = (b.startIdx / 7) * 100;
                   const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
+                  const ghost = draftNote(b.ev);
                   return (
                     <div
                       key={b.ev.id}
@@ -325,8 +345,11 @@ export function MonthView({
                         // re-enables its own pointer events to open the event popup.
                         "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
                         onEventClick && `pointer-events-auto cursor-pointer ${eventHover(own)}`,
-                        isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
+                        ghost !== null
+                          ? DRAFT_EVENT_CLASS
+                          : isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                       )}
+                      data-draft-event={ghost !== null ? "" : undefined}
                       style={{
                         top: `${b.lane * BAND_H}px`,
                         left: `${leftPct}%`,
@@ -340,6 +363,17 @@ export function MonthView({
                         borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
                       }}
                       title={b.ev.summary}
+                      // A band's name is its text; the ghost's says first that it's the new event.
+                      aria-label={
+                        ghost !== null
+                          ? spokenName(
+                              ghost,
+                              [b.ev.all_day ? "" : formatClockIso(b.ev.start), b.ev.summary]
+                                .filter(Boolean)
+                                .join(", "),
+                            )
+                          : undefined
+                      }
                       role={onEventClick ? "button" : undefined}
                       tabIndex={onEventClick ? 0 : undefined}
                       onClick={

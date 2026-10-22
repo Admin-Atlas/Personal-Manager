@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.151.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Quick create: press Shift+C on the calendar for a small box under + New event. Type a title and press Enter, and it's in your Google calendar; change the day or the time there, or choose the calendar. More options opens the full editor with everything you've typed, so nothing is lost on the way.",
+      "In the day, week, month and agenda views the new event shows as you type, dashed, in its calendar's colour, and moves as you change the time; a screen reader names it as the new event. The Year view and the Terminal look show only what's in your calendar.",
+      "Clicking elsewhere on the calendar only closes the box while it has no title, and a titled one is still there if you switch tabs and come back, so a half-made event isn't lost by accident; × throws it away.",
+    ],
+  },
+  {
     version: "3.150.0-alpha",
     date: "2026-10-20",
     highlights: [

@@ -10,6 +10,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
+import { DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -109,6 +110,66 @@ describe("TimeGridView", () => {
     expect(within(coloured).getByText("Coloured").style.color).toBe("rgb(31, 31, 31)");
     expect(plain.style.background).toContain("#336699 18%");
     expect(within(plain).getByText("Plain").style.color).toBe("");
+  });
+
+  // The event being made (#884, C10c): dashed, in its calendar's colour, and never greyed as past
+  // (one opacity utility only: `cn` doesn't resolve two).
+  it("draws the new event's ghost dashed in its calendar's colour, timed or all day", () => {
+    // Both days are over by `now`, so a synced event greys and the ghost doesn't.
+    const draw = (events: CalendarEvent[]) =>
+      render(
+        <TimeGridView
+          days={[new Date(2026, 9, 12), new Date(2026, 9, 13)]}
+          events={events}
+          colorOf={(id) => (id === "work" ? "#336699" : "#993366")}
+          range="day"
+          bounds={{ startHour: 0, endHour: 24 }}
+          zones={[]}
+          onZonesChange={() => {}}
+          allowZones={false}
+          now={new Date(2026, 9, 20)}
+          onEventClick={vi.fn()}
+        />,
+      );
+    draw([
+      ev({ id: DRAFT_EVENT_ID, calendar_id: "work", summary: "Dentist", end: null }),
+      ev({ id: "e2", summary: "Synced", start: "2026-10-12T09:00:00", end: null }),
+    ]);
+    // Named as the new event, not yet saved, so it isn't heard as one that's in the calendar.
+    const ghost = screen.getByRole("button", { name: /^New event, not saved yet: Dentist, / });
+    // Dashed inside its edge, where nothing around it can clip the dash away.
+    expect(ghost.className).toContain("outline-dashed");
+    expect(ghost.className).toContain("-outline-offset-1");
+    expect(ghost.className).not.toContain("opacity-60");
+    expect(ghost.hasAttribute("data-draft-event")).toBe(true);
+    expect(ghost.style.borderLeftColor).toBe("rgb(51, 102, 153)");
+    // A synced event beside it is drawn and named as ever.
+    const synced = screen.getByRole("button", { name: /^Synced, / });
+    expect(synced.className).not.toContain("outline-dashed");
+    expect(synced.className).toContain("opacity-60");
+    expect(synced.hasAttribute("data-draft-event")).toBe(false);
+    cleanup();
+    // Once a save may have made it, never "not saved".
+    draw([
+      {
+        ...ev({
+          id: DRAFT_EVENT_ID,
+          calendar_id: "work",
+          summary: "Away",
+          start: "2026-10-13",
+          end: "2026-10-14",
+          all_day: true,
+        }),
+        draft_state: "unsure",
+      } as CalendarEvent,
+    ]);
+    const band = screen.getByRole("button", {
+      name: "New event, PM may already have made it: Away",
+    });
+    expect(band.className).toContain("outline-dashed");
+    expect(band.className).toContain("-outline-offset-1");
+    expect(band.className).not.toContain("opacity-60");
+    expect(band.hasAttribute("data-draft-event")).toBe(true);
   });
 });
 

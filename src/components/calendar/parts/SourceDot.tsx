@@ -26,20 +26,31 @@ interface Props {
   /** The source's slot (from sourceShapeIndex), used to pick a redundant shape when the colour-blind
    *  axis is on. Omit (overlays, unknowns) to keep the plain circle. */
   shapeIndex?: number;
+  /** The new event's ghost (the Month view's dots): a dashed ring in the colour rather than a fill,
+   *  so it doesn't read as saved. Always round, as a cut shape would cut its ring. */
+  ghost?: boolean;
   className?: string;
 }
 
 /** The small colour dot that identifies a calendar (source) in the dropdown, agenda rows, and legend.
  *  Reserves the accent for chrome, so a source is never confusable with "now". Under the colour-blind
  *  axis it also carries a per-source shape (see {@link SHAPES}). */
-export function SourceDot({ color, shapeIndex, className }: Props) {
+export function SourceDot({ color, shapeIndex, ghost = false, className }: Props) {
   const { colorblind } = useTheme();
-  const clip = colorblind && shapeIndex != null ? SHAPES[shapeIndex % SHAPES.length] : null;
+  const clip =
+    colorblind && shapeIndex != null && !ghost ? SHAPES[shapeIndex % SHAPES.length] : null;
   return (
     <span
       aria-hidden
-      className={cn("inline-block h-2.5 w-2.5 shrink-0", clip == null && "rounded-full", className)}
-      style={{ backgroundColor: color, clipPath: clip ?? undefined }}
+      className={cn(
+        "inline-block h-2.5 w-2.5 shrink-0",
+        clip == null && "rounded-full",
+        ghost && "border border-dashed",
+        className,
+      )}
+      style={
+        ghost ? { borderColor: color } : { backgroundColor: color, clipPath: clip ?? undefined }
+      }
     />
   );
 }

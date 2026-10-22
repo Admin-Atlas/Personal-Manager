@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { buildWeekRows, weekStartMonday } from "./useMonthGrid";
-import { dayKey } from "../../../lib/calendar-layout";
+import { buildWeekRows, chipsShown, MONTH_MAX_BAND_LANES, weekStartMonday } from "./useMonthGrid";
+import { dayKey, DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
 
 describe("weekStartMonday", () => {
   it("returns the Monday of the week the date falls in", () => {
@@ -88,5 +88,114 @@ describe("buildWeekRows (continuous stream)", () => {
     ]);
     const bar = inside.flatMap((w) => w.bands)[0];
     expect([bar.continuesLeft, bar.continuesRight]).toEqual([false, false]);
+  });
+
+  // The new event's ghost (#884, C10c) is never folded into "+N more" as it's typed: past the lane
+  // cap it would only add to the count. It takes the top lane instead.
+  it("gives the new event's ghost band the top lane, under three bands already there", () => {
+    const span = (id: string, start: string, end: string) => ({
+      ...timed(start, end),
+      id,
+      all_day: true,
+    });
+    const weeks = buildWeekRows(start, 1, [
+      span("a", "2026-07-13", "2026-07-18"),
+      span("b", "2026-07-13", "2026-07-18"),
+      span("c", "2026-07-13", "2026-07-18"),
+      span(DRAFT_EVENT_ID, "2026-07-15", "2026-07-17"),
+    ]);
+    const lanes = new Map(weeks[0].bands.map((b) => [b.ev.id, b.lane]));
+    expect(lanes.get(DRAFT_EVENT_ID)).toBe(0);
+    expect(weeks[0].bands).toHaveLength(MONTH_MAX_BAND_LANES);
+    // The band it put out of sight is counted instead.
+    expect(weeks[0].cells[0].hiddenBands).toBe(1);
+  });
+
+  // The stream runs for months: the ghost's top lane is its own weeks', so a week it never touches
+  // keeps its bands where they were, none folded away and no row added.
+  it("leaves a week the ghost band doesn't touch as it was", () => {
+    const span = (id: string, start: string, end: string) => ({
+      ...timed(start, end),
+      id,
+      all_day: true,
+    });
+    const before = [
+      span("a", "2026-07-13", "2026-07-18"),
+      span("b", "2026-07-13", "2026-07-18"),
+      span("c", "2026-07-13", "2026-07-18"),
+    ];
+    const plain = buildWeekRows(start, 3, before);
+    // Two weeks on, timed across midnight: a band, as a start moved to 23:30 makes it.
+    const weeks = buildWeekRows(start, 3, [
+      ...before,
+      { ...timed("2026-07-28T23:30:00", "2026-07-29T00:30:00"), id: DRAFT_EVENT_ID },
+    ]);
+    const lanes = new Map(weeks[0].bands.map((b) => [b.ev.id, b.lane]));
+    expect([lanes.get("a"), lanes.get("b"), lanes.get("c")]).toEqual([0, 1, 2]);
+    expect(weeks[0].cells.map((c) => c.hiddenBands)).toEqual([0, 0, 0, 0, 0, 0, 0]);
+    expect(weeks[0].laneCount).toBe(plain[0].laneCount);
+    // And the ghost has the top lane in its own week.
+    expect(weeks[2].bands.map((b) => [b.ev.id, b.lane])).toEqual([[DRAFT_EVENT_ID, 0]]);
+  });
+
+  // The same for bands that run into the ghost's days: kept out of the top lane for their whole run,
+  // they'd leave it empty and fold one away in every week they cover. They give it up only in the
+  // ghost's own week.
+  it("leaves the weeks the ghost band doesn't touch as they were, for bands that reach its days", () => {
+    const span = (id: string, start: string, end: string) => ({
+      ...timed(start, end),
+      id,
+      all_day: true,
+    });
+    // From two weeks before the ghost's week to the week after it.
+    const through = [
+      span("a", "2026-07-13", "2026-08-06"),
+      span("b", "2026-07-13", "2026-08-06"),
+      span("c", "2026-07-13", "2026-08-06"),
+    ];
+    const plain = buildWeekRows(start, 4, through);
+    const weeks = buildWeekRows(start, 4, [
+      ...through,
+      { ...timed("2026-07-28T23:30:00", "2026-07-29T00:30:00"), id: DRAFT_EVENT_ID },
+    ]);
+    for (const w of [0, 1, 3]) {
+      const lanes = new Map(weeks[w].bands.map((b) => [b.ev.id, b.lane]));
+      expect([lanes.get("a"), lanes.get("b"), lanes.get("c")]).toEqual([0, 1, 2]);
+      expect(weeks[w].cells.map((c) => c.hiddenBands)).toEqual([0, 0, 0, 0, 0, 0, 0]);
+      expect(weeks[w].laneCount).toBe(plain[w].laneCount);
+    }
+    // In its own week the ghost has the top lane, and the band it puts out of sight is counted.
+    expect(weeks[2].bands.find((b) => b.ev.id === DRAFT_EVENT_ID)?.lane).toBe(0);
+    expect(weeks[2].cells[0].hiddenBands).toBe(1);
+  });
+});
+
+describe("chipsShown", () => {
+  const chip = (id: string) => ({
+    id,
+    calendar_id: "c",
+    summary: id,
+    description: null,
+    location: null,
+    start: "2026-07-15T09:00:00",
+    end: "2026-07-15T10:00:00",
+    all_day: false,
+    html_link: null,
+    uid: null,
+  });
+  const ids = (evs: { id: string }[]) => evs.map((e) => e.id);
+
+  it("draws the first that fit, and the ghost in the last place when it would fold away", () => {
+    const day = [chip("a"), chip("b"), chip("c"), chip("d"), chip(DRAFT_EVENT_ID)];
+    expect(ids(chipsShown(day, 3))).toEqual(["a", "b", DRAFT_EVENT_ID]);
+    // Already in reach, it stays where it sorts.
+    expect(ids(chipsShown([chip(DRAFT_EVENT_ID), ...day.slice(0, 3)], 3))).toEqual([
+      DRAFT_EVENT_ID,
+      "a",
+      "b",
+    ]);
+    // Without a ghost, the first that fit.
+    expect(ids(chipsShown(day.slice(0, 4), 3))).toEqual(["a", "b", "c"]);
+    expect(chipsShown(day, 0)).toEqual([]);
   });
 });

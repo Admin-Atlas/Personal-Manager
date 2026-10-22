@@ -15,9 +15,11 @@
 // generated stylesheet's ordering decide the winner. "Exactly one z-utility" is the property that
 // has to hold, and only a class-level assertion can state it.
 
+import { useRef } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+import { useDialogLayer } from "../../lib/useDialogLayer";
 import { Modal } from "./Modal";
 import { Popover } from "./Popover";
 
@@ -161,6 +163,76 @@ describe("Popover stacking", () => {
       expect(screen.getByRole("dialog").contains(panel)).toBe(withinDialog);
       // Placed in the viewport either way, so the dialog's scrolling body can't clip it.
       expect(panel.className).toContain("fixed");
+      cleanup();
+    }
+  });
+
+  // A non-modal layer (the calendar's quick create) registers as a dialog without taking focus, so a
+  // popover opened beside it is still the one in use: Escape closes it wherever it's pressed, except
+  // in the layer itself. A modal dialog over it holds the keyboard, and the key is the dialog's.
+  function besideLayer(modal: boolean) {
+    function Layer() {
+      const ref = useRef<HTMLDivElement>(null);
+      useDialogLayer(true, ref);
+      return (
+        <div ref={ref} role="dialog" aria-label="Quick create" aria-modal={modal || undefined}>
+          <input aria-label="Title" />
+        </div>
+      );
+    }
+    render(
+      <>
+        <Layer />
+        <Popover
+          ariaLabel="Mini calendar"
+          trigger={({ toggle }) => (
+            <button type="button" onClick={toggle}>
+              Open
+            </button>
+          )}
+        >
+          <button type="button">A day</button>
+        </Popover>
+      </>,
+    );
+    const isOpen = () => screen.queryByRole("group", { name: "Mini calendar" }) !== null;
+    const reopen = () => {
+      if (!isOpen()) fireEvent.click(screen.getByText("Open"));
+    };
+    return { isOpen, reopen };
+  }
+
+  it("closes on Escape on its panel, its trigger or the page, beside a non-modal layer", () => {
+    const { isOpen, reopen } = besideLayer(false);
+    reopen();
+    // Pressed in the layer, the key is the layer's: the popover stays open.
+    fireEvent.keyDown(screen.getByLabelText("Title"), { key: "Escape" });
+    expect(isOpen()).toBe(true);
+    fireEvent.keyDown(screen.getByText("A day"), { key: "Escape" });
+    expect(isOpen()).toBe(false);
+    // Focus left on the trigger by the click that opened it (WebKitGTK, WebView2).
+    reopen();
+    fireEvent.keyDown(screen.getByText("Open"), { key: "Escape" });
+    expect(isOpen()).toBe(false);
+    // Focus on the page (macOS WebKit doesn't focus a clicked button).
+    reopen();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(isOpen()).toBe(false);
+  });
+
+  it("leaves Escape to a modal dialog over it, wherever it's pressed", () => {
+    const { isOpen, reopen } = besideLayer(true);
+    reopen();
+    fireEvent.keyDown(screen.getByText("Open"), { key: "Escape" });
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(isOpen()).toBe(true);
+  });
+
+  // A surface with its own outside-click rule tells a click in a picker it opened (portalled out of
+  // its box) from a click outside by this attribute.
+  it("marks its panel, portalled or not, as a popover panel", () => {
+    for (const escapeClipping of [true, false]) {
+      expect(open(escapeClipping).hasAttribute("data-popover-panel")).toBe(true);
       cleanup();
     }
   });

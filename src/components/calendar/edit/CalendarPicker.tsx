@@ -28,6 +28,8 @@ interface Props {
   colorOf: (calendarId: string) => string;
   shapeOf: (calendarId: string) => number | undefined;
   disabled?: boolean;
+  /** Quick create's size: a smaller button with the calendar's name only, and a shorter list. */
+  compact?: boolean;
 }
 
 /** Why an account's calendars aren't on offer, as one line. */
@@ -52,6 +54,7 @@ export function CalendarPicker({
   colorOf,
   shapeOf,
   disabled = false,
+  compact = false,
 }: Props) {
   const { showMeta } = useDepth();
   const [open, setOpen] = useState(false);
@@ -104,7 +107,7 @@ export function CalendarPicker({
         <Button
           ref={triggerRef}
           variant="secondary"
-          size="sm"
+          size={compact ? "xs" : "sm"}
           aria-label={`Calendar: ${label}`}
           aria-expanded={expanded}
           disabled={disabled}
@@ -118,14 +121,17 @@ export function CalendarPicker({
           )}
           <span className="truncate">
             {label}
-            {showMeta && account ? ` · ${account}` : ""}
+            {showMeta && !compact && account ? ` · ${account}` : ""}
           </span>
         </Button>
       )}
     >
       <div
         ref={listRef}
-        className="flex max-h-[60vh] flex-col gap-1 overflow-y-auto"
+        className={cn(
+          "flex flex-col gap-1 overflow-y-auto",
+          compact ? "max-h-[45vh]" : "max-h-[60vh]",
+        )}
         onKeyDown={(e) => {
           pointer.current = false;
           // Enter picks what the arrow keys moved to, as a click does; Tab leaves the list for the

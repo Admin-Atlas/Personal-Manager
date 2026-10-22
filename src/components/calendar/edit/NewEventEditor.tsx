@@ -5,6 +5,7 @@
 // sibling of `EventEditor` sharing its fields (`EventFields`), with nothing to load, no session, no
 // conflicts and nothing to delete: the same dialog and checks, and a calendar picker where editing
 // names the calendar it saves to. Save, Ctrl+S (⌘S on a Mac) and Enter in the title all save.
+// Quick create's More options opens it on that draft (`handover`), sending nothing on the way.
 //
 // A new event never goes twice by accident. Every way to save passes one guard, set before the
 // request goes; while it's out, every field, the picker and closing are off, and a held key's
@@ -52,23 +53,24 @@ import {
   ambiguousText,
   CALLOUT_TONE,
   createText,
+  heldCreateText,
   problemText,
   retryAfter,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import {
   createdWhere,
+  createNotes,
   lengthFor,
-  outsideMirror,
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
 import { isLetterKey } from "../../../lib/letterKey";
-import { formatDateLocal } from "../../../lib/format";
 import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
 import {
+  NO_ZONE_CREATE,
   ShowAsControl,
   TextRow,
   VisibilitySelect,
@@ -93,7 +95,28 @@ interface Props {
   /** Filled in with a way to bring this editor's title into focus: a second "+ New event" focuses
    *  the one open rather than replacing it. */
   focusRef?: MutableRefObject<(() => void) | null>;
+  /** Quick create's "More options": its draft and calendar to carry on with (`seed` and
+   *  `calendarId` stay where it started, for "changed?"), an answer that never arrived, which opens
+   *  locked on Check again under the same token, the words of a token that ended unproven, and a
+   *  date its field couldn't read, still refusing. */
+  handover?: CreateHandover;
   onClose: () => void;
+}
+
+/** What quick create hands the full editor (C10c): nothing is sent on the way. */
+export interface CreateHandover {
+  draft: EditorFields;
+  calendarId: string;
+  /** A create PM may already have made: its retry token and exactly what was sent. */
+  held: { token: string; sent: CreateSent } | null;
+  /** A token that ended there without Google showing the event made: its words carry on here. */
+  unproven: Unproven | null;
+  /** Whether the user picked Show as, or changed the time, there. */
+  showAsTouched: boolean;
+  timeTouched: boolean;
+  /** Text quick create's date field couldn't read: it stands here as the start's (Start date or
+   *  First day), refusing a save until that field is given a date, as it did there. */
+  badDate: string | null;
 }
 
 /** An answer that never arrived: its retry token, exactly what was sent, and the fields that were. */
@@ -105,15 +128,12 @@ interface Held {
 
 /** A held token that ended without Google showing the event made (PM lost it, the draft differed,
  *  or it was made and since deleted): what was sent, and the answer that ended it. */
-interface Unproven {
+export interface Unproven {
   sent: CreateSent;
   outcome: WriteOutcome;
 }
 
 const PRIVATE_OFF = "This calendar's sharing doesn't let you make private events on it.";
-// The edit mode's line says times can't change; here nothing can be saved, which it has to say.
-const NO_ZONE_CREATE =
-  "PM couldn't tell which time zone this computer is in, so it can't save a new event. Set the time zone in your system settings.";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -126,18 +146,23 @@ export function NewEventEditor({
   colorOf,
   shapeOf,
   focusRef,
+  handover,
   onClose,
 }: Props) {
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
-  const [draft, setDraftState] = useState<EditorFields>(seed);
+  const startDraft = handover?.draft ?? seed;
+  const startCalendar = handover?.calendarId ?? firstCalendar;
+  const [draft, setDraftState] = useState<EditorFields>(startDraft);
   // The latest draft and calendar, readable synchronously: Save blurs the focused field first, and a
   // date typed but not yet committed commits in that blur, before React re-renders.
-  const draftRef = useRef<EditorFields>(seed);
-  const [calendarId, setCalendarIdState] = useState(firstCalendar);
-  const calendarRef = useRef(firstCalendar);
+  const draftRef = useRef<EditorFields>(startDraft);
+  const [calendarId, setCalendarIdState] = useState(startCalendar);
+  const calendarRef = useRef(startCalendar);
   // Text a date field couldn't read, by the half it sets: no save until that field is given a date.
-  const badDatesRef = useRef<BadDates>(NO_BAD_DATES);
-  const [badDates, setBadDatesState] = useState<BadDates>(NO_BAD_DATES);
+  // Quick create's one date field sets the start.
+  const startBad: BadDates = { ...NO_BAD_DATES, start: handover?.badDate ?? null };
+  const badDatesRef = useRef<BadDates>(startBad);
+  const [badDates, setBadDatesState] = useState<BadDates>(startBad);
   const setBadDates = (next: BadDates) => {
     badDatesRef.current = next;
     setBadDatesState(next);
@@ -145,21 +170,31 @@ export function NewEventEditor({
   // The When fields' own, so a save a refusal stops can find the date field it names.
   const whenId = useId();
   // The event's length, kept while its start moves: the account's default to begin with.
-  const lengthRef = useRef(lengthFor(overview, targetById(targets, firstCalendar)));
+  const lengthRef = useRef(lengthFor(overview, targetById(targets, startCalendar)));
   // Whether the user has changed the time: until then, another calendar brings its own length.
-  const timeTouched = useRef(false);
+  const timeTouched = useRef(handover?.timeTouched ?? false);
   // Whether the user has picked Show as: until then, it follows the kind (all day free).
-  const showAsTouched = useRef(false);
-  const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(null);
+  const showAsTouched = useRef(handover?.showAsTouched ?? false);
+  // Handed over while PM may already have made it: locked on what was sent, saying so; or after a
+  // token ended unproven there, still saying that.
+  const handedHeld: Held | null = handover?.held
+    ? { ...handover.held, fields: handover.draft }
+    : null;
+  const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(() => {
+    if (handedHeld) return heldCreateText(handedHeld.sent.draft.summary);
+    const u = handover?.unproven;
+    return u ? createText(u.outcome, u.sent.draft.summary, false) : null;
+  });
   // The one guard every way to save passes, set before the request goes (state alone would let a
   // second Enter in the same tick through).
   const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
-  const heldRef = useRef<Held | null>(null);
-  const [held, setHeldState] = useState<Held | null>(null);
-  // PM may have made an event this editor sent, though no token is held for it any more.
-  const unprovenRef = useRef<Unproven | null>(null);
-  const [unproven, setUnprovenState] = useState<Unproven | null>(null);
+  const heldRef = useRef<Held | null>(handedHeld);
+  const [held, setHeldState] = useState<Held | null>(handedHeld);
+  // PM may have made an event this editor (or quick create, before it) sent, though no token is held
+  // for it any more.
+  const unprovenRef = useRef<Unproven | null>(handover?.unproven ?? null);
+  const [unproven, setUnprovenState] = useState<Unproven | null>(handover?.unproven ?? null);
   const [askDiscard, setAskDiscardState] = useState(false);
   const askDiscardRef = useRef(false);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
@@ -222,13 +257,20 @@ export function NewEventEditor({
     alive.current = true;
     return () => {
       alive.current = false;
+      // What the editor held as it went, said only once it has really gone: StrictMode rehearses an
+      // unmount in development (a cleanup straight followed by a setup, which sets `alive` again
+      // before this runs), and an editor opened on quick create's token or words holds them from
+      // its first render, so a rehearsal would say them while it's still open.
       const u = unprovenRef.current;
-      if (u) {
-        const where = createdWhere(overviewRef.current, hiddenRef.current, u.sent.calendarId);
-        noteCreateResult(u.sent, null, u.outcome, where);
-      }
-      const h = heldRef.current;
-      if (h && !savingRef.current) noteHeldCreate(h.sent, h.token);
+      const h = savingRef.current ? null : heldRef.current;
+      queueMicrotask(() => {
+        if (alive.current) return;
+        if (u) {
+          const where = createdWhere(overviewRef.current, hiddenRef.current, u.sent.calendarId);
+          noteCreateResult(u.sent, null, u.outcome, where);
+        }
+        if (h) noteHeldCreate(h.sent, h.token);
+      });
     };
   }, []);
 
@@ -428,25 +470,11 @@ export function NewEventEditor({
   // The End list resolves every quarter hour, so it's worked out once per time change.
   const endChoices = useMemo(() => (timed ? endTimeChoices(NEW_EVENT_BASE, timed) : []), [timed]);
   const endMin = useMemo(() => (timed ? endDateMin(NEW_EVENT_BASE, timed) : undefined), [timed]);
-  const where = createdWhere(overview, hidden, calendarId);
-  const outside = outsideMirror(draft.time, overview);
-  const range = `${formatDateLocal(new Date(overview.mirror_start))} – ${formatDateLocal(
-    new Date(overview.mirror_end),
-  )}`;
   // A date a field couldn't read is said under When, naming the field.
   const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...(outside
-      ? [
-          `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
-        ]
-      : []),
-    ...(hidden.has(calendarId) && where.hidden
-      ? [
-          `${where.name} is hidden in your calendar list, so the new event won't show until you show that calendar again.`,
-        ]
-      : []),
+    ...createNotes(draft.time, overview, hidden, calendarId),
     ...(noPrivate ? [PRIVATE_OFF] : []),
   ];
 

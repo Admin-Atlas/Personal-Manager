@@ -7,8 +7,10 @@
 
 import { describe, expect, it } from "vitest";
 import type { Calendar, CalendarAccount, CalendarOverview } from "../types";
+import { formatDateLocal } from "../format";
 import {
   createdWhere,
+  createNotes,
   createReasonFor,
   createTargets,
   defaultTarget,
@@ -261,5 +263,28 @@ describe("createdWhere", () => {
   it("a calendar unticked while the event was being made, or gone, reads as hidden", () => {
     expect(createdWhere(overview(), new Set(), `${ME}:unsynced`).hidden).toBe(true);
     expect(createdWhere(overview(), new Set(), "gone").hidden).toBe(true);
+  });
+});
+
+describe("createNotes", () => {
+  // Both surfaces (the full editor and quick create) say these, so they're worded once.
+  it("says before Save when PM won't show the event: outside the months it syncs, or hidden", () => {
+    const o = overview();
+    const day = (d: string) => ({ kind: "all_day" as const, first_day: d, last_day: d });
+    expect(createNotes(day("2026-10-12"), o, new Set(), `${ME}:alpha`)).toEqual([]);
+    // The window's ends as this computer's dates, DD-MM.
+    const range = `${formatDateLocal(new Date(o.mirror_start))} – ${formatDateLocal(new Date(o.mirror_end))}`;
+    expect(createNotes(day("2028-01-01"), o, new Set(), `${ME}:alpha`)).toEqual([
+      `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
+    ]);
+    expect(createNotes(day("2026-10-12"), o, new Set([`${ME}:alpha`]), `${ME}:alpha`)).toEqual([
+      "Alpha is hidden in your calendar list, so the new event won't show until you show that calendar again.",
+    ]);
+    // A twin on show will show it, so there's nothing to say.
+    const twin = calendar(OFF, "alpha", { name: "Alpha (shared)" });
+    const withTwin = overview({ calendars: [...o.calendars, twin] });
+    expect(
+      createNotes(day("2026-10-12"), withTwin, new Set([`${ME}:alpha`]), `${ME}:alpha`),
+    ).toEqual([]);
   });
 });

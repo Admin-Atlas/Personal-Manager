@@ -42,6 +42,10 @@ const VISIBILITY: { value: EventVisibility; label: string }[] = [
 
 export const NO_ZONE =
   "PM couldn't tell which time zone this computer is in, so it can't change times. Set the time zone in your system settings.";
+/** A new event's line (the full editor's and quick create's): there nothing can be saved, which it
+ *  has to say. */
+export const NO_ZONE_CREATE =
+  "PM couldn't tell which time zone this computer is in, so it can't save a new event. Set the time zone in your system settings.";
 
 /** `date` (`YYYY-MM-DD`) moved by `days`. */
 function addDays(date: string, days: number): string {

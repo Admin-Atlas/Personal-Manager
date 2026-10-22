@@ -16,7 +16,7 @@ import { SourceDot } from "./SourceDot";
 
 afterEach(cleanup);
 
-const dot = (props: { color: string; shapeIndex?: number }) =>
+const dot = (props: { color: string; shapeIndex?: number; ghost?: boolean }) =>
   render(<SourceDot {...props} />).container.querySelector("span")!;
 
 describe("SourceDot shape redundancy", () => {
@@ -38,5 +38,19 @@ describe("SourceDot shape redundancy", () => {
     mockColorblind = true;
     expect(dot({ color: "#f00", shapeIndex: 0 }).className).toContain("rounded-full");
     expect(dot({ color: "#f00" }).className).toContain("rounded-full");
+  });
+});
+
+// The new event's ghost (#884, C10c) in the Month view's dots: a ring, dashed, in the colour, never
+// a fill, so it doesn't read as saved; round even under the axis, as a cut shape would cut its ring.
+describe("SourceDot as the new event's ghost", () => {
+  it("is a dashed ring in the colour, not a fill", () => {
+    mockColorblind = true;
+    const span = dot({ color: "#f00", shapeIndex: 2, ghost: true });
+    expect(span.className).toContain("border-dashed");
+    expect(span.className).toContain("rounded-full");
+    expect(span.style.borderColor).toBe("rgb(255, 0, 0)");
+    expect(span.style.backgroundColor).toBe("");
+    expect(span.style.clipPath).toBe("");
   });
 });

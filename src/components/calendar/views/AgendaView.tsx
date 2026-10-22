@@ -10,9 +10,12 @@ import type { CalendarEvent } from "../../../lib/types";
 import { formatClockIso, formatDateLocal } from "../../../lib/format";
 import {
   dayKey,
+  DRAFT_EVENT_CLASS,
+  draftNote,
   groupEventsFromDay,
   isEventPast,
   PAST_EVENT_CLASS,
+  spokenName,
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
@@ -82,6 +85,7 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
               {g.items.map((ev) => {
                 const clickable = !!onEventClick;
                 const own = eventColour(ev.color_id);
+                const ghost = draftNote(ev);
                 return (
                   <li
                     key={ev.id}
@@ -91,8 +95,22 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                       // A filled row's inline background outranks hover:bg-surface, so its fill
                       // changes brightness instead.
                       clickable && (own ? eventHover(own) : "hover:bg-surface"),
-                      isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
+                      ghost !== null
+                        ? DRAFT_EVENT_CLASS
+                        : isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                     )}
+                    data-draft-event={ghost !== null ? "" : undefined}
+                    // A row's name is its text; the ghost's says first that it's the new event.
+                    aria-label={
+                      ghost !== null
+                        ? spokenName(
+                            ghost,
+                            [eventTime(ev), ev.summary, showPower && ev.location]
+                              .filter(Boolean)
+                              .join(", "),
+                          )
+                        : undefined
+                    }
                     style={{
                       borderLeftColor: colorOf(ev.calendar_id),
                       // An event given its own colour in Google is filled with it, solid, in its own
