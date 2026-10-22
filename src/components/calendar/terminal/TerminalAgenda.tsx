@@ -21,6 +21,7 @@ import {
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
+import { isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { useDepth } from "../../../theme";
 import { eventColour } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
@@ -112,6 +113,7 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
               <ul className="flex flex-col gap-0.5">
                 {row.items.map((ev) => {
                   const clickable = !!onEventClick;
+                  const declined = isDeclined(ev);
                   return (
                     <li
                       key={ev.id}
@@ -152,7 +154,12 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
                       {/* Free-height row: wrap rather than clip. Same reasoning as AgendaView —
                           and in Terminal this component also serves Day and Week. */}
                       <div className="min-w-0 flex-1">
-                        <span className="break-words text-ink">{ev.summary}</span>
+                        {/* Struck through when the user declined it, as Google draws it; the
+                            words say so to a screen reader. */}
+                        <span className={cn("break-words text-ink", declined && "line-through")}>
+                          {ev.summary}
+                        </span>
+                        {declined && <span className="sr-only">, declined</span>}
                         {showPower && ev.location && (
                           <div className="break-words text-ink4">{ev.location}</div>
                         )}

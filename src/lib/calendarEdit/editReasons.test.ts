@@ -40,11 +40,13 @@ import {
   moveFailedText,
   moveLabel,
   moveOfferText,
+  notOrganizerText,
   outcomeText,
   partialText,
   problemText,
   reasonText,
   rebasedText,
+  replyNoticeText,
   replyText,
   savedNotice,
   settleText,
@@ -448,6 +450,57 @@ describe("what a reply came to (C14)", () => {
     );
     expect(replyText({ outcome: "unconfirmed" }, "no", null).text).toMatch(
       /whether it went through/,
+    );
+  });
+
+  // C14 critique C2-M1: the notice that outlives the popover names the event.
+  it("says it as a notice naming the event, in the same tone", () => {
+    expect(replyNoticeText(saved([]), "no", null, "Standup")).toEqual({
+      tone: "ok",
+      text: "You replied No to “Standup”.",
+    });
+    expect(replyNoticeText(saved([]), "yes", "all", " ")).toEqual({
+      tone: "ok",
+      text: "You replied Yes to all events of “(no title)”.",
+    });
+    expect(
+      replyNoticeText(
+        saved(["mirror_refresh_pending", "kept_own_reply"], ["2026-10-19"]),
+        "yes",
+        "all",
+        "Gym",
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "You replied Yes to all events of “Gym”. PM's calendar will show it after the next refresh. 1 occurrence you answered on its own kept its answer.",
+    });
+    expect(replyNoticeText({ outcome: "no_change" }, "yes", null, "Gym")).toEqual({
+      tone: "ok",
+      text: "That's already your reply to “Gym”.",
+    });
+    expect(replyNoticeText({ outcome: "busy" }, "yes", null, "Gym")).toEqual({
+      tone: "warn",
+      text: "Your reply to “Gym”: Google is busy right now. Reply again in a moment.",
+    });
+    expect(replyNoticeText({ outcome: "gone" }, "yes", null, "Gym").tone).toBe("error");
+  });
+});
+
+// C14 critiques C1-L10, C2-L1, C2-L10: under someone else's event, what the user may still do.
+describe("the line under someone else's event (C14b)", () => {
+  it("says the user can reply, only when this copy can, and how when editing is off", () => {
+    expect(reasonText("not_organizer")).toBe(
+      "Someone else organises this event. You can reply, and change only your own settings.",
+    );
+    expect(notOrganizerText(true, true)).toBe(reasonText("not_organizer"));
+    expect(notOrganizerText(false, true)).toBe(
+      "Someone else organises this event. You can change only your own settings.",
+    );
+    expect(notOrganizerText(true, false)).toBe(
+      "Someone else organises this event. Turn on editing for this account to reply from PM.",
+    );
+    expect(notOrganizerText(false, false)).toBe(
+      "Someone else organises this event. Turn on editing for this account to change your own settings from PM.",
     );
   });
 });

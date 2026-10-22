@@ -13,9 +13,9 @@
 // be wrong. There is no scrim, the calendar behind stays live, and clicking a different event is how
 // you move between them — Tab must be able to leave.
 
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CalendarEvent } from "../../../lib/types";
+import type { CalendarEvent, WriteOutcome } from "../../../lib/types";
 
 const eventFlags = vi.fn();
 
@@ -51,7 +51,11 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
-import { CalendarEventPopover } from "./CalendarEventPopover";
+import {
+  CalendarEventPopover,
+  type PopoverEditing,
+  type PopoverRsvp,
+} from "./CalendarEventPopover";
 
 function calendarEvent(over: Partial<CalendarEvent> = {}): CalendarEvent {
   return {
@@ -586,5 +590,150 @@ describe("CalendarEventPopover", () => {
       />,
     );
     expect(queryByText("Colour")).toBeNull();
+  });
+
+  // #884 C14b: "Going?" at the foot of the card, one per copy the user can reply from.
+  describe("the reply strip", () => {
+    const SAVED: WriteOutcome = { outcome: "saved", warnings: [], left_behind: [] };
+    const copy = (over: Partial<PopoverRsvp> = {}): PopoverRsvp => ({
+      key: "e1",
+      current: "awaiting",
+      repeating: false,
+      forWhom: null,
+      onReply: vi.fn(() => Promise.resolve(SAVED)),
+      ...over,
+    });
+    const editing = (rsvp?: PopoverRsvp[]): PopoverEditing => ({
+      canEdit: false,
+      canDelete: false,
+      reason: null,
+      onEdit: () => {},
+      onDelete: () => {},
+      rsvp,
+    });
+    function popover(edit?: PopoverEditing, event = calendarEvent(), onClose = () => {}) {
+      return (
+        <CalendarEventPopover
+          event={event}
+          anchor={rect(100)}
+          calendar={null}
+          color="#000"
+          milestone={null}
+          onClose={onClose}
+          editing={edit}
+        />
+      );
+    }
+    const me = (response: string) => ({
+      name: null,
+      email: "me@x.org",
+      response,
+      optional: false,
+      organizer: false,
+      self: true,
+    });
+
+    it("no strip without editing or without copies to reply from", () => {
+      for (const edit of [undefined, editing(), editing([])]) {
+        const view = render(popover(edit));
+        expect(view.queryByText(/^Going\?/)).toBeNull();
+        expect(view.queryByRole("button", { name: "Yes" })).toBeNull();
+        // Not even an empty section: the header, the body and the actions only.
+        expect(view.getByRole("dialog").children).toHaveLength(3);
+        view.unmount();
+      }
+      const view = render(popover(editing([copy()])));
+      expect(view.getByRole("dialog").children).toHaveLength(4);
+    });
+
+    it("one copy: Going? with no name; two: each names its calendar", () => {
+      const view = render(popover(editing([copy()])));
+      expect(view.getByRole("group", { name: "Going?" })).toBeTruthy();
+      view.rerender(
+        popover(editing([copy({ forWhom: "Work" }), copy({ key: "e2", forWhom: "Personal" })])),
+      );
+      expect(view.getByRole("group", { name: "Going? Replying for Work." })).toBeTruthy();
+      expect(view.getByRole("group", { name: "Going? Replying for Personal." })).toBeTruthy();
+      // Still a NON-modal dialog with the strip in it.
+      expect(view.getByRole("dialog").getAttribute("aria-modal")).toBeNull();
+    });
+
+    it("a reply calls that copy's onReply with the scope", async () => {
+      const first = copy({ forWhom: "Work" });
+      const second = copy({ key: "e2", forWhom: "Personal", repeating: true });
+      const view = render(popover(editing([first, second])));
+      const strip = view.getByRole("group", { name: "Going? Replying for Personal." });
+      fireEvent.click(within(strip).getByRole("button", { name: "No" }));
+      await act(async () => fireEvent.click(view.getByRole("button", { name: "All events" })));
+      expect(second.onReply).toHaveBeenCalledWith("no", "all");
+      expect(first.onReply).not.toHaveBeenCalled();
+    });
+
+    it("the occurrence question's Escape stays in the strip", () => {
+      const onClose = vi.fn();
+      const view = render(popover(editing([copy({ repeating: true })]), calendarEvent(), onClose));
+      fireEvent.click(view.getByRole("button", { name: "Yes" }));
+      fireEvent.keyDown(view.getByRole("button", { name: "Back" }), { key: "Escape" });
+      expect(onClose).not.toHaveBeenCalled();
+      // Back at the reply buttons, Escape closes the popover as ever.
+      fireEvent.keyDown(view.getByRole("button", { name: "Yes" }), { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    // The calendar renders the popover with its row read afresh (CalendarView), so a reply that
+    // landed shows in the guest list without reopening it.
+    it("after a reply the guest list shows it", () => {
+      const view = render(
+        popover(editing([copy()]), calendarEvent({ attendees: [me("needsAction")] })),
+      );
+      expect(view.getByRole("dialog").textContent).toContain("no reply");
+      view.rerender(
+        popover(editing([copy({ current: "no" })]), calendarEvent({ attendees: [me("declined")] })),
+      );
+      expect(view.getByRole("dialog").textContent).toContain("declined");
+      expect(view.getByRole("button", { name: "No" }).getAttribute("aria-pressed")).toBe("true");
+    });
+
+    // C14 critiques C1-L4, C2-L3: anything that changes the panel's size re-places it, the
+    // strip's question and lines included, not only the words and flags it knows of.
+    it("re-places the panel whenever its size changes", () => {
+      let resized: (() => void) | null = null;
+      const real = (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+      (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
+        constructor(callback: () => void) {
+          resized = callback;
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      };
+      const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight");
+      let tall = 200;
+      Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+        configurable: true,
+        get: () => tall,
+      });
+      try {
+        const view = render(
+          <CalendarEventPopover
+            event={calendarEvent()}
+            anchor={rect(window.innerHeight - 60)}
+            calendar={null}
+            color="#000"
+            milestone={null}
+            onClose={() => {}}
+            editing={editing([copy({ repeating: true })])}
+          />,
+        );
+        const panel = view.getByRole("dialog");
+        const before = panel.style.top;
+        tall = 320;
+        act(() => resized?.());
+        expect(panel.style.top).not.toBe(before);
+      } finally {
+        if (height) Object.defineProperty(HTMLElement.prototype, "offsetHeight", height);
+        (globalThis as { ResizeObserver?: unknown }).ResizeObserver = real;
+      }
+    });
   });
 });

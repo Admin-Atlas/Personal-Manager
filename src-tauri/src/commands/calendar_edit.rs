@@ -7127,7 +7127,7 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
              events there."
         }
         ReadOnlyReason::NotOrganizer => {
-            "Someone else organises this event, so only they can change it."
+            "Someone else organises this event. You can reply, and change only your own settings."
         }
         ReadOnlyReason::NotInvited => {
             "This calendar isn't on the event's guest list, so there's no reply to send from it."

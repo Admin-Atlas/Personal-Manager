@@ -162,6 +162,10 @@ pub struct AgendaEvent {
     #[serde(flatten)]
     pub event: CalendarEvent,
     pub ended: bool,
+    /// The user declined it on every copy that has their own guest-list entry, so the focus view
+    /// strikes it through, as Google Calendar draws a declined event (#884, C14b). Said here because
+    /// these rows carry no guest list.
+    pub declined: bool,
 }
 
 /// A calendar as returned by Google's `calendarList`, before PM's selection is applied.
@@ -2143,7 +2147,8 @@ fn agenda_query(
     let mut stmt = conn.prepare(
         "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
                 (all_day = 0 AND julianday(COALESCE(end, start)) < julianday('now')) AS ended, \
-                recurring, series_id, original_start \
+                recurring, series_id, original_start, attendees, \
+                (SELECT remote_id FROM calendars c WHERE c.id = calendar_events.calendar_id) \
          FROM calendar_events \
          WHERE (CASE WHEN all_day = 1 \
                      THEN date(COALESCE(end, date(start, '+1 day'))) > ?1 \
@@ -2157,11 +2162,15 @@ fn agenda_query(
         let all_day: i64 = r.get(7)?;
         let ended: i64 = r.get(10)?;
         let recurring: i64 = r.get(11)?;
-        Ok(AgendaEvent {
+        let attendees: Option<String> = r.get(14)?;
+        let calendar: Option<String> = r.get(15)?;
+        let reply = own_declined(attendees.as_deref(), calendar.as_deref());
+        let row = AgendaEvent {
             // The v40 detail fields (show_as/attendees/…) are only surfaced by the Calendar tab's
             // event popup via `list_all_events`; the assistant/focus paths this query feeds don't use
             // them, so they default to empty here rather than widening this hot query. The series
-            // facts are read: flag detection keys an occurrence by them (flags::occurrence_of).
+            // facts are read: flag detection keys an occurrence by them (flags::occurrence_of). The
+            // guest list is read only for the user's own reply, then dropped (`declined`).
             event: CalendarEvent {
                 id: r.get(0)?,
                 calendar_id: r.get(1)?,
@@ -2179,7 +2188,9 @@ fn agenda_query(
                 ..Default::default()
             },
             ended: ended != 0,
-        })
+            declined: false,
+        };
+        Ok((row, reply))
     })?;
     let collected = rows
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -2202,14 +2213,57 @@ fn agenda_query(
     // the flag/briefing label joins and `milestones::calendar_dates_by_uid` each want ONE row per
     // series ("a daily standup is one flag, not one per day"), which is a different question from
     // "which occurrences are on the agenda".
-    let mut seen = std::collections::HashSet::new();
-    Ok(collected
-        .into_iter()
-        .filter(|a| match &a.event.uid {
-            Some(uid) if !uid.is_empty() => seen.insert((uid.clone(), a.event.start.clone())),
-            _ => true,
+    //
+    // The copies folded away still count for `declined` (#884, C14b): a kept row is declined only
+    // when at least one copy has the user's own guest entry and every such copy says they declined,
+    // as the Calendar tab strikes a merged row through. Google draws each calendar's copy apart; PM
+    // lists one, so a copy still going keeps it plain.
+    let mut at = std::collections::HashMap::new();
+    let mut kept: Vec<AgendaEvent> = Vec::new();
+    let mut replies: Vec<(bool, bool)> = Vec::new();
+    for (a, reply) in collected {
+        let fold = |(any, all): (bool, bool)| match reply {
+            Some(declined) => (true, all && declined),
+            None => (any, all),
+        };
+        if let Some(uid) = a.event.uid.as_deref().filter(|u| !u.is_empty()) {
+            let key = (uid.to_string(), a.event.start.clone());
+            if let Some(&i) = at.get(&key) {
+                replies[i] = fold(replies[i]);
+                continue;
+            }
+            at.insert(key, kept.len());
+        }
+        replies.push(fold((false, true)));
+        kept.push(a);
+    }
+    for (a, (any, all)) in kept.iter_mut().zip(replies) {
+        a.declined = any && all;
+    }
+    Ok(kept)
+}
+
+/// Whether the user declined a mirrored row: `Some(declined)` from the guest-list entry marked as
+/// the calendar the row is on (Google's `self`, with an address; with two marked, the calendar's
+/// own address first, else the first, as the editing side picks it), `None` without one. `attendees`
+/// is the row's stored list, `calendar` its calendar's own id (a main calendar's is its address).
+fn own_declined(attendees: Option<&str>, calendar: Option<&str>) -> Option<bool> {
+    fn address(a: &Attendee) -> Option<&str> {
+        a.email.as_deref().map(str::trim).filter(|e| !e.is_empty())
+    }
+    let list: Vec<Attendee> = serde_json::from_str(attendees?).ok()?;
+    let marked: Vec<&Attendee> = list
+        .iter()
+        .filter(|a| a.is_self && address(a).is_some())
+        .collect();
+    let own = calendar
+        .and_then(|c| {
+            marked
+                .iter()
+                .find(|a| address(a).is_some_and(|e| e.to_lowercase() == c.trim().to_lowercase()))
         })
-        .collect())
+        .or(marked.first())?;
+    Some(own.response.as_deref() == Some("declined"))
 }
 
 /// Upcoming events under the strict "not yet ended" gate (chat preamble, project name-match, briefing,
@@ -3072,6 +3126,119 @@ mod tests {
         let rows = agenda_query(&conn, 21, 250, &today, "now").unwrap();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].event.id.as_str(), "a1" | "a2"));
+    }
+
+    /// The focus agenda says which events the user declined (#884, C14b): by their own entry on the
+    /// guest list (marked as the calendar, with an address; the calendar's own address first), and
+    /// a row mirrored on two calendars only when every copy with an own entry declined.
+    #[test]
+    fn the_agenda_says_which_events_the_user_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        upsert_source(
+            &conn,
+            "gcal:me@x.com",
+            "google",
+            Some("me@x.com"),
+            "me@x.com",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO calendars (id, source_id, provider, remote_id, name) VALUES \
+               ('cal-me', 'gcal:me@x.com', 'google', 'me@x.com', 'Me'), \
+               ('cal-two', 'gcal:me@x.com', 'google', 'two@x.com', 'Two');",
+        )
+        .unwrap();
+        /// One copy of the occurrence on `day` (its iCal UID and start are the day's, so two copies
+        /// of one occurrence share them exactly, as every producer writes them).
+        fn put(conn: &Connection, id: &str, calendar: &str, day: i64, list: Option<&[String]>) {
+            let start: String = conn
+                .query_row(
+                    "SELECT datetime(date('now'), ?1, '+12 hours')",
+                    params![format!("+{day} days")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_events (id, calendar_id, summary, start, end, all_day, uid, \
+                 attendees) VALUES (?1, ?2, 'Meet', ?3, datetime(?3, '+30 minutes'), 0, ?4, ?5)",
+                params![
+                    id,
+                    calendar,
+                    start,
+                    format!("day-{day}"),
+                    list.map(|l| format!("[{}]", l.join(",")))
+                ],
+            )
+            .unwrap();
+        }
+        let guest = |email: &str, response: &str, own: bool| {
+            format!(r#"{{"email":"{email}","response":"{response}","self":{own}}}"#)
+        };
+        let me = |response: &str| guest("me@x.com", response, true);
+        let two = |response: &str| guest("two@x.com", response, true);
+        let other = |response: &str| guest("a@x.org", response, false);
+        // 1: declined, with another guest going: struck through.
+        put(
+            &conn,
+            "d",
+            "cal-me",
+            1,
+            Some(&[me("declined"), other("accepted")]),
+        );
+        // 2: another guest declined, the user going: plain.
+        put(
+            &conn,
+            "a",
+            "cal-me",
+            2,
+            Some(&[me("accepted"), other("declined")]),
+        );
+        // 3: declined on one copy, going on the other: plain.
+        put(&conn, "m1", "cal-me", 3, Some(&[me("declined")]));
+        put(&conn, "m2", "cal-two", 3, Some(&[two("accepted")]));
+        // 4: declined on both copies: struck through.
+        put(&conn, "b1", "cal-me", 4, Some(&[me("declined")]));
+        put(&conn, "b2", "cal-two", 4, Some(&[two("declined")]));
+        // 5: a copy with no entry of its own (kept, as it sorts first) doesn't count either way.
+        put(
+            &conn,
+            "c1",
+            "cal-two",
+            5,
+            Some(&[guest("me@x.com", "accepted", false)]),
+        );
+        put(&conn, "c2", "cal-me", 5, Some(&[me("declined")]));
+        // 6, 7: two entries marked (an alias): the calendar's own address in any case, else the
+        // first.
+        let alias = |second: &str| {
+            vec![
+                guest("Me+pm@x.com", "declined", true),
+                guest(second, "accepted", true),
+            ]
+        };
+        put(&conn, "p1", "cal-me", 6, Some(&alias("ME@x.com")));
+        put(&conn, "p2", "cal-two", 7, Some(&alias("me@x.com")));
+        // 8, 9: marked without an address, or no guest list at all: nothing to say.
+        let no_address = String::from(r#"{"response":"declined","self":true}"#);
+        put(&conn, "n1", "cal-me", 8, Some(&[no_address]));
+        put(&conn, "n2", "cal-me", 9, None);
+        // 10: going on the copy kept, declined on the one folded away: plain (whichever comes last).
+        put(&conn, "q1", "cal-me", 10, Some(&[me("accepted")]));
+        put(&conn, "q2", "cal-two", 10, Some(&[two("declined")]));
+        let today: String = conn
+            .query_row("SELECT date('now')", [], |r| r.get(0))
+            .unwrap();
+
+        let rows = agenda_query(&conn, 21, 250, &today, "now").unwrap();
+        let declined: Vec<bool> = rows.iter().map(|a| a.declined).collect();
+        assert!(rows.len() == 10, "each occurrence once");
+        assert!(
+            declined == [true, false, false, true, true, false, true, false, false, false],
+            "declined by day"
+        );
+        // The guest list is read for the reply only: the rows still carry none.
+        assert!(rows.iter().all(|a| a.event.attendees.is_empty()));
     }
 
     /// A moved occurrence mirrored twice (Google's own copy, and its iCal feed's): the agenda always

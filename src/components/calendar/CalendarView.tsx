@@ -8,13 +8,14 @@
 // (a CLI status strip + agenda/tables, never a pixel grid) enumerated explicitly per view so nothing
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
 // on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. A synced event opens its
-// detail popover, where a Google event PM may change offers Edit and Delete (#884; every change goes
-// through `edit/useEventWrites`); "+ New event" and `c` open the editor for a new one, on a calendar
-// the user picks, and Shift+C a quick box under the button, whose draft is drawn on the grid as it's
-// typed (C10); everything else stays read-only. The two first-party overlays — project
-// milestones (click opens their project) and freeform pinboard timeline entries (click opens the
-// Pinboard) — are each an all-day event in its own hue, injected here and never written back to any
-// calendar.
+// detail popover, where a Google event PM may change offers Edit and Delete, and one the user is
+// invited to offers Yes, No and Maybe (#884; every change goes through `edit/useEventWrites`); an
+// event they declined is struck through, as Google draws it. "+ New event" and `c` open the editor
+// for a new one, on a calendar the user picks, and Shift+C a quick box under the button, whose
+// draft is drawn on the grid as it's typed (C10); everything else stays read-only. The two
+// first-party overlays — project milestones (click opens their project) and freeform pinboard
+// timeline entries (click opens the Pinboard) — are each an all-day event in its own hue, injected
+// here and never written back to any calendar.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -28,8 +29,10 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { reasonText } from "../../lib/calendarEdit/editReasons";
+import { notOrganizerText, reasonText } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
+import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
+import { isRepeating } from "../../lib/calendarEdit/saveChoices";
 import {
   createdWhere,
   createReasonFor,
@@ -726,9 +729,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     (ev: CalendarEvent): { canEdit: boolean; canDelete: boolean; reason: string | null } => {
       const none = (reason: string | null) => ({ canEdit: false, canDelete: false, reason });
       const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
+      const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
+      // Someone else's event says what the user may still do from this copy: reply when it's on
+      // the guest list, which the strip above the line offers, and how when editing is off (C14b).
+      if (ev.edit_block === "not_organizer") {
+        return none(notOrganizerText(ev.can_respond === true, on));
+      }
       if (ev.edit_block) return none(reasonText(ev.edit_block));
       if (cal?.provider !== "google") return none(null);
-      if (overview?.editing[cal.source_id] !== "on") return none(reasonText("editing_off"));
+      if (!on) return none(reasonText("editing_off"));
       // The gate decides Delete (C14): a locked copy, whose delete Google doesn't document, and an
       // invitation can't be deleted. A row the list didn't mark gets none.
       return {
@@ -752,6 +761,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // A row a delete is hiding takes every copy of its occurrence with it: the same Google event
     // seen through a second connected account is the same event, and showing that copy instead
     // would look like the delete hadn't happened.
+    //
+    // A row the user declined is struck through, as Google draws it, only when every copy shown
+    // that has their own guest entry says so (`markDeclined`, C14b): the kept copy may be the
+    // organiser's, which the reply doesn't change.
     const deleting = new Set(
       events
         .filter((e) => writes.hiddenIds.has(e.id))
@@ -760,10 +773,12 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     );
     const at = new Map<string, number>();
     const out: CalendarEvent[] = [];
+    const copies: CalendarEvent[] = [];
     for (const e of events) {
       if (hidden.has(e.calendar_id) || writes.hiddenIds.has(e.id)) continue;
       const key = occurrenceKey(e);
       if (key !== null && deleting.has(key)) continue;
+      copies.push(e);
       if (key !== null) {
         const i = at.get(key);
         if (i !== undefined) {
@@ -774,13 +789,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       }
       out.push(e);
     }
+    const address = new Map(overview?.calendars.map((c) => [c.id, c.remote_id]) ?? []);
+    const marked = markDeclined(out, copies, (id) => address.get(id) ?? null);
     // Both first-party overlays ride on top, each toggleable like a calendar via the same `hidden` set.
     // Their events carry a null uid + a unique calendar_id, so they skip the dedup and hide filter
     // cleanly.
-    if (!hidden.has(MILESTONE_CALENDAR_ID)) out.push(...milestoneEvents);
-    if (!hidden.has(PINBOARD_CALENDAR_ID)) out.push(...pinboardEvents);
-    return out;
-  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor]);
+    if (!hidden.has(MILESTONE_CALENDAR_ID)) marked.push(...milestoneEvents);
+    if (!hidden.has(PINBOARD_CALENDAR_ID)) marked.push(...pinboardEvents);
+    return marked;
+  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor, overview]);
 
   // The new event's ghost (C10c): quick create's draft in its calendar's colour, saying how far it
   // has got, or a saved one's waiting for its row. It joins after the hide filter, so it shows on a
@@ -829,7 +846,27 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       setEventPopup(null);
       deleteDialog.ask(ev);
     },
+    // A reply from each copy of the occurrence the user can send one from (C14b), the copy the
+    // dedup hid included: with both accounts shown, the organiser's copy is the one kept.
+    rsvp: replyCopies(
+      events,
+      ev,
+      overview?.calendars ?? [],
+      (c) => !hidden.has(c.id) && overview?.editing[c.source_id] === "on",
+    ).map(({ event, calendar, forWhom }) => ({
+      key: event.id,
+      current: myReply(event, calendar.remote_id),
+      repeating: isRepeating(event),
+      forWhom,
+      onReply: (reply, scope) => writes.respond(event.id, reply, null, scope),
+    })),
   });
+  // The popover reads its row afresh from the list, so after a reply lands and the list reloads,
+  // its guest list and its reply strip show what Google holds now. A row gone from the list keeps
+  // the copy taken at the click.
+  const popupEvent = eventPopup
+    ? (events.find((e) => e.id === eventPopup.ev.id) ?? eventPopup.ev)
+    : null;
 
   // Clicking an event: a PM overlay keeps its jump (a milestone opens its project, a freeform pinboard
   // entry opens the Pinboard), while a real synced event opens the in-place detail popup anchored at
@@ -1129,15 +1166,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         </div>
       )}
 
-      {eventPopup && (
+      {eventPopup && popupEvent && (
         <CalendarEventPopover
-          event={eventPopup.ev}
+          event={popupEvent}
           anchor={eventPopup.anchor}
-          calendar={overview?.calendars.find((c) => c.id === eventPopup.ev.calendar_id) ?? null}
-          color={colorOf(eventPopup.ev.calendar_id)}
+          calendar={overview?.calendars.find((c) => c.id === popupEvent.calendar_id) ?? null}
+          color={colorOf(popupEvent.calendar_id)}
           milestone={
-            eventPopup.ev.uid
-              ? (milestones.find((m) => m.event_uid && m.event_uid === eventPopup.ev.uid) ?? null)
+            popupEvent.uid
+              ? (milestones.find((m) => m.event_uid && m.event_uid === popupEvent.uid) ?? null)
               : null
           }
           onClose={() => setEventPopup(null)}
@@ -1150,7 +1187,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
                 }
               : undefined
           }
-          editing={popoverEditing(eventPopup.ev)}
+          editing={popoverEditing(popupEvent)}
           describeSeries={writes.describeSeries}
         />
       )}

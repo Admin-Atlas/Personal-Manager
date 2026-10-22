@@ -4,7 +4,8 @@
 // The click-to-open detail popup for a calendar event (card 6 follow-up). PM is the calendar
 // aggregator, so this surfaces everything the mirror holds — source calendar, when, busy/free,
 // location, attendees + organiser, conferencing, recurrence, description, and any linked milestone /
-// project / PM flag — plus buttons to open the event in its source calendar or its project. It's an
+// project / PM flag — plus buttons to open the event in its source calendar or its project, and, on
+// an event the user is invited to (#884, C14b), "Going?" with Yes, No and Maybe. It's an
 // in-place floating panel (the pinboard folder-popup pattern): fixed-position, clamped to the
 // viewport, dismissed by click-outside or Escape. The description is the one piece of untrusted
 // provider text, so it renders ONLY through the sanitising Markdown boundary.
@@ -28,14 +29,23 @@ import {
   type MutableRefObject,
   type ReactNode,
 } from "react";
-import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
-import { responseLabel } from "../../../lib/calendarEdit/guests";
+import type {
+  Calendar,
+  CalendarEvent,
+  Flag,
+  Milestone,
+  Rsvp,
+  RsvpScope,
+  WriteOutcome,
+} from "../../../lib/types";
+import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
 import { eventColour } from "../../../theme/eventPalette";
 import { Button, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
+import { RsvpControl } from "../edit/RsvpControl";
 import { repeatsText, whenText } from "./whenText";
 
 interface Props {
@@ -71,6 +81,18 @@ export interface PopoverEditing {
   reason: string | null;
   onEdit: () => void;
   onDelete: () => void;
+  /** Copies the user can reply from, the one shown first (C14b). Empty or absent: no reply strip. */
+  rsvp?: readonly PopoverRsvp[];
+}
+
+/** One copy of the event the user can reply from. */
+export interface PopoverRsvp {
+  /** The copy's row id: a React key. */
+  key: string;
+  current: Reply | null;
+  repeating: boolean;
+  forWhom: string | null;
+  onReply: (reply: Rsvp, scope: RsvpScope | null) => Promise<WriteOutcome>;
 }
 
 const MARGIN = 8;
@@ -142,7 +164,7 @@ export function CalendarEventPopover({
   // to the bottom) when there isn't room. Hidden until placed so it never flashes at 0,0. Measured
   // again when the repeat line's words or the flags arrive, since either can make the panel taller,
   // and one flipped above its chip would then grow over it; a move only when the numbers change.
-  useLayoutEffect(() => {
+  const place = useCallback(() => {
     const el = panelRef.current;
     if (!el) return;
     const w = el.offsetWidth;
@@ -154,7 +176,17 @@ export function CalendarEventPopover({
       top = above >= MARGIN ? above : Math.max(MARGIN, window.innerHeight - h - MARGIN);
     }
     setPos((p) => (p && p.left === left && p.top === top ? p : { left, top }));
-  }, [anchor, words, flags.length]);
+  }, [anchor]);
+  useLayoutEffect(() => place(), [place, words, flags.length]);
+  // And whenever anything else changes its size: the reply strip's occurrence question and its
+  // lines come and go inside it (C14 critiques C1-L4, C2-L3). jsdom has no ResizeObserver.
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const watch = new ResizeObserver(() => place());
+    watch.observe(el);
+    return () => watch.disconnect();
+  }, [place]);
   const placed = pos !== null;
 
   // Focus handling for a NON-MODAL dialog. This panel is deliberately not a `Modal`: there is no
@@ -384,6 +416,25 @@ export function CalendarEventPopover({
           </div>
         )}
       </div>
+
+      {/* "Going?", at the foot of the card as Google puts it: one per copy the user can reply
+          from (an invitation mirrored on two of their calendars names each). No note here: PM
+          doesn't know the note Google holds until the editor reads it (C14 spec Q2). */}
+      {editing?.rsvp && editing.rsvp.length > 0 && (
+        <div className="flex flex-col gap-2.5 border-t border-border px-3 py-2.5">
+          {editing.rsvp.map((copy) => (
+            <RsvpControl
+              key={copy.key}
+              current={copy.current}
+              repeating={copy.repeating}
+              forWhom={copy.forWhom}
+              note={null}
+              title={title}
+              onReply={(reply, _note, scope) => copy.onReply(reply, scope)}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Actions */}
       <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2.5">
