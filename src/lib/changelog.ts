@@ -24,6 +24,99 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.155.0-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "You can now change and delete events you organise that have guests, right from PM. Add guests by address or from people already in your calendars, mark them optional, take them off, and choose what they may do, just as in Google Calendar.",
+      "Like Google Calendar, PM asks every time whether Google should email your guests, with nothing picked for you, and says how many emails that is, a change to a repeating event included. A change to only Busy or Free emails nobody, so it never asks, and rooms are kept as they are.",
+    ],
+  },
+  {
+    version: "3.154.2-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "Under the hood, PM now has the pieces of a guest list like Google Calendar's: adding people by address or from people already in your calendars, marking them optional, the three guest permissions, and the question of whether Google emails your guests about a change, with Send and Don't send and no answer picked for you. None of it is in the app yet, and events with guests stay read-only for now.",
+    ],
+  },
+  {
+    version: "3.154.1-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "Under the hood, PM can now work out who a change to an event would email and ask you first, with no answer picked for you, and it keeps every guest's reply when a guest list changes. Events with guests stay read-only until guest editing arrives in a later update.",
+    ],
+  },
+  {
+    version: "3.154.0-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "You can now change how an event repeats. Open an event that happens once and pick a repeat under its date and time, and it repeats from then on. On a repeating event, pick a new repeat and choose whether it applies from that occurrence on or to every occurrence, as Google Calendar asks.",
+      "You can also switch every occurrence of a repeating event between all-day and timed, or move them all into another time zone, from any one of them. Occurrences you deleted stay deleted, and PM says before saving where a new repeat starts if it moves. Stopping a repeating event from repeating comes in a later update.",
+    ],
+  },
+  {
+    version: "3.153.1-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Under the hood, PM can now change how a repeating event repeats, for every occurrence or from one on, ready for the editor in the next update. Stopping a repeat comes after that.",
+    ],
+  },
+  {
+    version: "3.153.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "New events can repeat. Under the date and time, in the full editor and in quick create, pick one of Google's choices for that day, like “Weekly on Tuesday” or “Monthly on the second Tuesday”, or set your own with Custom…: every few days, weeks, months or years, on the days you choose, ending on a date or after a number of times.",
+      "If the days you pick don't include the start date, PM starts the event on the first day that fits and tells you which, and an event in another time zone says it repeats in that zone's time. Changing how an existing event repeats comes next.",
+    ],
+  },
+  {
+    version: "3.152.1-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Under the hood, PM can now put repeat rules into words and work out the day a repeating event starts, ready for creating repeating events in the next update.",
+    ],
+  },
+  {
+    version: "3.152.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Repeating Google events now say how they repeat in their details, such as “Weekly on Monday”, just as Google Calendar does.",
+      "After you change “this and the following events”, PM offers to move a milestone already linked to that event over to the new part, so the milestone keeps following your schedule instead of being left on the part that has ended. If you move it by mistake, you have a few seconds to move it back.",
+    ],
+  },
+  {
+    version: "3.151.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Quick create: press Shift+C on the calendar for a small box under + New event. Type a title and press Enter, and it's in your Google calendar; change the day or the time there, or choose the calendar. More options opens the full editor with everything you've typed, so nothing is lost on the way.",
+      "In the day, week, month and agenda views the new event shows as you type, dashed, in its calendar's colour, and moves as you change the time; a screen reader names it as the new event. The Year view and the Terminal look show only what's in your calendar.",
+      "Clicking elsewhere on the calendar only closes the box while it has no title, and a titled one is still there if you switch tabs and come back, so a half-made event isn't lost by accident; × throws it away.",
+    ],
+  },
+  {
+    version: "3.150.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "You can now create events in your Google calendars right from PM: press + New event at the top of the calendar, or just press c. Pick the calendar, and next time PM starts on the one you used last; a new event lasts as long as your Google Calendar's default, so a 30-minute default gives a 30-minute event. Ctrl+S (⌘S on a Mac) saves, as in Google Calendar.",
+      "It works on Google accounts with editing turned on in Settings › Connectors, and goes straight to Google with your calendar's usual notifications. If PM loses touch with Google while saving, it says so and offers Check again, which looks for the event in Google before sending it again, so a dropped connection is very unlikely to make a second copy. Repeating events and inviting guests come later.",
+    ],
+  },
+  {
+    version: "3.149.1-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Under the hood, PM can now create events on your Google calendars. If PM loses touch with Google while saving a new event, it looks for it there before sending it again, so a dropped connection is very unlikely to make a second copy. Nothing you can see changes yet: the way to create events in the app comes in a later update.",
+    ],
+  },
+  {
+    version: "3.149.0-alpha",
+    date: "2026-10-19",
+    highlights: [
+      "You can now change and delete repeating events you organise without guests in Google Calendar, right from PM. Like Google Calendar, PM asks whether you mean this event, this and the following events, or all events, and before you choose it says what that would change: occurrences you changed on their own, a move to another day, or a video call the new part won't have.",
+      "There's no Undo after saving a repeating event: for this event or all events, edit it again to change it back; a “this and the following events” change stays a repeating event of its own. Deleting one still gives you a few seconds to undo, as with any event. A new part made by “this and the following events” starts without a video call; add one in Google Calendar if you need it.",
+      "If PM loses touch with Google halfway through a change, it says so, with buttons to finish it, take it back or check again, as far as Google allows.",
+    ],
+  },
+  {
     version: "3.148.9-alpha",
     date: "2026-10-19",
     highlights: [

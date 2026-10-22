@@ -12,13 +12,15 @@
 use std::fmt;
 
 use chrono::{
-    DateTime, Days, FixedOffset, LocalResult, NaiveDate, NaiveTime, SecondsFormat, TimeZone,
-    Timelike,
+    DateTime, Days, FixedOffset, LocalResult, NaiveDate, NaiveTime, SecondsFormat, TimeDelta,
+    TimeZone, Timelike,
 };
 use chrono_tz::Tz;
 use serde_json::{json, Value};
 
 use super::dto::TimeDraft;
+use crate::calendar_recur::wire;
+use crate::calendar_recur::SeriesStart;
 
 /// Why a time can't be saved as given. Shown to the user as is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,22 +67,75 @@ pub fn parse_device_zone(zone: Option<&str>) -> Result<Tz, TimeError> {
     }
 }
 
-/// An IANA zone name as a zone.
+/// An IANA zone name as a zone. The three parsers here are the repeat menu's own ([`wire`]), so
+/// a save and the menu's words can't read the same text two ways (C11 critique 1 L6).
 pub fn parse_zone(name: &str) -> Result<Tz, TimeError> {
-    name.trim()
-        .parse::<Tz>()
-        .map_err(|_| TimeError::UnknownZone(name.trim().to_string()))
+    wire::parse_zone(name).ok_or_else(|| TimeError::UnknownZone(name.trim().to_string()))
 }
 
 fn parse_date(s: &str) -> Result<NaiveDate, TimeError> {
-    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| TimeError::BadDate(s.into()))
+    wire::parse_date(s).ok_or_else(|| TimeError::BadDate(s.into()))
 }
 
 fn parse_time(s: &str) -> Result<NaiveTime, TimeError> {
-    let s = s.trim();
-    NaiveTime::parse_from_str(s, "%H:%M")
-        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
-        .map_err(|_| TimeError::BadTime(s.into()))
+    wire::parse_time(s).ok_or_else(|| TimeError::BadTime(s.trim().into()))
+}
+
+/// Where a draft's event starts, as a series would, for a repeat rule to start from (C11): read as
+/// [`wire::series_start`] reads the repeat menu's start, with the same parsers in the same order,
+/// so the menu's words and the save start a rule on the same day. A time the clocks skip isn't
+/// refused here: the rule may move the start, and the day it lands on is checked there.
+pub fn series_start(draft: &TimeDraft) -> Result<SeriesStart, TimeError> {
+    match draft {
+        TimeDraft::Timed {
+            start_date,
+            start_time,
+            start_zone,
+            ..
+        } => {
+            let (date, time) = (parse_date(start_date)?, parse_time(start_time)?);
+            Ok(SeriesStart::Timed {
+                local: date.and_time(time),
+                zone: parse_zone(start_zone)?,
+            })
+        }
+        TimeDraft::AllDay { first_day, .. } => Ok(SeriesStart::AllDay(parse_date(first_day)?)),
+    }
+}
+
+/// The draft moved `days` days later, start and end alike, wall times and zones kept: where a repeat
+/// rule moved its start, the end goes with it and the event keeps its length.
+pub fn shifted(draft: &TimeDraft, days: i64) -> Result<TimeDraft, TimeError> {
+    let by = |date: &str| -> Result<String, TimeError> {
+        TimeDelta::try_days(days)
+            .and_then(|delta| parse_date(date).ok()?.checked_add_signed(delta))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .ok_or_else(|| TimeError::BadDate(date.into()))
+    };
+    Ok(match draft {
+        TimeDraft::Timed {
+            start_date,
+            start_time,
+            start_zone,
+            end_date,
+            end_time,
+            end_zone,
+        } => TimeDraft::Timed {
+            start_date: by(start_date)?,
+            start_time: start_time.clone(),
+            start_zone: start_zone.clone(),
+            end_date: by(end_date)?,
+            end_time: end_time.clone(),
+            end_zone: end_zone.clone(),
+        },
+        TimeDraft::AllDay {
+            first_day,
+            last_day,
+        } => TimeDraft::AllDay {
+            first_day: by(first_day)?,
+            last_day: by(last_day)?,
+        },
+    })
 }
 
 /// The instant a wall-clock time names in `zone`. The skipped hour is an error; a repeated one takes
@@ -116,6 +171,63 @@ pub fn last_day_covered(start: NaiveDate, exclusive_end: NaiveDate) -> NaiveDate
         .unwrap_or(start)
 }
 
+/// A start or end node as the editor's date, `HH:MM` and zone: the node's own zone, else
+/// `fallback`.
+fn wall_parts(node: &Value, fallback: &str) -> Option<(String, String, String)> {
+    let at = DateTime::parse_from_rfc3339(node.get("dateTime")?.as_str()?.trim()).ok()?;
+    let zone_name = node
+        .get("timeZone")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback);
+    let zone = parse_zone(zone_name)
+        .or_else(|_| parse_zone(fallback))
+        .ok()?;
+    let local = at.with_timezone(&zone);
+    Some((
+        local.format("%Y-%m-%d").to_string(),
+        local.format("%H:%M").to_string(),
+        zone.name().to_string(),
+    ))
+}
+
+/// An event's times as the editor shows them: an all-day one's first and last days covered, a
+/// timed one's wall times, each half in its node's own zone, else `fallback_zone` (the calendar's,
+/// else this computer's; never a guessed UTC, R6). The editor opens on this, and a one-off given a
+/// repeat starts from it when the user left its time alone (C11 §10), so both read it alike.
+/// `None` when its start or end can't be read.
+pub fn time_draft_of(event: &Value, fallback_zone: &str) -> Option<TimeDraft> {
+    let start = event.get("start")?;
+    let end = event.get("end")?;
+    match start.get("date").and_then(Value::as_str) {
+        Some(first) => {
+            let first_day = NaiveDate::parse_from_str(first, "%Y-%m-%d").ok()?;
+            let end_day = end
+                .get("date")
+                .and_then(Value::as_str)
+                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .unwrap_or(first_day);
+            Some(TimeDraft::AllDay {
+                first_day: first.to_string(),
+                last_day: last_day_covered(first_day, end_day)
+                    .format("%Y-%m-%d")
+                    .to_string(),
+            })
+        }
+        None => {
+            let (start_date, start_time, start_zone) = wall_parts(start, fallback_zone)?;
+            let (end_date, end_time, end_zone) = wall_parts(end, &start_zone)?;
+            Some(TimeDraft::Timed {
+                start_date,
+                start_time,
+                start_zone,
+                end_date,
+                end_time,
+                end_zone,
+            })
+        }
+    }
+}
+
 /// Start and end as Google's event resource holds them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoogleWhen {
@@ -127,10 +239,6 @@ pub struct GoogleWhen {
 /// A time draft as Google's `start` and `end`, for a new event. A timed event keeps its own
 /// zone(s): `dateTime` with that zone's offset, plus `timeZone`, so Google shows it as the user set it
 /// and a repeating event follows that zone's daylight saving.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C10, creating events")
-)]
 pub fn resolve(draft: &TimeDraft) -> Result<GoogleWhen, TimeError> {
     resolve_against(draft, None, None)
 }
@@ -518,6 +626,95 @@ mod tests {
         assert_eq!(
             moved.start,
             json!({ "dateTime": "2026-07-01T09:00:00+02:00", "timeZone": "Europe/Paris" })
+        );
+    }
+
+    // --- a repeating event's start (C11) ---
+
+    /// C11 critique 1 L6: the save reads a start exactly as the repeat menu does, the text it
+    /// accepts and the part it refuses first alike.
+    #[test]
+    fn the_save_reads_a_start_as_the_repeat_menu_does() {
+        use crate::calendar_recur::wire::{RepeatStart, StartError};
+        for (date, time, zone) in [
+            ("2026-10-13", "09:00", "Europe/London"),
+            (" 2026-10-13 ", " 09:00:30 ", " America/New_York "),
+            ("2026-03-29", "01:30", "Europe/London"),
+            ("13-10-2026", "09:00", "Europe/London"),
+            ("2026-10-13", "9am", "Europe/London"),
+            ("2026-10-13", "09:00", "Mars/Olympus"),
+            ("soon", "late", "nowhere"),
+            ("2026-10-13", "25:00", "nowhere"),
+        ] {
+            let draft = timed_draft(date, time, zone, date, time, zone);
+            let menu = wire::series_start(&RepeatStart::Timed {
+                date: date.into(),
+                time: time.into(),
+                zone: zone.into(),
+                end: None,
+            });
+            let save = series_start(&draft);
+            match (menu, save) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(StartError::Date), Err(TimeError::BadDate(_)))
+                | (Err(StartError::Time), Err(TimeError::BadTime(_)))
+                | (Err(StartError::Zone), Err(TimeError::UnknownZone(_))) => {}
+                _ => panic!("the save and the menu read {date} {time} {zone} differently"),
+            }
+        }
+        let all_day = TimeDraft::AllDay {
+            first_day: "2026-10-31".into(),
+            last_day: "2026-11-01".into(),
+        };
+        assert_eq!(
+            series_start(&all_day),
+            Ok(SeriesStart::AllDay(
+                NaiveDate::from_ymd_opt(2026, 10, 31).unwrap()
+            ))
+        );
+    }
+
+    /// A start the rule moved takes its end with it: the same wall times and zones, whole days on.
+    #[test]
+    fn a_draft_moves_whole_days_keeping_its_wall_times_and_zones() {
+        let flight = timed_draft(
+            "2026-10-13",
+            "22:00",
+            "Europe/London",
+            "2026-10-14",
+            "06:30",
+            "America/New_York",
+        );
+        assert_eq!(
+            shifted(&flight, 1),
+            Ok(timed_draft(
+                "2026-10-14",
+                "22:00",
+                "Europe/London",
+                "2026-10-15",
+                "06:30",
+                "America/New_York",
+            ))
+        );
+        assert_eq!(shifted(&flight, 0), Ok(flight));
+        let days = TimeDraft::AllDay {
+            first_day: "2026-10-31".into(),
+            last_day: "2026-11-01".into(),
+        };
+        assert_eq!(
+            shifted(&days, 2),
+            Ok(TimeDraft::AllDay {
+                first_day: "2026-11-02".into(),
+                last_day: "2026-11-03".into(),
+            })
+        );
+        let unread = TimeDraft::AllDay {
+            first_day: "2026-10-31".into(),
+            last_day: "someday".into(),
+        };
+        assert_eq!(
+            shifted(&unread, 1),
+            Err(TimeError::BadDate("someday".into()))
         );
     }
 }

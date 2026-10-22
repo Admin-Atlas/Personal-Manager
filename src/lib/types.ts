@@ -947,6 +947,9 @@ export interface CalendarOverview {
   mirror_end: string;
   /** Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`). */
   editing: Record<string, EditingStatus>;
+  /** Google's default length for a new event, in minutes, keyed by account id like `editing`. An
+   *  account missing here has none stored yet: a new event then lasts an hour. */
+  default_length: Record<string, number>;
 }
 
 /** Calendar editing for one Google account (`calendar_editing::EditingStatus`). `paused` is the
@@ -1545,10 +1548,8 @@ export type ReadOnlyReason =
   | "calendar_read_only"
   | "private_event"
   | "not_organizer"
-  | "recurring"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
-  | "has_guests"
   | "special_type"
   | "locked"
   | "html_description";
@@ -1578,7 +1579,129 @@ export interface EventPatchDraft {
   time?: TimeDraft | null;
   show_as?: ShowAs | null;
   visibility?: EventVisibility | null;
+  /** How it repeats from now on; omitted or null leaves it as it is (C11). A one-off given a rule
+   *  starts repeating; for an occurrence, the rule is the whole repeating event's, never this
+   *  occurrence's alone. */
+  recurrence?: RepeatDraft | null;
+  /** Guests the user added, took off or marked optional, as changes to Google's own list, never
+   *  the list itself (C12). An empty list is no change. */
+  guests?: GuestOp[] | null;
+  /** What guests may do: change the event, invite others, see the guest list. */
+  guests_can_modify?: boolean | null;
+  guests_can_invite_others?: boolean | null;
+  guests_can_see_other_guests?: boolean | null;
 }
+
+/** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
+ *  "external_only" is never offered. */
+export type Notify = "all" | "none" | "external_only";
+
+/** What the user wants for one guest after the save: on it, required or optional, or off it. */
+export type GuestState = "absent" | "required" | "optional";
+
+/** One guest the user added, took off or marked optional, matched by address whatever its case. */
+export interface GuestOp {
+  email: string;
+  to: GuestState;
+}
+
+/** Who Google would email with Send, in numbers only: never the user, never a room. `people` are
+ *  different guests, `emails` one per guest per event written; `complete` false: "at least".
+ *  `told_cancelled`: guests on an occurrence the change cancels and on nothing else it writes, told
+ *  that occurrence is cancelled, never among `updated`; none when `cancelled`. */
+export interface GuestNotice {
+  updated: number;
+  invited: number;
+  removed: number;
+  told_cancelled: number;
+  cancelled: boolean;
+  people: number;
+  emails: number;
+  complete: boolean;
+}
+
+/** One guest as the editor shows it, from Google's fresh copy. `response` as Google says it
+ *  (accepted, declined, tentative, needsAction); `self` is the calendar this copy is on. */
+export interface GuestForEdit {
+  email: string;
+  name: string | null;
+  response: string | null;
+  optional: boolean;
+  organizer: boolean;
+  self: boolean;
+  room: boolean;
+}
+
+/** A change to how an event repeats: a rule from the editor's set, or "Does not repeat". */
+export type RepeatDraft = { kind: "rule"; rule: RepeatRule } | { kind: "once" };
+
+/** A new event, for creating an event: every field as the editor holds it (empty text is left out
+ *  of what goes to Google). No guests, reminders or colour yet. */
+export interface NewEventDraft {
+  summary: string;
+  time: TimeDraft;
+  location: string;
+  description: string;
+  show_as: ShowAs;
+  visibility: EventVisibility;
+  /** How it repeats; null doesn't repeat. The backend starts it on the first day the rule makes
+   *  (the repeat menu's words say which) and moves the end with it. */
+  recurrence: RepeatRule | null;
+}
+
+// --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---
+
+/** A day of the week, Monday first. */
+export type DayCode = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+/** Which of a month's weekdays: the first four or the last, never a fifth. */
+export type NthCode = "first" | "second" | "third" | "fourth" | "last";
+
+export type RepeatPattern =
+  | { kind: "daily" }
+  /** Monday first, each day once. */
+  | { kind: "weekly"; days: DayCode[] }
+  | { kind: "monthly_day"; day: number }
+  | { kind: "monthly_weekday"; nth: NthCode; weekday: DayCode }
+  /** On the first occurrence's own date. */
+  | { kind: "yearly_date" }
+  | { kind: "yearly_weekday"; month: number; nth: NthCode; weekday: DayCode };
+
+/** `date` is the last day an occurrence can start on (YYYY-MM-DD, in the event's zone); `count`
+ *  is 1 to 730. */
+export type RepeatEnds =
+  { kind: "never" } | { kind: "on_date"; date: string } | { kind: "after"; count: number };
+
+/** A repeat rule from the editor's set. `interval`: every 1 to 99 days, weeks, months or years. */
+export interface RepeatRule {
+  pattern: RepeatPattern;
+  interval: number;
+  ends: RepeatEnds;
+}
+
+/** One ready-made rule of the repeat menu, with the repeat menu's words for it. */
+export interface RepeatPreset {
+  label: string;
+  rule: RepeatRule;
+}
+
+/** A wall-clock time as the editor's fields hold it. */
+export interface WallTime {
+  date: string;
+  time: string;
+  zone: string;
+}
+
+/** Where a new repeating event starts, as the editor's fields hold it. `end`: where its first
+ *  occurrence ends, so an end the rule moves into a skipped hour is said too. */
+export type RepeatStart =
+  | { kind: "timed"; date: string; time: string; zone: string; end?: WallTime | null }
+  | { kind: "all_day"; date: string };
+
+/** A rule in the repeat menu's words, and the day (YYYY-MM-DD) its first occurrence falls on;
+ *  `moved` when that isn't the day asked for. Or why it can't be saved, in words. */
+export type RepeatView =
+  | { outcome: "ready"; summary: string; starts: string; moved: boolean }
+  | { outcome: "refused"; message: string };
 
 /** What the user saw of an event when they chose to delete it, from the row they clicked. */
 export interface SeenSummary {
@@ -1597,6 +1720,8 @@ export interface FieldPermissions {
   description: boolean;
   show_as: boolean;
   visibility: boolean;
+  /** The guest list and what guests may do (C12). */
+  guests: boolean;
   delete: boolean;
   reasons: ReadOnlyReason[];
 }
@@ -1616,6 +1741,18 @@ export interface EventForEdit {
   visibility: EventVisibility;
   attachments: string[];
   html_link: string | null;
+  /** Every guest on Google's list with an address, the user and the organiser included, in
+   *  Google's order (C12). */
+  guests: GuestForEdit[];
+  /** What guests may do, Google's defaults filled in. */
+  guests_can_modify: boolean;
+  guests_can_invite_others: boolean;
+  guests_can_see_other_guests: boolean;
+  /** Google didn't send the whole guest list, so it can't change. */
+  guests_omitted: boolean;
+  /** The organiser's address, on the guest list or not: no guest change may touch it (the
+   *  backend's `check`). */
+  organizer_email: string | null;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
@@ -1640,6 +1777,13 @@ export interface SeriesInfo {
   first: boolean;
   /** How it repeats, as Google Calendar says it ("Weekly on Monday"). */
   repeats: string;
+  /** The rule as one from the repeat menu's set, or null for one PM can only show (`repeats` says
+   *  it), which can only be replaced. */
+  rule: RepeatRule | null;
+  /** Its first occurrence's day (YYYY-MM-DD), in the zone it repeats in. */
+  starts: string;
+  /** The zone it repeats in; null for an all-day one, which repeats by days. */
+  zone: string | null;
 }
 
 /** What the choices for a change to a repeating occurrence are asked for: an open editor's draft, or
@@ -1665,17 +1809,23 @@ export type SeriesWarning =
     }
   | { warning: "length_changes" }
   | { warning: "not_carried"; attachments: boolean; conference: boolean; label: boolean }
-  | { warning: "new_identity" };
+  | { warning: "new_identity" }
+  /** It stops repeating: only the occurrence on `day` stays, as an event of its own. */
+  | { warning: "becomes_one_event"; day: string }
+  /** This many occurrences changed on their own fall on days a new repeat skips: their changes go. */
+  | { warning: "changes_lost"; count: number };
 
-/** One of "This event", "This and following" and "All events". `token` names the plan in the save. */
+/** One of "This event", "This and following" and "All events". `token` names the plan in the save;
+ *  `guests`, who Google would email with Send, left out when nobody (C12). */
 export type ScopeRow =
-  | { row: "offered"; warnings: SeriesWarning[]; token: string }
+  | { row: "offered"; warnings: SeriesWarning[]; token: string; guests?: GuestNotice }
   /** "This and following" from the first occurrence: every occurrence, as "All events". */
-  | { row: "as_all"; warnings: SeriesWarning[]; token: string }
+  | { row: "as_all"; warnings: SeriesWarning[]; token: string; guests?: GuestNotice }
   | { row: "refused"; message: string }
   | { row: "conflict"; fields: string[] }
-  /** A change PM couldn't finish holds this series: settle it first (as `partial_split` says). */
-  | { row: "pending"; token: string; offers: SplitAction[]; from: string };
+  /** A change PM couldn't finish holds this series: settle it first (as `partial_split` says,
+   *  `emails` included). */
+  | { row: "pending"; token: string; offers: SplitAction[]; from: string; emails?: SplitAction[] };
 
 /** What to do about a "this and following" change PM couldn't finish. */
 export type SplitAction = "remove" | "finish" | "check";
@@ -1690,23 +1840,96 @@ export type SeriesChoices =
 /** Which occurrences of a repeating event a save or delete is for. */
 export type SeriesScope = "this" | "following" | "all";
 
-export type WriteWarning = "mirror_refresh_pending" | "left_on_old_series";
+/** `outside_mirror`: a new event saved in Google, a one-off made to repeat, or the one event "Does
+ *  not repeat" leaves of a repeating one (for all events or from one on), that starts outside the
+ *  months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and
+ *  following" change landed, but PM couldn't tell which repeating event Google made of the new
+ *  part, so the milestones `milestone_moves` lists stay on the earlier part. */
+export type WriteWarning =
+  "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror" | "milestone_not_offered";
+
+/** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
+ *  change. */
+export interface MilestoneOffer {
+  id: number;
+  label: string;
+  project: string;
+  date: string;
+}
+
+/** What moving milestones to a "this and following" change's new part needs. Days are YYYY-MM-DD
+ *  in the user's zone; null when PM can't say. */
+export interface MilestoneMoves {
+  /** Where Move sends a milestone; null: PM couldn't tell (`milestone_not_offered`). */
+  new_series_ical: string | null;
+  /** Where Move back sends it. */
+  earlier_series_ical: string;
+  new_title: string;
+  earlier_title: string;
+  /** The new part's first occurrence. */
+  first_day: string | null;
+  /** The earlier part's last occurrence: a milestone left on it reads overdue from then. */
+  earlier_last_day: string | null;
+  /** Today, as the change landed: whether that last day has passed yet, for the words. */
+  today: string;
+  milestones: MilestoneOffer[];
+}
+
+/** A milestone to move between the two parts of a repeating event a "this and following" change
+ *  made (C9b-2): what Move and Move back send, and the words. */
+export interface MilestoneMove {
+  milestoneId: number;
+  label: string;
+  project: string;
+  /** Each part's title, as Google holds it after the change. */
+  newTitle: string;
+  earlierTitle: string;
+  /** Where Move sends it, and the new part's first day: the date it shows until the next read
+   *  (null when PM can't say: it keeps its own). */
+  toIcal: string;
+  toDate: string | null;
+  /** Where Move back sends it, and its date before the change. */
+  backIcal: string;
+  backDate: string;
+  /** The earlier part's last day, and today as the change landed, for the words. */
+  earlierLastDay: string | null;
+  today: string;
+  /** The new part wasn't in PM's calendar yet when the change landed. */
+  pending: boolean;
+}
 
 /** What a save came to. `saved` and `no_change` are the successes. */
 export type WriteOutcome =
   /** `left_behind`: the days (YYYY-MM-DD) of occurrences changed on their own that a series delete
-   *  couldn't cancel, so they may still show. */
-  | { outcome: "saved"; warnings: WriteWarning[]; left_behind?: string[] }
+   *  couldn't cancel, so they may still show. `milestone_moves`: a "this and following" change that
+   *  landed, with milestones linked to the earlier part dated from its first day on, but not one on
+   *  an occurrence it left there (C9b-2). */
+  | {
+      outcome: "saved";
+      warnings: WriteWarning[];
+      left_behind?: string[];
+      milestone_moves?: MilestoneMoves;
+    }
   | { outcome: "no_change" }
-  /** The repeating event's plan changed since the user chose: ask again; nothing was sent. */
-  | { outcome: "needs_choice" }
+  /** Something must be chosen first; nothing was sent. `scope`: which occurrences (none was named,
+   *  or the plan changed since the user chose). `guests`: whether Google emails these guests, which
+   *  has no default (C12); `again`: an answer came, given for other numbers. */
+  | { outcome: "needs_choice"; scope: boolean; guests?: GuestNotice; again?: boolean }
   /** Google answered success and kept what was there; `split`: the new part a "this and
    *  following" change made was removed too. */
   | { outcome: "ignored_by_google"; split: boolean }
   /** A "this and following" change PM couldn't finish: Google may hold part of it. `offers` is what
    *  Google's state allows now; `from` is the day the change starts (YYYY-MM-DD). `note`: a settle
-   *  that didn't end it says why, while PM still holds it (so its buttons stay). */
-  | { outcome: "partial_split"; token: string; offers: SplitAction[]; from: string; note?: string }
+   *  that didn't end it says why, while PM still holds it (so its buttons stay). `emails`: the
+   *  offers that would email guests, since the change went with Send (C12); left out when none. */
+  | {
+      outcome: "partial_split";
+      token: string;
+      offers: SplitAction[];
+      from: string;
+      note?: string;
+      emails?: SplitAction[];
+    }
   /** The new part of a change PM couldn't finish was removed: the event is as it was. */
   | { outcome: "split_removed" }
   | { outcome: "conflict"; fields: string[] }
@@ -1716,6 +1939,10 @@ export type WriteOutcome =
   | { outcome: "reauth" }
   /** The answer never arrived and PM couldn't look afterwards: it may or may not have happened. */
   | { outcome: "unconfirmed" }
+  /** A new event whose answer never arrived: creating it again with `retry_token` looks for it
+   *  first and sends it again, under the same id, only if Google still doesn't show it, so a
+   *  second copy is very unlikely. PM's own token, never the event's id. */
+  | { outcome: "ambiguous"; retry_token: string }
   | { outcome: "failed"; message: string };
 
 /** A delete still waiting out its Undo window, for a webview that reloaded. */

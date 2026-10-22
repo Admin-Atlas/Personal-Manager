@@ -38,15 +38,35 @@ export function isAnyDialogOpen(): boolean {
 }
 
 /**
- * Whether a dialog is open that `el` is NOT inside — i.e. `el` sits behind it. A popover or menu that
- * claims Escape for itself asks this first: when a dialog was opened over it (the command palette over
- * an open Panels menu, say), the key belongs to that dialog, not to the hidden popover underneath.
- * Read at event time.
+ * Whether a key pressed on `target` belongs to a dialog open over `el` rather than to `el` itself. A
+ * popover or menu that claims Escape for itself asks this first. A modal dialog `el` isn't inside
+ * (the command palette over an open Panels menu, say) owns the key always, as it holds the keyboard;
+ * a non-modal one (the calendar's quick create, which leaves the page live) only when it was pressed
+ * inside it. Pressed on a popover's trigger, in its panel or on the page beside such a layer, the key
+ * is the popover's. Read at event time.
  */
-export function isCoveredByDialog(el: Element | null): boolean {
+export function isKeyForDialogOver(el: Element | null, target: EventTarget | null): boolean {
   if (!el) return false;
   for (const dialog of openDialogs) {
-    if (!dialog.contains(el)) return true;
+    if (dialog.contains(el)) continue;
+    if (dialog.getAttribute("aria-modal") === "true") return true;
+    if (target instanceof Node && dialog.contains(target)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether a key pressed on `target` is some open dialog's, for a page-wide use of it (Escape leaving
+ * fullscreen) that must stand down for one: a modal dialog's always; any dialog's it was pressed
+ * inside; and a non-modal dialog's that isn't a layer here (an event's details, which closes on
+ * Escape pressed anywhere). A non-modal layer (quick create) takes only a key pressed inside it, so
+ * with focus on the page beside it the key is the page's. Read at event time.
+ */
+export function isKeyForADialog(target: EventTarget | null): boolean {
+  for (const dialog of document.querySelectorAll<HTMLElement>('[role="dialog"]')) {
+    if (dialog.getAttribute("aria-modal") === "true") return true;
+    if (target instanceof Node && dialog.contains(target)) return true;
+    if (!openDialogs.has(dialog)) return true;
   }
   return false;
 }

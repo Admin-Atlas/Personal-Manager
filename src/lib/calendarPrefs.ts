@@ -24,7 +24,8 @@ export const CALENDAR_RANGES: readonly CalendarRange[] = ["work", "day", "full"]
 
 const VIEW_KEY = "pm.calendar.view";
 const RANGE_KEY = "pm.calendar.range";
-/** The hidden set's home in the encrypted store — NOT a localStorage key. */
+/** The encrypted store's home for the hidden set and the last calendar an event was created in —
+ *  NOT a localStorage key. */
 const PREF_KEY = "calendar_ui";
 
 /** The last view the user had open, clamped to `allowed` (so a value from a newer build that isn't
@@ -54,8 +55,9 @@ export function writeView(view: CalendarViewMode): void {
 
 /** The set of calendar ids the user has hidden from the aggregator (visibility, not sync).
  *
- *  The ONE key in this module that is user content, not view state: a Google/Outlook calendar id is
- *  routinely the account's email address. It therefore lives in the encrypted `settings` table under
+ *  One of the two keys in this module that are user content, not view state (the other is the last
+ *  calendar an event was created in, `readLastCreate`): a Google/Outlook calendar id is routinely the
+ *  account's email address. Both therefore live in the encrypted `settings` table under
  *  `calendar_ui` (see storedPrefs.ts) while the other nine keys here — view, range, roster fold,
  *  zones, bounds, day count, openOn, the cursor and the swipe distance — stay in localStorage, which
  *  is what they are for. */
@@ -77,6 +79,19 @@ export function writeHidden(hidden: Set<string>): void {
   } catch {
     /* non-browser context (tests) */
   }
+}
+
+/** The calendar the user last created an event in (its PM id), or null: where the next new event
+ *  starts, while it can still take one (`defaultTarget` checks). In `calendar_ui` beside `hidden`,
+ *  for the same reason: a calendar id is routinely an email address. */
+export function readLastCreate(): string | null {
+  const id = readStored(PREF_KEY).last_create;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** Remember the calendar an event was just created in. Only a create Google holds moves it. */
+export function writeLastCreate(calendarId: string): void {
+  writeStored(PREF_KEY, { last_create: calendarId });
 }
 
 const ROSTER_OPEN_KEY = "pm.calendar.rosterOpen";

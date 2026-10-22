@@ -3,8 +3,9 @@
 
 import { isLetterKey } from "./letterKey";
 
-/** What a key press asks the Calendar tab to do: step back or forward a period, or jump to today. */
-export type CalendarNav = "prev" | "next" | "today";
+/** What a key press asks the Calendar tab to do: step back or forward a period, jump to today, or
+ *  start a new event (`c`, the full editor; Shift+C, the quick one, as in Google Calendar). */
+export type CalendarNav = "prev" | "next" | "today" | "create" | "quick-create";
 
 /** The parts of a keyboard event the decision reads. */
 export interface NavKeyEvent {
@@ -12,6 +13,8 @@ export interface NavKeyEvent {
   metaKey: boolean;
   ctrlKey: boolean;
   altKey: boolean;
+  /** Read for `c` only: Shift+C is quick create, and Caps Lock alone isn't. */
+  shiftKey?: boolean;
   target: EventTarget | null;
 }
 
@@ -30,9 +33,12 @@ export function isTypingTarget(target: EventTarget | null): boolean {
 }
 
 /**
- * The Calendar tab's keyboard shortcuts (← / → / `t`), as a pure decision. Nothing when a modifier is
- * held (app shortcuts), when typing in a field, or when a dialog is open: the listener sits on
- * `window`, so without the dialog check a key pressed on a dialog's button paged the grid behind it.
+ * The Calendar tab's keyboard shortcuts (← / → / `t` / `c`), as a pure decision. Nothing when a
+ * modifier is held (app shortcuts, and Ctrl+C stays copy), when typing in a field, or when a dialog is
+ * open: the listener sits on `window`, so without the dialog check a key pressed on a dialog's button
+ * paged the grid behind it. The letters read `key`, as `t` always has (`NavKeyEvent` has no `code`),
+ * so all three change together if a layout ever needs it; `c` asks Shift itself, so Caps Lock types
+ * the full editor's `c`, not quick create's.
  */
 export function calendarNavKey(e: NavKeyEvent, dialogOpen: boolean): CalendarNav | null {
   if (dialogOpen) return null;
@@ -41,6 +47,7 @@ export function calendarNavKey(e: NavKeyEvent, dialogOpen: boolean): CalendarNav
   if (e.key === "ArrowLeft") return "prev";
   if (e.key === "ArrowRight") return "next";
   if (e.key === "t" || e.key === "T") return "today";
+  if (e.key.toLowerCase() === "c") return e.shiftKey ? "quick-create" : "create";
   return null;
 }
 

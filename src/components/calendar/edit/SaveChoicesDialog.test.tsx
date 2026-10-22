@@ -16,7 +16,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", mode: "dark", accent: "mono", depth: "standard" }),
 }));
 
-import type { ScopeRow, SeriesWarning } from "../../../lib/types";
+import type { GuestNotice, ScopeRow, SeriesWarning } from "../../../lib/types";
 import type { ReadyChoices } from "../../../lib/calendarEdit/saveChoices";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
 
@@ -106,7 +106,8 @@ describe("SaveChoicesDialog", () => {
     fireEvent.click(save);
     fireEvent.click(save);
     expect(onChoose).toHaveBeenCalledTimes(1);
-    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "f" });
+    // A row without guests asks nothing, so no answer goes with it (C12).
+    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "f", asAll: false }, null);
   });
 
   it("shows rows that can't be chosen disabled, with their reasons", () => {
@@ -138,17 +139,24 @@ describe("SaveChoicesDialog", () => {
     fireEvent.click(radio(/^All events/));
     expect(button("Save").disabled).toBe(false);
     fireEvent.click(button("Save"));
-    expect(onChoose).toHaveBeenCalledWith({ scope: "all", token: "a" });
+    expect(onChoose).toHaveBeenCalledWith({ scope: "all", token: "a", asAll: false }, null);
   });
 
   it("says what 'this and following' means from the first occurrence", () => {
-    open({ view: view(ready(offered("t"), { row: "as_all", warnings: [], token: "x" })) });
+    const { onChoose } = open({
+      view: view(ready(offered("t"), { row: "as_all", warnings: [], token: "x" })),
+    });
     expect(radio(/^This and following events/)).toBeTruthy();
     expect(
       screen.getByText(
         "This is the first occurrence, so this changes every occurrence, like All events.",
       ),
     ).toBeTruthy();
+    // Picked, it goes as the row it is, with its token, and says it saves every occurrence, so the
+    // notice after it can (C11c review round 2).
+    fireEvent.click(radio(/^This and following events/));
+    fireEvent.click(button("Save"));
+    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "x", asAll: true }, null);
   });
 
   it("says the picked row's question in the live region, naming both days", () => {
@@ -274,5 +282,126 @@ describe("SaveChoicesDialog", () => {
     const { onClose } = open();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// C12: a row that would email guests asks Send or Don't send in this dialog, with no default (R9).
+describe("SaveChoicesDialog, a row that would email guests", () => {
+  const notice = (over: Partial<GuestNotice> = {}): GuestNotice => ({
+    updated: 2,
+    invited: 0,
+    removed: 0,
+    told_cancelled: 0,
+    cancelled: false,
+    people: 2,
+    emails: 2,
+    complete: true,
+    ...over,
+  });
+  const withGuests = (token: string, guests: GuestNotice = notice()): ScopeRow => ({
+    row: "offered",
+    warnings: [],
+    token,
+    guests,
+  });
+  const send = () => radio(/^Send/);
+  const dontSend = () => radio(/^Don't send/);
+
+  it("Save waits for the email answer, then sends it with the row", () => {
+    const { onChoose } = open({ view: view(ready(withGuests("t"))), from: "me@x.org" });
+    // The scope is picked already; only the email question is open.
+    expect(radio(/^This event/).checked).toBe(true);
+    expect(screen.getByRole("group", { name: "Send update emails to guests?" })).toBeTruthy();
+    expect(screen.getByText("2 guests already invited will get an update.")).toBeTruthy();
+    expect(send().checked).toBe(false);
+    expect(dontSend().checked).toBe(false);
+    expect(screen.getByText("Google sends the emails from me@x.org.")).toBeTruthy();
+    const save = button("Save");
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+    expect(onChoose).not.toHaveBeenCalled();
+    fireEvent.click(dontSend());
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    expect(onChoose).toHaveBeenCalledTimes(1);
+    expect(onChoose).toHaveBeenCalledWith({ scope: "this", token: "t", asAll: false }, "none");
+  });
+
+  it("choosing another row clears the answer: it was to that row's numbers", () => {
+    const { onChoose } = open({
+      view: view(ready(withGuests("t"), offered("f"), withGuests("a", notice({ updated: 5 })))),
+    });
+    fireEvent.click(send());
+    expect(button("Save").disabled).toBe(false);
+    fireEvent.click(radio(/^All events/));
+    expect(screen.getByText("5 guests already invited will get an update.")).toBeTruthy();
+    expect(send().checked).toBe(false);
+    expect(button("Save").disabled).toBe(true);
+    fireEvent.click(send());
+    fireEvent.click(button("Save"));
+    expect(onChoose).toHaveBeenCalledWith({ scope: "all", token: "a", asAll: false }, "all");
+  });
+
+  it("a row without guests asks nothing and saves as before", () => {
+    const { onChoose } = open({ view: view(ready(offered("t"), withGuests("f"))) });
+    expect(screen.queryByRole("radio", { name: /^Send/ })).toBeNull();
+    expect(screen.queryByText(/emails to guests\?$/)).toBeNull();
+    fireEvent.click(button("Save"));
+    expect(onChoose).toHaveBeenCalledWith({ scope: "this", token: "t", asAll: false }, null);
+  });
+
+  it("asks afresh for a new answer from the backend", () => {
+    const props = {
+      kind: "save" as const,
+      title: "Gym",
+      settling: false,
+      onChoose: vi.fn(),
+      onSettle: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const { rerender } = render(
+      <SaveChoicesDialog {...props} view={view(ready(withGuests("t")))} />,
+    );
+    fireEvent.click(send());
+    rerender(<SaveChoicesDialog {...props} view={view(ready(withGuests("t2")), true)} />);
+    expect(send().checked).toBe(false);
+    expect(button("Save").disabled).toBe(true);
+  });
+
+  it("still focuses Back on open, so Enter answers nothing", () => {
+    const { onChoose, onClose } = open({ view: view(ready(withGuests("t"))) });
+    const back = button("Back");
+    expect(document.activeElement).toBe(back);
+    expect(screen.getAllByRole("radio")).not.toContain(document.activeElement);
+    fireEvent.keyDown(back, { key: "Enter" });
+    fireEvent.click(back);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onChoose).not.toHaveBeenCalled();
+  });
+
+  it("a delete asks about cancellation emails, with no word of a new part", () => {
+    const { onChoose } = open({
+      kind: "delete",
+      view: view(
+        ready(
+          offered("t"),
+          withGuests("f", notice({ updated: 3, people: 3, emails: 7, cancelled: true })),
+        ),
+      ),
+    });
+    fireEvent.click(radio(/^This and following events/));
+    expect(screen.getByRole("group", { name: "Send cancellation emails to guests?" })).toBeTruthy();
+    expect(screen.getByText("3 guests will be told it's cancelled.")).toBeTruthy();
+    expect(screen.queryByText(/the new part/)).toBeNull();
+    expect(dontSend().labels?.[0].textContent).toMatch(/may never get the cancellation:/);
+    fireEvent.click(send());
+    fireEvent.click(button("Delete"));
+    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "f", asAll: false }, "all");
+  });
+
+  it("settling disables the answer with everything else", () => {
+    open({ view: view(ready(withGuests("t"))), settling: true });
+    expect(send().disabled).toBe(true);
+    expect(dontSend().disabled).toBe(true);
   });
 });

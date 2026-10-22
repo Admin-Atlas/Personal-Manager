@@ -59,18 +59,22 @@ use chrono_tz::Tz;
 use serde_json::{json, Map, Value};
 
 use crate::calendar_recur::expand::{is_occurrence, last_before};
-use crate::calendar_recur::lines::{self, recurrence_verdict, same_recurrence, Applied};
+use crate::calendar_recur::lines::{self, same_recurrence, Applied};
 use crate::calendar_recur::reanchor::DayMap;
 use crate::calendar_recur::remap::{exdate_lines, retime, RetimeError, Retimed};
+use crate::calendar_recur::spec::spec_of;
 use crate::calendar_recur::split::{
     remaining_count, tail_recurrence, truncate_recurrence, Truncation,
 };
 use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
-use super::super::dto::{EventPatchDraft, Notify, ReadOnlyReason, SeenSummary};
+use super::super::attendees::{self, GuestError, Own, Reach};
+use super::super::dto::{
+    EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason, SeenSummary,
+};
 use super::super::patch::{
-    build_patch, delete_still_matches, description_is_html, drop_other_kind, is_gone, update_check,
-    when_eq,
+    bool_of, build_patch, delete_still_matches, description_is_html, drop_other_kind, is_gone,
+    update_check, when_eq, CREATABLE,
 };
 use super::super::patch::{DeleteCheck, UpdateCheck};
 use super::super::plan::{
@@ -78,10 +82,11 @@ use super::super::plan::{
 };
 use super::super::time;
 use super::diff::{Expect, Removes, SeriesDiff};
+use super::rule::{plan_all_rule, plan_split_rule, rule_ask, RuleAsk};
 use super::scope::{is_first, zones_changed, Scope};
 use super::{
-    attendee_set, classify_instance, excluded, google_before, guests_on, original_of, point_of,
-    Exceptions, FreshEvent, InstanceKind, Length, Listing, Master, SeriesRefusal,
+    attendee_set, classify_instance, excluded, google_before, original_of, point_of, Exceptions,
+    FreshEvent, InstanceKind, LaterPart, Length, Listing, Master, SeriesRefusal,
 };
 
 /// Everything a series plan is built from. C9 makes the GETs; nothing here fetches.
@@ -99,10 +104,12 @@ pub struct SeriesInput<'a> {
     pub instances: Option<&'a Listing>,
     /// The mirror holds another part of the same series, split earlier (Google's own `<id>_R…`).
     pub sibling: bool,
-    /// Whether a series with guests may change: false until C12 brings invitations, whatever the
-    /// occurrence shows. One whose guests were removed on its own passes the gate, and a split would
-    /// invite the series' guests again (C8b review G5).
-    pub guests_allowed: bool,
+    /// Where the earliest later part of the series starts, which a new rule mustn't repeat over (C11
+    /// critique 1 H2).
+    pub later: LaterPart,
+    /// The address the account reads this calendar with: the user, never a guest Google emails,
+    /// whatever a list PM built calls it (C12 critiques C1-H1, C2-H1).
+    pub me: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -167,11 +174,20 @@ pub struct SeriesPlan {
     /// The mirror rows the plan removes (A14), as planned: the run's own are
     /// [`SeriesPlan::removes_for`].
     pub removes: Removes,
-    /// The series' start, for reading recurrence lines by what they mean.
-    start: SeriesStart,
-    /// Whether it was planned with guests allowed (C12): until then, a guest who appears before a
-    /// step is sent again is a conflict ([`SeriesPlan::resend`]).
-    guests_allowed: bool,
+    /// The series' start, for reading recurrence lines by what they mean: what it held before the
+    /// plan, and what Google holds when a step didn't land.
+    pub(super) start: SeriesStart,
+    /// The start the series a step patches repeats from once it has landed: a rule rebuilt for every
+    /// occurrence starts on its own first day, maybe of another kind or in another zone, and what was
+    /// sent is read at it (C11; critique 2 M8). [`SeriesPlan::start`] for every other plan.
+    pub(super) rule_start: SeriesStart,
+    /// Who Google would email if this ran with Send (R9, A3): `None` when nobody. In the token.
+    pub guests: Option<GuestNotice>,
+    /// The Send / Don't send answer it was planned with; `None` when nobody answered (C12).
+    pub(super) chosen: Option<Notify>,
+    /// The calendar's own addresses it counted guests without, for reading Google's copy again on a
+    /// 412 the same way (C12a review).
+    pub(super) own: Own,
 }
 
 /// One write.
@@ -191,6 +207,12 @@ pub struct Step {
     /// A 404 or 410 means done: true for a cancel or a delete, which Google calls already deleted.
     pub gone_is_done: bool,
     pub undo: Option<Undo>,
+    /// The guest changes its body's guest list was built with (C12), so a copy sent again after a 412
+    /// builds it on Google's list then ([`SeriesPlan::again_on`]). Empty when it sends no guest list.
+    pub(super) guest_ops: Vec<GuestOp>,
+    /// Who it reaches on the copy it was planned on, stamped with its `notify`: a resend that would
+    /// reach anyone else stops ([`SeriesPlan::resend`]). `None` for an insert or a carry.
+    pub(super) reach: Option<Reach>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,9 +226,10 @@ pub enum Stage {
 /// The request a step sends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    /// A new series under PM's own id, minted for this plan and kept for every retry of it:
-    /// re-sending the same id can't make a second series, and a 409 means it's there (DS5). A new
-    /// plan gets a new id.
+    /// A new event under PM's own id, minted for this plan and kept for every retry of it:
+    /// re-sending the same id normally can't make a second one (Google warns it can't always
+    /// catch a repeated id, so the sends stay few), and a 409 means it's there (DS5). A new plan
+    /// gets a new id. A split's new series, or a new event ([`SeriesPlan::create`]).
     Insert {
         calendar: String,
         id: String,
@@ -327,6 +350,10 @@ impl Op {
                 "transparency",
                 "visibility",
                 "recurrence",
+                "attendees",
+                "guestsCanModify",
+                "guestsCanInviteOthers",
+                "guestsCanSeeOtherGuests",
             ],
             Op::Carry { .. } => &[
                 "summary",
@@ -392,6 +419,11 @@ pub enum Shows {
     /// GET that finds this mean it landed; a tail another plan left under a reused id reads as
     /// unknown, never as this one (C8b fix review). Its absence once proves nothing (DS5).
     Tail { of: String, plan: String },
+    /// There at all, under PM's own id: a new event (C10). The id is 128 random bits, so a live copy
+    /// under it is this create's, whatever has been changed on it since, and a cancelled one is this
+    /// create's too, deleted in Google since: proof it isn't there to land (C10 critique 1 L11). None
+    /// proves nothing on its own (DS5).
+    Created,
 }
 
 /// The compensation for a step, sent with the step's own `notify`, on the etag of the step's reply.
@@ -490,10 +522,12 @@ pub enum SeriesWarning {
     /// The days the series falls on move, as the occurrence at `from` moves to `to`: measured from
     /// where the occurrence first was, so retiming one that was already moved on its own moves the
     /// series' days too (AS2a). Raised for any move to another day, whatever the rule, a move of
-    /// whole weeks included. C9 words it from the rule and both dates: the new weekday, day of the
+    /// whole weeks included; but not with a new rule that names no day, whose start says it all
+    /// (C11). C9 words it from the rule and both dates: the new weekday, day of the
     /// month or date where the rule names one ("every Sunday → every Monday?"), and how far every
     /// occurrence moves wherever that is a week or more (a one-day weekly rule may move a week and a
-    /// day) or the rule names no day (daily). A split raises no `StartMoved`, so this is all it says.
+    /// day) or the rule names no day (daily). A split that keeps its rule raises no `StartMoved`, so
+    /// this is all it says; one with a new rule says where that starts too (C11).
     RepeatDayChanges { from: NaiveDate, to: NaiveDate },
     /// Every occurrence gets this occurrence's length.
     LengthChanges,
@@ -506,7 +540,21 @@ pub enum SeriesWarning {
     /// The new series is a new event in Google (a new iCal UID): links to the old one (a milestone,
     /// a reminder) stay with the part before the split.
     NewIdentity,
+    /// It stops repeating ("Does not repeat"): only the occurrence on `day` stays, as an event of its
+    /// own (C11).
+    BecomesOneEvent { day: NaiveDate },
+    /// This many occurrences changed on their own fall on days the new rule skips, so their changes
+    /// go with them (C11).
+    ChangesLost { count: u32 },
 }
+
+/// What guests may do: Google applies it to the whole series, like visibility (C12 critiques C1-M7,
+/// C2-L11), so never to one occurrence.
+const GUEST_PERMISSIONS: &[&str] = &[
+    "guestsCanModify",
+    "guestsCanInviteOthers",
+    "guestsCanSeeOtherGuests",
+];
 
 /// The fields a split's new series takes from the original, besides its times and rule.
 const TAIL_COPY: &[&str] = &[
@@ -528,7 +576,7 @@ const TAIL_COPY: &[&str] = &[
 /// Everything a split's new series takes from the original, its times and rule included: what may
 /// not have changed in Google before the split is planned, nor before its cut is sent again (R2,
 /// AS10). One list, so the two checks and the body can't drift (C8b review G1).
-const TAIL_WATCH: &[&str] = &[
+pub(super) const TAIL_WATCH: &[&str] = &[
     "recurrence",
     "start",
     "end",
@@ -620,17 +668,37 @@ impl SeriesPlan {
     /// A 412 on step `step`, `fresh` being Google's copy now: send again, or not. Asked only once no
     /// copy of the step can land: [`SeriesPlan::verdict`] found it not landed, or found neither the
     /// change nor what was there with every copy refused and Google at an etag none went out on.
-    /// Until C12, a guest who appeared meanwhile is a conflict, whatever the step watches (C9a-3a
-    /// design review).
+    /// Who hears is the user's to say, for what they saw, whatever the step watches (C9a-3a design
+    /// review; C12 §6.5 as the critiques' C1-M5 and C2-H3 read it): a step planned to email nobody,
+    /// with nobody's Don't send behind it, that would now change a guest's event is a conflict, and
+    /// so is one under a Send that would now email anyone else, or not someone it would have: the
+    /// save stops, and the next one asks with the numbers Google's copy gives, as a one-off's second
+    /// round asks again. Under a Don't send, nobody is emailed whoever appeared.
     pub fn resend(&self, step: usize, fresh: &Value) -> Resend {
+        let again = self.again_on(step, fresh);
         let Some(step) = self.steps.get(step) else {
             return Resend::Conflict(Vec::new());
         };
         if is_gone(fresh) {
             return Resend::Gone;
         }
-        if !self.guests_allowed && guests_on(fresh) {
-            return Resend::Conflict(vec!["attendees".into()]);
+        let guests_changed = Resend::Conflict(vec!["attendees".into()]);
+        // R9: who hears is the user's to say, and they said it for no one here.
+        if step.notify == Notify::None
+            && self.chosen != Some(Notify::None)
+            && attendees::reaches_anyone(fresh, &self.own)
+        {
+            return guests_changed;
+        }
+        // A guest list goes again built on Google's list now (C12 decision 3), which has to be one
+        // the step's guest changes apply to: a whole one, say.
+        if again.is_some() && attendees::check(fresh, &step.guest_ops).is_err() {
+            return guests_changed;
+        }
+        // An answer stands only for who it was given for (C12 critiques C1-M5, C2-H3).
+        let sent = again.as_ref().unwrap_or(&step.op);
+        if step.notify != Notify::None && step.reach != reach_onto(sent, fresh, &self.own) {
+            return guests_changed;
         }
         let changed: Vec<String> = match &step.conflict {
             Recheck::Never => return Resend::Conflict(Vec::new()),
@@ -670,6 +738,36 @@ impl SeriesPlan {
         }
     }
 
+    /// The write step `step` sends again once [`SeriesPlan::resend`] lets it, `fresh` being Google's
+    /// newer copy, when it sends a guest list: that list built again from Google's with the step's
+    /// guest changes, so a reply, a comment or extra guests that landed meanwhile goes back as Google
+    /// has it (C12 decision 3: on every path the ops apply to Google's list as it is then), the rest
+    /// as planned. `None` for a write with no guest list, whose last copy goes again as it was.
+    pub(super) fn again_on(&self, step: usize, fresh: &Value) -> Option<Op> {
+        let step = self.steps.get(step)?;
+        let Op::Patch {
+            calendar,
+            event,
+            etag,
+            body,
+        } = &step.op
+        else {
+            return None;
+        };
+        if !body.contains_key("attendees") {
+            return None;
+        }
+        let mut body = body.clone();
+        let list = attendees::apply(fresh.get("attendees"), &step.guest_ops);
+        body.insert("attendees".into(), Value::from(list));
+        Some(Op::Patch {
+            calendar: calendar.clone(),
+            event: event.clone(),
+            etag: etag.clone(),
+            body,
+        })
+    }
+
     /// Whether step `step` landed, read from Google's copy (`None` for a 404 or 410): its reply, or a
     /// GET after an answer that may have been applied.
     pub fn verdict(&self, step: usize, fresh: Option<&Value>) -> Applied {
@@ -684,18 +782,24 @@ impl SeriesPlan {
                 Applied::Yes
             }
             (Shows::Tail { .. }, _) => Applied::Unknown,
+            (Shows::Created, Some(v)) if !is_gone(v) => Applied::Yes,
+            // Made, then deleted in Google: the run reads it as gone ([`super::run`]).
+            (Shows::Created, Some(_)) => Applied::No,
+            (Shows::Created, None) => Applied::Unknown,
             (Shows::Fields { .. }, None) if step.gone_is_done => Applied::Yes,
             // The event itself is gone: whatever was sent can't be there.
             (Shows::Fields { .. }, None) => Applied::No,
             (Shows::Fields { sent, old }, Some(v)) => {
-                let holds = |fields: &Map<String, Value>| {
+                // What was sent is read at the start it repeats from once landed, and what was
+                // there at the start it had: never one start for both (C11 critique 2 M8).
+                let holds = |fields: &Map<String, Value>, start: &SeriesStart| {
                     fields
                         .iter()
-                        .all(|(k, want)| self.same(k, Some(want), v.get(k.as_str())))
+                        .all(|(k, want)| self.same_at(k, Some(want), v.get(k.as_str()), start))
                 };
-                if holds(sent) {
+                if holds(sent, &self.rule_start) {
                     Applied::Yes
-                } else if !old.is_empty() && holds(old) {
+                } else if !old.is_empty() && holds(old, &self.start) {
                     Applied::No
                 } else {
                     Applied::Unknown
@@ -721,12 +825,15 @@ impl SeriesPlan {
         };
         let start_landed = when_eq(Some(new_start), fresh.get("start"));
         let start_kept = when_eq(old.get("start"), fresh.get("start"));
-        let verdict = recurrence_verdict(
-            &lines_of(Some(sent_rule)),
-            &lines_of(old.get("recurrence")),
-            &lines_of(fresh.get("recurrence")),
-            &self.start,
-        );
+        // The rule sent read at the start it repeats from once landed, the old one at its own.
+        let now = lines_of(fresh.get("recurrence"));
+        let verdict = if same_recurrence(&lines_of(Some(sent_rule)), &now, &self.rule_start) {
+            Applied::Yes
+        } else if same_recurrence(&lines_of(old.get("recurrence")), &now, &self.start) {
+            Applied::No
+        } else {
+            Applied::Unknown
+        };
         (start_landed && verdict == Applied::No) || (start_kept && verdict == Applied::Yes)
     }
 
@@ -797,6 +904,9 @@ impl SeriesPlan {
         for warning in &self.warnings {
             let _ = write!(text, "\u{1f}{warning:?}");
         }
+        // Who it emails (C12 §6.4): a guest added or taken off in Google between the dialog and the
+        // save asks again, with the new numbers. Never the answer, which comes with the save.
+        let _ = write!(text, "\u{1f}{:?}", self.guests);
         for step in &self.steps {
             let kind = match step.op {
                 Op::Insert { .. } => "insert",
@@ -850,10 +960,19 @@ impl SeriesPlan {
             "attachments",
             "eventLabelId",
         ];
+        // Its rule read at its own start, which a new rule may put in another kind or zone (C11).
+        let start = body.get("start").and_then(start_of).unwrap_or(self.start);
+        // The user's own entry went without `self`, which Google's copy then marks (C12 critique
+        // C1-H1): it is the user on both sides, not a guest either side added.
+        let own = Own::of(&[], &[fresh]);
         !is_gone(fresh)
-            && TAIL_FIELDS
-                .iter()
-                .all(|k| self.same(k, body.get(*k), fresh.get(*k)))
+            && TAIL_FIELDS.iter().all(|k| match *k {
+                "attendees" => {
+                    attendees::guest_set_but(body.get(*k), &own)
+                        == attendees::guest_set_but(fresh.get(*k), &own)
+                }
+                _ => self.same_at(k, body.get(*k), fresh.get(*k), &start),
+            })
             && NEVER_SENT
                 .iter()
                 .all(|k| fresh.get(*k).is_none_or(Value::is_null))
@@ -887,17 +1006,37 @@ impl SeriesPlan {
 
     /// Whether two values of `key` say the same: start and end as instants in a zone, a rule by what it
     /// means, guests by who they are, Google's defaults filled in, anything else by value. Never
-    /// text-only, which reads any two lists as equal (DS9, G4).
+    /// text-only, which reads any two lists as equal (DS9, G4). A rule is read at the series' start.
     fn same(&self, key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
+        self.same_at(key, a, b, &self.start)
+    }
+
+    /// [`SeriesPlan::same`], a rule read at `start`: both sides at one start, the one they repeat
+    /// from (C11 critique 2 M8).
+    fn same_at(
+        &self,
+        key: &str,
+        a: Option<&Value>,
+        b: Option<&Value>,
+        start: &SeriesStart,
+    ) -> bool {
         let or = |v: Option<&Value>, d: &str| v.and_then(Value::as_str).unwrap_or(d).to_string();
         match key {
             "start" | "end" => when_eq(a, b),
             // A guest's reply isn't a change to the guest list (C8b review EXEC-6).
             "attendees" => attendee_set(a) == attendee_set(b),
-            "recurrence" => same_recurrence(&lines_of(a), &lines_of(b), &self.start),
+            "recurrence" => same_recurrence(&lines_of(a), &lines_of(b), start),
             "status" => or(a, "confirmed") == or(b, "confirmed"),
             "transparency" => or(a, "opaque") == or(b, "opaque"),
             "visibility" => or(a, "default") == or(b, "default"),
+            // Flags Google leaves out at their defaults (C12 §6.7): an explicit default against an
+            // absent key is no change.
+            "guestsCanModify" | "anyoneCanAddSelf" | "privateCopy" => {
+                bool_of(a, false) == bool_of(b, false)
+            }
+            "guestsCanInviteOthers" | "guestsCanSeeOtherGuests" => {
+                bool_of(a, true) == bool_of(b, true)
+            }
             "summary" | "description" | "location" | "colorId" => or(a, "") == or(b, ""),
             // PM's own notes (a fence, a split's) are bookkeeping, not a change anyone made (C9
             // design review M9).
@@ -921,9 +1060,6 @@ fn prepare(input: &SeriesInput) -> Result<(Master, Point), NotPlanned> {
     let master = Master::read(input.fresh.master)?;
     if let Some(reason) = master.read_only() {
         return Err(NotPlanned::ReadOnly(reason));
-    }
-    if master.guests && !input.guests_allowed {
-        return Err(NotPlanned::ReadOnly(ReadOnlyReason::HasGuests));
     }
     if instance.get("recurringEventId").and_then(Value::as_str) != Some(master.id.as_str()) {
         return Err(SeriesRefusal::NotInSeries.into());
@@ -960,7 +1096,7 @@ pub(crate) fn start_of(node: &Value) -> Option<SeriesStart> {
     })
 }
 
-/// A `recurrence` value's lines.
+/// A `recurrence` value's lines: none for `null`, `[]` or a value left out alike (C11 critique 1 L10).
 fn lines_of(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
         .into_iter()
@@ -971,7 +1107,7 @@ fn lines_of(v: Option<&Value>) -> Vec<String> {
 }
 
 /// The values `fresh` holds for `keys`, absent ones as `null`.
-fn snapshot(fresh: &Value, keys: &[&str]) -> Map<String, Value> {
+pub(super) fn snapshot(fresh: &Value, keys: &[&str]) -> Map<String, Value> {
     keys.iter()
         .map(|k| {
             (
@@ -1005,7 +1141,7 @@ fn before_split(
 
 /// The series' own stored exceptions: a listing by iCal UID also holds the master, and any other
 /// series split off it (C8b review G6).
-fn own_exceptions<'a>(
+pub(super) fn own_exceptions<'a>(
     master: &Master,
     exceptions: &'a Exceptions,
 ) -> impl Iterator<Item = &'a Value> {
@@ -1017,13 +1153,13 @@ fn own_exceptions<'a>(
 }
 
 /// A series cut just before one of its occurrences.
-struct SplitCut {
+pub(super) struct SplitCut {
     /// The original's new `recurrence`.
-    cut: Vec<String>,
+    pub(super) cut: Vec<String>,
     /// Its EXDATEs and RDATEs from the occurrence on, for the rest.
-    moved: Vec<lines::Line>,
+    pub(super) moved: Vec<lines::Line>,
     /// Google's count of what came before, when the rule has a COUNT.
-    before: Option<u32>,
+    pub(super) before: Option<u32>,
 }
 
 /// The original cut just before `at`, for "this and following": `None` when `at` is the series'
@@ -1047,7 +1183,7 @@ fn cut_at(master: &Master, input: &SeriesInput, at: Point) -> Result<Option<Spli
 }
 
 /// Exceptions on or after `at`, changed or cancelled, from a complete listing.
-fn exceptions_from<'a>(
+pub(super) fn exceptions_from<'a>(
     master: &Master,
     exceptions: &'a Exceptions,
     at: Point,
@@ -1066,39 +1202,12 @@ fn exceptions_from<'a>(
     Ok(out)
 }
 
-/// Until C12 brings Send / Don't send, a plan that reaches past the occurrence picked mustn't reach
-/// one with guests of its own (the series' own guests are refused in [`prepare`]): Google would
-/// change or cancel it with nobody told, and no choice of who is. `from` is a split's or a cut's
-/// occurrence (only those from it on are reached); `None` for the whole series. Only a complete
-/// listing can show there's none, so an incomplete one refuses too, a change of text included; the
-/// cross-check counts an occurrence with guests the listing lacks against it (C9a-2 review).
-fn no_guests_from(
-    master: &Master,
-    input: &SeriesInput,
-    from: Option<Point>,
-) -> Result<(), NotPlanned> {
-    if input.guests_allowed {
-        return Ok(());
-    }
-    if !input.exceptions.complete {
-        return Err(SeriesRefusal::Incomplete.into());
-    }
-    let zone = master.start.zone();
-    for item in own_exceptions(master, input.exceptions) {
-        if item.get("status").and_then(Value::as_str) == Some("cancelled") || !guests_on(item) {
-            continue;
-        }
-        let at = original_of(item).ok_or(SeriesRefusal::Unreadable)?;
-        if from.is_none_or(|from| !at.cmp_in(&from, zone).is_lt()) {
-            return Err(SeriesRefusal::GuestsElsewhere(at.day_in(zone)).into());
-        }
-    }
-    Ok(())
-}
-
 /// The gate reads the occurrence's description; a draft for the series writes the series' own, and
 /// would save a formatted one as plain text (C9 design review L7).
-fn keeps_formatting(master_json: &Value, draft: &EventPatchDraft) -> Result<(), NotPlanned> {
+pub(super) fn keeps_formatting(
+    master_json: &Value,
+    draft: &EventPatchDraft,
+) -> Result<(), NotPlanned> {
     let formatted = master_json
         .get("description")
         .and_then(Value::as_str)
@@ -1112,7 +1221,7 @@ fn keeps_formatting(master_json: &Value, draft: &EventPatchDraft) -> Result<(), 
 /// A cleanup cancel of the original's own copy of the occurrence at `original`, which moved to the new
 /// series (or was cut off): done when Google already shows it cancelled or gone; re-sent on a 412
 /// only while nothing it would throw away has changed (DS10).
-fn cancel_exception(
+pub(super) fn cancel_exception(
     calendar: &str,
     item: &Value,
     original: Point,
@@ -1145,6 +1254,8 @@ fn cancel_exception(
         },
         gone_is_done: true,
         undo: None,
+        guest_ops: Vec::new(),
+        reach: None,
     })
 }
 
@@ -1179,7 +1290,7 @@ fn plan_cut_delete(
 /// The PATCH that cuts the original. On a 412 it's sent again only if `watched` is as the plan saw
 /// it: its rule and times, and for a split every field the new series copied (AS10), or the new
 /// series would carry a value someone has just changed.
-fn cut_step(
+pub(super) fn cut_step(
     master: &Master,
     calendar: &str,
     master_json: &Value,
@@ -1208,13 +1319,28 @@ fn cut_step(
         },
         gone_is_done: false,
         undo: None,
+        guest_ops: Vec::new(),
+        reach: None,
     }
 }
 
 /// Delete the occurrence (`This`), the series from it on (`Following`), or the whole series (`All`)
 /// (T8). `seen` is what the user saw of the occurrence; the delete goes ahead only if that's still
-/// what's there (A8, A15).
+/// what's there (A8, A15). `notify` is the user's Send / Don't send, `None` when nobody answered: a
+/// plan that would tell someone then never runs ([`SeriesPlan::needs_notify`]), and its guests say
+/// whom it would (C12).
 pub fn plan_series_delete(
+    scope: Scope,
+    input: &SeriesInput,
+    seen: &SeenSummary,
+    notify: Option<Notify>,
+) -> Result<SeriesPlan, NotPlanned> {
+    let mut plan = delete_plan(scope, input, seen, notify.unwrap_or(Notify::None))?;
+    plan.settle_notify(input, notify, true);
+    Ok(plan)
+}
+
+fn delete_plan(
     scope: Scope,
     input: &SeriesInput,
     seen: &SeenSummary,
@@ -1232,10 +1358,9 @@ pub fn plan_series_delete(
     if input.sibling && scope != Scope::This {
         warnings.push(SeriesWarning::SplitSibling);
     }
-    // Every arm that deletes the whole series comes through here, guests checked.
-    let whole = |warnings: Vec<SeriesWarning>| -> Result<SeriesPlan, NotPlanned> {
-        no_guests_from(&master, input, None)?;
-        Ok(SeriesPlan {
+    // Every arm that deletes the whole series comes through here.
+    let whole = |warnings: Vec<SeriesWarning>| -> SeriesPlan {
+        SeriesPlan {
             scope: Scope::All,
             steps: vec![Step {
                 op: Op::Delete {
@@ -1254,6 +1379,8 @@ pub fn plan_series_delete(
                 shows: Shows::Gone,
                 gone_is_done: true,
                 undo: None,
+                guest_ops: Vec::new(),
+                reach: None,
             }],
             warnings,
             expect: vec![Expect::Absent {
@@ -1263,8 +1390,11 @@ pub fn plan_series_delete(
                 series: master.id.clone(),
             },
             start: master.start,
-            guests_allowed: input.guests_allowed,
-        })
+            rule_start: master.start,
+            guests: None,
+            chosen: None,
+            own: Own::default(),
+        }
     };
     match scope {
         Scope::This => Ok(SeriesPlan {
@@ -1286,6 +1416,8 @@ pub fn plan_series_delete(
                 },
                 gone_is_done: true,
                 undo: None,
+                guest_ops: Vec::new(),
+                reach: None,
             }],
             warnings,
             expect: vec![Expect::Cancelled {
@@ -1296,32 +1428,35 @@ pub fn plan_series_delete(
                 event: text(instance, "id"),
             },
             start: master.start,
-            guests_allowed: input.guests_allowed,
+            rule_start: master.start,
+            guests: None,
+            chosen: None,
+            own: Own::default(),
         }),
-        Scope::All => whole(warnings),
-        Scope::Following if is_first(&master, input.fresh.instance) => whole(warnings),
+        Scope::All => Ok(whole(warnings)),
+        Scope::Following if is_first(&master, input.fresh.instance) => Ok(whole(warnings)),
         Scope::Following => match cut_at(&master, input, original)? {
-            None => whole(warnings),
-            Some(SplitCut { cut, .. }) => {
-                no_guests_from(&master, input, Some(original))?;
-                Ok(SeriesPlan {
-                    scope,
-                    steps: plan_cut_delete(&master, input, original, cut, notify)?,
-                    warnings,
-                    expect: vec![Expect::EndsBefore {
-                        series: master.id.clone(),
-                        at: original,
-                        left: Vec::new(),
-                    }],
-                    removes: Removes::From {
-                        series: master.id.clone(),
-                        at: original,
-                        left: Vec::new(),
-                    },
-                    start: master.start,
-                    guests_allowed: input.guests_allowed,
-                })
-            }
+            None => Ok(whole(warnings)),
+            Some(SplitCut { cut, .. }) => Ok(SeriesPlan {
+                scope,
+                steps: plan_cut_delete(&master, input, original, cut, notify)?,
+                warnings,
+                expect: vec![Expect::EndsBefore {
+                    series: master.id.clone(),
+                    at: original,
+                    left: Vec::new(),
+                }],
+                removes: Removes::From {
+                    series: master.id.clone(),
+                    at: original,
+                    left: Vec::new(),
+                },
+                start: master.start,
+                rule_start: master.start,
+                guests: None,
+                chosen: None,
+                own: Own::default(),
+            }),
         },
     }
 }
@@ -1332,8 +1467,8 @@ struct NewTime {
     length: Length,
 }
 
-/// The draft's time, if it changes the occurrence's. A zone the user picked for its start or its
-/// end that isn't the occurrence's own can't be carried to the series (until C11).
+/// The draft's time, if it changes the occurrence's. A move between all-day and timed, or into
+/// another zone, never gets here: it rebuilds the series ([`own_rule_rebuild`]).
 fn new_time(draft: &EventPatchDraft, instance: &Value) -> Result<Option<NewTime>, NotPlanned> {
     let Some(draft_time) = &draft.time else {
         return Ok(None);
@@ -1343,9 +1478,6 @@ fn new_time(draft: &EventPatchDraft, instance: &Value) -> Result<Option<NewTime>
         && when_eq(instance.get("end"), Some(&when.end))
     {
         return Ok(None);
-    }
-    if zones_changed(draft_time, instance) {
-        return Err(SeriesRefusal::ZoneChange.into());
     }
     let (start, end) = (point_of(Some(&when.start)), point_of(Some(&when.end)));
     let length = match (start, end) {
@@ -1359,10 +1491,64 @@ fn new_time(draft: &EventPatchDraft, instance: &Value) -> Result<Option<NewTime>
     }))
 }
 
+/// The series' own rule to rebuild it from, when `draft` moves the occurrence (`original` in the
+/// series) between all-day and timed, or puts its start or end in another zone: the rule's text
+/// can't follow either, so every occurrence is rebuilt from it as a new rule rebuilds them (C11
+/// §12.4). `None` for any other change, a move included. A rule PM can't read as one of the
+/// editor's is refused, and so is a draft on a day other than the occurrence's own in the series,
+/// which would need the rule's own days moved too: one the user moved it to, or one it was already
+/// moved to on its own and left on.
+fn own_rule_rebuild(
+    draft: &EventPatchDraft,
+    instance: &Value,
+    master: &Master,
+    original: Point,
+) -> Result<Option<RuleAsk>, NotPlanned> {
+    let Some(draft_time) = &draft.time else {
+        return Ok(None);
+    };
+    let when = time::resolve_against(draft_time, instance.get("start"), instance.get("end"))?;
+    if when_eq(instance.get("start"), Some(&when.start))
+        && when_eq(instance.get("end"), Some(&when.end))
+    {
+        return Ok(None);
+    }
+    let kind = when.all_day != matches!(master.start, SeriesStart::AllDay(_));
+    if !kind && !zones_changed(draft_time, instance) {
+        return Ok(None);
+    }
+    let Some(spec) = spec_of(&master.recurrence, &master.start) else {
+        return Err(RetimeError::KindChange.into());
+    };
+    let zone = master.start.zone();
+    let day = time::series_start(draft_time)?.date();
+    if day != original.day_in(zone) {
+        // Left where it was moved on its own, the user moved no day (C11d review 1).
+        let shown = point_of(instance.get("start")).map(|p| p.day_in(zone));
+        return Err(if shown == Some(day) {
+            SeriesRefusal::KindFromMovedDay
+        } else {
+            SeriesRefusal::KindAndDay
+        }
+        .into());
+    }
+    Ok(Some(RuleAsk::New(spec)))
+}
+
 /// Google's `start` and `end` for a series starting at `first` with occurrences `length` long, in
 /// the master's own zones.
 fn when_nodes(master: &Master, first: Point, length: Length) -> Result<(Value, Value), NotPlanned> {
-    let zone = master.start.zone();
+    when_nodes_in(master.start.zone(), master.end_zone, first, length)
+}
+
+/// Google's `start` and `end` for a series starting at `first` with occurrences `length` long, its
+/// start in `zone` and its end in `end_zone`: a timed node always names its `timeZone` (G6).
+pub(super) fn when_nodes_in(
+    zone: Tz,
+    end_zone: Tz,
+    first: Point,
+    length: Length,
+) -> Result<(Value, Value), NotPlanned> {
     let timed = |t: DateTime<Utc>, zone: Tz| {
         json!({
             "dateTime": t.with_timezone(&zone).to_rfc3339_opts(SecondsFormat::Secs, false),
@@ -1371,7 +1557,7 @@ fn when_nodes(master: &Master, first: Point, length: Length) -> Result<(Value, V
     };
     let date = |d: NaiveDate| json!({ "date": d.format("%Y-%m-%d").to_string() });
     match (first, length) {
-        (Point::At(t), Length::Timed(len)) => Ok((timed(t, zone), timed(t + len, master.end_zone))),
+        (Point::At(t), Length::Timed(len)) => Ok((timed(t, zone), timed(t + len, end_zone))),
         (Point::Day(d), Length::AllDay(days)) => {
             let end = d
                 .checked_add_signed(chrono::TimeDelta::days(days))
@@ -1407,8 +1593,13 @@ fn with_cancelled(
     Ok(out)
 }
 
-/// The draft's touched text fields, as Google names them.
-fn draft_fields(draft: &EventPatchDraft) -> Vec<(&'static str, Value)> {
+/// The draft's touched fields, as Google names them: its text and choices, its guest changes as the
+/// series' own list (`master_json`'s, Google's entries kept) with them (C12), and what guests may do.
+/// A new part takes the guests through [`tail_body`], which leaves their replies behind.
+pub(super) fn draft_fields(
+    draft: &EventPatchDraft,
+    master_json: &Value,
+) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
     if let Some(v) = &draft.summary {
         out.push(("summary", Value::from(v.clone())));
@@ -1425,7 +1616,63 @@ fn draft_fields(draft: &EventPatchDraft) -> Vec<(&'static str, Value)> {
     if let Some(v) = draft.visibility {
         out.push(("visibility", Value::from(v.as_param())));
     }
+    let ops = draft.guest_ops();
+    if !ops.is_empty() {
+        let list = attendees::apply(master_json.get("attendees"), ops);
+        out.push(("attendees", Value::from(list)));
+    }
+    for (key, v) in [
+        ("guestsCanModify", draft.guests_can_modify),
+        ("guestsCanInviteOthers", draft.guests_can_invite_others),
+        ("guestsCanSeeOtherGuests", draft.guests_can_see_other_guests),
+    ] {
+        if let Some(v) = v {
+            out.push((key, Value::Bool(v)));
+        }
+    }
     out
+}
+
+impl SeriesPlan {
+    /// One new event under `id`, PM's own (`plan::client_event_id`), for creating an event (C10):
+    /// the insert step and nothing else, so a lost answer gets the A9 handling every insert gets
+    /// (look, wait, look, post again once under the same id; a 409 means look). `None` when the body
+    /// holds a key a create may not send (G5), the id isn't one path segment, or the body has no
+    /// start PM can read (never an invented one).
+    pub fn create(calendar: &str, id: &str, body: Map<String, Value>) -> Option<SeriesPlan> {
+        if body.keys().any(|k| !CREATABLE.contains(&k.as_str())) || !is_plain_segment(id) {
+            return None;
+        }
+        let start = body.get("start").and_then(start_of)?;
+        Some(SeriesPlan {
+            scope: Scope::All,
+            steps: vec![Step {
+                op: Op::Insert {
+                    calendar: calendar.into(),
+                    id: id.into(),
+                    body,
+                },
+                // R7: a new event has no guests until C12d, so nobody is emailed.
+                notify: Notify::None,
+                stage: Stage::Commit,
+                requires: None,
+                conflict: Recheck::Never,
+                shows: Shows::Created,
+                gone_is_done: false,
+                undo: None,
+                guest_ops: Vec::new(),
+                reach: None,
+            }],
+            warnings: Vec::new(),
+            expect: Vec::new(),
+            removes: Removes::Nothing,
+            start,
+            rule_start: start,
+            guests: None,
+            chosen: None,
+            own: Own::default(),
+        })
+    }
 }
 
 /// An empty plan, for comparing values the way a plan does.
@@ -1437,7 +1684,10 @@ fn probe(start: &SeriesStart) -> SeriesPlan {
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: *start,
-        guests_allowed: false,
+        rule_start: *start,
+        guests: None,
+        chosen: None,
+        own: Own::default(),
     }
 }
 
@@ -1458,8 +1708,23 @@ fn changed_since_opened(
 /// Change the occurrence (`This`), the series from it on (`Following`, a split), or the whole series
 /// (`All`) as `draft` says. `tail_id` is the id a split's new series is inserted under: C9 mints a new
 /// one with `plan::client_event_id` for every new plan, and reuses it only to send this same plan
-/// again (the module's "one plan, one tail id").
+/// again (the module's "one plan, one tail id"). `notify` is the user's Send / Don't send, `None`
+/// when nobody answered: a plan that would email someone then never runs
+/// ([`SeriesPlan::needs_notify`]), and its guests say whom it would (C12).
 pub fn plan_series_edit(
+    scope: Scope,
+    input: &SeriesInput,
+    draft: &EventPatchDraft,
+    tail_id: &str,
+    notify: Option<Notify>,
+) -> Result<SeriesPlan, NotPlanned> {
+    let mut plan = edit_plan(scope, input, draft, tail_id, notify.unwrap_or(Notify::None))?;
+    plan.keep_guest_ops(draft.guest_ops());
+    plan.settle_notify(input, notify, false);
+    Ok(plan)
+}
+
+fn edit_plan(
     scope: Scope,
     input: &SeriesInput,
     draft: &EventPatchDraft,
@@ -1467,6 +1732,7 @@ pub fn plan_series_edit(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let (master, original) = prepare(input)?;
+    guests_ready(scope, input, draft)?;
     match scope {
         Scope::This => plan_this(input, &master, draft, notify),
         Scope::All => plan_all(input, &master, original, draft, notify),
@@ -1475,8 +1741,176 @@ pub fn plan_series_edit(
         }
         Scope::Following => match cut_at(&master, input, original)? {
             None => plan_all(input, &master, original, draft, notify),
-            Some(cut) => plan_split(input, &master, original, cut, draft, tail_id, notify),
+            Some(cut) => {
+                // The new part copies the series' guest list, which Google cut short would copy part
+                // of (C12 critique C1): refused, whatever the draft changes.
+                if attendees::omitted(input.fresh.master.json()) {
+                    return Err(SeriesRefusal::Guest(GuestError::Omitted).into());
+                }
+                plan_split(input, &master, original, cut, draft, tail_id, notify)
+            }
         },
+    }
+}
+
+/// The draft's guest changes, checked on the copy they go to: the occurrence for "This event", the
+/// series for the rest (C12 §6.1), whose guest list the occurrence the user changed them on must
+/// have, or they'd be applied to a list the user never saw (critique C2-M5).
+fn guests_ready(
+    scope: Scope,
+    input: &SeriesInput,
+    draft: &EventPatchDraft,
+) -> Result<(), NotPlanned> {
+    let ops = draft.guest_ops();
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
+    if scope == Scope::This {
+        attendees::check(instance, ops).map_err(SeriesRefusal::Guest)?;
+        return Ok(());
+    }
+    attendees::check(master_json, ops).map_err(SeriesRefusal::Guest)?;
+    let list = |v: &Value| attendees::guest_set(v.get("attendees"));
+    if list(instance) != list(master_json) {
+        return Err(SeriesRefusal::GuestsDifferHere.into());
+    }
+    Ok(())
+}
+
+/// Google's copy of `event` as the plan read it: the series, the occurrence, or one of the series'
+/// listed occurrences. `None` for an id PM didn't read.
+fn json_of<'a>(input: &SeriesInput<'a>, event: &str) -> Option<&'a Value> {
+    let is = |v: &&Value| v.get("id").and_then(Value::as_str) == Some(event);
+    [input.fresh.master.json(), input.fresh.instance.json()]
+        .into_iter()
+        .find(is)
+        .or_else(|| input.exceptions.items.iter().find(is))
+}
+
+impl SeriesPlan {
+    /// It would email someone and nobody answered: it must not run (R9).
+    pub fn needs_notify(&self) -> bool {
+        self.guests.is_some() && self.chosen.is_none()
+    }
+
+    /// The body of the new event it inserts, if it inserts one.
+    fn inserted(&self) -> Option<&Map<String, Value>> {
+        self.steps.iter().find_map(|s| match &s.op {
+            Op::Insert { body, .. } => Some(body),
+            _ => None,
+        })
+    }
+
+    /// Stamp each step's `sendUpdates` from the user's answer: `chosen` where the step reaches
+    /// someone, `none` where it reaches nobody (R7), whatever was chosen; and say who the plan
+    /// reaches (A3). Every step, cleanup included, takes the answer until probe L-R13 shows guests'
+    /// copies of a carried or cancelled occurrence follow the organiser's anyway (A3); a follow-up
+    /// may then send `none` there. `deletes`: a delete's plan, whose writes all cancel what they reach
+    /// (a cut is a PATCH; C12 critiques C1-M1, C2-M1). Every public planner ends here.
+    fn settle_notify(&mut self, input: &SeriesInput, chosen: Option<Notify>, deletes: bool) {
+        let own = Own::of(
+            &[input.calendar, input.me],
+            &[input.fresh.master.json(), input.fresh.instance.json()],
+        );
+        let reaches: Vec<Reach> = self
+            .steps
+            .iter()
+            .map(|step| self.reach_of(step, input, &own))
+            .collect();
+        for (step, reach) in self.steps.iter_mut().zip(&reaches) {
+            step.notify = match reach.notice() {
+                Some(_) => chosen.unwrap_or(Notify::None),
+                None => Notify::None,
+            };
+            step.reach = written(&step.op)
+                .and_then(|event| json_of(input, event))
+                .and_then(|json| reach_onto(&step.op, json, &own));
+        }
+        let mut all = reaches
+            .into_iter()
+            .reduce(Reach::merge)
+            .unwrap_or_else(Reach::nobody);
+        // Those a new part leaves off are taken off, not told of an update (C12 critique C2-M7).
+        if let Some(body) = self.inserted() {
+            all = all.taking_off(attendees::left_off(input.fresh.master.json(), body, &own));
+        }
+        self.guests = all.cancelling(deletes).notice();
+        self.chosen = chosen;
+        self.own = own;
+    }
+
+    /// Keep `ops`, the draft's guest changes, on each write whose body sends a guest list: every such
+    /// list was built with them (C12).
+    fn keep_guest_ops(&mut self, ops: &[GuestOp]) {
+        for step in &mut self.steps {
+            if matches!(&step.op, Op::Patch { body, .. } if body.contains_key("attendees")) {
+                step.guest_ops = ops.to_vec();
+            }
+        }
+    }
+
+    /// Who one step reaches, from the copy it writes onto (C12 §6.2). A write to the series itself
+    /// is "at least" where PM couldn't see every occurrence, or (for every occurrence) where one
+    /// has a guest list of its own: whether Google emails those guests too is unprobed (INFERRED,
+    /// probe L8-11).
+    fn reach_of(&self, step: &Step, input: &SeriesInput, own: &Own) -> Reach {
+        let unseen = || Reach::nobody().short();
+        let (event, reach) = match &step.op {
+            Op::Insert { body, .. } => return Reach::of_insert(body, own),
+            // Onto an occurrence of the new part, whose guests are the insert's.
+            Op::Carry { body, .. } => {
+                return match self.inserted() {
+                    Some(new) => Reach::of_carry(new, body, own),
+                    None => unseen(),
+                }
+            }
+            Op::Patch { event, .. } | Op::Cancel { event, .. } | Op::Delete { event, .. } => {
+                match json_of(input, event).and_then(|json| reach_onto(&step.op, json, own)) {
+                    Some(reach) => (event, reach),
+                    None => return unseen(),
+                }
+            }
+        };
+        let master_json = input.fresh.master.json();
+        if master_json.get("id").and_then(Value::as_str) != Some(event.as_str()) || !reach.shared()
+        {
+            return reach;
+        }
+        let series_list = attendees::guest_set(master_json.get("attendees"));
+        let own_lists = self.scope == Scope::All
+            && input
+                .exceptions
+                .items
+                .iter()
+                .filter(|item| item.get("recurringEventId") == master_json.get("id"))
+                .filter(|item| !is_gone(item))
+                .any(|item| attendees::guest_set(item.get("attendees")) != series_list);
+        if !input.exceptions.complete || own_lists {
+            reach.short()
+        } else {
+            reach
+        }
+    }
+}
+
+/// The event `op` writes, when Google has it before the write: never an insert's or a carry's.
+fn written(op: &Op) -> Option<&str> {
+    match op {
+        Op::Patch { event, .. } | Op::Cancel { event, .. } | Op::Delete { event, .. } => {
+            Some(event)
+        }
+        Op::Insert { .. } | Op::Carry { .. } => None,
+    }
+}
+
+/// Who `op` reaches written onto `json`, Google's copy of the event it writes. `None` for an insert
+/// or a carry, whose event Google doesn't have before it.
+fn reach_onto(op: &Op, json: &Value, own: &Own) -> Option<Reach> {
+    match op {
+        Op::Patch { body, .. } => Some(Reach::of_patch(json, body, own)),
+        Op::Cancel { .. } | Op::Delete { .. } => Some(Reach::of_delete(json, own)),
+        Op::Insert { .. } | Op::Carry { .. } => None,
     }
 }
 
@@ -1487,12 +1921,20 @@ fn plan_this(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let instance = input.fresh.instance.json();
+    // A new rule is the whole series' (scope.rs refuses the row; this is the planner's own guard). The
+    // rule the series already has is no change of rule, as the rows read it (C11 critique 1 L12).
+    if rule_ask(draft, master)?.is_some() {
+        return Err(SeriesRefusal::RuleIsSeriesWide.into());
+    }
     let body = build_patch(instance, draft)?;
     if body.is_empty() {
         return Err(NotPlanned::NoChange);
     }
     if body.contains_key("visibility") {
         return Err(SeriesRefusal::VisibilityIsSeriesWide.into());
+    }
+    if GUEST_PERMISSIONS.iter().any(|k| body.contains_key(*k)) {
+        return Err(SeriesRefusal::GuestPermissionsAreSeriesWide.into());
     }
     match update_check(input.opened.instance.json(), instance, &body) {
         UpdateCheck::Proceed => {}
@@ -1520,12 +1962,17 @@ fn plan_this(
             },
             gone_is_done: false,
             undo: None,
+            guest_ops: Vec::new(),
+            reach: None,
         }],
         warnings: Vec::new(),
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: master.start,
-        guests_allowed: input.guests_allowed,
+        rule_start: master.start,
+        guests: None,
+        chosen: None,
+        own: Own::default(),
     })
 }
 
@@ -1536,9 +1983,26 @@ fn plan_all(
     draft: &EventPatchDraft,
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
+    // A new rule, or none: the series is rebuilt from it (C11). So is a move between all-day and
+    // timed, or into another zone, from its own rule.
+    if let Some(ask) = rule_ask(draft, master)? {
+        return plan_all_rule(input, master, original, draft, ask, notify);
+    }
+    if let Some(ask) = own_rule_rebuild(draft, input.fresh.instance.json(), master, original)? {
+        // The rebuild starts on the first day the rule makes: a first occurrence the rule doesn't
+        // make would go, and with "after n times" one more would come at the end, on a save that
+        // changed no day. A move refuses the same series (RM14; C11d review 1), in words of its own:
+        // here nothing was moved (C11d review 2).
+        let parsed = lines::parse(&master.recurrence);
+        let (_, facts) = lines::series_rule(&parsed).map_err(RecurError::TextOnly)?;
+        if !is_occurrence(&facts, &master.start, master.first)? {
+            let first = master.first.day_in(master.start.zone());
+            return Err(SeriesRefusal::KindStartNotOnRule(first).into());
+        }
+        return plan_all_rule(input, master, original, draft, ask, notify);
+    }
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
-    let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    no_guests_from(master, input, None)?;
+    input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     keeps_formatting(master_json, draft)?;
     let text_only = EventPatchDraft {
         time: None,
@@ -1633,6 +2097,24 @@ fn plan_all(
             SeriesRefusal::OnlyThisDiffers.into()
         });
     }
+    all_plan(input, master, body, warnings, undo, notify, master.start)
+}
+
+/// The one PATCH of the series' master that "all events" sends, `body` being what it changes: what a
+/// 412 rechecks and what was changed in Google since the editor opened (R2), the warning for the
+/// occurrences changed on their own, after `warnings`, and `undo`. `rule_start`: the start it repeats
+/// from once it lands ([`SeriesPlan::rule_start`]).
+pub(super) fn all_plan(
+    input: &SeriesInput,
+    master: &Master,
+    body: Map<String, Value>,
+    mut warnings: Vec<SeriesWarning>,
+    undo: Option<Undo>,
+    notify: Notify,
+    rule_start: SeriesStart,
+) -> Result<SeriesPlan, NotPlanned> {
+    let master_json = input.fresh.master.json();
+    let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     // A new end is measured from the series' start, so it watches the start and rule too.
     let mut watched: Vec<String> = body.keys().cloned().collect();
     if ["start", "end", "recurrence"]
@@ -1687,17 +2169,25 @@ fn plan_all(
             shows: Shows::Fields { sent: body, old },
             gone_is_done: false,
             undo,
+            guest_ops: Vec::new(),
+            reach: None,
         }],
         warnings,
         expect: Vec::new(),
         removes: Removes::Nothing,
         start: master.start,
-        guests_allowed: input.guests_allowed,
+        rule_start,
+        guests: None,
+        chosen: None,
+        own: Own::default(),
     })
 }
 
 /// The original starts of the series' cancelled occurrences, from a complete listing.
-fn cancelled_points(master: &Master, exceptions: &Exceptions) -> Result<Vec<Point>, NotPlanned> {
+pub(super) fn cancelled_points(
+    master: &Master,
+    exceptions: &Exceptions,
+) -> Result<Vec<Point>, NotPlanned> {
     if !exceptions.complete {
         return Err(SeriesRefusal::Incomplete.into());
     }
@@ -1708,7 +2198,7 @@ fn cancelled_points(master: &Master, exceptions: &Exceptions) -> Result<Vec<Poin
 }
 
 /// A conflict when the occurrence no longer holds, on `keys`, what the user opened (R2).
-fn unchanged_since_opened(
+pub(super) fn unchanged_since_opened(
     master: &Master,
     input: &SeriesInput,
     keys: &[&str],
@@ -1731,11 +2221,21 @@ fn plan_split(
     input: &SeriesInput,
     master: &Master,
     at: Point,
-    SplitCut { cut, moved, before }: SplitCut,
+    cut: SplitCut,
     draft: &EventPatchDraft,
     tail_id: &str,
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
+    // A new rule, or none: the rest is rebuilt from it (C11). So is a move between all-day and
+    // timed, or into another zone, from the series' own rule, whose "after n times" is then rebased
+    // on what is left of it, since the user didn't set it.
+    if let Some(ask) = rule_ask(draft, master)? {
+        return plan_split_rule(input, master, at, cut, draft, tail_id, ask, notify);
+    }
+    if let Some(ask) = own_rule_rebuild(draft, input.fresh.instance.json(), master, at)? {
+        return plan_split_rule(input, master, at, cut, draft, tail_id, ask, notify);
+    }
+    let SplitCut { cut, moved, before } = cut;
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     keeps_formatting(master_json, draft)?;
@@ -1751,33 +2251,8 @@ fn plan_split(
     };
     let rest = tail_recurrence(&master.recurrence, remaining, &moved)?;
     let zone = master.start.zone();
-    // The rest repeats at the series' own wall time from the split's day. On a day the clocks skip
-    // that time, the occurrence sits an hour off it, and the rest can't start there: it would repeat
-    // an hour late, and every EXDATE after it would name nothing (C8b fix review).
-    let rest_start = match (master.start, at) {
-        (SeriesStart::Timed { local, .. }, Point::At(_)) => {
-            // The occurrence's own day: where the series' time, read as RFC 5545 reads a skipped
-            // hour, lands on `at`. A time in an evening's skipped hour lands on the next date.
-            let time = local.time();
-            let today = at.day_in(zone);
-            let day = [today, today.pred_opt().unwrap_or(today)]
-                .into_iter()
-                .find(|d| rfc_instant(zone, d.and_time(time)).map(Point::At) == Some(at))
-                .unwrap_or(today);
-            let start = SeriesStart::Timed {
-                local: day.and_time(time),
-                zone,
-            };
-            if start.point() != Some(at) {
-                return Err(SeriesRefusal::SplitInGap(day).into());
-            }
-            start
-        }
-        (SeriesStart::AllDay(_), Point::Day(d)) => SeriesStart::AllDay(d),
-        _ => return Err(RetimeError::KindChange.into()),
-    };
+    let rest_start = rest_start(master, at)?;
     let exceptions = exceptions_from(master, input.exceptions, at)?;
-    no_guests_from(master, input, Some(at))?;
     let cancelled: Vec<Point> = exceptions
         .iter()
         .filter(|(item, _)| classify_instance(master_json, master, item) == InstanceKind::Cancelled)
@@ -1827,7 +2302,7 @@ fn plan_split(
         .as_ref()
         .is_some_and(|r| r.remap.day != DayMap::Same || r.first != at)
         || length != master.length;
-    let touched = draft_fields(draft);
+    let touched = draft_fields(draft, master_json);
     let compare = probe(&master.start);
     if !moves
         && touched
@@ -1841,122 +2316,16 @@ fn plan_split(
         });
     }
 
-    // The new series: the original's own fields (from Google's copy, never the mirror), the draft's
-    // over them, its times in the original's zones, and a private note of where it came from.
-    let mut body: Map<String, Value> = TAIL_COPY
-        .iter()
-        .filter_map(|k| master_json.get(*k).map(|v| ((*k).to_string(), v.clone())))
-        .collect();
-    if let Some(guests) = master_json.get("attendees").and_then(Value::as_array) {
-        let guests: Vec<Value> = guests
-            .iter()
-            .filter_map(|g| {
-                let mut kept = Map::new();
-                for k in ["email", "optional", "displayName"] {
-                    if let Some(v) = g.get(k) {
-                        kept.insert(k.to_string(), v.clone());
-                    }
-                }
-                kept.contains_key("email").then_some(Value::Object(kept))
-            })
-            .collect();
-        body.insert("attendees".into(), Value::from(guests));
-    }
-    let mut properties = master_json
-        .get("extendedProperties")
-        .cloned()
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    if let Some(obj) = properties.as_object_mut() {
-        let private = obj.entry("private").or_insert_with(|| json!({}));
-        if let Some(private) = private.as_object_mut() {
-            private.insert("pmSplitOf".into(), Value::from(master.id.clone()));
-            // And the occurrence it was split at, which an uncut original still holds whatever day
-            // the new part was moved to: what the overlap backstop measures from (review round 6).
-            private.insert("pmSplitAt".into(), Value::from(super::point_text(at)));
-        }
-    }
-    body.insert("extendedProperties".into(), properties);
-    for (k, v) in &touched {
-        body.insert((*k).to_string(), v.clone());
-    }
-    let (start, end) = when_nodes(master, first, length)?;
-    body.insert("start".into(), start);
-    body.insert("end".into(), end);
-    body.insert("recurrence".into(), Value::from(tail_lines));
-    // And a note of this plan, so its insert can't be read off another plan's tail (Shows::Tail).
-    let plan = plan_digest(&body);
-    if let Some(private) = body
-        .get_mut("extendedProperties")
-        .and_then(|p| p.get_mut("private"))
-        .and_then(Value::as_object_mut)
-    {
-        private.insert("pmSplitPlan".into(), Value::from(plan.clone()));
-    }
-    warnings.push(SeriesWarning::NotCarried {
-        attachments: master_json
-            .get("attachments")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty()),
-        conference: master_json.get("conferenceData").is_some()
-            || master_json.get("hangoutLink").is_some(),
-        label: master_json.get("eventLabelId").is_some(),
-    });
-    warnings.retain(|w| {
-        !matches!(
-            w,
-            SeriesWarning::NotCarried {
-                attachments: false,
-                conference: false,
-                label: false
-            }
-        )
-    });
+    let nodes = when_nodes(master, first, length)?;
+    let body = tail_body(master, master_json, at, &touched, nodes, Some(tail_lines));
+    warnings.extend(not_carried(master_json));
     warnings.push(SeriesWarning::NewIdentity);
     if input.sibling {
         warnings.push(SeriesWarning::SplitSibling);
     }
-
-    // Nothing the plan sends may have changed in Google since the editor opened (R2).
-    let watched: Vec<String> = TAIL_WATCH.iter().map(|k| (*k).to_string()).collect();
-    let changed = changed_since_opened(&master.start, opened.json(), master_json, &watched);
-    if !changed.is_empty() {
-        return Err(NotPlanned::Conflict(changed));
-    }
-    let instance_keys: Vec<String> = touched.iter().map(|(k, _)| (*k).to_string()).collect();
-    let changed = changed_since_opened(
-        &master.start,
-        input.opened.instance.json(),
-        instance,
-        &instance_keys,
-    );
-    if !changed.is_empty() {
-        return Err(NotPlanned::Conflict(changed));
-    }
-
+    split_unchanged_since_opened(master, input, opened, &touched)?;
     let mut steps = vec![
-        Step {
-            op: Op::Insert {
-                calendar: input.calendar.to_string(),
-                id: tail_id.to_string(),
-                body,
-            },
-            notify,
-            stage: Stage::Commit,
-            requires: None,
-            conflict: Recheck::Never,
-            shows: Shows::Tail {
-                of: master.id.clone(),
-                plan: plan.clone(),
-            },
-            gone_is_done: false,
-            undo: Some(Undo::DeleteInserted {
-                calendar: input.calendar.to_string(),
-                event: tail_id.to_string(),
-                split_of: master.id.clone(),
-                plan,
-            }),
-        },
+        insert_step(input, master, tail_id, body, notify),
         cut_step(master, input.calendar, master_json, cut, TAIL_WATCH, notify),
     ];
 
@@ -2026,6 +2395,8 @@ fn plan_split(
                 },
                 gone_is_done: false,
                 undo: None,
+                guest_ops: Vec::new(),
+                reach: None,
             });
             Some(steps.len() - 1)
         };
@@ -2058,15 +2429,202 @@ fn plan_split(
             left: Vec::new(),
         },
         start: master.start,
-        guests_allowed: input.guests_allowed,
+        rule_start: master.start,
+        guests: None,
+        chosen: None,
+        own: Own::default(),
     })
+}
+
+/// Where the rest of a series split at `at` repeats from: the series' own wall time on that
+/// occurrence's day. On a day the clocks skip that time, the occurrence sits an hour off it, and the
+/// rest can't start there: it would repeat an hour late, and every EXDATE after it would name nothing
+/// (C8b fix review).
+pub(super) fn rest_start(master: &Master, at: Point) -> Result<SeriesStart, NotPlanned> {
+    let zone = master.start.zone();
+    match (master.start, at) {
+        (SeriesStart::Timed { local, .. }, Point::At(_)) => {
+            // The occurrence's own day: where the series' time, read as RFC 5545 reads a skipped
+            // hour, lands on `at`. A time in an evening's skipped hour lands on the next date.
+            let time = local.time();
+            let today = at.day_in(zone);
+            let day = [today, today.pred_opt().unwrap_or(today)]
+                .into_iter()
+                .find(|d| rfc_instant(zone, d.and_time(time)).map(Point::At) == Some(at))
+                .unwrap_or(today);
+            let start = SeriesStart::Timed {
+                local: day.and_time(time),
+                zone,
+            };
+            if start.point() != Some(at) {
+                return Err(SeriesRefusal::SplitInGap(day).into());
+            }
+            Ok(start)
+        }
+        (SeriesStart::AllDay(_), Point::Day(d)) => Ok(SeriesStart::AllDay(d)),
+        _ => Err(RetimeError::KindChange.into()),
+    }
+}
+
+/// A split's new series, or the one event a split that stops repeating makes (C11): the original's
+/// own fields (from Google's copy, never the mirror), its guests (the draft's list when it changes
+/// them), `fields` over them, `start` and `end`, its `recurrence` if it repeats, and private notes of
+/// where it came from and of this plan, so its insert can't be read off another plan's
+/// (`Shows::Tail`). Its guests are invited anew ([`attendees::for_new_event`]: who, their name,
+/// optional, room and extra guests, never a reply or a comment).
+pub(super) fn tail_body(
+    master: &Master,
+    master_json: &Value,
+    at: Point,
+    fields: &[(&str, Value)],
+    (start, end): (Value, Value),
+    recurrence: Option<Vec<String>>,
+) -> Map<String, Value> {
+    let mut body: Map<String, Value> = TAIL_COPY
+        .iter()
+        .filter_map(|k| master_json.get(*k).map(|v| ((*k).to_string(), v.clone())))
+        .collect();
+    let guests = fields
+        .iter()
+        .find(|(k, _)| *k == "attendees")
+        .map(|(_, v)| v)
+        .or_else(|| master_json.get("attendees"));
+    if let Some(guests) = guests.and_then(Value::as_array) {
+        let guests: Vec<Value> = guests.iter().filter_map(attendees::for_new_event).collect();
+        body.insert("attendees".into(), Value::from(guests));
+    }
+    let mut properties = master_json
+        .get("extendedProperties")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = properties.as_object_mut() {
+        let private = obj.entry("private").or_insert_with(|| json!({}));
+        if let Some(private) = private.as_object_mut() {
+            private.insert("pmSplitOf".into(), Value::from(master.id.clone()));
+            // And the occurrence it was split at, which an uncut original still holds whatever day
+            // the new part was moved to: what the overlap backstop measures from (review round 6).
+            private.insert("pmSplitAt".into(), Value::from(super::point_text(at)));
+        }
+    }
+    body.insert("extendedProperties".into(), properties);
+    for (k, v) in fields.iter().filter(|(k, _)| *k != "attendees") {
+        body.insert((*k).to_string(), v.clone());
+    }
+    body.insert("start".into(), start);
+    body.insert("end".into(), end);
+    if let Some(lines) = recurrence {
+        body.insert("recurrence".into(), Value::from(lines));
+    }
+    let plan = plan_digest(&body);
+    if let Some(private) = body
+        .get_mut("extendedProperties")
+        .and_then(|p| p.get_mut("private"))
+        .and_then(Value::as_object_mut)
+    {
+        private.insert("pmSplitPlan".into(), Value::from(plan));
+    }
+    body
+}
+
+/// The new part doesn't take the original's attachments, video call or label: the warning, when it
+/// names one.
+pub(super) fn not_carried(master_json: &Value) -> Option<SeriesWarning> {
+    let warning = SeriesWarning::NotCarried {
+        attachments: master_json
+            .get("attachments")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+        conference: master_json.get("conferenceData").is_some()
+            || master_json.get("hangoutLink").is_some(),
+        label: master_json.get("eventLabelId").is_some(),
+    };
+    let none = SeriesWarning::NotCarried {
+        attachments: false,
+        conference: false,
+        label: false,
+    };
+    (warning != none).then_some(warning)
+}
+
+/// Nothing a split sends may have changed in Google since the editor opened (R2): every field the new
+/// part copies, on the series `opened` as the editor kept it, and the draft's `touched` fields on the
+/// occurrence.
+pub(super) fn split_unchanged_since_opened(
+    master: &Master,
+    input: &SeriesInput,
+    opened: &FreshEvent,
+    touched: &[(&str, Value)],
+) -> Result<(), NotPlanned> {
+    let watched: Vec<String> = TAIL_WATCH.iter().map(|k| (*k).to_string()).collect();
+    let changed = changed_since_opened(
+        &master.start,
+        opened.json(),
+        input.fresh.master.json(),
+        &watched,
+    );
+    if !changed.is_empty() {
+        return Err(NotPlanned::Conflict(changed));
+    }
+    let instance_keys: Vec<String> = touched.iter().map(|(k, _)| (*k).to_string()).collect();
+    let changed = changed_since_opened(
+        &master.start,
+        input.opened.instance.json(),
+        input.fresh.instance.json(),
+        &instance_keys,
+    );
+    if !changed.is_empty() {
+        return Err(NotPlanned::Conflict(changed));
+    }
+    Ok(())
+}
+
+/// The insert of a split's new part under `tail_id`, PM's own id: proved by its notes, undone by
+/// deleting it while it's still PM's.
+pub(super) fn insert_step(
+    input: &SeriesInput,
+    master: &Master,
+    tail_id: &str,
+    body: Map<String, Value>,
+    notify: Notify,
+) -> Step {
+    let plan = body
+        .get("extendedProperties")
+        .and_then(|p| p.pointer("/private/pmSplitPlan"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Step {
+        op: Op::Insert {
+            calendar: input.calendar.to_string(),
+            id: tail_id.to_string(),
+            body,
+        },
+        notify,
+        stage: Stage::Commit,
+        requires: None,
+        conflict: Recheck::Never,
+        shows: Shows::Tail {
+            of: master.id.clone(),
+            plan: plan.clone(),
+        },
+        gone_is_done: false,
+        undo: Some(Undo::DeleteInserted {
+            calendar: input.calendar.to_string(),
+            event: tail_id.to_string(),
+            split_of: master.id.clone(),
+            plan,
+        }),
+        guest_ops: Vec::new(),
+        reach: None,
+    }
 }
 
 /// The last occurrence the original keeps before `at`, a split's occurrence: its rule's latest that
 /// isn't deleted (an EXDATE, or among `cancelled`), else its start, which RFC 5545 and Google count
 /// even off its own rule. The rest can't start on that day or before (C8b reviews ADV-9). An extra
 /// date (RDATE) is an occurrence of its own, which the rest's rule can't double, so it doesn't count.
-fn last_kept(
+pub(super) fn last_kept(
     master: &Master,
     facts: &lines::RuleFacts,
     at: Point,
@@ -2249,12 +2807,7 @@ mod tests {
         ));
         for scope in [Scope::This, Scope::Following, Scope::All] {
             assert_eq!(
-                plan_series_delete(
-                    scope,
-                    &case.input(),
-                    &seen_of(&case.opened_instance),
-                    Notify::None
-                ),
+                plan_series_delete(scope, &case.input(), &seen_of(&case.opened_instance), None),
                 Err(NotPlanned::Conflict(vec!["start".into(), "end".into()]))
             );
         }
@@ -2264,7 +2817,7 @@ mod tests {
                 Scope::This,
                 &case.input(),
                 &seen_of(&case.opened_instance),
-                Notify::None
+                None
             ),
             Err(NotPlanned::Gone)
         );
@@ -2585,14 +3138,34 @@ mod tests {
             .op
             .carry_request("..", "\"e\"", Notify::None)
             .is_none());
-        // A3: every step, and every undo, sent with the one choice.
+        // A3: every step, and every undo, sent with the one choice where it reaches someone; on a
+        // series nobody else is on, `none`, whatever was chosen (R7, C12).
         let notify = Notify::All;
-        let plan = plan_series_edit(
+        let alone = plan_series_edit(
             Scope::Following,
             &case.input(),
             &at("10:00", "2026-10-19"),
             TAIL,
-            notify,
+            Some(notify),
+        )
+        .unwrap();
+        assert!(alone.guests.is_none());
+        assert!(alone.steps.iter().all(|s| s.notify == Notify::None));
+        let guest = |event: &Value| {
+            if is_gone(event) {
+                event.clone()
+            } else {
+                guests_on_it(event.clone(), &["a@example.com"])
+            }
+        };
+        let invited = Case::new(guest(case.master.json()), guest(&monday_19()))
+            .exceptions(case.exceptions.items.iter().map(guest).collect());
+        let plan = plan_series_edit(
+            Scope::Following,
+            &invited.input(),
+            &at("10:00", "2026-10-19"),
+            TAIL,
+            Some(notify),
         )
         .unwrap();
         for step in &plan.steps {
@@ -2772,7 +3345,7 @@ mod tests {
             ..case.input()
         };
         assert_eq!(
-            plan_series_edit(Scope::All, &input, &title("Retro"), TAIL, Notify::None),
+            plan_series_edit(Scope::All, &input, &title("Retro"), TAIL, None),
             Err(NotPlanned::Refused(SeriesRefusal::NoBase))
         );
     }
@@ -2864,39 +3437,44 @@ mod tests {
         )
     }
 
-    /// G5: a series with guests stays read-only until C12, whatever the occurrence shows. Once guests
-    /// are allowed, an occurrence whose guests were removed on its own is a change PM can't carry.
+    /// G5, C12: a series with guests plans like any other and says who it would email, whatever
+    /// the occurrence shows (C12 lifted the gate's refusal). An occurrence whose guests were removed
+    /// on its own is still a change PM can't carry.
     #[test]
-    fn a_series_with_guests_is_judged_by_its_own_guest_list() {
+    fn a_series_with_guests_plans_and_counts_them() {
         let no_guests_here = monday_19();
         let case = Case::new(with_guests(), no_guests_here);
-        for scope in [Scope::All, Scope::Following] {
-            assert_eq!(
-                case.edit(scope, title("Retro")),
-                Err(NotPlanned::ReadOnly(ReadOnlyReason::HasGuests))
-            );
-        }
-        assert_eq!(
-            case.delete(Scope::Following),
-            Err(NotPlanned::ReadOnly(ReadOnlyReason::HasGuests))
-        );
+        let two = |cancelled: bool| GuestNotice {
+            updated: 2,
+            cancelled,
+            people: 2,
+            emails: 2,
+            complete: true,
+            ..GuestNotice::default()
+        };
+        let all = case.edit(Scope::All, title("Retro")).unwrap();
+        assert!(all.guests == Some(two(false)), "a and b get the update");
+        assert!(all.needs_notify(), "unanswered, it may not run");
+        let gone = case.delete(Scope::All).unwrap();
+        assert!(gone.guests == Some(two(true)), "a and b are told");
+        let split = case.edit(Scope::Following, title("Retro")).unwrap();
+        assert!(split.guests.is_some() && split.needs_notify());
         // Only the user on the list isn't a guest.
         let just_me = with(
             weekly(),
             "attendees",
             json!([{ "email": "me@example.com", "self": true }]),
         );
-        assert!(Case::new(just_me, monday_19())
+        let alone = Case::new(just_me, monday_19())
             .edit(Scope::All, title("Retro"))
-            .is_ok());
+            .unwrap();
+        assert!(alone.guests.is_none() && !alone.needs_notify());
         let solo = with(
             plain("2026-10-26T09:00:00Z"),
             "summary",
             json!("Solo review"),
         );
-        let case = Case::new(with_guests(), monday_19())
-            .exceptions(vec![solo])
-            .guests();
+        let case = Case::new(with_guests(), monday_19()).exceptions(vec![solo]);
         assert_eq!(
             case.edit(Scope::Following, title("Retro")),
             Err(NotPlanned::Refused(SeriesRefusal::CannotCarry(day(
@@ -2910,7 +3488,7 @@ mod tests {
     /// shared property changed, does.
     #[test]
     fn a_split_watches_the_guests_it_copies_but_not_their_replies() {
-        let mut case = Case::new(with_guests(), monday_19()).guests();
+        let mut case = Case::new(with_guests(), monday_19());
         let replied = with(
             weekly(),
             "attendees",
@@ -2921,7 +3499,10 @@ mod tests {
             ]),
         );
         case.master = fresh(replied.clone());
-        let plan = case.edit(Scope::Following, title("Retro")).unwrap();
+        // Planned with Send: an unanswered plan would meet any guest as one nobody chose to tell.
+        let plan = case
+            .edit_told(Scope::Following, title("Retro"), Some(Notify::All))
+            .unwrap();
         assert_eq!(
             body(&plan.steps[0])["attendees"],
             json!([
@@ -3099,9 +3680,10 @@ mod tests {
             .any(|w| matches!(w, SeriesWarning::ExceptionsMayReset { .. })));
     }
 
-    /// G7: an end moved into another zone is a zone change for the series rows, as a start is.
+    /// G7: an end moved into another zone is a zone change for the series rows, as a start is: every
+    /// occurrence, or the rest, is rebuilt from the rule with its end there (C11 §12.4).
     #[test]
-    fn an_end_in_another_zone_is_a_zone_change() {
+    fn an_end_in_another_zone_rebuilds_every_occurrence_with_it() {
         let draft = EventPatchDraft {
             time: Some(TimeDraft::Timed {
                 start_date: "2026-10-19".into(),
@@ -3114,12 +3696,495 @@ mod tests {
             ..Default::default()
         };
         let case = Case::new(weekly(), monday_19());
+        let all = case.edit(Scope::All, draft.clone()).unwrap();
+        let sent = body(&all.steps[0]);
+        assert_eq!(
+            sent["end"],
+            json!({ "dateTime": "2026-10-05T12:00:00+02:00", "timeZone": "Europe/Paris" })
+        );
+        assert_eq!(
+            sent["start"],
+            json!({ "dateTime": "2026-10-05T10:00:00+01:00", "timeZone": "Europe/London" })
+        );
+        let following = case.edit(Scope::Following, draft).unwrap();
+        assert_eq!(
+            body(&following.steps[0])["end"],
+            json!({ "dateTime": "2026-10-19T12:00:00+02:00", "timeZone": "Europe/Paris" })
+        );
+    }
+
+    /// The weekly standup from Monday 05-10 to 30-11, its 02-11 occurrence deleted by an EXDATE and
+    /// its 26-10 one cancelled.
+    fn standup_to_november() -> Case {
+        Case::new(
+            master(&[
+                "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261130T235959Z",
+                "EXDATE;TZID=Europe/London:20261102T090000",
+            ]),
+            monday_19(),
+        )
+        .exceptions(vec![cancelled("2026-10-26T09:00:00Z")])
+    }
+
+    /// C11 §12.4: every occurrence from timed to all-day is the series rebuilt from its own rule, in
+    /// dates: its first day, its end date, and the occurrences deleted from it, as dates. A move of
+    /// kind alone moves no day, so it asks nothing about one.
+    #[test]
+    fn a_kind_change_on_all_rebuilds_from_the_series_rule() {
+        let draft = EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-10-19".into(),
+                last_day: "2026-10-19".into(),
+            }),
+            ..Default::default()
+        };
+        let plan = standup_to_november().edit(Scope::All, draft).unwrap();
+        let sent = body(&plan.steps[0]);
+        assert_eq!(
+            sent["start"],
+            json!({ "date": "2026-10-05", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(
+            sent["end"],
+            json!({ "date": "2026-10-06", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(
+            sent["recurrence"],
+            json!([
+                "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261130",
+                "EXDATE;VALUE=DATE:20261026,20261102"
+            ])
+        );
+        assert!(!sent.contains_key("summary"));
+        assert!(plan.rule_start == SeriesStart::AllDay(day(2026, 10, 5)));
+        assert!(!plan.warnings.iter().any(|w| matches!(
+            w,
+            SeriesWarning::RepeatDayChanges { .. } | SeriesWarning::StartMoved { .. }
+        )));
+        assert!(plan.warnings.contains(&SeriesWarning::LengthChanges));
+        assert!(matches!(
+            plan.steps[0].undo,
+            Some(Undo::RestoreMaster { .. })
+        ));
+    }
+
+    /// Into another zone, the end date's UNTIL is that day's last second there, in UTC.
+    #[test]
+    fn a_zone_change_on_all_rewrites_the_until_in_utc() {
+        let draft = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-10-19".into(),
+                start_time: "09:00".into(),
+                start_zone: "America/New_York".into(),
+                end_date: "2026-10-19".into(),
+                end_time: "10:00".into(),
+                end_zone: "America/New_York".into(),
+            }),
+            ..Default::default()
+        };
+        let plan = standup_to_november().edit(Scope::All, draft).unwrap();
+        let sent = body(&plan.steps[0]);
+        assert_eq!(
+            sent["start"],
+            json!({ "dateTime": "2026-10-05T09:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        let rule = sent["recurrence"][0].as_str().unwrap();
+        assert_eq!(rule, "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261201T045959Z");
+        // The deleted days stay deleted, at the new time (New York's clocks go back on 01-11).
+        assert_eq!(
+            sent["recurrence"][1],
+            "EXDATE:20261026T130000Z,20261102T140000Z"
+        );
+    }
+
+    /// "This and following" into another zone: the rest rebuilt from the series' rule there, its
+    /// "after 10 times" rebased on what is left of it, since the user didn't set it (C11 §12.4).
+    #[test]
+    fn a_zone_change_on_following_rebuilds_the_new_part_and_rebases_its_count() {
+        let counted = master(&["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10"]);
+        let fifth = plain("2026-11-02T09:00:00Z");
+        let mut case = Case::new(counted, fifth.clone());
+        case.instances = Some(Listing {
+            items: vec![
+                plain("2026-10-05T09:00:00+01:00"),
+                plain("2026-10-12T09:00:00+01:00"),
+                plain("2026-10-19T09:00:00+01:00"),
+                plain("2026-10-26T09:00:00Z"),
+                fifth,
+            ],
+            complete: true,
+        });
+        let draft = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-11-02".into(),
+                start_time: "09:00".into(),
+                start_zone: "America/New_York".into(),
+                end_date: "2026-11-02".into(),
+                end_time: "10:00".into(),
+                end_zone: "America/New_York".into(),
+            }),
+            ..Default::default()
+        };
+        let plan = case.edit(Scope::Following, draft).unwrap();
+        let insert = body(&plan.steps[0]);
+        assert_eq!(
+            insert["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6"])
+        );
+        assert_eq!(
+            insert["start"],
+            json!({ "dateTime": "2026-11-02T09:00:00-05:00", "timeZone": "America/New_York" })
+        );
+        assert_eq!(
+            body(&plan.steps[1])["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261102T085959Z"])
+        );
+    }
+
+    /// A rule PM can read but can't write back as one of the editor's (here, more times than Google
+    /// allows a new one) can't be rebuilt, so the change of kind is refused in words.
+    #[test]
+    fn a_kind_change_on_a_custom_rule_is_refused_in_words() {
+        let case = Case::new(
+            master(&["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=800"]),
+            monday_19(),
+        );
+        let draft = EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-10-19".into(),
+                last_day: "2026-10-19".into(),
+            }),
+            ..Default::default()
+        };
+        let refused = case.edit(Scope::All, draft);
+        assert!(
+            refused
+                == Err(NotPlanned::Refused(SeriesRefusal::Retime(
+                    RetimeError::KindChange
+                )))
+        );
+        assert_eq!(
+            SeriesRefusal::Retime(RetimeError::KindChange).to_string(),
+            "PM can only change every occurrence between all-day and timed, or into another time \
+             zone, when it can read how the event repeats. Change this occurrence on its own."
+        );
+    }
+
+    /// Weekly on Monday at 01:00 in London, which is Sunday evening in New York. Put in New York at
+    /// 01:00 on the same Monday, it stays on Mondays, for every occurrence and from this one on: the
+    /// day the series' own rule names is the one on the clock, wherever the rebuild reads days from
+    /// (C11c review). No day moved, so nothing asks to move every occurrence a day or says the
+    /// series' start moves (C11d review 4), nor, made "Does not repeat", that the one kept moves
+    /// (C11d review 5). Kept at the same moment, Sunday in New York, its day
+    /// moves: refused in words.
+    #[test]
+    fn a_zone_change_past_midnight_keeps_the_rules_own_day() {
+        let late = master_with(
+            &["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+            "2026-10-05T01:00:00+01:00",
+            "2026-10-05T02:00:00+01:00",
+        );
+        let case = Case::new(late, plain("2026-10-19T01:00:00+01:00"));
+        let monday = timed_in("2026-10-19", "01:00", "02:00", "America/New_York");
+        let all = case.edit(Scope::All, monday.clone()).unwrap();
+        assert_eq!(
+            body(&all.steps[0])["start"],
+            json!({ "dateTime": "2026-10-05T01:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        assert!(!all.warnings.iter().any(|w| matches!(
+            w,
+            SeriesWarning::RepeatDayChanges { .. } | SeriesWarning::StartMoved { .. }
+        )));
+        // Moved on to Tuesday there too and made "Weekly on Tuesday", a day moves: both are said,
+        // in the series' own days, Monday to Tuesday and 05-10 to 06-10.
+        let tuesday = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Rule {
+                rule: crate::calendar_recur::wire::RepeatRule {
+                    pattern: crate::calendar_recur::wire::RepeatPattern::Weekly {
+                        days: vec![crate::calendar_recur::wire::DayCode::Tue],
+                    },
+                    interval: 1,
+                    ends: crate::calendar_recur::wire::RepeatEnds::Never,
+                },
+            }),
+            ..timed_in("2026-10-20", "01:00", "02:00", "America/New_York")
+        };
+        let moved = case.edit(Scope::All, tuesday).unwrap();
+        assert_eq!(
+            body(&moved.steps[0])["start"],
+            json!({ "dateTime": "2026-10-06T01:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        let day = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        assert!(moved.warnings.contains(&SeriesWarning::RepeatDayChanges {
+            from: day(19),
+            to: day(20)
+        }));
+        assert!(moved.warnings.contains(&SeriesWarning::StartMoved {
+            from: day(5),
+            to: day(6)
+        }));
+        // "Does not repeat" on the same Monday keeps the first, Monday 05-10, on its own day: it
+        // becomes one event there and nothing says it moves (C11d review 5).
+        let once = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            ..monday.clone()
+        };
+        let stopped = case.edit(Scope::All, once).unwrap();
+        assert_eq!(
+            body(&stopped.steps[0])["start"],
+            json!({ "dateTime": "2026-10-05T01:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        assert_eq!(
+            stopped.warnings,
+            [SeriesWarning::BecomesOneEvent { day: day(5) }]
+        );
+        let rest = case.edit(Scope::Following, monday).unwrap();
+        let new_part =
+            json!({ "dateTime": "2026-10-19T01:00:00-04:00", "timeZone": "America/New_York" });
+        let mondays = json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]);
+        let starts_monday =
+            |b: &Map<String, Value>| b["start"] == new_part && b["recurrence"] == mondays;
+        assert!(rest
+            .steps
+            .iter()
+            .any(|s| s.op.body().is_some_and(starts_monday)));
+        let sunday = timed_in("2026-10-18", "20:00", "21:00", "America/New_York");
         for scope in [Scope::All, Scope::Following] {
-            assert_eq!(
-                case.edit(scope, draft.clone()),
-                Err(NotPlanned::Refused(SeriesRefusal::ZoneChange))
+            assert!(
+                case.edit(scope, sunday.clone())
+                    == Err(NotPlanned::Refused(SeriesRefusal::KindAndDay))
             );
         }
+    }
+
+    /// The series' own rule names its days, so it can't move them and change kind or zone in one save:
+    /// refused in words, for every occurrence and from this one on alike.
+    #[test]
+    fn a_kind_or_zone_change_with_a_new_day_is_refused_in_words() {
+        let tuesday_all_day = TimeDraft::AllDay {
+            first_day: "2026-10-20".into(),
+            last_day: "2026-10-20".into(),
+        };
+        let tuesday_in_new_york = TimeDraft::Timed {
+            start_date: "2026-10-20".into(),
+            start_time: "09:00".into(),
+            start_zone: "America/New_York".into(),
+            end_date: "2026-10-20".into(),
+            end_time: "10:00".into(),
+            end_zone: "America/New_York".into(),
+        };
+        let case = Case::new(weekly(), monday_19());
+        for time in [tuesday_all_day, tuesday_in_new_york] {
+            let draft = EventPatchDraft {
+                time: Some(time),
+                ..Default::default()
+            };
+            for scope in [Scope::All, Scope::Following] {
+                let refused = case.edit(scope, draft.clone());
+                assert!(refused == Err(NotPlanned::Refused(SeriesRefusal::KindAndDay)));
+            }
+        }
+        // Shown on both rows, so worded for both (C11d review 1).
+        assert_eq!(
+            SeriesRefusal::KindAndDay.to_string(),
+            "PM can't move these occurrences to another day and change them between all-day and \
+             timed, or into another time zone, in one save. Change the day in one save and the \
+             rest in another."
+        );
+        // The same day, another kind, goes.
+        assert!(case
+            .edit(
+                Scope::All,
+                EventPatchDraft {
+                    time: Some(TimeDraft::AllDay {
+                        first_day: "2026-10-19".into(),
+                        last_day: "2026-10-19".into(),
+                    }),
+                    ..Default::default()
+                }
+            )
+            .is_ok());
+    }
+
+    /// C11d review 1: an occurrence moved to Wednesday on its own and left there, made all-day or put
+    /// in another zone, names no move the user made; moved further, it does; on its usual day, it
+    /// goes.
+    #[test]
+    fn a_kind_or_zone_change_on_an_occurrence_moved_on_its_own_says_so() {
+        let wednesday = moved(
+            "2026-10-19T09:00:00+01:00",
+            "2026-10-21T09:00:00+01:00",
+            "2026-10-21T10:00:00+01:00",
+        );
+        let case = Case::new(weekly(), wednesday.clone()).exceptions(vec![wednesday]);
+        let all_day_on = |date: &str| EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: date.into(),
+                last_day: date.into(),
+            }),
+            ..Default::default()
+        };
+        let in_new_york = timed_in("2026-10-21", "09:00", "10:00", "America/New_York");
+        for scope in [Scope::All, Scope::Following] {
+            for draft in [all_day_on("2026-10-21"), in_new_york.clone()] {
+                assert!(
+                    case.edit(scope, draft)
+                        == Err(NotPlanned::Refused(SeriesRefusal::KindFromMovedDay))
+                );
+            }
+            assert!(
+                case.edit(scope, all_day_on("2026-10-22"))
+                    == Err(NotPlanned::Refused(SeriesRefusal::KindAndDay))
+            );
+            assert!(case.edit(scope, all_day_on("2026-10-19")).is_ok());
+        }
+        assert_eq!(
+            SeriesRefusal::KindFromMovedDay.to_string(),
+            "This occurrence was moved to another day on its own, so PM can't change other \
+             occurrences from it between all-day and timed, or into another time zone. Change it \
+             on its own, or from an occurrence on its usual day."
+        );
+    }
+
+    /// C11d review 1: weekly on Monday, ten times, from a Sunday its rule doesn't make (Google counts
+    /// that Sunday). Rebuilt from its rule, the Sunday would go and an eleventh Monday would come, so
+    /// a change of kind or zone for every occurrence is refused in words, from the Sunday as from any
+    /// other: words of its own, naming no move, since the user moved nothing (C11d review 2). Its
+    /// rest, from a Monday, still goes: the new part starts on an occurrence the rule makes.
+    #[test]
+    fn a_kind_change_on_all_refuses_a_series_starting_off_its_rule() {
+        let from_sunday = |rule: &str| {
+            master_with(
+                &[rule],
+                "2026-10-04T09:00:00+01:00",
+                "2026-10-04T10:00:00+01:00",
+            )
+        };
+        let all_day_on = |date: &str| EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: date.into(),
+                last_day: date.into(),
+            }),
+            ..Default::default()
+        };
+        let counted = from_sunday("RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10");
+        let refused = Err(NotPlanned::Refused(SeriesRefusal::KindStartNotOnRule(day(
+            2026, 10, 4,
+        ))));
+        let case = Case::new(counted.clone(), monday_19());
+        assert!(case.edit(Scope::All, all_day_on("2026-10-19")) == refused);
+        let in_new_york = timed_in("2026-10-19", "09:00", "10:00", "America/New_York");
+        assert!(case.edit(Scope::All, in_new_york) == refused);
+        assert_eq!(
+            SeriesRefusal::KindStartNotOnRule(day(2026, 10, 4)).to_string(),
+            "This repeating event starts on 04-10-2026, a day its own rule doesn't repeat on, so \
+             PM can't change every occurrence between all-day and timed, or into another time \
+             zone. Change this occurrence on its own."
+        );
+        let sunday = Case::new(counted, plain("2026-10-04T09:00:00+01:00"));
+        for scope in [Scope::All, Scope::Following] {
+            assert!(sunday.edit(scope, all_day_on("2026-10-04")) == refused);
+        }
+        let until = Case::new(
+            from_sunday("RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261130T235959Z"),
+            monday_19(),
+        );
+        assert!(until.edit(Scope::All, all_day_on("2026-10-19")) == refused);
+        let rest = until
+            .edit(Scope::Following, all_day_on("2026-10-19"))
+            .unwrap();
+        assert_eq!(
+            body(&rest.steps[0])["start"],
+            json!({ "date": "2026-10-19" })
+        );
+    }
+
+    /// An all-day weekly series to 30-11, its 02-11 deleted by a dated EXDATE and its 26-10 cancelled,
+    /// opened on 19-10.
+    fn all_day_to_november() -> Case {
+        let series = with(
+            with(
+                master(&[
+                    "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261130",
+                    "EXDATE;VALUE=DATE:20261102",
+                ]),
+                "start",
+                json!({ "date": "2026-10-05" }),
+            ),
+            "end",
+            json!({ "date": "2026-10-06" }),
+        );
+        let on = |date: &str, status: &str| {
+            json!({
+                "kind": "calendar#event",
+                "id": format!("abc_{}", date.replace('-', "")),
+                "etag": "\"d1\"",
+                "status": status,
+                "summary": "Standup",
+                "description": "Daily notes",
+                "recurringEventId": "abc",
+                "originalStartTime": { "date": date },
+                "start": { "date": date },
+                "end": { "date": "2026-10-20" },
+                "organizer": { "email": "me@example.com", "self": true },
+                "reminders": { "useDefault": true },
+            })
+        };
+        Case::new(series, on("2026-10-19", "confirmed"))
+            .exceptions(vec![on("2026-10-26", "cancelled")])
+    }
+
+    /// C11d review 1: from all-day to timed, every occurrence is rebuilt from the rule at the new
+    /// time: dated keys cleared, the end date's UNTIL that day's last second in UTC, and the deleted
+    /// days kept deleted as instants.
+    #[test]
+    fn a_kind_change_on_all_from_all_day_to_timed_rebuilds_from_the_series_rule() {
+        let draft = at("09:00", "2026-10-19");
+        let plan = all_day_to_november().edit(Scope::All, draft).unwrap();
+        let sent = body(&plan.steps[0]);
+        assert_eq!(
+            sent["start"],
+            json!({
+                "dateTime": "2026-10-05T09:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(
+            sent["end"],
+            json!({
+                "dateTime": "2026-10-05T10:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(
+            sent["recurrence"],
+            json!([
+                "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261130T235959Z",
+                "EXDATE:20261026T090000Z,20261102T090000Z"
+            ])
+        );
+        assert!(matches!(plan.rule_start, SeriesStart::Timed { .. }));
+    }
+
+    /// The same from this occurrence on: the new part timed from 19-10, its deleted days instants.
+    #[test]
+    fn a_kind_change_on_following_from_all_day_to_timed_rebuilds_the_new_part() {
+        let draft = at("09:00", "2026-10-19");
+        let plan = all_day_to_november().edit(Scope::Following, draft).unwrap();
+        let insert = body(&plan.steps[0]);
+        assert_eq!(
+            insert["start"],
+            json!({ "dateTime": "2026-10-19T09:00:00+01:00", "timeZone": "Europe/London" })
+        );
+        assert_eq!(
+            insert["recurrence"],
+            json!([
+                "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261130T235959Z",
+                "EXDATE:20261026T090000Z,20261102T090000Z"
+            ])
+        );
     }
 
     /// ADV-1: a new time is read against the occurrence as Google holds it; one moved in Google since
@@ -3207,7 +4272,7 @@ mod tests {
                 &case.input(),
                 &title("Retro"),
                 "abc",
-                Notify::None
+                None
             ),
             Err(NotPlanned::Refused(SeriesRefusal::Unreadable))
         );
@@ -3660,14 +4725,7 @@ mod tests {
     #[test]
     fn a_choice_token_ignores_etags_and_tail_ids() {
         let split = |case: &Case, tail: &str| {
-            plan_series_edit(
-                Scope::Following,
-                &case.input(),
-                &title("Retro"),
-                tail,
-                Notify::None,
-            )
-            .unwrap()
+            plan_series_edit(Scope::Following, &case.input(), &title("Retro"), tail, None).unwrap()
         };
         let case = Case::new(weekly(), monday_19());
         let token = split(&case, TAIL).choice_digest("s1");
@@ -3690,58 +4748,61 @@ mod tests {
         assert_ne!(split(&busier, TAIL).choice_digest("s1"), token);
     }
 
-    /// Until C12, nothing past the occurrence picked reaches one with guests of its own: not a split
-    /// or a cut from before it, nor anything for every occurrence. "This event" elsewhere, and a split
-    /// after it, still go ahead; with guests allowed (C12), all of them do.
+    /// C12: an occurrence with guests of its own no longer holds back what reaches it (C9a-2's
+    /// refusal until Send / Don't send). A write to the whole series counts it as "at least", since
+    /// PM can't tell whether Google emails that occurrence's guests too (probe L-R13-4); "this and
+    /// following" past it still can't carry its guests onto the new part (Q3).
     #[test]
-    fn an_occurrence_with_guests_of_its_own_holds_back_what_reaches_it() {
+    fn an_occurrence_with_guests_of_its_own_is_counted_by_a_whole_series_write() {
         let invited = with(
             plain("2026-10-26T09:00:00Z"),
             "attendees",
             json!([{ "email": "a@example.com", "responseStatus": "needsAction" }]),
         );
-        let held = Err(NotPlanned::Refused(SeriesRefusal::GuestsElsewhere(day(
+        let cant_carry = Err(NotPlanned::Refused(SeriesRefusal::CannotCarry(day(
             2026, 10, 26,
         ))));
+        let at_least = |plan: SeriesPlan| {
+            plan.needs_notify()
+                && plan
+                    .guests
+                    .is_some_and(|g| !g.complete && g.people == 0 && g.emails == 0)
+        };
         let case = Case::new(weekly(), monday_19()).exceptions(vec![invited.clone()]);
         assert!(case.edit(Scope::This, title("Retro")).is_ok());
         assert!(case.delete(Scope::This).is_ok());
-        assert_eq!(case.edit(Scope::Following, title("Retro")), held);
-        assert_eq!(case.edit(Scope::All, title("Retro")), held);
-        assert_eq!(case.delete(Scope::Following), held);
-        assert_eq!(case.delete(Scope::All), held);
+        assert_eq!(case.edit(Scope::Following, title("Retro")), cant_carry);
+        assert!(at_least(case.edit(Scope::All, title("Retro")).unwrap()));
+        assert!(at_least(case.delete(Scope::All).unwrap()));
+        // A cut cancels that occurrence on the way: its guest is told, by count.
+        let cut = case.delete(Scope::Following).unwrap();
+        assert!(cut
+            .guests
+            .is_some_and(|g| g.cancelled && g.updated == 1 && g.complete));
         let after =
             Case::new(weekly(), plain("2026-11-02T09:00:00Z")).exceptions(vec![invited.clone()]);
-        assert!(after.edit(Scope::Following, title("Retro")).is_ok());
+        let split = after.edit(Scope::Following, title("Retro")).unwrap();
+        assert!(split.guests.is_none(), "nobody past it to tell");
         assert!(after.delete(Scope::Following).is_ok());
-        assert_eq!(after.edit(Scope::All, title("Retro")), held);
+        assert!(at_least(after.edit(Scope::All, title("Retro")).unwrap()));
         // From the first occurrence, "this and following" is every occurrence.
-        let first = Case::new(weekly(), plain("2026-10-05T09:00:00+01:00"))
-            .exceptions(vec![invited.clone()]);
-        assert_eq!(first.delete(Scope::Following), held);
-        assert_eq!(first.edit(Scope::Following, title("Retro")), held);
-        let allowed = Case::new(weekly(), monday_19())
-            .exceptions(vec![invited])
-            .guests();
-        assert!(allowed.delete(Scope::All).is_ok());
+        let first =
+            Case::new(weekly(), plain("2026-10-05T09:00:00+01:00")).exceptions(vec![invited]);
+        assert!(at_least(first.delete(Scope::Following).unwrap()));
     }
 
-    /// Until C12, only a whole listing shows that nothing a plan reaches has guests of its own, so a
-    /// short one refuses even a change of text to every occurrence, and deleting them. With guests
-    /// allowed, the change of text goes ahead and says "some" may keep or lose their changes; the
-    /// warning carries that, so the token tells "some" from a count.
+    /// The over-correction named (C12 §7.2): C9a-2's guests rule refused a short listing for a change
+    /// of text to every occurrence and for deleting them, since only a whole listing showed no
+    /// occurrence had guests. With guests allowed those run, and say "some" may keep or lose their
+    /// changes; the warning carries that, so the token tells "some" from a count. On a series with
+    /// guests the count is "at least" too.
     #[test]
-    fn a_short_listing_refuses_what_reaches_past_this_occurrence_until_c12() {
+    fn a_short_listing_lets_text_go_to_all_events_and_says_some() {
         let mut short = Case::new(weekly(), monday_19());
         short.exceptions.complete = false;
-        let incomplete = Err(NotPlanned::Refused(SeriesRefusal::Incomplete));
         assert!(short.edit(Scope::This, title("Retro")).is_ok());
-        assert_eq!(short.edit(Scope::All, title("Retro")), incomplete);
-        assert_eq!(short.delete(Scope::All), incomplete);
-        assert_eq!(short.delete(Scope::Following), incomplete);
-        let mut allowed = Case::new(weekly(), monday_19()).guests();
-        allowed.exceptions.complete = false;
-        let some = allowed.edit(Scope::All, title("Retro")).unwrap();
+        assert!(short.delete(Scope::All).is_ok());
+        let some = short.edit(Scope::All, title("Retro")).unwrap();
         assert_eq!(
             some.warnings,
             [SeriesWarning::ExceptionsMayReset {
@@ -3750,21 +4811,24 @@ mod tests {
             }]
         );
         let seen = Case::new(weekly(), monday_19())
-            .guests()
             .edit(Scope::All, title("Retro"))
             .unwrap();
         assert!(seen.warnings.is_empty());
         assert_ne!(some.choice_digest("s1"), seen.choice_digest("s1"));
+        let mut guests = Case::new(with_guests(), monday_19());
+        guests.exceptions.complete = false;
+        let counted = guests.edit(Scope::All, title("Retro")).unwrap();
+        assert!(counted
+            .guests
+            .is_some_and(|g| !g.complete && g.updated == 2 && g.people == 2));
         // The same count, seen whole or not: two tokens.
         let retitled = with(
             plain("2026-10-26T09:00:00Z"),
             "summary",
             json!("Standup (room 4)"),
         );
-        let whole = Case::new(weekly(), monday_19())
-            .exceptions(vec![retitled])
-            .guests();
-        let mut part = Case::new(weekly(), monday_19()).guests();
+        let whole = Case::new(weekly(), monday_19()).exceptions(vec![retitled]);
+        let mut part = Case::new(weekly(), monday_19());
         part.exceptions = Exceptions {
             items: whole.exceptions.items.clone(),
             complete: false,
@@ -3789,11 +4853,11 @@ mod tests {
         assert_ne!(whole.choice_digest("s1"), part.choice_digest("s1"));
     }
 
-    /// With guests allowed (C12), the guests rule no longer refuses a short listing, and the guards
-    /// that need it whole still do: a cut, a split, and a move of every occurrence.
+    /// No guests rule refuses a short listing any more (C12), and the guards that need it whole
+    /// still do: a cut, a split, and a move of every occurrence.
     #[test]
-    fn a_short_listing_still_refuses_cuts_splits_and_moves_with_guests_allowed() {
-        let mut short = Case::new(weekly(), monday_19()).guests();
+    fn a_short_listing_still_refuses_cuts_splits_and_moves() {
+        let mut short = Case::new(weekly(), monday_19());
         short.exceptions.complete = false;
         let incomplete = Err(NotPlanned::Refused(SeriesRefusal::Incomplete));
         assert_eq!(short.delete(Scope::Following), incomplete);
@@ -3948,5 +5012,715 @@ mod tests {
                 .new_rule(&weekly_rule),
             None
         );
+    }
+
+    // --- creating an event (C10) ---
+
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
+
+    /// What the editor sends for a new event, as the create command builds it.
+    fn new_body() -> Map<String, Value> {
+        super::super::super::patch::insert_body(&crate::calendar_write::dto::NewEventDraft {
+            summary: "Dentist".into(),
+            time: TimeDraft::Timed {
+                start_date: "2026-10-26".into(),
+                start_time: "10:00".into(),
+                start_zone: "Europe/London".into(),
+                end_date: "2026-10-26".into(),
+                end_time: "11:00".into(),
+                end_zone: "Europe/London".into(),
+            },
+            location: String::new(),
+            description: String::new(),
+            show_as: Some(ShowAs::Busy),
+            visibility: None,
+            recurrence: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_create_plan_is_one_commit_step_under_pms_id_with_no_one_notified() {
+        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        let step = &plan.steps[0];
+        assert!(matches!(&step.op, Op::Insert { calendar, id, body }
+            if calendar == CALENDAR && id == NEW && *body == new_body()));
+        assert_eq!(step.notify, Notify::None);
+        assert_eq!(step.stage, Stage::Commit);
+        assert!(step.requires.is_none() && step.undo.is_none() && !step.gone_is_done);
+        assert_eq!(step.conflict, Recheck::Never);
+        assert_eq!(step.shows, Shows::Created);
+        assert!(step.op.fits());
+        let request = step.op.request(step.notify).unwrap();
+        assert_eq!(request.method, Method::Insert);
+        assert!(request
+            .url
+            .ends_with("/events?sendUpdates=none&conferenceDataVersion=1"));
+        assert_eq!(request.body.unwrap()["id"], NEW);
+        assert!(plan.expect.is_empty() && plan.warnings.is_empty());
+        assert_eq!(plan.removes, Removes::Nothing);
+    }
+
+    /// G5: a key a create may not send, a body with no start PM can read, or an id that isn't one
+    /// path segment builds no plan at all. The repeat rule is one a create sends since C11.
+    #[test]
+    fn a_create_plan_refuses_a_key_a_create_may_not_send() {
+        for key in [
+            "attendees",
+            "extendedProperties",
+            "reminders",
+            "conferenceData",
+            "colorId",
+            "id",
+        ] {
+            let mut body = new_body();
+            body.insert(key.into(), json!([]));
+            assert!(SeriesPlan::create(CALENDAR, NEW, body).is_none(), "{key}");
+        }
+        let mut no_start = new_body();
+        no_start.insert("start".into(), json!({ "dateTime": "soon" }));
+        assert!(SeriesPlan::create(CALENDAR, NEW, no_start).is_none());
+        for id in ["", "..", "a\nb"] {
+            assert!(
+                SeriesPlan::create(CALENDAR, id, new_body()).is_none(),
+                "{id:?}"
+            );
+        }
+    }
+
+    /// C11: a repeating event's body (its one rule line, its zone on both nodes) builds the same
+    /// one-step plan, the rule in what it sends.
+    #[test]
+    fn a_create_plan_sends_a_repeating_events_rule() {
+        let body =
+            super::super::super::patch::insert_body(&crate::calendar_write::dto::NewEventDraft {
+                recurrence: Some(crate::calendar_recur::wire::RepeatRule {
+                    pattern: crate::calendar_recur::wire::RepeatPattern::Daily,
+                    interval: 1,
+                    ends: crate::calendar_recur::wire::RepeatEnds::After { count: 5 },
+                }),
+                summary: "Dentist".into(),
+                time: TimeDraft::AllDay {
+                    first_day: "2026-10-26".into(),
+                    last_day: "2026-10-26".into(),
+                },
+                location: String::new(),
+                description: String::new(),
+                show_as: None,
+                visibility: None,
+            })
+            .unwrap();
+        let plan = SeriesPlan::create(CALENDAR, NEW, body).unwrap();
+        let step = &plan.steps[0];
+        assert!(step.op.fits());
+        assert_eq!(step.notify, Notify::None);
+        let request = step.op.request(step.notify).unwrap();
+        let sent = request.body.unwrap();
+        assert_eq!(sent["recurrence"], json!(["RRULE:FREQ=DAILY;COUNT=5"]));
+        assert_eq!(sent["id"], NEW);
+    }
+
+    /// A live copy under PM's id is this create's, renamed or not; a cancelled one is this create's,
+    /// deleted since; none proves nothing.
+    #[test]
+    fn created_reads_a_live_copy_as_landed_a_cancelled_one_as_not_and_none_as_unknown() {
+        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        let mut copy = Value::Object(new_body());
+        copy["id"] = json!(NEW);
+        copy["status"] = json!("confirmed");
+        assert_eq!(plan.verdict(0, Some(&copy)), Applied::Yes);
+        let renamed = with(copy.clone(), "summary", json!("Dentist (moved)"));
+        assert_eq!(plan.verdict(0, Some(&renamed)), Applied::Yes);
+        let cancelled = with(copy, "status", json!("cancelled"));
+        assert_eq!(plan.verdict(0, Some(&cancelled)), Applied::No);
+        assert_eq!(plan.verdict(0, None), Applied::Unknown);
+    }
+
+    // --- guests, and who a plan emails (C12a) ---
+
+    use crate::calendar_write::dto::{GuestNotice, GuestOp, GuestState};
+
+    const A: &str = "a@example.com";
+    const B: &str = "b@example.com";
+
+    /// A draft that sets these guests' states.
+    fn guests_to(ops: &[(&str, GuestState)]) -> EventPatchDraft {
+        EventPatchDraft {
+            guests: Some(
+                ops.iter()
+                    .map(|(email, to)| GuestOp {
+                        email: (*email).into(),
+                        to: *to,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The weekly series and its Monday 19-10 occurrence, both with `list` as guests besides the
+    /// user.
+    fn invited(list: &[&str]) -> Case {
+        Case::new(
+            guests_on_it(weekly(), list),
+            guests_on_it(monday_19(), list),
+        )
+    }
+
+    /// Who each step reaches, as the plan was stamped by.
+    fn reach_of_each(plan: &SeriesPlan, case: &Case) -> Vec<Option<GuestNotice>> {
+        let input = case.input();
+        let own = Own::of(
+            &[CALENDAR, CALENDAR],
+            &[case.master.json(), case.instance.json()],
+        );
+        plan.steps
+            .iter()
+            .map(|s| plan.reach_of(s, &input, &own).notice())
+            .collect()
+    }
+
+    fn told(updated: u32, invited: u32, removed: u32, emails: u32) -> GuestNotice {
+        GuestNotice {
+            updated,
+            invited,
+            removed,
+            told_cancelled: 0,
+            cancelled: false,
+            people: updated + invited + removed,
+            emails,
+            complete: true,
+        }
+    }
+
+    /// C12 §6.3 (critique C1-M3: a delete, since a split past an occurrence with its own guests is
+    /// refused): each step sends the answer only where it reaches someone; an occurrence whose guest
+    /// was taken off on its own is cancelled with `none`.
+    #[test]
+    fn every_step_sends_the_answer_only_where_it_reaches_someone() {
+        let alone = guests_on_it(
+            with(plain("2026-11-02T09:00:00Z"), "summary", json!("Solo")),
+            &[],
+        );
+        let shared = guests_on_it(
+            with(plain("2026-11-09T09:00:00Z"), "summary", json!("Shared")),
+            &[A],
+        );
+        let case = invited(&[A]).exceptions(vec![alone, shared]);
+        let plan = case
+            .delete_told(Scope::Following, Some(Notify::All))
+            .unwrap();
+        let kinds: Vec<(bool, Notify)> = plan
+            .steps
+            .iter()
+            .map(|s| (matches!(s.op, Op::Patch { .. }), s.notify))
+            .collect();
+        assert!(
+            kinds
+                == [
+                    (true, Notify::All),
+                    (false, Notify::None),
+                    (false, Notify::All)
+                ],
+            "the cut and the shared occurrence's cancel tell A; the solo one tells nobody"
+        );
+        assert!(
+            plan.guests
+                == Some(GuestNotice {
+                    cancelled: true,
+                    ..told(1, 0, 0, 2)
+                }),
+            "one guest, two emails, as a cancellation"
+        );
+        // Don't send: none everywhere, and it may run.
+        let quiet = case
+            .delete_told(Scope::Following, Some(Notify::None))
+            .unwrap();
+        assert!(quiet.steps.iter().all(|s| s.notify == Notify::None));
+        assert!(!quiet.needs_notify());
+        // No answer: placeholders, and it must not run.
+        let unanswered = case.delete(Scope::Following).unwrap();
+        assert!(unanswered.needs_notify());
+        assert!(unanswered.steps.iter().all(|s| s.notify == Notify::None));
+    }
+
+    /// C12 critiques C2-H2 and C1-M2, re-derived: a "this and following" change of a series with A
+    /// and B, one later occurrence moved on its own, adding c. Each step's reach is pinned: the new
+    /// part invites three, the cut tells two, the carry onto the new part's occurrence tells its
+    /// three, the old copy's cancel tells two. Ten emails, three people, and only c is new.
+    #[test]
+    fn this_and_following_counts_invitations_updates_and_occurrences() {
+        let moved_one = guests_on_it(
+            moved(
+                "2026-11-02T09:00:00Z",
+                "2026-11-03T09:00:00Z",
+                "2026-11-03T10:00:00Z",
+            ),
+            &[A, B],
+        );
+        let case = invited(&[A, B]).exceptions(vec![moved_one]);
+        let draft = guests_to(&[("c@example.com", GuestState::Required)]);
+        let plan = case
+            .edit_told(Scope::Following, draft, Some(Notify::All))
+            .unwrap();
+        let ops: Vec<&str> = plan
+            .steps
+            .iter()
+            .map(|s| match s.op {
+                Op::Insert { .. } => "insert",
+                Op::Patch { .. } => "cut",
+                Op::Carry { .. } => "carry",
+                Op::Cancel { .. } => "cancel",
+                Op::Delete { .. } => "delete",
+            })
+            .collect();
+        assert_eq!(ops, ["insert", "cut", "carry", "cancel"]);
+        assert!(
+            reach_of_each(&plan, &case)
+                == [
+                    Some(told(0, 3, 0, 3)),
+                    Some(told(2, 0, 0, 2)),
+                    Some(told(0, 3, 0, 3)),
+                    Some(GuestNotice {
+                        cancelled: true,
+                        ..told(2, 0, 0, 2)
+                    }),
+                ],
+            "each step's own reach"
+        );
+        assert!(
+            plan.guests
+                == Some(GuestNotice {
+                    updated: 2,
+                    invited: 1,
+                    removed: 0,
+                    told_cancelled: 0,
+                    cancelled: false,
+                    people: 3,
+                    emails: 10,
+                    complete: true,
+                }),
+            "two already invited, one new, ten emails"
+        );
+        assert!(plan.steps.iter().all(|s| s.notify == Notify::All));
+    }
+
+    /// C12 critique C2-M7: a guest taken off from this one on is told they're off, not of an update.
+    #[test]
+    fn a_guest_left_off_the_new_part_is_counted_as_taken_off() {
+        let case = invited(&[A, B]);
+        let draft = guests_to(&[(B, GuestState::Absent)]);
+        let plan = case
+            .edit_told(Scope::Following, draft, Some(Notify::All))
+            .unwrap();
+        assert!(
+            plan.guests == Some(told(1, 0, 1, 3)),
+            "A updated, B taken off: the new part invites A, the cut tells both"
+        );
+    }
+
+    /// C12 critiques C1-H1, C2-H1: the user is never a guest. A split of a series only the user is
+    /// on emails nobody, and Google's copy of the new part, which marks the user `self`, still
+    /// reads as what was inserted, so Remove isn't refused after a partial change.
+    #[test]
+    fn the_user_is_never_a_guest_of_the_new_part() {
+        let case = Case::new(guests_on_it(weekly(), &[]), guests_on_it(monday_19(), &[]));
+        let plan = case.edit(Scope::Following, title("Retro")).unwrap();
+        assert!(plan.guests.is_none() && !plan.needs_notify());
+        let sent = body(&plan.steps[0]).clone();
+        assert_eq!(sent["attendees"], json!([{ "email": CALENDAR }]));
+        let mut reply = Value::Object(sent);
+        reply["id"] = json!(TAIL);
+        reply["etag"] = json!("\"t1\"");
+        reply["attendees"] = json!([
+            { "email": CALENDAR, "self": true, "organizer": true, "responseStatus": "accepted" }
+        ]);
+        assert!(plan.tail_as_inserted(0, &reply));
+        // A guest added to it in Google since is a change.
+        reply["attendees"] = json!([
+            { "email": CALENDAR, "self": true, "organizer": true },
+            { "email": A }
+        ]);
+        assert!(!plan.tail_as_inserted(0, &reply));
+    }
+
+    /// C12 §6.4: the token binds who the plan emails, never their replies, and never the answer.
+    #[test]
+    fn the_token_changes_when_the_guests_do() {
+        let digest = |case: &Case, notify: Option<Notify>| {
+            case.edit_told(Scope::All, title("Retro"), notify)
+                .unwrap()
+                .choice_digest("s1")
+        };
+        let one = invited(&[A]);
+        let two = invited(&[A, B]);
+        assert!(digest(&one, None) != digest(&two, None));
+        let mut replied = guests_on_it(weekly(), &[A]);
+        replied["attendees"][1]["responseStatus"] = json!("declined");
+        let mut one_replied = invited(&[A]);
+        one_replied.master = fresh(replied.clone());
+        one_replied.opened_master = fresh(replied);
+        assert!(digest(&one, None) == digest(&one_replied, None));
+        assert!(digest(&one, None) == digest(&one, Some(Notify::All)));
+    }
+
+    /// C12 §6.2: a write to every occurrence is "at least" where an occurrence has a guest list of
+    /// its own, or where PM couldn't see every occurrence changed on its own; a short listing asks
+    /// even with nobody seen (C12 critique C1, "short listings ask").
+    #[test]
+    fn a_whole_series_write_is_at_least_when_an_occurrence_has_guests_of_its_own() {
+        let own_list = guests_on_it(
+            with(plain("2026-10-26T09:00:00Z"), "summary", json!("Review")),
+            &[A, B],
+        );
+        let case = invited(&[A]).exceptions(vec![own_list]);
+        let plan = case
+            .edit_told(Scope::All, title("Retro"), Some(Notify::All))
+            .unwrap();
+        assert!(
+            plan.guests
+                == Some(GuestNotice {
+                    complete: false,
+                    ..told(1, 0, 0, 1)
+                }),
+            "at least"
+        );
+        // Same guest lists everywhere: exact.
+        let same = guests_on_it(
+            with(plain("2026-10-26T09:00:00Z"), "summary", json!("Review")),
+            &[A],
+        );
+        let plan = invited(&[A])
+            .exceptions(vec![same])
+            .edit(Scope::All, title("Retro"))
+            .unwrap();
+        assert!(plan.guests == Some(told(1, 0, 0, 1)), "exact");
+        // A short listing, on a series with nobody else on it.
+        let mut short = Case::new(weekly(), monday_19());
+        short.exceptions.complete = false;
+        let plan = short.edit(Scope::All, title("Retro")).unwrap();
+        assert!(
+            plan.guests
+                == Some(GuestNotice {
+                    complete: false,
+                    ..GuestNotice::default()
+                }),
+            "asks, with nobody seen"
+        );
+        assert!(plan.needs_notify());
+        // A personal change never asks, however short the listing.
+        let busy = EventPatchDraft {
+            show_as: Some(crate::calendar_write::dto::ShowAs::Free),
+            ..Default::default()
+        };
+        assert!(short.edit(Scope::All, busy).unwrap().guests.is_none());
+    }
+
+    /// C12 §6.8: a guest change goes to the copy the scope names, as Google's own list with it.
+    #[test]
+    fn a_guest_change_to_this_event_patches_the_occurrence() {
+        let case = invited(&[A]);
+        let plan = case
+            .edit(Scope::This, guests_to(&[(B, GuestState::Optional)]))
+            .unwrap();
+        let Op::Patch { event, body, .. } = &plan.steps[0].op else {
+            panic!("not a patch");
+        };
+        assert_eq!(event, "abc_20261019T080000Z");
+        let mut want = guests_on_it(monday_19(), &[A])["attendees"].clone();
+        want.as_array_mut()
+            .unwrap()
+            .push(json!({ "email": B, "optional": true }));
+        assert_eq!(body["attendees"], want);
+        assert!(plan.guests == Some(told(1, 1, 0, 2)));
+    }
+
+    #[test]
+    fn a_guest_change_to_all_events_patches_the_series() {
+        let case = invited(&[A, B]);
+        let plan = case
+            .edit(Scope::All, guests_to(&[(A, GuestState::Absent)]))
+            .unwrap();
+        let Op::Patch { event, body, .. } = &plan.steps[0].op else {
+            panic!("not a patch");
+        };
+        assert_eq!(event, "abc");
+        assert_eq!(body["attendees"], guests_on_it(weekly(), &[B])["attendees"]);
+        assert!(plan.guests == Some(told(1, 0, 1, 2)));
+    }
+
+    /// The new part takes the series' list with the change, each guest invited anew: no reply.
+    #[test]
+    fn a_guest_change_from_this_one_on_goes_to_the_new_part() {
+        let case = invited(&[A]);
+        let plan = case
+            .edit(Scope::Following, guests_to(&[(B, GuestState::Required)]))
+            .unwrap();
+        assert_eq!(
+            body(&plan.steps[0])["attendees"],
+            json!([{ "email": CALENDAR }, { "email": A }, { "email": B }])
+        );
+        // The cut sends no guest list: the earlier part keeps its own.
+        assert!(!body(&plan.steps[1]).contains_key("attendees"));
+    }
+
+    /// C12 §6.8: a guests-only change from this one on is a change like a title's, so it splits;
+    /// one Google already holds is no change.
+    #[test]
+    fn a_guests_only_change_from_this_one_on_is_a_split() {
+        let case = Case::new(weekly(), monday_19());
+        let plan = case
+            .edit(Scope::Following, guests_to(&[(A, GuestState::Required)]))
+            .unwrap();
+        assert!(matches!(plan.steps[0].op, Op::Insert { .. }));
+        assert!(plan.guests == Some(told(0, 1, 0, 1)));
+        let already = invited(&[A]);
+        assert!(
+            matches!(
+                already.edit(Scope::Following, guests_to(&[(A, GuestState::Required)])),
+                Err(NotPlanned::NoChange)
+            ),
+            "Google already has it"
+        );
+    }
+
+    /// Whether `planned` was refused for `why` (never printed: a plan is Google's data).
+    fn refused_for(planned: Result<SeriesPlan, NotPlanned>, why: SeriesRefusal) -> bool {
+        matches!(planned, Err(NotPlanned::Refused(r)) if r == why)
+    }
+
+    /// C12 §6.7: flags Google leaves out at their defaults compare as Google means them, so a new
+    /// part sent with an explicit default still reads as what was inserted.
+    #[test]
+    fn default_permissions_compare_as_google_means_them() {
+        let probe = probe(&SeriesStart::AllDay(day(2026, 10, 19)));
+        let (on, off) = (json!(true), json!(false));
+        for (key, value, same) in [
+            ("guestsCanInviteOthers", &on, true),
+            ("guestsCanInviteOthers", &off, false),
+            ("guestsCanSeeOtherGuests", &on, true),
+            ("guestsCanModify", &off, true),
+            ("guestsCanModify", &on, false),
+            ("anyoneCanAddSelf", &off, true),
+            ("privateCopy", &off, true),
+            ("privateCopy", &on, false),
+        ] {
+            assert_eq!(probe.same(key, Some(value), None), same, "{key}");
+        }
+        let explicit = with(weekly(), "guestsCanInviteOthers", json!(true));
+        let case = Case::new(explicit, monday_19());
+        let plan = case.edit(Scope::Following, title("Retro")).unwrap();
+        let mut reply = Value::Object(body(&plan.steps[0]).clone());
+        if let Some(obj) = reply.as_object_mut() {
+            obj.retain(|k, _| k != "guestsCanInviteOthers");
+        }
+        assert!(plan.tail_as_inserted(0, &reply));
+    }
+
+    /// C12 §6.5 and critiques C1-M6, C1-M5, C2-H3: a step planned to email nobody, with nobody's
+    /// Don't send behind it, meets anyone Google would email as a conflict; the user and a room are
+    /// no one to email. Under a Send, anyone Google's copy now adds to or takes off whom it emails is
+    /// a conflict too, so the save asks again with the new numbers; a reply changes nobody.
+    #[test]
+    fn a_resend_asks_again_where_nobody_answered_for_who_hears() {
+        let fresh_with = |list: Value| with(weekly(), "attendees", list);
+        let guest = fresh_with(json!([{ "email": B }]));
+        let room = fresh_with(
+            json!([{ "email": "room1@resource.calendar.google.com", "resource": true }]),
+        );
+        let only_me = fresh_with(json!([{ "email": CALENDAR, "self": true }]));
+        let alone = Case::new(weekly(), monday_19());
+        let conflict = Resend::Conflict(vec!["attendees".into()]);
+        for notify in [None, Some(Notify::All)] {
+            let plan = alone.edit_told(Scope::All, title("Retro"), notify).unwrap();
+            assert_eq!(plan.resend(0, &guest), conflict, "{notify:?}");
+            assert_eq!(plan.resend(0, &room), Resend::Proceed);
+            assert_eq!(plan.resend(0, &only_me), Resend::Proceed);
+        }
+        let quiet = alone
+            .edit_told(Scope::All, title("Retro"), Some(Notify::None))
+            .unwrap();
+        assert_eq!(quiet.resend(0, &guest), Resend::Proceed);
+        // A plan that tells A. Under Don't send, a guest who appeared is told nothing, as the rest.
+        let with_a = invited(&[A]);
+        let b_too = guests_on_it(weekly(), &[A, B]);
+        let quiet = with_a
+            .edit_told(Scope::All, title("Retro"), Some(Notify::None))
+            .unwrap();
+        assert_eq!(quiet.resend(0, &b_too), Resend::Proceed);
+        // Under Send, the answer was for A alone.
+        let sent = with_a
+            .edit_told(Scope::All, title("Retro"), Some(Notify::All))
+            .unwrap();
+        assert_eq!(sent.resend(0, &b_too), conflict, "a guest who appeared");
+        assert_eq!(
+            sent.resend(0, &guests_on_it(weekly(), &[])),
+            conflict,
+            "a guest taken off"
+        );
+        let mut cut_short = guests_on_it(weekly(), &[A]);
+        cut_short["attendeesOmitted"] = json!(true);
+        assert_eq!(sent.resend(0, &cut_short), conflict, "a list cut short");
+        let mut replied = guests_on_it(weekly(), &[A]);
+        replied["attendees"][1]["responseStatus"] = json!("declined");
+        assert_eq!(sent.resend(0, &replied), Resend::Proceed, "a reply");
+        // Unanswered, it would never run; asked anyway, it's a conflict.
+        let unanswered = with_a.edit(Scope::All, title("Retro")).unwrap();
+        assert_eq!(unanswered.resend(0, &b_too), conflict);
+    }
+
+    /// C12 critiques C1-M5, C2-H3: a delete answered with Send stops at a 412 where Google's copy
+    /// now tells anyone else, the whole series' and one occurrence's alike.
+    #[test]
+    fn a_delete_sent_again_tells_only_whom_the_user_answered_for() {
+        let case = invited(&[A]);
+        let conflict = Resend::Conflict(vec!["attendees".into()]);
+        let whole = case.delete_told(Scope::All, Some(Notify::All)).unwrap();
+        assert_eq!(whole.resend(0, &guests_on_it(weekly(), &[A, B])), conflict);
+        assert_eq!(whole.resend(0, case.master.json()), Resend::Proceed);
+        let one = case.delete_told(Scope::This, Some(Notify::All)).unwrap();
+        assert_eq!(one.resend(0, &guests_on_it(monday_19(), &[A, B])), conflict);
+        assert_eq!(one.resend(0, case.instance.json()), Resend::Proceed);
+    }
+
+    /// C12 decision 3: a guest list sent again after a 412 is Google's list then with the draft's
+    /// guest changes, never the copy the plan read, so a reply, a comment or extra guests that landed
+    /// meanwhile stay; and Google's list then has to be one they apply to, under Don't send too.
+    #[test]
+    fn a_guest_list_sent_again_is_built_on_googles_list_then() {
+        let waiting = |event: Value| {
+            let mut v = guests_on_it(event, &[A]);
+            v["attendees"][1]["responseStatus"] = json!("needsAction");
+            v
+        };
+        let case = Case::new(waiting(weekly()), waiting(monday_19()));
+        let add_b = guests_to(&[(B, GuestState::Required)]);
+        let conflict = Resend::Conflict(vec!["attendees".into()]);
+        for (scope, now) in [(Scope::All, weekly()), (Scope::This, monday_19())] {
+            let plan = case
+                .edit_told(scope, add_b.clone(), Some(Notify::All))
+                .unwrap();
+            // A accepts in Google, with a comment and one more guest, before the write lands.
+            let mut replied = guests_on_it(now.clone(), &[A]);
+            replied["attendees"][1]["comment"] = json!("On my way");
+            replied["attendees"][1]["additionalGuests"] = json!(1);
+            assert_eq!(plan.resend(0, &replied), Resend::Proceed, "{scope:?}");
+            let Some(Op::Patch { body, .. }) = plan.again_on(0, &replied) else {
+                panic!("{scope:?}: no guest list sent again");
+            };
+            let mut want = replied["attendees"].clone();
+            want.as_array_mut().unwrap().push(json!({ "email": B }));
+            assert!(
+                body["attendees"] == want,
+                "{scope:?}: A's reply kept, B still added"
+            );
+            // Cut short since: the list can't be built on it.
+            let quiet = case
+                .edit_told(scope, add_b.clone(), Some(Notify::None))
+                .unwrap();
+            let mut cut_short = waiting(now);
+            cut_short["attendeesOmitted"] = json!(true);
+            assert_eq!(quiet.resend(0, &cut_short), conflict, "{scope:?}");
+        }
+        // A write with no guest list goes again as it was.
+        let retitled = case
+            .edit_told(Scope::All, title("Retro"), Some(Notify::All))
+            .unwrap();
+        assert!(retitled.again_on(0, case.master.json()).is_none());
+    }
+
+    /// C12 critiques C1-H1, C2-H1: the account's own address is the user where the list doesn't mark
+    /// it, as on a calendar whose id isn't the account's: a change to the series emails nobody, nor
+    /// does a new part, and the 412 rule doesn't count the user either.
+    #[test]
+    fn the_users_unmarked_address_is_never_a_guest() {
+        const ME: &str = "bobby@example.org";
+        let unmarked = |event: Value| {
+            with(
+                event,
+                "attendees",
+                json!([{ "email": ME, "responseStatus": "accepted" }]),
+            )
+        };
+        let case = Case::new(unmarked(weekly()), unmarked(monday_19()));
+        let input = SeriesInput {
+            me: ME,
+            ..case.input()
+        };
+        let all = plan_series_edit(Scope::All, &input, &title("Retro"), TAIL, None).unwrap();
+        assert!(
+            all.guests.is_none() && !all.needs_notify(),
+            "a title change emails nobody"
+        );
+        assert_eq!(
+            all.resend(0, case.master.json()),
+            Resend::Proceed,
+            "nor does the 412 rule count the user"
+        );
+        let split =
+            plan_series_edit(Scope::Following, &input, &title("Retro"), TAIL, None).unwrap();
+        assert!(matches!(split.steps[0].op, Op::Insert { .. }));
+        assert!(split.guests.is_none(), "the new part invites nobody");
+    }
+
+    /// C12 §6.1 and critiques C2-M5, C1-M7, C1: guest changes are checked on the copy they go to;
+    /// an occurrence with a list of its own can't send its changes to the others; what guests may do
+    /// is the whole series'; a new part never copies a list Google cut short.
+    #[test]
+    fn guest_changes_are_refused_where_they_cant_go() {
+        let case = invited(&[A]);
+        for scope in [Scope::This, Scope::Following, Scope::All] {
+            assert!(
+                refused_for(
+                    case.edit(scope, guests_to(&[(CALENDAR, GuestState::Absent)])),
+                    SeriesRefusal::Guest(GuestError::CantRemove)
+                ),
+                "{scope:?}: the user stays"
+            );
+            assert!(
+                refused_for(
+                    case.edit(
+                        scope,
+                        guests_to(&[("not an address", GuestState::Required)])
+                    ),
+                    SeriesRefusal::Guest(GuestError::NotAnAddress)
+                ),
+                "{scope:?}: an address"
+            );
+        }
+        // This occurrence had A taken off on its own.
+        let mut own_list = invited(&[A]);
+        own_list.instance = fresh(guests_on_it(monday_19(), &[]));
+        own_list.opened_instance = own_list.instance.clone();
+        let add_b = guests_to(&[(B, GuestState::Required)]);
+        for scope in [Scope::Following, Scope::All] {
+            assert!(
+                refused_for(
+                    own_list.edit(scope, add_b.clone()),
+                    SeriesRefusal::GuestsDifferHere
+                ),
+                "{scope:?}: a list the others don't have"
+            );
+        }
+        assert!(own_list.edit(Scope::This, add_b.clone()).is_ok());
+        // What guests may do, never for one occurrence.
+        let modify = EventPatchDraft {
+            guests_can_modify: Some(true),
+            ..Default::default()
+        };
+        assert!(refused_for(
+            case.edit(Scope::This, modify.clone()),
+            SeriesRefusal::GuestPermissionsAreSeriesWide
+        ));
+        assert!(case.edit(Scope::All, modify).is_ok());
+        // A series whose list Google cut short: no new part copies part of it.
+        let mut cut_short = guests_on_it(weekly(), &[A]);
+        cut_short["attendeesOmitted"] = json!(true);
+        let short = Case::new(cut_short, guests_on_it(monday_19(), &[A]));
+        assert!(refused_for(
+            short.edit(Scope::Following, title("Retro")),
+            SeriesRefusal::Guest(GuestError::Omitted)
+        ));
     }
 }

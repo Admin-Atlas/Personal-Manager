@@ -67,6 +67,9 @@ pub struct CalendarOverview {
     /// Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`).
     /// Computed here only, from the stored choice and the account's calendar token.
     pub editing: BTreeMap<String, EditingStatus>,
+    /// Google's default length for a new event, in minutes, keyed by account id (`gcal:<email>`)
+    /// like `editing`. An account with none stored is missing: the editor then uses an hour.
+    pub default_length: BTreeMap<String, u32>,
 }
 
 /// The unified calendar state across every provider. Runs the one-time legacy Google migration first
@@ -75,7 +78,7 @@ pub struct CalendarOverview {
 pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     let _ = migrate_legacy_google_calendar(&app).await;
     let state = app.state::<AppState>();
-    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices) = {
+    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices, lengths) = {
         let conn = state.conn()?;
         (
             calendar::list_sources(&conn, None)?,
@@ -83,8 +86,17 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
             calendar::last_sync(&conn)?,
             calendar::time_window(&conn)?,
             calendar_editing::choices(&conn)?,
+            calendar::default_lengths(&conn)?,
         )
     };
+    let default_length = accounts
+        .iter()
+        .filter(|a| a.provider == "google")
+        .filter_map(|a| {
+            let email = a.email.as_deref()?.trim().to_lowercase();
+            Some((a.id.clone(), *lengths.get(&email)?))
+        })
+        .collect();
     // Token scopes come from the keychain, read with the DB lock released. Only an account with a
     // stored choice needs one: without it, editing is off whatever the token holds.
     let editing = accounts
@@ -112,6 +124,7 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         mirror_start,
         mirror_end,
         editing,
+        default_length,
     })
 }
 
@@ -206,8 +219,14 @@ async fn do_connect_google_calendar(
         secrets::set_google_client_for_account(&email, id, secret)?;
     }
     google::save_consented_token(&google_calendar_token_key(&email), &token).await?;
+    // Google's default length for a new event, read now so a new account has it before its first
+    // full sync (C10b); one that can't be read leaves any stored one, and the editor uses an hour.
+    let default_length = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
+    // A nicety, so a store that can't take it never fails the connect. The same guarded store as a
+    // sync's (the source was registered just above, under this lock).
+    let _ = calendar::remember_default_length_if_connected(&conn, &account, &email, default_length);
     // A read-only connect asked Google for reading only, so it turns editing off even when the
     // account had it: only the "Turn on editing" consent sets the choice.
     calendar_editing::set_choice(&conn, &email, None)?;
@@ -279,6 +298,7 @@ pub async fn disconnect_google_calendar_account(
     }
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
     calendar_editing::set_choice(&conn, &email, None)?;
+    calendar::set_default_length(&conn, &email, None)?;
     // A grant Google keeps still carries the write scope if editing was ever granted; a revoke ends it.
     let calendar_write = !plan.revoke && calendar_editing::write_granted(&conn, &email)?;
     if plan.revoke {
@@ -650,6 +670,7 @@ pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     calendar_editing::clear_all(&conn)?;
+    calendar::clear_default_lengths(&conn)?;
     drive::forget_all_accounts(&conn)?;
     // A backup-only account has no Drive row, so the loop above never saw its sign-in. Clear it before
     // the destination below forgets which account it was.
@@ -790,7 +811,8 @@ fn write_fetched_events(
 /// truncated page-run or an unreachable account can never delete a real calendar (its selected/quiet
 /// choices and mirrored events). Best-effort per account: a failed list fetch is skipped here, and the
 /// account's state is still settled by the event-sync pass. Never holds the DB lock across a fetch
-/// (rule #4). ICS feeds carry no separate list to reconcile (one feed is one calendar).
+/// (rule #4). ICS feeds carry no separate list to reconcile (one feed is one calendar). A Google
+/// account whose list came back also has its default event length read again, for new events.
 async fn reconcile_calendar_lists(app: &AppHandle) {
     let accounts: Vec<calendar::CalendarAccount> = {
         let state = app.state::<AppState>();
@@ -819,19 +841,32 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
         let Ok((items, complete)) = fetched else {
             continue;
         };
-        let state = app.state::<AppState>();
-        let Ok(conn) = state.conn() else {
-            continue;
-        };
-        let _ = calendar::register_calendars(
-            &conn,
-            &acc.id,
-            &acc.provider,
-            &items,
-            complete,
-            // A newly-discovered calendar is shown by default (selected); the user can untick it.
-            |_| true,
-        );
+        {
+            let state = app.state::<AppState>();
+            let Ok(conn) = state.conn() else {
+                continue;
+            };
+            let _ = calendar::register_calendars(
+                &conn,
+                &acc.id,
+                &acc.provider,
+                &items,
+                complete,
+                // A newly-discovered calendar is shown by default (selected); the user can untick it.
+                |_| true,
+            );
+        }
+        if acc.provider == "google" {
+            // Google's default length for a new event (A28, C10b): one more GET per account beside
+            // the list's, read with no lock held. A failed read keeps the last good value.
+            let read = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
+            let state = app.state::<AppState>();
+            let Ok(conn) = state.conn() else {
+                continue;
+            };
+            // Disconnected during the read: its length went with it, and stays gone.
+            let _ = calendar::remember_default_length_if_connected(&conn, &acc.id, &email, read);
+        }
     }
 }
 

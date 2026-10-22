@@ -26,7 +26,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "nav-calendar": {
     title: "Calendar",
-    body: "One place to see everything from the calendars you've connected — Google, Outlook and iCal subscriptions — laid over each other. Switch between Agenda, Month, Week and Year, jump to today, and choose which calendars show. Click an event for its details; on a Google account with editing turned on, you can change or delete one-off events you organise without guests from there. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
+    body: "One place to see everything from the calendars you've connected — Google, Outlook and iCal subscriptions — laid over each other. Switch between Agenda, Month, Week and Year, jump to today, and choose which calendars show. Click an event for its details. On a Google account with editing turned on, you can create events with + New event (or press c), and change or delete events you organise from an event's details, repeating ones and ones with guests included: PM asks which occurrences you mean, and whether Google should email the guests, as Google Calendar does. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
   },
   "nav-documents": {
     title: "Documents",
@@ -262,11 +262,11 @@ export const HELP: Record<string, HelpEntry> = {
   // Calendar (unified view, card 8; editing #884)
   "calendar-view": {
     title: "Your calendar",
-    body: "A single view of every calendar you've connected, merged together and colour-coded by source (an event you gave its own colour in Google shows in it, with its calendar's colour down the edge), so you can see your whole schedule in one place; PM uses the same events for your agenda, chat answers and 'Due soon' flags. While PM is open, changes made in Google show within about half a minute. Click an event for its details. On a Google account with editing turned on (Settings → Connectors), Edit and Delete appear there for one-off events you organise without guests. Changes go straight to Google: a save never overwrites a field someone changed there in the meantime, and a delete waits a few seconds for Undo (or Ctrl+Z, ⌘Z on a Mac) and doesn't happen if the title, time or place changed there. Anything else says why it can't be changed. Connect or choose calendars in Settings → Connectors.",
+    body: "A single view of every calendar you've connected, merged together and colour-coded by source (an event you gave its own colour in Google shows in it, with its calendar's colour down the edge), so you can see your whole schedule in one place; PM uses the same events for your agenda, chat answers and 'Due soon' flags. While PM is open, changes made in Google show within about half a minute. Click an event for its details. On a Google account with editing turned on (Settings → Connectors), Edit and Delete appear there for events you organise. You can add guests, mark them optional, take them off, and set what they may do, with suggestions from people already in your calendars; when a change would email guests, PM asks whether Google should send the emails, and says how many, with nothing picked for you (a change to only Busy or Free emails nobody, so it never asks). Rooms are kept as they are. On those accounts, + New event (or press c for the full editor, Shift+C for a quick one) creates an event on a calendar you choose; it goes straight to Google, with the calendar's usual notifications and nobody invited, and PM starts it on the calendar you last created one in. In the quick one, type a title and press Enter; in the day, week, month and agenda views the new event shows as you type (the Year view and the Terminal look show only what's in your calendar), and More options opens the full editor. Clicking elsewhere on the calendar closes the quick one only while it has no title, and a titled one is still there if you switch tabs and come back. When you create an event, Repeat sets how it repeats: Google's choices, or Custom… for your own; if the days you pick don't include the start date, PM starts it on the first day that fits and says so. Change how an existing event repeats the same way: a new repeat for a repeating event applies from that occurrence on or to all of them, never to one alone. Every occurrence can also move between all-day and timed, or into another time zone. For a repeating event PM asks whether you mean this event, this and the following events, or all of them, as Google Calendar does, and says first what that would change. A repeating event's details say how it repeats, as Google Calendar does. After you change “this and the following events”, PM asks whether to move a milestone already linked to it, dated from that day on, to the new part. Changes go straight to Google: a save never overwrites a field someone changed there in the meantime, and a delete waits a few seconds for Undo (or Ctrl+Z, ⌘Z on a Mac) and doesn't happen if the title, time or place changed there. Anything else says why it can't be changed. Connect or choose calendars in Settings → Connectors.",
   },
   "calendar-header": {
     title: "Move around & choose a view",
-    body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Agenda, Month, Week and Year, and the label shows the range you're looking at. Everything here only changes what you see — it never changes your actual calendars.",
+    body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Agenda, Month, Week and Year, and the label shows the range you're looking at. + New event creates an event in Google (on an account with editing turned on); everything else here only changes what you see.",
   },
   "calendar-filter": {
     title: "Which calendars show",
@@ -394,7 +394,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-calendar-editing": {
     title: "Calendar editing",
-    body: "Lets PM change and delete events on this Google account's calendars (one-off events you organise without guests, for now), including calendars shared with you that you can edit. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
+    body: "Lets PM create events on this Google account's calendars, one-off or repeating, and change and delete events you organise (repeating ones and ones with guests included), including on calendars shared with you that you can edit. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
   },
   "settings-calendar-microsoft": {
     title: "Outlook Calendar",
@@ -586,7 +586,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-milestones": {
     title: "Milestones",
-    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a name and a date. Tick the checkbox on the left to mark one done: it gets a 'Done' tag and a line through it. The nearest one you haven't ticked off drives the 'Due soon' status; tick it and the next takes over. Reorder with the arrows, remove with ×. Link a milestone to a calendar event (📅) and its date stays in sync with your calendar automatically.",
+    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a name and a date. Tick the checkbox on the left to mark one done: it gets a 'Done' tag and a line through it. The nearest one you haven't ticked off drives the 'Due soon' status; tick it and the next takes over. Reorder with the arrows, remove with ×. A milestone linked to a calendar event (📅) takes its date from that event; Unlink makes the date yours to edit.",
   },
   "project-resize": {
     title: "Resize the panel",
@@ -598,7 +598,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-milestones-panel": {
     title: "This project's milestones",
-    body: "The project's deadlines, editable in place — add one, date it, tick it off, reorder, or link it to a calendar event. The nearest one you haven't ticked drives the project's 'Due soon' status. Drag the divider below to give this panel more or less room against the files list.",
+    body: "The project's deadlines, editable in place — add one, date it, tick it off, reorder, or unlink one that takes its date from a calendar event. The nearest one you haven't ticked drives the project's 'Due soon' status. Drag the divider below to give this panel more or less room against the files list.",
   },
   "project-split": {
     title: "Resize milestones vs files",

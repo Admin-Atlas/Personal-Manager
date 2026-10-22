@@ -162,6 +162,30 @@ describe("the rows", () => {
       "Changed in Google since you opened it.",
     );
   });
+
+  // C12: the dialog asks Send or Don't send for a row exactly when it carries who would be emailed.
+  it("carries who an offered row would email, and nobody for the rest", () => {
+    const guests = {
+      updated: 2,
+      invited: 0,
+      removed: 0,
+      told_cancelled: 0,
+      cancelled: false,
+      people: 2,
+      emails: 2,
+      complete: true,
+    };
+    const rows = rowsOf(
+      ready(
+        { row: "offered", warnings: [], token: "t", guests },
+        { row: "as_all", warnings: [], token: "f", guests },
+        { row: "refused", message: VISIBILITY },
+      ),
+      "save",
+    );
+    expect(rows.map((r) => r.guests)).toEqual([guests, guests, null]);
+    expect(rowsOf(ready(offered("t")), "save").map((r) => r.guests)).toEqual([null, null, null]);
+  });
 });
 
 describe("an earlier change PM couldn't finish", () => {
@@ -171,7 +195,25 @@ describe("an earlier change PM couldn't finish", () => {
       token: "p",
       offers: ["remove", "check"],
       from: "2026-11-02",
+      emails: [],
     });
+    // C12: which settles would email guests comes with it.
+    const sent: ScopeRow = { ...pending, emails: ["remove"] } as ScopeRow;
+    expect(pendingOf(ready(offered("t"), sent, sent))?.emails).toEqual(["remove"]);
+  });
+
+  // C12 critiques C1-M4, C2-M2: a change that went with Send says, before a button is pressed,
+  // which settles email guests; only the offers that would, and none after Don't send.
+  it("says which settles would email guests", () => {
+    expect(pendingText(["finish", "remove"], "2026-11-02", ["finish", "remove"])).toBe(
+      "PM couldn't finish an earlier change to this repeating event: it may show twice from 02-11. Finish it or remove the new part first. If you remove the new part, guests will get a cancellation email. If you finish it, guests will get the rest of the update emails.",
+    );
+    expect(pendingText(["remove", "check"], "2026-11-02", ["remove"])).toMatch(
+      /Remove the new part, or check again\. If you remove the new part, guests will get a cancellation email\.$/,
+    );
+    // Only what's offered: a Finish no longer offered says nothing of its emails.
+    expect(pendingText(["remove", "check"], "2026-11-02", ["finish"])).not.toMatch(/guests/);
+    expect(pendingText(["finish", "remove"], "2026-11-02", [])).not.toMatch(/guests/);
   });
 
   it("is worded by what Google allows now, never hinting at deleting without Remove", () => {
@@ -222,7 +264,9 @@ describe("a row Google changed since the editor opened", () => {
 describe("the warnings", () => {
   const every: SeriesWarning[] = [
     dayMove("every Sunday", "every Monday", 1),
+    { warning: "becomes_one_event", day: "2026-10-05" },
     { warning: "start_moved", from: "2026-10-05", to: "2026-10-06" },
+    { warning: "changes_lost", count: 2 },
     { warning: "length_changes" },
     { warning: "exceptions_may_reset", count: 1, complete: true },
     { warning: "not_carried", attachments: true, conference: true, label: true },
@@ -240,7 +284,7 @@ describe("the warnings", () => {
         }
       }
     }
-    expect(seriesWarningText(every[1], "save", "all", "Gym")).toBe(
+    expect(seriesWarningText(every[2], "save", "all", "Gym")).toBe(
       "The first occurrence of “Gym” moves from 05-10 to 06-10.",
     );
     expect(seriesWarningText({ warning: "length_changes" }, "save", "following", "Gym")).toBe(
@@ -286,8 +330,10 @@ describe("the warnings", () => {
   });
 
   it("says where links go when it becomes a new repeating event, and what an earlier change made", () => {
-    expect(seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")).toMatch(
-      /milestone stays with the earlier part, and reminders to prepare may show again/,
+    // C9b-2: a milestone is offered a move after saving (hedged: only when PM can make the offer),
+    // and the flags' warning stays before the save (scope-L9).
+    expect(seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")).toBe(
+      "From this occurrence on, it becomes a new repeating event in Google. If a milestone linked to it falls on or after this day, PM offers to move it to the new part after saving. Reminders to prepare may show again for the new part.",
     );
     const sibling = (kind: "save" | "delete") =>
       seriesWarningText({ warning: "split_sibling" }, kind, "all", "Gym");
@@ -305,8 +351,10 @@ describe("the warnings", () => {
       label: "This and following events",
       detail: "",
       selectable: true,
+      asAll: false,
       token: "f",
       warnings: [...every].reverse(),
+      guests: null,
     };
     const lines = warningLines(row, "save", "Gym");
     expect(lines).toEqual(every.map((w) => seriesWarningText(w, "save", "following", "Gym")));
@@ -321,6 +369,78 @@ describe("the warnings", () => {
     expect(
       warningLines({ ...row, warnings: [nothing, { warning: "new_identity" }] }, "save", "Gym"),
     ).toEqual([seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")]);
+  });
+
+  it("words a new repeat and 'Does not repeat' for each row (C11 §9.9)", () => {
+    const say = (w: SeriesWarning, scope: "following" | "all") =>
+      seriesWarningText(w, "save", scope, "Gym");
+    const stops: SeriesWarning = { warning: "becomes_one_event", day: "2026-10-05" };
+    expect(say(stops, "all")).toBe(
+      "Only the occurrence on 05-10 stays, as an event that doesn't repeat. Every other occurrence of “Gym” goes.",
+    );
+    // Never "a new repeating event" for one that doesn't repeat (C11 critique 2 M2).
+    expect(say(stops, "following")).toBe(
+      "From this occurrence on, “Gym” becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.",
+    );
+    expect(say({ warning: "changes_lost", count: 1 }, "following")).toBe(
+      "One occurrence of “Gym” you changed on its own falls on a day the new repeat skips, so that change goes.",
+    );
+    expect(say({ warning: "changes_lost", count: 3 }, "following")).toBe(
+      "3 occurrences of “Gym” you changed on their own fall on days the new repeat skips, so those changes go.",
+    );
+    const moved: SeriesWarning = { warning: "start_moved", from: "2026-10-20", to: "2026-10-21" };
+    expect(say(moved, "following")).toBe(
+      "From this occurrence on, the new part of “Gym” starts on 21-10, the first day the new repeat allows.",
+    );
+    expect(say(moved, "all")).toBe("The first occurrence of “Gym” moves from 20-10 to 21-10.");
+    // The question first, then the stop, where it starts and what's lost, before the rest.
+    const row: RowView = {
+      scope: "following",
+      label: "This and following events",
+      detail: "",
+      selectable: true,
+      asAll: false,
+      token: "f",
+      warnings: [
+        { warning: "new_identity" },
+        { warning: "changes_lost", count: 1 },
+        moved,
+        { warning: "length_changes" },
+        stops,
+        dayMove("every Sunday", "every Monday", 1),
+      ],
+      guests: null,
+    };
+    const fromHere = (w: SeriesWarning) => say(w, "following");
+    expect(warningLines(row, "save", "Gym")).toEqual([
+      fromHere(dayMove("every Sunday", "every Monday", 1)),
+      fromHere(stops),
+      fromHere(moved),
+      fromHere({ warning: "changes_lost", count: 1 }),
+      fromHere({ warning: "length_changes" }),
+      fromHere({ warning: "new_identity" }),
+    ]);
+  });
+
+  it("words a 'this and following' row that changes every occurrence as All", () => {
+    // From the first occurrence: no new part, so never "the new part starts" or "from this one on".
+    const warnings: SeriesWarning[] = [
+      { warning: "start_moved", from: "2026-10-05", to: "2026-10-06" },
+      { warning: "becomes_one_event", day: "2026-10-06" },
+    ];
+    const [, asAll] = rowsOf(ready(offered("t"), { row: "as_all", warnings, token: "x" }), "save");
+    expect(asAll).toMatchObject({ scope: "following", asAll: true, token: "x" });
+    expect(warningLines(asAll, "save", "Gym")).toEqual([
+      "Only the occurrence on 06-10 stays, as an event that doesn't repeat. Every other occurrence of “Gym” goes.",
+      "The first occurrence of “Gym” moves from 05-10 to 06-10.",
+    ]);
+    // The same warnings on a row that makes a new part keep that row's words.
+    const [, split] = rowsOf(ready(offered("t"), offered("f", warnings)), "save");
+    expect(split.asAll).toBe(false);
+    expect(warningLines(split, "save", "Gym")).toEqual([
+      "From this occurrence on, “Gym” becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.",
+      "From this occurrence on, the new part of “Gym” starts on 06-10, the first day the new repeat allows.",
+    ]);
   });
 
   it("says a re-ask once per kind", () => {

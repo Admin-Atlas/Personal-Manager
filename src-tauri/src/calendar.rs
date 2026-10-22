@@ -262,6 +262,99 @@ fn primary_calendar_id(value: &serde_json::Value) -> Option<String> {
     (!id.is_empty()).then(|| id.to_lowercase())
 }
 
+// --- each Google account's default event length (A28, C10) ---
+
+/// `settings` key: `{ "<lowercased account email>": minutes }`, Google's default length for a new
+/// event on each account. The `calendar_editing` shape: one key for every account, so a change is
+/// one read-modify-write under the DB lock. Read from Google when an account connects and at each
+/// sync ([`fetch_default_length`]); a disconnect clears it.
+pub const DEFAULT_LENGTH_KEY: &str = "calendar_default_length";
+
+/// Google's default length for a new event on the account `token_key` signs in as, in minutes
+/// (`settings.get('defaultEventLength')`, readable with the read-only calendar permission every
+/// account has), or `None` when it can't be read. Network only: callers hold no lock across it.
+pub async fn fetch_default_length(token_key: &str) -> Option<u32> {
+    let url = format!("{CALENDAR_API}/users/me/settings/defaultEventLength");
+    let value = google::authorized_get(token_key, &url).await.ok()?;
+    parse_default_length(&value)
+}
+
+/// `{"value": "30", …}` is 30. Google documents a number of minutes, as a string; anything else
+/// (missing, not a string, not a number, zero, or over a day) reads as `None`, and the editor keeps
+/// its hour.
+pub fn parse_default_length(v: &serde_json::Value) -> Option<u32> {
+    v.get("value")?
+        .as_str()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|m| (1..=1440).contains(m))
+}
+
+/// Store what a read of one account's default length found, under the caller's lock: a value Google
+/// gave replaces the last one; a read that failed (`None`) changes nothing, so the last good value
+/// stays rather than falling back to an hour.
+fn remember_default_length(conn: &Connection, email: &str, read: Option<u32>) -> Result<()> {
+    match read {
+        Some(minutes) => set_default_length(conn, email, Some(minutes)),
+        None => Ok(()),
+    }
+}
+
+/// [`remember_default_length`] for a read made with no lock held, under the lock taken again after
+/// it: only while the Google source `source_id` is still connected. A disconnect during the read
+/// cleared the account's length, and a value read with the token it had before must not bring the
+/// length back for an account PM no longer holds.
+pub fn remember_default_length_if_connected(
+    conn: &Connection,
+    source_id: &str,
+    email: &str,
+    read: Option<u32>,
+) -> Result<()> {
+    let connected = list_sources(conn, Some("google"))?
+        .iter()
+        .any(|s| s.id == source_id);
+    if connected {
+        remember_default_length(conn, email, read)
+    } else {
+        Ok(())
+    }
+}
+
+/// Every account's stored default length. A value PM can't read is none at all: the editor then
+/// uses an hour, as it would before the first sync.
+pub fn default_lengths(conn: &Connection) -> Result<std::collections::BTreeMap<String, u32>> {
+    let Some(raw) = db::get_setting(conn, DEFAULT_LENGTH_KEY)? else {
+        return Ok(Default::default());
+    };
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+/// Store (or with `None`, forget) one account's default length, under the caller's lock. Writes
+/// only on a change, so a sync that reads the same value writes nothing; forgetting the last one
+/// removes the key.
+pub fn set_default_length(conn: &Connection, email: &str, minutes: Option<u32>) -> Result<()> {
+    let mut all = default_lengths(conn)?;
+    let key = email.trim().to_lowercase();
+    let changed = match minutes {
+        Some(m) => all.insert(key, m) != Some(m),
+        None => all.remove(&key).is_some(),
+    };
+    if !changed {
+        return Ok(());
+    }
+    if all.is_empty() {
+        return db::delete_setting(conn, DEFAULT_LENGTH_KEY);
+    }
+    let json = serde_json::to_string(&all).map_err(|e| Error::Other(e.to_string()))?;
+    db::set_setting(conn, DEFAULT_LENGTH_KEY, &json)
+}
+
+/// Forget every account's default length (every Google account went).
+pub fn clear_default_lengths(conn: &Connection) -> Result<()> {
+    db::delete_setting(conn, DEFAULT_LENGTH_KEY)
+}
+
 /// Fetch events from one Google calendar within `[time_min, time_max]` (RFC3339), with recurring
 /// events expanded to single instances and ordered by start. `mirror_calendar_id` is the owning
 /// [`Calendar::id`] the events are stored under; `remote_id` is Google's own calendar id for the API
@@ -910,6 +1003,17 @@ fn google_conference(it: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether a Google event resource is a repeating event's master: it carries a rule and no
+/// `recurringEventId`. An empty or null `recurrence` is no rule (C11 critique 1 L10), so an event
+/// Google echoes with `[]` after its repeat was taken off is a one-off again, here and in every
+/// check that asks this.
+pub(crate) fn is_master(it: &serde_json::Value) -> bool {
+    it.get("recurrence")
+        .and_then(|r| r.as_array())
+        .is_some_and(|lines| !lines.is_empty())
+        && it.get("recurringEventId").is_none()
+}
+
 fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEvent> {
     value
         .get("items")
@@ -929,14 +1033,14 @@ fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEve
 /// back, so a saved event is mirrored exactly as the next sync would mirror it. The row id is the
 /// event's own id, an occurrence's instance id included (`<series>_<start>`).
 ///
-/// A master (it carries the `recurrence` rule and no `recurringEventId`) never becomes a row: the sync
-/// asks for `singleEvents=true` and so only ever mirrors occurrences, and a master's `start` is just
-/// its first occurrence's. A save that touches a series refetches the occurrences instead.
+/// A master ([`is_master`]) never becomes a row: the sync asks for `singleEvents=true` and so only
+/// ever mirrors occurrences, and a master's `start` is just its first occurrence's. A save that
+/// touches a series refetches the occurrences instead.
 pub(crate) fn parse_event(calendar_id: &str, it: &serde_json::Value) -> Option<CalendarEvent> {
     if it.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
         return None;
     }
-    if it.get("recurrence").is_some() && it.get("recurringEventId").is_none() {
+    if is_master(it) {
         return None;
     }
     let event_id = it
@@ -3234,8 +3338,16 @@ mod tests {
             "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
         });
         assert!(parse_event("cal-1", &master).is_none());
+        assert!(is_master(&master));
         // An occurrence of it is mirrored as usual.
         assert!(parse_event("cal-1", &google_occurrence()).is_some());
+        // C11 critique 1 L10: an empty or null rule is no rule, so that event is a one-off row.
+        for none in [serde_json::json!([]), serde_json::Value::Null] {
+            let mut once = master.clone();
+            once["recurrence"] = none;
+            assert!(!is_master(&once));
+            assert!(parse_event("cal-1", &once).is_some_and(|row| row.summary == "Standup"));
+        }
     }
 
     #[test]
@@ -3466,5 +3578,108 @@ mod tests {
         for p in ["google", "microsoft", "Google", "evil\nline"] {
             assert!(feed_provider(p).is_err(), "{p:?}");
         }
+    }
+
+    #[test]
+    fn default_lengths_round_trip_and_none_removes_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        set_default_length(&conn, "Me@Example.com", Some(30)).unwrap();
+        set_default_length(&conn, "work@example.com", Some(45)).unwrap();
+        let all = default_lengths(&conn).unwrap();
+        assert_eq!(all.get("me@example.com"), Some(&30));
+        assert_eq!(all.get("work@example.com"), Some(&45));
+        set_default_length(&conn, "me@example.com", None).unwrap();
+        assert_eq!(default_lengths(&conn).unwrap().len(), 1);
+        set_default_length(&conn, "work@example.com", None).unwrap();
+        assert_eq!(db::get_setting(&conn, DEFAULT_LENGTH_KEY).unwrap(), None);
+        // A value PM can't read is none, never an error.
+        db::set_setting(&conn, DEFAULT_LENGTH_KEY, "not json").unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        set_default_length(&conn, "me@example.com", Some(20)).unwrap();
+        clear_default_lengths(&conn).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_length_reads_googles_minutes_string() {
+        use serde_json::json;
+        assert_eq!(parse_default_length(&json!({ "value": "30" })), Some(30));
+        assert_eq!(parse_default_length(&json!({ "value": " 45 " })), Some(45));
+        assert_eq!(
+            parse_default_length(&json!({ "kind": "calendar#setting", "value": "1440" })),
+            Some(1440)
+        );
+    }
+
+    #[test]
+    fn an_odd_default_length_reads_as_none() {
+        use serde_json::json;
+        let odd = [
+            json!({ "value": "0" }),
+            json!({ "value": "-5" }),
+            json!({ "value": "1441" }),
+            json!({ "value": "half an hour" }),
+            json!({ "value": "" }),
+            json!({ "value": 30 }),
+            json!({ "kind": "calendar#setting" }),
+            json!("30"),
+        ];
+        for (i, v) in odd.iter().enumerate() {
+            assert_eq!(parse_default_length(v), None, "case {i}");
+        }
+    }
+
+    /// A sync whose read failed leaves the last good length, never the hour the editor falls back to.
+    #[test]
+    fn a_failed_default_length_read_keeps_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        remember_default_length(&conn, "me@example.com", Some(30)).unwrap();
+        remember_default_length(&conn, "me@example.com", None).unwrap();
+        assert_eq!(
+            default_lengths(&conn).unwrap().get("me@example.com"),
+            Some(&30)
+        );
+        remember_default_length(&conn, "Me@Example.com", Some(25)).unwrap();
+        assert_eq!(
+            default_lengths(&conn).unwrap().get("me@example.com"),
+            Some(&25)
+        );
+        // Nothing read for an account with none stored stores nothing.
+        remember_default_length(&conn, "new@example.com", None).unwrap();
+        assert_eq!(default_lengths(&conn).unwrap().len(), 1);
+    }
+
+    /// A sync reads the length with no lock held; an account disconnected meanwhile (its source gone,
+    /// its length cleared) gets none back from that read. A connected one does.
+    #[test]
+    fn a_default_length_read_lands_only_while_its_account_is_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let me = google_account_id("me@example.com");
+        upsert_source(
+            &conn,
+            &me,
+            "google",
+            Some("me@example.com"),
+            "me@example.com",
+        )
+        .unwrap();
+        remember_default_length_if_connected(&conn, &me, "me@example.com", Some(30)).unwrap();
+        assert_eq!(
+            default_lengths(&conn).unwrap().get("me@example.com"),
+            Some(&30)
+        );
+        // Disconnected during the read, as the disconnect does it: source removed, length cleared.
+        remove_source(&conn, &me).unwrap();
+        set_default_length(&conn, "me@example.com", None).unwrap();
+        remember_default_length_if_connected(&conn, &me, "me@example.com", Some(45)).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        // A source by that id that isn't Google's doesn't count.
+        upsert_source(&conn, &me, "other", None, "Feed").unwrap();
+        remember_default_length_if_connected(&conn, &me, "me@example.com", Some(45)).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
     }
 }

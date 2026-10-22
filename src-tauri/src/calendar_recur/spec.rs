@@ -137,8 +137,14 @@ pub enum SpecError {
     NoOccurrence,
     /// The clocks skip the chosen time on the series' first day.
     Gap(NaiveDate),
+    /// The clocks skip the first occurrence's end time on the day it ends (C11 critique 2 L7).
+    EndGap(NaiveDate),
+    /// An end date PM can't read.
+    BadDate,
 }
 
+/// Shown on the editor's Repeat row, so no "series", "instance", "exception", "split" or "master"
+/// (C9b-1 critique 2 M4): the user made a repeating event and its occurrences.
 impl fmt::Display for SpecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -149,19 +155,28 @@ impl fmt::Display for SpecError {
             SpecError::Count => write!(f, "It has to happen at least once."),
             SpecError::TooMany => write!(
                 f,
-                "Google allows at most {MAX_OCCURRENCES} occurrences in a series."
+                "Google allows at most {MAX_OCCURRENCES} occurrences of a repeating event."
             ),
-            SpecError::EndsBeforeStart => write!(f, "The end date is before the series starts."),
+            SpecError::EndsBeforeStart => {
+                write!(f, "The end date is before the first occurrence.")
+            }
             SpecError::NoOccurrence => write!(
                 f,
-                "That rule has no occurrence between the start and the end date."
+                "This repeat has no occurrence between the start and the end date."
             ),
             SpecError::Gap(day) => write!(
                 f,
-                "The series would start on {}, when the clocks skip that time. Pick a time outside \
-                 that hour.",
+                "The first occurrence would be on {}, when the clocks skip that time. Pick a time \
+                 outside that hour.",
                 day.format("%d-%m-%Y")
             ),
+            SpecError::EndGap(day) => write!(
+                f,
+                "The first occurrence would end on {}, when the clocks skip that time. Pick an end \
+                 time outside that hour.",
+                day.format("%d-%m-%Y")
+            ),
+            SpecError::BadDate => write!(f, "PM couldn't read that end date."),
         }
     }
 }
@@ -247,13 +262,6 @@ pub fn spec_from_rule(f: &RuleFacts, start: &SeriesStart) -> Option<RecurrenceSp
 /// The rule as Google gets it: one `RRULE:` line in PM's canonical form, never with BYHOUR, BYMINUTE,
 /// BYSECOND or WKST. "Ends on" a day is UNTIL at that day's last second in the series' zone, as UTC
 /// (RFC 5545 wants UTC when the start names a zone), or the date itself for an all-day series.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first caller lands in C10/C11, creating and changing rules"
-    )
-)]
 pub fn rule_from_spec(spec: &RecurrenceSpec, start: &SeriesStart) -> Result<String, SpecError> {
     if !(1..=MAX_INTERVAL).contains(&spec.interval) {
         return Err(SpecError::Interval);
@@ -389,12 +397,12 @@ pub fn describe(spec: &RecurrenceSpec, start: &SeriesStart) -> String {
 /// described, or [`CUSTOM_RULE`] for anything outside the editor's set. EXDATEs and RDATEs don't
 /// change the words.
 pub fn describe_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> String {
-    spec_of_lines(lines, start)
-        .map_or_else(|| CUSTOM_RULE.to_string(), |spec| describe(&spec, start))
+    spec_of(lines, start).map_or_else(|| CUSTOM_RULE.to_string(), |spec| describe(&spec, start))
 }
 
-/// `recurrence` lines' one RRULE as a rule from the editor's set, or `None` for anything else.
-fn spec_of_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<RecurrenceSpec> {
+/// `recurrence` lines' one RRULE as a rule from the editor's set, or `None` for anything else: what
+/// the editor's Repeat row starts from, and what a change of rule is told from (C11).
+pub fn spec_of<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<RecurrenceSpec> {
     let lines = lines::parse(lines);
     let mut rules = lines.iter().filter_map(|l| match &l.kind {
         Kind::Rule(rule) => Some(rule),
@@ -415,7 +423,7 @@ fn spec_of_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<Recu
 /// 13 October". `None` for a daily series, which names no day, and for a rule outside the editor's
 /// set; the question then says how far every occurrence moves instead.
 pub fn day_phrase<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<String> {
-    let spec = spec_of_lines(lines, start)?;
+    let spec = spec_of(lines, start)?;
     let n = spec.interval;
     let months = |text: String| match n {
         1 => format!("{text} of each month"),
@@ -465,10 +473,6 @@ pub fn day_phrase<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<Str
 }
 
 /// One of the repeat menu's ready-made rules.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C11, repeat rules")
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preset {
     pub label: String,
@@ -479,10 +483,6 @@ pub struct Preset {
 /// daily, weekly on that weekday, monthly on its numbered weekday (the first to the fourth, and also
 /// the last when `day` is in its month's last seven days; never a fifth), annually on that date, and
 /// every weekday. "Does not repeat" and "Custom…" are the menu's own rows.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C11, repeat rules")
-)]
 pub fn presets(day: NaiveDate) -> Vec<Preset> {
     let weekday = day.weekday();
     let mut patterns = vec![Pattern::Daily, Pattern::Weekly(vec![weekday])];
@@ -618,6 +618,56 @@ fn month_name(month: u32) -> &'static str {
         .unwrap_or("")
 }
 
+/// T2: the rules Google's editor writes and the words it says them in, against Tue 13-10-2026
+/// 09:00 in London. The webview's repeat-rule tests read the same rows from
+/// `src/lib/calendarEdit/repeatRules.fixture.json`, which `wire`'s tests hold to this list.
+#[cfg(test)]
+pub(super) const T2_RULES: [(&str, &str); 16] = [
+    ("RRULE:FREQ=DAILY", "Daily"),
+    (
+        "RRULE:FREQ=DAILY;INTERVAL=3;COUNT=10",
+        "Every 3 days, 10 times",
+    ),
+    ("RRULE:FREQ=WEEKLY", "Weekly on Tuesday"),
+    ("RRULE:FREQ=WEEKLY;BYDAY=TU", "Weekly on Tuesday"),
+    (
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "Every weekday (Monday to Friday)",
+    ),
+    (
+        "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=20261231T235959Z",
+        "Every 2 weeks on Monday and Wednesday, until 31-12-2026",
+    ),
+    (
+        "RRULE:FREQ=WEEKLY;BYDAY=FR,MO,WE",
+        "Weekly on Monday, Wednesday and Friday",
+    ),
+    ("RRULE:FREQ=MONTHLY", "Monthly on day 13"),
+    ("RRULE:FREQ=MONTHLY;BYMONTHDAY=13", "Monthly on day 13"),
+    (
+        "RRULE:FREQ=MONTHLY;BYDAY=2TU",
+        "Monthly on the second Tuesday",
+    ),
+    (
+        "RRULE:FREQ=MONTHLY;BYDAY=-1TU",
+        "Monthly on the last Tuesday",
+    ),
+    ("RRULE:FREQ=YEARLY", "Annually on 13 October"),
+    (
+        "RRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=13",
+        "Annually on 13 October",
+    ),
+    (
+        "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=2TU",
+        "Annually on the second Tuesday of October",
+    ),
+    ("RRULE:FREQ=DAILY;COUNT=1", "Daily, once"),
+    (
+        "RRULE:FREQ=YEARLY;INTERVAL=2",
+        "Every 2 years on 13 October",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,52 +706,55 @@ mod tests {
     #[test]
     fn rules_read_as_google_says_them() {
         let t = tuesday();
-        for (rule, expected) in [
-            ("RRULE:FREQ=DAILY", "Daily"),
-            (
-                "RRULE:FREQ=DAILY;INTERVAL=3;COUNT=10",
-                "Every 3 days, 10 times",
-            ),
-            ("RRULE:FREQ=WEEKLY", "Weekly on Tuesday"),
-            ("RRULE:FREQ=WEEKLY;BYDAY=TU", "Weekly on Tuesday"),
-            (
-                "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
-                "Every weekday (Monday to Friday)",
-            ),
-            (
-                "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=20261231T235959Z",
-                "Every 2 weeks on Monday and Wednesday, until 31-12-2026",
-            ),
-            (
-                "RRULE:FREQ=WEEKLY;BYDAY=FR,MO,WE",
-                "Weekly on Monday, Wednesday and Friday",
-            ),
-            ("RRULE:FREQ=MONTHLY", "Monthly on day 13"),
-            ("RRULE:FREQ=MONTHLY;BYMONTHDAY=13", "Monthly on day 13"),
-            (
-                "RRULE:FREQ=MONTHLY;BYDAY=2TU",
-                "Monthly on the second Tuesday",
-            ),
-            (
-                "RRULE:FREQ=MONTHLY;BYDAY=-1TU",
-                "Monthly on the last Tuesday",
-            ),
-            ("RRULE:FREQ=YEARLY", "Annually on 13 October"),
-            (
-                "RRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=13",
-                "Annually on 13 October",
-            ),
-            (
-                "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=2TU",
-                "Annually on the second Tuesday of October",
-            ),
-            ("RRULE:FREQ=DAILY;COUNT=1", "Daily, once"),
-            (
-                "RRULE:FREQ=YEARLY;INTERVAL=2",
-                "Every 2 years on 13 October",
-            ),
-        ] {
+        for (rule, expected) in T2_RULES {
             assert_eq!(words(rule, &t), expected, "{rule}");
+        }
+    }
+
+    /// Every word a rule can be refused with is one the editor shows as is (C11 §1.3), pinned here
+    /// as the webview's problem words are pinned there, so the two can't drift.
+    #[test]
+    fn spec_error_words_name_no_jargon() {
+        let skipped = day(2026, 3, 29);
+        for (e, expected) in [
+            (SpecError::Interval, "Repeat every 1 to 99."),
+            (SpecError::NoWeekdays, "Pick at least one day of the week."),
+            (
+                SpecError::DayOfMonth,
+                "Pick a day of the month from 1 to 31.",
+            ),
+            (SpecError::Month, "Pick a month."),
+            (SpecError::Count, "It has to happen at least once."),
+            (
+                SpecError::TooMany,
+                "Google allows at most 730 occurrences of a repeating event.",
+            ),
+            (
+                SpecError::EndsBeforeStart,
+                "The end date is before the first occurrence.",
+            ),
+            (
+                SpecError::NoOccurrence,
+                "This repeat has no occurrence between the start and the end date.",
+            ),
+            (
+                SpecError::Gap(skipped),
+                "The first occurrence would be on 29-03-2026, when the clocks skip that time. \
+                 Pick a time outside that hour.",
+            ),
+            (
+                SpecError::EndGap(skipped),
+                "The first occurrence would end on 29-03-2026, when the clocks skip that time. \
+                 Pick an end time outside that hour.",
+            ),
+            (SpecError::BadDate, "PM couldn't read that end date."),
+        ] {
+            let words = e.to_string();
+            assert_eq!(words, expected);
+            let lower = words.to_lowercase();
+            for jargon in ["series", "instance", "exception", "split", "master"] {
+                assert!(!lower.contains(jargon), "{words}");
+            }
         }
     }
 

@@ -5,17 +5,26 @@ import { describe, it, expect } from "vitest";
 import {
   dayDiff,
   dayKey,
+  DRAFT_EVENT_ID,
+  draftEvent,
+  draftNote,
+  eventDaySpan,
+  ghostAfterRead,
   inTimeGridBand,
+  isDraftEvent,
   isEventPast,
   isMultiDay,
   minutesFromLocalMidnight,
   occurrenceKey,
+  packBands,
+  spokenName,
   startOfDay,
   startOfWeek,
   timedEndMinutes,
   timedSegments,
 } from "./calendar-layout";
 import type { CalendarEvent } from "./types";
+import type { EditorFields } from "./calendarEdit/eventDraft";
 
 // Local Date constructors (new Date(y, m0, d, h, min)) read the local clock, so these are TZ-agnostic.
 
@@ -190,5 +199,169 @@ describe("isEventPast", () => {
     const ev = { ...timedEv("2026-10-12", "2026-10-14"), all_day: true };
     expect(isEventPast(ev, new Date(2026, 9, 13, 23, 0))).toBe(false);
     expect(isEventPast(ev, new Date(2026, 9, 14, 0, 1))).toBe(true);
+  });
+});
+
+describe("the new event's ghost (C10c)", () => {
+  const fields: EditorFields = {
+    summary: "Dentist",
+    location: "",
+    description: "",
+    time: {
+      kind: "timed",
+      start_date: "2026-10-12",
+      start_time: "09:00",
+      start_zone: "Europe/London",
+      end_date: "2026-10-12",
+      end_time: "10:30",
+      end_zone: "America/New_York",
+    },
+    recurrence: { kind: "once" },
+    guests: [],
+    guest_perms: { modify: false, invite_others: true, see_others: true },
+    show_as: "busy",
+    visibility: "default",
+  };
+  const timed = fields.time as Extract<EditorFields["time"], { kind: "timed" }>;
+
+  it("draftEvent builds a timed and an all-day ghost in mirror shapes", () => {
+    // Each end in its own zone, as a UTC instant with no milliseconds, as the mirror writes it.
+    expect(draftEvent(fields, "cal-1")).toEqual({
+      id: DRAFT_EVENT_ID,
+      calendar_id: "cal-1",
+      summary: "Dentist",
+      description: null,
+      location: null,
+      start: "2026-10-12T08:00:00Z",
+      end: "2026-10-12T14:30:00Z",
+      all_day: false,
+      html_link: null,
+      uid: null,
+      draft_state: "unsaved",
+    });
+    // All day: civil dates, the end exclusive, across a month's end; "(no title)" as the grid says.
+    const allDay = draftEvent(
+      {
+        ...fields,
+        summary: "  ",
+        time: { kind: "all_day", first_day: "2026-10-30", last_day: "2026-10-31" },
+      },
+      "cal-2",
+    );
+    expect(allDay).toMatchObject({
+      summary: "(no title)",
+      start: "2026-10-30",
+      end: "2026-11-01",
+      all_day: true,
+      calendar_id: "cal-2",
+    });
+    expect(eventDaySpan(allDay!)).toEqual({
+      startDay: new Date(2026, 9, 30),
+      endDay: new Date(2026, 9, 31),
+    });
+  });
+
+  it("draftEvent draws nothing for a time that doesn't resolve", () => {
+    // A time the clocks skip (London, 29-03-2026), an end not after the start, an unknown zone,
+    // and a last day before the first.
+    const at = (over: Partial<typeof timed>) => ({ ...fields, time: { ...timed, ...over } });
+    expect(draftEvent(at({ start_date: "2026-03-29", start_time: "01:30" }), "c")).toBeNull();
+    expect(draftEvent(at({ end_time: "04:00" }), "c")).toBeNull();
+    expect(draftEvent(at({ start_zone: "Nowhere/Here" }), "c")).toBeNull();
+    const backwards = { kind: "all_day" as const, first_day: "2026-10-14", last_day: "2026-10-12" };
+    expect(draftEvent({ ...fields, time: backwards }, "c")).toBeNull();
+  });
+
+  it("isDraftEvent finds only the ghost", () => {
+    const ghost = draftEvent(fields, "cal-1")!;
+    expect(isDraftEvent(ghost)).toBe(true);
+    expect(isDraftEvent(timedEv("2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z"))).toBe(false);
+    expect(isDraftEvent({ ...ghost, id: "cal-1:draft:new" })).toBe(false);
+  });
+
+  // The dashed edge says "new" to the eye; the name says it to a screen reader, and how far the save
+  // got. Once anything was sent, never "not saved": PM may already have made it.
+  it("draftNote names the ghost, by how far it has got, and nothing else", () => {
+    const at = (state: Parameters<typeof draftEvent>[2]) =>
+      draftNote(draftEvent(fields, "c", state)!);
+    expect(at("unsaved")).toBe("New event, not saved yet");
+    expect(at("saving")).toBe("New event, saving");
+    expect(at("unsure")).toBe("New event, PM may already have made it");
+    expect(at("saved")).toBe("New event, saved");
+    // A row carrying the ghost's id but no state (as the views' tests draw one) is a draft.
+    expect(draftNote(timedEv("2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z"))).toBeNull();
+    expect(draftNote({ ...timedEv("2026-10-12T09:00:00Z", null), id: DRAFT_EVENT_ID })).toBe(
+      "New event, not saved yet",
+    );
+    expect(spokenName("New event, saving", "Dentist, 09:00")).toBe(
+      "New event, saving: Dentist, 09:00",
+    );
+    expect(spokenName(null, "Dentist, 09:00")).toBe("Dentist, 09:00");
+  });
+
+  // A saved quick create's ghost waits for its row: a read begun after the save brings it, and the
+  // ghost goes; one begun before may not have it, and the ghost stays.
+  it("ghostAfterRead keeps the ghost until a read that started after the save lands", () => {
+    const landed = { ev: draftEvent(fields, "c", "saved")!, after: 4 };
+    expect(ghostAfterRead(landed, 4)).toBe(landed);
+    expect(ghostAfterRead(landed, 3)).toBe(landed);
+    expect(ghostAfterRead(landed, 5)).toBeNull();
+    expect(ghostAfterRead(null, 9)).toBeNull();
+  });
+});
+
+describe("packBands", () => {
+  it("packs by start, longest first, each in the lowest lane free", () => {
+    const { bands, laneCount } = packBands([
+      { id: "late", startDay: 3, endDay: 4 },
+      { id: "long", startDay: 0, endDay: 5 },
+      { id: "short", startDay: 0, endDay: 1 },
+      { id: "after", startDay: 2, endDay: 2 },
+    ]);
+    const lane = new Map(bands.map((b) => [b.id, b.lane]));
+    expect([lane.get("long"), lane.get("short"), lane.get("after"), lane.get("late")]).toEqual([
+      0, 1, 1, 1,
+    ]);
+    expect(laneCount).toBe(2);
+  });
+
+  // `first` (Month's ghost) is placed before the rest: the top lane, wherever it starts, and nothing
+  // packed after it overlaps it. It holds that lane over its own days only.
+  it("places `first` in the top lane, the rest around it", () => {
+    const { bands, laneCount } = packBands(
+      [
+        { id: "a", startDay: 0, endDay: 6 },
+        { id: "b", startDay: 0, endDay: 1 },
+        { id: "ghost", startDay: 3, endDay: 4 },
+        { id: "d", startDay: 2, endDay: 3 },
+        { id: "c", startDay: 5, endDay: 6 },
+      ],
+      "ghost",
+    );
+    const lane = new Map(bands.map((b) => [b.id, b.lane]));
+    expect(lane.get("ghost")).toBe(0);
+    expect(lane.get("a")).toBe(1);
+    // "b" ends before the ghost starts: it keeps the top lane it has without one.
+    expect(lane.get("b")).toBe(0);
+    // "d" starts after "b" ends but runs into the ghost's days: not the top lane.
+    expect(lane.get("d")).toBe(2);
+    // "c" starts after the ghost ends: the top lane is free again.
+    expect(lane.get("c")).toBe(0);
+    expect(laneCount).toBe(3);
+  });
+
+  // A ghost months on leaves the bands that end before it in the lanes they have without it.
+  it("leaves bands clear of `first` in the lanes they have without it", () => {
+    const spans = [
+      { id: "a", startDay: 0, endDay: 2 },
+      { id: "b", startDay: 0, endDay: 2 },
+      { id: "c", startDay: 1, endDay: 2 },
+    ];
+    const without = packBands(spans);
+    const withGhost = packBands([...spans, { id: "ghost", startDay: 30, endDay: 31 }], "ghost");
+    const lanes = (r: ReturnType<typeof packBands>) =>
+      r.bands.filter((b) => b.id !== "ghost").map((b) => [b.id, b.lane]);
+    expect(lanes(withGhost)).toEqual(lanes(without));
+    expect(withGhost.laneCount).toBe(without.laneCount);
   });
 });

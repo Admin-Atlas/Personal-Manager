@@ -37,8 +37,13 @@
 //!   as a rate limit on that retry, doesn't count, and leaves the once-more unspent), and If-Match
 //!   lets at most one per etag apply.
 //! - **A lost insert** is looked for, looked for again after a second, and only then sent again under
-//!   the same id, which Google refuses as a duplicate if the first copy landed (plan amendment A9).
+//!   the same id, which Google normally refuses as a duplicate if the first copy landed (plan
+//!   amendment A9; it can't always catch a repeated id, so the posts under one id are capped).
 //!   Its absence alone proves nothing.
+//! - **Creating an event** is a one-insert plan ([`SeriesPlan::create`]) run the same way. A copy
+//!   found cancelled under PM's own id was made and deleted since: gone, not unknown. A retry of one
+//!   left unknown runs as [`Run::retry_insert`], in doubt from its first answer and never posted
+//!   again within the run (C10).
 //!
 //! CodeQL guardrail (DECISIONS, 2026-10-10): nothing here uses `Vec::remove`, `insert` or
 //! `swap_remove` on fetched data, or puts anything from a Google reply in a log or panic message.
@@ -58,7 +63,7 @@ use super::super::plan::{
     get_event, instances, is_plain_segment, patch_event, RequestPlan, VersionFlags,
 };
 use super::original_of;
-use super::plan::{Op, Recheck, Resend, SeriesPlan, Shows, Stage, Undo};
+use super::plan::{Op, Recheck, Resend, SeriesPlan, Shows, Stage, Step, Undo};
 
 /// Google's answer to one request the machine asked for, as the command layer read it.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,9 +129,13 @@ pub enum End {
         reply: Option<Value>,
         date: Option<DateTime<Utc>>,
     },
-    /// A cleanup step not done or unknown, or one requiring such a step: left out, and reported
-    /// ([`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`] take these).
+    /// A cleanup step proved not done, or one requiring a step that isn't done, so never sent: left
+    /// out, and reported ([`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`] take these).
     Skipped,
+    /// A cleanup step whose answer PM couldn't read, a look included: it may have landed. Left out
+    /// and reported as [`End::Skipped`] is ([`Ran::skipped`]), but never taken for one that wasn't
+    /// done ([`Ran::not_done`], C9b-2 review round 2).
+    Unanswered,
     /// Landed, then undone by a rollback.
     Undone,
 }
@@ -169,7 +178,8 @@ pub enum Rollback {
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ran {
-    /// Every commit step landed; cleanup steps that didn't are [`End::Skipped`].
+    /// Every commit step landed; cleanup steps that didn't are [`End::Skipped`] or
+    /// [`End::Unanswered`].
     Done { ends: Vec<End> },
     /// Commit step `step` provably isn't in Google (it didn't land, or its event is gone), and the
     /// steps before it were rolled back.
@@ -195,12 +205,23 @@ impl Ran {
         }
     }
 
-    /// The steps left out, for [`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`].
+    /// The steps left out, for [`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`]: those
+    /// not done, and those whose answer was lost.
     pub fn skipped(&self) -> Vec<usize> {
+        self.left_out(|e| matches!(e, End::Skipped | End::Unanswered))
+    }
+
+    /// The steps left out that surely didn't land: proved not done, or never sent. Never one whose
+    /// answer was lost.
+    pub fn not_done(&self) -> Vec<usize> {
+        self.left_out(|e| *e == End::Skipped)
+    }
+
+    fn left_out(&self, of: impl Fn(&End) -> bool) -> Vec<usize> {
         self.ends()
             .iter()
             .enumerate()
-            .filter(|(_, e)| **e == End::Skipped)
+            .filter(|(_, e)| of(e))
             .map(|(i, _)| i)
             .collect()
     }
@@ -225,8 +246,10 @@ enum Read {
     Check,
     /// Send the same request once more on this etag (one a copy already went out on).
     Again(String),
-    /// Send it on Google's newer etag: no copy of it can land any more.
-    OnNewer(String),
+    /// Send it on Google's newer etag: no copy of it can land any more. With the write to send when
+    /// it isn't the last copy as it went: one whose guest list is built again on Google's newer copy
+    /// ([`SeriesPlan::again_on`]).
+    OnNewer(String, Option<Op>),
     /// Put the series' times and rule back on this etag: Google took half the move.
     Restore(String),
     /// A lost insert's new series isn't there yet: look again after a pause.
@@ -298,6 +321,9 @@ pub struct Run {
     /// Steps still to undo, the last one first.
     undo: Vec<usize>,
     result: Option<Ran>,
+    /// The run is a retry of a new event an earlier run sent ([`Run::retry_insert`]): its step
+    /// starts in doubt and already posted again.
+    retry: bool,
 }
 
 impl Run {
@@ -305,6 +331,29 @@ impl Run {
     pub fn new(plan: SeriesPlan) -> Result<Run, Unfit> {
         let ends = vec![End::NotRun; plan.steps.len()];
         Run::from(plan, ends)
+    }
+
+    /// Send a new event again that an earlier run left unknown and two looks since didn't find
+    /// (creating an event, C10): a plan of that one insert, under the same id. Its step starts in
+    /// doubt, since the earlier copy may still land, and as already posted again, so nothing this
+    /// copy meets proves the event isn't there: a 404 or a copy that never went out is looked for,
+    /// never read as "no calendar" or "nothing was sent", and it is never posted a further time
+    /// (C10 critiques 1 M1, 2 H1). A plan of anything else is [`Unfit`].
+    pub fn retry_insert(plan: SeriesPlan) -> Result<Run, Unfit> {
+        let one_insert = matches!(
+            plan.steps.as_slice(),
+            [Step {
+                op: Op::Insert { .. },
+                stage: Stage::Commit,
+                ..
+            }]
+        );
+        if !one_insert {
+            return Err(Unfit);
+        }
+        let mut run = Run::new(plan)?;
+        run.retry = true;
+        Ok(run)
     }
 
     /// "Finish" the split `ran` left partial, on the proof [`Settle`] found: an unknown cut Google
@@ -347,7 +396,13 @@ impl Run {
         let fits = plan.steps.iter().all(|s| {
             s.op.fits() && (matches!(s.op, Op::Carry { .. }) || s.op.request(s.notify).is_some())
         });
-        if !fits || ends.len() != plan.steps.len() || ends.contains(&End::Undone) {
+        // R9: a plan that would email someone and has no Send / Don't send behind it never starts,
+        // whatever its steps hold in the meantime (C12 §6.6): a second lock behind the command's own.
+        if !fits
+            || plan.needs_notify()
+            || ends.len() != plan.steps.len()
+            || ends.contains(&End::Undone)
+        {
             return Err(Unfit);
         }
         let at = ends
@@ -379,6 +434,7 @@ impl Run {
             failed: None,
             undo: Vec::new(),
             result: None,
+            retry: false,
         })
     }
 
@@ -448,6 +504,12 @@ impl Run {
             }
         }
         self.copies = Copies::default();
+        if self.retry {
+            // The copy an earlier run sent may land yet, and that run's own post again was its
+            // one (A9).
+            self.copies.in_doubt = true;
+            self.copies.reposted = true;
+        }
         if matches!(step.op, Op::Carry { .. }) {
             return Some(self.look(1));
         }
@@ -571,6 +633,9 @@ impl Run {
             return match body {
                 Some(b) => match self.plan.verdict(self.at, Some(&b)) {
                     Applied::Yes => Read::Done(Some(b), date),
+                    // Only a new event's verdict is ever No for an insert: its own copy, under
+                    // PM's id, deleted in Google (`Shows::Created`).
+                    Applied::No if method == Method::Insert => Read::NotDone(Why::Gone),
                     // This copy was applied, on the etag it went out on, and Google kept what was
                     // there: it ignored the change. No earlier copy can land after it.
                     Applied::No => Read::NotDone(Why::Ignored),
@@ -665,6 +730,17 @@ impl Run {
         let Some(fresh) = fresh else {
             return Read::NotDone(Why::Gone);
         };
+        if self.method() == Method::Insert {
+            // An insert has no etag, so nothing below applies. Only a new event's verdict is
+            // ever No: its own copy, under PM's 128-bit id, cancelled in Google since. It was
+            // made and then deleted, and the id is spent, so no copy can land after it
+            // (`Shows::Created`; C10 critique 1 L11). Anything else stays unknown.
+            return if is_gone(&fresh) {
+                Read::NotDone(Why::Gone)
+            } else {
+                Read::Unknown
+            };
+        }
         // A copy was applied, yet Google shows what was there: changed back since? Don't guess.
         if self.copies.answered_ok {
             return Read::Unknown;
@@ -682,15 +758,10 @@ impl Run {
                 Read::Again(etag)
             };
         }
-        if self.method() == Method::Insert {
-            // An insert has no etag, so nothing above applies; a step that shows what was there
-            // can't be an insert (its verdict is never No).
-            return Read::Unknown;
-        }
         // Google is at an etag no copy went out on: none of them can land.
         match self.plan.resend(self.at, &fresh) {
             Resend::Proceed if self.copies.moved_on => Read::NotDone(Why::Conflict(Vec::new())),
-            Resend::Proceed => Read::OnNewer(etag),
+            Resend::Proceed => Read::OnNewer(etag, self.plan.again_on(self.at, &fresh)),
             Resend::Gone if self.step_gone_is_done() => Read::Done(None, None),
             Resend::Gone => Read::NotDone(Why::Gone),
             Resend::Conflict(fields) => Read::NotDone(Why::Conflict(fields)),
@@ -703,11 +774,18 @@ impl Run {
                 verdict: Verdict::Ok,
                 body: Some(b),
                 ..
-            } if self.plan.verdict(self.at, Some(&b)) == Applied::Yes => {
-                self.apply(Read::Done(Some(b), None))
+            } => {
+                let read = match self.plan.verdict(self.at, Some(&b)) {
+                    Applied::Yes => Read::Done(Some(b), None),
+                    // Its own copy, cancelled in Google since: gone, as on the first look (C10
+                    // critique 1 L11).
+                    Applied::No => self.not_landed(Some(b)),
+                    Applied::Unknown => Read::Unknown,
+                };
+                self.apply(read)
             }
             // Still not there after a pause: post it again under the same id (A9). If the first
-            // copy landed after all, Google refuses this one as a duplicate.
+            // copy landed after all, Google normally refuses this one as a duplicate.
             Answer::Reply {
                 verdict: Verdict::Gone,
                 ..
@@ -735,8 +813,14 @@ impl Run {
                 self.copies.resent_on.push(etag);
                 Some(self.send(request))
             }
-            Read::OnNewer(etag) => {
-                let Some(request) = self.copies.last.clone().map(|r| on_etag(r, &etag)) else {
+            Read::OnNewer(etag, again) => {
+                // A guest list goes as Google's list now with the step's guest changes, never as the
+                // plan read it, so a reply that landed meanwhile stays (C12 decision 3).
+                let request = match again {
+                    Some(op) => op.request(self.plan.steps[self.at].notify),
+                    None => self.copies.last.clone(),
+                };
+                let Some(request) = request.map(|r| on_etag(r, &etag)) else {
                     return Some(self.stop_unknown());
                 };
                 self.copies.in_doubt = false;
@@ -766,7 +850,10 @@ impl Run {
             Read::NotDone(_) | Read::Unknown
                 if self.plan.steps[self.at].stage == Stage::Cleanup =>
             {
-                self.ends[self.at] = End::Skipped;
+                self.ends[self.at] = match read {
+                    Read::Unknown => End::Unanswered,
+                    _ => End::Skipped,
+                };
                 self.at += 1;
                 self.phase = Phase::Start;
                 None
@@ -1497,10 +1584,11 @@ impl Machine for Settle {
     }
 }
 
-/// The fence write: PM's private note `pmFence` on the series `original`, on its etag, notify none.
-/// Every existing private and shared property goes back with it, so it can't wipe another app's
-/// whether Google merges or replaces the maps on a PATCH. Built here, not as an [`Op`]: a series
-/// PATCH may not send `extendedProperties` (`Op::fits`).
+/// The fence write: PM's private note `pmFence` on the series `original`, on its etag, notify none
+/// (R7: a private property, nobody to tell, whatever the user answered for the change). Every
+/// existing private and shared property goes back with it, so it can't wipe another app's whether
+/// Google merges or replaces the maps on a PATCH. Built here, not as an [`Op`]: a series PATCH may
+/// not send `extendedProperties` (`Op::fits`).
 pub fn fence_request(calendar: &str, original: &Value, marker: &str) -> Option<RequestPlan> {
     let id = original
         .get("id")
@@ -1684,10 +1772,31 @@ mod tests {
     #[test]
     fn a_plan_with_a_key_its_write_may_not_send_never_starts() {
         let (_, mut plan) = this_case();
+        // Guests are a key a save may send now (C12); a video call isn't.
         if let Op::Patch { body, .. } = &mut plan.steps[0].op {
-            body.insert("attendees".into(), json!([]));
+            body.insert("conferenceData".into(), json!({}));
         }
         assert_eq!(Run::new(plan).err(), Some(Unfit));
+    }
+
+    /// C12 §6.6: a plan that would email someone and has no answer never starts, on every way in.
+    #[test]
+    fn a_plan_with_guests_and_no_answer_wont_run() {
+        let case = Case::new(
+            guests_on_it(weekly(), &["a@example.com"]),
+            guests_on_it(monday_19(), &["a@example.com"]),
+        );
+        let unanswered = case.edit(Scope::All, title("Retro")).unwrap();
+        assert!(unanswered.needs_notify());
+        assert_eq!(Run::new(unanswered).err(), Some(Unfit));
+        let answered = case
+            .edit_told(Scope::All, title("Retro"), Some(Notify::None))
+            .unwrap();
+        assert!(!answered.needs_notify());
+        assert!(Run::new(answered).is_ok());
+        // Nobody to email, nothing to answer.
+        let (_, solo) = this_case();
+        assert!(!solo.needs_notify() && Run::new(solo).is_ok());
     }
 
     #[test]
@@ -1778,6 +1887,82 @@ mod tests {
         assert_eq!(sent[0].if_match, Some(instance_etag(&case)));
         assert_eq!(sent[2].if_match.as_deref(), Some("\"i9\""));
         assert_eq!(sent[2].body, sent[0].body);
+    }
+
+    /// C12 decision 3: a guest list sent once more after a 412 is Google's list then with the user's
+    /// guest changes, so A's reply, comment and extra guest that landed between PM's read and its
+    /// write stay, and B is still added: the series' list and one occurrence's alike. The rebuilt
+    /// write still emails whom the user chose, as the first one did, whichever answer it was.
+    #[test]
+    fn a_guest_list_sent_once_more_keeps_what_guests_said_meanwhile() {
+        use crate::calendar_write::dto::{EventPatchDraft, GuestOp, GuestState};
+        let send_updates = |url: &str| {
+            url.split_once("sendUpdates=")
+                .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_owned())
+        };
+        let waiting = |event: Value| {
+            let mut v = guests_on_it(event, &["a@example.com"]);
+            v["attendees"][1]["responseStatus"] = json!("needsAction");
+            v
+        };
+        let case = Case::new(waiting(weekly()), waiting(monday_19()));
+        let add_b = EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: "b@example.com".into(),
+                to: GuestState::Required,
+            }]),
+            ..Default::default()
+        };
+        for (notify, (scope, event)) in [Notify::All, Notify::None, Notify::ExternalOnly]
+            .into_iter()
+            .flat_map(|n| {
+                [
+                    (Scope::All, case.master.json()),
+                    (Scope::This, case.instance.json()),
+                ]
+                .map(|s| (n, s))
+            })
+        {
+            let told = notify.as_param();
+            let plan = case.edit_told(scope, add_b.clone(), Some(notify)).unwrap();
+            let mut replied = at_etag(event, "\"r2\"");
+            replied["attendees"][1] = json!({ "email": "a@example.com", "responseStatus": "accepted",
+                                              "comment": "On my way", "additionalGuests": 1 });
+            let mut patches = 0;
+            let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+                Method::Patch => {
+                    patches += 1;
+                    match (patches, &r.body) {
+                        (1, _) => status(Verdict::Conflict),
+                        (_, Some(body)) => ok(at_etag(
+                            &with(replied.clone(), "attendees", body["attendees"].clone()),
+                            "\"r3\"",
+                        )),
+                        _ => status(Verdict::BadRequest("no body".into())),
+                    }
+                }
+                _ => ok(replied.clone()),
+            });
+            assert!(matches!(ran, Ran::Done { .. }), "{scope:?}, {told}: landed");
+            assert!(sent.len() == 3 && sent[1].method == Method::Get);
+            assert!(sent[2].if_match.as_deref() == Some("\"r2\""));
+            let mut want = replied["attendees"].clone();
+            want.as_array_mut()
+                .unwrap()
+                .push(json!({ "email": "b@example.com" }));
+            assert!(
+                sent[2].body.as_ref().map(|b| &b["attendees"]) == Some(&want),
+                "{scope:?}, {told}: A's reply kept, B still added"
+            );
+            assert!(
+                send_updates(&sent[0].url).as_deref() == Some(told),
+                "{scope:?}, {told}: the first write emails whom the user chose"
+            );
+            assert!(
+                send_updates(&sent[2].url) == send_updates(&sent[0].url),
+                "{scope:?}, {told}: the rebuilt write emails whom the first one did"
+            );
+        }
     }
 
     /// C9 design review: the cut watches every field the new series copied (AS10), so one changed
@@ -2679,6 +2864,371 @@ mod tests {
         );
     }
 
+    // --- Run: creating an event (C10) ---
+
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
+
+    /// A new event's plan: Dentist on Monday 26-10, 10:00 to 11:00 in London, under [`NEW`].
+    fn create_plan() -> SeriesPlan {
+        let body =
+            crate::calendar_write::patch::insert_body(&crate::calendar_write::dto::NewEventDraft {
+                summary: "Dentist".into(),
+                time: crate::calendar_write::dto::TimeDraft::Timed {
+                    start_date: "2026-10-26".into(),
+                    start_time: "10:00".into(),
+                    start_zone: "Europe/London".into(),
+                    end_date: "2026-10-26".into(),
+                    end_time: "11:00".into(),
+                    end_zone: "Europe/London".into(),
+                },
+                location: String::new(),
+                description: String::new(),
+                show_as: None,
+                visibility: None,
+                recurrence: None,
+            })
+            .unwrap();
+        SeriesPlan::create(CALENDAR, NEW, body).unwrap()
+    }
+
+    /// Google's copy of the new event.
+    fn new_copy(plan: &SeriesPlan) -> Value {
+        let Op::Insert { body, id, .. } = &plan.steps[0].op else {
+            panic!("not a create");
+        };
+        let mut v = Value::Object(body.clone());
+        v["id"] = json!(id);
+        v["etag"] = json!("\"n1\"");
+        v["status"] = json!("confirmed");
+        v
+    }
+
+    fn posts(sent: &[RequestPlan]) -> Vec<&RequestPlan> {
+        sent.iter().filter(|r| r.method == Method::Insert).collect()
+    }
+
+    #[test]
+    fn a_create_answered_2xx_is_done() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        let (ran, sent, waits) = drive(&mut Run::new(plan).unwrap(), |_| ok(copy.clone()));
+        assert!(matches!(&ran, Ran::Done { ends }
+            if matches!(ends.as_slice(), [End::Done { reply: Some(r), .. }] if *r == copy)));
+        assert_eq!(sent.len(), 1);
+        assert!(waits.is_empty());
+        // A 2xx PM can't read is looked up under the id.
+        let no_body = Answer::Reply {
+            verdict: Verdict::Ok,
+            body: None,
+            date: None,
+            maybe_applied: false,
+        };
+        let (ran, sent, _) = drive(&mut Run::new(create_plan()).unwrap(), |r| match r.method {
+            Method::Insert => no_body.clone(),
+            _ => ok(copy.clone()),
+        });
+        assert!(matches!(ran, Ran::Done { .. }));
+        assert!(sent[1].method == Method::Get && to(&sent[1], NEW));
+    }
+
+    #[test]
+    fn a_lost_create_found_on_the_first_look_is_done_with_one_post() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        let (ran, sent, waits) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Insert => lost(),
+            _ => ok(copy.clone()),
+        });
+        assert!(matches!(ran, Ran::Done { .. }));
+        assert_eq!(posts(&sent).len(), 1);
+        assert!(sent[1].method == Method::Get && to(&sent[1], NEW));
+        assert!(waits.is_empty());
+    }
+
+    /// A9: look, wait a second, look, then post the very same request once more.
+    #[test]
+    fn a_lost_create_absent_twice_is_posted_again_once_under_the_same_id() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        let mut n = 0;
+        let (ran, sent, waits) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Insert => {
+                n += 1;
+                if n == 1 {
+                    lost()
+                } else {
+                    ok(copy.clone())
+                }
+            }
+            _ => status(Verdict::Gone),
+        });
+        assert!(matches!(ran, Ran::Done { .. }));
+        assert_eq!(waits, vec![Duration::from_secs(1)]);
+        let methods: Vec<Method> = sent.iter().map(|r| r.method).collect();
+        assert_eq!(
+            methods,
+            [Method::Insert, Method::Get, Method::Get, Method::Insert]
+        );
+        assert_eq!(sent[0], sent[3]);
+    }
+
+    #[test]
+    fn a_reposted_create_answered_409_is_looked_up_and_done() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        let (mut posted, mut looked) = (0, 0);
+        let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
+            Method::Insert => {
+                posted += 1;
+                if posted == 1 {
+                    lost()
+                } else {
+                    status(Verdict::Duplicate)
+                }
+            }
+            _ => {
+                looked += 1;
+                if looked <= 2 {
+                    status(Verdict::Gone)
+                } else {
+                    ok(copy.clone())
+                }
+            }
+        });
+        assert!(matches!(ran, Ran::Done { .. }));
+        assert_eq!(posts(&sent).len(), 2);
+        assert_eq!(sent.last().map(|r| r.method), Some(Method::Get));
+    }
+
+    #[test]
+    fn a_create_whose_repost_is_lost_is_unknown() {
+        let (ran, sent, _) = drive(&mut Run::new(create_plan()).unwrap(), |r| match r.method {
+            Method::Insert => lost(),
+            _ => status(Verdict::Gone),
+        });
+        assert!(matches!(ran, Ran::Unknown { step: 0, .. }));
+        assert_eq!(posts(&sent).len(), 2);
+    }
+
+    #[test]
+    fn a_first_create_404_is_refused_not_looked_for() {
+        let (ran, sent, waits) = drive(&mut Run::new(create_plan()).unwrap(), |_| {
+            status(Verdict::Gone)
+        });
+        assert!(matches!(
+            ran,
+            Ran::NotDone {
+                why: Why::Refused(Verdict::Gone),
+                ..
+            }
+        ));
+        assert_eq!(sent.len(), 1);
+        assert!(waits.is_empty());
+    }
+
+    /// A server error may have been applied: never a second POST before a look.
+    #[test]
+    fn a_create_5xx_is_looked_for_before_any_second_post() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        for answer in [
+            after_5xx(Verdict::ServerError),
+            status(Verdict::ServerError),
+        ] {
+            let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+                Method::Insert => answer.clone(),
+                _ => ok(copy.clone()),
+            });
+            assert!(matches!(ran, Ran::Done { .. }));
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[1].method, Method::Get);
+        }
+    }
+
+    /// C10 critique 1 L11: a copy under PM's id that Google holds cancelled was made, then deleted
+    /// in Google. The run says gone, as the retry does, never unknown.
+    #[test]
+    fn a_cancelled_copy_of_a_new_event_is_gone() {
+        let plan = create_plan();
+        let cancelled = with(new_copy(&plan), "status", json!("cancelled"));
+        for first in [lost(), status(Verdict::Duplicate)] {
+            let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+                Method::Insert => first.clone(),
+                _ => ok(cancelled.clone()),
+            });
+            assert!(matches!(ran, Ran::NotDone { why: Why::Gone, .. }));
+            assert_eq!(posts(&sent).len(), 1);
+        }
+        // On the second look too, after a first that found nothing: gone, never posted again.
+        let mut looks = 0;
+        let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| match r.method {
+            Method::Insert => lost(),
+            _ => {
+                looks += 1;
+                if looks == 1 {
+                    status(Verdict::Gone)
+                } else {
+                    ok(cancelled.clone())
+                }
+            }
+        });
+        assert!(matches!(ran, Ran::NotDone { why: Why::Gone, .. }));
+        assert_eq!((posts(&sent).len(), looks), (1, 2));
+        let (ran, _, _) = drive(&mut Run::new(plan).unwrap(), |_| ok(cancelled.clone()));
+        assert!(matches!(ran, Ran::NotDone { why: Why::Gone, .. }));
+    }
+
+    /// Every sequence of answers to depth five (two POSTs, three looks): at most two POSTs, each
+    /// the same request under PM's id, nobody emailed and no Meet of Google's own; done only once
+    /// Google showed the new event; gone only once it showed it cancelled; not done otherwise only
+    /// on a first answer that proves nothing went (unsent) or a 404 to the first POST; unknown
+    /// never once Google showed a copy, live or cancelled.
+    #[test]
+    fn every_create_answer_sequence_sends_at_most_two_posts_under_one_id() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        let cancelled = with(copy.clone(), "status", json!("cancelled"));
+        let post_answers = [
+            ok(copy.clone()),
+            status(Verdict::Duplicate),
+            status(Verdict::Gone),
+            after_5xx(Verdict::ServerError),
+            lost(),
+            Answer::Unsent(Unsent::Offline),
+        ];
+        let look_answers = [
+            ok(copy.clone()),
+            ok(cancelled.clone()),
+            status(Verdict::Gone),
+            lost(),
+        ];
+        let shows =
+            |a: &Answer, v: &Value| matches!(a, Answer::Reply { body: Some(b), .. } if b == v);
+        let pick = |n: usize, i: usize, base: usize| (n / base.pow(i as u32)) % base;
+        let mut seen = (0, 0, 0, 0);
+        for p in 0..post_answers.len().pow(2) {
+            for g in 0..look_answers.len().pow(3) {
+                let (mut pi, mut gi) = (0, 0);
+                let (mut live, mut gone) = (false, false);
+                let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| {
+                    let a = match r.method {
+                        Method::Insert => {
+                            pi += 1;
+                            post_answers[pick(p, pi - 1, post_answers.len())].clone()
+                        }
+                        _ => {
+                            gi += 1;
+                            assert!(gi <= 3, "{p}/{g}: a fourth look");
+                            look_answers[pick(g, gi - 1, look_answers.len())].clone()
+                        }
+                    };
+                    live |= shows(&a, &copy);
+                    gone |= shows(&a, &cancelled);
+                    a
+                });
+                let inserts = posts(&sent);
+                assert!(inserts.len() <= 2, "{p}/{g}: {} posts", inserts.len());
+                assert!(inserts.iter().all(|r| **r == *inserts[0]), "{p}/{g}");
+                let first = inserts[0];
+                assert!(
+                    first.url.contains("sendUpdates=none")
+                        && first.url.contains("conferenceDataVersion=1")
+                        && first.body.as_ref().is_some_and(|b| b["id"] == NEW),
+                    "{p}/{g}"
+                );
+                let first_answer = &post_answers[pick(p, 0, post_answers.len())];
+                let proof_first = matches!(
+                    first_answer,
+                    Answer::Unsent(_)
+                        | Answer::Reply {
+                            verdict: Verdict::Gone,
+                            ..
+                        }
+                );
+                match &ran {
+                    Ran::Done { .. } => {
+                        seen.0 += 1;
+                        assert!(live, "{p}/{g}: done unseen");
+                    }
+                    Ran::NotDone { why: Why::Gone, .. } => {
+                        seen.1 += 1;
+                        assert!(gone, "{p}/{g}: gone unseen");
+                    }
+                    Ran::NotDone { .. } => {
+                        seen.2 += 1;
+                        assert!(proof_first && sent.len() == 1, "{p}/{g}");
+                    }
+                    Ran::Unknown { .. } => {
+                        seen.3 += 1;
+                        // A copy Google showed, live or cancelled, always settles it (C10
+                        // critique 1 L11): on the first look or the second.
+                        assert!(!proof_first && !live && !gone, "{p}/{g}");
+                    }
+                }
+            }
+        }
+        assert!(seen.0 > 0 && seen.1 > 0 && seen.2 > 0 && seen.3 > 0);
+    }
+
+    /// A retry of a new event (C10 critiques 1 M1, 2 H1): the earlier copy may still land, so
+    /// nothing this copy meets proves it isn't there. One POST at most, and every end but a copy
+    /// Google showed (live, or cancelled) is unknown.
+    #[test]
+    fn a_retried_create_starts_in_doubt_and_posts_once_at_most() {
+        let plan = create_plan();
+        let copy = new_copy(&plan);
+        let cancelled = with(copy.clone(), "status", json!("cancelled"));
+        let post_answers = [
+            ok(copy.clone()),
+            status(Verdict::Duplicate),
+            status(Verdict::Gone),
+            status(Verdict::ReadOnly),
+            status(Verdict::Reauth),
+            after_5xx(Verdict::ServerError),
+            lost(),
+            Answer::Unsent(Unsent::Offline),
+            Answer::Unsent(Unsent::SignIn),
+        ];
+        let look_answers = [
+            ok(copy.clone()),
+            ok(cancelled.clone()),
+            status(Verdict::Gone),
+            lost(),
+        ];
+        let shows =
+            |a: &Answer, v: &Value| matches!(a, Answer::Reply { body: Some(b), .. } if b == v);
+        for post in &post_answers {
+            for look in &look_answers {
+                let (mut live, mut gone) = (shows(post, &copy), false);
+                let (ran, sent, waits) =
+                    drive(&mut Run::retry_insert(plan.clone()).unwrap(), |r| {
+                        match r.method {
+                            Method::Insert => post.clone(),
+                            _ => {
+                                live |= shows(look, &copy);
+                                gone |= shows(look, &cancelled);
+                                look.clone()
+                            }
+                        }
+                    });
+                assert_eq!(posts(&sent).len(), 1);
+                assert!(waits.is_empty(), "a retry never waits to post again");
+                assert!(sent.len() <= 2);
+                match &ran {
+                    Ran::Done { .. } => assert!(live),
+                    Ran::NotDone { why: Why::Gone, .. } => assert!(gone),
+                    Ran::NotDone { .. } => panic!("a retry read something as proof of not done"),
+                    Ran::Unknown { .. } => assert!(!live && !gone),
+                }
+            }
+        }
+        // Only a plan of one insert is retried this way.
+        let (_, patch) = this_case();
+        assert_eq!(Run::retry_insert(patch).err(), Some(Unfit));
+        let (_, split) = split_case(Vec::new());
+        assert_eq!(Run::retry_insert(split).err(), Some(Unfit));
+    }
+
     // --- Run: deletes and cancels ---
 
     #[test]
@@ -2772,18 +3322,21 @@ mod tests {
 
     // --- Run: who Google emails ---
 
-    /// A3, R7b: every step, and every undo, sends the `sendUpdates` its plan stamped on it.
+    /// A3, R7b: every step, and every undo, sends the `sendUpdates` its plan stamped on it: a series
+    /// with a guest, since a step that reaches nobody sends `none` whatever was chosen (C12 §6.10).
     #[test]
     fn every_step_and_undo_sends_its_own_send_updates() {
+        let guest = |event: Value| guests_on_it(event, &["a@example.com"]);
         for notify in [Notify::All, Notify::ExternalOnly, Notify::None] {
             let param = format!("sendUpdates={}", notify.as_param());
-            let case = Case::new(weekly(), monday_19()).exceptions(vec![renamed()]);
+            let case =
+                Case::new(guest(weekly()), guest(monday_19())).exceptions(vec![guest(renamed())]);
             let plan = plan_series_edit(
                 Scope::Following,
                 &case.input(),
                 &title("Standup v2"),
                 TAIL,
-                notify,
+                Some(notify),
             )
             .unwrap();
             // Rolled back: the insert, the cut and the undo.
@@ -2838,9 +3391,10 @@ mod tests {
             assert!(sent.last().unwrap().url.contains(&param));
 
             // A half-landed move put back, on a series retimed with this `sendUpdates`.
-            let case = Case::new(weekly(), monday_19());
+            let case = Case::new(guest(weekly()), guest(monday_19()));
             let draft = at("09:00", "2026-10-20");
-            let plan = plan_series_edit(Scope::All, &case.input(), &draft, TAIL, notify).unwrap();
+            let plan =
+                plan_series_edit(Scope::All, &case.input(), &draft, TAIL, Some(notify)).unwrap();
             let old = case.master.json().clone();
             let mut half = landed(&old, &plan.steps[0], "\"m2\"");
             half["recurrence"] = old["recurrence"].clone();
@@ -3180,8 +3734,36 @@ mod tests {
         });
         assert_eq!(ran.skipped(), vec![2, 3]);
         assert!(matches!(ran, Ran::Done { .. }));
-        // The cancel that required the carry was never sent.
+        // The cancel that required the carry was never sent: that one surely isn't done, while the
+        // carry, whose answer was lost, may be.
         assert!(!sent.iter().any(|r| to(r, "abc_20261102T090000Z")));
+        assert!(matches!(ran.ends(), [_, _, End::Unanswered, End::Skipped]));
+        assert_eq!(ran.not_done(), vec![3]);
+    }
+
+    /// C9b-2 review round 2: a cleanup cancel whose answer was lost, a look included, may have
+    /// landed, so it's never counted as not done; one Google refused is.
+    #[test]
+    fn a_cleanup_whose_answer_was_lost_is_never_taken_for_not_done() {
+        let (case, plan) = split_case(vec![renamed()]);
+        let tail = tail_of(&plan, "\"t1\"");
+        for (cancel, unanswered) in [(lost(), true), (status(Verdict::ReadOnly), false)] {
+            let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| {
+                if to(r, "abc_20261102T090000Z") {
+                    return cancel.clone();
+                }
+                finished_split(&case, &plan, &tail, r)
+            });
+            assert!(sent.iter().any(|r| to(r, "abc_20261102T090000Z")));
+            assert_eq!(ran.skipped(), vec![3]);
+            if unanswered {
+                assert!(matches!(ran.ends()[3], End::Unanswered), "the lost one");
+                assert!(ran.not_done().is_empty());
+            } else {
+                assert!(matches!(ran.ends()[3], End::Skipped), "the refused one");
+                assert_eq!(ran.not_done(), vec![3]);
+            }
+        }
     }
 
     #[test]

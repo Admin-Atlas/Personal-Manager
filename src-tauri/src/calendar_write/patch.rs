@@ -16,12 +16,20 @@
 //!   still matches the fresh copy ([`delete_still_matches`]). Re-deleting just because the etag moved
 //!   would delete a version of the event nobody looked at.
 
+use std::fmt;
+
 use serde_json::{Map, Value};
 
-use super::dto::{EventPatchDraft, SeenSummary};
+use super::attendees;
+use super::dto::{EventPatchDraft, NewEventDraft, SeenSummary, TimeDraft, Visibility};
 use super::time::{self, TimeError};
+use crate::calendar_recur::expand::sync_start;
+use crate::calendar_recur::spec::{rule_from_spec, SpecError};
+use crate::calendar_recur::wire::RepeatRule;
+use crate::calendar_recur::SeriesStart;
 
-/// The only fields a single-event save sends.
+/// The only fields a single-event save sends: the guest list and what guests may do among them
+/// (C12).
 pub const PATCHABLE: &[&str] = &[
     "summary",
     "location",
@@ -30,7 +38,179 @@ pub const PATCHABLE: &[&str] = &[
     "end",
     "transparency",
     "visibility",
+    "attendees",
+    "guestsCanModify",
+    "guestsCanInviteOthers",
+    "guestsCanSeeOtherGuests",
 ];
+
+/// What a save that makes a one-off repeat may send (C11 §10): [`PATCHABLE`]'s fields and the rule,
+/// its own list so that guests changed in the same save go too (C12 critiques C1-H4, C2-M4).
+/// `repeat_patchable_is_patchable_and_the_rule` pins it.
+pub const REPEAT_PATCHABLE: &[&str] = &[
+    "summary",
+    "location",
+    "description",
+    "start",
+    "end",
+    "transparency",
+    "visibility",
+    "attendees",
+    "guestsCanModify",
+    "guestsCanInviteOthers",
+    "guestsCanSeeOtherGuests",
+    "recurrence",
+];
+
+/// What a create may send: a save's fields before guests, and the repeat rule (C11). Still no
+/// attendees (C12d), reminders, conference, colour or private notes until their layers. Widening it
+/// is a decision, never a slip: `creatable_is_the_c11_list_with_no_guests` pins it to exactly this,
+/// and the create plan's own refusal test names what it still refuses (C10 critique 1 L10).
+pub const CREATABLE: &[&str] = &[
+    "summary",
+    "location",
+    "description",
+    "start",
+    "end",
+    "transparency",
+    "visibility",
+    "recurrence",
+];
+
+/// Why a create's body can't be built. Shown to the user as is: the inner words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertError {
+    Time(TimeError),
+    Rule(SpecError),
+    /// A one-off given a repeat, its time left alone, whose start or end has no zone, with none to
+    /// read it in: not the calendar's, nor this computer's (C11d review 1).
+    NoEventZone,
+}
+
+impl fmt::Display for InsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InsertError::Time(e) => e.fmt(f),
+            InsertError::Rule(e) => e.fmt(f),
+            InsertError::NoEventZone => write!(
+                f,
+                "PM can't tell which time zone this event is in, so it can't make it repeat."
+            ),
+        }
+    }
+}
+
+impl From<TimeError> for InsertError {
+    fn from(e: TimeError) -> Self {
+        InsertError::Time(e)
+    }
+}
+
+impl From<SpecError> for InsertError {
+    fn from(e: SpecError) -> Self {
+        InsertError::Rule(e)
+    }
+}
+
+/// The insert body for `draft`. Google's `start`/`end` come from [`time::resolve`] (explicit zones,
+/// a skipped hour refused, a repeated hour's first occurrence, an all-day end the day after the
+/// last day); empty text is left out, so Google keeps no empty strings. No `id`: the insert request
+/// writes PM's own in ([`super::plan::insert_event`]).
+///
+/// A repeating event starts on the first day its rule makes ([`sync_start`]: "Weekly on Monday and
+/// Wednesday" chosen on a Tuesday starts on the Wednesday, A27), its end moved the same number of
+/// days, and carries one rule line and nothing else (no EXDATE or RDATE). A timed one names its
+/// zone on both nodes, as every timed node does; an all-day one sends dates only (probe P-R1).
+pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertError> {
+    let (time, rule) = match &draft.recurrence {
+        None => (draft.time.clone(), None),
+        Some(rule) => {
+            let spec = rule.to_spec()?;
+            let asked = time::series_start(&draft.time)?;
+            let synced = sync_start(&spec, &asked)?;
+            let moved = (synced.date() - asked.date()).num_days();
+            (
+                time::shifted(&draft.time, moved)?,
+                Some(rule_from_spec(&spec, &synced)?),
+            )
+        }
+    };
+    let when = time::resolve(&time)?;
+    let mut body = Map::new();
+    for (key, text) in [
+        ("summary", &draft.summary),
+        ("location", &draft.location),
+        ("description", &draft.description),
+    ] {
+        // As typed, untrimmed, as a save sends it; only text that is all blank is left out.
+        if !text.trim().is_empty() {
+            body.insert(key.into(), Value::String(text.clone()));
+        }
+    }
+    body.insert("start".into(), when.start);
+    body.insert("end".into(), when.end);
+    if let Some(show_as) = draft.show_as {
+        body.insert(
+            "transparency".into(),
+            Value::String(show_as.as_transparency().into()),
+        );
+    }
+    if let Some(visibility) = draft.visibility.filter(|v| *v != Visibility::Default) {
+        body.insert(
+            "visibility".into(),
+            Value::String(visibility.as_param().into()),
+        );
+    }
+    if let Some(line) = rule {
+        body.insert("recurrence".into(), Value::from(vec![line]));
+    }
+    Ok(body)
+}
+
+/// Make a one-off repeat by `rule` (C11 §10): its `start`, `end` and `recurrence` into `body`, and
+/// the start it repeats from. The times are the draft's (`time`), or the event's own as the editor
+/// showed them ([`time::time_draft_of`]: each node's zone, else `fallback_zone`, the calendar's or
+/// else this computer's as the editor had it; never UTC, R6), moved to the first day the rule makes
+/// ([`sync_start`]) with their length kept, as a new repeating event's are. Both nodes are always
+/// sent, a timed one naming its `timeZone` (G6): Google's own node, which a save hands back for a
+/// half the user left alone, may have none. A switch between timed and all-day sends the other
+/// kind's keys as `null`, as any save does.
+pub fn add_repeat(
+    body: &mut Map<String, Value>,
+    fresh: &Value,
+    time: Option<&TimeDraft>,
+    rule: &RepeatRule,
+    fallback_zone: Option<&str>,
+) -> Result<SeriesStart, InsertError> {
+    let own;
+    let time = match time {
+        Some(time) => time,
+        // The editor opened on these very nodes in this very zone, so only a node with no zone, and
+        // no zone to read it in, can't be read here.
+        None => {
+            own = time::time_draft_of(fresh, fallback_zone.unwrap_or(""))
+                .ok_or(InsertError::NoEventZone)?;
+            &own
+        }
+    };
+    let spec = rule.to_spec()?;
+    let asked = time::series_start(time)?;
+    let synced = sync_start(&spec, &asked)?;
+    let moved = (synced.date() - asked.date()).num_days();
+    let when = time::resolve(&time::shifted(time, moved)?)?;
+    let line = rule_from_spec(&spec, &synced)?;
+    let (mut start, mut end) = (when.start, when.end);
+    let was_all_day = fresh.get("start").is_some_and(|s| s.get("date").is_some());
+    if was_all_day != when.all_day {
+        for node in [&mut start, &mut end] {
+            drop_other_kind(node);
+        }
+    }
+    body.insert("start".into(), start);
+    body.insert("end".into(), end);
+    body.insert("recurrence".into(), Value::from(vec![line]));
+    Ok(synced)
+}
 
 /// The PATCH body for `draft` against `fresh`, Google's current copy. Empty means Google already
 /// holds exactly this, and nothing should be sent.
@@ -66,6 +246,33 @@ pub fn build_patch(
                 "visibility".into(),
                 Value::String(visibility.as_param().into()),
             );
+        }
+    }
+    let ops = draft.guest_ops();
+    if !ops.is_empty() {
+        // R1: Google's own list with the user's changes, never the editor's list.
+        let list = Value::from(attendees::apply(fresh.get("attendees"), ops));
+        if attendees::guest_set(Some(&list)) != attendees::guest_set(fresh.get("attendees")) {
+            body.insert("attendees".into(), list);
+        }
+    }
+    for (key, default, new) in [
+        ("guestsCanModify", false, draft.guests_can_modify),
+        (
+            "guestsCanInviteOthers",
+            true,
+            draft.guests_can_invite_others,
+        ),
+        (
+            "guestsCanSeeOtherGuests",
+            true,
+            draft.guests_can_see_other_guests,
+        ),
+    ] {
+        if let Some(new) = new {
+            if bool_of(fresh.get(key), default) != new {
+                body.insert(key.into(), Value::Bool(new));
+            }
         }
     }
     if let Some(draft_time) = &draft.time {
@@ -254,6 +461,12 @@ fn visibility_of(event: &Value) -> &str {
         .unwrap_or("default")
 }
 
+/// A flag Google leaves out when it holds its default: `guestsCanModify` false,
+/// `guestsCanInviteOthers` and `guestsCanSeeOtherGuests` true (INFERRED, probe G2).
+pub(crate) fn bool_of(v: Option<&Value>, default: bool) -> bool {
+    v.and_then(Value::as_bool).unwrap_or(default)
+}
+
 /// Whether one patchable field has the same value in `a` and `b`, each a field value as it appears
 /// in an event (or in a PATCH body), `None` when absent.
 fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
@@ -267,9 +480,14 @@ fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
             a.and_then(Value::as_str).unwrap_or("default")
                 == b.and_then(Value::as_str).unwrap_or("default")
         }
-        // A list or an object (`recurrence`, `reminders`, `attendees`…) by value: read as text, any two
-        // would be "" and equal, so a changed one would never be a conflict (G4, found by C8's survey;
-        // no field PM sends today is one).
+        // Who is on it, not each one's reply (R2: someone's RSVP is no conflict).
+        "attendees" => attendees::guest_set(a) == attendees::guest_set(b),
+        // A flag read as text would be "" either way, so any two would match (C12 §3.3).
+        "guestsCanModify" => bool_of(a, false) == bool_of(b, false),
+        "guestsCanInviteOthers" | "guestsCanSeeOtherGuests" => bool_of(a, true) == bool_of(b, true),
+        // A list or an object (`recurrence`, `reminders`…) by value: read as text, any two would be ""
+        // and equal, so a changed one would never be a conflict (G4, found by C8's survey; the guest
+        // list, the one PM sends, has its own arm above).
         _ if [a, b]
             .iter()
             .any(|v| v.is_some_and(|v| v.is_array() || v.is_object())) =>
@@ -308,8 +526,13 @@ pub(crate) fn when_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calendar_write::dto::{ShowAs, TimeDraft, Visibility};
+    use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
+    use crate::calendar_write::dto::{GuestOp, GuestState, ShowAs, TimeDraft, Visibility};
     use serde_json::json;
+
+    fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
 
     /// Google's fresh copy of a one-off event, with fields PM must never touch.
     fn fresh() -> Value {
@@ -376,11 +599,25 @@ mod tests {
             }),
             show_as: Some(ShowAs::Free),
             visibility: Some(Visibility::Private),
+            // A repeat is never a one-event body's: the series planners write it (C11).
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            guests: Some(vec![GuestOp {
+                email: "b@x.org".into(),
+                to: GuestState::Required,
+            }]),
+            guests_can_modify: Some(true),
+            guests_can_invite_others: Some(false),
+            guests_can_see_other_guests: Some(false),
         };
         let body = build_patch(&fresh(), &draft).unwrap();
         for key in body.keys() {
             assert!(PATCHABLE.contains(&key.as_str()), "{key}");
         }
+        assert_eq!(
+            body.len(),
+            11,
+            "every patchable field, the guests' included"
+        );
         for never in [
             "eventType",
             "recurringEventId",
@@ -695,6 +932,625 @@ mod tests {
             delete_still_matches(&seen_none, &no_location),
             DeleteCheck::Matches
         );
+    }
+
+    // --- creating an event (C10) ---
+
+    fn new_event(time: TimeDraft) -> NewEventDraft {
+        NewEventDraft {
+            summary: "Dentist".into(),
+            time,
+            location: "High St".into(),
+            description: "Bring the form\nand a pen".into(),
+            show_as: Some(ShowAs::Free),
+            visibility: Some(Visibility::Private),
+            recurrence: None,
+        }
+    }
+
+    /// `new_event` repeating by `pattern`, every time, until `ends`.
+    fn repeating(time: TimeDraft, pattern: RepeatPattern, ends: RepeatEnds) -> NewEventDraft {
+        NewEventDraft {
+            recurrence: Some(RepeatRule {
+                pattern,
+                interval: 1,
+                ends,
+            }),
+            ..new_event(time)
+        }
+    }
+
+    fn weekly_on(days: &[DayCode]) -> RepeatPattern {
+        RepeatPattern::Weekly {
+            days: days.to_vec(),
+        }
+    }
+
+    /// Every field a create may send, the rule included, and nothing else.
+    #[test]
+    fn insert_body_sends_only_what_a_create_may() {
+        let body = insert_body(&repeating(
+            timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
+            weekly_on(&[DayCode::Mon]),
+            RepeatEnds::After { count: 10 },
+        ))
+        .unwrap();
+        let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "description",
+                "end",
+                "location",
+                "recurrence",
+                "start",
+                "summary",
+                "transparency",
+                "visibility"
+            ]
+        );
+        assert!(keys.iter().all(|k| CREATABLE.contains(k)));
+        assert_eq!(body["summary"], "Dentist");
+        assert_eq!(body["description"], "Bring the form\nand a pen");
+        assert_eq!(body["transparency"], "transparent");
+        assert_eq!(body["visibility"], "private");
+        assert_eq!(
+            body["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10"])
+        );
+        assert!(!body.contains_key("id"), "the insert request writes the id");
+        // No rule, no `recurrence` at all.
+        let once = insert_body(&new_event(timed(
+            "2026-10-26",
+            "10:00",
+            "2026-10-26",
+            "11:00",
+        )))
+        .unwrap();
+        assert!(!once.contains_key("recurrence"));
+    }
+
+    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4): a create still sends a save's
+    /// fields as they were before guests, and the rule, exactly; C12d adds the guests' four.
+    #[test]
+    fn creatable_is_the_c11_list_with_no_guests() {
+        assert_eq!(
+            CREATABLE,
+            [
+                "summary",
+                "location",
+                "description",
+                "start",
+                "end",
+                "transparency",
+                "visibility",
+                "recurrence"
+            ]
+        );
+        let guests = [
+            "attendees",
+            "guestsCanModify",
+            "guestsCanInviteOthers",
+            "guestsCanSeeOtherGuests",
+        ];
+        let before_guests: Vec<&str> = PATCHABLE
+            .iter()
+            .copied()
+            .filter(|k| !guests.contains(k))
+            .chain(["recurrence"])
+            .collect();
+        assert_eq!(CREATABLE, before_guests.as_slice());
+    }
+
+    /// A one-off made to repeat may send whatever a save may, and the rule (C11 §10): guests changed
+    /// in the same save go too.
+    #[test]
+    fn repeat_patchable_is_patchable_and_the_rule() {
+        let mut expected: Vec<&str> = PATCHABLE.to_vec();
+        expected.push("recurrence");
+        assert_eq!(REPEAT_PATCHABLE, expected.as_slice());
+    }
+
+    // --- guests (C12) ---
+
+    fn me() -> Value {
+        json!({ "email": "me@example.com", "self": true, "organizer": true,
+                "responseStatus": "accepted" })
+    }
+
+    fn guest_a(reply: &str) -> Value {
+        json!({ "email": "A@x.org", "responseStatus": reply, "comment": "late",
+                "additionalGuests": 1, "id": "g1" })
+    }
+
+    fn with_guests(list: Vec<Value>) -> Value {
+        let mut event = fresh();
+        event["attendees"] = Value::from(list);
+        event
+    }
+
+    fn adding(email: &str, to: GuestState) -> EventPatchDraft {
+        EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: email.into(),
+                to,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// R1: the list sent is Google's own with the change, every key Google sent kept.
+    #[test]
+    fn a_guest_change_is_sent_as_googles_list_with_the_change() {
+        let event = with_guests(vec![me(), guest_a("accepted")]);
+        let add = adding("b@x.org", GuestState::Required);
+        let body = build_patch(&event, &add).unwrap();
+        assert!(
+            Value::Object(body.clone())
+                == json!({ "attendees": [me(), guest_a("accepted"), { "email": "b@x.org" }] }),
+            "O1 through the save"
+        );
+        assert!(
+            body["attendees"]
+                == Value::from(attendees::apply(event.get("attendees"), add.guest_ops())),
+            "exactly the ops on Google's list"
+        );
+        let off = adding("a@x.org", GuestState::Absent);
+        assert!(
+            Value::Object(build_patch(&event, &off).unwrap()) == json!({ "attendees": [me()] }),
+            "O3 through the save"
+        );
+    }
+
+    /// O7: a change Google already holds sends nothing, as a title typed back to itself doesn't.
+    #[test]
+    fn a_guest_change_google_already_holds_sends_nothing() {
+        let event = with_guests(vec![me(), guest_a("accepted")]);
+        for draft in [
+            adding("A@X.ORG", GuestState::Required),
+            adding("c@x.org", GuestState::Absent),
+        ] {
+            assert!(build_patch(&event, &draft).unwrap().is_empty());
+        }
+    }
+
+    /// Each permission is sent only when it differs from Google's, its default read in.
+    #[test]
+    fn guest_permissions_are_sent_only_when_they_differ() {
+        let perm = |modify, invite, see| EventPatchDraft {
+            guests_can_modify: modify,
+            guests_can_invite_others: invite,
+            guests_can_see_other_guests: see,
+            ..Default::default()
+        };
+        assert!(build_patch(&fresh(), &perm(None, Some(true), Some(true)))
+            .unwrap()
+            .is_empty());
+        assert!(
+            Value::Object(build_patch(&fresh(), &perm(Some(false), Some(false), None)).unwrap())
+                == json!({ "guestsCanInviteOthers": false }),
+            "only what differs"
+        );
+        let mut modifiable = fresh();
+        modifiable["guestsCanModify"] = json!(true);
+        assert!(build_patch(&modifiable, &perm(Some(true), None, None))
+            .unwrap()
+            .is_empty());
+        assert!(
+            Value::Object(build_patch(&fresh(), &perm(Some(true), None, Some(false))).unwrap())
+                == json!({ "guestsCanModify": true, "guestsCanSeeOtherGuests": false }),
+            "both"
+        );
+    }
+
+    /// The plan's "rebase after someone else's RSVP": a reply that landed since the editor opened is
+    /// no conflict, and the list sent carries it.
+    #[test]
+    fn someone_elses_reply_is_no_conflict() {
+        let base = with_guests(vec![me(), guest_a("needsAction")]);
+        let fresh = with_guests(vec![me(), guest_a("accepted")]);
+        let body = build_patch(&fresh, &adding("b@x.org", GuestState::Required)).unwrap();
+        assert_eq!(update_check(&base, &fresh, &body), UpdateCheck::Proceed);
+        assert_eq!(body["attendees"][1]["responseStatus"], "accepted");
+    }
+
+    /// R2: a guest added, taken off or made optional in Google since the editor opened is a conflict.
+    #[test]
+    fn a_guest_added_in_google_meanwhile_is_a_conflict() {
+        let base = with_guests(vec![me(), guest_a("accepted")]);
+        let c = json!({ "email": "c@x.org" });
+        let mut optional = guest_a("accepted");
+        optional["optional"] = json!(true);
+        for fresh in [
+            with_guests(vec![me(), guest_a("accepted"), c]),
+            with_guests(vec![me()]),
+            with_guests(vec![me(), optional]),
+        ] {
+            let body = build_patch(&fresh, &adding("b@x.org", GuestState::Required)).unwrap();
+            assert_eq!(
+                update_check(&base, &fresh, &body),
+                UpdateCheck::Conflict(vec!["attendees".into()])
+            );
+        }
+    }
+
+    /// After a lost answer, Google's copy holds the guests sent when it has the same people, whatever
+    /// keys Google added to them.
+    #[test]
+    fn a_landed_guest_change_reads_as_applied() {
+        let body = build_patch(
+            &with_guests(vec![me(), guest_a("accepted")]),
+            &adding("b@x.org", GuestState::Required),
+        )
+        .unwrap();
+        let landed = with_guests(vec![
+            me(),
+            guest_a("declined"),
+            json!({ "email": "b@x.org", "responseStatus": "needsAction", "id": "g2" }),
+        ]);
+        assert!(already_applied(&landed, &body));
+        let without = with_guests(vec![me(), guest_a("accepted")]);
+        assert!(!already_applied(&without, &body));
+    }
+
+    /// C12 §3.3: a flag read as text was "" either way, so any two compared equal; they compare as
+    /// Google means them, its defaults filled in.
+    #[test]
+    fn booleans_compare_as_google_means_them() {
+        let (on, off) = (json!(true), json!(false));
+        assert!(!field_eq("guestsCanModify", Some(&on), None));
+        assert!(field_eq("guestsCanModify", Some(&off), None));
+        assert!(field_eq("guestsCanInviteOthers", Some(&on), None));
+        assert!(!field_eq("guestsCanInviteOthers", Some(&off), None));
+        assert!(!field_eq("guestsCanSeeOtherGuests", Some(&off), None));
+        assert!(field_eq("guestsCanSeeOtherGuests", Some(&on), Some(&on)));
+        // So a lost save of a flag isn't read as landed when Google doesn't hold it.
+        let body: Map<String, Value> = [("guestsCanModify".to_string(), on.clone())]
+            .into_iter()
+            .collect();
+        assert!(!already_applied(&fresh(), &body));
+    }
+
+    /// G6: a weekly event on its own weekday sends one rule line, and both nodes name the zone.
+    #[test]
+    fn a_repeating_insert_sends_one_rule_and_names_its_zone() {
+        let body = insert_body(&repeating(
+            timed("2026-10-13", "09:00", "2026-10-13", "10:00"),
+            weekly_on(&[DayCode::Tue]),
+            RepeatEnds::Never,
+        ))
+        .unwrap();
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=TU"]));
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-13T09:00:00+01:00", "timeZone": "Europe/London" })
+        );
+        assert_eq!(body["end"]["timeZone"], "Europe/London");
+    }
+
+    /// A27 (live test L-R10's case): Monday and Wednesday chosen on a Tuesday starts on the
+    /// Wednesday, and the hour's length goes with it.
+    #[test]
+    fn a_repeating_insert_starts_on_the_first_day_its_rule_makes() {
+        let body = insert_body(&repeating(
+            timed("2026-10-13", "09:00", "2026-10-13", "10:00"),
+            weekly_on(&[DayCode::Wed, DayCode::Mon]),
+            RepeatEnds::OnDate {
+                date: "2026-12-31".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-14T09:00:00+01:00", "timeZone": "Europe/London" })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "dateTime": "2026-10-14T10:00:00+01:00", "timeZone": "Europe/London" })
+        );
+        // The end date's last second in London, as UTC (GMT by then).
+        assert_eq!(
+            body["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261231T235959Z"])
+        );
+    }
+
+    /// An all-day repeating event names days only (probe P-R1): no zone on either node.
+    #[test]
+    fn an_all_day_repeating_insert_sends_dates_only() {
+        let body = insert_body(&repeating(
+            TimeDraft::AllDay {
+                first_day: "2026-10-26".into(),
+                last_day: "2026-10-26".into(),
+            },
+            RepeatPattern::Daily,
+            RepeatEnds::Never,
+        ))
+        .unwrap();
+        assert_eq!(body["start"], json!({ "date": "2026-10-26" }));
+        assert_eq!(body["end"], json!({ "date": "2026-10-27" }));
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=DAILY"]));
+    }
+
+    /// London skips 01:00-02:00 on Sunday 29-03-2026. A Sunday rule chosen at 01:30 on the Saturday
+    /// would start in it; an end the move puts in it is refused as any end in a gap is.
+    #[test]
+    fn a_repeating_insert_in_a_gap_is_refused() {
+        let gap = insert_body(&repeating(
+            timed("2026-03-28", "01:30", "2026-03-28", "03:00"),
+            weekly_on(&[DayCode::Sun]),
+            RepeatEnds::Never,
+        ));
+        assert!(gap == Err(InsertError::Rule(SpecError::Gap(day(2026, 3, 29)))));
+        assert_eq!(
+            gap.unwrap_err().to_string(),
+            "The first occurrence would be on 29-03-2026, when the clocks skip that time. Pick a \
+             time outside that hour."
+        );
+        let end_gap = insert_body(&repeating(
+            timed("2026-03-27", "23:00", "2026-03-28", "01:30"),
+            weekly_on(&[DayCode::Sat]),
+            RepeatEnds::Never,
+        ));
+        assert!(matches!(
+            end_gap,
+            Err(InsertError::Time(TimeError::Gap { .. }))
+        ));
+    }
+
+    /// Google allows 730 occurrences (Help 37115): 731 builds nothing to send.
+    #[test]
+    fn a_rule_past_730_builds_nothing() {
+        let draft = |count: u16| {
+            repeating(
+                timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
+                RepeatPattern::Daily,
+                RepeatEnds::After { count },
+            )
+        };
+        assert!(insert_body(&draft(731)) == Err(InsertError::Rule(SpecError::TooMany)));
+        assert_eq!(
+            insert_body(&draft(730)).unwrap()["recurrence"],
+            json!(["RRULE:FREQ=DAILY;COUNT=730"])
+        );
+        // An end date PM can't read, or a time it can't, is said in its own words.
+        let unread = NewEventDraft {
+            recurrence: Some(RepeatRule {
+                pattern: RepeatPattern::Daily,
+                interval: 1,
+                ends: RepeatEnds::OnDate {
+                    date: "31-12-2026".into(),
+                },
+            }),
+            ..draft(1)
+        };
+        assert!(insert_body(&unread) == Err(InsertError::Rule(SpecError::BadDate)));
+        let bad_time = repeating(
+            timed("2026-10-26", "late", "2026-10-26", "11:00"),
+            RepeatPattern::Daily,
+            RepeatEnds::Never,
+        );
+        assert!(
+            insert_body(&bad_time) == Err(InsertError::Time(TimeError::BadTime("late".into())))
+        );
+    }
+
+    fn weekly_rule(days: &[DayCode]) -> RepeatRule {
+        RepeatRule {
+            pattern: RepeatPattern::Weekly {
+                days: days.to_vec(),
+            },
+            interval: 1,
+            ends: RepeatEnds::Never,
+        }
+    }
+
+    /// C11 §10: a one-off given a repeat, its time left alone, starts on the first day the rule
+    /// makes at its own wall time and length, both nodes naming their zone even where Google's own
+    /// had none; it repeats from there.
+    #[test]
+    fn a_repeat_given_to_a_one_off_starts_on_the_rules_first_day_with_its_zone() {
+        let mut bare = fresh();
+        bare["start"] = json!({ "dateTime": "2026-10-12T10:00:00+01:00" });
+        bare["end"] = json!({ "dateTime": "2026-10-12T11:30:00+01:00" });
+        let mut body = build_patch(&bare, &EventPatchDraft::default()).unwrap();
+        let start = add_repeat(
+            &mut body,
+            &bare,
+            None,
+            &weekly_rule(&[DayCode::Wed]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(start.date(), day(2026, 10, 14));
+        assert_eq!(
+            Value::Object(body),
+            json!({
+                "start": { "dateTime": "2026-10-14T10:00:00+01:00", "timeZone": "Europe/London" },
+                "end": { "dateTime": "2026-10-14T11:30:00+01:00", "timeZone": "Europe/London" },
+                "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=WE"],
+            })
+        );
+        // A node with no zone, and no zone to read it in, is never read as UTC (R6), and says so of
+        // the event, not this computer (C11d review 1).
+        let mut body = Map::new();
+        let refused = add_repeat(&mut body, &bare, None, &weekly_rule(&[DayCode::Wed]), None);
+        assert!(refused == Err(InsertError::NoEventZone));
+        assert!(body.is_empty(), "nothing built");
+        assert_eq!(
+            InsertError::NoEventZone.to_string(),
+            "PM can't tell which time zone this event is in, so it can't make it repeat."
+        );
+    }
+
+    /// C11d review 1: an all-day one-off given a repeat and a time clears its dates, as any save's
+    /// switch does.
+    #[test]
+    fn a_repeat_given_with_a_switch_to_timed_clears_the_other_kind() {
+        let mut all_day = fresh();
+        all_day["start"] = json!({ "date": "2026-10-12" });
+        all_day["end"] = json!({ "date": "2026-10-13" });
+        let at_ten = timed("2026-10-12", "10:00", "2026-10-12", "11:00");
+        let draft = EventPatchDraft {
+            time: Some(at_ten.clone()),
+            ..Default::default()
+        };
+        let mut body = build_patch(&all_day, &draft).unwrap();
+        add_repeat(
+            &mut body,
+            &all_day,
+            Some(&at_ten),
+            &weekly_rule(&[DayCode::Mon]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({
+                "dateTime": "2026-10-12T10:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(
+            body["end"],
+            json!({
+                "dateTime": "2026-10-12T11:00:00+01:00",
+                "timeZone": "Europe/London",
+                "date": null
+            })
+        );
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]));
+    }
+
+    /// The draft's own time wins, and a switch to all day clears the timed keys, as any save's does.
+    #[test]
+    fn a_repeat_given_with_a_switch_to_all_day_clears_the_other_kind() {
+        let all_day = TimeDraft::AllDay {
+            first_day: "2026-10-12".into(),
+            last_day: "2026-10-12".into(),
+        };
+        let draft = EventPatchDraft {
+            time: Some(all_day.clone()),
+            ..Default::default()
+        };
+        let mut body = build_patch(&fresh(), &draft).unwrap();
+        add_repeat(
+            &mut body,
+            &fresh(),
+            Some(&all_day),
+            &weekly_rule(&[DayCode::Mon]),
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "date": "2026-10-12", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "date": "2026-10-13", "dateTime": null, "timeZone": null })
+        );
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]));
+        // A rule outside the limits builds nothing.
+        let mut body = Map::new();
+        let too_many = RepeatRule {
+            ends: RepeatEnds::After { count: 731 },
+            ..weekly_rule(&[DayCode::Mon])
+        };
+        assert!(
+            add_repeat(&mut body, &fresh(), None, &too_many, Some("Europe/London"))
+                == Err(InsertError::Rule(SpecError::TooMany))
+        );
+        assert!(body.is_empty());
+    }
+
+    /// Blank text is left out, so Google stores no empty strings; text with words in is sent as
+    /// typed, spaces and all.
+    #[test]
+    fn an_empty_title_and_empty_text_are_left_out() {
+        let draft = NewEventDraft {
+            summary: "   ".into(),
+            location: String::new(),
+            description: "\n ".into(),
+            ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+        };
+        let body = insert_body(&draft).unwrap();
+        for key in ["summary", "location", "description"] {
+            assert!(!body.contains_key(key), "{key}");
+        }
+        let spaced = NewEventDraft {
+            summary: " Dentist ".into(),
+            ..draft
+        };
+        assert_eq!(insert_body(&spaced).unwrap()["summary"], " Dentist ");
+    }
+
+    /// A flight: each half carries its own zone and offset.
+    #[test]
+    fn a_timed_insert_names_its_zones() {
+        let body = insert_body(&new_event(TimeDraft::Timed {
+            start_date: "2026-10-26".into(),
+            start_time: "10:00".into(),
+            start_zone: "Europe/London".into(),
+            end_date: "2026-10-26".into(),
+            end_time: "13:00".into(),
+            end_zone: "America/New_York".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-26T10:00:00+00:00", "timeZone": "Europe/London" })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "dateTime": "2026-10-26T13:00:00-04:00", "timeZone": "America/New_York" })
+        );
+    }
+
+    #[test]
+    fn an_all_day_insert_ends_the_day_after() {
+        let body = insert_body(&new_event(TimeDraft::AllDay {
+            first_day: "2026-10-26".into(),
+            last_day: "2026-10-26".into(),
+        }))
+        .unwrap();
+        assert_eq!(body["start"], json!({ "date": "2026-10-26" }));
+        assert_eq!(body["end"], json!({ "date": "2026-10-27" }));
+    }
+
+    #[test]
+    fn a_gap_or_an_end_before_start_builds_nothing() {
+        let gap = insert_body(&new_event(timed(
+            "2026-03-29",
+            "01:30",
+            "2026-03-29",
+            "03:00",
+        )));
+        assert!(matches!(gap, Err(InsertError::Time(TimeError::Gap { .. }))));
+        for end in ["10:00", "09:00"] {
+            let backwards =
+                insert_body(&new_event(timed("2026-10-26", "10:00", "2026-10-26", end)));
+            assert!(
+                matches!(backwards, Err(InsertError::Time(TimeError::EndBeforeStart))),
+                "{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_visibility_and_no_show_as_are_left_out() {
+        for visibility in [None, Some(Visibility::Default)] {
+            let body = insert_body(&NewEventDraft {
+                show_as: None,
+                visibility,
+                ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+            })
+            .unwrap();
+            assert!(!body.contains_key("transparency"));
+            assert!(!body.contains_key("visibility"), "{visibility:?}");
+        }
     }
 
     #[test]

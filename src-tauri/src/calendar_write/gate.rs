@@ -6,11 +6,14 @@
 //! save runs it again on a fresh copy from Google before sending anything. It fails closed: a role or
 //! an event type PM doesn't know reads as read-only, never as editable.
 //!
-//! The first layers edit only solo, one-off events you organise. Repeating events, events with
-//! guests and invitations are read-only with a reason until the layers that handle them (C9, C12,
-//! C14) lift that reason, each replacing it with the rule it stood in for (rule R9). A one-off that
-//! Google has since turned into a repeating event is read-only with its own reason on every path,
-//! since a write to it would change every occurrence with no choice asked.
+//! Events PM can change are the ones you organise on a calendar you can edit. The first layers
+//! edited only solo, one-off events; repeating events (C9) and events with guests (C12) are now
+//! editable, each with the choice it stood in for (rule R9): a change to an occurrence names which
+//! occurrences it's for ("this event", "this and following", "all events"), a change Google would
+//! email guests about names whether it should, and a write without that choice is asked again.
+//! Invitations stay read-only until C14. A one-off that Google has since turned into a repeating
+//! event is read-only with its own reason on every path, since a write to it would change every
+//! occurrence with no choice asked.
 
 use crate::calendar_editing::EditingStatus;
 
@@ -30,14 +33,11 @@ pub struct EditFacts<'a> {
     pub organizer_self: bool,
     pub locked: bool,
     pub visibility: Option<&'a str>,
-    pub recurring: bool,
     /// Google's copy is a repeating event's series itself (its rule, no `recurringEventId`), while PM
     /// asked about one event: a one-off that had a rule added in Google since. Saving or deleting it
     /// would change every occurrence with no choice asked (C9 design §0.7, critique 2 M6). Known only
     /// from a fresh copy; the mirror never holds a series itself.
     pub series_master: bool,
-    /// Guests besides the calendar itself.
-    pub has_guests: bool,
     /// The description is formatted. Known only from a fresh copy (the mirror clips descriptions).
     pub html_description: bool,
 }
@@ -54,16 +54,19 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         description: true,
         show_as: true,
         visibility: true,
+        guests: true,
         delete: true,
         reasons: Vec::new(),
     };
     if facts.locked {
         // Google refuses changes to a locked copy's summary, description, location, start, end and
-        // recurrence. Whether it lets the copy be deleted isn't documented, so PM doesn't offer it.
+        // recurrence. Whether it lets the copy be deleted, or its guests change, isn't documented,
+        // so PM offers neither (INFERRED: fails closed, C12 §4.4).
         perms.summary = false;
         perms.time = false;
         perms.location = false;
         perms.description = false;
+        perms.guests = false;
         perms.delete = false;
         perms.reasons.push(ReadOnlyReason::Locked);
     }
@@ -83,6 +86,28 @@ pub fn edit_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
     } else {
         perms.reasons.first().copied()
     }
+}
+
+/// Why PM may not create an event with `visibility` on a calendar, or `None` when it may: the account
+/// and calendar rules of [`edit_rights`], for an event that would be a solo one-off you organise.
+/// Q1: a `writerWithoutPrivateAccess` calendar takes every event but a private one. `google` holds
+/// already: the caller resolved the calendar, and a feed or an Outlook calendar never gets here.
+pub fn create_block(
+    editing: EditingStatus,
+    access_role: Option<&str>,
+    visibility: Option<&str>,
+) -> Option<ReadOnlyReason> {
+    blanket_reason(&EditFacts {
+        google: true,
+        editing,
+        access_role,
+        event_type: None,
+        organizer_self: true,
+        locked: false,
+        visibility,
+        series_master: false,
+        html_description: false,
+    })
 }
 
 /// The reason nothing at all may change, checked account first, then calendar, then the event
@@ -113,15 +138,8 @@ fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
     if !facts.organizer_self {
         return Some(ReadOnlyReason::NotOrganizer);
     }
-    // Before `recurring`: a copy turned into a series has both, and its own reason says what to do.
     if facts.series_master {
         return Some(ReadOnlyReason::BecameRepeating);
-    }
-    if facts.recurring {
-        return Some(ReadOnlyReason::Recurring);
-    }
-    if facts.has_guests {
-        return Some(ReadOnlyReason::HasGuests);
     }
     None
 }
@@ -141,9 +159,7 @@ mod tests {
             organizer_self: true,
             locked: false,
             visibility: None,
-            recurring: false,
             series_master: false,
-            has_guests: false,
             html_description: false,
         }
     }
@@ -153,6 +169,8 @@ mod tests {
         let perms = edit_rights(&editable());
         assert!(perms.summary && perms.time && perms.location && perms.description);
         assert!(perms.show_as && perms.visibility && perms.delete);
+        // Guests may change wherever the rest may (C12).
+        assert!(perms.guests);
         assert!(perms.reasons.is_empty());
         assert_eq!(edit_block(&editable()), None);
         // Absent eventType is Google's documented default.
@@ -292,43 +310,10 @@ mod tests {
             ),
             (
                 EditFacts {
-                    recurring: true,
-                    ..e()
-                },
-                Recurring,
-            ),
-            (
-                EditFacts {
                     series_master: true,
                     ..e()
                 },
                 BecameRepeating,
-            ),
-            // A copy turned into a series also repeats: its own reason is the one shown.
-            (
-                EditFacts {
-                    series_master: true,
-                    recurring: true,
-                    ..e()
-                },
-                BecameRepeating,
-            ),
-            (
-                EditFacts {
-                    has_guests: true,
-                    ..e()
-                },
-                HasGuests,
-            ),
-            // The first reason wins: a read-only shared calendar outranks "it repeats".
-            (
-                EditFacts {
-                    access_role: Some("reader"),
-                    recurring: true,
-                    has_guests: true,
-                    ..e()
-                },
-                CalendarReadOnly,
             ),
             // A read-only shared calendar outranks "it became a repeating event".
             (
@@ -361,6 +346,58 @@ mod tests {
         }
     }
 
+    /// Who may create where (C10): the account's editing first, then the calendar's role, with Q1's
+    /// one exception for a private event on a calendar that can't hold one.
+    #[test]
+    fn create_block_follows_q1() {
+        let on = EditingStatus::On;
+        let cases = [
+            (on, Some("owner"), None, None),
+            (on, Some("owner"), Some("private"), None),
+            (on, Some("writer"), Some("confidential"), None),
+            (on, Some("writerWithoutPrivateAccess"), None, None),
+            (
+                on,
+                Some("writerWithoutPrivateAccess"),
+                Some("default"),
+                None,
+            ),
+            (on, Some("writerWithoutPrivateAccess"), Some("public"), None),
+            (
+                on,
+                Some("writerWithoutPrivateAccess"),
+                Some("private"),
+                Some(PrivateEvent),
+            ),
+            (
+                on,
+                Some("writerWithoutPrivateAccess"),
+                Some("confidential"),
+                Some(PrivateEvent),
+            ),
+            (on, Some("reader"), None, Some(CalendarReadOnly)),
+            (on, Some("freeBusyReader"), None, Some(CalendarReadOnly)),
+            (on, None, None, Some(CalendarReadOnly)),
+            (on, Some("someNewRole"), None, Some(CalendarReadOnly)),
+            // Editing comes before the role: an account that can't write says so first.
+            (EditingStatus::Paused, Some("owner"), None, Some(EditingOff)),
+            (
+                EditingStatus::NeedsConsent,
+                Some("owner"),
+                None,
+                Some(EditingOff),
+            ),
+            (EditingStatus::Off, Some("reader"), None, Some(EditingOff)),
+        ];
+        for (editing, role, visibility, want) in cases {
+            assert_eq!(
+                create_block(editing, role, visibility),
+                want,
+                "{editing:?} {role:?} {visibility:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_locked_copy_keeps_only_what_google_lets_it_change() {
         let perms = edit_rights(&EditFacts {
@@ -369,6 +406,8 @@ mod tests {
         });
         assert!(!perms.summary && !perms.time && !perms.location && !perms.description);
         assert!(!perms.delete);
+        // Not among Google's locked fields, but undocumented, so closed (C12 §4.4).
+        assert!(!perms.guests);
         assert!(perms.show_as && perms.visibility);
         assert_eq!(perms.reasons, vec![Locked]);
         // Something can still change, so the list offers Edit.

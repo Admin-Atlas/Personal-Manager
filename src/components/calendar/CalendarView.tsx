@@ -9,7 +9,9 @@
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
 // on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. A synced event opens its
 // detail popover, where a Google event PM may change offers Edit and Delete (#884; every change goes
-// through `edit/useEventWrites`); everything else stays read-only. The two first-party overlays — project
+// through `edit/useEventWrites`); "+ New event" and `c` open the editor for a new one, on a calendar
+// the user picks, and Shift+C a quick box under the button, whose draft is drawn on the grid as it's
+// typed (C10); everything else stays read-only. The two first-party overlays — project
 // milestones (click opens their project) and freeform pinboard timeline entries (click opens the
 // Pinboard) — are each an all-day event in its own hue, injected here and never written back to any
 // calendar.
@@ -27,11 +29,21 @@ import {
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import { reasonText } from "../../lib/calendarEdit/editReasons";
+import { guestSuggestions } from "../../lib/calendarEdit/guests";
+import {
+  createdWhere,
+  createReasonFor,
+  createTargets,
+  defaultTarget,
+  lengthFor,
+} from "../../lib/calendarEdit/createTargets";
+import { newEventSeed, type EditorFields } from "../../lib/calendarEdit/eventDraft";
 import {
   clampDayCount,
   readCursorDay,
   readDayCount,
   readHidden,
+  readLastCreate,
   readOpenOn,
   readRange,
   readRangeBounds,
@@ -56,7 +68,10 @@ import { formatDateLocal } from "../../lib/format";
 import {
   addDays,
   dayKey,
+  draftEvent,
   eventDaySpan,
+  ghostAfterRead,
+  isDraftEvent,
   isMilestoneEvent,
   isOverlayEvent,
   isPinboardEvent,
@@ -65,10 +80,13 @@ import {
   PINBOARD_CALENDAR_ID,
   startOfDay,
   startOfWeek,
+  type DraftState,
+  type LandedGhost,
 } from "../../lib/calendar-layout";
 import { pinboardEntries, type PinboardEntry } from "../../lib/pinboard/calendarEntries";
 import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
 import {
+  deviceTimeZoneOrNull,
   milestoneColor,
   pinboardColor,
   sourceColors,
@@ -83,8 +101,10 @@ import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
 import { EventEditor } from "./edit/EventEditor";
+import { NewEventEditor, type CreateHandover } from "./edit/NewEventEditor";
+import { QuickCreatePopover, type LeftDraft } from "./edit/QuickCreatePopover";
 import { WriteNotices } from "./edit/WriteNotices";
-import { pruneRemoved, undoLatest, useEventWrites } from "./edit/useEventWrites";
+import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -105,6 +125,12 @@ let cachedEvents: CalendarEvent[] = [];
 let cachedOverview: CalendarOverview | null = null;
 let cachedMilestones: Milestone[] = [];
 let cachedPinboard: PinboardEntry[] = [];
+// A quick-create draft whose box went with the tab, titled and with nothing sent (a click in the
+// sidebar switches tabs, and a titled box stays through a click): it opens again on return.
+let leftQuick: LeftDraft | null = null;
+const leaveQuick = (left: LeftDraft) => {
+  leftQuick = left;
+};
 
 /** How many days the grid shows for a view. Week is 7 by definition; Day is the user's chosen
  *  width (1-6). Anything else isn't a day grid. */
@@ -239,9 +265,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const [error, setError] = useState<string | null>(null);
   const [eventsFailed, setEventsFailed] = useState(false);
   const aliveRef = useRef(true);
-  // Monotonic token so an older in-flight events read (e.g. a focus refresh) can't overwrite a newer
-  // one that resolved first.
-  const eventsSeqRef = useRef(0);
   const now = useNowTick();
 
   useEffect(() => {
@@ -251,23 +274,32 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     };
   }, []);
 
-  const loadEvents = useCallback(async () => {
-    const seq = ++eventsSeqRef.current;
-    try {
-      const evts = await listAllCalendarEvents();
-      if (!aliveRef.current || seq !== eventsSeqRef.current) return;
-      setEvents(evts);
-      cachedEvents = evts;
-      pruneRemoved(evts);
-      setEventsFailed(false);
-    } catch {
-      // Keep the last-good events; a read failure is transient. Flag it only when we have nothing to
-      // show, so the empty grid isn't mistaken for "no events".
-      if (aliveRef.current && seq === eventsSeqRef.current && cachedEvents.length === 0) {
-        setEventsFailed(true);
-      }
-    }
+  // A quick create that saved: its ghost (the new event as it was typed) stays until a read of the
+  // mirror that started after the save has landed, so the event doesn't blink out between the box
+  // closing and its row arriving (`ghostAfterRead`).
+  const [landed, setLanded] = useState<LandedGhost | null>(null);
+  const readsStarted = useRef(0);
+  const readEvents = useCallback(() => {
+    readsStarted.current += 1;
+    return listAllCalendarEvents();
   }, []);
+  const applyEvents = useCallback((evts: CalendarEvent[]) => {
+    setEvents(evts);
+    cachedEvents = evts;
+    setEventsFailed(false);
+    // Only the newest read started is applied, so this is it.
+    const started = readsStarted.current;
+    setLanded((l) => ghostAfterRead(l, started));
+  }, []);
+  const eventsReadFailed = useCallback(() => {
+    // Keep the last-good events; a read failure is transient. Flag it only when we have nothing to
+    // show, so the empty grid isn't mistaken for "no events".
+    if (cachedEvents.length === 0) setEventsFailed(true);
+  }, []);
+  // Only the newest read applies (an older in-flight one, e.g. a focus refresh, can't overwrite a
+  // newer one that resolved first), and each is marked, so rows a delete hid are shown again only
+  // by a read that knows how it ended. A delete that settles reads again.
+  const loadEvents = useMirrorReads(readEvents, applyEvents, eventsReadFailed);
 
   const loadMilestones = useCallback(async () => {
     try {
@@ -454,22 +486,136 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   useEffect(() => {
     popoverOpenRef.current = eventPopup !== null;
   }, [eventPopup]);
+  const popoverOpen = useCallback(() => popoverOpenRef.current, []);
   // The popover's own close, which hands focus back as its Escape does (it fills this in).
   const popoverCloseRef = useRef<(() => void) | null>(null);
+
+  // A new event being made (#884, C10): its starting fields and calendar, and where: the full editor,
+  // or quick create under "+ New event" (`anchor`, the button's rect), which More options turns into
+  // the full editor carrying its draft (`handover`), and which opens again on a draft that went with
+  // the tab (`resume`). Null = closed.
+  const [creating, setCreating] = useState<{
+    seed: EditorFields;
+    calendarId: string;
+    mode: "quick" | "full";
+    anchor: DOMRect | null;
+    handover?: CreateHandover;
+    resume?: LeftDraft;
+  } | null>(null);
+  // The open surface's way to bring its title into focus: "+ New event" again, or a click on the
+  // ghost, focuses it, never replaces it.
+  const focusCreateRef = useRef<(() => void) | null>(null);
+  // "+ New event": quick create opens under it, and focus goes back to it when that closes.
+  const createButtonRef = useRef<HTMLButtonElement>(null);
+  // Quick create's draft as it's typed, and how far it has got, for the ghost on the grid. The ref is
+  // for its close, which turns the last of it into the ghost that waits for the saved row.
+  const [quickDraft, setQuickDraft] = useState<{
+    draft: EditorFields;
+    calendarId: string;
+    state: DraftState;
+  } | null>(null);
+  const quickDraftRef = useRef(quickDraft);
+  const onQuickDraft = useCallback((draft: EditorFields, calendarId: string, state: DraftState) => {
+    quickDraftRef.current = { draft, calendarId, state };
+    setQuickDraft(quickDraftRef.current);
+  }, []);
+  // Where a new event can go. With no Google account there's no button at all; with one but no
+  // calendar to take an event, the button says why.
+  const targets = useMemo(() => (overview ? createTargets(overview) : null), [overview]);
+  const hasGoogle = overview?.accounts.some((a) => a.provider === "google") ?? false;
+  const createReason = overview && targets ? createReasonFor(overview, targets) : null;
+  // "+ New event" and `c` open the full editor; Shift+C quick create under the button (as Google's
+  // keys do; without the button on screen, the full editor). Either starts on the calendar last
+  // created in (else the primary), at the next half hour today when today is on screen, else at
+  // 09:00 on the day the view is on, for the account's own default length. Times are this
+  // computer's; without its zone, the calendar's (and then nothing can be saved, which they say).
+  const startCreate = useCallback(
+    (mode: "quick" | "full") => {
+      if (creating) {
+        focusCreateRef.current?.();
+        return;
+      }
+      if (!overview || !targets) return;
+      const target = defaultTarget(targets, readLastCreate());
+      if (!target) return;
+      const anchor =
+        mode === "quick" ? (createButtonRef.current?.getBoundingClientRect() ?? null) : null;
+      const now = new Date();
+      const { start, end } = visibleRange(view, cursor, dayCount);
+      const today = startOfDay(now).getTime();
+      const day = today >= start.getTime() && today < end.getTime() ? now : cursor;
+      const zone = deviceTimeZoneOrNull() ?? target.calendar.time_zone ?? null;
+      // A saved event's ghost still waiting for its row gives way to the new one.
+      setLanded(null);
+      setCreating({
+        seed: newEventSeed(dayKey(startOfDay(day)), now, zone, lengthFor(overview, target)),
+        calendarId: target.calendar.id,
+        mode: anchor ? mode : "full",
+        anchor,
+      });
+    },
+    [creating, overview, targets, view, cursor, dayCount],
+  );
+  const openCreate = useCallback(() => startCreate("full"), [startCreate]);
+
+  // Quick create closed: when it saved, its last draft stays drawn until a read that started after
+  // the save lands (one starts now: the read the save itself set off may have begun before it).
+  const onQuickClose = useCallback(
+    (saved: boolean) => {
+      const last = quickDraftRef.current;
+      const ev = saved && last ? draftEvent(last.draft, last.calendarId, "saved") : null;
+      if (ev) {
+        setLanded({ ev, after: readsStarted.current });
+        void loadEvents();
+      }
+      quickDraftRef.current = null;
+      setQuickDraft(null);
+      setCreating(null);
+    },
+    [loadEvents],
+  );
+  // More options: the full editor carries on with quick create's draft; nothing is sent.
+  const onQuickMore = useCallback((handover: CreateHandover) => {
+    quickDraftRef.current = null;
+    setQuickDraft(null);
+    setCreating((c) => (c ? { ...c, mode: "full", anchor: null, handover } : c));
+  }, []);
+
+  // Back on the calendar after a titled quick create went with the tab (`leftQuick`): the box opens
+  // again on that draft, on its calendar while that can still take an event (else the usual one). It
+  // opens with what's known at once (the overview kept from before), as the box did; a calendar on
+  // offer is a Google account's, so "+ New event" is there to open under.
+  useEffect(() => {
+    if (!overview || !targets || leftQuick === null) return;
+    const left = leftQuick;
+    leftQuick = null;
+    const target = defaultTarget(targets, left.calendarId);
+    const anchor = createButtonRef.current?.getBoundingClientRect();
+    if (!target || !anchor) return;
+    setCreating({
+      seed: left.seed,
+      calendarId: target.calendar.id,
+      mode: "quick",
+      anchor,
+      resume: left,
+    });
+  }, [overview, targets]);
 
   // One step per swipe, in the direction of travel: a swipe left (positive deltaX) moves forward, by
   // the days Settings chooses (`swipeDays`, read at the swipe). Both gestures move the cursor and
   // nothing else — `writeCursorDay` above is what remembers it, and `openOn` decides whether that
-  // memory is ever read back. Not under an open popover, for the reason ← and → aren't (above).
+  // memory is ever read back. Not under an open popover, for the reason ← and → aren't (above), nor
+  // under a new event's editor.
   const gridRef = useHorizontalWheelShift(
     (dir) => setCursor((c) => addDays(c, dir * swipeDays(windowDays(view, dayCount)))),
-    (view === "day" || view === "week") && eventPopup === null,
+    (view === "day" || view === "week") && eventPopup === null && creating === null,
   );
 
-  // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
-  // field is focused, a modifier is held (so app shortcuts and text entry are untouched), or a dialog
-  // or the event popover is open over the tab (see `calendarNavKey`). Ctrl/Cmd+Z is the delete's Undo
-  // (`calendarUndoKey`).
+  // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today, `c` starts a
+  // new event in the full editor and Shift+C in quick create. Ignored while a field is focused, a
+  // modifier is held (so app shortcuts and text entry are untouched), or a dialog (quick create
+  // included) or the event popover is open over the tab (see `calendarNavKey`). Ctrl/Cmd+Z is the
+  // delete's Undo (`calendarUndoKey`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Ctrl/Cmd+Z presses the newest Undo on screen (a delete still waiting). Unlike the arrows it
@@ -492,11 +638,17 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onNext();
       } else if (nav === "today") {
         onToday();
+      } else if (nav === "create") {
+        e.preventDefault();
+        startCreate("full");
+      } else if (nav === "quick-create") {
+        e.preventDefault();
+        startCreate("quick");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onPrev, onNext, onToday]);
+  }, [onPrev, onNext, onToday, startCreate]);
 
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
@@ -630,11 +782,37 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return out;
   }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor]);
 
-  // The event the delete dialog is asking about (null = closed).
-  const [confirmDelete, setConfirmDelete] = useState<CalendarEvent | null>(null);
+  // The new event's ghost (C10c): quick create's draft in its calendar's colour, saying how far it
+  // has got, or a saved one's waiting for its row. It joins after the hide filter, so it shows on a
+  // hidden calendar too (the box says that calendar is hidden), and in its own memo, so a title
+  // keystroke doesn't run the filter and dedup above again. Not while the full editor is open: that
+  // covers the grid.
+  const ghost = useMemo(() => {
+    if (creating?.mode === "quick") {
+      return quickDraft
+        ? draftEvent(quickDraft.draft, quickDraft.calendarId, quickDraft.state)
+        : null;
+    }
+    return landed?.ev ?? null;
+  }, [creating?.mode, quickDraft, landed]);
+  const shownEvents = useMemo(
+    () => (ghost ? [...visibleEvents, ghost] : visibleEvents),
+    [visibleEvents, ghost],
+  );
+
   // The popover's editing actions for `ev`. Delete closes the popover and asks first.
   // The event open in the editor (null = closed).
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
+  // The delete dialog: the event it asks about (null = closed), and the delete it sends. It sees open
+  // dialogs (the editor among them) itself; the popover isn't one.
+  const deleteDialog = useDeleteDialog(popoverOpen);
+  const confirmDelete = deleteDialog.asked?.event ?? null;
+  // People already in the user's Google and Outlook calendars, for the editor's guest box: worked out
+  // here, over the rows this view holds, so no contacts are read (C12; never a subscription's).
+  const suggestions = useMemo(
+    () => guestSuggestions(events, overview?.calendars ?? [], null),
+    [events, overview],
+  );
   // The address of the account a synced event's calendar belongs to.
   const accountOf = (ev: CalendarEvent): string | null => {
     const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
@@ -648,15 +826,22 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     },
     onDelete: () => {
       setEventPopup(null);
-      setConfirmDelete(ev);
+      deleteDialog.ask(ev);
     },
   });
 
   // Clicking an event: a PM overlay keeps its jump (a milestone opens its project, a freeform pinboard
   // entry opens the Pinboard), while a real synced event opens the in-place detail popup anchored at
-  // the click. Every event is now clickable (was overlay-only).
+  // the click. Every event is now clickable (was overlay-only). While quick create is open, a click
+  // on any event (its own ghost included) goes back to it: an overlay's jump would switch tabs and
+  // lose the draft, and an event's details would be a second box with a second primary button.
+  const quickOpen = creating?.mode === "quick";
   const onEventClick = useCallback(
     (ev: CalendarEvent, anchor: DOMRect) => {
+      if (isDraftEvent(ev) || quickOpen) {
+        focusCreateRef.current?.();
+        return;
+      }
       if (isPinboardEvent(ev)) {
         onOpenPinboard?.();
         return;
@@ -669,7 +854,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       }
       setEventPopup({ ev, anchor });
     },
-    [milestones, onOpenProject, onOpenPinboard],
+    [quickOpen, milestones, onOpenProject, onOpenPinboard],
   );
 
   // Both day grids are the same thing now — N consecutive days starting at the cursor. Week is
@@ -799,11 +984,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           );
       }
     }
+    // The ghost of a new event joins the pixel views and the Agenda (`shownEvents`); the Year
+    // overview and the Terminal tables show what's in the calendar only.
     switch (view) {
       case "agenda":
         return (
           <AgendaView
-            events={visibleEvents}
+            events={shownEvents}
             fromDay={cursor}
             colorOf={colorOf}
             now={now}
@@ -814,7 +1001,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         return (
           <MonthView
             cursor={cursor}
-            events={visibleEvents}
+            events={shownEvents}
             colorOf={colorOf}
             shapeOf={shapeOf}
             onFocusDate={onFocusDate}
@@ -837,7 +1024,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         return (
           <TimeGridView
             days={gridDays}
-            events={visibleEvents}
+            events={shownEvents}
             colorOf={colorOf}
             range={range}
             bounds={activeBounds}
@@ -876,6 +1063,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onRefresh={onRefresh}
         syncing={syncing}
         lastSync={overview?.last_sync ?? null}
+        onCreate={hasGoogle ? openCreate : undefined}
+        createReason={createReason}
+        createRef={createButtonRef}
       />
 
       {isTerminal && <TerminalChrome view={view} label={label} count={chromeCount} />}
@@ -960,6 +1150,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               : undefined
           }
           editing={popoverEditing(eventPopup.ev)}
+          describeSeries={writes.describeSeries}
         />
       )}
 
@@ -971,6 +1162,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           row={editing}
           calendar={overview?.calendars.find((c) => c.id === editing.calendar_id) ?? null}
           account={accountOf(editing)}
+          suggestions={suggestions}
           milestone={
             editing.uid
               ? (milestones.find((m) => m.event_uid && m.event_uid === editing.uid) ?? null)
@@ -980,9 +1172,48 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             // Close the editor first so its focus goes back to the event's chip, and the delete
             // dialog that opens next returns it there too.
             flushSync(() => setEditing(null));
-            setConfirmDelete(row);
+            deleteDialog.ask(row);
           }}
           onClose={() => setEditing(null)}
+        />
+      )}
+      {creating?.mode === "full" && overview && targets && (
+        <NewEventEditor
+          seed={creating.seed}
+          targets={targets}
+          calendarId={creating.calendarId}
+          overview={overview}
+          hidden={hidden}
+          colorOf={colorOf}
+          shapeOf={shapeOf}
+          focusRef={focusCreateRef}
+          handover={creating.handover}
+          onClose={() => {
+            // From quick create, the editor opened from its More options, which is gone: focus
+            // goes back to "+ New event", as quick create's own close would have sent it.
+            const fromQuick = creating.handover !== undefined;
+            setCreating(null);
+            if (fromQuick) createButtonRef.current?.focus();
+          }}
+        />
+      )}
+      {creating?.mode === "quick" && creating.anchor && overview && targets && (
+        <QuickCreatePopover
+          anchor={creating.anchor}
+          seed={creating.seed}
+          targets={targets}
+          calendarId={creating.calendarId}
+          overview={overview}
+          hidden={hidden}
+          colorOf={colorOf}
+          shapeOf={shapeOf}
+          returnFocusTo={createButtonRef}
+          focusRef={focusCreateRef}
+          resume={creating.resume}
+          onDraft={onQuickDraft}
+          onMore={onQuickMore}
+          onClose={onQuickClose}
+          onLeave={leaveQuick}
         />
       )}
       <DeleteEventDialog
@@ -991,16 +1222,38 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           overview?.calendars.find((c) => c.id === confirmDelete?.calendar_id)?.name ?? null
         }
         when={confirmDelete ? whenText(confirmDelete) : ""}
-        onClose={() => setConfirmDelete(null)}
-        onConfirm={(ev) => {
-          setConfirmDelete(null);
-          void writes.startDelete(ev);
-        }}
+        from={confirmDelete ? accountOf(confirmDelete) : null}
+        again={deleteDialog.asked?.reask?.again ?? false}
+        forceRepeating={!!deleteDialog.asked?.reask}
+        guests={deleteDialog.asked?.guests ?? null}
+        onClose={deleteDialog.close}
+        onConfirm={deleteDialog.confirm}
       />
       <WriteNotices
         notices={writes.notices}
         onUndo={(token) => void writes.undoDelete(token)}
         onDismiss={writes.dismissNotice}
+        onSettle={(token, action, title) => void writes.settleSplit(token, action, title)}
+        onCheckCreate={(id) =>
+          void writes.checkCreate(id, (calendarId) =>
+            overview
+              ? createdWhere(overview, hidden, calendarId)
+              : { name: "that calendar", hidden: false },
+          )
+        }
+        // A move writes no calendar row, so no write-outcome follows: the milestones are read
+        // again here, for the popover's "Open in Project" and the editor's line to follow it.
+        onMove={(id) =>
+          void writes.moveMilestone(id).then((moved) => {
+            if (moved) void loadMilestones();
+          })
+        }
+        onMoveBack={(id) =>
+          void writes.moveMilestoneBack(id).then((moved) => {
+            if (moved) void loadMilestones();
+          })
+        }
+        onHold={writes.holdMoveBack}
       />
     </div>
   );

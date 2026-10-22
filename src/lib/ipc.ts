@@ -139,7 +139,14 @@ import type {
   DeleteStart,
   EditLoad,
   EventPatchDraft,
+  GuestNotice,
   HeldDeleteInfo,
+  NewEventDraft,
+  Notify,
+  RepeatPreset,
+  RepeatRule,
+  RepeatStart,
+  RepeatView,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -943,9 +950,15 @@ export const addMilestone = (
 export const updateMilestone = (id: number, label: string, dueDate: string | null) =>
   invoke<void>("update_milestone", { id, label, dueDate });
 
-/** Link a milestone to a calendar event (uid + cached date) or unlink it (null uid). */
-export const setMilestoneEvent = (id: number, eventUid: string | null, cachedDate: string | null) =>
-  invoke<void>("set_milestone_event", { id, eventUid, cachedDate });
+/** Link a milestone to a calendar event (uid + cached date) or unlink it (null uid).
+ *  `onlyIfLinkedTo`: only while it's still linked to that event, so an offer made a while ago never
+ *  undoes a change made since; it throws when nothing was changed (the calendar's milestone move). */
+export const setMilestoneEvent = (
+  id: number,
+  eventUid: string | null,
+  cachedDate: string | null,
+  onlyIfLinkedTo: string | null = null,
+) => invoke<void>("set_milestone_event", { id, eventUid, cachedDate, onlyIfLinkedTo });
 
 /** Set a milestone's progress status — the SINGLE writer for "how far along is this".
  *
@@ -1080,6 +1093,18 @@ export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_cal
 /** The active PM flags anchored on a calendar event's iCal UID — for the event detail popup. */
 export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid });
 
+// Repeat rules (#884, C11): pure reads for the editor's Repeat row. They change nothing.
+
+/** The repeat menu's ready-made rules for an event starting on `day` (YYYY-MM-DD); none when the day
+ *  can't be read. */
+export const recurrencePresets = (day: string) =>
+  invoke<RepeatPreset[]>("recurrence_presets", { day });
+
+/** A rule in the repeat menu's words for an event starting at `start`, and the day its first
+ *  occurrence falls on, or why it can't be saved. */
+export const describeRecurrence = (rule: RepeatRule, start: RepeatStart) =>
+  invoke<RepeatView>("describe_recurrence", { rule, start });
+
 // Calendar editing (#884). Importable only from src/components/calendar/edit/useEventWrites.ts
 // (eslint.config.js + scripts/check-calendar-write-fence.mjs); every command is main-window only.
 
@@ -1091,23 +1116,41 @@ export const getCalendarEventForEdit = (eventId: string, deviceZone: string | nu
 
 /** Save the fields the user changed in an open editor. Outcomes come back as data, never thrown.
  *  For an occurrence of a repeating event, `scope` says which occurrences and `choice` names the
- *  plan the user chose (a row's `token` from `seriesChoices`). */
+ *  plan the user chose (a row's `token` from `seriesChoices`). `notify` is the user's Send / Don't
+ *  send and `asked` the numbers the question showed: a save that would email someone without an
+ *  answer for those numbers is answered `needs_choice` with nothing sent. */
 export const updateCalendarEvent = (
   session: string,
   draft: EventPatchDraft,
   scope: SeriesScope | null = null,
   choice: string | null = null,
-) => invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice });
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+) =>
+  invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice, notify, asked });
+
+/** Create an event on one of PM's Google calendars (`calendarId`, PM's own id). Outcomes come back as
+ *  data. `retryToken` (from an `ambiguous` outcome) looks for the earlier attempt and sends it again,
+ *  under the same id, only if Google still doesn't show it, so a retry is very unlikely to make a
+ *  second copy. Nobody is emailed: new events have no guests. */
+export const createCalendarEvent = (
+  calendarId: string,
+  draft: NewEventDraft,
+  retryToken: string | null = null,
+) => invoke<WriteOutcome>("create_calendar_event", { calendarId, draft, retryToken });
 
 /** Delete a mirrored event after an Undo window held by the backend. It goes to Google when the
  *  window ends, only if Google still holds what the user saw (`seen`); `onCalendarDeleteSettled`
- *  reports how it ended. `scope` and `choice` as for a save. */
+ *  reports how it ended. `scope`, `choice`, `notify` and `asked` as for a save; the answer is kept
+ *  with the hold. */
 export const deleteCalendarEvent = (
   eventId: string,
   seen: SeenSummary,
   scope: SeriesScope | null = null,
   choice: string | null = null,
-) => invoke<DeleteStart>("delete_calendar_event", { eventId, seen, scope, choice });
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+) => invoke<DeleteStart>("delete_calendar_event", { eventId, seen, scope, choice, notify, asked });
 
 /** Undo a held delete: true when it was still waiting (the event is kept). */
 export const cancelCalendarDelete = (undoToken: string) =>
@@ -1120,6 +1163,11 @@ export const listHeldDeletes = () => invoke<HeldDeleteInfo[]>("list_held_deletes
  *  planned against Google's copies now: what it would do, or why it can't. Only reads go to Google. */
 export const seriesChoices = (request: ChoiceRequest) =>
   invoke<SeriesChoices>("series_choices", { request });
+
+/** How the repeating event a mirrored Google row belongs to repeats, in Google Calendar's words
+ *  ("Weekly on Monday"), or null when PM can't say. Only a read goes to Google. */
+export const getSeriesSummary = (eventId: string) =>
+  invoke<string | null>("get_series_summary", { eventId });
 
 /** Settle a "this and following" change PM couldn't finish (`token` from a `partial_split` outcome
  *  or a `pending` row): look again, remove the new part, or finish the change. */

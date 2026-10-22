@@ -36,10 +36,12 @@ const CALENDAR_WRITES = {
   importNames: [
     "getCalendarEventForEdit",
     "updateCalendarEvent",
+    "createCalendarEvent",
     "deleteCalendarEvent",
     "cancelCalendarDelete",
     "listHeldDeletes",
     "seriesChoices",
+    "getSeriesSummary",
     "settleSeriesSplit",
   ],
   message: "Calendar edits go only through src/components/calendar/edit/useEventWrites.ts (#884).",

@@ -9,13 +9,20 @@
 import { formatDateOnly } from "../format";
 import type {
   CalendarEvent,
+  GuestNotice,
   ScopeRow,
   SeriesChoices,
   SeriesScope,
   SeriesWarning,
   SplitAction,
 } from "../types";
-import { conflictFields, listFields, outcomeText, type ChoiceKind } from "./editReasons";
+import {
+  conflictFields,
+  listFields,
+  outcomeText,
+  withSettleEmails,
+  type ChoiceKind,
+} from "./editReasons";
 
 export type { ChoiceKind } from "./editReasons";
 export type ReadyChoices = Extract<SeriesChoices, { outcome: "ready" }>;
@@ -23,6 +30,10 @@ export type ReadyChoices = Extract<SeriesChoices, { outcome: "ready" }>;
 export interface Picked {
   scope: SeriesScope;
   token: string;
+  /** The row was "this and following" from the first occurrence (`RowView.asAll`): what saves is
+   *  every occurrence's plan, so the notice after it speaks as All. Never sent: the write names
+   *  `scope` and `token` only. */
+  asAll?: boolean;
 }
 
 function unreachable(value: never): never {
@@ -45,9 +56,14 @@ export interface RowView {
   detail: string;
   /** Offered, or "this and following" from the first occurrence (every occurrence). */
   selectable: boolean;
+  /** "This and following" from the first occurrence: its warnings are every occurrence's plan's,
+   *  and are worded as All's. */
+  asAll: boolean;
   /** The row's token when selectable. */
   token: string | null;
   warnings: SeriesWarning[];
+  /** Who Google would email with Send, when anyone (C12): choosing the row asks it. */
+  guests: GuestNotice | null;
 }
 
 const SCOPES: readonly SeriesScope[] = ["this", "following", "all"];
@@ -82,7 +98,7 @@ function offeredDetail(scope: SeriesScope, asAll: boolean, kind: ChoiceKind, day
 }
 
 function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: string): RowView {
-  const base = { scope, label: LABEL[scope] };
+  const base = { scope, label: LABEL[scope], asAll: false, guests: null };
   switch (row.row) {
     case "offered":
     case "as_all":
@@ -90,8 +106,10 @@ function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: stri
         ...base,
         detail: offeredDetail(scope, row.row === "as_all", kind, day),
         selectable: true,
+        asAll: row.row === "as_all",
         token: row.token,
         warnings: row.warnings,
+        guests: row.guests ?? null,
       };
     case "refused":
       return { ...base, detail: row.message, selectable: false, token: null, warnings: [] };
@@ -134,28 +152,42 @@ export function defaultScope(choices: ReadyChoices): SeriesScope | null {
 /** A pending row's change to settle first, once per dialog: every pending row shares one token. */
 export function pendingOf(
   choices: ReadyChoices,
-): { token: string; offers: SplitAction[]; from: string } | null {
+): { token: string; offers: SplitAction[]; from: string; emails: SplitAction[] } | null {
   for (const scope of SCOPES) {
     const row = choices[scope];
-    if (row.row === "pending") return { token: row.token, offers: row.offers, from: row.from };
+    if (row.row === "pending") {
+      return { token: row.token, offers: row.offers, from: row.from, emails: row.emails ?? [] };
+    }
   }
   return null;
 }
 
 /** The settle block's words, by what Google allows now: never a hint to delete unless Remove is
- *  offered, and never "lost touch" for Check alone, which a new part changed in Google also leaves. */
-export function pendingText(offers: readonly SplitAction[], from: string): string {
+ *  offered, and never "lost touch" for Check alone, which a new part changed in Google also leaves.
+ *  `emails`: the offers that would email guests, said before they're pressed (C12). */
+export function pendingText(
+  offers: readonly SplitAction[],
+  from: string,
+  emails?: readonly SplitAction[],
+): string {
   const day = formatDateOnly(from);
   const finish = offers.includes("finish");
   const remove = offers.includes("remove");
+  const said = (text: string) => withSettleEmails(text, offers, emails);
   if (finish && remove) {
-    return `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Finish it or remove the new part first.`;
+    return said(
+      `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Finish it or remove the new part first.`,
+    );
   }
   if (finish) {
-    return `An earlier change from ${day} is saved, but PM couldn't finish moving the occurrences you changed on their own. Finish it first.`;
+    return said(
+      `An earlier change from ${day} is saved, but PM couldn't finish moving the occurrences you changed on their own. Finish it first.`,
+    );
   }
   if (remove) {
-    return `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Remove the new part, or check again.`;
+    return said(
+      `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Remove the new part, or check again.`,
+    );
   }
   return `PM couldn't finish an earlier change to this repeating event from ${day}. Check again; if it still can't, look at that day in Google Calendar.`;
 }
@@ -177,13 +209,15 @@ export function conflictOf(choices: ReadyChoices): string[] | null {
 /** The re-ask's line: the plan changed between the choice and the write, so nothing was sent. */
 export function againText(kind: ChoiceKind): string {
   return kind === "save"
-    ? outcomeText({ outcome: "needs_choice" }).text
+    ? outcomeText({ outcome: "needs_choice", scope: true }).text
     : "This repeating event changed since you chose which occurrences to delete. Choose again; nothing was deleted.";
 }
 
 const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
   "repeat_day_changes",
+  "becomes_one_event",
   "start_moved",
+  "changes_lost",
   "length_changes",
   "exceptions_may_reset",
   "not_carried",
@@ -192,13 +226,15 @@ const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
 ];
 
 /** The selected row's lines, the question first; equal kinds keep the backend's order. A warning
- *  with nothing to say (a "not carried" naming nothing) has no line. */
+ *  with nothing to say (a "not carried" naming nothing) has no line. Each is worded by the plan the
+ *  row was made from: a "this and following" row that changes every occurrence speaks as All. */
 export function warningLines(row: RowView, kind: ChoiceKind, title: string): string[] {
   const rank = (w: SeriesWarning) => WARNING_ORDER.indexOf(w.warning);
+  const scope: SeriesScope = row.asAll ? "all" : row.scope;
   return [...row.warnings]
     .map((w, i) => ({ w, i }))
     .sort((a, b) => rank(a.w) - rank(b.w) || a.i - b.i)
-    .map(({ w }) => seriesWarningText(w, kind, row.scope, title))
+    .map(({ w }) => seriesWarningText(w, kind, scope, title))
     .filter((line) => line !== "");
 }
 
@@ -221,7 +257,19 @@ export function seriesWarningText(
     case "repeat_day_changes":
       return repeatDayQuestion(title, w, scope);
     case "start_moved":
-      return `The first occurrence of ${t} moves from ${formatDateOnly(w.from)} to ${formatDateOnly(w.to)}.`;
+      // From one occurrence on, only a new repeat moves where the new part starts (C11).
+      return scope === "following"
+        ? `From this occurrence on, the new part of ${t} starts on ${formatDateOnly(w.to)}, the first day the new repeat allows.`
+        : `The first occurrence of ${t} moves from ${formatDateOnly(w.from)} to ${formatDateOnly(w.to)}.`;
+    case "becomes_one_event":
+      // "Does not repeat" (C11): never "a new repeating event" (C11 critique 2 M2).
+      return scope === "following"
+        ? `From this occurrence on, ${t} becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.`
+        : `Only the occurrence on ${formatDateOnly(w.day)} stays, as an event that doesn't repeat. Every other occurrence of ${t} goes.`;
+    case "changes_lost":
+      return w.count === 1
+        ? `One occurrence of ${t} you changed on its own falls on a day the new repeat skips, so that change goes.`
+        : `${w.count} occurrences of ${t} you changed on their own fall on days the new repeat skips, so those changes go.`;
     case "length_changes":
       return scope === "following"
         ? "Every occurrence from this one on will last as long as this one."
@@ -246,7 +294,9 @@ export function seriesWarningText(
       return `The new repeating event this makes won't have ${andList(missing)}. The earlier part ${keeps}.${call}`;
     }
     case "new_identity":
-      return "From this occurrence on, it becomes a new repeating event in Google. A linked milestone stays with the earlier part, and reminders to prepare may show again for the new part.";
+      // The flags' warning (C9 design scope-L9) is the last sentence: they aren't moved, and no
+      // question follows the save for them (DECISIONS 17-10 #2).
+      return "From this occurrence on, it becomes a new repeating event in Google. If a milestone linked to it falls on or after this day, PM offers to move it to the new part after saving. Reminders to prepare may show again for the new part.";
     case "split_sibling": {
       const head = `Part of ${t} was made into a repeating event of its own by an earlier “this and following” change.`;
       return kind === "save"

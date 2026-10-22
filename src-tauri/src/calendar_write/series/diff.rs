@@ -42,6 +42,10 @@ pub enum Expect {
     Present { series: String },
     /// Nothing of the series.
     Absent { series: String },
+    /// The new event `id`, one that doesn't repeat, a split that stops repeating made (C11): it lands
+    /// from its insert's own answer, never a listing, since what Google lists for a one-off's
+    /// occurrences is unproven. [`diff_series`] reads no re-fetch for it.
+    Event { id: String },
 }
 
 /// The rows a plan removes from the mirror, so a stale re-fetch can't bring them back (A14): a
@@ -113,7 +117,7 @@ pub fn floor_of<'a>(moments: impl IntoIterator<Item = &'a str>) -> Option<String
 
 /// Where a mirror row sits in its series: its `original_start` (or its start, for a row without one),
 /// as the mirror normalises them (`…Z`, or a bare date).
-fn row_point(row: &CalendarEvent) -> Option<Point> {
+pub fn row_point(row: &CalendarEvent) -> Option<Point> {
     mirror_point(row.original_start.as_deref().unwrap_or(&row.start))
 }
 
@@ -264,14 +268,15 @@ fn instant(p: Point) -> DateTime<Utc> {
 
 /// Whether the re-fetch shows `expect`. A series that wasn't re-fetched shows nothing.
 fn shows(expect: &Expect, refetched: &[Refetch], zone: Tz) -> bool {
-    let series_of = |e: &Expect| match e {
+    let series = match expect {
         Expect::Updated { series, .. }
         | Expect::Cancelled { series, .. }
         | Expect::EndsBefore { series, .. }
         | Expect::Present { series }
         | Expect::Absent { series } => series.clone(),
+        // Landed from its insert's answer: no listing stands for it.
+        Expect::Event { .. } => return true,
     };
-    let series = series_of(expect);
     let Some(r) = refetched.iter().find(|r| r.series == series) else {
         return false;
     };
@@ -302,6 +307,7 @@ fn shows(expect: &Expect, refetched: &[Refetch], zone: Tz) -> bool {
         }
         Expect::Present { .. } => live().next().is_some(),
         Expect::Absent { .. } => r.listing.complete && live().next().is_none(),
+        Expect::Event { .. } => true,
     }
 }
 
@@ -582,6 +588,12 @@ mod tests {
         }];
         let diff = diff_series(CAL, &[], &refetch, window(), &[], London, None);
         assert!(diff.upserts.is_empty() && diff.created_since(&[]).is_empty());
+
+        // C11: one event a split made lands from its insert's answer: no listing stands for it, so
+        // it never stales one.
+        let event = Expect::Event { id: "new".into() };
+        let diff = diff_series(CAL, &[], &refetch, window(), &[event], London, None);
+        assert!(!diff.stale);
     }
 
     /// C8b review R2: an occurrence the run reported it couldn't cancel is still in Google. A

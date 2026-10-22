@@ -337,9 +337,9 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
 /// The keys the webview may read and write through [`get_pref`]/[`set_pref`].
 ///
 /// `milestone_ui`, `calendar_ui` and `backup_ui` join the presentation blobs because their contents
-/// are USER CONTENT, not chrome — the sort map is keyed by project name, the hidden-calendar set is
-/// a list of calendar ids (frequently the account's email address) and the backup dismissals are
-/// keyed by cloud account. Those lived in the webview's `localStorage`, which is plaintext on disk,
+/// are USER CONTENT, not chrome — the sort map is keyed by project name, the hidden-calendar set and
+/// the last calendar an event was created in are calendar ids (frequently the account's email
+/// address) and the backup dismissals are keyed by cloud account. Those lived in the webview's `localStorage`, which is plaintext on disk,
 /// absent from a `.pmbackup`, and not covered by the store's key. They each get their OWN key rather
 /// than joining `project_ui`: `useSidebarSplit` rewrites that blob whole on every divider drag, so a
 /// co-tenant would be silently deleted.

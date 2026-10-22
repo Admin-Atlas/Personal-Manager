@@ -25,7 +25,14 @@ vi.mock("../lib/ipc", () => ({
   exportPlaintextMarkdown: () => exportPlaintextMarkdown(),
   createLocalBackup: (dest: string, pass: string) => createLocalBackup(dest, pass),
   // The strength meter's own call.
-  scorePassphrase: vi.fn(async () => ({ score: 4, acceptable: true, feedback: [] })),
+  scorePassphrase: vi.fn(async () => ({
+    score: 4,
+    acceptable: true,
+    too_short: false,
+    padded: false,
+    warning: null,
+    suggestions: [],
+  })),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: (opts: unknown) => saveFileDialog(opts) }));

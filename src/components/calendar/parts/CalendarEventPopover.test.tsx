@@ -13,7 +13,7 @@
 // be wrong. There is no scrim, the calendar behind stays live, and clicking a different event is how
 // you move between them — Tab must be able to leave.
 
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 
@@ -208,7 +208,7 @@ describe("CalendarEventPopover", () => {
     const second = chip("Standup");
     first.focus();
 
-    const { rerender } = render(
+    const { rerender, getByRole } = render(
       <CalendarEventPopover
         event={calendarEvent()}
         anchor={rect(100)}
@@ -231,6 +231,8 @@ describe("CalendarEventPopover", () => {
       />,
     );
 
+    // Re-pointed, the panel takes focus again, as it did when it opened.
+    expect(getByRole("dialog").contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(document.activeElement).toBe(second);
   });
@@ -312,7 +314,8 @@ describe("CalendarEventPopover", () => {
   });
 
   // #884 C7: an iCal series says how it repeats; a row still holding a raw rule from before says
-  // only "Repeats", as does one with no summary (every Google occurrence).
+  // only "Repeats", as does one with no summary. A Google occurrence holds no rule: its words come
+  // from Google through `describeSeries` (C9b-2, below), and without it it reads "Repeats" too.
   it.each([
     ["Weekly on Monday", "Weekly on Monday"],
     ["FREQ=WEEKLY;BYDAY=MO", "Repeats"],
@@ -331,6 +334,131 @@ describe("CalendarEventPopover", () => {
     const text = getByRole("dialog").textContent ?? "";
     expect(text).toContain(expected);
     expect(text).not.toContain("FREQ=");
+  });
+
+  describe("how a Google occurrence repeats (C9b-2)", () => {
+    const occurrence = (id = "e1") =>
+      calendarEvent({ id, recurring: true, series_id: "abc", summary: "Gym" });
+
+    /** A `describeSeries` whose answers the test gives, one per call, in order. */
+    function deferred() {
+      const answers: Array<{ resolve: (w: string | null) => void; reject: (e: Error) => void }> =
+        [];
+      const ask = vi.fn<(id: string) => Promise<string | null>>(
+        () =>
+          new Promise<string | null>((resolve, reject) => {
+            answers.push({ resolve, reject });
+          }),
+      );
+      return { ask, answers };
+    }
+
+    function popover(
+      event: CalendarEvent,
+      anchor: DOMRect,
+      ask?: (id: string) => Promise<string | null>,
+    ) {
+      return (
+        <CalendarEventPopover
+          event={event}
+          anchor={anchor}
+          calendar={null}
+          color="#000"
+          milestone={null}
+          onClose={() => {}}
+          describeSeries={ask}
+        />
+      );
+    }
+
+    it('a Google occurrence reads "Repeats", then how it repeats', async () => {
+      const { ask, answers } = deferred();
+      const view = render(popover(occurrence(), rect(100), ask));
+      expect(view.getByText("Repeats")).toBeTruthy();
+      expect(ask).toHaveBeenCalledTimes(1);
+      expect(ask).toHaveBeenCalledWith("e1");
+      await act(async () => answers[0].resolve("Weekly on Monday"));
+      expect(view.getByText("Weekly on Monday")).toBeTruthy();
+      expect(view.queryByText("Repeats")).toBeNull();
+    });
+
+    it('a failed or empty answer keeps "Repeats"', async () => {
+      for (const answer of [new Error("offline"), null, "  "]) {
+        const { ask, answers } = deferred();
+        const view = render(popover(occurrence(), rect(100), ask));
+        await act(async () =>
+          answer instanceof Error ? answers[0].reject(answer) : answers[0].resolve(answer),
+        );
+        expect(view.getByText("Repeats")).toBeTruthy();
+        view.unmount();
+      }
+    });
+
+    it("a row with its own words, or a one-off, never asks", () => {
+      const { ask } = deferred();
+      const feed = calendarEvent({ recurring: true, recurrence_summary: "Weekly on Monday" });
+      const view = render(popover(feed, rect(100), ask));
+      expect(view.getByText("Weekly on Monday")).toBeTruthy();
+      view.unmount();
+      const once = render(popover(calendarEvent({ series_id: null }), rect(100), ask));
+      expect(once.queryByText("Repeats")).toBeNull();
+      expect(ask).not.toHaveBeenCalled();
+    });
+
+    it("re-pointed at another event, the old words never show", async () => {
+      const { ask, answers } = deferred();
+      const view = render(popover(occurrence("e1"), rect(100), ask));
+      await act(async () => answers[0].resolve("Weekly on Monday"));
+      expect(view.getByText("Weekly on Monday")).toBeTruthy();
+      // The keyboard path re-points the mounted panel: the next event reads "Repeats" at once.
+      view.rerender(popover(occurrence("e2"), rect(300), ask));
+      expect(view.queryByText("Weekly on Monday")).toBeNull();
+      expect(view.getByText("Repeats")).toBeTruthy();
+      // And an answer for an event no longer shown is dropped, even one that comes after the shown
+      // event's own (that one kept by the backend, the older one still out at Google).
+      view.rerender(popover(occurrence("e3"), rect(500), ask));
+      await act(async () => answers[2].resolve("Daily"));
+      expect(view.getByText("Daily")).toBeTruthy();
+      await act(async () => answers[1].resolve("Weekly on Tuesday"));
+      expect(view.queryByText("Weekly on Tuesday")).toBeNull();
+      expect(view.getByText("Daily")).toBeTruthy();
+    });
+
+    it("the words arriving never move focus", async () => {
+      // jsdom has no layout: the panel is taller once the words are in, and opens flipped above a
+      // chip near the bottom, so the words move it.
+      const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight");
+      Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+        configurable: true,
+        get(this: HTMLElement) {
+          return this.textContent?.includes("Weekly on Monday") ? 300 : 200;
+        },
+      });
+      try {
+        const { ask, answers } = deferred();
+        const view = render(popover(occurrence(), rect(window.innerHeight - 60), ask));
+        const panel = view.getByRole("dialog");
+        const before = panel.style.top;
+        const elsewhere = chip("Standup");
+        elsewhere.focus();
+        await act(async () => answers[0].resolve("Weekly on Monday"));
+        expect(panel.style.top).not.toBe(before);
+        expect(document.activeElement).toBe(elsewhere);
+      } finally {
+        if (height) Object.defineProperty(HTMLElement.prototype, "offsetHeight", height);
+      }
+    });
+
+    it("re-pointed at another event, the old flags go even when its read fails", async () => {
+      eventFlags.mockResolvedValueOnce([{ id: 1, type: "prep-needed" }]);
+      const view = render(popover(calendarEvent({ uid: "u1" }), rect(100)));
+      await act(async () => {});
+      expect(view.getByText("prep needed")).toBeTruthy();
+      eventFlags.mockRejectedValueOnce(new Error("locked"));
+      view.rerender(popover(calendarEvent({ id: "e2", uid: "u2" }), rect(300)));
+      await act(async () => {});
+      expect(view.queryByText("prep needed")).toBeNull();
+    });
   });
 
   // #884: CalendarView passes `editing`; FocusUpcoming doesn't, and must stay as it was.
