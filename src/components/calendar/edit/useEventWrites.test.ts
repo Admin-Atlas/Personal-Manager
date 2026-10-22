@@ -8,17 +8,40 @@
 // (it outlives the Calendar tab unmounting), so each test loads a fresh copy.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CalendarEvent, DeleteSettled, DeleteStart, HeldDeleteInfo } from "../../../lib/types";
+import type {
+  CalendarEvent,
+  ChoiceRequest,
+  DeleteSettled,
+  DeleteStart,
+  EventPatchDraft,
+  HeldDeleteInfo,
+  SeriesChoices,
+  SplitAction,
+  WriteOutcome,
+} from "../../../lib/types";
 
-const deleteCalendarEvent = vi.fn<(id: string, seen: unknown) => Promise<DeleteStart>>();
+type Scope = string | null;
+const deleteCalendarEvent =
+  vi.fn<(id: string, seen: unknown, scope: Scope, choice: Scope) => Promise<DeleteStart>>();
 const cancelCalendarDelete = vi.fn<(token: string) => Promise<boolean>>();
 const listHeldDeletes = vi.fn<() => Promise<HeldDeleteInfo[]>>();
+const updateCalendarEvent =
+  vi.fn<
+    (session: string, draft: EventPatchDraft, scope: Scope, choice: Scope) => Promise<WriteOutcome>
+  >();
+const seriesChoices = vi.fn<(request: ChoiceRequest) => Promise<SeriesChoices>>();
+const settleSeriesSplit = vi.fn<(token: string, action: SplitAction) => Promise<WriteOutcome>>();
 let settledHandler: ((s: DeleteSettled) => void) | null = null;
 
 vi.mock("../../../lib/ipc", () => ({
-  deleteCalendarEvent: (id: string, seen: unknown) => deleteCalendarEvent(id, seen),
+  deleteCalendarEvent: (id: string, seen: unknown, scope: Scope, choice: Scope) =>
+    deleteCalendarEvent(id, seen, scope, choice),
   cancelCalendarDelete: (token: string) => cancelCalendarDelete(token),
   listHeldDeletes: () => listHeldDeletes(),
+  updateCalendarEvent: (session: string, draft: EventPatchDraft, scope: Scope, choice: Scope) =>
+    updateCalendarEvent(session, draft, scope, choice),
+  seriesChoices: (request: ChoiceRequest) => seriesChoices(request),
+  settleSeriesSplit: (token: string, action: SplitAction) => settleSeriesSplit(token, action),
   onCalendarDeleteSettled: (h: (s: DeleteSettled) => void) => {
     settledHandler = h;
     return Promise.resolve(() => {});
@@ -67,14 +90,19 @@ describe("a held delete", () => {
     deleteCalendarEvent.mockResolvedValue(held);
     const { mod, hook, act } = await load();
     await act(() => mod.startDelete(event));
-    // What the user saw is what decides the delete later.
-    expect(deleteCalendarEvent).toHaveBeenCalledWith(event.id, {
-      summary: "Dentist",
-      start: event.start,
-      end: event.end,
-      all_day: false,
-      location: "High St",
-    });
+    // What the user saw is what decides the delete later; a one-off names no occurrences.
+    expect(deleteCalendarEvent).toHaveBeenCalledWith(
+      event.id,
+      {
+        summary: "Dentist",
+        start: event.start,
+        end: event.end,
+        all_day: false,
+        location: "High St",
+      },
+      null,
+      null,
+    );
     expect(hook.result.current.hiddenIds.has(event.id)).toBe(true);
     expect(hook.result.current.notices).toEqual([
       {
@@ -335,5 +363,338 @@ describe("undoing the newest delete", () => {
         { id: 3, tone: "ok", text: "Saved." },
       ]),
     ).toBe("new");
+  });
+});
+
+// A repeating event's writes (#884, C9b-1): the choices, a scope always with its token, every row a
+// delete of several occurrences reaches, and a change PM couldn't finish kept with its buttons.
+describe("a repeating event", () => {
+  const occurrence: CalendarEvent = { ...event, summary: "Gym", series_id: "abc", recurring: true };
+  const later = [`${event.id}_2`, `${event.id}_3`];
+  const partial = (
+    offers: SplitAction[],
+    token = "s1",
+    note?: string,
+  ): Extract<WriteOutcome, { outcome: "partial_split" }> => ({
+    outcome: "partial_split",
+    token,
+    offers,
+    from: "2026-11-02",
+    ...(note ? { note } : {}),
+  });
+
+  beforeEach(() => {
+    vi.setSystemTime(new Date("2026-10-18T12:00:00"));
+  });
+
+  it("hides every row a delete of several occurrences reaches, and Undo shows them all again", async () => {
+    deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+      hidden: [occurrence.id, ...later],
+    });
+    cancelCalendarDelete.mockResolvedValue(true);
+    const { mod, hook, act } = await load();
+    await act(async () => {
+      expect(await mod.startDelete(occurrence, { scope: "following", token: "f" })).toBe("held");
+    });
+    expect([...hook.result.current.hiddenIds]).toEqual([occurrence.id, ...later]);
+    await act(() => mod.undoDelete("t1"));
+    expect(hook.result.current.hiddenIds.size).toBe(0);
+  });
+
+  it("keeps every row it removed hidden until a read no longer has them", async () => {
+    deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+      hidden: later,
+    });
+    const { mod, hook, act } = await load();
+    await act(() => mod.startDelete(occurrence, { scope: "following", token: "f" }));
+    act(() =>
+      settledHandler!({
+        undo_token: "t1",
+        event_id: occurrence.id,
+        result: { outcome: "saved", warnings: [] },
+      }),
+    );
+    expect([...hook.result.current.hiddenIds].sort()).toEqual([occurrence.id, ...later].sort());
+    act(() => mod.pruneRemoved([{ ...event, id: later[0] }]));
+    expect([...hook.result.current.hiddenIds]).toEqual([later[0]]);
+    act(() => mod.pruneRemoved([]));
+    expect(hook.result.current.hiddenIds.size).toBe(0);
+  });
+
+  it("picks up a held delete's rows after a reload", async () => {
+    listHeldDeletes.mockResolvedValue([
+      { undo_token: "t9", event_id: occurrence.id, summary: "Gym", seconds_left: 5, hidden: later },
+    ]);
+    const { hook } = await load();
+    expect([...hook.result.current.hiddenIds]).toEqual([occurrence.id, ...later]);
+  });
+
+  it("answers ask, saying nothing, when the backend wants the occurrences chosen", async () => {
+    deleteCalendarEvent.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "needs_choice" },
+    });
+    const { mod, hook, act } = await load();
+    await act(async () => {
+      expect(await mod.startDelete(occurrence)).toBe("ask");
+      // Chosen, but the plan changed since: ask again, too.
+      expect(await mod.startDelete(occurrence, { scope: "all", token: "a" })).toBe("ask");
+    });
+    expect(hook.result.current.notices).toEqual([]);
+    expect(hook.result.current.hiddenIds.size).toBe(0);
+    deleteCalendarEvent.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "read_only", reason: "editing_off" },
+    });
+    await act(async () => {
+      expect(await mod.startDelete(occurrence)).toBe("refused");
+    });
+    expect(hook.result.current.notices[0].text).toMatch(/^“Gym” wasn't deleted\. Editing isn't on/);
+  });
+
+  it("never sends a scope without its token", async () => {
+    deleteCalendarEvent.mockResolvedValue({ outcome: "held", undo_token: "t1", undo_seconds: 8 });
+    updateCalendarEvent.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const { mod, act } = await load();
+    const changes: EventPatchDraft = { summary: "Retro" };
+    await act(() => mod.startDelete(occurrence, { scope: "following", token: "f" }));
+    expect(deleteCalendarEvent).toHaveBeenLastCalledWith(
+      occurrence.id,
+      expect.anything(),
+      "following",
+      "f",
+    );
+    await act(async () => {
+      await mod.saveEdit("sess", changes, { scope: "all", token: "a" }, "Gym");
+      await mod.saveEdit("sess", changes, null, "Gym");
+    });
+    expect(updateCalendarEvent.mock.calls).toEqual([
+      ["sess", changes, "all", "a"],
+      ["sess", changes, null, null],
+    ]);
+    // The very draft the choices were asked for goes to the save (the token binds it).
+    expect(updateCalendarEvent.mock.calls[0][1]).toBe(changes);
+  });
+
+  it("asks for the choices as the token binds them, once per row while one is on its way", async () => {
+    let answer: (c: SeriesChoices) => void = () => {};
+    seriesChoices.mockReturnValue(new Promise((r) => (answer = r)));
+    const { mod, act } = await load();
+    const draft: EventPatchDraft = { summary: "Retro" };
+    void mod.choicesForEdit("sess", draft);
+    expect(seriesChoices).toHaveBeenLastCalledWith({ kind: "edit", session: "sess", draft });
+    // StrictMode mounts the delete dialog's effect twice: one ask.
+    const first = mod.choicesForDelete(occurrence);
+    const second = mod.choicesForDelete(occurrence);
+    expect(second).toBe(first);
+    expect(seriesChoices).toHaveBeenCalledTimes(2);
+    expect(seriesChoices).toHaveBeenLastCalledWith({
+      kind: "delete",
+      event_id: occurrence.id,
+      seen: {
+        summary: "Gym",
+        start: event.start,
+        end: event.end,
+        all_day: false,
+        location: "High St",
+      },
+    });
+    await act(async () => {
+      answer({ outcome: "not_repeating" });
+      await first;
+    });
+    // Answered: the next open asks again.
+    void mod.choicesForDelete(occurrence);
+    expect(seriesChoices).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps a save that went partial with its buttons, whatever happens to the editor", async () => {
+    updateCalendarEvent.mockResolvedValue(partial(["finish", "remove"]));
+    const { mod, hook, act } = await load();
+    let answer: Awaited<ReturnType<typeof mod.saveEdit>> | null = null;
+    await act(async () => {
+      answer = await mod.saveEdit(
+        "sess",
+        { summary: "Retro" },
+        { scope: "following", token: "f" },
+        "Gym",
+      );
+    });
+    expect(answer).toMatchObject({ outcome: "partial_split", newPartial: true });
+    const [notice] = hook.result.current.notices;
+    expect(notice).toMatchObject({
+      tone: "warn",
+      split: { token: "s1", offers: ["finish", "remove"], title: "Gym" },
+    });
+    expect(notice.text).toMatch(
+      /^“Gym”: PM couldn't finish this change: it may show twice from 02-11/,
+    );
+    // An earlier change blocking the next save: the same notice, not new.
+    await act(async () => {
+      answer = await mod.saveEdit(
+        "sess",
+        { summary: "Again" },
+        { scope: "all", token: "a" },
+        "Gym",
+      );
+    });
+    expect(answer).toMatchObject({ newPartial: false });
+    expect(hook.result.current.notices).toHaveLength(1);
+  });
+
+  it("notes a partial once per change, and it never goes by itself", async () => {
+    const { mod, hook, act } = await load();
+    act(() => {
+      expect(mod.notePartial("Gym", partial(["check"]))).toBe(true);
+    });
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(hook.result.current.notices).toHaveLength(1);
+    act(() => {
+      expect(mod.notePartial("Gym", partial(["finish"]))).toBe(false);
+    });
+    expect(hook.result.current.notices).toHaveLength(1);
+    expect(hook.result.current.notices[0].split?.offers).toEqual(["finish"]);
+  });
+
+  it("settles one at a time, its buttons off meanwhile, kept while the change is still held", async () => {
+    let answer: (o: WriteOutcome) => void = () => {};
+    settleSeriesSplit.mockReturnValue(new Promise((r) => (answer = r)));
+    const { mod, hook, act } = await load();
+    act(() => {
+      mod.notePartial("Gym", partial(["finish", "remove"]));
+    });
+    let first: Promise<WriteOutcome | null> = Promise.resolve(null);
+    await act(async () => {
+      first = mod.settleSplit("s1", "finish", "Gym");
+      expect(await mod.settleSplit("s1", "finish", "Gym")).toBeNull();
+    });
+    expect(settleSeriesSplit).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.notices[0].settling).toBe(true);
+    // Still held (Finish couldn't read everything): the buttons stay, with the offers now and why.
+    const note =
+      "PM couldn't read every occurrence it has to check, so it didn't finish. Try again in a moment.";
+    await act(async () => {
+      answer(partial(["remove"], "s1", note));
+      await first;
+    });
+    const [notice] = hook.result.current.notices;
+    expect(notice).toMatchObject({
+      tone: "warn",
+      text: `“Gym”: ${note}`,
+      split: { token: "s1", offers: ["remove"], title: "Gym" },
+    });
+    expect(notice.settling).toBeFalsy();
+  });
+
+  it("takes the buttons away once the change ends, and that notice goes by itself", async () => {
+    settleSeriesSplit.mockResolvedValue({ outcome: "split_removed" });
+    const { mod, hook, act } = await load();
+    act(() => {
+      mod.notePartial("Gym", partial(["remove", "check"]));
+    });
+    await act(() => mod.settleSplit("s1", "remove", "Gym"));
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "ok",
+        text: "Removed the new part of “Gym”. The repeating event is as it was.",
+      },
+    ]);
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(hook.result.current.notices).toEqual([]);
+  });
+
+  it("makes a notice for a settle from the dialog, and keeps the buttons when no answer came", async () => {
+    settleSeriesSplit.mockRejectedValueOnce(new Error("PM's backend didn't answer."));
+    const { mod, hook, act } = await load();
+    await act(() => mod.settleSplit("p", "check", "Gym"));
+    expect(hook.result.current.notices).toHaveLength(1);
+    expect(hook.result.current.notices[0]).toMatchObject({
+      tone: "error",
+      text: "“Gym”: PM's backend didn't answer.",
+      split: { token: "p", offers: ["check"], title: "Gym" },
+    });
+  });
+
+  it("keeps a notice's own offers when its settle gets no answer", async () => {
+    const { mod, hook, act } = await load();
+    act(() => {
+      mod.notePartial("Gym", partial(["finish", "remove"]));
+    });
+    const id = hook.result.current.notices[0].id;
+    settleSeriesSplit.mockRejectedValueOnce(new Error("PM's backend didn't answer."));
+    await act(() => mod.settleSplit("s1", "finish", "Gym"));
+    expect(hook.result.current.notices).toHaveLength(1);
+    expect(hook.result.current.notices[0]).toMatchObject({
+      id,
+      tone: "error",
+      split: { token: "s1", offers: ["finish", "remove"] },
+    });
+  });
+
+  it("gives a delete an earlier change blocked that change's buttons, never 'Settle that first'", async () => {
+    deleteCalendarEvent.mockResolvedValueOnce({
+      outcome: "refused",
+      result: partial(["finish"]),
+    });
+    deleteCalendarEvent.mockResolvedValueOnce({
+      outcome: "held",
+      undo_token: "t2",
+      undo_seconds: 8,
+    });
+    const { mod, hook, act } = await load();
+    await act(async () => {
+      expect(await mod.startDelete(occurrence, { scope: "all", token: "a" })).toBe("refused");
+    });
+    expect(hook.result.current.notices[0]).toMatchObject({
+      text: "“Gym” wasn't deleted. PM is still finishing an earlier change to it from 02-11. Finish it first.",
+      split: { token: "s1", offers: ["finish"] },
+    });
+    // Held, then blocked at the send: its "Deleting" notice gives way to the one already up.
+    await act(() => mod.startDelete(occurrence, { scope: "all", token: "a" }));
+    expect(hook.result.current.notices).toHaveLength(2);
+    act(() =>
+      settledHandler!({ undo_token: "t2", event_id: occurrence.id, result: partial(["finish"]) }),
+    );
+    expect(hook.result.current.notices).toHaveLength(1);
+    expect(hook.result.current.notices[0].split?.token).toBe("s1");
+    expect(hook.result.current.notices.some((n) => /Settle/.test(n.text))).toBe(false);
+  });
+
+  it("keeps words said once until they're dismissed", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteSeriesNotice("PM closed before it finished changing this repeating event."));
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(hook.result.current.notices).toEqual([
+      { id: 1, tone: "warn", text: "PM closed before it finished changing this repeating event." },
+    ]);
+  });
+
+  it("says how to change a repeating save back, with no Undo", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteSaved("Gym", { outcome: "saved", warnings: [] }, "this"));
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "ok",
+        text: "Saved “Gym” for this occurrence. To change it back, edit it again.",
+      },
+    ]);
+    expect(hook.result.current.notices[0].undoToken).toBeUndefined();
+    // A one-off's words are as they were.
+    act(() => mod.noteSaved("Dentist", { outcome: "saved", warnings: [] }));
+    expect(hook.result.current.notices[1].text).toBe("Saved “Dentist”.");
   });
 });

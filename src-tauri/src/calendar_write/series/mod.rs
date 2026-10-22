@@ -632,43 +632,46 @@ impl fmt::Display for SeriesRefusal {
             SeriesRefusal::Recur(e) => e.fmt(f),
             SeriesRefusal::Retime(e) => e.fmt(f),
             SeriesRefusal::Time(e) => e.fmt(f),
+            // The words the dialog's rows show: no "series", "split", "instance", "exception" or
+            // "master" (C9b-1 critique 2 M4); a test walks every one.
             SeriesRefusal::Unreadable => {
-                write!(f, "PM couldn't read this series' details from Google.")
+                write!(f, "PM couldn't read this repeating event's details from Google.")
             }
             SeriesRefusal::NoZone => write!(
                 f,
-                "Google's copy of this series has no time zone, so PM won't guess one."
+                "Google's copy of this repeating event has no time zone, so PM won't guess one."
             ),
             SeriesRefusal::NotInSeries => {
                 write!(
                     f,
-                    "This occurrence doesn't belong to the series PM fetched."
+                    "This occurrence doesn't belong to the repeating event PM fetched."
                 )
             }
             SeriesRefusal::Incomplete => write!(
                 f,
-                "PM couldn't see every occurrence of this series that was changed on its own."
+                "PM couldn't see every occurrence of this repeating event that was changed on its \
+                 own."
             ),
             SeriesRefusal::NoBase => write!(
                 f,
-                "PM no longer has the series as it was when you opened it. Open it again."
+                "PM no longer has this repeating event as it was when you opened it. Open it again."
             ),
             SeriesRefusal::CannotCarry(day) => write!(
                 f,
                 "The occurrence on {} has its own guests, attachments, video call, label or who can \
-                 see it, which PM can't move to the new series.",
+                 see it, which PM can't move to the new part.",
                 day.format("%d-%m-%Y")
             ),
             SeriesRefusal::GuestsElsewhere(day) => write!(
                 f,
                 "The occurrence on {} has guests of its own, and PM can't change events with \
-                 guests yet. Choose \"This event\" to change only this one.",
+                 guests yet. Choose “This event” to change only this one.",
                 day.format("%d-%m-%Y")
             ),
             SeriesRefusal::FormattedDescription => write!(
                 f,
-                "This series' description has formatting, which saving it here as plain text \
-                 would remove. Change this occurrence on its own instead."
+                "This repeating event's description has formatting, which saving it here as plain \
+                 text would remove. Change this occurrence on its own instead."
             ),
             SeriesRefusal::VisibilityIsSeriesWide => write!(
                 f,
@@ -677,37 +680,38 @@ impl fmt::Display for SeriesRefusal {
             ),
             SeriesRefusal::OnlyThisDiffers => write!(
                 f,
-                "The series already has that; only this occurrence is different. Choose \"This \
-                 event\" to change it."
+                "Every occurrence already has that; only this one is different. Choose “This \
+                 event” to change it."
             ),
             SeriesRefusal::OnlyThisTimeDiffers => write!(
                 f,
-                "This occurrence has a time of its own, so changing the whole series here wouldn't \
-                 change it. Choose \"This event\" to change it, and change the rest of the series on \
-                 its own."
+                "This occurrence has a time of its own, so changing every occurrence here wouldn't \
+                 change it. Choose “This event” to change it, and change the others in a separate \
+                 save."
             ),
             SeriesRefusal::SplitInGap(day) => write!(
                 f,
-                "On {} the series' time falls in the hour the clocks skip, so PM can't start the \
-                 rest of the series there. Change this occurrence on its own.",
+                "On {} this repeating event's time falls in the hour the clocks skip, so PM can't \
+                 start the new part there. Change this occurrence on its own.",
                 day.format("%d-%m-%Y")
             ),
             SeriesRefusal::ZoneChange => write!(
                 f,
-                "PM can't move a whole series into another time zone. Change this occurrence on \
-                 its own."
+                "PM can't move every occurrence of a repeating event into another time zone. \
+                 Change this occurrence on its own."
             ),
             SeriesRefusal::SplitOverlap(day) => write!(
                 f,
-                "A part PM split off this repeating event from {} is still there, and this part \
-                 still repeats past that day, so it may show twice. Check it in Google Calendar \
-                 first.",
+                "An earlier “this and following” change made a new part of this repeating event \
+                 from {}, and this part still repeats past that day, so it may show twice. Check it \
+                 in Google Calendar first.",
                 day.format("%d-%m-%Y")
             ),
             SeriesRefusal::PartsUnread => write!(
                 f,
-                "PM couldn't check for a part it split off this repeating event earlier, so it \
-                 won't change more than this occurrence now. Try again in a moment."
+                "PM couldn't check for a new part an earlier “this and following” change made of \
+                 this repeating event, so it won't change more than this occurrence now. Try again \
+                 in a moment."
             ),
         }
     }

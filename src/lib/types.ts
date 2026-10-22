@@ -1546,6 +1546,8 @@ export type ReadOnlyReason =
   | "private_event"
   | "not_organizer"
   | "recurring"
+  /** A one-off in PM that has since become a repeating event in Google. */
+  | "became_repeating"
   | "has_guests"
   | "special_type"
   | "locked"
@@ -1702,8 +1704,9 @@ export type WriteOutcome =
    *  following" change made was removed too. */
   | { outcome: "ignored_by_google"; split: boolean }
   /** A "this and following" change PM couldn't finish: Google may hold part of it. `offers` is what
-   *  Google's state allows now; `from` is the day the change starts (YYYY-MM-DD). */
-  | { outcome: "partial_split"; token: string; offers: SplitAction[]; from: string }
+   *  Google's state allows now; `from` is the day the change starts (YYYY-MM-DD). `note`: a settle
+   *  that didn't end it says why, while PM still holds it (so its buttons stay). */
+  | { outcome: "partial_split"; token: string; offers: SplitAction[]; from: string; note?: string }
   /** The new part of a change PM couldn't finish was removed: the event is as it was. */
   | { outcome: "split_removed" }
   | { outcome: "conflict"; fields: string[] }

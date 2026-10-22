@@ -86,20 +86,21 @@ pub enum ReanchorError {
 impl fmt::Display for ReanchorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // Shown on the dialog's rows: no "series" (C9b-1 critique 2 M4).
             ReanchorError::Collision(day) => write!(
                 f,
-                "The series already repeats on {}, so every occurrence can't move there.",
+                "It already repeats on {}, so every occurrence can't move there.",
                 weekday_name(*day)
             ),
             ReanchorError::Crosses(day) => write!(
                 f,
-                "That moves it past {}, which the series also repeats on.",
+                "That moves it past {}, which it also repeats on.",
                 weekday_name(*day)
             ),
             ReanchorError::CrossWeek => write!(
                 f,
-                "The series repeats on several days every few weeks, and that move would change \
-                 which weeks one of them repeats in."
+                "It repeats on several days every few weeks, and that move would change which \
+                 weeks one of them repeats in."
             ),
             ReanchorError::CrossMonth => write!(
                 f,
@@ -111,15 +112,15 @@ impl fmt::Display for ReanchorError {
             ),
             ReanchorError::Fifth => write!(
                 f,
-                "Not every month has a fifth of that weekday, so the series can't repeat on it."
+                "Not every month has a fifth of that weekday, so it can't repeat on it."
             ),
             ReanchorError::NotLast => write!(
                 f,
-                "The series repeats on the last of a weekday each month, and that day isn't one."
+                "It repeats on the last of a weekday each month, and that day isn't one."
             ),
             ReanchorError::NotDerivable => write!(
                 f,
-                "PM can't work out how this series would repeat after that move."
+                "PM can't work out how this event would repeat after that move."
             ),
         }
     }

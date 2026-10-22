@@ -78,6 +78,24 @@ describe("useFocusTrap", () => {
     expect(document.activeElement).toBe(mid);
   });
 
+  // The repeating-event dialog puts first focus on Back, so Enter on open sends nothing (#884).
+  it("gives first focus to a [data-autofocus] element over the first focusable one", () => {
+    function AutofocusHarness() {
+      const ref = useRef<HTMLDivElement>(null);
+      useFocusTrap(true, ref);
+      return (
+        <div ref={ref} tabIndex={-1}>
+          <button data-testid="first">first</button>
+          <button data-testid="back" data-autofocus>
+            back
+          </button>
+        </div>
+      );
+    }
+    const { getByTestId } = render(<AutofocusHarness />);
+    expect(document.activeElement).toBe(getByTestId("back"));
+  });
+
   it("restores focus to the opener when the container closes", () => {
     const { getByTestId, queryByTestId } = render(<Harness />);
     const opener = openDialog(getByTestId);

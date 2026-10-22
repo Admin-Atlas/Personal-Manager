@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.9-alpha",
+    date: "2026-10-19",
+    highlights: [
+      "Under the hood, the dialog that asks which occurrences of a repeating event you mean is built and checked, along with what it warns about first and the buttons for finishing or taking back a change PM couldn't complete. It isn't shown yet: repeating events stay read-only until the next update. One thing you might notice: a one-off event that has since been turned into a repeating event in Google Calendar now says so when you open or delete it, and suggests refreshing and opening one of its occurrences.",
+    ],
+  },
+  {
     version: "3.148.8-alpha",
     date: "2026-10-18",
     highlights: [

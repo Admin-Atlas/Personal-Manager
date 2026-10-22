@@ -89,39 +89,42 @@ impl fmt::Display for RetimeError {
         match self {
             RetimeError::Recur(e) => e.fmt(f),
             RetimeError::Reanchor(e) => e.fmt(f),
+            // Shown on the dialog's rows: no "series" or "split" (C9b-1 critique 2 M4).
             RetimeError::KindChange => write!(
                 f,
-                "PM can't change a whole series between all-day and timed. Change this occurrence on its own."
+                "PM can't change every occurrence of a repeating event between all-day and timed. \
+                 Change this occurrence on its own."
             ),
             RetimeError::HasExtraDates => write!(
                 f,
-                "This series also has dates of its own outside its rule, which PM can't move with it."
+                "This repeating event also has dates of its own outside its rule, which PM can't \
+                 move with it."
             ),
             RetimeError::NotOnRule => write!(
                 f,
-                "That occurrence is an extra date, not one the series' rule makes, so PM can't move the series by it."
+                "That occurrence is an extra date, not one the repeat rule makes, so PM can't move \
+                 the others by it."
             ),
             RetimeError::StartNotOnRule(d) => write!(
                 f,
-                "This series starts on {}, a day its own rule doesn't repeat on, so PM can't move every \
-                 occurrence with it. Change this occurrence on its own.",
+                "This repeating event starts on {}, a day its own rule doesn't repeat on, so PM \
+                 can't move every occurrence with it. Change this occurrence on its own.",
                 date(d)
             ),
             RetimeError::RepeatedTime(d) => write!(
                 f,
-                "On {} that time happens twice, as the clocks go back, and PM can't move the series to \
-                 the second one. Pick another time.",
+                "On {} that time happens twice, as the clocks go back, and PM can't move these \
+                 occurrences to the second one. Pick another time.",
                 date(d)
             ),
             RetimeError::Gap(d) => write!(
                 f,
-                "On {}, the series' new start falls in the hour the clocks skip.",
+                "On {}, the new start falls in the hour the clocks skip.",
                 date(d)
             ),
             RetimeError::Overlaps(d) => write!(
                 f,
-                "That would start the rest of the series on {}, which the part before it already \
-                 reaches.",
+                "That would start the new part on {}, which the earlier part already reaches.",
                 date(d)
             ),
             RetimeError::Loses(d) => write!(
@@ -131,13 +134,13 @@ impl fmt::Display for RetimeError {
             ),
             RetimeError::Adds(d) => write!(
                 f,
-                "That move would add an occurrence on {} that the series doesn't have now.",
+                "That move would add an occurrence on {} that the repeating event doesn't have now.",
                 date(d)
             ),
             RetimeError::CannotPlace => write!(
                 f,
-                "PM can't tell where every occurrence would land after that move, so it won't move the \
-                 series. Change this occurrence on its own."
+                "PM can't tell where every occurrence would land after that move, so it won't move \
+                 them. Change this occurrence on its own."
             ),
         }
     }

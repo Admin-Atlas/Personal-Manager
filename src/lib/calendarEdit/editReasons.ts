@@ -5,8 +5,16 @@
 // reason and outcome the backend can return has a line here, and the switches are exhaustive, so a
 // new backend value is a `tsc` failure until it has words. The backend decides; this only explains.
 
+import type { Tone as CalloutTone } from "../../components/ui/tone";
 import { formatDateOnly } from "../format";
-import type { EditLoad, ReadOnlyReason, SplitAction, WriteOutcome } from "../types";
+import type {
+  EditLoad,
+  ReadOnlyReason,
+  SeriesScope,
+  SplitAction,
+  WriteOutcome,
+  WriteWarning,
+} from "../types";
 import type { DraftProblem, EditorField } from "./eventDraft";
 
 function unreachable(value: never): never {
@@ -28,6 +36,8 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "Someone else organises this event, so only they can change it.";
     case "recurring":
       return "This is a repeating event, and PM can't change repeating events yet.";
+    case "became_repeating":
+      return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "has_guests":
       return "This event has guests, and PM can't change events with guests yet.";
     case "special_type":
@@ -89,16 +99,61 @@ export function listFields(fields: readonly EditorField[]): string {
 
 export type Tone = "ok" | "warn" | "error";
 
+/** How each tone shows as a Callout: the editor's banner, the calendar's notices and the
+ *  repeating-event dialog read this one map. */
+export const CALLOUT_TONE: Record<Tone, CalloutTone> = {
+  ok: "info",
+  warn: "warning",
+  error: "danger",
+};
+
+/** Whether words are for a change or a delete. */
+export type ChoiceKind = "save" | "delete";
+
 const REAUTH =
   "Google needs you to sign in again. Reconnect the account in Settings › Connectors, then try again.";
 // A 404 doesn't say which: the event was deleted, or the calendar stopped being visible to the account.
 const GONE =
   "This event is no longer in Google: it was deleted there, or this account can't see it any more.";
 
+/** The days of occurrences a change left behind, as a parenthesis to put in its sentence: up to
+ *  five, then how many more. Empty when there are none. */
+export function leftBehindText(days?: readonly string[]): string {
+  if (!days || days.length === 0) return "";
+  const shown = days.slice(0, 5).map(formatDateOnly).join(", ");
+  const more = days.length > 5 ? ` and ${days.length - 5} more` : "";
+  return ` (${shown}${more})`;
+}
+
+/** A warning a save or a delete came back with, as a sentence. `leftBehind`: the days of
+ *  `left_on_old_series`. A delete's occurrences "may still show"; a save's may be on the earlier
+ *  part. */
+export function writeWarningText(
+  warning: WriteWarning,
+  kind: ChoiceKind,
+  leftBehind?: readonly string[],
+): string {
+  switch (warning) {
+    case "mirror_refresh_pending":
+      return kind === "save"
+        ? "PM's calendar will show it after the next refresh."
+        : "PM's calendar will catch up after the next refresh.";
+    case "left_on_old_series": {
+      const days = leftBehindText(leftBehind);
+      return kind === "save"
+        ? `Some occurrences you changed on their own may still be on the earlier part, or hidden by Google${days}; check them in Google Calendar.`
+        : `Some occurrences changed on their own may still show${days}; check them in Google Calendar.`;
+    }
+    default:
+      return unreachable(warning);
+  }
+}
+
 /** A "this and following" change PM couldn't finish, worded by what Google's state allows now
  *  (review H3/M3): never "Saved" while the event may show twice, and never a hint to delete while
- *  the earlier part already ends before the day. */
-function partialText(offers: readonly SplitAction[], from: string): string {
+ *  the earlier part already ends before the day. Check alone is also what a new part changed in
+ *  Google since leaves, so it never says PM lost touch (C9b-1 critique 2 M5). */
+export function partialText(offers: readonly SplitAction[], from: string): string {
   const day = formatDateOnly(from);
   const finish = offers.includes("finish");
   const remove = offers.includes("remove");
@@ -111,7 +166,19 @@ function partialText(offers: readonly SplitAction[], from: string): string {
   if (remove) {
     return `PM couldn't finish this change: it may show twice from ${day}. Remove the new part, or check again.`;
   }
-  return `PM lost touch with Google while changing this from ${day}. Check again. If PM closes first, look at that day in Google Calendar: only if it shows twice, delete the newer one.`;
+  return `PM couldn't finish this change from ${day}. Check again; if it still can't, look at that day in Google Calendar: only if it shows twice, delete the newer one.`;
+}
+
+/** An earlier change PM couldn't finish blocks this one: what it is and what to press first,
+ *  worded by what Google allows now. Never a hint to delete unless Remove is offered. */
+export function earlierChangeText(offers: readonly SplitAction[], from: string): string {
+  const head = `PM is still finishing an earlier change to it from ${formatDateOnly(from)}.`;
+  const finish = offers.includes("finish");
+  const remove = offers.includes("remove");
+  if (finish && remove) return `${head} Finish it or remove the new part first.`;
+  if (finish) return `${head} Finish it first.`;
+  if (remove) return `${head} Remove the new part, or check again.`;
+  return `${head} Check again; if it still can't, look at that day in Google Calendar.`;
 }
 
 /** What a save came to, and how it should look. A conflict names the fields Google changed; it
@@ -124,13 +191,13 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
       if (outcome.warnings.includes("left_on_old_series")) {
         return {
           tone: "warn",
-          text: "Saved from that day on. Some occurrences you changed on their own may still be on the earlier part, or hidden by Google; check them in Google Calendar.",
+          text: `Saved from that day on. ${writeWarningText("left_on_old_series", "save", outcome.left_behind)}`,
         };
       }
       return {
         tone: "ok",
         text: outcome.warnings.includes("mirror_refresh_pending")
-          ? "Saved to Google. PM's calendar will show it after the next refresh."
+          ? `Saved to Google. ${writeWarningText("mirror_refresh_pending", "save")}`
           : "Saved.",
       };
     case "no_change":
@@ -199,13 +266,13 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       if (outcome.warnings.includes("left_on_old_series")) {
         return {
           tone: "warn",
-          text: `Deleted ${t} from that day on. Some occurrences changed on their own may still show; check them in Google Calendar.`,
+          text: `Deleted ${t} from that day on. ${writeWarningText("left_on_old_series", "delete", outcome.left_behind)}`,
         };
       }
       return {
         tone: "ok",
         text: outcome.warnings.includes("mirror_refresh_pending")
-          ? `Deleted ${t} from Google. PM's calendar will catch up after the next refresh.`
+          ? `Deleted ${t} from Google. ${writeWarningText("mirror_refresh_pending", "delete")}`
           : `Deleted ${t}.`,
       };
     case "gone":
@@ -216,17 +283,16 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     case "no_change":
       return notDeleted("Google had nothing to change.", "warn");
     case "needs_choice":
+      // Also a delete sent with no choice that the backend wants one for: a held delete can't
+      // reopen the dialog seconds later, so the user deletes again and chooses then.
       return notDeleted(
-        "It changed since you chose which occurrences to delete. Choose again.",
+        "PM needs to ask which occurrences first. Delete it again to choose.",
         "warn",
       );
     case "ignored_by_google":
       return notDeleted("Google answered as if it deleted it, but kept it.", "warn");
     case "partial_split":
-      return notDeleted(
-        `PM is still finishing an earlier change to it from ${formatDateOnly(outcome.from)}. Settle that first.`,
-        "warn",
-      );
+      return notDeleted(earlierChangeText(outcome.offers, outcome.from), "warn");
     case "split_removed":
       return notDeleted("PM removed the new part of an earlier change instead.", "warn");
     case "conflict": {
@@ -250,6 +316,116 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     default:
       return unreachable(outcome);
   }
+}
+
+const quote = (title: string) => `“${title.trim() || "(no title)"}”`;
+
+/** The buttons for a change PM couldn't finish, always in this order, filtered by what's offered. */
+export const SPLIT_ORDER: readonly SplitAction[] = ["finish", "remove", "check"];
+
+/** A settle button's label. */
+export function splitActionLabel(action: SplitAction): string {
+  switch (action) {
+    case "finish":
+      return "Finish";
+    case "remove":
+      return "Remove the new part";
+    case "check":
+      return "Check again";
+    default:
+      return unreachable(action);
+  }
+}
+
+/** What settling a change PM couldn't finish came to, as a notice naming the event `title`. One
+ *  still held carries its own words (`note`), or says what Google allows now. */
+export function settleText(result: WriteOutcome, title: string): { tone: Tone; text: string } {
+  const t = quote(title);
+  switch (result.outcome) {
+    case "saved": {
+      const warnings = result.warnings.map((w) => writeWarningText(w, "save", result.left_behind));
+      return {
+        tone: result.warnings.includes("left_on_old_series") ? "warn" : "ok",
+        text: [`Finished the change to ${t}.`, ...warnings].join(" "),
+      };
+    }
+    case "split_removed":
+      return {
+        tone: "ok",
+        text: `Removed the new part of ${t}. The repeating event is as it was.`,
+      };
+    case "partial_split":
+      return {
+        tone: "warn",
+        text: `${t}: ${result.note ?? partialText(result.offers, result.from)}`,
+      };
+    // PM's own claim on the repeating event comes back as `partial_split` with a note, the change still
+    // held. A plain busy means Google refused Finish's next step and PM took its new part back, the
+    // change no longer held (C9b-1a review round 2).
+    case "busy":
+      return {
+        tone: "warn",
+        text: `${t}: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.`,
+      };
+    case "no_change":
+    case "needs_choice":
+    case "ignored_by_google":
+    case "conflict":
+    case "gone":
+    case "read_only":
+    case "reauth":
+    case "unconfirmed":
+    case "failed": {
+      const said = outcomeText(result);
+      return { tone: said.tone, text: `${t}: ${said.text}` };
+    }
+    default:
+      return unreachable(result);
+  }
+}
+
+/** A save that landed, said once the editor has closed. `scope` names the occurrences of a
+ *  repeating event it was for: there's no Undo after one (DECISIONS 17-10 #4), so the notice says
+ *  how to change it back, and for "this and following", which makes a repeating event of its own
+ *  from `from` (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). */
+export function savedNotice(
+  title: string,
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  scope: SeriesScope | null,
+  from?: string,
+): { tone: Tone; text: string } {
+  const t = quote(title);
+  const pending = outcome.warnings.includes("mirror_refresh_pending");
+  const left = outcome.warnings.includes("left_on_old_series");
+  let first: string;
+  let back: string | null;
+  switch (scope) {
+    case null:
+      first = pending ? `Saved ${t} to Google.` : `Saved ${t}.`;
+      back = null;
+      break;
+    case "this":
+      first = `Saved ${t} for this occurrence.`;
+      back = "To change it back, edit it again.";
+      break;
+    case "following":
+      first = `Saved ${t} from ${from ? formatDateOnly(from) : "this occurrence"} on, as a repeating event of its own.`;
+      back =
+        "There's no Undo: editing it again changes that part, but won't join it back to the earlier one.";
+      break;
+    case "all":
+      first = `Saved ${t} for every occurrence.`;
+      back = "To change it back, edit it again.";
+      break;
+    default:
+      return unreachable(scope);
+  }
+  const parts = [first];
+  if (pending) parts.push(writeWarningText("mirror_refresh_pending", "save"));
+  // Occurrences left on the earlier part come first: changing it back isn't the whole story.
+  if (left) parts.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
+  else if (back) parts.push(back);
+  return { tone: left ? "warn" : "ok", text: parts.join(" ") };
 }
 
 /** Why the editor couldn't open. */
