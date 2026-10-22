@@ -134,6 +134,7 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     guests_can_invite_others: true,
     guests_can_see_other_guests: true,
     guests_omitted: false,
+    organizer_email: "me@x.com",
     ...over,
   };
 }

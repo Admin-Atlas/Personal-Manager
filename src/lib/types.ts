@@ -1748,6 +1748,9 @@ export interface EventForEdit {
   guests_can_see_other_guests: boolean;
   /** Google didn't send the whole guest list, so it can't change. */
   guests_omitted: boolean;
+  /** The organiser's address, on the guest list or not: no guest change may touch it (the
+   *  backend's `check`). */
+  organizer_email: string | null;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */

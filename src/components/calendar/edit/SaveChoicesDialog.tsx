@@ -11,6 +11,10 @@
 // with the reason rather than hidden; the selected row's warnings show under the rows, in one live
 // region, so a radio's spoken name stays one line; and a change PM couldn't finish earlier gets one
 // settle block, since Google never leaves a change half done.
+//
+// A row that would email guests also asks whether Google sends the emails (C12), in this dialog
+// rather than a second one after it (Google asks in turn, and gives no counts): Save waits for the
+// answer, and picking another row asks again, since the answer is to the numbers on screen.
 
 import { useRef, useState } from "react";
 import {
@@ -30,8 +34,10 @@ import {
   splitActionLabel,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
-import type { SeriesScope, SplitAction } from "../../../lib/types";
+import { notifyOf } from "../../../lib/calendarEdit/guests";
+import type { Notify, SeriesScope, SplitAction } from "../../../lib/types";
 import { Button, Callout, Dialog, RadioChoice, Skeleton } from "../../ui";
+import { NotifyChoice } from "./NotifyChoice";
 
 /** What the dialog shows: the choices loading (several reads of Google), ready, or refused. */
 export type ChoicesView =
@@ -53,7 +59,11 @@ interface Props {
   calendarName?: string | null;
   /** The occurrence's day as the user sees it (DD-MM), which a delete's "This event" names. */
   day?: string;
-  onChoose: (picked: Picked) => void;
+  /** The address Google sends guests' emails from (the account), for a row that would email them. */
+  from?: string | null;
+  /** The row picked, and Send or Don't send when the row would email guests (null when it wouldn't:
+   *  nothing was asked). */
+  onChoose: (picked: Picked, notify: Notify | null) => void;
   onSettle: (token: string, action: SplitAction) => void;
   onClose: () => void;
 }
@@ -67,6 +77,7 @@ export function SaveChoicesDialog({
   when,
   calendarName,
   day,
+  from = null,
   onChoose,
   onSettle,
   onClose,
@@ -76,6 +87,9 @@ export function SaveChoicesDialog({
   const [picked, setPicked] = useState<SeriesScope | null>(() =>
     choices ? defaultScope(choices) : null,
   );
+  // Send or Don't send, for the numbers on screen: none until the user picks, and none again
+  // whenever the row or the backend's answer changes (R9).
+  const [notify, setNotify] = useState<Notify | null>(null);
   // A new answer from the backend picks afresh; anything else re-rendering the parent (a notice
   // expiring, an event list loading) keeps the user's pick (C9b-1 critique 1 M5).
   const [pickedFor, setPickedFor] = useState(choices);
@@ -83,14 +97,25 @@ export function SaveChoicesDialog({
   if (choices !== pickedFor) {
     setPickedFor(choices);
     setPicked(choices ? defaultScope(choices) : null);
+    setNotify(null);
     sent.current = false;
   }
+  const pick = (scope: SeriesScope) => {
+    setPicked(scope);
+    setNotify(null);
+  };
 
   const rows = choices ? rowsOf(choices, kind, day) : [];
   const selected = rows.find((r) => r.scope === picked) ?? null;
   const pending = choices ? pendingOf(choices) : null;
   const lines = selected?.selectable ? warningLines(selected, kind, name) : [];
-  const canSend = choices !== null && selected !== null && selected.selectable && !settling;
+  const guests = selected?.selectable ? selected.guests : null;
+  const canSend =
+    choices !== null &&
+    selected !== null &&
+    selected.selectable &&
+    !settling &&
+    (guests === null || notify !== null);
   // Nothing picked because "This event" can't be (visibility, say): its reason, where a keyboard
   // user hears it, since a disabled radio is skipped (C9b-1 critique 2 M7).
   const thisRefused =
@@ -102,7 +127,10 @@ export function SaveChoicesDialog({
     // Once: a second click before the parent unmounts the dialog sends nothing.
     if (!canSend || sent.current || !selected?.token) return;
     sent.current = true;
-    onChoose({ scope: selected.scope, token: selected.token, asAll: selected.asAll });
+    onChoose(
+      { scope: selected.scope, token: selected.token, asAll: selected.asAll },
+      guests !== null && notify !== null ? notifyOf(notify) : null,
+    );
   }
 
   const lead =
@@ -170,7 +198,7 @@ export function SaveChoicesDialog({
               name="series-scope"
               value={row.scope}
               current={picked}
-              onSelect={setPicked}
+              onSelect={pick}
               label={row.label}
               detail={row.detail}
               disabled={!row.selectable || settling}
@@ -206,6 +234,18 @@ export function SaveChoicesDialog({
           </Callout>
         )}
       </div>
+      {guests !== null && selected !== null && (
+        <NotifyChoice
+          notice={guests}
+          kind={kind}
+          scope={selected.scope}
+          from={from}
+          value={notify}
+          onChange={setNotify}
+          disabled={settling}
+          legend="shown"
+        />
+      )}
       {kind === "delete" && (
         <p className="mt-3 text-xs text-ink4">
           You can undo it for a few seconds. If you quit PM in that time, nothing is deleted.

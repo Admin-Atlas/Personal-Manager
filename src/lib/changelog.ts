@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.154.2-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "Under the hood, PM now has the pieces of a guest list like Google Calendar's: adding people by address or from people already in your calendars, marking them optional, the three guest permissions, and the question of whether Google emails your guests about a change, with Send and Don't send and no answer picked for you. None of it is in the app yet, and events with guests stay read-only for now.",
+    ],
+  },
+  {
     version: "3.154.1-alpha",
     date: "2026-10-21",
     highlights: [

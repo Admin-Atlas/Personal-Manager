@@ -217,6 +217,8 @@ describe("the new event's ghost (C10c)", () => {
       end_zone: "America/New_York",
     },
     recurrence: { kind: "once" },
+    guests: [],
+    guest_perms: { modify: false, invite_others: true, see_others: true },
     show_as: "busy",
     visibility: "default",
   };

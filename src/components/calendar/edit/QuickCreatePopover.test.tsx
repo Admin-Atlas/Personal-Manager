@@ -139,6 +139,8 @@ const seed: EditorFields = {
     end_zone: "Europe/London",
   },
   recurrence: { kind: "once" },
+  guests: [],
+  guest_perms: { modify: false, invite_others: true, see_others: true },
   show_as: "busy",
   visibility: "default",
 };
@@ -146,7 +148,16 @@ const seed: EditorFields = {
 /** What the box sends for the seed titled `summary`, on Personal. */
 const sentFor = (summary: string) => ({
   calendarId: PERSONAL,
-  draft: { ...seed, summary, recurrence: null } as NewEventDraft,
+  // Every field the seed has but its guests, which a create doesn't send yet (C12d).
+  draft: {
+    summary,
+    time: seed.time,
+    location: seed.location,
+    description: seed.description,
+    show_as: seed.show_as,
+    visibility: seed.visibility,
+    recurrence: null,
+  } as NewEventDraft,
 });
 
 const saved: WriteOutcome = { outcome: "saved", warnings: [], left_behind: [] };

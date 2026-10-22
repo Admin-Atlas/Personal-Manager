@@ -489,6 +489,11 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
         guests_can_invite_others: patch::bool_of(fresh.get("guestsCanInviteOthers"), true),
         guests_can_see_other_guests: patch::bool_of(fresh.get("guestsCanSeeOtherGuests"), true),
         guests_omitted: attendees::omitted(fresh),
+        organizer_email: fresh
+            .get("organizer")
+            .and_then(|o| o.get("email"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -7612,6 +7617,27 @@ mod tests {
         .unwrap()
         .guests
         .is_empty());
+    }
+
+    /// The organiser's address goes to the editor whether or not Google's list carries it: an
+    /// event with no guests has no list, and `attendees::check` refuses a change to it either way.
+    #[test]
+    fn the_editor_knows_the_organiser_even_off_the_list() {
+        let bare = json!({
+            "start": { "date": "2026-10-12" },
+            "end": { "date": "2026-10-13" },
+            "organizer": { "email": "me@example.com", "self": true }
+        });
+        let e = event_for_edit(&bare, "Europe/London").unwrap();
+        assert!(e.guests.is_empty());
+        assert_eq!(e.organizer_email.as_deref(), Some("me@example.com"));
+        let none = json!({ "start": { "date": "2026-10-12" }, "end": { "date": "2026-10-13" } });
+        assert_eq!(
+            event_for_edit(&none, "Europe/London")
+                .unwrap()
+                .organizer_email,
+            None
+        );
     }
 
     /// C12 §5.1: a delete of a row you organise says who it would tell, before anything is held;

@@ -43,6 +43,7 @@ import {
   outcomeText,
   problemText,
   reasonText,
+  rebasedText,
   savedNotice,
   settleText,
   SPLIT_ORDER,
@@ -91,17 +92,47 @@ describe("edit reasons", () => {
   });
 
   it("names conflicting fields in the editor's words", () => {
-    expect(conflictFields(["start", "end", "summary", "transparency", "attendees"])).toEqual([
+    // A key the editor has no field for (the colour, say) names nothing.
+    expect(conflictFields(["start", "end", "summary", "transparency", "colorId"])).toEqual([
       "time",
       "summary",
       "show_as",
     ]);
+    // The guest list and its three permissions (C12), each said once.
+    expect(
+      conflictFields([
+        "attendees",
+        "guestsCanModify",
+        "guestsCanInviteOthers",
+        "guestsCanSeeOtherGuests",
+      ]),
+    ).toEqual(["guests", "guest_perms"]);
+    expect(listFields(["guests", "guest_perms"])).toBe("guests and guest permissions");
     expect(listFields(["summary"])).toBe("title");
     expect(listFields(["summary", "time", "location"])).toBe("title, time and location");
     // How it repeats, in Google's word for it (C11).
     expect(conflictFields(["recurrence", "start"])).toEqual(["recurrence", "time"]);
     expect(fieldLabel("recurrence")).toBe("repeat");
     expect(listFields(["time", "recurrence"])).toBe("time and repeat");
+  });
+
+  it("after taking Google's copy, says whose guest change went, never that the list is Google's", () => {
+    const head = "Google changed this event while you were editing.";
+    expect(rebasedText(head, [], [])).toBe(
+      `${head} Your changes are still here; save again to apply them.`,
+    );
+    expect(rebasedText(head, ["summary"], [])).toBe(
+      `${head} Google's version of the title is shown now; your other changes are still here.`,
+    );
+    // The guest list merges: only the change to a guest Google changed too was dropped.
+    const guests = rebasedText(head, ["guests"], ["Ann"]);
+    expect(guests).toBe(
+      `${head} Google changed Ann on the guest list too, so your change to that guest wasn't kept; your other changes are still here.`,
+    );
+    expect(guests).not.toMatch(/version of the guests/);
+    expect(rebasedText(head, ["summary", "guests"], ["Ann", "bo@x.org"])).toBe(
+      `${head} Google's version of the title is shown now. Google changed Ann and bo@x.org on the guest list too, so your changes to those guests weren't kept; your other changes are still here.`,
+    );
   });
 
   it("explains every outcome, promising on a conflict only that nothing was saved over it", () => {
@@ -266,6 +297,9 @@ describe("edit reasons", () => {
     );
     expect(problemText({ kind: "unreadable", half: "end", what: "zone" })).toBe(
       "The end time zone isn't one PM knows.",
+    );
+    expect(problemText({ kind: "bad_guest", email: "bob at x" })).toBe(
+      "“bob at x” isn't an email address.",
     );
   });
 });

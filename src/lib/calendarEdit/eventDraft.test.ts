@@ -18,15 +18,18 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   followStart,
+  guestNotice,
   halfInstant,
   newEventSeed,
   rebaseDraft,
   repeatSeed,
+  sameField,
   seedDraft,
   switchNewKind,
   toChanges,
   toNewEvent,
   type EditorFields,
+  type GuestDraft,
 } from "./eventDraft";
 import { QUARTER_HOURS } from "./timeSlots";
 
@@ -63,6 +66,7 @@ const event: EventForEdit = {
   guests_can_invite_others: true,
   guests_can_see_other_guests: true,
   guests_omitted: false,
+  organizer_email: "me@x.org",
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -457,6 +461,308 @@ describe("carrying a draft onto Google's newer copy", () => {
   });
 });
 
+// --- guests (#884, C12) ---
+
+const guest = (email: string, over: Partial<GuestDraft> = {}): GuestDraft => ({
+  email,
+  name: null,
+  response: "accepted",
+  optional: false,
+  organizer: false,
+  self: false,
+  room: false,
+  ...over,
+});
+const ME = guest("me@x.org", { name: "Me", organizer: true, self: true });
+const A = guest("A@x.org", { name: "Ann", response: "needsAction" });
+const withGuests = (guests: GuestDraft[], over: Partial<EventForEdit> = {}): EditorFields =>
+  seedDraft({ ...event, guests, ...over });
+
+describe("guests in the draft", () => {
+  it("seeds the list and Google's permissions from the copy opened, its own copy", () => {
+    const opened: EventForEdit = {
+      ...event,
+      guests: [ME, A],
+      guests_can_modify: true,
+      guests_can_invite_others: false,
+      guests_can_see_other_guests: true,
+    };
+    const b = seedDraft(opened);
+    expect(b.guests).toEqual([ME, A]);
+    expect(b.guests[1]).not.toBe(opened.guests[1]);
+    expect(b.guest_perms).toEqual({ modify: true, invite_others: false, see_others: true });
+    // Guests come after the time and how it repeats, as Google lists them.
+    expect(changedFields(b, { ...b, summary: "x", guests: [ME], location: "y" })).toEqual([
+      "summary",
+      "guests",
+      "location",
+    ]);
+  });
+
+  it("compares by who is on it and who is optional, never replies, names, case or order", () => {
+    const b = withGuests([ME, A]);
+    const replied = {
+      ...b,
+      guests: [{ ...A, email: "a@X.ORG", name: "A. N.", response: "accepted" }, ME],
+    };
+    expect(sameField("guests", b, replied)).toBe(true);
+    expect(changedFields(b, replied)).toEqual([]);
+    expect(toChanges(b, replied)).toEqual({});
+    expect(sameField("guests", b, { ...b, guests: [ME, { ...A, optional: true }] })).toBe(false);
+    expect(sameField("guests", b, { ...b, guests: [ME] })).toBe(false);
+  });
+
+  it("sends changes to Google's list, sorted by address, never the list", () => {
+    const c = guest("Cat@x.org", { response: null });
+    const z = guest("zed@x.org");
+    const b = withGuests([ME, z, A]);
+    const draft = { ...b, guests: [ME, { ...A, optional: true }, guest("bob@x.org"), c] };
+    expect(toChanges(b, draft)).toEqual({
+      guests: [
+        { email: "A@x.org", to: "optional" },
+        { email: "bob@x.org", to: "required" },
+        { email: "Cat@x.org", to: "required" },
+        { email: "zed@x.org", to: "absent" },
+      ],
+    });
+    // Made optional from the start.
+    expect(toChanges(b, { ...b, guests: [ME, z, A, { ...c, optional: true }] }).guests).toEqual([
+      { email: "Cat@x.org", to: "optional" },
+    ]);
+    // Required again is a change of its own.
+    const opt = withGuests([ME, { ...A, optional: true }]);
+    expect(toChanges(opt, { ...opt, guests: [ME, A] }).guests).toEqual([
+      { email: "A@x.org", to: "required" },
+    ]);
+  });
+
+  it("never sends a change to the organiser's or the user's own entry", () => {
+    const organiser = guest("o@x.org", { organizer: true });
+    const me = guest("me@x.org", { self: true });
+    const b = withGuests([organiser, me, A]);
+    // Taken off or made optional: nothing goes for either.
+    expect(toChanges(b, { ...b, guests: [A] })).toEqual({});
+    expect(
+      toChanges(b, {
+        ...b,
+        guests: [{ ...organiser, optional: true }, { ...me, optional: true }, A],
+      }),
+    ).toEqual({});
+    // Nor for an entry marked as theirs that the opened copy didn't have (a hand-over could).
+    const theirs = [guest("o2@x.org", { organizer: true }), guest("me2@x.org", { self: true })];
+    expect(toChanges(b, { ...b, guests: [...b.guests, ...theirs] })).toEqual({});
+  });
+
+  it("never sends a change to the organiser's address, on Google's list or not", () => {
+    // An event the user organises with no guests: Google sends no list, only the organiser. The
+    // backend refuses any change to that address, so the whole save would fail.
+    const none = withGuests([], { organizer_email: "Me@X.org" });
+    expect(none.organizer_email).toBe("Me@X.org");
+    const typed = guest("me@x.org", { response: null });
+    expect(toChanges(none, { ...none, guests: [typed, A] })).toEqual({
+      guests: [{ email: "A@x.org", to: "required" }],
+    });
+    // On the list without Google's marks: still the organiser's.
+    const unmarked = withGuests([guest("me@x.org"), A], { organizer_email: "me@x.org" });
+    expect(
+      toChanges(unmarked, { ...unmarked, guests: [{ ...guest("me@x.org"), optional: true }] }),
+    ).toEqual({ guests: [{ email: "A@x.org", to: "absent" }] });
+  });
+
+  it("sends only the permissions that changed", () => {
+    const b = base();
+    expect(
+      toChanges(b, { ...b, guest_perms: { modify: true, invite_others: true, see_others: true } }),
+    ).toEqual({ guests_can_modify: true });
+    expect(
+      toChanges(b, {
+        ...b,
+        guest_perms: { modify: false, invite_others: false, see_others: false },
+      }),
+    ).toEqual({ guests_can_invite_others: false, guests_can_see_other_guests: false });
+    expect(changedFields(b, { ...b, guest_perms: { ...b.guest_perms } })).toEqual([]);
+  });
+
+  it("refuses an added guest whose address isn't one, never Google's own", () => {
+    const b = withGuests([ME, guest("not an address")]);
+    const draft = { ...b, guests: [...b.guests, guest("bob at x"), guest("b@x.org")] };
+    expect(checkDraft(b, draft).problems).toEqual([{ kind: "bad_guest", email: "bob at x" }]);
+    // Even with the time untouched, which the rest of the check skips.
+    expect(checkDraft(b, b).problems).toEqual([]);
+  });
+
+  it("goes with its own right for both the list and its permissions", () => {
+    const perms: FieldPermissions = {
+      summary: true,
+      time: true,
+      location: true,
+      description: true,
+      show_as: true,
+      visibility: true,
+      guests: false,
+      delete: true,
+      reasons: [],
+    };
+    expect(canEdit(perms, "guests")).toBe(false);
+    expect(canEdit(perms, "guest_perms")).toBe(false);
+    expect(canEdit({ ...perms, guests: true }, "guests")).toBe(true);
+    expect(canEdit({ ...perms, guests: true }, "guest_perms")).toBe(true);
+    expect(canEdit(perms, "summary")).toBe(true);
+  });
+
+  it("starts a new event with nobody and Google's permissions", () => {
+    const seed = newEventSeed(
+      "2026-10-12",
+      new Date("2026-10-12T08:00:00Z"),
+      "Europe/London",
+      HOUR,
+    );
+    expect(seed.guests).toEqual([]);
+    expect(seed.guest_perms).toEqual({ modify: false, invite_others: true, see_others: true });
+    expect(NEW_EVENT_BASE.guest_perms).toEqual(seed.guest_perms);
+    expect(changedFields(NEW_EVENT_BASE, seed)).not.toContain("guest_perms");
+    // A create doesn't send guests yet (C12d).
+    expect(Object.keys(toNewEvent(seed))).not.toContain("guests");
+  });
+
+  it("asks before a round trip only when the save would email someone", () => {
+    const b = withGuests([ME, A]);
+    expect(guestNotice(b, { ...b, show_as: "free" }, false)).toBeNull();
+    expect(guestNotice(b, { ...b, summary: "Retro" }, false)).toMatchObject({ updated: 1 });
+  });
+});
+
+describe("carrying guests onto Google's newer copy", () => {
+  const b = guest("b@x.org", { name: "Bea", response: null });
+
+  it("a rebase after someone else's reply keeps the user's guests and shows the reply", () => {
+    const oldBase = withGuests([ME, A]);
+    const newBase = withGuests([ME, { ...A, response: "accepted" }]);
+    const draft = { ...oldBase, guests: [...oldBase.guests, b] };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guests).toEqual([ME, { ...A, response: "accepted" }, b]);
+    expect(r.overwritten).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({ guests: [{ email: "b@x.org", to: "required" }] });
+  });
+
+  it("Google took a guest off that the user made optional: dropped, and said", () => {
+    const oldBase = withGuests([ME, A]);
+    const newBase = withGuests([ME]);
+    const draft = { ...oldBase, guests: [ME, { ...A, optional: true }] };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guests).toEqual([ME]);
+    expect(r.overwritten).toEqual(["guests"]);
+    // Named, as the list showed them, so the banner can say whose change went.
+    expect(r.lost_guests).toEqual(["Ann"]);
+  });
+
+  it("takes off a guest the user took off while Google added another", () => {
+    const B = guest("B@x.org", { name: "Bo" });
+    const c = guest("c@x.org", { name: "Cy" });
+    const oldBase = withGuests([ME, A, B]);
+    const newBase = withGuests([ME, A, B, c]);
+    const r = rebaseDraft(oldBase, newBase, { ...oldBase, guests: [ME, A] });
+    expect(r.draft.guests).toEqual([ME, A, c]);
+    expect(r.overwritten).toEqual([]);
+    expect(r.lost_guests).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({ guests: [{ email: "B@x.org", to: "absent" }] });
+  });
+
+  it("makes a guest Google left alone optional, or required again, on Google's list", () => {
+    const B = guest("B@x.org", { name: "Bo" });
+    const c = guest("c@x.org");
+    // Google added c; the user made A required again (from optional) and B optional.
+    const oldBase = withGuests([ME, { ...A, optional: true }, B]);
+    const newBase = withGuests([ME, { ...A, optional: true }, B, c]);
+    const draft = { ...oldBase, guests: [ME, A, { ...B, optional: true }] };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guests).toEqual([ME, A, { ...B, optional: true }, c]);
+    expect(r.overwritten).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({
+      guests: [
+        { email: "A@x.org", to: "required" },
+        { email: "B@x.org", to: "optional" },
+      ],
+    });
+  });
+
+  it("Google added one and the user another: both, nothing lost", () => {
+    const c = guest("c@x.org", { name: "Cy" });
+    const oldBase = withGuests([ME, A]);
+    const newBase = withGuests([ME, A, c]);
+    const draft = { ...oldBase, guests: [ME, A, b] };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guests).toEqual([ME, A, c, b]);
+    expect(r.overwritten).toEqual([]);
+  });
+
+  it("makes the user's other changes on Google's list, and a change Google made too is no loss", () => {
+    const c = guest("c@x.org");
+    const oldBase = withGuests([ME, A, c]);
+    // Google: A made optional, c taken off. The user: A made optional too, c made optional, b added.
+    const newBase = withGuests([ME, { ...A, optional: true }]);
+    const draft = {
+      ...oldBase,
+      guests: [ME, { ...A, optional: true }, { ...c, optional: true }, b],
+    };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guests).toEqual([ME, { ...A, optional: true }, b]);
+    expect(r.overwritten).toEqual(["guests"]);
+    // The same change on both sides: Google's list, nothing said.
+    const same = rebaseDraft(oldBase, newBase, {
+      ...oldBase,
+      guests: [ME, { ...A, optional: true }],
+    });
+    expect(same.draft.guests).toEqual(newBase.guests);
+    expect(same.overwritten).toEqual([]);
+  });
+
+  it("merges the permissions one by one", () => {
+    const oldBase = base();
+    const newBase = {
+      ...oldBase,
+      guest_perms: { modify: false, invite_others: false, see_others: true },
+    };
+    // Only the user changed see_others; only Google invite_others: each keeps its own.
+    const draft = {
+      ...oldBase,
+      guest_perms: { modify: false, invite_others: true, see_others: false },
+    };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guest_perms).toEqual({ modify: false, invite_others: false, see_others: false });
+    expect(r.overwritten).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({ guests_can_see_other_guests: false });
+    // A box has two states, so both changing one is the same change: nothing to say.
+    const both = rebaseDraft(oldBase, newBase, {
+      ...oldBase,
+      guest_perms: { modify: false, invite_others: false, see_others: true },
+    });
+    expect(both.overwritten).toEqual([]);
+    expect(toChanges(both.base, both.draft)).toEqual({});
+    // The rebase never shares the new copy's objects with the draft it makes.
+    expect(r.draft.guest_perms).not.toBe(newBase.guest_perms);
+    expect(r.draft.guests).not.toBe(newBase.guests);
+  });
+
+  it("keeps Google's Invite others when the user ticked Modify event, sending only that", () => {
+    // Ticking Modify ticks all three in the field; only Modify differs from what was opened, so
+    // Google's newer Invite others stands, and the field draws it checked under Modify.
+    const oldBase = base();
+    const newBase = {
+      ...oldBase,
+      guest_perms: { modify: false, invite_others: false, see_others: true },
+    };
+    const draft = {
+      ...oldBase,
+      guest_perms: { modify: true, invite_others: true, see_others: true },
+    };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guest_perms).toEqual({ modify: true, invite_others: false, see_others: true });
+    expect(r.overwritten).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({ guests_can_modify: true });
+  });
+});
+
 // --- creating an event (#884, C10) ---
 
 const HOUR = 60 * 60_000;
@@ -546,6 +852,8 @@ describe("a new event's starting fields", () => {
       description: "Bring the form",
       time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
       recurrence: { kind: "once" },
+      guests: [],
+      guest_perms: { modify: false, invite_others: true, see_others: true },
       show_as: "free",
       visibility: "private",
     };

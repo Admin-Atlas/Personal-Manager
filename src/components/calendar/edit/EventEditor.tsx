@@ -85,6 +85,7 @@ import {
   outcomeText,
   problemText,
   reasonText,
+  rebasedText,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
@@ -386,12 +387,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       series: fresh.series,
     });
     setDraft(r.draft);
-    setBanner({
-      tone: "warn",
-      text: r.overwritten.length
-        ? `${head} Google's version of the ${listFields(r.overwritten)} is shown now; your other changes are still here.`
-        : `${head} Your changes are still here; save again to apply them.`,
-    });
+    setBanner({ tone: "warn", text: rebasedText(head, r.overwritten, r.lost_guests) });
   }
 
   /** A time change by the user. A rule picked in this editor whose day came from the start date
