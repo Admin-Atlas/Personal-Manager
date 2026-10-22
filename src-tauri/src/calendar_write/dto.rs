@@ -103,6 +103,94 @@ pub struct EventPatchDraft {
     pub visibility: Option<Visibility>,
     /// How it repeats from now on. `None` leaves the repeat as it is (C11).
     pub recurrence: Option<RepeatDraft>,
+    /// Guests the user added, took off or marked optional, as changes to Google's own list (R1);
+    /// never the list itself. `Some` of an empty list reads as `None` (C12).
+    pub guests: Option<Vec<GuestOp>>,
+    /// Google's `guestsCanModify`, `guestsCanInviteOthers` and `guestsCanSeeOtherGuests`.
+    pub guests_can_modify: Option<bool>,
+    pub guests_can_invite_others: Option<bool>,
+    pub guests_can_see_other_guests: Option<bool>,
+}
+
+impl EventPatchDraft {
+    /// The guest changes it makes: none when untouched, or touched and empty.
+    pub fn guest_ops(&self) -> &[GuestOp] {
+        self.guests.as_deref().unwrap_or_default()
+    }
+
+    /// Whether it changes the guest list or what guests may do (C12).
+    pub fn touches_guests(&self) -> bool {
+        !self.guest_ops().is_empty()
+            || self.guests_can_modify.is_some()
+            || self.guests_can_invite_others.is_some()
+            || self.guests_can_see_other_guests.is_some()
+    }
+}
+
+/// What the user wants for one guest after the save: on the event, required or optional, or off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestState {
+    Absent,
+    Required,
+    Optional,
+}
+
+/// One guest the user added, took off or marked optional: a change to Google's own guest list (R1),
+/// never the list itself. Matched by address, whatever its case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestOp {
+    pub email: String,
+    pub to: GuestState,
+}
+
+/// Who Google would email about a change if the user chose Send, so the choice can say so (R9, A3).
+/// Never the addresses: the editor has them, and the question says only how many. The user and
+/// rooms are never among them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestNotice {
+    /// Guests already on the event who'd hear about the change.
+    pub updated: u32,
+    /// Guests new to the event: each gets an invitation.
+    pub invited: u32,
+    /// Guests the change takes off: each is told.
+    pub removed: u32,
+    /// The change deletes it (or every occurrence it reaches): `updated` are told it's cancelled.
+    pub cancelled: bool,
+    /// Different guests who'd hear, every write together.
+    pub people: u32,
+    /// Emails in all with Send: one per guest per event written. More than `people` when a change
+    /// writes several events (a "this and following" change: the new part, the earlier part, each
+    /// occurrence moved or cancelled).
+    pub emails: u32,
+    /// PM saw every guest list it counted. `false`: Google cut one short, or PM couldn't see every
+    /// occurrence the change reaches: "at least".
+    pub complete: bool,
+}
+
+impl GuestNotice {
+    /// Whether an answer given to `asked` (the numbers the question showed) answers this: the same
+    /// people, emails and completeness (C12 critiques C1-M5, C2-H3). Someone added meanwhile is
+    /// asked about first, never emailed unseen.
+    pub fn answered_by(&self, asked: &GuestNotice) -> bool {
+        (self.people, self.emails, self.complete) == (asked.people, asked.emails, asked.complete)
+    }
+}
+
+/// One guest as the editor shows it, from Google's fresh copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuestForEdit {
+    pub email: String,
+    pub name: Option<String>,
+    /// As Google says it: accepted | declined | tentative | needsAction.
+    pub response: Option<String>,
+    pub optional: bool,
+    pub organizer: bool,
+    /// The calendar this copy is on (Google's `self`).
+    #[serde(rename = "self")]
+    pub is_self: bool,
+    /// A room or another bookable thing (Google's `resource`, or its address).
+    pub room: bool,
 }
 
 /// A change to how an event repeats (C11): a rule from the editor's set, or none.
@@ -198,6 +286,8 @@ pub struct FieldPermissions {
     pub description: bool,
     pub show_as: bool,
     pub visibility: bool,
+    /// The guest list and what guests may do (C12).
+    pub guests: bool,
     pub delete: bool,
     /// Every reason something is read-only, most important first. Empty when everything may change.
     pub reasons: Vec<ReadOnlyReason>,
@@ -220,6 +310,7 @@ impl FieldPermissions {
             || self.description
             || self.show_as
             || self.visibility
+            || self.guests
             || self.delete
     }
 }
@@ -271,9 +362,17 @@ pub enum WriteOutcome {
     Failed {
         message: String,
     },
-    /// The plan for the occurrences chosen isn't the one the dialog showed any more, or none was
-    /// named: choose again. Nothing was sent.
-    NeedsChoice,
+    /// Something must be chosen first, and nothing was sent. `scope`: which occurrences (none was
+    /// named, or the plan for those chosen isn't the one the dialog showed any more; R9). `guests`:
+    /// whether Google emails these guests, Send or Don't send, which has no default (R9, C12).
+    /// `again`: an answer came, given for other numbers than these (C12 critiques C1-M5, C2-H3).
+    NeedsChoice {
+        scope: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        guests: Option<GuestNotice>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        again: bool,
+    },
     /// Google answered as if it had saved the change, but kept the event as it was. `split`: the new
     /// part a "this and following" change made was removed too.
     IgnoredByGoogle {
@@ -293,6 +392,35 @@ pub enum WriteOutcome {
     },
     /// The new part of a change PM couldn't finish was removed: the repeating event is as it was.
     SplitRemoved,
+}
+
+impl WriteOutcome {
+    /// Choose the occurrences (again).
+    pub fn needs_scope() -> WriteOutcome {
+        WriteOutcome::NeedsChoice {
+            scope: true,
+            guests: None,
+            again: false,
+        }
+    }
+
+    /// Choose whether Google emails these guests.
+    pub fn needs_notify(guests: GuestNotice) -> WriteOutcome {
+        WriteOutcome::NeedsChoice {
+            scope: false,
+            guests: Some(guests),
+            again: false,
+        }
+    }
+
+    /// Choose again whether Google emails these guests: the answer that came was for others.
+    pub fn needs_notify_again(guests: GuestNotice) -> WriteOutcome {
+        WriteOutcome::NeedsChoice {
+            scope: false,
+            guests: Some(guests),
+            again: true,
+        }
+    }
 }
 
 /// What to do about a "this and following" change PM couldn't finish.
@@ -418,6 +546,16 @@ pub struct EventForEdit {
     pub attachments: Vec<String>,
     /// Google's own page for the event.
     pub html_link: Option<String>,
+    /// Every entry of Google's guest list with an address, the user's and the organiser's included,
+    /// in Google's order (C12).
+    pub guests: Vec<GuestForEdit>,
+    /// What guests may do, Google's defaults filled in: modify (false), invite others (true), see
+    /// the guest list (true).
+    pub guests_can_modify: bool,
+    pub guests_can_invite_others: bool,
+    pub guests_can_see_other_guests: bool,
+    /// Google cut the guest list short (`attendeesOmitted`), so it can't be changed.
+    pub guests_omitted: bool,
 }
 
 /// What opening the editor came to.
@@ -503,15 +641,20 @@ pub enum SeriesChoices {
 #[serde(tag = "row", rename_all = "snake_case")]
 pub enum ScopeRow {
     /// It can go ahead. `token` is what the save names to say the user chose this plan; a plan that
-    /// changed since gets asked about again.
+    /// changed since gets asked about again. `guests`: who Google would email with Send, left out
+    /// when nobody (C12).
     Offered {
         warnings: Vec<SeriesWarningDto>,
         token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        guests: Option<GuestNotice>,
     },
     /// "This and following" from the series' first occurrence: every occurrence, as "All events".
     AsAll {
         warnings: Vec<SeriesWarningDto>,
         token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        guests: Option<GuestNotice>,
     },
     /// Not for this change, and why, in words.
     Refused { message: String },
@@ -608,7 +751,29 @@ mod tests {
             r#"{"outcome":"saved","warnings":["left_on_old_series"],"left_behind":["2026-11-02"]}"#
         );
         for (outcome, json) in [
-            (WriteOutcome::NeedsChoice, r#"{"outcome":"needs_choice"}"#),
+            (
+                WriteOutcome::needs_scope(),
+                r#"{"outcome":"needs_choice","scope":true}"#,
+            ),
+            (
+                WriteOutcome::needs_notify(GuestNotice {
+                    updated: 2,
+                    people: 2,
+                    emails: 2,
+                    complete: true,
+                    ..Default::default()
+                }),
+                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":2,"invited":0,"removed":0,"cancelled":false,"people":2,"emails":2,"complete":true}}"#,
+            ),
+            (
+                WriteOutcome::needs_notify_again(GuestNotice {
+                    invited: 1,
+                    people: 1,
+                    emails: 1,
+                    ..Default::default()
+                }),
+                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":0,"invited":1,"removed":0,"cancelled":false,"people":1,"emails":1,"complete":false},"again":true}"#,
+            ),
             (
                 WriteOutcome::IgnoredByGoogle { split: false },
                 r#"{"outcome":"ignored_by_google","split":false}"#,
@@ -778,8 +943,10 @@ mod tests {
             this: ScopeRow::Offered {
                 warnings: Vec::new(),
                 token: "t1".into(),
+                guests: None,
             },
             following: ScopeRow::AsAll {
+                guests: None,
                 warnings: vec![
                     SeriesWarningDto::SplitSibling,
                     SeriesWarningDto::ExceptionsMayReset {
@@ -826,6 +993,22 @@ mod tests {
             })
             .unwrap(),
             r#"{"row":"pending","token":"t","offers":["finish"],"from":"2026-11-02"}"#
+        );
+        // C12: a row that would email someone says who, in numbers.
+        assert_eq!(
+            serde_json::to_string(&ScopeRow::Offered {
+                warnings: Vec::new(),
+                token: "t".into(),
+                guests: Some(GuestNotice {
+                    invited: 1,
+                    people: 1,
+                    emails: 1,
+                    complete: true,
+                    ..Default::default()
+                }),
+            })
+            .unwrap(),
+            r#"{"row":"offered","warnings":[],"token":"t","guests":{"updated":0,"invited":1,"removed":0,"cancelled":false,"people":1,"emails":1,"complete":true}}"#
         );
         for (text, action) in [
             (r#""remove""#, SplitAction::Remove),
@@ -956,5 +1139,110 @@ mod tests {
         let none = FieldPermissions::none(ReadOnlyReason::NotGoogle);
         assert!(!none.any());
         assert_eq!(none.reasons, vec![ReadOnlyReason::NotGoogle]);
+        // The guest list alone is something that may change.
+        let guests = FieldPermissions {
+            guests: true,
+            ..Default::default()
+        };
+        assert!(guests.any());
+    }
+
+    /// C12: guest changes come as changes to Google's own list, each a wanted state; a state PM
+    /// doesn't know is refused, never guessed, and untouched guests are no change.
+    #[test]
+    fn a_draft_reads_guest_ops_as_the_editor_sends_them() {
+        let draft: EventPatchDraft = serde_json::from_str(
+            r#"{"guests":[{"email":"A@x.org","to":"optional"},{"email":"b@x.org","to":"absent"}],
+                "guests_can_modify":true}"#,
+        )
+        .unwrap();
+        assert!(
+            draft.guest_ops()
+                == [
+                    GuestOp {
+                        email: "A@x.org".into(),
+                        to: GuestState::Optional
+                    },
+                    GuestOp {
+                        email: "b@x.org".into(),
+                        to: GuestState::Absent
+                    }
+                ],
+            "both changes, as sent"
+        );
+        assert_eq!(draft.guests_can_modify, Some(true));
+        assert!(draft.touches_guests());
+        assert!(serde_json::from_str::<EventPatchDraft>(
+            r#"{"guests":[{"email":"a@x.org","to":"maybe"}]}"#
+        )
+        .is_err());
+        let title: EventPatchDraft = serde_json::from_str(r#"{"summary":"Gym"}"#).unwrap();
+        assert!(title.guests.is_none() && !title.touches_guests());
+        // An empty list reads as untouched.
+        let empty: EventPatchDraft = serde_json::from_str(r#"{"guests":[]}"#).unwrap();
+        assert!(empty.guest_ops().is_empty() && !empty.touches_guests());
+        // Each permission alone touches the guests.
+        for json in [
+            r#"{"guests_can_modify":false}"#,
+            r#"{"guests_can_invite_others":false}"#,
+            r#"{"guests_can_see_other_guests":false}"#,
+        ] {
+            let one: EventPatchDraft = serde_json::from_str(json).unwrap();
+            assert!(one.touches_guests(), "{json}");
+        }
+    }
+
+    /// The editor names the user's own entry as Google does.
+    #[test]
+    fn a_guest_reads_self_as_google_names_it() {
+        let me = GuestForEdit {
+            email: "me@x.org".into(),
+            name: None,
+            response: Some("accepted".into()),
+            optional: false,
+            organizer: true,
+            is_self: true,
+            room: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&me).unwrap(),
+            r#"{"email":"me@x.org","name":null,"response":"accepted","optional":false,"organizer":true,"self":true,"room":false}"#
+        );
+    }
+
+    /// C12 critiques C1-M5, C2-H3: an answer stands for the numbers the question showed, by who
+    /// hears, how many emails, and whether PM saw everyone; how they split doesn't matter.
+    #[test]
+    fn an_answer_stands_for_the_numbers_it_was_given_for() {
+        let asked = GuestNotice {
+            updated: 1,
+            people: 1,
+            emails: 1,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(asked.answered_by(&asked));
+        let read: GuestNotice = serde_json::from_str(
+            r#"{"updated":1,"invited":0,"removed":0,"cancelled":false,"people":1,"emails":1,
+                "complete":true}"#,
+        )
+        .unwrap();
+        assert!(asked.answered_by(&read));
+        for other in [
+            GuestNotice {
+                people: 2,
+                ..asked.clone()
+            },
+            GuestNotice {
+                emails: 2,
+                ..asked.clone()
+            },
+            GuestNotice {
+                complete: false,
+                ..asked.clone()
+            },
+        ] {
+            assert!(!other.answered_by(&asked));
+        }
     }
 }

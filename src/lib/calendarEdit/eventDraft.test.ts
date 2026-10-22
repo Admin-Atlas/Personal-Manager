@@ -58,6 +58,11 @@ const event: EventForEdit = {
   visibility: "default",
   attachments: [],
   html_link: null,
+  guests: [],
+  guests_can_modify: false,
+  guests_can_invite_others: true,
+  guests_can_see_other_guests: true,
+  guests_omitted: false,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -102,6 +107,7 @@ describe("the event draft", () => {
       description: false,
       show_as: true,
       visibility: true,
+      guests: false,
       delete: false,
       reasons: ["locked"],
     };

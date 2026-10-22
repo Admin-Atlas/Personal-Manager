@@ -643,7 +643,7 @@ describe("a repeating event", () => {
   it("answers ask, saying nothing, when the backend wants the occurrences chosen", async () => {
     deleteCalendarEvent.mockResolvedValue({
       outcome: "refused",
-      result: { outcome: "needs_choice" },
+      result: { outcome: "needs_choice", scope: true },
     });
     const { mod, hook, act } = await load();
     await act(async () => {
@@ -663,12 +663,40 @@ describe("a repeating event", () => {
     expect(hook.result.current.notices[0].text).toMatch(/^“Gym” wasn't deleted\. Editing isn't on/);
   });
 
+  // C12: whether Google emails the guests is no choice of occurrences, so it never reopens them.
+  it("says a delete needs the guests' answer, never asking which occurrences", async () => {
+    const guests = {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    deleteCalendarEvent.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "needs_choice", scope: false, guests },
+    });
+    const { mod, hook, act } = await load();
+    await act(async () => {
+      expect(await mod.startDelete(occurrence)).toBe("refused");
+    });
+    expect(hook.result.current.notices[0].text).toBe(
+      "“Gym” wasn't deleted. Choose whether Google emails the guests first.",
+    );
+    expect(hook.result.current.hiddenIds.size).toBe(0);
+  });
+
   // The delete dialog as the calendar runs it (C9b-1b review F1, F6, F8, F11; round 2 F1, F2): a
   // delete answered "choose" reopens it once, never over a dialog or the popover opened meanwhile
   // nor once the Calendar tab has gone, and a notice says to delete again otherwise, in words that
   // fit whether a choice was made. Run under StrictMode, which mounts every effect twice.
   describe("the delete dialog", () => {
-    const ASK = { outcome: "refused", result: { outcome: "needs_choice" } } as DeleteStart;
+    const ASK = {
+      outcome: "refused",
+      result: { outcome: "needs_choice", scope: true },
+    } as DeleteStart;
     const CHANGED =
       "“Gym” wasn't deleted. This repeating event changed since you chose which occurrences to delete. Delete it again to choose.";
     const NEEDS =

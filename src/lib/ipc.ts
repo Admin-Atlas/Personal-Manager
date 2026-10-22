@@ -139,8 +139,10 @@ import type {
   DeleteStart,
   EditLoad,
   EventPatchDraft,
+  GuestNotice,
   HeldDeleteInfo,
   NewEventDraft,
+  Notify,
   RepeatPreset,
   RepeatRule,
   RepeatStart,
@@ -1114,13 +1116,18 @@ export const getCalendarEventForEdit = (eventId: string, deviceZone: string | nu
 
 /** Save the fields the user changed in an open editor. Outcomes come back as data, never thrown.
  *  For an occurrence of a repeating event, `scope` says which occurrences and `choice` names the
- *  plan the user chose (a row's `token` from `seriesChoices`). */
+ *  plan the user chose (a row's `token` from `seriesChoices`). `notify` is the user's Send / Don't
+ *  send and `asked` the numbers the question showed: a save that would email someone without an
+ *  answer for those numbers is answered `needs_choice` with nothing sent. */
 export const updateCalendarEvent = (
   session: string,
   draft: EventPatchDraft,
   scope: SeriesScope | null = null,
   choice: string | null = null,
-) => invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice });
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+) =>
+  invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice, notify, asked });
 
 /** Create an event on one of PM's Google calendars (`calendarId`, PM's own id). Outcomes come back as
  *  data. `retryToken` (from an `ambiguous` outcome) looks for the earlier attempt and sends it again,
@@ -1134,13 +1141,16 @@ export const createCalendarEvent = (
 
 /** Delete a mirrored event after an Undo window held by the backend. It goes to Google when the
  *  window ends, only if Google still holds what the user saw (`seen`); `onCalendarDeleteSettled`
- *  reports how it ended. `scope` and `choice` as for a save. */
+ *  reports how it ended. `scope`, `choice`, `notify` and `asked` as for a save; the answer is kept
+ *  with the hold. */
 export const deleteCalendarEvent = (
   eventId: string,
   seen: SeenSummary,
   scope: SeriesScope | null = null,
   choice: string | null = null,
-) => invoke<DeleteStart>("delete_calendar_event", { eventId, seen, scope, choice });
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+) => invoke<DeleteStart>("delete_calendar_event", { eventId, seen, scope, choice, notify, asked });
 
 /** Undo a held delete: true when it was still waiting (the event is kept). */
 export const cancelCalendarDelete = (undoToken: string) =>

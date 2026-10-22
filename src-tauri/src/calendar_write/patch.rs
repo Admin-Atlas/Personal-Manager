@@ -20,6 +20,7 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
+use super::attendees;
 use super::dto::{EventPatchDraft, NewEventDraft, SeenSummary, TimeDraft, Visibility};
 use super::time::{self, TimeError};
 use crate::calendar_recur::expand::sync_start;
@@ -27,7 +28,8 @@ use crate::calendar_recur::spec::{rule_from_spec, SpecError};
 use crate::calendar_recur::wire::RepeatRule;
 use crate::calendar_recur::SeriesStart;
 
-/// The only fields a single-event save sends.
+/// The only fields a single-event save sends: the guest list and what guests may do among them
+/// (C12).
 pub const PATCHABLE: &[&str] = &[
     "summary",
     "location",
@@ -36,12 +38,34 @@ pub const PATCHABLE: &[&str] = &[
     "end",
     "transparency",
     "visibility",
+    "attendees",
+    "guestsCanModify",
+    "guestsCanInviteOthers",
+    "guestsCanSeeOtherGuests",
 ];
 
-/// What a create may send: [`PATCHABLE`]'s fields and the repeat rule (C11). Still no attendees,
-/// reminders, conference, colour or private notes until their layers. Widening it is a decision,
-/// never a slip: `creatable_is_patchable_and_the_rule` pins it to exactly this, and the create
-/// plan's own refusal test names what it still refuses (C10 critique 1 L10).
+/// What a save that makes a one-off repeat may send (C11 §10): [`PATCHABLE`]'s fields and the rule,
+/// its own list so that guests changed in the same save go too (C12 critiques C1-H4, C2-M4).
+/// `repeat_patchable_is_patchable_and_the_rule` pins it.
+pub const REPEAT_PATCHABLE: &[&str] = &[
+    "summary",
+    "location",
+    "description",
+    "start",
+    "end",
+    "transparency",
+    "visibility",
+    "attendees",
+    "guestsCanModify",
+    "guestsCanInviteOthers",
+    "guestsCanSeeOtherGuests",
+    "recurrence",
+];
+
+/// What a create may send: a save's fields before guests, and the repeat rule (C11). Still no
+/// attendees (C12d), reminders, conference, colour or private notes until their layers. Widening it
+/// is a decision, never a slip: `creatable_is_the_c11_list_with_no_guests` pins it to exactly this,
+/// and the create plan's own refusal test names what it still refuses (C10 critique 1 L10).
 pub const CREATABLE: &[&str] = &[
     "summary",
     "location",
@@ -222,6 +246,33 @@ pub fn build_patch(
                 "visibility".into(),
                 Value::String(visibility.as_param().into()),
             );
+        }
+    }
+    let ops = draft.guest_ops();
+    if !ops.is_empty() {
+        // R1: Google's own list with the user's changes, never the editor's list.
+        let list = Value::from(attendees::apply(fresh.get("attendees"), ops));
+        if attendees::guest_set(Some(&list)) != attendees::guest_set(fresh.get("attendees")) {
+            body.insert("attendees".into(), list);
+        }
+    }
+    for (key, default, new) in [
+        ("guestsCanModify", false, draft.guests_can_modify),
+        (
+            "guestsCanInviteOthers",
+            true,
+            draft.guests_can_invite_others,
+        ),
+        (
+            "guestsCanSeeOtherGuests",
+            true,
+            draft.guests_can_see_other_guests,
+        ),
+    ] {
+        if let Some(new) = new {
+            if bool_of(fresh.get(key), default) != new {
+                body.insert(key.into(), Value::Bool(new));
+            }
         }
     }
     if let Some(draft_time) = &draft.time {
@@ -410,6 +461,12 @@ fn visibility_of(event: &Value) -> &str {
         .unwrap_or("default")
 }
 
+/// A flag Google leaves out when it holds its default: `guestsCanModify` false,
+/// `guestsCanInviteOthers` and `guestsCanSeeOtherGuests` true (INFERRED, probe G2).
+pub(crate) fn bool_of(v: Option<&Value>, default: bool) -> bool {
+    v.and_then(Value::as_bool).unwrap_or(default)
+}
+
 /// Whether one patchable field has the same value in `a` and `b`, each a field value as it appears
 /// in an event (or in a PATCH body), `None` when absent.
 fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
@@ -423,9 +480,14 @@ fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
             a.and_then(Value::as_str).unwrap_or("default")
                 == b.and_then(Value::as_str).unwrap_or("default")
         }
-        // A list or an object (`recurrence`, `reminders`, `attendees`…) by value: read as text, any two
-        // would be "" and equal, so a changed one would never be a conflict (G4, found by C8's survey;
-        // no field PM sends today is one).
+        // Who is on it, not each one's reply (R2: someone's RSVP is no conflict).
+        "attendees" => attendees::guest_set(a) == attendees::guest_set(b),
+        // A flag read as text would be "" either way, so any two would match (C12 §3.3).
+        "guestsCanModify" => bool_of(a, false) == bool_of(b, false),
+        "guestsCanInviteOthers" | "guestsCanSeeOtherGuests" => bool_of(a, true) == bool_of(b, true),
+        // A list or an object (`recurrence`, `reminders`…) by value: read as text, any two would be ""
+        // and equal, so a changed one would never be a conflict (G4, found by C8's survey; the guest
+        // list, the one PM sends, has its own arm above).
         _ if [a, b]
             .iter()
             .any(|v| v.is_some_and(|v| v.is_array() || v.is_object())) =>
@@ -465,7 +527,7 @@ pub(crate) fn when_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
 mod tests {
     use super::*;
     use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
-    use crate::calendar_write::dto::{ShowAs, TimeDraft, Visibility};
+    use crate::calendar_write::dto::{GuestOp, GuestState, ShowAs, TimeDraft, Visibility};
     use serde_json::json;
 
     fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
@@ -539,11 +601,23 @@ mod tests {
             visibility: Some(Visibility::Private),
             // A repeat is never a one-event body's: the series planners write it (C11).
             recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            guests: Some(vec![GuestOp {
+                email: "b@x.org".into(),
+                to: GuestState::Required,
+            }]),
+            guests_can_modify: Some(true),
+            guests_can_invite_others: Some(false),
+            guests_can_see_other_guests: Some(false),
         };
         let body = build_patch(&fresh(), &draft).unwrap();
         for key in body.keys() {
             assert!(PATCHABLE.contains(&key.as_str()), "{key}");
         }
+        assert_eq!(
+            body.len(),
+            11,
+            "every patchable field, the guests' included"
+        );
         for never in [
             "eventType",
             "recurringEventId",
@@ -937,12 +1011,205 @@ mod tests {
         assert!(!once.contains_key("recurrence"));
     }
 
-    /// C11 §3.3: what a create may send is a single save's fields and the rule, exactly.
+    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4): a create still sends a save's
+    /// fields as they were before guests, and the rule, exactly; C12d adds the guests' four.
     #[test]
-    fn creatable_is_patchable_and_the_rule() {
+    fn creatable_is_the_c11_list_with_no_guests() {
+        assert_eq!(
+            CREATABLE,
+            [
+                "summary",
+                "location",
+                "description",
+                "start",
+                "end",
+                "transparency",
+                "visibility",
+                "recurrence"
+            ]
+        );
+        let guests = [
+            "attendees",
+            "guestsCanModify",
+            "guestsCanInviteOthers",
+            "guestsCanSeeOtherGuests",
+        ];
+        let before_guests: Vec<&str> = PATCHABLE
+            .iter()
+            .copied()
+            .filter(|k| !guests.contains(k))
+            .chain(["recurrence"])
+            .collect();
+        assert_eq!(CREATABLE, before_guests.as_slice());
+    }
+
+    /// A one-off made to repeat may send whatever a save may, and the rule (C11 §10): guests changed
+    /// in the same save go too.
+    #[test]
+    fn repeat_patchable_is_patchable_and_the_rule() {
         let mut expected: Vec<&str> = PATCHABLE.to_vec();
         expected.push("recurrence");
-        assert_eq!(CREATABLE, expected.as_slice());
+        assert_eq!(REPEAT_PATCHABLE, expected.as_slice());
+    }
+
+    // --- guests (C12) ---
+
+    fn me() -> Value {
+        json!({ "email": "me@example.com", "self": true, "organizer": true,
+                "responseStatus": "accepted" })
+    }
+
+    fn guest_a(reply: &str) -> Value {
+        json!({ "email": "A@x.org", "responseStatus": reply, "comment": "late",
+                "additionalGuests": 1, "id": "g1" })
+    }
+
+    fn with_guests(list: Vec<Value>) -> Value {
+        let mut event = fresh();
+        event["attendees"] = Value::from(list);
+        event
+    }
+
+    fn adding(email: &str, to: GuestState) -> EventPatchDraft {
+        EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: email.into(),
+                to,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// R1: the list sent is Google's own with the change, every key Google sent kept.
+    #[test]
+    fn a_guest_change_is_sent_as_googles_list_with_the_change() {
+        let event = with_guests(vec![me(), guest_a("accepted")]);
+        let add = adding("b@x.org", GuestState::Required);
+        let body = build_patch(&event, &add).unwrap();
+        assert!(
+            Value::Object(body.clone())
+                == json!({ "attendees": [me(), guest_a("accepted"), { "email": "b@x.org" }] }),
+            "O1 through the save"
+        );
+        assert!(
+            body["attendees"]
+                == Value::from(attendees::apply(event.get("attendees"), add.guest_ops())),
+            "exactly the ops on Google's list"
+        );
+        let off = adding("a@x.org", GuestState::Absent);
+        assert!(
+            Value::Object(build_patch(&event, &off).unwrap()) == json!({ "attendees": [me()] }),
+            "O3 through the save"
+        );
+    }
+
+    /// O7: a change Google already holds sends nothing, as a title typed back to itself doesn't.
+    #[test]
+    fn a_guest_change_google_already_holds_sends_nothing() {
+        let event = with_guests(vec![me(), guest_a("accepted")]);
+        for draft in [
+            adding("A@X.ORG", GuestState::Required),
+            adding("c@x.org", GuestState::Absent),
+        ] {
+            assert!(build_patch(&event, &draft).unwrap().is_empty());
+        }
+    }
+
+    /// Each permission is sent only when it differs from Google's, its default read in.
+    #[test]
+    fn guest_permissions_are_sent_only_when_they_differ() {
+        let perm = |modify, invite, see| EventPatchDraft {
+            guests_can_modify: modify,
+            guests_can_invite_others: invite,
+            guests_can_see_other_guests: see,
+            ..Default::default()
+        };
+        assert!(build_patch(&fresh(), &perm(None, Some(true), Some(true)))
+            .unwrap()
+            .is_empty());
+        assert!(
+            Value::Object(build_patch(&fresh(), &perm(Some(false), Some(false), None)).unwrap())
+                == json!({ "guestsCanInviteOthers": false }),
+            "only what differs"
+        );
+        let mut modifiable = fresh();
+        modifiable["guestsCanModify"] = json!(true);
+        assert!(build_patch(&modifiable, &perm(Some(true), None, None))
+            .unwrap()
+            .is_empty());
+        assert!(
+            Value::Object(build_patch(&fresh(), &perm(Some(true), None, Some(false))).unwrap())
+                == json!({ "guestsCanModify": true, "guestsCanSeeOtherGuests": false }),
+            "both"
+        );
+    }
+
+    /// The plan's "rebase after someone else's RSVP": a reply that landed since the editor opened is
+    /// no conflict, and the list sent carries it.
+    #[test]
+    fn someone_elses_reply_is_no_conflict() {
+        let base = with_guests(vec![me(), guest_a("needsAction")]);
+        let fresh = with_guests(vec![me(), guest_a("accepted")]);
+        let body = build_patch(&fresh, &adding("b@x.org", GuestState::Required)).unwrap();
+        assert_eq!(update_check(&base, &fresh, &body), UpdateCheck::Proceed);
+        assert_eq!(body["attendees"][1]["responseStatus"], "accepted");
+    }
+
+    /// R2: a guest added, taken off or made optional in Google since the editor opened is a conflict.
+    #[test]
+    fn a_guest_added_in_google_meanwhile_is_a_conflict() {
+        let base = with_guests(vec![me(), guest_a("accepted")]);
+        let c = json!({ "email": "c@x.org" });
+        let mut optional = guest_a("accepted");
+        optional["optional"] = json!(true);
+        for fresh in [
+            with_guests(vec![me(), guest_a("accepted"), c]),
+            with_guests(vec![me()]),
+            with_guests(vec![me(), optional]),
+        ] {
+            let body = build_patch(&fresh, &adding("b@x.org", GuestState::Required)).unwrap();
+            assert_eq!(
+                update_check(&base, &fresh, &body),
+                UpdateCheck::Conflict(vec!["attendees".into()])
+            );
+        }
+    }
+
+    /// After a lost answer, Google's copy holds the guests sent when it has the same people, whatever
+    /// keys Google added to them.
+    #[test]
+    fn a_landed_guest_change_reads_as_applied() {
+        let body = build_patch(
+            &with_guests(vec![me(), guest_a("accepted")]),
+            &adding("b@x.org", GuestState::Required),
+        )
+        .unwrap();
+        let landed = with_guests(vec![
+            me(),
+            guest_a("declined"),
+            json!({ "email": "b@x.org", "responseStatus": "needsAction", "id": "g2" }),
+        ]);
+        assert!(already_applied(&landed, &body));
+        let without = with_guests(vec![me(), guest_a("accepted")]);
+        assert!(!already_applied(&without, &body));
+    }
+
+    /// C12 §3.3: a flag read as text was "" either way, so any two compared equal; they compare as
+    /// Google means them, its defaults filled in.
+    #[test]
+    fn booleans_compare_as_google_means_them() {
+        let (on, off) = (json!(true), json!(false));
+        assert!(!field_eq("guestsCanModify", Some(&on), None));
+        assert!(field_eq("guestsCanModify", Some(&off), None));
+        assert!(field_eq("guestsCanInviteOthers", Some(&on), None));
+        assert!(!field_eq("guestsCanInviteOthers", Some(&off), None));
+        assert!(!field_eq("guestsCanSeeOtherGuests", Some(&off), None));
+        assert!(field_eq("guestsCanSeeOtherGuests", Some(&on), Some(&on)));
+        // So a lost save of a flag isn't read as landed when Google doesn't hold it.
+        let body: Map<String, Value> = [("guestsCanModify".to_string(), on.clone())]
+            .into_iter()
+            .collect();
+        assert!(!already_applied(&fresh(), &body));
     }
 
     /// G6: a weekly event on its own weekday sends one rule line, and both nodes name the zone.

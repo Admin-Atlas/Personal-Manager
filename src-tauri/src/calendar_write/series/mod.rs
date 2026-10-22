@@ -44,6 +44,7 @@ use crate::calendar_recur::remap::RetimeError;
 use crate::calendar_recur::spec::SpecError;
 use crate::calendar_recur::{Point, RecurError, SeriesStart};
 
+use super::attendees::{guest_set, GuestError};
 use super::dto::ReadOnlyReason;
 use super::time::TimeError;
 
@@ -422,24 +423,9 @@ fn without_pm_notes(v: Option<&Value>) -> Value {
     Value::Object(out)
 }
 
-/// Guests as (address, optional), ignoring each one's reply (an RSVP isn't the organiser's change)
-/// and the user's own entry.
+/// Guests as (address, optional), one way for a series and a single event ([`guest_set`]).
 pub(super) fn attendee_set(v: Option<&Value>) -> Vec<(String, bool)> {
-    let mut set: Vec<(String, bool)> = v
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|a| !a.get("self").and_then(Value::as_bool).unwrap_or(false))
-        .filter_map(|a| {
-            let email = a.get("email")?.as_str()?.to_ascii_lowercase();
-            Some((
-                email,
-                a.get("optional").and_then(Value::as_bool).unwrap_or(false),
-            ))
-        })
-        .collect();
-    set.sort_unstable();
-    set
+    guest_set(v)
 }
 
 /// What `instance` is next to its `master` (T13). Its time is compared as instants (dates for an
@@ -655,6 +641,14 @@ pub enum SeriesRefusal {
     /// The occurrence deleted on this day would move with the days it repeats on, and PM can't read
     /// the old rule to tell whether the day it moves to had an occurrence of its own (C11c review).
     DeletedDayUnread(NaiveDate),
+    /// The draft's guest changes can't be made (C12).
+    Guest(GuestError),
+    /// The draft changes guests, and this occurrence's guest list isn't the series': its changes were
+    /// made against a list the others don't have (C12 critique C2-M5).
+    GuestsDifferHere,
+    /// What guests may do applies to the whole series: like visibility, never one occurrence's
+    /// until a probe shows Google applies it to one (C12 critiques C1-M7, C2-L11).
+    GuestPermissionsAreSeriesWide,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -802,6 +796,17 @@ impl fmt::Display for SeriesRefusal {
                  deleted on {} would move to. Change the days it repeats on in Google Calendar, or \
                  keep this occurrence on its own day.",
                 day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::Guest(e) => e.fmt(f),
+            SeriesRefusal::GuestsDifferHere => write!(
+                f,
+                "This occurrence has its own guest list, so a change to its guests can't go to \
+                 the other occurrences. Choose “This event” to change only this one."
+            ),
+            SeriesRefusal::GuestPermissionsAreSeriesWide => write!(
+                f,
+                "What guests may do applies to every occurrence of a repeating event, so it can't \
+                 change for this one only."
             ),
         }
     }
@@ -1250,16 +1255,47 @@ pub(crate) mod fixtures {
                 sibling: self.sibling,
                 later: self.later,
                 guests_allowed: self.guests_allowed,
+                me: CALENDAR,
             }
         }
 
+        /// Planned with no Send / Don't send answer, as the dialog previews it.
         pub fn delete(&self, scope: Scope) -> Result<SeriesPlan, NotPlanned> {
-            plan_series_delete(scope, &self.input(), &seen_of(&self.instance), Notify::None)
+            self.delete_told(scope, None)
         }
 
-        pub fn edit(&self, scope: Scope, draft: EventPatchDraft) -> Result<SeriesPlan, NotPlanned> {
-            plan_series_edit(scope, &self.input(), &draft, TAIL, Notify::None)
+        pub fn delete_told(
+            &self,
+            scope: Scope,
+            notify: Option<Notify>,
+        ) -> Result<SeriesPlan, NotPlanned> {
+            plan_series_delete(scope, &self.input(), &seen_of(&self.instance), notify)
         }
+
+        /// Planned with no Send / Don't send answer, as the dialog previews it.
+        pub fn edit(&self, scope: Scope, draft: EventPatchDraft) -> Result<SeriesPlan, NotPlanned> {
+            self.edit_told(scope, draft, None)
+        }
+
+        pub fn edit_told(
+            &self,
+            scope: Scope,
+            draft: EventPatchDraft,
+            notify: Option<Notify>,
+        ) -> Result<SeriesPlan, NotPlanned> {
+            plan_series_edit(scope, &self.input(), &draft, TAIL, notify)
+        }
+    }
+
+    /// `event` with `list` as its guests.
+    pub fn guests_on_it(event: Value, list: &[&str]) -> Value {
+        let mut entries = vec![json!({ "email": CALENDAR, "self": true, "organizer": true,
+                                       "responseStatus": "accepted" })];
+        entries.extend(
+            list.iter()
+                .map(|email| json!({ "email": email, "responseStatus": "accepted" })),
+        );
+        with(event, "attendees", Value::from(entries))
     }
 
     /// What the user saw of an occurrence: its mirror row's summary and times.

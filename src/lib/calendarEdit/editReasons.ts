@@ -213,6 +213,13 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
     case "no_change":
       return { tone: "ok", text: "Nothing to save: Google already has this." };
     case "needs_choice":
+      // Whether Google emails the guests (C12): never answered here by choosing occurrences.
+      if (outcome.guests && !outcome.scope) {
+        return {
+          tone: "warn",
+          text: "Choose whether Google emails the guests. Nothing was saved.",
+        };
+      }
       return {
         tone: "warn",
         text: "This repeating event changed since you chose which occurrences to change. Choose again; nothing was saved.",
@@ -299,6 +306,10 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     case "no_change":
       return notDeleted("Google had nothing to change.", "warn");
     case "needs_choice":
+      // Whether Google emails the guests (C12): never answered here by choosing occurrences.
+      if (outcome.guests && !outcome.scope) {
+        return notDeleted("Choose whether Google emails the guests first.", "warn");
+      }
       // Also a delete sent with no choice that the backend wants one for: a held delete can't
       // reopen the dialog seconds later, so the user deletes again and chooses then.
       return notDeleted(

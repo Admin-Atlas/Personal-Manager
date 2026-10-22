@@ -43,12 +43,14 @@ use crate::calendar_recur::lines::{self, Applied};
 use crate::calendar_recur::spec::{day_phrase, describe_lines, spec_of};
 use crate::calendar_recur::wire::RepeatRule;
 use crate::calendar_recur::{Point, SeriesStart};
+use crate::calendar_write::attendees::{self, Own};
 use crate::calendar_write::classify::{Method, Verdict};
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
-    FieldPermissions, HeldDeleteInfo, MilestoneMoves, MilestoneOffer, NewEventDraft, Notify,
-    ReadOnlyReason, RepeatDraft, ScopeRow, SeenSummary, SeriesChoices, SeriesInfo, SeriesScope,
-    SeriesWarningDto, ShowAs, SplitAction, TimeDraft, Visibility, WriteOutcome, WriteWarning,
+    FieldPermissions, GuestForEdit, GuestNotice, HeldDeleteInfo, MilestoneMoves, MilestoneOffer,
+    NewEventDraft, Notify, ReadOnlyReason, RepeatDraft, ScopeRow, SeenSummary, SeriesChoices,
+    SeriesInfo, SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft, Visibility,
+    WriteOutcome, WriteWarning,
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
@@ -350,6 +352,60 @@ fn needs_scope(conn: &Connection, row_id: &str) -> Result<bool> {
     Ok(calendar::event_by_id(conn, row_id)?.is_some_and(|row| row_repeats(&row)))
 }
 
+/// Who a delete of the mirror row `row_id` would tell, when the user organises it: asked before the
+/// hold rather than 8 s later (R9, C12 §5.1). A row someone else organises isn't asked about here:
+/// the gate refuses it at the send.
+fn row_guests(conn: &Connection, row_id: &str, own: &Own) -> Result<Option<GuestNotice>> {
+    Ok(calendar::event_by_id(conn, row_id)?
+        .filter(|row| row.organizer_self)
+        .and_then(|row| attendees::row_delete_notice(&row.attendees, own)))
+}
+
+/// The calendar's own addresses for `target`: its id and the account it's read with, and what
+/// `events` (Google's copies) mark as the user's. Never a guest Google emails (C12).
+fn own_of(target: &Target, events: &[&Value]) -> Own {
+    Own::of(
+        &[target.remote_calendar.as_str(), target.email.as_str()],
+        events,
+    )
+}
+
+/// The user's Send / Don't send for a write that would email guests, and the numbers the question
+/// showed (C12): an answer stands for those only (critiques C1-M5, C2-H3).
+#[derive(Debug, Clone, Default)]
+struct GuestAnswer {
+    notify: Option<Notify>,
+    asked: Option<GuestNotice>,
+}
+
+impl GuestAnswer {
+    /// What a write reaching `guests` (from Google's copy now; `None`: nobody) sends: `none` when
+    /// nobody would be emailed, whatever was chosen (R7); the answer when it was given for these very
+    /// numbers; otherwise nothing, and the user is asked, again when an answer came for others (R9).
+    fn for_write(&self, guests: Option<GuestNotice>) -> std::result::Result<Notify, WriteOutcome> {
+        let Some(guests) = guests else {
+            return Ok(Notify::None);
+        };
+        match (self.notify, &self.asked) {
+            (Some(chosen), Some(asked)) if guests.answered_by(asked) => Ok(chosen),
+            (None, _) => Err(WriteOutcome::needs_notify(guests)),
+            _ => Err(WriteOutcome::needs_notify_again(guests)),
+        }
+    }
+
+    /// Whether a delete may be held for the Undo window, `row` being who the mirror's row says it
+    /// would tell: asked now when that's someone and nobody answered, rather than held and asked 8 s
+    /// later (C12 §5.1). The numbers an answer was given for are compared only at the send, on
+    /// Google's copy: the mirror can't say a list was cut short, so comparing them here could refuse
+    /// every answer to such an event (C12a review).
+    fn before_hold(&self, row: Option<GuestNotice>) -> std::result::Result<(), WriteOutcome> {
+        match (row, self.notify) {
+            (Some(guests), None) => Err(WriteOutcome::needs_notify(guests)),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Each row's list-level edit block (see [`facts_from_row`]): the one reason nothing about it may
 /// change, or `None`.
 pub(super) fn edit_blocks(
@@ -422,6 +478,33 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
             .get("htmlLink")
             .and_then(Value::as_str)
             .map(str::to_string),
+        guests: fresh
+            .get("attendees")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(guest_for_edit)
+            .collect(),
+        guests_can_modify: patch::bool_of(fresh.get("guestsCanModify"), false),
+        guests_can_invite_others: patch::bool_of(fresh.get("guestsCanInviteOthers"), true),
+        guests_can_see_other_guests: patch::bool_of(fresh.get("guestsCanSeeOtherGuests"), true),
+        guests_omitted: attendees::omitted(fresh),
+    })
+}
+
+/// One entry of Google's guest list as the editor shows it; `None` without an address.
+fn guest_for_edit(entry: &Value) -> Option<GuestForEdit> {
+    let email = entry.get("email").and_then(Value::as_str)?.to_string();
+    let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_string);
+    let flag = |key: &str| entry.get(key).and_then(Value::as_bool).unwrap_or(false);
+    Some(GuestForEdit {
+        room: flag("resource") || attendees::is_room_address(&email),
+        name: text("displayName"),
+        response: text("responseStatus"),
+        optional: flag("optional"),
+        organizer: flag("organizer"),
+        is_self: flag("self"),
+        email,
     })
 }
 
@@ -434,7 +517,9 @@ fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<Re
         || (draft.show_as.is_some() && !perms.show_as)
         || (draft.visibility.is_some() && !perms.visibility)
         // How it repeats moves its times, so it takes the time's permission (C11).
-        || (draft.recurrence.is_some() && !perms.time);
+        || (draft.recurrence.is_some() && !perms.time)
+        // The guest list and what guests may do (C12).
+        || (draft.touches_guests() && !perms.guests);
     touched_closed.then(|| {
         perms
             .reasons
@@ -657,6 +742,12 @@ fn seen_of(calendar_id: &str, fresh: &Value) -> Option<SeenSummary> {
 /// a repeating event it's for and `choice` the plan the user chose ([`series_choices`]); without a
 /// scope it's one event: a one-off (an occurrence of a repeating event answers `NeedsChoice`, rule
 /// R9).
+///
+/// `notify` is the user's answer to Send / Don't send, and `asked` the numbers the question showed
+/// (C12). A save that would email someone and has no answer, or one given for other numbers, is
+/// answered `NeedsChoice` with only a GET sent (R9); one that would email nobody sends `none`
+/// whatever it says (R7). For occurrences the chosen plan's token binds the numbers instead.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn update_calendar_event(
     app: AppHandle,
@@ -665,6 +756,8 @@ pub async fn update_calendar_event(
     draft: EventPatchDraft,
     scope: Option<SeriesScope>,
     choice: Option<String>,
+    notify: Option<Notify>,
+    asked: Option<GuestNotice>,
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
@@ -701,7 +794,16 @@ pub async fn update_calendar_event(
             missing_ok: MISSING_CHOICE_OK,
             new_series_id: plan::client_event_id,
         };
-        return Ok(save_series(&ctx, &session, open, draft, scope.into(), choice.as_deref()).await);
+        return Ok(save_series(
+            &ctx,
+            &session,
+            open,
+            draft,
+            scope.into(),
+            choice.as_deref(),
+            notify,
+        )
+        .await);
     }
     let token_key = open.target.token_key.clone();
     Ok(save_event(
@@ -711,6 +813,7 @@ pub async fn update_calendar_event(
         &open,
         &draft,
         editing,
+        &GuestAnswer { notify, asked },
     )
     .await)
 }
@@ -881,7 +984,7 @@ async fn held_new_part<W: Wire, H: Host>(
 }
 
 /// [`update_calendar_event`] for one event, past its shell: Google through `wire`, the mirror and
-/// the claims through `host`.
+/// the claims through `host`, `answer` the user's Send / Don't send.
 async fn save_event<W: Wire, H: Host>(
     wire: &W,
     host: &H,
@@ -889,6 +992,7 @@ async fn save_event<W: Wire, H: Host>(
     open: &EditSession,
     draft: &EventPatchDraft,
     editing: EditingStatus,
+    answer: &GuestAnswer,
 ) -> WriteOutcome {
     let Some(_flight) = InFlight::claim(host.edit(), &open.target.row_id) else {
         return WriteOutcome::Busy;
@@ -916,7 +1020,14 @@ async fn save_event<W: Wire, H: Host>(
         // An occurrence of a repeating event: which occurrences is the user's choice, never a
         // default (rule R9). Only a GET has gone out.
         if fresh.get("recurringEventId").is_some() {
-            return WriteOutcome::NeedsChoice;
+            return WriteOutcome::needs_scope();
+        }
+        // Guest changes need real addresses, each once, the organiser and the user left as they
+        // are, and Google's whole list to go onto (C12).
+        if let Err(e) = attendees::check(&fresh, draft.guest_ops()) {
+            return WriteOutcome::Failed {
+                message: e.to_string(),
+            };
         }
         // The one-off new part of a change PM couldn't finish waits until that change is settled.
         // Only reads have gone out.
@@ -957,7 +1068,7 @@ async fn save_event<W: Wire, H: Host>(
         // Fail closed: a single-event save sends nothing beyond the fields it may change, and its
         // repeat only when it was given one.
         let allowed = if repeats.is_some() {
-            patch::CREATABLE
+            patch::REPEAT_PATCHABLE
         } else {
             patch::PATCHABLE
         };
@@ -971,19 +1082,29 @@ async fn save_event<W: Wire, H: Host>(
             UpdateCheck::Gone => return land_gone(host, target, Some(&fresh)),
             UpdateCheck::Conflict(fields) => return WriteOutcome::Conflict { fields },
         }
+        // R9: who this would email is the user's to say, every time, for the numbers they saw;
+        // nobody, and it's `none` (R7). Asked before anything is sent, a second round included.
+        let notify = match answer.for_write(attendees::notify_required(
+            &fresh,
+            &body,
+            &own_of(target, &[&fresh]),
+        )) {
+            Ok(notify) => notify,
+            Err(ask) => return ask,
+        };
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
             return WriteOutcome::Failed {
                 message: "Google sent this event without a version stamp, so PM won't change it."
                     .into(),
             };
         };
-        // R7: nobody to email while events with guests stay read-only (C12 adds the choice).
+        // R7/R9: the user's answer, or none where nobody would be emailed.
         let request = plan::patch_event(
             &target.remote_calendar,
             &target.remote_event,
             etag,
             Value::Object(body.clone()),
-            Notify::None,
+            notify,
             plan::VersionFlags::default(),
         );
         let reply = match wire.send(&request).await {
@@ -1742,6 +1863,11 @@ impl<W: Wire> Wire for Posts<'_, W> {
 /// during the hold, nothing is deleted. Other writes to the event answer Busy meanwhile. `scope` and
 /// `choice` name the occurrences of a repeating event and the plan chosen, as for a save; a series
 /// delete is planned before the hold, and planned again at the send.
+///
+/// `notify`: Send / Don't send for a delete Google would tell guests about, and `asked` the numbers
+/// the question showed (R9, C12). Both are kept with the hold, so the answer given before the Undo
+/// window is the one sent after it, and only for the guests Google's copy has then.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn delete_calendar_event(
     app: AppHandle,
@@ -1750,20 +1876,23 @@ pub async fn delete_calendar_event(
     seen: SeenSummary,
     scope: Option<SeriesScope>,
     choice: Option<String>,
+    notify: Option<Notify>,
+    asked: Option<GuestNotice>,
 ) -> Result<DeleteStart> {
     require_main_window(&window)?;
     require_owner(&app)?;
     let refused = |result| Ok(DeleteStart::Refused { result });
     let state = app.state::<AppState>();
-    // One lock for the row's target, its account's choice and whether it repeats (the DB mutex
-    // isn't re-entrant).
-    let (target, editing_choice, in_series) = {
+    // One lock for the row's target, its account's choice, whether it repeats and who it would tell
+    // (the DB mutex isn't re-entrant).
+    let (target, editing_choice, in_series, guests) = {
         let conn = state.conn()?;
         match resolve_target(&conn, &event_id)? {
             Ok(target) => {
                 let editing_choice = calendar_editing::choice(&conn, &target.email)?;
                 let in_series = needs_scope(&conn, &event_id)?;
-                (target, editing_choice, in_series)
+                let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;
+                (target, editing_choice, in_series, guests)
             }
             Err(reason) => return refused(WriteOutcome::ReadOnly { reason }),
         }
@@ -1789,7 +1918,7 @@ pub async fn delete_calendar_event(
     // window and refuse it at the send (rule R9). A one-off Google has turned into a series since
     // isn't one here; it holds, and the gate refuses it at the send.
     if scope.is_none() && in_series {
-        return refused(WriteOutcome::NeedsChoice);
+        return refused(WriteOutcome::needs_scope());
     }
     if let Some(scope) = scope {
         return start_series_delete(
@@ -1800,8 +1929,15 @@ pub async fn delete_calendar_event(
             scope.into(),
             choice,
             editing,
+            notify,
         )
         .await;
+    }
+    // Guests the row shows, and no answer: asked now, rather than held and asked 8 s later. The answer
+    // is checked against Google's copy at the send.
+    let answer = GuestAnswer { notify, asked };
+    if let Err(ask) = answer.before_hold(guests) {
+        return refused(ask);
     }
     let Some(flight) = InFlight::claim(&state.calendar_edit, &target.row_id) else {
         return refused(WriteOutcome::Busy);
@@ -1829,7 +1965,14 @@ pub async fn delete_calendar_event(
                 return;
             }
         }
-        let result = send_delete(&GoogleWire(&target.token_key), &task_app, &target, &seen).await;
+        let result = send_delete(
+            &GoogleWire(&target.token_key),
+            &task_app,
+            &target,
+            &seen,
+            &answer,
+        )
+        .await;
         let _ = task_app.emit_to(
             "main",
             "calendar://delete-settled",
@@ -1970,14 +2113,15 @@ pub fn list_held_deletes(app: AppHandle, window: tauri::Window) -> Result<Vec<He
     Ok(app.state::<AppState>().calendar_edit.held_deletes.list())
 }
 
-/// Send a held delete: a fresh copy, the gate, the "is it still what you saw" rule, then a DELETE
-/// guarded by the etag. Editing is read again here, since it may have been turned off while the
-/// delete waited.
+/// Send a held delete: a fresh copy, the gate, the "is it still what you saw" rule, the guests it
+/// would tell, then a DELETE guarded by the etag. Editing is read again here, since it may have been
+/// turned off while the delete waited.
 async fn send_delete<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
     seen: &SeenSummary,
+    answer: &GuestAnswer,
 ) -> WriteOutcome {
     let editing = match host.editing(target) {
         Ok(editing) => editing,
@@ -2011,25 +2155,29 @@ async fn send_delete<W: Wire, H: Host>(
         // An occurrence of a repeating event: which occurrences is the user's choice, never a
         // default (rule R9). Only a GET has gone out.
         if fresh.get("recurringEventId").is_some() {
-            return WriteOutcome::NeedsChoice;
+            return WriteOutcome::needs_scope();
         }
         match patch::delete_still_matches(seen, &fresh) {
             DeleteCheck::Matches => {}
             DeleteCheck::Gone => return land_gone(host, target, Some(&fresh)),
             DeleteCheck::Changed(fields) => return land_changed(host, target, &fresh, fields),
         }
+        // R9 again on Google's copy now: guests may have been added during the hold. Asked, Google's
+        // copy goes into the mirror, so a delete started again asks about them before its hold (C12
+        // critique C1-H2).
+        let notify =
+            match answer.for_write(attendees::delete_notice(&fresh, &own_of(target, &[&fresh]))) {
+                Ok(notify) => notify,
+                Err(ask) => return land_fresh(host, target, &fresh, ask),
+            };
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
             return WriteOutcome::Failed {
                 message: "Google sent this event without a version stamp, so PM won't delete it."
                     .into(),
             };
         };
-        let request = plan::delete_event(
-            &target.remote_calendar,
-            &target.remote_event,
-            etag,
-            Notify::None,
-        );
+        let request =
+            plan::delete_event(&target.remote_calendar, &target.remote_event, etag, notify);
         let reply = match wire.send(&request).await {
             Ok(reply) => reply,
             Err(google_io::NoAnswer::Unsent { why, .. }) => return unsent_outcome(why),
@@ -2636,7 +2784,14 @@ async fn choices<W: Wire, H: Host>(
         // A "this and following" preview gets a new series id of its own, never sent: the save
         // mints one again (one plan, one tail id), and the token leaves it out.
         let tail = plan::client_event_id();
-        match plan_scope(&planning, &target.remote_calendar, request, scope, &tail) {
+        match plan_scope(
+            &planning,
+            &target.remote_calendar,
+            request,
+            scope,
+            &tail,
+            None,
+        ) {
             Planned::NotOffered(why) => ScopeRow::Refused {
                 message: why.to_string(),
             },
@@ -2666,6 +2821,8 @@ struct Planning {
     /// What the token binds: the session and the draft (an edit), or the row and what the user saw
     /// (a delete).
     bind: String,
+    /// The account the calendar is read with: the user, never a guest Google emails (C12).
+    me: String,
 }
 
 impl Planning {
@@ -2685,6 +2842,7 @@ impl Planning {
             sibling: self.series.sibling,
             later: self.series.later,
             guests_allowed: GUESTS_ALLOWED,
+            me: &self.me,
         }
     }
 }
@@ -2712,13 +2870,15 @@ enum Planned {
     Planned(std::result::Result<SeriesPlan, NotPlanned>),
 }
 
-/// Plan `scope` as its row offers it. `tail_id`: a split's new series id.
+/// Plan `scope` as its row offers it. `tail_id`: a split's new series id. `notify`: the save's Send /
+/// Don't send (C12); a preview, never sent, has none.
 fn plan_scope(
     planning: &Planning,
     calendar: &str,
     request: &ChoiceRequest,
     scope: Scope,
     tail_id: &str,
+    notify: Option<Notify>,
 ) -> Planned {
     let options = scope_options(
         &planning.change,
@@ -2746,9 +2906,9 @@ fn plan_scope(
     let input = planning.input(calendar);
     Planned::Planned(match request {
         ChoiceRequest::Edit { draft, .. } => {
-            plan_series_edit(scope, &input, draft, tail_id, Notify::None)
+            plan_series_edit(scope, &input, draft, tail_id, notify)
         }
-        ChoiceRequest::Delete { seen, .. } => plan_series_delete(scope, &input, seen, Notify::None),
+        ChoiceRequest::Delete { seen, .. } => plan_series_delete(scope, &input, seen, notify),
     })
 }
 
@@ -2866,6 +3026,7 @@ async fn prepare_change<W: Wire>(
         series,
         change,
         bind,
+        me: target.email.clone(),
     }))
 }
 
@@ -2888,10 +3049,20 @@ fn scope_row(
                 .map(|w| warning_dto(w, &plan, series))
                 .collect();
             let token = plan.choice_digest(bind);
+            // Who it would email with Send: the dialog asks Send / Don't send under the row (C12).
+            let guests = plan.guests.clone();
             if asked == Scope::Following && plan.scope == Scope::All {
-                ScopeRow::AsAll { warnings, token }
+                ScopeRow::AsAll {
+                    warnings,
+                    token,
+                    guests,
+                }
             } else {
-                ScopeRow::Offered { warnings, token }
+                ScopeRow::Offered {
+                    warnings,
+                    token,
+                    guests,
+                }
             }
         }
         Err(NotPlanned::Conflict(fields)) => ScopeRow::Conflict { fields },
@@ -3074,15 +3245,24 @@ enum Landing<'a> {
     Delete,
 }
 
-/// Plan the claimed scope again, as the dialog's row did, and refuse what a row would.
+/// Plan the claimed scope again, as the dialog's row did, and refuse what a row would. `notify`:
+/// the save's Send / Don't send, stamped on each step that reaches someone (C12).
 fn planned_or_refused<W: Wire, H: Host>(
     ctx: &SeriesWrite<'_, W, H>,
     planning: &Planning,
     request: &ChoiceRequest,
     scope: Scope,
+    notify: Option<Notify>,
 ) -> std::result::Result<SeriesPlan, WriteOutcome> {
     let tail = (ctx.new_series_id)();
-    match plan_scope(planning, &ctx.target.remote_calendar, request, scope, &tail) {
+    match plan_scope(
+        planning,
+        &ctx.target.remote_calendar,
+        request,
+        scope,
+        &tail,
+        notify,
+    ) {
         Planned::NotOffered(why) => Err(WriteOutcome::Failed {
             message: why.to_string(),
         }),
@@ -3195,7 +3375,8 @@ async fn prepared_for<W: Wire, H: Host>(
 }
 
 /// Save a draft for the occurrences `scope` names: claim the series and the row, plan again from
-/// fresh copies, check the plan is the one chosen (`choice`), send it step by step, land it.
+/// fresh copies, check the plan is the one chosen (`choice`), and that the user answered Send / Don't
+/// send when it would email anyone (`notify`, R9), send it step by step, land it.
 async fn save_series<W: Wire, H: Host>(
     ctx: &SeriesWrite<'_, W, H>,
     session: &str,
@@ -3203,6 +3384,7 @@ async fn save_series<W: Wire, H: Host>(
     draft: EventPatchDraft,
     scope: Scope,
     choice: Option<&str>,
+    notify: Option<Notify>,
 ) -> WriteOutcome {
     // The series is known from the occurrence as opened, so the claim comes before any read (L2).
     let Some(master_id) = open
@@ -3232,12 +3414,17 @@ async fn save_series<W: Wire, H: Host>(
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
-    let plan = match planned_or_refused(ctx, &planning, &request, scope) {
+    let plan = match planned_or_refused(ctx, &planning, &request, scope, notify) {
         Ok(plan) => plan,
         Err(outcome) => return outcome,
     };
     if !choice_matches(choice, &plan.choice_digest(&planning.bind), ctx.missing_ok) {
-        return WriteOutcome::NeedsChoice;
+        return WriteOutcome::needs_scope();
+    }
+    // R9: it would email someone, and nobody answered. The token, checked first, binds who: a list
+    // that changed since the dialog asks the whole choice again.
+    if plan.needs_notify() {
+        return WriteOutcome::needs_notify(plan.guests.clone().unwrap_or_default());
     }
     // A new series is claimed too, through its landing and the look after a partial one: a sync
     // may mirror it mid-run, and a write to it then is Busy (C9a-3b critique M9).
@@ -3839,11 +4026,12 @@ fn stale_saved(
 }
 
 /// What a held series delete keeps for its send: the token it was chosen by, the series claimed,
-/// and the rows it hides.
+/// the rows it hides, and the Send / Don't send it was given (C12).
 struct HeldPlan {
     token: String,
     master: Option<String>,
     hidden: Vec<String>,
+    notify: Option<Notify>,
 }
 
 /// The first half of a series delete, before its Undo window: claim, then plan on what the user saw
@@ -3854,6 +4042,7 @@ async fn plan_held_delete<'h, W: Wire, H: Host>(
     seen: &SeenSummary,
     scope: Scope,
     choice: Option<&str>,
+    notify: Option<Notify>,
 ) -> std::result::Result<(InFlight<'h>, HeldPlan), WriteOutcome> {
     // The series is known from the mirror row, so the claim comes before any read (L2).
     let master = ctx
@@ -3876,10 +4065,16 @@ async fn plan_held_delete<'h, W: Wire, H: Host>(
         seen: seen.clone(),
     };
     let (_, planning) = prepared_for(ctx, &request, None, master.as_deref(), scope).await?;
-    let plan = planned_or_refused(ctx, &planning, &request, scope)?;
+    let plan = planned_or_refused(ctx, &planning, &request, scope, notify)?;
     let token = plan.choice_digest(&planning.bind);
     if !choice_matches(choice, &token, ctx.missing_ok) {
-        return Err(WriteOutcome::NeedsChoice);
+        return Err(WriteOutcome::needs_scope());
+    }
+    // R9: asked now, never held without an answer.
+    if plan.needs_notify() {
+        return Err(WriteOutcome::needs_notify(
+            plan.guests.clone().unwrap_or_default(),
+        ));
     }
     let zone = planning.series.master.start.zone();
     let hidden = ctx
@@ -3905,6 +4100,7 @@ async fn plan_held_delete<'h, W: Wire, H: Host>(
             token,
             master,
             hidden,
+            notify,
         },
     ))
 }
@@ -3927,17 +4123,22 @@ async fn send_held_series_delete<W: Wire, H: Host>(
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
-    let plan = match planned_or_refused(ctx, &planning, &request, scope) {
+    let plan = match planned_or_refused(ctx, &planning, &request, scope, held.notify) {
         Ok(plan) => plan,
         Err(outcome) => return outcome,
     };
     if plan.choice_digest(&planning.bind) != held.token {
-        return WriteOutcome::NeedsChoice;
+        return WriteOutcome::needs_scope();
+    }
+    // The token binds who it tells, so only a plan held without an answer could get here.
+    if plan.needs_notify() {
+        return WriteOutcome::needs_notify(plan.guests.clone().unwrap_or_default());
     }
     send_series(ctx, &mirror, &planning, plan, Landing::Delete).await
 }
 
 /// A scoped delete: planned now, held for its Undo window with the claim handed off, then sent.
+#[allow(clippy::too_many_arguments)]
 async fn start_series_delete(
     app: AppHandle,
     target: Target,
@@ -3946,6 +4147,7 @@ async fn start_series_delete(
     scope: Scope,
     choice: Option<String>,
     editing: EditingStatus,
+    notify: Option<Notify>,
 ) -> Result<DeleteStart> {
     let token_key = target.token_key.clone();
     let wire = GoogleWire(&token_key);
@@ -3958,7 +4160,7 @@ async fn start_series_delete(
         new_series_id: plan::client_event_id,
     };
     let (flight, held) =
-        match plan_held_delete(&ctx, &event_id, &seen, scope, choice.as_deref()).await {
+        match plan_held_delete(&ctx, &event_id, &seen, scope, choice.as_deref(), notify).await {
             Ok(planned) => planned,
             Err(result) => return Ok(DeleteStart::Refused { result }),
         };
@@ -5118,7 +5320,7 @@ fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> W
             "Google's sign-in for this account needs renewing. Reconnect it, then try again."
                 .to_string()
         }
-        WriteOutcome::Conflict { .. } | WriteOutcome::NeedsChoice => {
+        WriteOutcome::Conflict { .. } | WriteOutcome::NeedsChoice { .. } => {
             "This repeating event changed in Google meanwhile; check again.".to_string()
         }
         WriteOutcome::PartialSplit { .. }
@@ -6384,10 +6586,21 @@ fn land_changed(
     fresh: &Value,
     fields: Vec<String>,
 ) -> WriteOutcome {
+    land_fresh(host, target, fresh, WriteOutcome::Conflict { fields })
+}
+
+/// A delete stopped by Google's copy `fresh` (changed, or with guests to ask about): it goes into the
+/// mirror, so the row that comes back shows it, and `outcome` is said.
+fn land_fresh(
+    host: &impl Host,
+    target: &Target,
+    fresh: &Value,
+    outcome: WriteOutcome,
+) -> WriteOutcome {
     if let Some(row) = calendar::parse_event(&target.calendar_id, fresh) {
         let _ = land(host, target, vec![row], Vec::new());
     }
-    WriteOutcome::Conflict { fields }
+    outcome
 }
 
 fn land_on(
@@ -7099,6 +7312,7 @@ mod tests {
             description: true,
             show_as: true,
             visibility: true,
+            guests: true,
             delete: true,
             reasons: Vec::new(),
         };
@@ -7206,6 +7420,833 @@ mod tests {
             ..locked.clone()
         };
         assert_eq!(refused_field(&open, &stop), None);
+        // The guest list and what guests may do: closed on a locked copy (C12 §4.4), each alone.
+        let modify = EventPatchDraft {
+            guests_can_modify: Some(true),
+            ..Default::default()
+        };
+        for guests in [adding_guest("b@x.org"), modify] {
+            assert_eq!(
+                refused_field(&locked, &guests),
+                Some(ReadOnlyReason::Locked)
+            );
+            let open = FieldPermissions {
+                guests: true,
+                ..locked.clone()
+            };
+            assert_eq!(refused_field(&open, &guests), None);
+        }
+        // An empty list of changes touches nothing.
+        let untouched = EventPatchDraft {
+            guests: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(refused_field(&locked, &untouched), None);
+    }
+
+    // --- guests (C12a): who a write would email, asked before anything is sent ---
+
+    use crate::calendar_write::dto::{GuestOp, GuestState};
+
+    /// A draft that adds `email` to the guest list.
+    fn adding_guest(email: &str) -> EventPatchDraft {
+        EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: email.into(),
+                to: GuestState::Required,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// One guest new to the event: one invitation.
+    fn one_invited() -> GuestNotice {
+        GuestNotice {
+            invited: 1,
+            people: 1,
+            emails: 1,
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// The user's Send / Don't send, given for the numbers `asked`.
+    fn answered(notify: Notify, asked: GuestNotice) -> GuestAnswer {
+        GuestAnswer {
+            notify: Some(notify),
+            asked: Some(asked),
+        }
+    }
+
+    /// A write to `path` on `etag` whose query holds `query`: who Google emails.
+    fn told(method: Method, path: &str, etag: &str, query: &'static str, answer: Scripted) -> Step {
+        Step {
+            if_match: Some(etag.into()),
+            ..Step::new(method, path, query, answer)
+        }
+    }
+
+    /// C12 critiques C1-M5, C2-H3: an answer stands only for the numbers the question showed; with
+    /// nobody to email it's `none`, whatever was chosen (R7).
+    #[test]
+    fn an_answer_stands_only_for_the_numbers_it_was_given_for() {
+        let two = GuestNotice {
+            updated: 2,
+            people: 2,
+            emails: 2,
+            complete: true,
+            ..Default::default()
+        };
+        for answer in [GuestAnswer::default(), answered(Notify::All, two.clone())] {
+            assert!(answer.for_write(None) == Ok(Notify::None), "nobody: none");
+        }
+        assert!(
+            GuestAnswer::default().for_write(Some(two.clone()))
+                == Err(WriteOutcome::needs_notify(two.clone())),
+            "no answer: asked"
+        );
+        for notify in [Notify::All, Notify::None] {
+            assert!(
+                answered(notify, two.clone()).for_write(Some(two.clone())) == Ok(notify),
+                "the answer, for the numbers it was given for"
+            );
+        }
+        let three = GuestNotice {
+            updated: 3,
+            people: 3,
+            emails: 3,
+            ..two.clone()
+        };
+        assert!(
+            answered(Notify::All, two.clone()).for_write(Some(three.clone()))
+                == Err(WriteOutcome::needs_notify_again(three)),
+            "given for other numbers: asked again, with these"
+        );
+        let unsaid = GuestAnswer {
+            notify: Some(Notify::None),
+            asked: None,
+        };
+        assert!(
+            unsaid.for_write(Some(two.clone())) == Err(WriteOutcome::needs_notify_again(two)),
+            "an answer without the numbers it was given for is asked again"
+        );
+    }
+
+    /// C12 §4.3: the editor opens on every entry of Google's list with an address, in Google's
+    /// order, rooms said as rooms, and what guests may do with Google's defaults filled in.
+    #[test]
+    fn the_editor_opens_with_the_guest_list_and_its_permissions() {
+        let fresh = json!({
+            "summary": "Retro",
+            "start": { "dateTime": "2026-10-12T09:00:00Z" },
+            "end": { "dateTime": "2026-10-12T10:00:00Z" },
+            "attendees": [
+                { "email": "me@example.com", "self": true, "organizer": true,
+                  "responseStatus": "accepted" },
+                { "email": "a@x.org", "displayName": "A", "responseStatus": "accepted",
+                  "comment": "late", "additionalGuests": 1 },
+                { "email": "room1@resource.calendar.google.com", "resource": true,
+                  "responseStatus": "accepted" },
+                { "displayName": "No address" }
+            ]
+        });
+        let e = event_for_edit(&fresh, "Europe/London").unwrap();
+        let who: Vec<(&str, bool, bool, bool)> = e
+            .guests
+            .iter()
+            .map(|g| (g.email.as_str(), g.is_self, g.organizer, g.room))
+            .collect();
+        assert!(
+            who == [
+                ("me@example.com", true, true, false),
+                ("a@x.org", false, false, false),
+                ("room1@resource.calendar.google.com", false, false, true)
+            ],
+            "Google's order, the user and the organiser included, a room as a room"
+        );
+        let a = &e.guests[1];
+        assert!(
+            a.name.as_deref() == Some("A")
+                && a.response.as_deref() == Some("accepted")
+                && !a.optional,
+            "name and reply as Google says them"
+        );
+        assert!(
+            (
+                e.guests_can_modify,
+                e.guests_can_invite_others,
+                e.guests_can_see_other_guests,
+                e.guests_omitted
+            ) == (false, true, true, false),
+            "Google's defaults"
+        );
+        // Set, and cut short; a room the copy doesn't flag is a room by its address.
+        let set = json!({
+            "start": { "date": "2026-10-12" },
+            "end": { "date": "2026-10-13" },
+            "guestsCanModify": true,
+            "guestsCanInviteOthers": false,
+            "guestsCanSeeOtherGuests": false,
+            "attendeesOmitted": true,
+            "attendees": [{ "email": "Room2@Resource.Calendar.Google.com", "optional": true }]
+        });
+        let e = event_for_edit(&set, "Europe/London").unwrap();
+        assert!(
+            (
+                e.guests_can_modify,
+                e.guests_can_invite_others,
+                e.guests_can_see_other_guests,
+                e.guests_omitted
+            ) == (true, false, false, true),
+            "as Google holds them"
+        );
+        assert!(e.guests.len() == 1 && e.guests[0].room && e.guests[0].optional);
+        // No list at all: none.
+        assert!(event_for_edit(
+            &json!({
+                "start": { "date": "2026-10-12" },
+                "end": { "date": "2026-10-13" }
+            }),
+            "Europe/London"
+        )
+        .unwrap()
+        .guests
+        .is_empty());
+    }
+
+    /// C12 §5.1: a delete of a row you organise says who it would tell, before anything is held;
+    /// never the user, even where the mirror doesn't mark them; a row someone else organises isn't
+    /// asked about here (the gate refuses it at the send).
+    #[test]
+    fn a_row_you_organise_says_who_its_delete_would_tell() {
+        let (_d, conn) = store();
+        let cal = "gcal:me@x.com:me@x.com";
+        add_calendar(&conn, "gcal:me@x.com", "google", cal, Some("me@x.com"));
+        let guest = |email: &str, is_self: bool| calendar::Attendee {
+            name: None,
+            email: Some(email.into()),
+            response: None,
+            optional: false,
+            organizer: is_self,
+            is_self,
+        };
+        let mine = CalendarEvent {
+            id: format!("{cal}:a"),
+            calendar_id: cal.into(),
+            summary: "Mine".into(),
+            start: "2026-10-12T09:00:00Z".into(),
+            organizer_self: true,
+            attendees: vec![guest("me@x.com", true), guest("a@x.org", false)],
+            ..Default::default()
+        };
+        let invite = CalendarEvent {
+            id: format!("{cal}:i"),
+            organizer_self: false,
+            ..mine.clone()
+        };
+        let alone = CalendarEvent {
+            id: format!("{cal}:s"),
+            attendees: vec![guest("Me@x.com", false)],
+            ..mine.clone()
+        };
+        let rows = [mine.clone(), invite.clone(), alone.clone()];
+        calendar::replace_events(&conn, cal, &rows, true).unwrap();
+        let own = Own::of(&["me@x.com"], &[]);
+        let told = GuestNotice {
+            updated: 1,
+            people: 1,
+            emails: 1,
+            cancelled: true,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(
+            row_guests(&conn, &mine.id, &own).unwrap() == Some(told),
+            "one guest told"
+        );
+        assert!(row_guests(&conn, &invite.id, &own).unwrap().is_none());
+        assert!(row_guests(&conn, &alone.id, &own).unwrap().is_none());
+        assert!(row_guests(&conn, &format!("{cal}:missing"), &own)
+            .unwrap()
+            .is_none());
+    }
+
+    /// C12 §5.1: the delete shell asks about the row's guests before it holds anything, when nobody
+    /// answered. The shell needs the app, so its order is read from the source, as for the dev
+    /// allow-list.
+    #[test]
+    fn a_delete_asks_about_the_rows_guests_before_its_hold() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let start = shipped
+            .find("pub async fn delete_calendar_event(")
+            .expect("the delete command");
+        let shell = &shipped[start..];
+        let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
+        assert!(
+            shell.contains("let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;")
+        );
+        let ask = shell
+            .find("if let Err(ask) = answer.before_hold(guests) {\n        return refused(ask);")
+            .expect("asked before the hold");
+        let hold = shell.find("held_deletes.hold(").expect("the hold");
+        let series = shell
+            .find("return start_series_delete(")
+            .expect("a series delete");
+        assert!(
+            series < ask && ask < hold,
+            "a one-off's guests are asked about before its hold"
+        );
+    }
+
+    /// C12 §6.9: a series delete that would tell someone is never held, nor sent, unanswered. Until
+    /// the lift (C12c) no series with guests gets this far, so the order is read from the source.
+    #[test]
+    fn a_series_delete_is_never_held_or_sent_unanswered() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body_of = |head: &str| {
+            let start = shipped.find(head).expect("the function");
+            let rest = &shipped[start..];
+            rest[..rest.find("\n}\n").unwrap_or(rest.len())].to_string()
+        };
+        let asks = "if plan.needs_notify() {\n        return";
+        let held = body_of("async fn plan_held_delete<");
+        let token = held.find("if !choice_matches(").expect("the token");
+        let asked = held.find(asks).expect("asked before the hold");
+        let kept = held.find("HeldPlan {").expect("what the hold keeps");
+        assert!(token < asked && asked < kept);
+        let send = body_of("async fn send_held_series_delete<");
+        let token = send.find("!= held.token").expect("the token");
+        let asked = send.find(asks).expect("asked before the send");
+        let sent = send.find("send_series(").expect("the send");
+        assert!(token < asked && asked < sent);
+    }
+
+    /// C12 §4.5: a first guest added to a one-off is asked about, with who it would email, and only
+    /// the GET has gone out.
+    #[tokio::test]
+    async fn adding_the_first_guest_asks_before_anything_is_sent() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &adding_guest("b@x.org"),
+            Vec::new(),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(one_invited()),
+            "asked, with one invitation"
+        );
+        assert_eq!(script.sent().len(), 1);
+    }
+
+    /// The answer goes to Google as chosen, on Google's own list with the guest added; one given
+    /// for other numbers, or without them, is asked again with only the GET sent (C12 critiques
+    /// C1-M5, C2-H3).
+    #[tokio::test]
+    async fn the_answer_goes_to_google_as_chosen() {
+        let event = dentist();
+        let landed = written(
+            &event,
+            &[(
+                "attendees",
+                json!([{ "email": "b@x.org", "responseStatus": "needsAction" }]),
+            )],
+            "\"s2\"",
+        );
+        for (notify, query) in [
+            (Notify::All, "sendUpdates=all"),
+            (Notify::None, "sendUpdates=none"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off_told(
+                &host,
+                &event,
+                target(&event),
+                &adding_guest("b@x.org"),
+                vec![told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    query,
+                    Scripted::Json(landed.clone()),
+                )],
+                answered(notify, one_invited()),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "saved");
+            assert!(
+                first_write(&script).body == Some(json!({ "attendees": [{ "email": "b@x.org" }] })),
+                "Google's list with the guest"
+            );
+        }
+        let two = GuestNotice {
+            invited: 2,
+            people: 2,
+            emails: 2,
+            ..one_invited()
+        };
+        for answer in [
+            answered(Notify::All, two),
+            GuestAnswer {
+                notify: Some(Notify::All),
+                asked: None,
+            },
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off_told(
+                &host,
+                &event,
+                target(&event),
+                &adding_guest("b@x.org"),
+                Vec::new(),
+                answer,
+            )
+            .await;
+            script.finished();
+            assert!(
+                outcome == WriteOutcome::needs_notify_again(one_invited()),
+                "asked again, with the numbers now"
+            );
+        }
+    }
+
+    /// R7: a save that emails nobody sends `none`, whatever was chosen.
+    #[tokio::test]
+    async fn a_save_that_emails_nobody_sends_none_whatever_was_chosen() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off_told(
+            &host,
+            &event,
+            target(&event),
+            &title("Retro"),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(retitled(&event, "\"s2\"")),
+            )],
+            answered(Notify::All, one_invited()),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "saved, emailing nobody");
+    }
+
+    /// C12 §4.2: a 412's second round asks when Google's copy now reaches someone the first didn't
+    /// (here a list Google cut short: PM can't tell who would hear), with nothing more sent.
+    #[tokio::test]
+    async fn a_second_round_asks_when_googles_copy_now_reaches_someone() {
+        let event = dentist();
+        let cut_short = written(
+            &event,
+            &[
+                (
+                    "attendees",
+                    json!([{ "email": "me@example.com", "self": true }]),
+                ),
+                ("attendeesOmitted", json!(true)),
+            ],
+            "\"s2\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &title("Retro"),
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Status(412),
+                ),
+                Step::get("/events/solo", "", cut_short),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::needs_notify(GuestNotice {
+                    complete: false,
+                    ..Default::default()
+                }),
+            "asked, PM couldn't see every guest"
+        );
+        let writes = script
+            .sent()
+            .iter()
+            .filter(|p| p.method != Method::Get)
+            .count();
+        assert_eq!(writes, 1, "only the first round's PATCH");
+    }
+
+    /// The organiser and the user stay on the list as they are; an address that isn't one, or one
+    /// twice, is refused too: in words naming no address, nothing sent.
+    #[tokio::test]
+    async fn taking_off_the_organiser_is_refused_with_words() {
+        let event = with(
+            dentist(),
+            "attendees",
+            json!([{ "email": "me@example.com", "self": true, "organizer": true,
+                     "responseStatus": "accepted" }]),
+        );
+        let ops = |ops: &[(&str, GuestState)]| EventPatchDraft {
+            guests: Some(
+                ops.iter()
+                    .map(|(email, to)| GuestOp {
+                        email: (*email).into(),
+                        to: *to,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        for (draft, error) in [
+            (
+                ops(&[("ME@example.com", GuestState::Absent)]),
+                attendees::GuestError::CantRemove,
+            ),
+            (
+                ops(&[("bob at x", GuestState::Required)]),
+                attendees::GuestError::NotAnAddress,
+            ),
+            (
+                ops(&[
+                    ("b@x.org", GuestState::Required),
+                    ("B@x.org", GuestState::Optional),
+                ]),
+                attendees::GuestError::Repeated,
+            ),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) =
+                save_one_off(&host, &event, target(&event), &draft, Vec::new()).await;
+            script.finished();
+            assert!(
+                outcome
+                    == WriteOutcome::Failed {
+                        message: error.to_string()
+                    },
+                "refused before anything is sent"
+            );
+        }
+    }
+
+    /// C12 critiques C1-H4, C2-M4: a one-off given a repeat and a guest in one save sends both, on
+    /// the repeat's own list of what it may send.
+    #[tokio::test]
+    async fn a_one_off_given_a_repeat_and_a_guest_sends_both() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let draft = EventPatchDraft {
+            guests: adding_guest("b@x.org").guests,
+            ..weekly_on(&[DayCode::Mon])
+        };
+        let (outcome, script, _) = save_one_off_told(
+            &host,
+            &event,
+            target(&event),
+            &draft,
+            vec![told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                "sendUpdates=all",
+                Scripted::Status(500),
+            )],
+            answered(Notify::All, one_invited()),
+        )
+        .await;
+        script.asked_all();
+        assert!(matches!(outcome, WriteOutcome::Failed { .. }));
+        let body = first_write(&script).body.unwrap();
+        assert!(body["attendees"] == json!([{ "email": "b@x.org" }]));
+        assert!(body["recurrence"] == json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]));
+    }
+
+    /// R7: a delete that tells nobody sends `none`, whatever was chosen.
+    #[tokio::test]
+    async fn a_delete_with_no_guests_sends_none_whatever_was_chosen() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            Step::write(
+                Method::Delete,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Status(204),
+            ),
+        ]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &answered(Notify::All, one_invited()),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, telling nobody");
+    }
+
+    /// C12 §5.2, critique C1-H2: at the send, Google's copy reaches someone (here a list Google cut
+    /// short) and nobody answered: asked, nothing deleted, and Google's copy goes into the mirror so
+    /// the next delete starts from it. An answer given for these numbers sends it as chosen.
+    #[tokio::test]
+    async fn a_delete_google_would_tell_someone_about_is_asked_at_the_send() {
+        let event = dentist();
+        let cut_short = written(
+            &event,
+            &[
+                ("description", json!("Bring forms")),
+                (
+                    "attendees",
+                    json!([{ "email": "me@example.com", "self": true }]),
+                ),
+                ("attendeesOmitted", json!(true)),
+            ],
+            "\"s2\"",
+        );
+        let at_least = GuestNotice {
+            cancelled: true,
+            complete: false,
+            ..Default::default()
+        };
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![Step::get("/events/solo", "", cut_short.clone())]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &GuestAnswer::default(),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(at_least.clone()),
+            "asked, nothing deleted"
+        );
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap()
+            .expect("still there");
+        assert_eq!(row.description.as_deref(), Some("Bring forms"));
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", cut_short),
+            told(
+                Method::Delete,
+                "/events/solo",
+                "\"s2\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+        ]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &answered(Notify::All, at_least),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, as chosen");
+    }
+
+    /// C12a review: the mirror can't say Google cut a guest list short, so before the hold only a
+    /// missing answer is asked about, and the numbers wait for Google's copy at the send. Here the
+    /// row still shows A, Google's copy lists only the user and is cut short, and the answer was
+    /// given for Google's numbers: it gets past the check before the hold and is deleted, rather
+    /// than asked about on every try.
+    #[tokio::test]
+    async fn a_cut_short_list_answered_with_googles_numbers_gets_past_the_hold_and_is_deleted() {
+        let event = dentist();
+        let shown = written(
+            &event,
+            &[(
+                "attendees",
+                json!([
+                    { "email": "me@example.com", "self": true, "organizer": true },
+                    { "email": "a@x.org", "responseStatus": "accepted" }
+                ]),
+            )],
+            "\"s1\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&shown));
+        let target = target(&event);
+        let row = host
+            .with_conn(|conn| row_guests(conn, &target.row_id, &own_of(&target, &[])))
+            .unwrap();
+        let mirrors = GuestNotice {
+            updated: 1,
+            people: 1,
+            emails: 1,
+            cancelled: true,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(row == Some(mirrors.clone()), "the row shows A");
+        let at_least = GuestNotice {
+            cancelled: true,
+            complete: false,
+            ..Default::default()
+        };
+        let answer = answered(Notify::All, at_least);
+        assert!(
+            answer.before_hold(row.clone()) == Ok(()),
+            "past the check before the hold"
+        );
+        assert!(
+            GuestAnswer::default().before_hold(row) == Err(WriteOutcome::needs_notify(mirrors)),
+            "with no answer, asked before the hold"
+        );
+        assert!(
+            GuestAnswer::default().before_hold(None) == Ok(()),
+            "nobody to tell"
+        );
+        let cut_short = written(
+            &event,
+            &[
+                (
+                    "attendees",
+                    json!([{ "email": "me@example.com", "self": true }]),
+                ),
+                ("attendeesOmitted", json!(true)),
+            ],
+            "\"s2\"",
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", cut_short),
+            told(
+                Method::Delete,
+                "/events/solo",
+                "\"s2\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+        ]);
+        let seen = seen_by_user(&fresh_event(shown.clone()));
+        let outcome = send_delete(&script, &*host, &target, &seen, &answer).await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, as chosen");
+    }
+
+    /// C12 §6.10: a first guest added to a repeating event (allowed: it has none yet) is counted on
+    /// every row the dialog offers.
+    #[tokio::test]
+    async fn series_choices_carry_who_each_row_would_email() {
+        let (series, instance) = (weekly(), monday_19());
+        let script = Script::new(october_reads());
+        let opened = Some((&instance, Some(&series)));
+        let (this, following, all) = ask(
+            &script,
+            &instance,
+            edit(adding_guest("b@x.org")),
+            opened,
+            &["abc"],
+        )
+        .await;
+        for row in [&this, &following, &all] {
+            assert!(
+                matches!(row, ScopeRow::Offered { guests: Some(g), .. } if *g == one_invited()),
+                "one invitation on every row"
+            );
+        }
+    }
+
+    /// C12 §6.9: the plan chosen, its token still matching, would email someone and nobody answered:
+    /// asked, with only reads sent. With Send, it goes to Google as chosen.
+    #[tokio::test]
+    async fn a_series_save_with_guests_and_no_answer_is_asked() {
+        let host = TestHost::holding(&october());
+        let (series, instance) = (weekly(), monday_19());
+        let draft = adding_guest("b@x.org");
+        let (session, open) = open_in(&host, &instance, &series);
+        let request = ChoiceRequest::Edit {
+            session: session.clone(),
+            draft: draft.clone(),
+        };
+        let script = Script::new(october_reads());
+        let (_, _, all) = ask(&script, &instance, request, Some(open.opened()), &["abc"]).await;
+        let script = Script::new(october_reads());
+        let target = target(&instance);
+        let outcome = save_series(
+            &writer(&script, &host, &target),
+            &session,
+            open,
+            draft.clone(),
+            Scope::All,
+            Some(token(&all)),
+            None,
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(one_invited()),
+            "asked, nothing sent"
+        );
+        // Send: the series' PATCH says so.
+        let with_b = |event: &Value, etag: &str| {
+            written(
+                event,
+                &[(
+                    "attendees",
+                    json!([{ "email": "b@x.org", "responseStatus": "needsAction" }]),
+                )],
+                etag,
+            )
+        };
+        let occurrences: Vec<Value> = october()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| with_b(e, &format!("\"r{i}\"")))
+            .collect();
+        let mut steps = october_reads();
+        steps.push(told(
+            Method::Patch,
+            "/events/abc",
+            "\"m1\"",
+            "sendUpdates=all",
+            Scripted::Json(with_b(&series, "\"m2\"")),
+        ));
+        steps.push(refetch_read(Scripted::Json(page(occurrences, None))));
+        let script = Script::new(steps);
+        let (outcome, _) = save_told(
+            &host,
+            &script,
+            &instance,
+            &series,
+            draft,
+            Scope::All,
+            Some(Notify::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "saved, as chosen");
+        assert!(
+            first_write(&script).body == Some(json!({ "attendees": [{ "email": "b@x.org" }] })),
+            "the series' list with the guest"
+        );
     }
 
     #[test]
@@ -9211,6 +10252,19 @@ mod tests {
         draft: EventPatchDraft,
         scope: Scope,
     ) -> (WriteOutcome, String) {
+        save_told(host, script, instance, series, draft, scope, None).await
+    }
+
+    /// [`save`] with the user's Send / Don't send.
+    async fn save_told(
+        host: &TestHost,
+        script: &Script,
+        instance: &Value,
+        series: &Value,
+        draft: EventPatchDraft,
+        scope: Scope,
+        notify: Option<Notify>,
+    ) -> (WriteOutcome, String) {
         let (session, open) = open_in(host, instance, series);
         let target = target(instance);
         let outcome = save_series(
@@ -9220,6 +10274,7 @@ mod tests {
             draft,
             scope,
             None,
+            notify,
         )
         .await;
         (outcome, session)
@@ -9232,14 +10287,25 @@ mod tests {
         instance: &Value,
         scope: Scope,
     ) -> WriteOutcome {
+        held_delete_told(host, script, instance, scope, None).await
+    }
+
+    /// [`held_delete`] with the user's Send / Don't send.
+    async fn held_delete_told(
+        host: &TestHost,
+        script: &Script,
+        instance: &Value,
+        scope: Scope,
+        notify: Option<Notify>,
+    ) -> WriteOutcome {
         let target = target(instance);
         let ctx = writer(script, host, &target);
         let seen = seen_by_user(&fresh_event(instance.clone()));
-        let (_claim, held) = match plan_held_delete(&ctx, &target.row_id, &seen, scope, None).await
-        {
-            Ok(planned) => planned,
-            Err(outcome) => return outcome,
-        };
+        let (_claim, held) =
+            match plan_held_delete(&ctx, &target.row_id, &seen, scope, None, notify).await {
+                Ok(planned) => planned,
+                Err(outcome) => return outcome,
+            };
         send_held_series_delete(&ctx, &target.row_id, &seen, scope, &held).await
     }
 
@@ -10247,6 +11313,7 @@ mod tests {
                 &seen,
                 Scope::All,
                 None,
+                None,
             )
             .await;
             assert_eq!(planned.err(), Some(WriteOutcome::Busy), "{held}");
@@ -10303,10 +11370,11 @@ mod tests {
             title("Retro"),
             Scope::All,
             Some(token(&all)),
+            None,
         )
         .await;
         script.finished();
-        assert_eq!(outcome, WriteOutcome::NeedsChoice);
+        assert_eq!(outcome, WriteOutcome::needs_scope());
     }
 
     // --- changing how it repeats (C11c) ---
@@ -10525,10 +11593,14 @@ mod tests {
             every_other_day,
             Scope::All,
             Some(token(&all)),
+            None,
         )
         .await;
         script.finished();
-        assert!(matches!(outcome, WriteOutcome::NeedsChoice), "asked again");
+        assert!(
+            outcome == WriteOutcome::needs_scope(),
+            "asked again which occurrences"
+        );
     }
 
     /// C11 §9.7, critiques 1 M2 and 2 M1: "Does not repeat" for every occurrence lands Google's answer
@@ -10904,8 +11976,8 @@ mod tests {
         };
         let (session, open) = open_in(&host, &instance, &series);
         assert_eq!(
-            save_series(&ctx, &session, open, title("Retro"), Scope::All, None).await,
-            WriteOutcome::NeedsChoice
+            save_series(&ctx, &session, open, title("Retro"), Scope::All, None, None).await,
+            WriteOutcome::needs_scope()
         );
         script.finished();
         let script = Script::new(october_reads());
@@ -10914,8 +11986,8 @@ mod tests {
             ..writer(&script, &host, &target)
         };
         let seen = seen_by_user(&fresh_event(instance.clone()));
-        let planned = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None).await;
-        assert_eq!(planned.err(), Some(WriteOutcome::NeedsChoice));
+        let planned = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None).await;
+        assert_eq!(planned.err(), Some(WriteOutcome::needs_scope()));
         script.finished();
     }
 
@@ -10974,6 +12046,7 @@ mod tests {
             &seen,
             Scope::All,
             None,
+            None,
         )
         .await;
         script.finished();
@@ -11005,6 +12078,7 @@ mod tests {
             &seen,
             Scope::All,
             None,
+            None,
         )
         .await;
         script.finished();
@@ -11019,6 +12093,7 @@ mod tests {
             &target.row_id,
             &seen,
             Scope::All,
+            None,
             None,
         )
         .await
@@ -13834,8 +14909,14 @@ mod tests {
                 Prepared::Ready(planning) => planning,
                 _ => panic!("not ready"),
             };
-            let plan = planned_or_refused(&ctx, &planning, &edit(title("Retro")), Scope::Following)
-                .unwrap();
+            let plan = planned_or_refused(
+                &ctx,
+                &planning,
+                &edit(title("Retro")),
+                Scope::Following,
+                None,
+            )
+            .unwrap();
             ids.push(new_series(&plan).unwrap().to_string());
             tokens.push(plan.choice_digest(&planning.bind));
         }
@@ -13895,6 +14976,7 @@ mod tests {
                 title("Retro"),
                 scope,
                 Some(token(&row)),
+                None,
             )
             .await;
             script.asked_all();
@@ -13920,7 +15002,7 @@ mod tests {
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let ctx = writer(&script, &host, &target);
         assert_eq!(
-            save_series(&ctx, &session, open, title("Retro"), Scope::All, None).await,
+            save_series(&ctx, &session, open, title("Retro"), Scope::All, None, None).await,
             WriteOutcome::Failed {
                 message: NOT_REPEATING.into()
             }
@@ -13929,7 +15011,7 @@ mod tests {
         let script = Script::new(vec![Step::get("/events/solo", "", one_off.clone())]);
         let ctx = writer(&script, &host, &target);
         let seen = seen_by_user(&fresh_event(one_off));
-        let planned = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None).await;
+        let planned = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None).await;
         assert_eq!(
             planned.err(),
             Some(WriteOutcome::Failed {
@@ -13949,7 +15031,7 @@ mod tests {
         let script = Script::new(october_reads());
         let ctx = writer(&script, &host, &target);
         let seen = seen_by_user(&fresh_event(instance.clone()));
-        let (claim, held) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None)
+        let (claim, held) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None)
             .await
             .unwrap();
         script.finished();
@@ -13994,7 +15076,7 @@ mod tests {
         let script = Script::new(steps);
         assert_eq!(
             held_delete(&host, &script, &instance, Scope::Following).await,
-            WriteOutcome::NeedsChoice
+            WriteOutcome::needs_scope()
         );
         script.finished();
     }
@@ -14190,7 +15272,7 @@ mod tests {
         let seen = seen_by_user(&fresh_event(instance));
         let script = Script::new(october_reads());
         let ctx = writer(&script, host, &target);
-        let (_, plan) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None)
+        let (_, plan) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None)
             .await
             .unwrap();
         HeldSeriesDelete {
@@ -14402,7 +15484,10 @@ mod tests {
             let mut steps = vec![Step::get("/events/solo", "", event.clone())];
             steps.extend(answers);
             let script = Script::new(steps);
-            assert_eq!(send_delete(&script, &*host, &target, &seen).await, expected);
+            assert_eq!(
+                send_delete(&script, &*host, &target, &seen, &GuestAnswer::default()).await,
+                expected
+            );
             script.asked_all();
             let row = host
                 .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
@@ -14414,7 +15499,7 @@ mod tests {
         *host.editing.lock().unwrap() = EditingStatus::Paused;
         let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
         assert_eq!(
-            send_delete(&script, &*host, &target, &seen).await,
+            send_delete(&script, &*host, &target, &seen, &GuestAnswer::default()).await,
             WriteOutcome::ReadOnly {
                 reason: ReadOnlyReason::EditingOff
             }
@@ -14514,6 +15599,7 @@ mod tests {
                 &open,
                 &title("Retro"),
                 EditingStatus::On,
+                &GuestAnswer::default(),
             )
             .await;
             script.asked_all();
@@ -14575,6 +15661,7 @@ mod tests {
             &open,
             &title("Retro"),
             EditingStatus::On,
+            &GuestAnswer::default(),
         )
         .await;
         script.finished();
@@ -14607,7 +15694,7 @@ mod tests {
         );
         let host = TestHost::holding(std::slice::from_ref(&event));
         let script = Script::new(vec![Step::get("/events/solo", "", turned)]);
-        let outcome = send_delete(&script, &*host, &target, &seen).await;
+        let outcome = send_delete(&script, &*host, &target, &seen, &GuestAnswer::default()).await;
         script.finished();
         assert!(matches!(
             outcome,
@@ -14645,11 +15732,12 @@ mod tests {
             &open,
             &title("Retro"),
             EditingStatus::On,
+            &GuestAnswer::default(),
         )
         .await;
         script.finished();
         assert!(
-            matches!(outcome, WriteOutcome::NeedsChoice),
+            outcome == WriteOutcome::needs_scope(),
             "asks rather than saving this event alone"
         );
         assert_eq!(script.sent().len(), 1);
@@ -14740,7 +15828,16 @@ mod tests {
         draft: &EventPatchDraft,
         answers: Vec<Step>,
     ) -> (WriteOutcome, Script, String) {
-        save_one_off_in(host, event, target, draft, answers, None).await
+        save_one_off_with(
+            host,
+            event,
+            target,
+            draft,
+            answers,
+            None,
+            GuestAnswer::default(),
+        )
+        .await
     }
 
     /// [`save_one_off`] from an editor opened on a computer in `device_zone`.
@@ -14752,12 +15849,55 @@ mod tests {
         answers: Vec<Step>,
         device_zone: Option<chrono_tz::Tz>,
     ) -> (WriteOutcome, Script, String) {
+        save_one_off_with(
+            host,
+            event,
+            target,
+            draft,
+            answers,
+            device_zone,
+            GuestAnswer::default(),
+        )
+        .await
+    }
+
+    /// [`save_one_off`] with the user's Send / Don't send.
+    async fn save_one_off_told(
+        host: &TestHost,
+        event: &Value,
+        target: Target,
+        draft: &EventPatchDraft,
+        answers: Vec<Step>,
+        answer: GuestAnswer,
+    ) -> (WriteOutcome, Script, String) {
+        save_one_off_with(host, event, target, draft, answers, None, answer).await
+    }
+
+    /// [`save_one_off`] from an editor in `device_zone`, with the user's Send / Don't send.
+    async fn save_one_off_with(
+        host: &TestHost,
+        event: &Value,
+        target: Target,
+        draft: &EventPatchDraft,
+        answers: Vec<Step>,
+        device_zone: Option<chrono_tz::Tz>,
+        answer: GuestAnswer,
+    ) -> (WriteOutcome, Script, String) {
         let session = keep_session(&host.edit, target, event.clone(), None, device_zone).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let mut steps = vec![Step::get("/events/solo", "", event.clone())];
         steps.extend(answers);
         let script = Script::new(steps);
-        let outcome = save_event(&script, host, &session, &open, draft, EditingStatus::On).await;
+        let outcome = save_event(
+            &script,
+            host,
+            &session,
+            &open,
+            draft,
+            EditingStatus::On,
+            &answer,
+        )
+        .await;
         (outcome, script, session)
     }
 
@@ -15312,7 +16452,16 @@ mod tests {
         let mut steps = vec![event_read(TAIL, Scripted::Json(copy.clone()))];
         steps.extend(answers);
         let script = Script::new(steps);
-        let outcome = save_event(&script, host, &session, &open, draft, EditingStatus::On).await;
+        let outcome = save_event(
+            &script,
+            host,
+            &session,
+            &open,
+            draft,
+            EditingStatus::On,
+            &GuestAnswer::default(),
+        )
+        .await;
         (outcome, script)
     }
 
@@ -15523,6 +16672,7 @@ mod tests {
             &open,
             &title("Retro"),
             EditingStatus::On,
+            &GuestAnswer::default(),
         )
         .await;
         script.finished();
@@ -15544,10 +16694,10 @@ mod tests {
         let seen = seen_by_user(&fresh_event(event.clone()));
         let host = TestHost::holding(std::slice::from_ref(&event));
         let script = Script::new(vec![Step::get("/events/solo", "", event)]);
-        let outcome = send_delete(&script, &*host, &target, &seen).await;
+        let outcome = send_delete(&script, &*host, &target, &seen, &GuestAnswer::default()).await;
         script.finished();
         assert!(
-            matches!(outcome, WriteOutcome::NeedsChoice),
+            outcome == WriteOutcome::needs_scope(),
             "asks rather than deleting this event alone"
         );
         assert_eq!(script.sent().len(), 1);

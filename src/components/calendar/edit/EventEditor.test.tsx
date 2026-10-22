@@ -103,6 +103,7 @@ const ALL: FieldPermissions = {
   description: true,
   show_as: true,
   visibility: true,
+  guests: true,
   delete: true,
   reasons: [],
 };
@@ -128,6 +129,11 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     visibility: "default",
     attachments: [],
     html_link: null,
+    guests: [],
+    guests_can_modify: false,
+    guests_can_invite_others: true,
+    guests_can_see_other_guests: true,
+    guests_omitted: false,
     ...over,
   };
 }
@@ -1001,7 +1007,7 @@ describe("EventEditor, a repeating event", () => {
 
   it("opens the choices when a save without one is answered that it repeats (R9)", async () => {
     openForEdit.mockResolvedValue(ready(event()));
-    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice" });
+    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice", scope: true });
     choicesForEdit.mockResolvedValue(choices());
     await open();
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
@@ -1021,7 +1027,7 @@ describe("EventEditor, a repeating event", () => {
   it("asks again once when the plan changed since the choice, then says so", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     choicesForEdit.mockResolvedValue(choices());
-    saveEdit.mockResolvedValue({ outcome: "needs_choice" });
+    saveEdit.mockResolvedValue({ outcome: "needs_choice", scope: true });
     const { onClose, dialog } = await retitle();
     await inDialog(dialog).findByRole("radio", { name: /^This event/ });
     fireEvent.click(inDialog(dialog).getByRole("button", { name: "Save" }));
@@ -1039,7 +1045,7 @@ describe("EventEditor, a repeating event", () => {
     expect(saveEdit).toHaveBeenCalledTimes(2);
     expect(onClose).not.toHaveBeenCalled();
     // A new Save starts its count afresh: the plan changing once more is asked again, not refused.
-    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice" });
+    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice", scope: true });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     const next = inDialog(await screen.findByRole("dialog", { name: "Edit repeating event" }));
     await next.findByRole("radio", { name: /^This event/ });
@@ -1130,8 +1136,8 @@ describe("EventEditor, a repeating event", () => {
     openForEdit.mockResolvedValue(ready(event()));
     // Twice each, then answers that end a loop, so one would fail here rather than hang.
     saveEdit
-      .mockResolvedValueOnce({ outcome: "needs_choice" })
-      .mockResolvedValueOnce({ outcome: "needs_choice" })
+      .mockResolvedValueOnce({ outcome: "needs_choice", scope: true })
+      .mockResolvedValueOnce({ outcome: "needs_choice", scope: true })
       .mockResolvedValue({ outcome: "failed", message: "Sent a third time." });
     choicesForEdit
       .mockResolvedValueOnce({ outcome: "not_repeating" })
@@ -1147,6 +1153,35 @@ describe("EventEditor, a repeating event", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(choicesForEdit).toHaveBeenCalledTimes(2);
     expect(saveEdit).toHaveBeenCalledTimes(2);
+    expect(choicesOpen()).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  // C12 §14.1: whether Google emails the guests is no choice of occurrences. Asking those would
+  // say "doesn't repeat" and send it again unanswered, round and round; it's said instead.
+  it("says a save needs the guests' answer, and never asks which occurrences", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const guests = {
+      updated: 0,
+      invited: 1,
+      removed: 0,
+      cancelled: false,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice", scope: false, guests });
+    const onClose = await open();
+    const editorSave = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(editorSave);
+    expect(
+      await screen.findByText("Choose whether Google emails the guests. Nothing was saved."),
+    ).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(choicesForEdit).not.toHaveBeenCalled();
     expect(choicesOpen()).toBeNull();
     expect(onClose).not.toHaveBeenCalled();
     await waitFor(() => expect(document.activeElement).toBe(editorSave));

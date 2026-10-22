@@ -185,7 +185,7 @@ export function conflictOf(choices: ReadyChoices): string[] | null {
 /** The re-ask's line: the plan changed between the choice and the write, so nothing was sent. */
 export function againText(kind: ChoiceKind): string {
   return kind === "save"
-    ? outcomeText({ outcome: "needs_choice" }).text
+    ? outcomeText({ outcome: "needs_choice", scope: true }).text
     : "This repeating event changed since you chose which occurrences to delete. Choose again; nothing was deleted.";
 }
 

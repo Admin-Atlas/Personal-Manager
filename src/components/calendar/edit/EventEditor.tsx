@@ -501,7 +501,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
         // "choose" to the plain save and "nothing to choose" here can't loop.
         closeChoices();
         if (++againRef.current > 1) {
-          setBanner(outcomeText({ outcome: "needs_choice" }));
+          setBanner(outcomeText({ outcome: "needs_choice", scope: true }));
           refocusSave();
           return;
         }
@@ -586,6 +586,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           onClose();
           return;
         case "needs_choice":
+          // Whether Google emails the guests (C12): never answered by choosing occurrences, whose
+          // dialog would say "doesn't repeat" and send it again unanswered, round and round.
+          if (outcome.guests && !outcome.scope) {
+            setBanner(outcomeText(outcome));
+            return;
+          }
           // No choice sent, and the event repeats after all (R9): ask, saying nothing.
           if (picked === null) {
             reasked = true;

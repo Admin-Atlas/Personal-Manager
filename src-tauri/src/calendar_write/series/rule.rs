@@ -30,6 +30,7 @@ use crate::calendar_recur::spec::{
 use crate::calendar_recur::split::remaining_count;
 use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
+use super::super::attendees::Own;
 use super::super::dto::{EventPatchDraft, Notify, RepeatDraft, TimeDraft};
 use super::super::patch::{build_patch, drop_other_kind, is_gone, when_eq};
 use super::super::plan::is_plain_segment;
@@ -693,8 +694,10 @@ pub(super) fn plan_all_rule(
                     {
                         return Err(SeriesRefusal::KeptHasOwn(kept.day_in(zone)).into());
                     }
-                    let draft_keys: Vec<&str> =
-                        draft_fields(draft).iter().map(|(k, _)| *k).collect();
+                    let draft_keys: Vec<&str> = draft_fields(draft, master_json)
+                        .iter()
+                        .map(|(k, _)| *k)
+                        .collect();
                     for field in carry {
                         if field == "time" {
                             own_time = Some(item);
@@ -892,7 +895,7 @@ pub(super) fn plan_split_rule(
             _ => {}
         }
     }
-    let touched = draft_fields(draft);
+    let touched = draft_fields(draft, master_json);
     let draft_keys: Vec<&str> = touched.iter().map(|(k, _)| *k).collect();
     let mut warnings = Vec::new();
     let mut lost: u32 = 0;
@@ -1083,6 +1086,8 @@ pub(super) fn plan_split_rule(
                             },
                             gone_is_done: false,
                             undo: None,
+                            guest_ops: Vec::new(),
+                            reach: None,
                         });
                         Some(steps.len() - 1)
                     }
@@ -1136,7 +1141,9 @@ pub(super) fn plan_split_rule(
         },
         start: master.start,
         rule_start: master.start,
-        guests_allowed: input.guests_allowed,
+        guests: None,
+        chosen: None,
+        own: Own::default(),
     })
 }
 
@@ -3562,7 +3569,7 @@ mod tests {
                         &case.input(),
                         &draft,
                         id,
-                        Notify::None
+                        None
                     ),
                     Err(NotPlanned::Refused(SeriesRefusal::Unreadable)),
                     "{id}"

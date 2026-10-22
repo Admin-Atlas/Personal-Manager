@@ -55,16 +55,19 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         description: true,
         show_as: true,
         visibility: true,
+        guests: true,
         delete: true,
         reasons: Vec::new(),
     };
     if facts.locked {
         // Google refuses changes to a locked copy's summary, description, location, start, end and
-        // recurrence. Whether it lets the copy be deleted isn't documented, so PM doesn't offer it.
+        // recurrence. Whether it lets the copy be deleted, or its guests change, isn't documented,
+        // so PM offers neither (INFERRED: fails closed, C12 §4.4).
         perms.summary = false;
         perms.time = false;
         perms.location = false;
         perms.description = false;
+        perms.guests = false;
         perms.delete = false;
         perms.reasons.push(ReadOnlyReason::Locked);
     }
@@ -172,6 +175,9 @@ mod tests {
         let perms = edit_rights(&editable());
         assert!(perms.summary && perms.time && perms.location && perms.description);
         assert!(perms.show_as && perms.visibility && perms.delete);
+        // C12a: guests may change wherever the rest may (the gate still refuses an event that has
+        // any until C12c).
+        assert!(perms.guests);
         assert!(perms.reasons.is_empty());
         assert_eq!(edit_block(&editable()), None);
         // Absent eventType is Google's documented default.
@@ -423,6 +429,8 @@ mod tests {
         });
         assert!(!perms.summary && !perms.time && !perms.location && !perms.description);
         assert!(!perms.delete);
+        // Not among Google's locked fields, but undocumented, so closed (C12 §4.4).
+        assert!(!perms.guests);
         assert!(perms.show_as && perms.visibility);
         assert_eq!(perms.reasons, vec![Locked]);
         // Something can still change, so the list offers Edit.
