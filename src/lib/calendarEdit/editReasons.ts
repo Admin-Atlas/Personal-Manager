@@ -385,13 +385,15 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       return notDeleted("Google had nothing to change.", "warn");
     case "needs_choice":
       // Whether Google emails the guests (C12): never answered here by choosing occurrences. Said
-      // when the dialog can't ask again: guests Google added during the Undo window, or numbers
-      // that changed since the user chose (neutral: the backend knows only that, C2-L6).
+      // when the dialog can't ask again: guests nobody had answered about, or numbers that changed
+      // since the user chose (neutral: the backend knows only that, C2-L6). Unanswered, it may be
+      // asking from PM's older row after Google dropped the guests, so not "it has guests now"
+      // (C12c review round 2).
       if (outcome.guests && !outcome.scope) {
         return notDeleted(
           outcome.again
             ? "Who Google would email has changed since you chose. Delete it again to choose whether Google emails the guests."
-            : "It has guests now. Delete it again to choose whether Google emails them.",
+            : "PM found guests who would be told. Delete it again to choose whether Google emails them.",
           "warn",
         );
       }

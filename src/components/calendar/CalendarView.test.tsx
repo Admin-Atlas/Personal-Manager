@@ -490,7 +490,7 @@ describe("CalendarView: guests", () => {
     expect(within(again).getByText("Google sends the emails from me@x.com.")).toBeTruthy();
     expect(
       within(again).getByText(
-        "It wasn't deleted: it has guests now. Choose whether Google emails them.",
+        "It wasn't deleted. PM found guests who would be told. Choose whether Google emails them.",
       ),
     ).toBeTruthy();
     const del = within(again).getByRole<HTMLButtonElement>("button", { name: "Delete" });

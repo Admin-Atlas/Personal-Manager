@@ -261,13 +261,14 @@ describe("edit reasons", () => {
       tone: "warn",
       text: "“Standup” wasn't deleted. PM needs to ask which occurrences first. Delete it again to choose.",
     });
-    // Whether Google emails the guests is no choice of occurrences (C12): guests Google added
-    // during the hold, or numbers changed since the answer (said neutrally, C2-L6).
+    // Whether Google emails the guests is no choice of occurrences (C12): guests nobody had
+    // answered about, or numbers changed since the answer (said neutrally, C2-L6, and true when
+    // Google dropped the guests after the last sync).
     expect(
       deleteText({ outcome: "needs_choice", scope: false, guests: ONE_GUEST }, "Standup"),
     ).toEqual({
       tone: "warn",
-      text: "“Standup” wasn't deleted. It has guests now. Delete it again to choose whether Google emails them.",
+      text: "“Standup” wasn't deleted. PM found guests who would be told. Delete it again to choose whether Google emails them.",
     });
     expect(
       deleteText(

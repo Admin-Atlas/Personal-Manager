@@ -868,7 +868,7 @@ describe("a repeating event", () => {
       sent("t4", false);
       expect(hook.result.current.dialog.asked).toBeNull();
       expect(hook.result.current.writes.notices.map((n) => n.text).slice(1)).toEqual([
-        "“Dentist” wasn't deleted. It has guests now. Delete it again to choose whether Google emails them.",
+        "“Dentist” wasn't deleted. PM found guests who would be told. Delete it again to choose whether Google emails them.",
       ]);
       other.unmount();
     });

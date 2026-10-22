@@ -149,12 +149,14 @@ function PlainDelete({
       </p>
       {/* Reopened by the backend: the delete didn't happen, which is said first, whether or not
           anyone had answered (C12c review). Neutral, as the editor's question is: the backend knows
-          only that its numbers differ, not why (C12 critique C2-L6). */}
+          only that its numbers differ, not why (C12 critique C2-L6). With no answer yet it may be
+          asking from PM's older row, after Google dropped the guests, so it doesn't say the event
+          "has guests now"; the send checks Google's copy either way (C12c review round 2). */}
       {guests && (
         <Callout tone="warning" size="md" className="mt-3">
           {guests.again
             ? "It wasn't deleted. PM checked with Google before deleting, and these are the numbers it found."
-            : "It wasn't deleted: it has guests now. Choose whether Google emails them."}
+            : "It wasn't deleted. PM found guests who would be told. Choose whether Google emails them."}
         </Callout>
       )}
       {notice && (

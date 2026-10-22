@@ -180,7 +180,7 @@ describe("DeleteEventDialog", () => {
         "It wasn't deleted. PM checked with Google before deleting, and these are the numbers it found.",
       ),
     ).toBeTruthy();
-    expect(screen.queryByText(/it has guests now/)).toBeNull();
+    expect(screen.queryByText(/PM found guests/)).toBeNull();
     fireEvent.click(radio(/^Send/));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(onConfirm).toHaveBeenCalledWith(occurrence, null, "all", notice);
@@ -188,7 +188,8 @@ describe("DeleteEventDialog", () => {
 
   // C12c review: reopened for guests when nobody had answered (Google's copy has guests the row
   // didn't show, found before the hold or at the send), it says the delete didn't happen and why,
-  // rather than coming back as if nothing had been tried.
+  // rather than coming back as if nothing had been tried. Round 2: the words stay true when the
+  // backend asks from PM's older row after Google dropped the guests, so not "it has guests now".
   it("says it wasn't deleted when reopened for guests nobody had answered about", () => {
     const notice: GuestNotice = {
       updated: 1,
@@ -201,8 +202,11 @@ describe("DeleteEventDialog", () => {
     };
     const { onConfirm } = open(oneOff, { from: "me@x.com", guests: { notice, again: false } });
     expect(
-      screen.getByText("It wasn't deleted: it has guests now. Choose whether Google emails them."),
+      screen.getByText(
+        "It wasn't deleted. PM found guests who would be told. Choose whether Google emails them.",
+      ),
     ).toBeTruthy();
+    expect(screen.queryByText(/has guests now/)).toBeNull();
     expect(screen.queryByText(/PM checked with Google/)).toBeNull();
     expect(screen.getByText("1 guest will be told it's cancelled.")).toBeTruthy();
     fireEvent.click(radio(/^Don't send/));
