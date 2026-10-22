@@ -38,7 +38,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     date: "2026-10-21",
     highlights: [
       "You can now change and delete events you organise that have guests, right from PM. Add guests by address or from people already in your calendars, mark them optional, take them off, and choose what they may do, just as in Google Calendar.",
-      "Like Google Calendar, PM asks every time whether Google should email your guests, with nothing picked for you, and says how many emails that is, a change to a repeating event included. A change to only Busy or Free emails nobody, so it never asks, and rooms are kept as they are.",
+      "Like Google Calendar, PM asks every time whether Google should email your guests, with nothing picked for you, and says how many emails that is, a change to a repeating event included. A change to only Busy or Free emails nobody, so it doesn't ask, except for this and the following events of a repeating event, which makes a new event that invites the guests again. Rooms are kept as they are.",
     ],
   },
   {
