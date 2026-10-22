@@ -126,7 +126,7 @@ import {
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
-import { guestsWithReply, withReply } from "../../../lib/calendarEdit/rsvp";
+import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
@@ -436,18 +436,15 @@ export function EventEditor({
    *  editor's copy says it, and so does the user's own entry on the guest list on screen; the base a
    *  later Save compares is left as it was, since C12 compares who is on the list, never replies.
    *  An occurrence that kept its own answer when the reply went to all events (its day among those
-   *  the outcome names, which only an all-events reply does) still shows its own. */
+   *  the outcome names, which only an all-events reply does), or may have (PM couldn't read the
+   *  occurrences back yet), still shows its own (`replyHeld`). */
   async function onReply(
     reply: Rsvp,
     note: string | null,
     scope: RsvpScope | null,
   ): Promise<WriteOutcome> {
     const outcome = await respond(row.id, reply, note, scope);
-    const shows =
-      outcome.outcome === "no_change" ||
-      (outcome.outcome === "saved" &&
-        !(loaded !== null && (outcome.left_behind ?? []).includes(firstDay(loaded.base.time))));
-    if (shows) {
+    if (replyHeld(outcome, scope, loaded !== null ? firstDay(loaded.base.time) : null)) {
       const own = calendar?.remote_id ?? null;
       setLoaded((l) => (l ? { ...l, event: withReply(l.event, reply, note, own) } : l));
       const now = draftRef.current;

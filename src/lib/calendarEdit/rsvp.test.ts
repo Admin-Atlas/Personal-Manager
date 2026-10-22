@@ -7,7 +7,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Attendee, Calendar, CalendarEvent, EventForEdit, GuestForEdit } from "../types";
+import type {
+  Attendee,
+  Calendar,
+  CalendarEvent,
+  EventForEdit,
+  GuestForEdit,
+  WriteOutcome,
+} from "../types";
 import {
   asRsvp,
   declinedByMe,
@@ -19,6 +26,7 @@ import {
   NOTE_MAX,
   noteLength,
   replyCopies,
+  replyHeld,
   RSVP_CHOICES,
   rsvpLabel,
   tidyNote,
@@ -299,5 +307,51 @@ describe("the editor after a reply (C14c)", () => {
     expect(guestsWithReply(none, "no", "me@x.org")).toEqual(none);
     // A new list, the entry given a copy.
     expect(list[2].response).toBe("needsAction");
+  });
+});
+
+// PR B review round 2: what a reply came to says whether the copy it was sent from holds it, so
+// "Going?" and the editor's guest list may say it before Google's rows land.
+describe("whether the copy replied from holds the reply", () => {
+  const saved = (
+    warnings: ("mirror_refresh_pending" | "kept_own_reply")[],
+    left_behind: string[] = [],
+  ): WriteOutcome => ({ outcome: "saved", warnings, left_behind });
+  const day = "2026-10-19";
+
+  it("holds a reply Google already held, and one saved to this copy alone", () => {
+    expect(replyHeld({ outcome: "no_change" }, "all", day)).toBe(true);
+    for (const scope of [null, "this"] as const) {
+      expect(replyHeld(saved([]), scope, day)).toBe(true);
+      // Taken, if not read back yet: this copy is the one it went to.
+      expect(replyHeld(saved(["mirror_refresh_pending"]), scope, day)).toBe(true);
+    }
+  });
+
+  it("never holds one that wasn't saved", () => {
+    for (const outcome of [
+      { outcome: "unconfirmed" },
+      { outcome: "ignored_by_google", split: false },
+      { outcome: "busy" },
+      { outcome: "failed", message: "no" },
+    ] as WriteOutcome[]) {
+      expect(replyHeld(outcome, null, day)).toBe(false);
+    }
+  });
+
+  it("for all events, holds it once read back, unless this occurrence kept its own answer", () => {
+    expect(replyHeld(saved([]), "all", day)).toBe(true);
+    expect(replyHeld(saved(["kept_own_reply"], ["2026-10-12"]), "all", day)).toBe(true);
+    expect(replyHeld(saved(["kept_own_reply"], [day]), "all", day)).toBe(false);
+    // Which occurrence isn't known: it may be one that kept its own.
+    expect(replyHeld(saved(["kept_own_reply"], ["2026-10-12"]), "all", null)).toBe(false);
+  });
+
+  it("for all events not read back yet, never holds it: this occurrence may have kept its own", () => {
+    expect(replyHeld(saved(["mirror_refresh_pending"]), "all", day)).toBe(false);
+    expect(replyHeld(saved(["mirror_refresh_pending"]), "all", null)).toBe(false);
+    expect(
+      replyHeld(saved(["mirror_refresh_pending", "kept_own_reply"], ["2026-10-12"]), "all", day),
+    ).toBe(false);
   });
 });

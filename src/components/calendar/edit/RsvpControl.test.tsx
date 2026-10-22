@@ -330,6 +330,35 @@ describe("RsvpControl", () => {
     expect(pressed()).toEqual(["Yes"]);
   });
 
+  // PR B review round 2: an all-events reply PM couldn't read back yet may not have reached this
+  // occurrence (answered Yes on its own), so the reply sent isn't shown as its own either.
+  it("an all-events reply not read back yet leaves the occurrence's answer to the row", async () => {
+    const pending: WriteOutcome = {
+      outcome: "saved",
+      warnings: ["mirror_refresh_pending"],
+      left_behind: [],
+    };
+    const { view, props } = control({
+      current: "yes",
+      repeating: true,
+      onReply: vi.fn<OnReply>(() => Promise.resolve(pending)),
+    });
+    fireEvent.click(button("Maybe"));
+    await act(async () => fireEvent.click(button("All events")));
+    expect(status().textContent).toBe(
+      "You replied Maybe for all events. PM's calendar will show it after the next refresh.",
+    );
+    expect(pressed()).toEqual(["Yes"]);
+    // Google kept its Yes: the row lands unchanged, and Maybe can still go to it alone.
+    view.rerender(<RsvpControl {...props} current="yes" />);
+    expect(pressed()).toEqual(["Yes"]);
+    fireEvent.click(button("Maybe"));
+    expect(screen.getByRole("group", { name: "Reply Maybe to which occurrences?" })).toBeTruthy();
+    // To this occurrence alone it went to this copy: shown, though not read back yet.
+    await act(async () => fireEvent.click(button("This event")));
+    expect(pressed()).toEqual(["Maybe"]);
+  });
+
   it("replying for a shared calendar names it", () => {
     control({ forWhom: "Team" });
     expect(screen.getByRole("group", { name: "Going? Replying for Team." })).toBeTruthy();
