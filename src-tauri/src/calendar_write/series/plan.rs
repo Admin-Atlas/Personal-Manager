@@ -1639,11 +1639,28 @@ impl SeriesPlan {
     /// (look, wait, look, post again once under the same id; a 409 means look). `None` when the body
     /// holds a key a create may not send (G5), the id isn't one path segment, or the body has no
     /// start PM can read (never an invented one).
-    pub fn create(calendar: &str, id: &str, body: Map<String, Value>) -> Option<SeriesPlan> {
+    ///
+    /// Its guests (C12d) are each invited ([`Reach::of_insert`]: never one of `own`, the calendar's
+    /// own addresses, nor a room). The plan says how many, and its step sends `chosen`, the user's
+    /// Send or Don't send, or `none` when it invites nobody, whatever was chosen (R7). With guests
+    /// and no answer it never runs (R9, [`SeriesPlan::needs_notify`]). A held create keeps the plan,
+    /// so a retry sends the very answer first sent.
+    pub fn create(
+        calendar: &str,
+        id: &str,
+        body: Map<String, Value>,
+        own: &Own,
+        chosen: Option<Notify>,
+    ) -> Option<SeriesPlan> {
         if body.keys().any(|k| !CREATABLE.contains(&k.as_str())) || !is_plain_segment(id) {
             return None;
         }
         let start = body.get("start").and_then(start_of)?;
+        let guests = Reach::of_insert(&body, own).notice();
+        let notify = match guests {
+            Some(_) => chosen.unwrap_or(Notify::None),
+            None => Notify::None,
+        };
         Some(SeriesPlan {
             scope: Scope::All,
             steps: vec![Step {
@@ -1652,8 +1669,8 @@ impl SeriesPlan {
                     id: id.into(),
                     body,
                 },
-                // R7: a new event has no guests until C12d, so nobody is emailed.
-                notify: Notify::None,
+                // R7/R9: the user's answer, or none where nobody would be invited.
+                notify,
                 stage: Stage::Commit,
                 requires: None,
                 conflict: Recheck::Never,
@@ -1668,9 +1685,9 @@ impl SeriesPlan {
             removes: Removes::Nothing,
             start,
             rule_start: start,
-            guests: None,
-            chosen: None,
-            own: Own::default(),
+            guests,
+            chosen,
+            own: own.clone(),
         })
     }
 }
@@ -5035,13 +5052,23 @@ mod tests {
             show_as: Some(ShowAs::Busy),
             visibility: None,
             recurrence: None,
+            guests: Vec::new(),
+            guests_can_modify: None,
+            guests_can_invite_others: None,
+            guests_can_see_other_guests: None,
         })
         .unwrap()
     }
 
+    /// The create plan for `body` under [`NEW`], counting guests without nobody's own address and
+    /// with nobody's answer.
+    fn create_plan(id: &str, body: Map<String, Value>) -> Option<SeriesPlan> {
+        SeriesPlan::create(CALENDAR, id, body, &Own::default(), None)
+    }
+
     #[test]
     fn a_create_plan_is_one_commit_step_under_pms_id_with_no_one_notified() {
-        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        let plan = create_plan(NEW, new_body()).unwrap();
         assert_eq!(plan.steps.len(), 1);
         let step = &plan.steps[0];
         assert!(matches!(&step.op, Op::Insert { calendar, id, body }
@@ -5060,14 +5087,18 @@ mod tests {
         assert_eq!(request.body.unwrap()["id"], NEW);
         assert!(plan.expect.is_empty() && plan.warnings.is_empty());
         assert_eq!(plan.removes, Removes::Nothing);
+        assert!(
+            plan.guests.is_none() && !plan.needs_notify(),
+            "nobody to invite, nobody asked"
+        );
     }
 
     /// G5: a key a create may not send, a body with no start PM can read, or an id that isn't one
-    /// path segment builds no plan at all. The repeat rule is one a create sends since C11.
+    /// path segment builds no plan at all. The repeat rule is one a create sends since C11, and the
+    /// guests and what they may do since C12d.
     #[test]
     fn a_create_plan_refuses_a_key_a_create_may_not_send() {
         for key in [
-            "attendees",
             "extendedProperties",
             "reminders",
             "conferenceData",
@@ -5076,17 +5107,74 @@ mod tests {
         ] {
             let mut body = new_body();
             body.insert(key.into(), json!([]));
-            assert!(SeriesPlan::create(CALENDAR, NEW, body).is_none(), "{key}");
+            assert!(create_plan(NEW, body).is_none(), "{key}");
         }
+        let mut invited = new_body();
+        invited.insert("attendees".into(), json!([{ "email": A }]));
+        invited.insert("guestsCanModify".into(), json!(true));
+        invited.insert("guestsCanInviteOthers".into(), json!(false));
+        invited.insert("guestsCanSeeOtherGuests".into(), json!(false));
+        assert!(create_plan(NEW, invited).is_some(), "guests are a create's");
         let mut no_start = new_body();
         no_start.insert("start".into(), json!({ "dateTime": "soon" }));
-        assert!(SeriesPlan::create(CALENDAR, NEW, no_start).is_none());
+        assert!(create_plan(NEW, no_start).is_none());
         for id in ["", "..", "a\nb"] {
+            assert!(create_plan(id, new_body()).is_none(), "{id:?}");
+        }
+    }
+
+    /// C12d: a new event's guests are each invited, never the calendar's own address or a room; its
+    /// one step sends the user's answer, and with nobody's it never runs (R9). Inviting nobody, it
+    /// sends `none` whatever was chosen (R7).
+    #[test]
+    fn a_create_plan_invites_its_guests_with_the_users_answer() {
+        let mut body = new_body();
+        body.insert(
+            "attendees".into(),
+            json!([
+                { "email": A },
+                { "email": "Me@Example.com" },
+                { "email": "room1@resource.calendar.google.com" },
+                { "email": B, "optional": true }
+            ]),
+        );
+        let own = Own::of(&["me@example.com"], &[]);
+        let invites = |chosen| SeriesPlan::create(CALENDAR, NEW, body.clone(), &own, chosen);
+        let unanswered = invites(None).unwrap();
+        assert!(
+            unanswered.guests
+                == Some(GuestNotice {
+                    invited: 2,
+                    people: 2,
+                    emails: 2,
+                    complete: true,
+                    ..Default::default()
+                }),
+            "A and B are invited; not you, not the room"
+        );
+        assert!(unanswered.needs_notify(), "asked before it runs");
+        for (chosen, sent) in [(Notify::All, "all"), (Notify::None, "none")] {
+            let plan = invites(Some(chosen)).unwrap();
+            assert!(!plan.needs_notify());
+            assert_eq!(plan.steps[0].notify, chosen);
+            let request = plan.steps[0].op.request(plan.steps[0].notify).unwrap();
+            assert!(request.url.ends_with(&format!(
+                "/events?sendUpdates={sent}&conferenceDataVersion=1"
+            )));
             assert!(
-                SeriesPlan::create(CALENDAR, id, new_body()).is_none(),
-                "{id:?}"
+                request.body.unwrap()["attendees"] == body["attendees"],
+                "every guest as sent"
             );
         }
+        // Only you and a room: nobody to invite, so nobody is asked, and Send sends `none`.
+        let mut only_you = new_body();
+        only_you.insert(
+            "attendees".into(),
+            json!([{ "email": "me@example.com" }, { "email": "room1@resource.calendar.google.com" }]),
+        );
+        let plan = SeriesPlan::create(CALENDAR, NEW, only_you, &own, Some(Notify::All)).unwrap();
+        assert!(plan.guests.is_none() && !plan.needs_notify());
+        assert_eq!(plan.steps[0].notify, Notify::None);
     }
 
     /// C11: a repeating event's body (its one rule line, its zone on both nodes) builds the same
@@ -5109,9 +5197,13 @@ mod tests {
                 description: String::new(),
                 show_as: None,
                 visibility: None,
+                guests: Vec::new(),
+                guests_can_modify: None,
+                guests_can_invite_others: None,
+                guests_can_see_other_guests: None,
             })
             .unwrap();
-        let plan = SeriesPlan::create(CALENDAR, NEW, body).unwrap();
+        let plan = create_plan(NEW, body).unwrap();
         let step = &plan.steps[0];
         assert!(step.op.fits());
         assert_eq!(step.notify, Notify::None);
@@ -5125,7 +5217,7 @@ mod tests {
     /// deleted since; none proves nothing.
     #[test]
     fn created_reads_a_live_copy_as_landed_a_cancelled_one_as_not_and_none_as_unknown() {
-        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        let plan = create_plan(NEW, new_body()).unwrap();
         let mut copy = Value::Object(new_body());
         copy["id"] = json!(NEW);
         copy["status"] = json!("confirmed");

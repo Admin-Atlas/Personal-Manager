@@ -15,7 +15,7 @@
 //
 // Creating an event uses the same fields: `newEventSeed` starts one, it's judged against
 // `NEW_EVENT_BASE` (nothing to keep, so every half is checked), and `toNewEvent` sends all of it,
-// its repeat included (C11).
+// its repeat (C11) and its guests (C12d) included.
 //
 // Guests are fields too (C12): the list, compared by who is on it and who is optional (a reply is
 // never a change), sent as changes to Google's own list, never the list; and the three guest
@@ -821,9 +821,12 @@ export function followStart(was: EditorFields, next: EditorFields): EditorFields
 
 /** What creating an event sends: every field, as the editor holds it, sharing nothing with the draft
  *  (what was sent is kept for a retry, and must not change with it). Its repeat is the rule chosen,
- *  or null for "Does not repeat"; the backend starts it on the first day the rule makes. */
+ *  or null for "Does not repeat"; the backend starts it on the first day the rule makes. Its guests
+ *  are who and whether optional, in the order added (never an organiser's or the calendar's own
+ *  entry, which only Google writes), and each guest permission goes only where it isn't Google's
+ *  own. */
 export function toNewEvent(draft: EditorFields): NewEventDraft {
-  return {
+  const sent: NewEventDraft = {
     summary: draft.summary,
     time: { ...draft.time },
     location: draft.location,
@@ -832,7 +835,19 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
     visibility: draft.visibility,
     // A rule PM can only show (`kept`) belongs to an existing event, never a new one.
     recurrence: draft.recurrence.kind === "rule" ? copyRule(draft.recurrence.rule) : null,
+    guests: draft.guests
+      .filter((g) => !g.self && !g.organizer)
+      .map((g) => ({ email: g.email, optional: g.optional })),
   };
+  const perms = draft.guest_perms;
+  if (perms.modify !== GOOGLE_PERMS.modify) sent.guests_can_modify = perms.modify;
+  if (perms.invite_others !== GOOGLE_PERMS.invite_others) {
+    sent.guests_can_invite_others = perms.invite_others;
+  }
+  if (perms.see_others !== GOOGLE_PERMS.see_others) {
+    sent.guests_can_see_other_guests = perms.see_others;
+  }
+  return sent;
 }
 
 function setField(target: EditorFields, field: EditorField, from: EditorFields) {

@@ -1196,7 +1196,13 @@ const RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// Create an event on one of the user's Google calendars, under an id PM chose. `calendar_id` is
 /// PM's calendar row id; `draft` is what the editor holds; `retry_token` names a create whose
 /// answer never arrived (from an `Ambiguous` outcome), which is looked for before anything is sent
-/// again (R2). Nobody is emailed: a new event has no guests (R7).
+/// again (R2).
+///
+/// `notify` is Send / Don't send for a new event with guests, who get invitations, and `asked` the
+/// numbers the question showed (R9, C12d). One with guests and no answer, or an answer given for
+/// other numbers, is answered `NeedsChoice` with nothing sent; one inviting nobody sends `none`
+/// whatever it says (R7). A retry sends what was first sent, its answer included, whatever these
+/// say now.
 #[tauri::command]
 pub async fn create_calendar_event(
     app: AppHandle,
@@ -1204,6 +1210,8 @@ pub async fn create_calendar_event(
     calendar_id: String,
     draft: NewEventDraft,
     retry_token: Option<String>,
+    notify: Option<Notify>,
+    asked: Option<GuestNotice>,
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
@@ -1240,7 +1248,8 @@ pub async fn create_calendar_event(
         new_id: plan::client_event_id,
         new_ref: new_create_ref,
     };
-    Ok(create_event(&ctx, draft, retry_token.as_deref()).await)
+    let answer = GuestAnswer { notify, asked };
+    Ok(create_event(&ctx, draft, retry_token.as_deref(), &answer).await)
 }
 
 /// What one create works with: Google through `wire`, the mirror and the held creates through
@@ -1272,7 +1281,8 @@ fn create_key(token: &str) -> String {
 struct HeldCreate {
     /// Where it was sent: the retry must name the same calendar.
     target: CalendarTarget,
-    /// The one-step plan, PM's id inside it.
+    /// The one-step plan, PM's id inside it, and the Send or Don't send its guests went with
+    /// (C12d): a retry sends that answer again, never a newer one.
     plan: SeriesPlan,
     /// What was sent, for telling a retry of the same event from a changed one.
     body: serde_json::Map<String, Value>,
@@ -1339,11 +1349,13 @@ impl Drop for TakenCreate<'_> {
 }
 
 /// [`create_calendar_event`] past its shell: Google through `ctx.wire`, the mirror and the held
-/// creates through `ctx.host`.
+/// creates through `ctx.host`. `answer`: the user's Send or Don't send for its guests, asked after
+/// every other refusal and before anything is sent (R9); a retry never reads it.
 async fn create_event<W: Wire, H: Host>(
     ctx: &CreateWrite<'_, W, H>,
     draft: NewEventDraft,
     retry_token: Option<&str>,
+    answer: &GuestAnswer,
 ) -> WriteOutcome {
     let body = match patch::insert_body(&draft) {
         Ok(body) => body,
@@ -1366,11 +1378,30 @@ async fn create_event<W: Wire, H: Host>(
         return WriteOutcome::ReadOnly { reason };
     }
     let id = (ctx.new_id)();
-    let Some(plan) = SeriesPlan::create(&ctx.target.remote_calendar, &id, body.clone()) else {
+    // The calendar's own addresses: never a guest Google invites (C12 critique C1-H1).
+    let own = Own::of(
+        &[
+            ctx.target.remote_calendar.as_str(),
+            ctx.target.email.as_str(),
+        ],
+        &[],
+    );
+    let Some(plan) = SeriesPlan::create(
+        &ctx.target.remote_calendar,
+        &id,
+        body.clone(),
+        &own,
+        answer.notify,
+    ) else {
         return WriteOutcome::Failed {
             message: UNFIT.into(),
         };
     };
+    // R9: whether Google invites the guests is the user's to say, for the numbers they saw, and
+    // nothing is sent or held until they have.
+    if let Err(ask) = answer.for_write(plan.guests.clone()) {
+        return ask;
+    }
     let Ok(mut run) = Run::new(plan.clone()) else {
         return WriteOutcome::Failed {
             message: UNFIT.into(),
@@ -1492,7 +1523,9 @@ fn retry_next(look: RetryLook, first: bool) -> RetryStep {
 
 /// A retry of the create `token` named: look for it under its id first, and only after looking
 /// twice and not finding it, send it again under the same id (A9). Never with a changed calendar or
-/// body: a copy that landed holds what was first sent, and a retry can't edit it. The looks are
+/// body: a copy that landed holds what was first sent, and a retry can't edit it. Nor with another
+/// answer about its guests: the held plan's step keeps the Send or Don't send first sent (C12d), so
+/// the retry takes none. The looks are
 /// reads, so the account's editing and the calendar's role are asked only before a re-send (C10
 /// critique 1 M1). Every end but Google showing the event, or showing it deleted, keeps it held
 /// under the same token.
@@ -17839,6 +17872,24 @@ mod tests {
             show_as: None,
             visibility: None,
             recurrence: None,
+            guests: Vec::new(),
+            guests_can_modify: None,
+            guests_can_invite_others: None,
+            guests_can_see_other_guests: None,
+        }
+    }
+
+    /// The dentist, inviting `guests` (C12d).
+    fn dentist_with(guests: &[&str]) -> NewEventDraft {
+        NewEventDraft {
+            guests: guests
+                .iter()
+                .map(|email| crate::calendar_write::dto::NewGuest {
+                    email: (*email).into(),
+                    optional: false,
+                })
+                .collect(),
+            ..dentist_draft()
         }
     }
 
@@ -17910,7 +17961,8 @@ mod tests {
         Scripted::Status(404)
     }
 
-    /// Create `draft` (or retry `token`) on `target` through `steps`, which must all be asked for.
+    /// Create `draft` (or retry `token`) on `target` through `steps`, which must all be asked for,
+    /// with nobody's Send or Don't send.
     async fn create_on(
         host: &TestHost,
         target: &CalendarTarget,
@@ -17919,8 +17971,31 @@ mod tests {
         draft: NewEventDraft,
         token: Option<&str>,
     ) -> (WriteOutcome, Script) {
+        create_answered(
+            host,
+            steps,
+            draft,
+            token,
+            &GuestAnswer::default(),
+            target,
+            editing,
+        )
+        .await
+    }
+
+    /// [`create_on`] with `answer` given for the guests.
+    async fn create_answered(
+        host: &TestHost,
+        steps: Vec<Step>,
+        draft: NewEventDraft,
+        token: Option<&str>,
+        answer: &GuestAnswer,
+        target: &CalendarTarget,
+        editing: EditingStatus,
+    ) -> (WriteOutcome, Script) {
         let script = Script::new(steps);
-        let outcome = create_event(&creator(&script, host, target, editing), draft, token).await;
+        let ctx = creator(&script, host, target, editing);
+        let outcome = create_event(&ctx, draft, token, answer).await;
         script.asked_all();
         (outcome, script)
     }
@@ -18030,8 +18105,9 @@ mod tests {
         assert_eq!(held_creates(&host), 0);
     }
 
+    /// C10's tripwire, as C12d leaves it: guests go only with a draft that has them (below).
     #[tokio::test]
-    async fn a_create_sends_no_guests_reminders_conference_or_notes() {
+    async fn a_create_sends_no_reminders_conference_or_notes() {
         let host = TestHost::holding(&[]);
         let draft = NewEventDraft {
             location: "High St".into(),
@@ -18053,7 +18129,6 @@ mod tests {
         assert!(outcome == saved(), "saved");
         let body = script.sent()[0].body.clone().unwrap();
         for never in [
-            "attendees",
             "reminders",
             "conferenceData",
             "extendedProperties",
@@ -18061,10 +18136,240 @@ mod tests {
         ] {
             assert!(body.get(never).is_none(), "{never}");
         }
-        // A rule goes only with a draft that repeats (C11).
+        // A rule goes only with a draft that repeats (C11), guests only with one that has them
+        // (C12d).
         assert!(body.get("recurrence").is_none(), "no rule, no recurrence");
+        assert!(body.get("attendees").is_none(), "no guests, no attendees");
         assert_eq!(body["transparency"], "transparent");
         assert_eq!(body["visibility"], "private");
+    }
+
+    // --- creating an event with guests (C12d) ---
+
+    /// R9: a new event with a guest and nobody's answer is asked about, with only what Google would
+    /// do counted, and nothing is sent or held. A refusal of the calendar comes first (C12 §4.2's
+    /// order): it isn't the question's to say.
+    #[tokio::test]
+    async fn a_create_with_guests_and_no_answer_is_asked_and_sends_nothing() {
+        let host = TestHost::holding(&[]);
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            Vec::new(),
+            dentist_with(&["b@example.org"]),
+            None,
+        )
+        .await;
+        assert!(
+            outcome == WriteOutcome::needs_notify(one_invited()),
+            "asked about one invitation"
+        );
+        assert!(script.sent().is_empty() && held_creates(&host) == 0);
+        let reader = CalendarTarget {
+            facts: CalendarFacts {
+                access_role: Some("reader".into()),
+                ..Default::default()
+            },
+            ..new_target()
+        };
+        let (outcome, _) = create_on(
+            &host,
+            &reader,
+            EditingStatus::On,
+            Vec::new(),
+            dentist_with(&["b@example.org"]),
+            None,
+        )
+        .await;
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::CalendarReadOnly
+                },
+            "the calendar's refusal, not the question"
+        );
+    }
+
+    /// The new event's POST, sending what `query` says (`sendUpdates` and no Meet of Google's own).
+    fn insert_sending(query: &'static str, answer: Scripted) -> Step {
+        Step::new(Method::Insert, "/events", query, answer)
+    }
+
+    const SEND_ALL: &str = "sendUpdates=all conferenceDataVersion=1";
+
+    /// The answer goes to Google as chosen, with the guests as new entries.
+    #[tokio::test]
+    async fn a_create_with_guests_sends_the_answer() {
+        for (notify, sent, query) in [
+            (Notify::All, "all", SEND_ALL),
+            (
+                Notify::None,
+                "none",
+                "sendUpdates=none conferenceDataVersion=1",
+            ),
+        ] {
+            let host = TestHost::holding(&[]);
+            let draft = dentist_with(&["b@example.org"]);
+            let copy = google_copy(&draft, "\"n1\"");
+            let (outcome, script) = create_answered(
+                &host,
+                vec![insert_sending(query, Scripted::Json(copy))],
+                draft,
+                None,
+                &answered(notify, one_invited()),
+                &new_target(),
+                EditingStatus::On,
+            )
+            .await;
+            assert!(outcome == saved(), "created");
+            let posts = inserts(&script);
+            assert_eq!(posts.len(), 1);
+            assert!(posts[0].url.ends_with(&format!(
+                "/events?sendUpdates={sent}&conferenceDataVersion=1"
+            )));
+            let body = posts[0].body.as_ref().unwrap();
+            assert!(
+                body["attendees"] == json!([{ "email": "b@example.org" }]),
+                "the guest, as a new entry"
+            );
+            assert!(new_row(&host).is_some_and(|row| row.attendees.len() == 1));
+        }
+    }
+
+    /// An answer stands only for the numbers the question showed (C12 critiques C1-M5, C2-H3): one
+    /// given for others, or with none, is asked again, and nothing is sent.
+    #[tokio::test]
+    async fn a_create_answered_for_other_numbers_is_asked_again() {
+        let host = TestHost::holding(&[]);
+        let two = GuestNotice {
+            invited: 2,
+            people: 2,
+            emails: 2,
+            ..one_invited()
+        };
+        for answer in [
+            answered(Notify::All, two),
+            GuestAnswer {
+                notify: Some(Notify::None),
+                asked: None,
+            },
+        ] {
+            let (outcome, script) = create_answered(
+                &host,
+                Vec::new(),
+                dentist_with(&["b@example.org"]),
+                None,
+                &answer,
+                &new_target(),
+                EditingStatus::On,
+            )
+            .await;
+            assert!(
+                outcome == WriteOutcome::needs_notify_again(one_invited()),
+                "asked again, with Google's numbers"
+            );
+            assert!(script.sent().is_empty());
+        }
+    }
+
+    /// The calendar's own addresses (its id, and the account it's written through, here a calendar
+    /// shared into another account) and a room are nobody to invite: nothing is asked, and `none` is
+    /// sent whatever was chosen (R7).
+    #[tokio::test]
+    async fn a_create_inviting_only_you_or_a_room_asks_nothing_and_sends_none() {
+        let through_another = CalendarTarget {
+            email: "owner@example.com".into(),
+            ..new_target()
+        };
+        for answer in [GuestAnswer::default(), answered(Notify::All, one_invited())] {
+            let host = TestHost::holding(&[]);
+            let draft = dentist_with(&[
+                "Me@Example.com",
+                "Owner@Example.com",
+                "room1@resource.calendar.google.com",
+            ]);
+            let copy = google_copy(&draft, "\"n1\"");
+            let (outcome, script) = create_answered(
+                &host,
+                vec![insert_step(Scripted::Json(copy))],
+                draft,
+                None,
+                &answer,
+                &through_another,
+                EditingStatus::On,
+            )
+            .await;
+            assert!(outcome == saved(), "created without a question");
+            assert!(inserts(&script)[0]
+                .url
+                .ends_with("/events?sendUpdates=none&conferenceDataVersion=1"));
+        }
+    }
+
+    /// A guest Google would refuse builds nothing to send, in words naming no address.
+    #[tokio::test]
+    async fn a_create_with_a_guest_google_would_refuse_sends_nothing() {
+        let host = TestHost::holding(&[]);
+        let (outcome, script) = create_answered(
+            &host,
+            Vec::new(),
+            dentist_with(&["b@example.org", "B@example.org"]),
+            None,
+            &answered(Notify::All, one_invited()),
+            &new_target(),
+            EditingStatus::On,
+        )
+        .await;
+        assert!(outcome == failed("A guest is listed twice."), "refused");
+        assert!(script.sent().is_empty());
+    }
+
+    /// The held create keeps its answer: a retry sends the one first sent, whatever it's called
+    /// with (C12 §9.3), as it sends the body first sent.
+    #[tokio::test]
+    async fn a_retried_create_sends_its_first_answer() {
+        let host = TestHost::holding(&[]);
+        let draft = dentist_with(&["b@example.org"]);
+        let (outcome, _) = create_answered(
+            &host,
+            vec![
+                insert_sending(SEND_ALL, lost()),
+                new_read(absent()),
+                new_read(absent()),
+                insert_sending(SEND_ALL, lost()),
+                new_read(absent()),
+            ],
+            draft.clone(),
+            None,
+            &answered(Notify::All, one_invited()),
+            &new_target(),
+            EditingStatus::On,
+        )
+        .await;
+        assert!(outcome == ambiguous("ref-1"), "held");
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, script) = create_answered(
+            &host,
+            vec![
+                new_read(absent()),
+                new_read(absent()),
+                insert_sending(SEND_ALL, Scripted::Json(copy)),
+            ],
+            draft,
+            Some("ref-1"),
+            &answered(Notify::None, one_invited()),
+            &new_target(),
+            EditingStatus::On,
+        )
+        .await;
+        assert!(outcome == saved(), "sent again, and landed");
+        let posts = inserts(&script);
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0]
+            .url
+            .ends_with("/events?sendUpdates=all&conferenceDataVersion=1"));
+        assert_eq!(held_creates(&host), 0);
     }
 
     #[tokio::test]
@@ -18366,7 +18671,13 @@ mod tests {
             new_ref: || "ref-2".to_string(),
             ..creator(&script, &host, &target, EditingStatus::On)
         };
-        let outcome = create_event(&ctx, dentist_draft(), Some("ref-1")).await;
+        let outcome = create_event(
+            &ctx,
+            dentist_draft(),
+            Some("ref-1"),
+            &GuestAnswer::default(),
+        )
+        .await;
         script.asked_all();
         assert!(outcome == ambiguous("ref-1"), "the same token");
         assert_eq!(held_creates(&host), 1);

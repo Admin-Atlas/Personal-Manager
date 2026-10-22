@@ -743,9 +743,20 @@ export function createText(
       return held
         ? { tone: "warn", text: `${t}: Google is busy right now. Check again in a moment.` }
         : notMade("Google is busy right now. Try again in a moment.", "warn");
+    // Whether Google sends the invitations (C12d): said only where the question can't be asked
+    // again (a second ask in one save, or an answer after the editor has gone). Nothing was sent.
+    case "needs_choice":
+      if (outcome.guests && !outcome.scope) {
+        return notMade(
+          outcome.again
+            ? "PM's count of who Google would invite differs from the one you answered. Save it again to choose whether Google sends the invitations."
+            : "Choose whether Google sends the invitations, then save it again.",
+          "warn",
+        );
+      }
+      return notMade(outcomeText(outcome).text, "warn");
     // Never a create's answer; said as a change's would be.
     case "no_change":
-    case "needs_choice":
     case "ignored_by_google":
     case "partial_split":
     case "split_removed":
