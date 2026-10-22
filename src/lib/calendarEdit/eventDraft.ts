@@ -20,8 +20,13 @@
 // Guests are fields too (C12): the list, compared by who is on it and who is optional (a reply is
 // never a change), sent as changes to Google's own list, never the list; and the three guest
 // permissions. A rebase merges the guest list rather than taking Google's whole (`rebaseDraft`).
+//
+// So are notifications and colour (C13): the notifications go whole, compared in any order, and a
+// colour is the calendar's or one of Google's eleven. Both are the user's own, so a change to them
+// emails no guest.
 
 import type {
+  ColourChoice,
   EventForEdit,
   EventPatchDraft,
   EventVisibility,
@@ -31,12 +36,14 @@ import type {
   GuestOp,
   GuestState,
   NewEventDraft,
+  RemindersDraft,
   SeriesInfo,
   ShowAs,
   TimeDraft,
 } from "../types";
 import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
 import { addressKey, changeNotice, isEmail } from "./guests";
+import { calendarDefaults, copyReminders, sameReminders } from "./reminders";
 import {
   copyRule,
   followStartDate,
@@ -73,6 +80,10 @@ export interface EditorFields {
   /** Who is on it, the organiser and the user included, in Google's order then the order added. */
   guests: GuestDraft[];
   guest_perms: GuestPerms;
+  /** The calendar's default notifications, or the event's own list (C13). */
+  reminders: RemindersDraft;
+  /** The calendar's colour, or one of Google's eleven (C13). */
+  colour: ColourChoice;
   show_as: ShowAs;
   visibility: EventVisibility;
   /** The organiser's address, on the list or not (Google's copy; none on a new event). Not a field:
@@ -83,7 +94,8 @@ export interface EditorFields {
 export type EditorField = Exclude<keyof EditorFields, "organizer_email">;
 
 /** Every field, in the order the editor shows them: guests after the time, as Google's quick
- *  create has them (INFERRED). */
+ *  create has them (INFERRED); notifications and colour under the location, as Google's event page
+ *  has them (INFERRED). */
 export const EDITOR_FIELDS: readonly EditorField[] = [
   "summary",
   "time",
@@ -91,13 +103,28 @@ export const EDITOR_FIELDS: readonly EditorField[] = [
   "guests",
   "guest_perms",
   "location",
+  "reminders",
+  "colour",
   "description",
   "show_as",
   "visibility",
 ];
 
+/** Fields that are the user's own, so a change to only them emails no guest: busy or free,
+ *  notifications and colour (the backend's `PERSONAL`). */
+const PERSONAL: readonly EditorField[] = ["show_as", "reminders", "colour"];
+
+/** No colour of its own: it shows in its calendar's. */
+const CALENDAR_COLOUR: ColourChoice = { kind: "calendar" };
+
+/** A colour choice sharing nothing with `c`. */
+const copyColour = (c: ColourChoice): ColourChoice =>
+  c.kind === "colour" ? { kind: "colour", id: c.id } : { kind: "calendar" };
+
 /** The editor's starting fields: Google's copy as it is, and how it repeats (`repeatSeed`), which a
- *  one-off has none of. */
+ *  one-off has none of. Its colour is its `colorId`, any Google holds (one PM doesn't know is shown
+ *  as that and sent only if changed); a label's colour isn't PM's to set, so a label leaves the
+ *  colour field as `colorId` has it, read-only (the backend's `LabelReadOnly`). */
 export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): EditorFields {
   return {
     summary: event.summary,
@@ -111,6 +138,8 @@ export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): Edit
       invite_others: event.guests_can_invite_others,
       see_others: event.guests_can_see_other_guests,
     },
+    reminders: copyReminders(event.reminders),
+    colour: event.color_id ? { kind: "colour", id: event.color_id } : { kind: "calendar" },
     show_as: event.show_as,
     visibility: event.visibility,
     organizer_email: event.organizer_email,
@@ -178,6 +207,14 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
       return sameGuests(a.guests, b.guests);
     case "guest_perms":
       return PERMS.every((p) => a.guest_perms[p] === b.guest_perms[p]);
+    // Google may hand the list back in another order than it was sent.
+    case "reminders":
+      return sameReminders(a.reminders, b.reminders);
+    case "colour":
+      return (
+        a.colour.kind === b.colour.kind &&
+        (a.colour.kind !== "colour" || b.colour.kind !== "colour" || a.colour.id === b.colour.id)
+      );
     case "show_as":
     case "visibility":
       return a[field] === b[field];
@@ -262,6 +299,13 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
         }
         break;
       }
+      // The whole list, or the defaults: Google replaces a list it is sent (R1).
+      case "reminders":
+        changes.reminders = copyReminders(draft.reminders);
+        break;
+      case "colour":
+        changes.colour = copyColour(draft.colour);
+        break;
       case "show_as":
         changes.show_as = draft.show_as;
         break;
@@ -274,17 +318,17 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
 }
 
 /** Who saving `draft` over `base` would email, judged as the backend judges it (its
- *  `notify_required`, the same table in both tests): null when nobody. A change to busy or free
- *  alone is the user's own and emails nobody. `omitted`: Google cut the list short, so "at least".
- *  `me`: the account saving, never a guest even where Google's copy doesn't mark it. The backend
- *  has the last word; this only lets the editor ask before a round trip. */
+ *  `notify_required`, the same table in both tests): null when nobody. A change to only busy or
+ *  free, notifications or colour is the user's own and emails nobody. `omitted`: Google cut the list
+ *  short, so "at least". `me`: the account saving, never a guest even where Google's copy doesn't
+ *  mark it. The backend has the last word; this only lets the editor ask before a round trip. */
 export function guestNotice(
   base: EditorFields,
   draft: EditorFields,
   omitted: boolean,
   me: string | null = null,
 ): GuestNotice | null {
-  const shared = changedFields(base, draft).some((f) => f !== "show_as");
+  const shared = changedFields(base, draft).some((f) => !PERSONAL.includes(f));
   return changeNotice(base.guests, draft.guests, shared, omitted, me);
 }
 
@@ -593,6 +637,8 @@ export function rebaseDraft(
     time: { ...newBase.time },
     guests: newBase.guests.map((g) => ({ ...g })),
     guest_perms: { ...newBase.guest_perms },
+    reminders: copyReminders(newBase.reminders),
+    colour: copyColour(newBase.colour),
   };
   const overwritten: EditorField[] = [];
   let lost_guests: string[] = [];
@@ -699,6 +745,8 @@ export const NEW_EVENT_BASE: EditorFields = {
   recurrence: ONCE,
   guests: [],
   guest_perms: { ...GOOGLE_PERMS },
+  reminders: calendarDefaults(),
+  colour: CALENDAR_COLOUR,
   show_as: "busy",
   visibility: "default",
 };
@@ -721,8 +769,8 @@ function firstShown(date: string, time: string, zone: string): string | null {
  *  strictly after `now` (14:10 → 14:30, 14:30 → 15:00, 23:40 → 00:00 the next day), on any other day
  *  09:00, stepping past a time the clocks skip; `lengthMs` long (`endAfterStart`, so a repeated hour
  *  never gives an end before the start). Busy, the calendar's default visibility, not repeating, no
- *  guests and Google's guest permissions. With no zone at all there's no time to show, so it starts
- *  as an all-day event on `day`, free as Google's are. */
+ *  guests, Google's guest permissions, and the calendar's notifications and colour. With no zone at
+ *  all there's no time to show, so it starts as an all-day event on `day`, free as Google's are. */
 export function newEventSeed(
   day: string,
   now: Date,
@@ -736,6 +784,8 @@ export function newEventSeed(
     recurrence: ONCE,
     guests: [],
     guest_perms: { ...GOOGLE_PERMS },
+    reminders: calendarDefaults(),
+    colour: { kind: "calendar" } as const,
     visibility: "default" as const,
   };
   if (zone === null) {
@@ -809,6 +859,26 @@ export function switchNewKind(
   };
 }
 
+/** A draft whose time just switched between timed and all-day (`draft`, with the new time), with
+ *  its notifications fitted to the new kind: a list of its own goes back to the calendar's defaults,
+ *  as Google web does (INFERRED, live probe E9f), since "30 minutes before" means nothing on an
+ *  all-day event, which counts from the midnight before it; `reset` says the editor should say so.
+ *  Back on the kind `base` has, the list `base` has comes back (C13 critique C2-L5): the event never
+ *  changed kind, so a save sends nothing for it. Notifications the user can't change are never
+ *  touched (C1-L14): the save would be refused. */
+export function remindersAfterKindSwitch(
+  base: EditorFields,
+  draft: EditorFields,
+  editable: boolean,
+): { draft: EditorFields; reset: boolean } {
+  if (!editable) return { draft, reset: false };
+  if (draft.time.kind === base.time.kind) {
+    return { draft: { ...draft, reminders: copyReminders(base.reminders) }, reset: false };
+  }
+  if (draft.reminders.use_default) return { draft, reset: false };
+  return { draft: { ...draft, reminders: calendarDefaults() }, reset: true };
+}
+
 /** `next`, a draft whose time just changed from `was`'s, with its rule following the start date
  *  (`followStartDate`): weekly on the old start's weekday becomes weekly on the new one's, and so on
  *  for a rule whose day came from the start. */
@@ -824,7 +894,8 @@ export function followStart(was: EditorFields, next: EditorFields): EditorFields
  *  or null for "Does not repeat"; the backend starts it on the first day the rule makes. Its guests
  *  are who and whether optional, in the order added (never an organiser's or the calendar's own
  *  entry, which only Google writes), and each guest permission goes only where it isn't Google's
- *  own. */
+ *  own. Its notifications are null on the calendar's defaults, and its colour null on the
+ *  calendar's: Google then gives it the calendar's own (INFERRED, E9). */
 export function toNewEvent(draft: EditorFields): NewEventDraft {
   const sent: NewEventDraft = {
     summary: draft.summary,
@@ -838,6 +909,8 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
     guests: draft.guests
       .filter((g) => !g.self && !g.organizer)
       .map((g) => ({ email: g.email, optional: g.optional })),
+    reminders: draft.reminders.use_default ? null : copyReminders(draft.reminders),
+    colour: draft.colour.kind === "calendar" ? null : copyColour(draft.colour),
   };
   const perms = draft.guest_perms;
   if (perms.modify !== GOOGLE_PERMS.modify) sent.guests_can_modify = perms.modify;
@@ -864,6 +937,12 @@ function setField(target: EditorFields, field: EditorField, from: EditorFields) 
       target.recurrence = from.recurrence;
       break;
     // The guest list and its permissions merge (`rebaseGuests`, `rebasePerms`): never set whole.
+    case "reminders":
+      target.reminders = copyReminders(from.reminders);
+      break;
+    case "colour":
+      target.colour = copyColour(from.colour);
+      break;
     case "show_as":
       target.show_as = from.show_as;
       break;

@@ -37,6 +37,13 @@
 // repeating event's: the row only names it, the choices then say what each would do (never "This
 // event" alone), and a rule left as it was never stops a save. Moving the date carries along only a
 // rule picked here, never the repeating event's own, whose move is the choices' question.
+//
+// Notifications and colour (C13) sit under the location, as on Google's event page: the whole list
+// goes when it changed, and a colour is the calendar's or one of Google's eleven. Both are the
+// user's own, so they never ask about emails, and a locked event keeps them. Switching between timed
+// and all-day puts a list of the event's own back to the calendar's defaults, as Google does, and
+// says so; back on the kind Google holds, the event's own list returns. A notification row that
+// can't be committed stops the save, as a date a field couldn't read does.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -74,12 +81,14 @@ import {
   hasBadDate,
   rebaseDraft,
   refusedDateId,
+  remindersAfterKindSwitch,
   repeatSeed,
   seedDraft,
   toChanges,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
+import { kindSwitchText } from "../../../lib/calendarEdit/reminders";
 import {
   ONCE,
   repeatingStartOf,
@@ -97,7 +106,6 @@ import {
   problemText,
   reasonText,
   rebasedText,
-  shownReasons,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
@@ -106,8 +114,10 @@ import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
 import { NotifyPrompt } from "./NotifyPrompt";
+import { ReminderList } from "./ReminderList";
 import {
   NO_ZONE,
   RepeatRow,
@@ -141,6 +151,8 @@ interface Props {
   suggestions: readonly GuestSuggestion[];
   /** A milestone linked to this event, which moves with it. */
   milestone: Milestone | null;
+  /** The colour PM draws a calendar in: the colour list's "Calendar colour". */
+  colorOf: (calendarId: string) => string;
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
    *  passed carries what the editor showed (Google's fresh copy), which the delete compares. */
   onDelete?: (row: CalendarEvent) => void;
@@ -214,6 +226,7 @@ export function EventEditor({
   account,
   suggestions,
   milestone,
+  colorOf,
   onDelete,
   onClose,
 }: Props) {
@@ -273,6 +286,10 @@ export function EventEditor({
     badGuestRef.current = text;
     setBadGuestState(text);
   };
+  // A notification row holding something it can't commit (said under it): no save meanwhile.
+  const badRemindersRef = useRef(false);
+  // The kind switch put the defaults back: said under the list until it next changes.
+  const [remindersNote, setRemindersNote] = useState<string | null>(null);
   // The Custom dialog, while open: no save goes from behind it.
   const customRef = useRef(false);
   const [customOpen, setCustomOpenState] = useState(false);
@@ -359,8 +376,14 @@ export function EventEditor({
   const requestClose = () => {
     if (saving || promptRef.current) return;
     commitFocused();
-    // Text in the guest box that isn't an address never reached the draft: it would be lost too.
-    if (isDirty() || hasBadDate(badDatesRef.current) || badGuestRef.current !== null) {
+    // Text in the guest box that isn't an address, or a notification row that can't be
+    // committed, never reached the draft: it would be lost too.
+    if (
+      isDirty() ||
+      hasBadDate(badDatesRef.current) ||
+      badGuestRef.current !== null ||
+      badRemindersRef.current
+    ) {
       setAskDiscard("close");
     } else onClose();
   };
@@ -466,6 +489,18 @@ export function EventEditor({
     else setDraft(followStart(was, next));
   }
 
+  /** All day ↔ timed, as a time change, with the notifications fitted to the new kind. */
+  function changeKind(zone: string) {
+    const was = draftRef.current;
+    if (!loaded || !was) return;
+    const switched = { ...was, time: switchKind(was.time, loaded.base.time, zone) };
+    const r = remindersAfterKindSwitch(loaded.base, switched, may("reminders"));
+    changeTime(r.draft);
+    setRemindersNote(
+      r.reset ? kindSwitchText(calendar?.name ?? null, switched.time.kind === "all_day") : null,
+    );
+  }
+
   /** Whether a one-off's repeat may be saved: no repeat, or a rule the backend called ready at
    *  exactly the start of `fields` (a date the blur before a save just committed is a new start,
    *  not yet asked about). A repeating event's never stops a save: each choice says what it does. */
@@ -494,11 +529,13 @@ export function EventEditor({
       return;
     }
     // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row; text in
-    // the guest box that isn't an address, under the box and in the problem lines.
+    // the guest box that isn't an address, under the box and in the problem lines; a notification
+    // that can't be committed, under its row.
     if (
       checkDraft(loaded.base, current, loaded.event).problems.length > 0 ||
       !repeatReady(current) ||
-      badGuestRef.current !== null
+      badGuestRef.current !== null ||
+      badRemindersRef.current
     ) {
       setBanner(null);
       refocus(focused);
@@ -764,7 +801,7 @@ export function EventEditor({
   const timeOff = deviceZone === null;
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
   const reasons = [
-    ...(perms ? shownReasons(perms.reasons).map(reasonText) : []),
+    ...(perms?.reasons.map(reasonText) ?? []),
     ...(timeOff && perms?.time ? [NO_ZONE] : []),
   ];
   const heldTimed = loaded?.base.time.kind === "timed" ? loaded.base.time : null;
@@ -872,13 +909,7 @@ export function EventEditor({
               moveStart={moveStart}
               moveEndDate={moveEndDate}
               // A time change like any other: a rule picked here follows the date it lands on.
-              onSwitchKind={() =>
-                zoneFallback &&
-                changeTime({
-                  ...draft,
-                  time: switchKind(draft.time, loaded.base.time, zoneFallback),
-                })
-              }
+              onSwitchKind={() => zoneFallback && changeKind(zoneFallback)}
               canSwitchKind={!!zoneFallback}
               onPickZone={setZonePick}
               repeat={
@@ -961,6 +992,33 @@ export function EventEditor({
               disabled={!may("location")}
               onChange={(location) => setDraft({ ...draft, location })}
             />
+
+            <ReminderList
+              value={draft.reminders}
+              allDay={draft.time.kind === "all_day"}
+              calendar={calendar}
+              disabled={!may("reminders")}
+              unreadable={perms?.reasons.includes("reminders_unreadable")}
+              note={remindersNote}
+              onChange={(reminders) => {
+                setRemindersNote(null);
+                if (draftRef.current) setDraft({ ...draftRef.current, reminders });
+              }}
+              onInvalid={(bad) => {
+                badRemindersRef.current = bad;
+              }}
+            />
+
+            <div className="flex flex-col items-start gap-1">
+              <span className="text-sm text-ink2">Colour</span>
+              <EventColorPicker
+                value={draft.colour}
+                calendarColour={colorOf(row.calendar_id)}
+                labelled={!!loaded.event.label_id}
+                disabled={!may("colour")}
+                onChange={(colour) => draftRef.current && setDraft({ ...draftRef.current, colour })}
+              />
+            </div>
 
             {loaded.event.description_html ? (
               <div className="flex flex-col gap-1">

@@ -219,6 +219,8 @@ describe("the new event's ghost (C10c)", () => {
     recurrence: { kind: "once" },
     guests: [],
     guest_perms: { modify: false, invite_others: true, see_others: true },
+    reminders: { use_default: true, overrides: [] },
+    colour: { kind: "calendar" },
     show_as: "busy",
     visibility: "default",
   };

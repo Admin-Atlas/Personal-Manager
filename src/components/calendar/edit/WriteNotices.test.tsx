@@ -168,6 +168,8 @@ describe("WriteNotices", () => {
             visibility: "default",
             recurrence: null,
             guests: [],
+            reminders: null,
+            colour: null,
           },
         },
       },

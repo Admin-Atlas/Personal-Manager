@@ -34,6 +34,13 @@
 // sits inside this dialog, so Escape closes only it, and no way to save or close goes from behind
 // it. What was sent keeps its answer: Check again sends it again with the draft (the backend sends
 // the answer first sent whatever comes). Quick create has no guest box: More options opens this.
+//
+// Notifications and colour (C13) sit under the location, as when editing: left as the calendar's,
+// nothing is sent for them and Google gives the event the calendar's own. Another calendar keeps a
+// list the user made (the defaults shown are the new calendar's). Switching between timed and
+// all-day puts a list of the event's own back to the defaults, and says so. A notification row that
+// can't be committed stops every way to save, as a date a field couldn't read does. Quick create has
+// neither row, as Google's has none (INFERRED).
 
 import {
   useCallback,
@@ -61,11 +68,13 @@ import {
   halfInstant,
   hasBadDate,
   refusedDateId,
+  remindersAfterKindSwitch,
   switchNewKind,
   toNewEvent,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
+import { kindSwitchText } from "../../../lib/calendarEdit/reminders";
 import {
   ambiguousText,
   CALLOUT_TONE,
@@ -89,8 +98,10 @@ import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
 import { NotifyPrompt } from "./NotifyPrompt";
+import { ReminderList } from "./ReminderList";
 import {
   NO_ZONE_CREATE,
   RepeatRow,
@@ -254,6 +265,10 @@ export function NewEventEditor({
   // Text left in the guest box that isn't an address: no save until it's cleared or fixed.
   const badGuestRef = useRef<string | null>(null);
   const [badGuest, setBadGuestState] = useState<string | null>(null);
+  // A notification row holding something it can't commit (said under it): no save meanwhile.
+  const badRemindersRef = useRef(false);
+  // The kind switch put the defaults back: said under the list until it next changes.
+  const [remindersNote, setRemindersNote] = useState<string | null>(null);
   const saveButton = useRef<HTMLButtonElement>(null);
   const titleBox = useRef<HTMLDivElement>(null);
   // The latest overview and hidden set, for the words an answer gets after the props moved on.
@@ -372,9 +387,15 @@ export function NewEventEditor({
     if (savingRef.current || promptRef.current) return;
     commitFocused();
     // Nothing to discard: what may be in Google stays in hand, as a notice. Text in the guest box
-    // that isn't an address never reached the draft: it would be lost too.
+    // that isn't an address, or a notification row that can't be committed, never reached the
+    // draft: it would be lost too.
     if (heldRef.current) onClose();
-    else if (isDirty() || hasBadDate(badDatesRef.current) || badGuestRef.current !== null) {
+    else if (
+      isDirty() ||
+      hasBadDate(badDatesRef.current) ||
+      badGuestRef.current !== null ||
+      badRemindersRef.current
+    ) {
       setAskDiscard(true);
     } else onClose();
   };
@@ -426,6 +447,16 @@ export function NewEventEditor({
     setDraft(followStart(draftRef.current, next));
   }
 
+  /** All day ↔ timed, as a time change, with the notifications fitted to the new kind. */
+  function changeKind(zone: string) {
+    const was = draftRef.current;
+    const switched = switchNewKind(was, seed, zone, lengthRef.current, showAsTouched.current);
+    const r = remindersAfterKindSwitch(seed, switched, true);
+    changeTime(r.draft);
+    const name = targetById(targets, calendarRef.current)?.calendar.name ?? null;
+    setRemindersNote(r.reset ? kindSwitchText(name, switched.time.kind === "all_day") : null);
+  }
+
   /** Another calendar. While the time is still the seed's, the end follows that account's length
    *  (and back again), as Google's own length would. */
   function pickCalendar(id: string) {
@@ -472,11 +503,13 @@ export function NewEventEditor({
       return;
     }
     // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row too;
-    // text in the guest box that isn't an address, under the box and in the problem lines.
+    // text in the guest box that isn't an address, under the box and in the problem lines; a
+    // notification that can't be committed, under its row.
     if (
       checkDraft(NEW_EVENT_BASE, current).problems.length > 0 ||
       !repeatReady(current) ||
-      badGuestRef.current !== null
+      badGuestRef.current !== null ||
+      badRemindersRef.current
     ) {
       setBanner(null);
       refocus(focused);
@@ -720,12 +753,7 @@ export function NewEventEditor({
             onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
             moveStart={moveStart}
             moveEndDate={moveEndDate}
-            onSwitchKind={() =>
-              deviceZone &&
-              changeTime(
-                switchNewKind(draft, seed, deviceZone, lengthRef.current, showAsTouched.current),
-              )
-            }
+            onSwitchKind={() => deviceZone && changeKind(deviceZone)}
             canSwitchKind={!timeOff}
             onPickZone={setZonePick}
             repeat={
@@ -792,6 +820,33 @@ export function NewEventEditor({
             disabled={locked}
             onChange={(location) => setDraft({ ...draft, location })}
           />
+
+          <ReminderList
+            value={draft.reminders}
+            allDay={draft.time.kind === "all_day"}
+            calendar={target?.calendar ?? null}
+            disabled={locked}
+            note={remindersNote}
+            onChange={(reminders) => {
+              setRemindersNote(null);
+              setDraft({ ...draftRef.current, reminders });
+            }}
+            onInvalid={(bad) => {
+              badRemindersRef.current = bad;
+            }}
+          />
+
+          <div className="flex flex-col items-start gap-1">
+            <span className="text-sm text-ink2">Colour</span>
+            <EventColorPicker
+              value={draft.colour}
+              calendarColour={colorOf(calendarId)}
+              labelled={false}
+              disabled={locked}
+              onChange={(colour) => setDraft({ ...draftRef.current, colour })}
+            />
+          </div>
+
           <TextRow
             label="Description"
             multiline
