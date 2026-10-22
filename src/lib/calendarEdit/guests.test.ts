@@ -333,6 +333,8 @@ const opened: EventForEdit = {
   reminders: { use_default: true, overrides: [] },
   color_id: null,
   label_id: null,
+  reply: null,
+  organizer_self: true,
 };
 const fields = (guests: GuestDraft[]): EditorFields => seedDraft({ ...opened, guests });
 const retitled = (f: EditorFields): EditorFields => ({ ...f, summary: "Retro (moved)" });

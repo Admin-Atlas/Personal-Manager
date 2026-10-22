@@ -19,6 +19,7 @@ import {
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
+import { declinedName, isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { useDepth } from "../../../theme";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
@@ -86,6 +87,7 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                 const clickable = !!onEventClick;
                 const own = eventColour(ev.color_id);
                 const ghost = draftNote(ev);
+                const declined = isDeclined(ev);
                 return (
                   <li
                     key={ev.id}
@@ -100,14 +102,18 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                         : isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                     )}
                     data-draft-event={ghost !== null ? "" : undefined}
-                    // A row's name is its text; the ghost's says first that it's the new event.
+                    // A row's name is its text; the ghost's says first that it's the new event, and
+                    // a declined one's says so last.
                     aria-label={
-                      ghost !== null
-                        ? spokenName(
-                            ghost,
-                            [eventTime(ev), ev.summary, showPower && ev.location]
-                              .filter(Boolean)
-                              .join(", "),
+                      ghost !== null || declined
+                        ? declinedName(
+                            spokenName(
+                              ghost,
+                              [eventTime(ev), ev.summary, showPower && ev.location]
+                                .filter(Boolean)
+                                .join(", "),
+                            ),
+                            declined,
                           )
                         : undefined
                     }
@@ -142,7 +148,13 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                         ellipsis swallowed most real meeting titles, and the title is what the row
                         is for. The time stays a one-line gutter; the location drops below. */}
                     <div className="min-w-0 flex-1">
-                      <span className="break-words font-head text-sm text-ink" style={inkOn(own)}>
+                      <span
+                        className={cn(
+                          "break-words font-head text-sm text-ink",
+                          declined && "line-through",
+                        )}
+                        style={inkOn(own)}
+                      >
                         {ev.summary}
                       </span>
                       {showPower && ev.location && (

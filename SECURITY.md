@@ -20,7 +20,8 @@ event changes you make to Google), a read-only sync of the cloud accounts you co
 Drive, Google Sheets, OneDrive), and encrypted backups to your own cloud. There is no telemetry,
 analytics, or crash reporting. **Calendar editing raises the stakes of a stolen token:** a Google
 account with editing on holds a token that can create, change and delete events on every
-calendar that account can edit, and send invitations in its name. "Turn off editing" in PM stops
+calendar that account can edit, and send invitations, and replies to invitations, in its name.
+"Turn off editing" in PM stops
 PM using it at once but doesn't narrow what Google granted. Disconnecting the account removes
 the grant at Google only when nothing else in PM uses that account; while Google Drive or
 backups still do, the calendar write permission stays granted until you remove PM at

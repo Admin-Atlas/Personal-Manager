@@ -30,6 +30,7 @@ import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../lib/calendarGeom";
 import { readHidden, swipeDays, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
 import { addDays, dayKey, occurrenceKey, startOfDay } from "../lib/calendar-layout";
+import { markDeclined } from "../lib/calendarEdit/rsvp";
 import { sourceColors, useTheme, useUserTime } from "../theme";
 import { formatEventWhen } from "../lib/format";
 import { Card, SegmentedControl } from "./ui";
@@ -176,13 +177,18 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   // Without them a calendar marked quiet stayed out of the list but kept showing here — against the
   // documented promise that quiet excludes a calendar from focus upcoming — and a calendar hidden on
   // the Calendar tab reappeared in Focus.
+  //
+  // A declined event is struck through as on the Calendar tab: when every copy the filter keeps
+  // that has the user's own guest entry says they declined (`markDeclined`, #884 C14b).
   const gridEvents = useMemo(() => {
     const quiet = new Set(calendars.filter((c) => c.quiet).map((c) => c.id));
     const hiddenIds = readHidden();
     const seen = new Set<string>();
     const out: CalendarEvent[] = [];
+    const copies: CalendarEvent[] = [];
     for (const e of allEvents) {
       if (quiet.has(e.calendar_id) || hiddenIds.has(e.calendar_id)) continue;
+      copies.push(e);
       const key = occurrenceKey(e);
       if (key !== null) {
         if (seen.has(key)) continue;
@@ -190,7 +196,8 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
       }
       out.push(e);
     }
-    return out;
+    const address = new Map(calendars.map((c) => [c.id, c.remote_id]));
+    return markDeclined(out, copies, (id) => address.get(id) ?? null);
   }, [allEvents, calendars]);
 
   const colorOf = useMemo(() => {
@@ -376,8 +383,12 @@ function AgendaList({
             </span>
             <span className="min-w-0 flex-1">
               {/* `break-words` so a single unbroken token (a long URL-ish title) still folds rather
-                  than forcing the card to scroll sideways. */}
-              <span className="break-words text-ink2">{e.summary}</span>
+                  than forcing the card to scroll sideways. Struck through when the user declined
+                  it, as Google draws it (the agenda says so: its rows carry no guest list). */}
+              <span className={`break-words text-ink2${e.declined ? " line-through" : ""}`}>
+                {e.summary}
+              </span>
+              {e.declined && <span className="sr-only">, declined</span>}
               {e.location && (
                 <span className="ml-2 break-words text-xs text-ink4">{e.location}</span>
               )}

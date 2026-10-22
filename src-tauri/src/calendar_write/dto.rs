@@ -304,6 +304,57 @@ pub enum SeriesScope {
     All,
 }
 
+/// A reply to an invitation, in the reply control's words. Google's are `accepted`, `declined`,
+/// `tentative`; "no reply yet" (`needsAction`) is never sent: Google web has no way back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rsvp {
+    Yes,
+    No,
+    Maybe,
+}
+
+impl Rsvp {
+    /// Google's word for it.
+    pub fn as_google(self) -> &'static str {
+        match self {
+            Rsvp::Yes => "accepted",
+            Rsvp::No => "declined",
+            Rsvp::Maybe => "tentative",
+        }
+    }
+}
+
+/// Which occurrences of a repeating event a reply is for. There is no "this and following": a guest
+/// can't split someone else's repeating event (plan CUT), so it can't even be named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RsvpScope {
+    This,
+    All,
+}
+
+/// The user's own reply on the copy the editor opened (the guest-list entry Google marks `self`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplyForEdit {
+    /// As Google says it: accepted | declined | tentative | needsAction.
+    pub response: Option<String>,
+    /// Their note, "" for none. Everyone invited can see it.
+    pub note: String,
+}
+
+/// What the calendar view may offer on one row, from the mirror's copy, assuming editing is on for
+/// its account (the view merges each account's real status from the overview).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ListRights {
+    /// Why nothing in the editor may change, or `None` when something can.
+    pub edit_block: Option<ReadOnlyReason>,
+    /// Delete: the gate's own answer, so the list never offers one the send would refuse.
+    pub can_delete: bool,
+    /// Yes, No or Maybe.
+    pub can_respond: bool,
+}
+
 /// Why PM won't change an event, or one part of it. Each has a reason line in the editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -316,8 +367,15 @@ pub enum ReadOnlyReason {
     CalendarReadOnly,
     /// You can edit this shared calendar's events except private ones, and this one is private.
     PrivateEvent,
-    /// Someone else organises it: an invitation.
+    /// Someone else organises it and hasn't let guests change it: its shared fields stay theirs
+    /// (C14).
     NotOrganizer,
+    /// The calendar this copy is on has no entry on the event's guest list, so it has no reply to
+    /// send (C14).
+    NotInvited,
+    /// The guest list of someone else's event stays the organiser's, even where they let guests
+    /// change the rest (C14).
+    OrganizerOnlyGuests,
     /// A one-off in PM that has since become a repeating event in Google: open one of its occurrences.
     BecameRepeating,
     /// A birthday, a Gmail event, focus time, out of office or a working location.
@@ -340,6 +398,9 @@ pub enum ReadOnlyReason {
 pub struct FieldPermissions {
     pub summary: bool,
     pub time: bool,
+    /// How it repeats: closed with the time (Google locks the rule with the start), and on every
+    /// event someone else organises, whatever they let guests change (C14 critiques C1-H2, C2-H2).
+    pub repeat: bool,
     pub location: bool,
     pub description: bool,
     pub show_as: bool,
@@ -350,6 +411,9 @@ pub struct FieldPermissions {
     pub reminders: bool,
     pub colour: bool,
     pub delete: bool,
+    /// The user may reply (Yes, No, Maybe). Not part of [`Self::any`]: a reply isn't one of the
+    /// editor's fields (C14).
+    pub respond: bool,
     /// Every reason something is read-only, most important first. Empty when everything may change.
     pub reasons: Vec<ReadOnlyReason>,
 }
@@ -363,10 +427,11 @@ impl FieldPermissions {
         }
     }
 
-    /// Whether anything at all may change.
+    /// Whether anything in the editor may change. A reply alone isn't (C14).
     pub fn any(&self) -> bool {
         self.summary
             || self.time
+            || self.repeat
             || self.location
             || self.description
             || self.show_as
@@ -384,8 +449,10 @@ impl FieldPermissions {
 pub enum WriteOutcome {
     Saved {
         warnings: Vec<WriteWarning>,
-        /// Occurrences changed on their own that PM couldn't cancel (`YYYY-MM-DD`, in the series'
-        /// zone): they may still show. Empty, and left out, for every other save.
+        /// Occurrences changed on their own that the write didn't reach (`YYYY-MM-DD`, in the
+        /// series' zone): ones PM couldn't cancel, which may still show (`LeftOnOldSeries`), or, for
+        /// a reply to every occurrence, ones answered on their own that kept their answer
+        /// (`KeptOwnReply`, C14). Empty, and left out, for every other save.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         left_behind: Vec<String>,
         /// A "this and following" change that landed, with milestones linked to the earlier part
@@ -559,6 +626,9 @@ pub enum WriteWarning {
     /// beside a new title, say): what Google holds is in the mirror, and the words say to look (C13
     /// review round 1). Never "nothing changed", and never a plain "Saved".
     PartlyApplied,
+    /// A reply to every occurrence landed, and these occurrences, answered on their own before,
+    /// kept their own answer: `Saved.left_behind` says which (C14 critiques C1-M3, C2-H1).
+    KeptOwnReply,
 }
 
 /// What moving milestones to the new part of a "this and following" change needs (C9b-2). Dates
@@ -636,6 +706,11 @@ pub struct EventForEdit {
     /// sets the colour Google draws (C13).
     pub color_id: Option<String>,
     pub label_id: Option<String>,
+    /// The user's own reply, from the entry Google marks as the calendar this copy is on; `None`
+    /// without one (C14).
+    pub reply: Option<ReplyForEdit>,
+    /// Google's `organizer.self`: the calendar this copy is on organises the event.
+    pub organizer_self: bool,
 }
 
 /// What opening the editor came to.
@@ -825,6 +900,16 @@ mod tests {
                 ReadOnlyReason::RemindersUnreadable,
                 r#"{"outcome":"read_only","reason":"reminders_unreadable"}"#,
             ),
+            // C14: a copy whose calendar isn't on the guest list has no reply to send.
+            (
+                ReadOnlyReason::NotInvited,
+                r#"{"outcome":"read_only","reason":"not_invited"}"#,
+            ),
+            // C14c: the guest list of someone else's event stays the organiser's.
+            (
+                ReadOnlyReason::OrganizerOnlyGuests,
+                r#"{"outcome":"read_only","reason":"organizer_only_guests"}"#,
+            ),
         ] {
             assert_eq!(
                 serde_json::to_string(&WriteOutcome::ReadOnly { reason }).unwrap(),
@@ -853,6 +938,16 @@ mod tests {
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["left_on_old_series"],"left_behind":["2026-11-02"]}"#
+        );
+        // C14: a reply to every occurrence that some occurrences answered on their own kept.
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: vec![WriteWarning::KeptOwnReply],
+                left_behind: vec!["2026-11-02".into()],
+                milestone_moves: None,
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":["kept_own_reply"],"left_behind":["2026-11-02"]}"#
         );
         for (outcome, json) in [
             (
@@ -1321,9 +1416,91 @@ mod tests {
                 colour: true,
                 ..Default::default()
             },
+            // How it repeats, alone (C14 critique C1-H2: its own right now, not the time's).
+            FieldPermissions {
+                repeat: true,
+                ..Default::default()
+            },
         ] {
             assert!(one.any());
         }
+        // A reply alone is no field of the editor's (C14): the list carries it apart.
+        let reply = FieldPermissions {
+            respond: true,
+            ..Default::default()
+        };
+        assert!(!reply.any());
+        assert!(!FieldPermissions::none(ReadOnlyReason::NotOrganizer).respond);
+    }
+
+    /// C14c: the editor's Repeat row reads its own right by this name (`canEdit`'s `repeat`); under
+    /// any other the row would stay off on every event.
+    #[test]
+    fn the_repeat_right_goes_to_the_editor_by_its_name() {
+        let open = FieldPermissions {
+            repeat: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&open).unwrap();
+        assert_eq!(json["repeat"], serde_json::json!(true));
+        assert_eq!(json["time"], serde_json::json!(false));
+    }
+
+    /// C14: the reply control's three words, and its two scopes; "no reply yet", Google's own words
+    /// and "this and following" are refused at the boundary, never guessed.
+    #[test]
+    fn a_reply_reads_as_the_control_sends_it() {
+        for (json, reply, google) in [
+            (r#""yes""#, Rsvp::Yes, "accepted"),
+            (r#""no""#, Rsvp::No, "declined"),
+            (r#""maybe""#, Rsvp::Maybe, "tentative"),
+        ] {
+            assert_eq!(serde_json::from_str::<Rsvp>(json).unwrap(), reply);
+            assert_eq!(reply.as_google(), google);
+        }
+        for refused in [r#""needs_action""#, r#""accepted""#, r#""Yes""#] {
+            assert!(serde_json::from_str::<Rsvp>(refused).is_err(), "{refused}");
+        }
+        assert_eq!(
+            serde_json::from_str::<RsvpScope>(r#""this""#).unwrap(),
+            RsvpScope::This
+        );
+        assert_eq!(
+            serde_json::from_str::<RsvpScope>(r#""all""#).unwrap(),
+            RsvpScope::All
+        );
+        assert!(serde_json::from_str::<RsvpScope>(r#""following""#).is_err());
+    }
+
+    /// The list's rights sit flat beside the row's own fields, as the calendar view reads them.
+    #[test]
+    fn list_rights_serialise_flat() {
+        assert_eq!(
+            serde_json::to_string(&ListRights {
+                edit_block: None,
+                can_delete: true,
+                can_respond: false,
+            })
+            .unwrap(),
+            r#"{"edit_block":null,"can_delete":true,"can_respond":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ListRights {
+                edit_block: Some(ReadOnlyReason::NotOrganizer),
+                can_delete: false,
+                can_respond: true,
+            })
+            .unwrap(),
+            r#"{"edit_block":"not_organizer","can_delete":false,"can_respond":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplyForEdit {
+                response: Some("needsAction".into()),
+                note: String::new(),
+            })
+            .unwrap(),
+            r#"{"response":"needsAction","note":""}"#
+        );
     }
 
     /// C13: notifications and a colour as the editor will send them; left out, each is untouched,

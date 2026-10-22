@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.157.0-alpha",
+    date: "2026-10-22",
+    highlights: [
+      "Reply to invitations right from PM. Click an event you're invited to and choose Yes, No or Maybe under “Going?”; on a repeating event, pick this occurrence or all of them. Google tells the organiser, just as when you reply in Google Calendar. If you're on the guest list from more than one of your calendars, each gets its own “Going?”, named by its calendar. Replying needs editing turned on for that account in Settings → Connectors.",
+      "Events you've declined are now struck through, as in Google Calendar, on the Calendar tab and in Focus.",
+      "On events someone else organises, Edit now lets you add a note to your reply, and change your own notifications, colour and Busy or Free without emailing anyone. If the organiser lets guests change the event, you can change its details too, and PM asks whether Google should email the guests. How it repeats and who's invited always stay the organiser's, and the line under the event says what's yours to change.",
+      "If you close an event before your reply has gone through, PM tells you how it went in a notice.",
+    ],
+  },
+  {
     version: "3.156.0-alpha",
     date: "2026-10-22",
     highlights: [

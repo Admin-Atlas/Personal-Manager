@@ -10,6 +10,7 @@
 
 import { cn } from "../../ui";
 import { DRAFT_EVENT_CLASS, PAST_EVENT_CLASS, spokenName } from "../../../lib/calendar-layout";
+import { declinedName } from "../../../lib/calendarEdit/rsvp";
 import { eventFill, eventHover, inkOn, type EventColour } from "../../../theme/eventPalette";
 
 interface Props {
@@ -26,6 +27,8 @@ interface Props {
   /** The new event being made (its ghost): the words its name starts with, saying so (`draftNote`).
    *  Drawn dashed, never greyed as past. Null for any other event. */
   ghost?: string | null;
+  /** The user declined it: its title is struck through and its name says so, as Google draws it. */
+  declined?: boolean;
   /** When set, the chip is interactive — click / Enter / Space opens the event's detail popup,
    *  anchored at the chip's on-screen rect. */
   onClick?: (anchor: DOMRect) => void;
@@ -39,6 +42,7 @@ export function EventChip({
   showTime,
   isPast,
   ghost = null,
+  declined = false,
   onClick,
 }: Props) {
   return (
@@ -54,7 +58,10 @@ export function EventChip({
         borderLeftColor: color,
       }}
       title={summary}
-      aria-label={spokenName(ghost, [timeLabel, summary].filter(Boolean).join(", "))}
+      aria-label={declinedName(
+        spokenName(ghost, [timeLabel, summary].filter(Boolean).join(", ")),
+        declined,
+      )}
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
       onClick={onClick ? (e) => onClick(e.currentTarget.getBoundingClientRect()) : undefined}
@@ -75,7 +82,10 @@ export function EventChip({
           {timeLabel}
         </span>
       )}
-      <span className="truncate font-head text-ink" style={inkOn(own)}>
+      <span
+        className={cn("truncate font-head text-ink", declined && "line-through")}
+        style={inkOn(own)}
+      >
         {summary}
       </span>
     </div>

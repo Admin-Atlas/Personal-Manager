@@ -7,7 +7,7 @@
 // never greyed as past, named as the new event, and marked so a click on it isn't a click outside
 // quick create; a synced row beside it is drawn and named as ever.
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 import { DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
@@ -91,5 +91,18 @@ describe("AgendaView", () => {
         name: `New event, PM may already have made it: ${clock(9)}, Dentist`,
       }),
     ).toBeTruthy();
+  });
+
+  // #884 C14b: an event the user declined (the calendar marks it, `markDeclined`) is struck
+  // through, as Google draws it, and its name says so; any other is drawn as ever.
+  it("strikes through an event the user declined, and says so", () => {
+    agenda([
+      { ...ev({ id: "d", summary: "Review" }), declined: true } as CalendarEvent,
+      ev({ id: "p", summary: "Plain", start: "2026-10-12T11:00:00" }),
+    ]);
+    const row = screen.getByRole("button", { name: `${clock(9)}, Review, declined` });
+    expect(within(row).getByText("Review").className).toContain("line-through");
+    const plain = screen.getByRole("button", { name: new RegExp(`^${clock(11)}\\s*Plain$`) });
+    expect(within(plain).getByText("Plain").className).not.toContain("line-through");
   });
 });

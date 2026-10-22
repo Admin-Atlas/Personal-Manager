@@ -19,6 +19,8 @@ import type {
   MilestoneMoves,
   NewEventDraft,
   Notify,
+  Rsvp,
+  RsvpScope,
   SeriesChoices,
   SplitAction,
   WriteOutcome,
@@ -45,6 +47,15 @@ const updateCalendarEvent =
     ) => Promise<WriteOutcome>
   >();
 const seriesChoices = vi.fn<(request: ChoiceRequest) => Promise<SeriesChoices>>();
+const respondToCalendarEvent =
+  vi.fn<
+    (
+      eventId: string,
+      response: Rsvp,
+      comment: string | null,
+      scope: RsvpScope | null,
+    ) => Promise<WriteOutcome>
+  >();
 const settleSeriesSplit = vi.fn<(token: string, action: SplitAction) => Promise<WriteOutcome>>();
 const createCalendarEvent =
   vi.fn<
@@ -81,6 +92,9 @@ vi.mock("../../../lib/ipc", () => ({
     ...told: Told
   ) => updateCalendarEvent(session, draft, scope, choice, ...told),
   seriesChoices: (request: ChoiceRequest) => seriesChoices(request),
+  // Every argument passes through, as given.
+  respondToCalendarEvent: (...a: [string, Rsvp, string | null, RsvpScope | null]) =>
+    respondToCalendarEvent(...a),
   settleSeriesSplit: (token: string, action: SplitAction) => settleSeriesSplit(token, action),
   onCalendarDeleteSettled: (h: (s: DeleteSettled) => void) => {
     settledHandler = h;
@@ -1287,6 +1301,48 @@ const ONE_INVITED: GuestNotice = {
   emails: 1,
   complete: true,
 };
+
+describe("replying to an invitation (C14)", () => {
+  it("sends the reply with its note and scope as given, and hands back the outcome unchanged", async () => {
+    const outcome: WriteOutcome = {
+      outcome: "saved",
+      warnings: ["kept_own_reply"],
+      left_behind: ["2026-10-19"],
+    };
+    respondToCalendarEvent.mockResolvedValue(outcome);
+    const { hook } = await load();
+    const got = await hook.result.current.respond(event.id, "maybe", "late", "all");
+    expect(respondToCalendarEvent).toHaveBeenCalledTimes(1);
+    expect(respondToCalendarEvent).toHaveBeenCalledWith(event.id, "maybe", "late", "all");
+    expect(got).toBe(outcome);
+    // Left out, the note and scope go as null: keep Google's note, and no scope chosen.
+    await hook.result.current.respond(event.id, "no");
+    expect(respondToCalendarEvent).toHaveBeenLastCalledWith(event.id, "no", null, null);
+    // A reply asks nothing first and holds nothing: no notice, no row hidden.
+    expect(hook.result.current.notices).toEqual([]);
+    expect(hook.result.current.hiddenIds.size).toBe(0);
+  });
+
+  // C14 critique C2-M1 (C14b): the reply control hands its answer here when it has gone, or when
+  // the answer isn't a success; a success goes by itself, anything else stays until dismissed.
+  it("says what a reply came to as a notice naming the event", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteReply("Dentist", { outcome: "busy" }, "no", null));
+    act(() =>
+      mod.noteReply("Gym", { outcome: "saved", warnings: [], left_behind: [] }, "yes", "all"),
+    );
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "warn",
+        text: "Your reply to “Dentist”: Google is busy right now. Reply again in a moment.",
+      },
+      { id: 2, tone: "ok", text: "You replied Yes to all events of “Gym”." },
+    ]);
+    await act(async () => vi.advanceTimersByTime(5000));
+    expect(hook.result.current.notices.map((n) => n.id)).toEqual([1]);
+  });
+});
 
 describe("creating an event", () => {
   // C12d: and the Send or Don't send for its guests, with the numbers it was given for; none

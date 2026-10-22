@@ -25,6 +25,7 @@ import type {
   WriteOutcome,
 } from "../../lib/types";
 import { dayKey, startOfDay } from "../../lib/calendar-layout";
+import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
 
 const ipc = vi.hoisted(() => ({
   calendarOverview: vi.fn(),
@@ -45,6 +46,8 @@ const ipc = vi.hoisted(() => ({
   seriesChoices: vi.fn(),
   settleSeriesSplit: vi.fn(),
   updateCalendarEvent: vi.fn(),
+  respondToCalendarEvent: vi.fn(),
+  getSeriesSummary: vi.fn(),
   eventFlags: vi.fn(),
   openUrl: vi.fn(),
   recurrencePresets: vi.fn(),
@@ -150,6 +153,10 @@ const row = (over: Partial<CalendarEvent>): CalendarEvent => ({
   all_day: false,
   html_link: null,
   uid: "u1",
+  // What the list says PM may offer on it (C14): yours, so Edit and Delete, and nobody invited.
+  edit_block: null,
+  can_delete: true,
+  can_respond: false,
   ...over,
 });
 const standup = row({});
@@ -436,6 +443,8 @@ describe("CalendarView: guests", () => {
       reminders: { use_default: true, overrides: [] },
       color_id: null,
       label_id: null,
+      reply: null,
+      organizer_self: true,
     };
     const load: EditLoad = {
       outcome: "ready",
@@ -444,6 +453,7 @@ describe("CalendarView: guests", () => {
       permissions: {
         summary: true,
         time: true,
+        repeat: true,
         location: true,
         description: true,
         show_as: true,
@@ -452,6 +462,7 @@ describe("CalendarView: guests", () => {
         reminders: true,
         colour: true,
         delete: true,
+        respond: false,
         reasons: [],
       },
       seen: null,
@@ -468,6 +479,16 @@ describe("CalendarView: guests", () => {
     );
     expect(option.textContent).toContain("Ann");
     expect(option.textContent).toContain("ann@x.org");
+  });
+
+  // The list decides Delete, as the backend's gate does (C14): a row it marks undeletable (a locked
+  // copy, an invitation) offers Edit and no Delete, whatever the webview could guess from the row.
+  it("offers Delete only where the list says it can be deleted", async () => {
+    rows = [row({ can_delete: false })];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: /Standup/ }));
+    expect(await screen.findByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
   it("reopens a delete the backend asks about guests with its numbers and the sending account", async () => {
@@ -512,5 +533,299 @@ describe("CalendarView: guests", () => {
       "all",
       told,
     );
+  });
+});
+
+// Replying to invitations (#884, C14b): "Going?" in the popover from each copy the user can reply
+// from (with both accounts shown, the dedup keeps the organiser's copy, and the invitation's copy
+// would otherwise have no surface); the line under someone else's event; the popover reading its
+// row afresh; a declined event struck through only when every copy with the user's entry says so;
+// and a reply's answer said as a notice once the popover has closed (C14 critique C2-M1).
+describe("CalendarView: invitations", () => {
+  const own = (email: string, response: string, organizer = false) => ({
+    name: null,
+    email,
+    response,
+    optional: false,
+    organizer,
+    self: true,
+  });
+  /** Bobby's copy of someone else's invitation, on his main calendar: editable for his own
+   *  settings since C14c, never deleted. */
+  const invite = (response = "needsAction") =>
+    row({
+      id: "i1",
+      edit_block: null,
+      can_delete: false,
+      can_respond: true,
+      organizer_self: false,
+      attendees: [own("me@x.com", response)],
+    });
+  /** The organiser's copy of the same occurrence, on another calendar he can see. */
+  const organiser = (response = "accepted") =>
+    row({
+      id: "o1",
+      calendar_id: WORK_CAL,
+      can_respond: true,
+      organizer_self: true,
+      attendees: [own("work", response, true)],
+    });
+  const chip = () => screen.getByRole("button", { name: /Standup/ });
+
+  it("offers Going? from every copy of the occurrence, the one shown first, each named", async () => {
+    rows = [invite(), organiser()];
+    ipc.respondToCalendarEvent.mockResolvedValue(saved);
+    await mount();
+    fireEvent.click(chip());
+    // The organiser's copy is the one shown (it can be deleted); the invitation's is offered too.
+    const groups = screen.getAllByRole("group", { name: /^Going\?/ });
+    expect(groups).toHaveLength(2);
+    expect(groups[0]).toBe(screen.getByRole("group", { name: "Going? Replying for Work." }));
+    const personal = screen.getByRole("group", { name: "Going? Replying for Personal." });
+    expect(groups[1]).toBe(personal);
+    await act(async () => fireEvent.click(within(personal).getByRole("button", { name: "No" })));
+    expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "no", null, null);
+  });
+
+  it("says under an invitation what the user may still do, and how with editing off", async () => {
+    rows = [invite()];
+    await mount();
+    fireEvent.click(chip());
+    expect(
+      screen.getByText(
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your reply, notifications, colour and busy or free are yours to change.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Going?" })).toBeTruthy();
+    // C14c: Edit, for the user's own settings, and never Delete.
+    expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    cleanup();
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    await mount();
+    fireEvent.click(chip());
+    expect(
+      screen.getByText(
+        "Someone else organises this event. Turn on editing for this account to reply and change your own settings from PM.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("group", { name: /^Going\?/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  // C14c: where the organiser lets guests change it, the line is Google's warning; with no entry of
+  // the user's own, it never offers the reply.
+  it("says Google's warning where guests may change it, and never a reply it can't send", async () => {
+    rows = [row({ ...invite(), guests_can_modify: true })];
+    await mount();
+    fireEvent.click(chip());
+    expect(screen.getByText(A11_NOTE)).toBeTruthy();
+    cleanup();
+    rows = [row({ ...invite(), can_respond: false, attendees: [] })];
+    await mount();
+    fireEvent.click(chip());
+    expect(
+      screen.getByText(
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your notifications, colour and busy or free are yours to change.",
+      ),
+    ).toBeTruthy();
+  });
+
+  // C14 §9.5: an invitation can be changed now (its own settings), so "can be changed" no longer
+  // means "yours": the organiser's copy is kept, even one that can't be deleted (locked), over an
+  // editable invitation listed first.
+  it("keeps the organiser's copy over an editable invitation of the same occurrence", async () => {
+    rows = [invite(), row({ ...organiser(), locked: true, can_delete: false })];
+    await mount();
+    fireEvent.click(chip());
+    const groups = screen.getAllByRole("group", { name: /^Going\?/ });
+    expect(groups[0]).toBe(screen.getByRole("group", { name: "Going? Replying for Work." }));
+    expect(
+      screen.getByText("Google has locked this event's title, time, place and description."),
+    ).toBeTruthy();
+    // An invitation still wins over a copy that can't be changed at all.
+    cleanup();
+    rows = [row({ ...organiser(), edit_block: "calendar_read_only", can_delete: false }), invite()];
+    await mount();
+    fireEvent.click(chip());
+    expect(screen.getAllByRole("group", { name: /^Going\?/ })[0]).toBe(
+      screen.getByRole("group", { name: "Going? Replying for Personal." }),
+    );
+    // Two invitations' copies rank the same: the first listed is kept.
+    for (const [first, name] of [
+      [PERSONAL, "Personal"],
+      [WORK_CAL, "Work"],
+    ] as const) {
+      cleanup();
+      const other = first === PERSONAL ? WORK_CAL : PERSONAL;
+      rows = [
+        row({ ...invite(), id: "i1", calendar_id: first }),
+        row({ ...invite(), id: "i2", calendar_id: other }),
+      ];
+      await mount();
+      fireEvent.click(chip());
+      expect(screen.getAllByRole("group", { name: /^Going\?/ })[0]).toBe(
+        screen.getByRole("group", { name: `Going? Replying for ${name}.` }),
+      );
+    }
+  });
+
+  it("after a reply lands, the popover shows it, and the event is struck through", async () => {
+    rows = [invite()];
+    ipc.respondToCalendarEvent.mockResolvedValue(saved);
+    await mount();
+    fireEvent.click(chip());
+    const dialog = screen.getByRole("dialog", { name: "Standup" });
+    expect(dialog.textContent).toContain("no reply");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "No" })));
+    // The backend landed Google's copy and says so; the list is read again.
+    rows = [invite("declined")];
+    await act(async () => writeLanded());
+    expect(screen.getByRole("dialog", { name: "Standup" }).textContent).toContain("declined");
+    expect(screen.getByRole("button", { name: "No" }).getAttribute("aria-pressed")).toBe("true");
+    const struck = screen.getByRole("button", { name: /Standup, declined$/ });
+    expect(within(struck).getByText("Standup").className).toContain("line-through");
+  });
+
+  // C14 critiques C1-M4, C2-H3: the kept copy may be the organiser's, which the reply doesn't
+  // change; Google draws each calendar's copy apart.
+  it("strikes a merged event through only when every copy with the user's entry declined", async () => {
+    rows = [invite("declined"), organiser("accepted")];
+    await mount();
+    expect(chip().getAttribute("aria-label") ?? "").not.toMatch(/declined/);
+    expect(within(chip()).getByText("Standup").className).not.toContain("line-through");
+    cleanup();
+    rows = [invite("declined"), organiser("declined")];
+    await mount();
+    expect(screen.getByRole("button", { name: /Standup, declined$/ })).toBeTruthy();
+    // Hiding the organiser's calendar leaves the invitation's copy to say it, and the only one to
+    // reply from (on the main calendar, so unnamed).
+    cleanup();
+    env.hidden = new Set([WORK_CAL]);
+    rows = [invite("declined"), organiser("accepted")];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: /Standup, declined$/ }));
+    expect(screen.getAllByRole("group", { name: /^Going\?/ })).toEqual([
+      screen.getByRole("group", { name: "Going?" }),
+    ]);
+  });
+
+  // Two entries marked as the calendar (an alias): its own address is the user's, as the backend
+  // reads it, for the strike-through and for the reply shown.
+  it("reads the calendar's own entry when an alias is marked too", async () => {
+    rows = [
+      row({
+        ...invite(),
+        attendees: [own("Me+pm@x.com", "declined"), own("ME@x.com", "accepted")],
+      }),
+    ];
+    await mount();
+    expect(chip().getAttribute("aria-label") ?? "").not.toMatch(/declined/);
+    fireEvent.click(chip());
+    expect(screen.getByRole("button", { name: "Yes" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("asks which occurrences first on a repeating invitation", async () => {
+    rows = [row({ ...invite(), series_id: "s1", recurring: true })];
+    ipc.respondToCalendarEvent.mockResolvedValue(saved);
+    // The popover asks how it repeats; PM can't say here.
+    ipc.getSeriesSummary.mockResolvedValue(null);
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    expect(screen.getByRole("group", { name: "Reply Yes to which occurrences?" })).toBeTruthy();
+    expect(ipc.respondToCalendarEvent).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "All events" })));
+    expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "yes", null, "all");
+  });
+
+  // PR B review round 1: the occurrence clicked kept its own No when Yes went to all events, and
+  // its row lands still declined: "Going?" says No, as the guest list and the struck-through chip do.
+  it("an occurrence that kept its own answer for all events keeps it in the popover", async () => {
+    const declined = () => row({ ...invite("declined"), series_id: "s1", recurring: true });
+    rows = [declined()];
+    ipc.respondToCalendarEvent.mockResolvedValue({
+      outcome: "saved",
+      warnings: ["kept_own_reply"],
+      left_behind: [today],
+    });
+    ipc.getSeriesSummary.mockResolvedValue(null);
+    await mount();
+    fireEvent.click(chip());
+    const going = () =>
+      ["Yes", "No", "Maybe"].filter(
+        (name) => screen.getByRole("button", { name }).getAttribute("aria-pressed") === "true",
+      );
+    expect(going()).toEqual(["No"]);
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "All events" })));
+    expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "yes", null, "all");
+    expect(going()).toEqual(["No"]);
+    rows = [declined()];
+    await act(async () => writeLanded());
+    expect(screen.getByRole("dialog", { name: "Standup" }).textContent).toContain("declined");
+    expect(going()).toEqual(["No"]);
+  });
+
+  // PR B review round 2: an all-events reply PM couldn't read back yet may not have reached the
+  // occurrence clicked (answered No on its own): "Going?" keeps No, as the guest list and the
+  // struck-through chip do, through the next refresh that finds Google kept it.
+  it("an all-events reply not read back yet keeps the occurrence's own answer in the popover", async () => {
+    const declined = () => row({ ...invite("declined"), series_id: "s1", recurring: true });
+    rows = [declined()];
+    let synced: () => void = () => {};
+    ipc.onCalendarSynced.mockImplementation((cb: () => void) => {
+      synced = cb;
+      return Promise.resolve(() => {});
+    });
+    ipc.respondToCalendarEvent.mockResolvedValue({
+      outcome: "saved",
+      warnings: ["mirror_refresh_pending"],
+      left_behind: [],
+    });
+    ipc.getSeriesSummary.mockResolvedValue(null);
+    await mount();
+    fireEvent.click(chip());
+    const going = () =>
+      ["Yes", "No", "Maybe"].filter(
+        (name) => screen.getByRole("button", { name }).getAttribute("aria-pressed") === "true",
+      );
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "All events" })));
+    expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "yes", null, "all");
+    expect(going()).toEqual(["No"]);
+    rows = [declined()];
+    await act(async () => synced());
+    expect(screen.getByRole("dialog", { name: "Standup" }).textContent).toContain("declined");
+    expect(going()).toEqual(["No"]);
+  });
+
+  // C14 critiques C1-L7, C2-L7: the Terminal look's agenda (also its Day and Week) and month table.
+  it("the Terminal look strikes it through too, and says so", async () => {
+    env.system = "terminal";
+    rows = [invite("declined")];
+    await mount();
+    const line = screen.getByRole("button", { name: /Standup, declined/ });
+    expect(within(line).getByText("Standup").className).toContain("line-through");
+    fireEvent.click(screen.getByRole("button", { name: "Month" }));
+    const cell = await screen.findByRole("button", { name: /Standup, declined/ });
+    expect(within(cell).getByText("Standup").className).toContain("line-through");
+  });
+
+  it("a reply that fails after the popover closed shows a notice", async () => {
+    rows = [invite()];
+    let answer: (o: WriteOutcome) => void = () => {};
+    ipc.respondToCalendarEvent.mockReturnValue(new Promise<WriteOutcome>((r) => (answer = r)));
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(screen.getByRole("button", { name: "Maybe" }));
+    press("Escape");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await act(async () => answer({ outcome: "busy" }));
+    expect(
+      screen.getByText(
+        "Your reply to “Standup”: Google is busy right now. Reply again in a moment.",
+      ),
+    ).toBeTruthy();
   });
 });

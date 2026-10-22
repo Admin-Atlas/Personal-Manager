@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The event editor (#884): change one Google event you organise, a repeating one or one with guests
-// included: for an occurrence the choices dialog asks which occurrences first, and a change Google
-// would email guests about asks whether it should. It opens on Google's fresh copy (never the
-// mirror, which clips text), greys out whatever the backend says can't change and says why, and
-// saves only the fields the user changed. If the event changed in Google meanwhile on a field this
-// save also sends, nothing is overwritten: the editor reloads Google's copy, keeps the user's other
-// changes, and names the fields where Google's version now shows. A dirty draft asks before it is
-// thrown away (closing, Escape, or Delete).
+// included, and invitations: your reply and note, your own notifications, colour and busy or free,
+// and the rest when the organiser lets guests change it (C14c). For an occurrence the choices
+// dialog asks which occurrences first, and a change Google would email guests about asks whether
+// it should. It opens on Google's fresh copy (never the mirror, which clips text), greys out
+// whatever the backend says can't change and says why, and saves only the fields the user changed.
+// If the event changed in Google meanwhile on a field this save also sends, nothing is overwritten:
+// the editor reloads Google's copy, keeps the user's other changes, and names the fields where
+// Google's version now shows. A dirty draft asks before it is thrown away (closing, Escape, or
+// Delete).
 //
 // Guests (C12): the list, Optional, take off, and the three guest permissions, as Google Calendar
 // has them, with suggestions from people already in the user's calendars. Send or Don't send has no
@@ -44,6 +46,13 @@
 // and all-day puts a list of the event's own back to the calendar's defaults, as Google does, and
 // says so; back on the kind Google holds, the event's own list returns. A notification row that
 // can't be committed stops the save, as a date a field couldn't read does.
+//
+// Invitations (C14c): "Going?" sits on top, with the note Google holds, as Google's event page keeps
+// the reply apart from the fields. A reply goes the moment it's chosen and is none of the fields: it
+// never makes the draft dirty, Save never sends it, and once Google holds it the editor shows it
+// (the guest list too) without touching what a later Save compares. What stays the organiser's is
+// greyed out with their reason; how it repeats always is, whatever they let guests change. Where
+// they let guests change it, Google's warning says a guest's change may not last.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -57,11 +66,14 @@ import type {
   GuestNotice,
   Milestone,
   Notify,
+  Rsvp,
+  RsvpScope,
   SeenSummary,
   SeriesChoices,
   SeriesInfo,
   SplitAction,
   TimeDraft,
+  WriteOutcome,
 } from "../../../lib/types";
 import {
   DEFAULT_LENGTH_MS,
@@ -97,20 +109,24 @@ import {
   startDateOf,
 } from "../../../lib/calendarEdit/recurrenceDraft";
 import {
+  A11_NOTE,
   ambiguousText,
   CALLOUT_TONE,
   earlierChangeText,
   listFields,
   loadText,
+  notOrganizerText,
   outcomeText,
   problemText,
   reasonText,
   rebasedText,
+  repeatTheirsText,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
-import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
+import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
+import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
@@ -118,6 +134,7 @@ import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
 import { NotifyPrompt } from "./NotifyPrompt";
 import { ReminderList } from "./ReminderList";
+import { RsvpControl } from "./RsvpControl";
 import {
   NO_ZONE,
   RepeatRow,
@@ -135,6 +152,7 @@ import {
   noteSaved,
   noteSeriesNotice,
   openForEdit,
+  respond,
   saveEdit,
   settleSplit,
 } from "./useEventWrites";
@@ -413,6 +431,27 @@ export function EventEditor({
     if (isDirty()) setAskDiscard("delete");
     else onDelete(deleteRow());
   };
+
+  /** A reply from "Going?" (C14c), sent at once and apart from the draft. Once Google holds it the
+   *  editor's copy says it, and so does the user's own entry on the guest list on screen; the base a
+   *  later Save compares is left as it was, since C12 compares who is on the list, never replies.
+   *  An occurrence that kept its own answer when the reply went to all events (its day among those
+   *  the outcome names, which only an all-events reply does), or may have (PM couldn't read the
+   *  occurrences back yet), still shows its own (`replyHeld`). */
+  async function onReply(
+    reply: Rsvp,
+    note: string | null,
+    scope: RsvpScope | null,
+  ): Promise<WriteOutcome> {
+    const outcome = await respond(row.id, reply, note, scope);
+    if (replyHeld(outcome, scope, loaded !== null ? firstDay(loaded.base.time) : null)) {
+      const own = calendar?.remote_id ?? null;
+      setLoaded((l) => (l ? { ...l, event: withReply(l.event, reply, note, own) } : l));
+      const now = draftRef.current;
+      if (now) setDraft({ ...now, guests: guestsWithReply(now.guests, reply, own) });
+    }
+    return outcome;
+  }
 
   /** The event's length now, kept for the next start move, or the last one it had: a length under a
    *  minute (an end picked before the start, a 0-minute event Google holds, seconds an app wrote) is
@@ -833,10 +872,16 @@ export function EventEditor({
   const may = (f: Parameters<typeof canEdit>[1]) => !!perms && canEdit(perms, f) && !saving;
   const timeOff = deviceZone === null;
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
+  // Someone else's event says the reply is the user's only where this copy can send one (C14
+  // critique C2-L1).
   const reasons = [
-    ...(perms?.reasons.map(reasonText) ?? []),
+    ...(perms?.reasons.map((r) =>
+      r === "not_organizer" ? notOrganizerText(perms.respond, true) : reasonText(r),
+    ) ?? []),
     ...(timeOff && perms?.time ? [NO_ZONE] : []),
   ];
+  // Someone else's event: its reply on top, and how it repeats always theirs (C14c).
+  const theirs = loaded?.event.organizer_self === false;
   const heldTimed = loaded?.base.time.kind === "timed" ? loaded.base.time : null;
   const zoneFallback = heldTimed?.start_zone ?? calendar?.time_zone ?? deviceZone;
   const timeEditable = may("time") && !timeOff;
@@ -921,6 +966,25 @@ export function EventEditor({
               </Callout>
             )}
 
+            {/* The reply sits apart from the fields, as on Google's event page: none of the draft,
+                and Save never sends it (C14c). */}
+            {perms?.respond && (
+              <div className="flex flex-col gap-1.5 border-b border-border pb-3">
+                <RsvpControl
+                  current={replyOf(loaded.event.reply?.response ?? null)}
+                  repeating={repeating}
+                  forWhom={calendar && !calendar.is_primary ? calendar.name : null}
+                  note={loaded.event.reply?.note ?? ""}
+                  title={title}
+                  disabled={saving}
+                  onReply={onReply}
+                />
+              </div>
+            )}
+            {theirs && loaded.event.guests_can_modify && (
+              <p className="text-xs leading-relaxed text-ink3">{A11_NOTE}</p>
+            )}
+
             <TextRow
               label="Title"
               value={draft.summary}
@@ -955,9 +1019,17 @@ export function EventEditor({
                   deviceZone={deviceZone}
                   skippedTime={!!check?.problems.some((p) => p.kind === "gap")}
                   judge={!repeating}
-                  offReason={repeating && !series ? UNREADABLE_REPEAT : undefined}
+                  offReason={
+                    theirs
+                      ? repeatTheirsText(repeating)
+                      : repeating && !series
+                        ? UNREADABLE_REPEAT
+                        : undefined
+                  }
                   standing={standing}
-                  disabled={!timeEditable}
+                  // Its own right, never the time's: a guest may move an occurrence where the
+                  // organiser allows it, never re-rule it (C14 critiques C1-H2, C2-H2).
+                  disabled={!may("recurrence") || timeOff}
                   onChange={(recurrence) =>
                     draftRef.current && setDraft({ ...draftRef.current, recurrence })
                   }

@@ -147,6 +147,8 @@ import type {
   RepeatRule,
   RepeatStart,
   RepeatView,
+  Rsvp,
+  RsvpScope,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -1128,6 +1130,17 @@ export const updateCalendarEvent = (
   asked: GuestNotice | null = null,
 ) =>
   invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice, notify, asked });
+
+/** Reply to an invitation (by its row id): Yes, No or Maybe. `comment` null keeps the note Google
+ *  holds, "" removes it. For an occurrence of a repeating event `scope` says this one or all of
+ *  them. Google tells the organiser, with no question asked. Outcomes come back as data, never
+ *  thrown. */
+export const respondToCalendarEvent = (
+  eventId: string,
+  response: Rsvp,
+  comment: string | null = null,
+  scope: RsvpScope | null = null,
+) => invoke<WriteOutcome>("respond_to_calendar_event", { eventId, response, comment, scope });
 
 /** Create an event on one of PM's Google calendars (`calendarId`, PM's own id). Outcomes come back as
  *  data. `retryToken` (from an `ambiguous` outcome) looks for the earlier attempt and sends it again,

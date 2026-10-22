@@ -15,6 +15,7 @@ import type {
   WriteWarning,
 } from "../types";
 import {
+  A11_NOTE,
   CALLOUT_TONE,
   CREATE_CHANGED,
   CREATE_LOST,
@@ -40,11 +41,15 @@ import {
   moveFailedText,
   moveLabel,
   moveOfferText,
+  notOrganizerText,
   outcomeText,
   partialText,
   problemText,
   reasonText,
   rebasedText,
+  repeatTheirsText,
+  replyNoticeText,
+  replyText,
   savedNotice,
   settleText,
   SPLIT_ORDER,
@@ -79,6 +84,8 @@ const REASONS: ReadOnlyReason[] = [
   "calendar_read_only",
   "private_event",
   "not_organizer",
+  "not_invited",
+  "organizer_only_guests",
   "became_repeating",
   "special_type",
   "locked",
@@ -347,6 +354,7 @@ describe("a write's warnings", () => {
       "outside_mirror",
       "milestone_not_offered",
       "partly_applied",
+      "kept_own_reply",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
@@ -381,6 +389,150 @@ describe("a write's warnings", () => {
 
   it("maps every tone onto a Callout's", () => {
     expect(CALLOUT_TONE).toEqual({ ok: "info", warn: "warning", error: "danger" });
+  });
+});
+
+describe("what a reply came to (C14)", () => {
+  it("says the reply in Google's words, and all events as Google says it", () => {
+    expect(replyText(saved([]), "no", null)).toEqual({ tone: "ok", text: "You replied No." });
+    expect(replyText(saved([]), "maybe", "this").text).toBe("You replied Maybe.");
+    expect(replyText(saved([]), "yes", "all")).toEqual({
+      tone: "ok",
+      text: "You replied Yes for all events.",
+    });
+    expect(replyText(saved(["mirror_refresh_pending"]), "yes", null).text).toBe(
+      "You replied Yes. PM's calendar will show it after the next refresh.",
+    );
+    expect(replyText({ outcome: "no_change" }, "yes", null)).toEqual({
+      tone: "ok",
+      text: "That's already your reply.",
+    });
+  });
+
+  // C14 critiques C1-M3, C2-H1: "all events" never hides an occurrence that kept its own answer.
+  it("says how many occurrences answered on their own kept their answer", () => {
+    expect(
+      replyText(saved(["kept_own_reply"], ["2026-10-19", "2026-10-26"]), "yes", "all"),
+    ).toEqual({
+      tone: "warn",
+      text: "You replied Yes for all events. 2 occurrences you answered on their own kept their answer.",
+    });
+    expect(replyText(saved(["kept_own_reply"], ["2026-10-19"]), "no", "all").text).toBe(
+      "You replied No for all events. 1 occurrence you answered on its own kept its answer.",
+    );
+  });
+
+  it("has words for every outcome, never a promise it went when it may not have", () => {
+    const outcomes: WriteOutcome[] = [
+      { outcome: "needs_choice", scope: true },
+      { outcome: "ignored_by_google", split: false },
+      { outcome: "partial_split", token: "t", offers: ["check"], from: "2026-11-02" },
+      { outcome: "split_removed" },
+      { outcome: "conflict", fields: [] },
+      { outcome: "gone" },
+      { outcome: "read_only", reason: "not_invited" },
+      { outcome: "busy" },
+      { outcome: "reauth" },
+      { outcome: "unconfirmed" },
+      { outcome: "ambiguous", retry_token: "t" },
+      { outcome: "failed", message: "Google wouldn't take this reply from PM." },
+    ];
+    for (const o of outcomes) {
+      const said = replyText(o, "yes", null);
+      expect(said.text).toMatch(/^[A-Z“].*\.$/);
+      expect(said.text).not.toMatch(/^You replied/);
+      expect(said.tone).not.toBe("ok");
+      expect(said.text).not.toMatch(/rsvp|attendee|series|instance|organizer/i);
+    }
+    // Google answered as if it took it, and doesn't hold it: never "You replied".
+    expect(replyText({ outcome: "ignored_by_google", split: false }, "yes", null).text).toBe(
+      "Google didn't take the reply. Try again, or reply in Google Calendar.",
+    );
+    expect(replyText({ outcome: "read_only", reason: "not_invited" }, "no", null).text).toBe(
+      "PM can only reply where this calendar is on the guest list itself (not through a group).",
+    );
+    expect(replyText({ outcome: "unconfirmed" }, "no", null).text).toMatch(
+      /whether it went through/,
+    );
+  });
+
+  // C14 critique C2-M1: the notice that outlives the popover names the event.
+  it("says it as a notice naming the event, in the same tone", () => {
+    expect(replyNoticeText(saved([]), "no", null, "Standup")).toEqual({
+      tone: "ok",
+      text: "You replied No to “Standup”.",
+    });
+    expect(replyNoticeText(saved([]), "yes", "all", " ")).toEqual({
+      tone: "ok",
+      text: "You replied Yes to all events of “(no title)”.",
+    });
+    expect(
+      replyNoticeText(
+        saved(["mirror_refresh_pending", "kept_own_reply"], ["2026-10-19"]),
+        "yes",
+        "all",
+        "Gym",
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "You replied Yes to all events of “Gym”. PM's calendar will show it after the next refresh. 1 occurrence you answered on its own kept its answer.",
+    });
+    expect(replyNoticeText({ outcome: "no_change" }, "yes", null, "Gym")).toEqual({
+      tone: "ok",
+      text: "That's already your reply to “Gym”.",
+    });
+    expect(replyNoticeText({ outcome: "busy" }, "yes", null, "Gym")).toEqual({
+      tone: "warn",
+      text: "Your reply to “Gym”: Google is busy right now. Reply again in a moment.",
+    });
+    expect(replyNoticeText({ outcome: "gone" }, "yes", null, "Gym").tone).toBe("error");
+  });
+});
+
+// C14 critiques C1-L10, C2-L1, C2-L10: under someone else's event, what the user may still do.
+describe("the line under someone else's event (C14b, C14c)", () => {
+  const theirs =
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+
+  it("says what stays the organiser's and what the user may change, the reply only when this copy can", () => {
+    // The reason alone never promises a reply: the calendar may not be on the guest list.
+    expect(reasonText("not_organizer")).toBe(
+      `${theirs} Your notifications, colour and busy or free are yours to change.`,
+    );
+    expect(notOrganizerText(true, true)).toBe(
+      `${theirs} Your reply, notifications, colour and busy or free are yours to change.`,
+    );
+    expect(notOrganizerText(false, true)).toBe(reasonText("not_organizer"));
+    expect(notOrganizerText(true, false)).toBe(
+      "Someone else organises this event. Turn on editing for this account to reply and change your own settings from PM.",
+    );
+    expect(notOrganizerText(false, false)).toBe(
+      "Someone else organises this event. Turn on editing for this account to change your own settings from PM.",
+    );
+  });
+
+  it("says the guest list is the organiser's, and why a group invitation can't be answered", () => {
+    expect(reasonText("organizer_only_guests")).toBe(
+      "In PM, only the organiser can change who's invited.",
+    );
+    expect(reasonText("not_invited")).toBe(
+      "PM can only reply where this calendar is on the guest list itself (not through a group).",
+    );
+  });
+
+  it("words the A11 note and the Repeat row's line without jargon", () => {
+    expect(A11_NOTE).toBe(
+      "The organiser lets guests change this event. Your changes show on your copy, and may be lost if the organiser changes the event.",
+    );
+    expect(repeatTheirsText(true)).toBe(
+      "Someone else organises this repeating event, so only they can change how it repeats.",
+    );
+    expect(repeatTheirsText(false)).toBe(
+      "Someone else organises this event, so only they can make it repeat.",
+    );
+    for (const line of [A11_NOTE, repeatTheirsText(true), repeatTheirsText(false)]) {
+      expect(line).not.toMatch(/series|recurr|attendee|organizer|guestsCanModify|instance/i);
+    }
   });
 });
 

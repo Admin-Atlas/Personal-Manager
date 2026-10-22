@@ -24,6 +24,7 @@ import { formatClockIso } from "../../../lib/format";
 import { scrollBehavior, useDepth } from "../../../theme";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
+import { declinedName, isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { EventChip } from "../parts/EventChip";
 import { SourceDot } from "../parts/SourceDot";
 import {
@@ -312,6 +313,7 @@ export function MonthView({
                             showTime={showMeta}
                             isPast={isEventPast(ev, nowDate)}
                             ghost={draftNote(ev)}
+                            declined={isDeclined(ev)}
                             onClick={onEventClick ? (rect) => onEventClick(ev, rect) : undefined}
                           />
                         ))}
@@ -337,6 +339,7 @@ export function MonthView({
                   const leftPct = (b.startIdx / 7) * 100;
                   const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
                   const ghost = draftNote(b.ev);
+                  const declined = isDeclined(b.ev);
                   return (
                     <div
                       key={b.ev.id}
@@ -363,14 +366,18 @@ export function MonthView({
                         borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
                       }}
                       title={b.ev.summary}
-                      // A band's name is its text; the ghost's says first that it's the new event.
+                      // A band's name is its text; the ghost's says first that it's the new event,
+                      // and a declined one's says so last.
                       aria-label={
-                        ghost !== null
-                          ? spokenName(
-                              ghost,
-                              [b.ev.all_day ? "" : formatClockIso(b.ev.start), b.ev.summary]
-                                .filter(Boolean)
-                                .join(", "),
+                        ghost !== null || declined
+                          ? declinedName(
+                              spokenName(
+                                ghost,
+                                [b.ev.all_day ? "" : formatClockIso(b.ev.start), b.ev.summary]
+                                  .filter(Boolean)
+                                  .join(", "),
+                              ),
+                              declined,
                             )
                           : undefined
                       }
@@ -401,7 +408,9 @@ export function MonthView({
                             {formatClockIso(b.ev.start)}{" "}
                           </span>
                         )}
-                        {b.ev.summary}
+                        <span className={declined ? "line-through" : undefined}>
+                          {b.ev.summary}
+                        </span>
                       </span>
                     </div>
                   );

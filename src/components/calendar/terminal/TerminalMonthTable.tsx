@@ -9,6 +9,7 @@
 
 import type { CalendarEvent } from "../../../lib/types";
 import { dayKey, isEventPast, PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
+import { isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
@@ -115,6 +116,8 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                       {cell.chips.slice(0, maxChips).map((ev) => {
                         const clickable = !!onEventClick;
                         const own = eventColour(ev.color_id);
+                        // Struck through when the user declined it, as Google draws it.
+                        const declined = isDeclined(ev);
                         return (
                           <div
                             key={ev.id}
@@ -156,8 +159,12 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                                 {formatClockIso(ev.start)}
                               </span>
                             )}
-                            <span className="truncate text-ink" style={inkOn(own)}>
+                            <span
+                              className={cn("truncate text-ink", declined && "line-through")}
+                              style={inkOn(own)}
+                            >
                               {ev.summary}
+                              {declined && <span className="sr-only">, declined</span>}
                             </span>
                           </div>
                         );
@@ -184,6 +191,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                 const own = eventColour(b.ev.color_id);
                 const leftPct = (b.startIdx / 7) * 100;
                 const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
+                const declined = isDeclined(b.ev);
                 return (
                   <div
                     key={b.ev.id}
@@ -232,7 +240,8 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                           {formatClockIso(b.ev.start)}{" "}
                         </span>
                       )}
-                      {b.ev.summary}
+                      <span className={declined ? "line-through" : undefined}>{b.ev.summary}</span>
+                      {declined && <span className="sr-only">, declined</span>}
                     </span>
                   </div>
                 );

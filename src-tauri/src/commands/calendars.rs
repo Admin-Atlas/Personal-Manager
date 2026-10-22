@@ -19,7 +19,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::calendar_editing::{self, Choice, ConsentVerdict, EditingStatus};
 use crate::calendar_fresh::{Freshness, Plan, Verdict};
-use crate::calendar_write::dto::ReadOnlyReason;
+use crate::calendar_write::dto::ListRights;
 use crate::calendar_write::reconcile::Stamp;
 use crate::error::{Error, Result};
 use crate::google;
@@ -1237,17 +1237,18 @@ async fn check_one_calendar(
 /// (card 8). The focus view keeps the narrow forward agenda ([`list_calendar_events`]); this returns
 /// the whole band (previous month included) and the client filters to the visible range.
 ///
-/// Each row says whether PM could edit it (`edit_block`), as far as the mirror can tell; the editor
-/// asks Google again when it opens.
+/// Each row says whether PM could edit it (`edit_block`), delete it (`can_delete`) and reply to it
+/// (`can_respond`), as far as the mirror can tell; the editor asks Google again when it opens, and
+/// every write checks again on Google's copy.
 #[tauri::command]
 pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<ListedEvent>> {
     let conn = state.conn()?;
     let rows = calendar::list_all_events(&conn)?;
-    let blocks = super::calendar_edit::edit_blocks(&conn, &rows)?;
+    let rights = super::calendar_edit::list_rights(&conn, &rows)?;
     Ok(rows
         .into_iter()
-        .zip(blocks)
-        .map(|(event, edit_block)| ListedEvent { event, edit_block })
+        .zip(rights)
+        .map(|(event, rights)| ListedEvent { event, rights })
         .collect())
 }
 
@@ -1256,9 +1257,10 @@ pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<Listed
 pub struct ListedEvent {
     #[serde(flatten)]
     pub event: CalendarEvent,
-    /// Why nothing about it may change, or `None` when something can, assuming editing is on for
-    /// its account (the view merges each account's real status from `calendar_overview`).
-    pub edit_block: Option<ReadOnlyReason>,
+    /// What the view may offer on it, assuming editing is on for its account (the view merges each
+    /// account's real status from `calendar_overview`), beside the row's own fields.
+    #[serde(flatten)]
+    pub rights: ListRights,
 }
 
 /// The active PM flags anchored on a calendar event's iCal UID — shown in the event detail popup so a
@@ -1387,5 +1389,31 @@ mod tests {
         // An incomplete fetch only upserts, so the deleted row is removed explicitly.
         write_fetched_events(&conn, &edit, &cal, vec![a], false, before).unwrap();
         assert_eq!(titles(&conn), vec!["Gym"]);
+    }
+
+    /// The calendar view reads what it may offer on a row beside the row's own fields (C14): one
+    /// flat object, never a nested one it would miss.
+    #[test]
+    fn a_listed_row_carries_its_rights_flat() {
+        let listed = ListedEvent {
+            event: CalendarEvent {
+                id: format!("{CAL}:a"),
+                calendar_id: CAL.into(),
+                summary: "Dentist".into(),
+                start: "2026-10-09T10:00:00Z".into(),
+                ..Default::default()
+            },
+            rights: ListRights {
+                edit_block: None,
+                can_delete: true,
+                can_respond: false,
+            },
+        };
+        let json = serde_json::to_value(&listed).unwrap();
+        assert_eq!(json["summary"], "Dentist");
+        assert_eq!(json["edit_block"], serde_json::Value::Null);
+        assert_eq!(json["can_delete"], true);
+        assert_eq!(json["can_respond"], false);
+        assert!(json.get("rights").is_none(), "flat, not nested");
     }
 }

@@ -83,7 +83,12 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   Terminal look), repeating ones too (Google's choices, or your own with Custom…) and ones with
   guests, and change and delete events you organise, repeating ones and ones with guests included
   (PM asks whether Google should email the guests, as Google Calendar does); new or not, an
-  event's notifications and colour can be set too. Every change goes
+  event's notifications and colour can be set too. Answer invitations from an event's details
+  (Yes, No or Maybe, for one occurrence of a repeating one or all of them; Google tells the
+  organiser), with a note from the editor, where your own notifications, colour and Busy or Free
+  change too, and its title, time and place where the organiser lets guests change them (how it
+  repeats and who's invited stay the organiser's); events you've declined are struck through, as
+  Google shows them. Every change goes
   straight to Google, a save never overwrites a field someone changed there in the meantime, and a
   new event whose save loses the connection is looked for in Google before it's ever sent again.
 - **Bring your own model.** Choose your model through OpenRouter — separate chat and
