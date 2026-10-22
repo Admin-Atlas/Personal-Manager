@@ -10,6 +10,8 @@
 //! - [`plan`]: the writes themselves, and the rules for reading their answers.
 //! - [`diff`]: a re-fetch of a series turned into mirror rows added and removed.
 //! - [`run`]: a plan sent step by step, its answers read by the rules in [`plan`] (C9a), with no I/O.
+//! - [`journal`]: what PM keeps of a "this and following" change while it runs, and how a record left
+//!   from before a restart reads against Google's copies (C9a-3b-2).
 //!
 //! Everything starts from fresh copies of the event and its series ([`FreshEvent`]), never from the
 //! mirror (rule R1), and a change made in Google since the user opened the event is a conflict,
@@ -23,6 +25,7 @@
 //! `swap_remove` on fetched data, or puts anything from a Google reply in a log or panic message.
 
 pub mod diff;
+pub mod journal;
 pub mod plan;
 pub mod run;
 pub mod scope;
@@ -373,10 +376,30 @@ pub fn fields_missing_vs_master(master_json: &Value, instances: &[Value]) -> Vec
         .collect()
 }
 
-/// The private notes PM itself puts on a series: which series a new one was split off and by what
-/// plan, and the fence a "Remove the new series" writes (C9). Bookkeeping, not a change anyone made:
-/// an occurrence holding a copy from before one was written isn't changed on its own.
-pub const PM_NOTES: &[&str] = &["pmSplitOf", "pmSplitPlan", "pmFence"];
+/// The private notes PM itself puts on a series: which series a new one was split off, at which
+/// occurrence and by what plan, and the fence a "Remove the new series" writes (C9). Bookkeeping, not
+/// a change anyone made: an occurrence holding a copy from before one was written isn't changed on its
+/// own.
+pub const PM_NOTES: &[&str] = &["pmSplitOf", "pmSplitAt", "pmSplitPlan", "pmFence"];
+
+/// A point as PM writes it down (a split's `pmSplitAt` note, the journal): a day as `YYYY-MM-DD`, an
+/// instant as RFC 3339 in UTC.
+pub fn point_text(point: Point) -> String {
+    match point {
+        Point::Day(day) => day.format("%Y-%m-%d").to_string(),
+        Point::At(t) => t.to_rfc3339(),
+    }
+}
+
+/// [`point_text`] read back, `None` when PM can't.
+pub fn point_from_text(text: &str) -> Option<Point> {
+    if let Ok(day) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Some(Point::Day(day));
+    }
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| Point::At(t.with_timezone(&Utc)))
+}
 
 /// `extendedProperties` without [`PM_NOTES`], an emptied map read as none.
 fn without_pm_notes(v: Option<&Value>) -> Value {
@@ -596,6 +619,11 @@ pub enum SeriesRefusal {
     SplitInGap(NaiveDate),
     /// A whole series moved into another zone.
     ZoneChange,
+    /// A part PM split off this series from this day is still there, and the series still repeats
+    /// past it ([`parts_overlap`]).
+    SplitOverlap(NaiveDate),
+    /// PM couldn't list the parts it split off this series.
+    PartsUnread,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -669,6 +697,18 @@ impl fmt::Display for SeriesRefusal {
                 "PM can't move a whole series into another time zone. Change this occurrence on \
                  its own."
             ),
+            SeriesRefusal::SplitOverlap(day) => write!(
+                f,
+                "A part PM split off this repeating event from {} is still there, and this part \
+                 still repeats past that day, so it may show twice. Check it in Google Calendar \
+                 first.",
+                day.format("%d-%m-%Y")
+            ),
+            SeriesRefusal::PartsUnread => write!(
+                f,
+                "PM couldn't check for a part it split off this repeating event earlier, so it \
+                 won't change more than this occurrence now. Try again in a moment."
+            ),
         }
     }
 }
@@ -694,6 +734,86 @@ impl From<TimeError> for SeriesRefusal {
 /// Whether the series' rule is one PM can only show as text.
 pub fn text_only(master: &Master) -> Option<TextOnly> {
     lines::series_rule(&lines::parse(&master.recurrence)).err()
+}
+
+/// Whether a part PM split off a series still overlaps it (C9 design review scope-M4): the backstop
+/// for a "this and following" change whose record went, a restore or a lost settings value, say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parts {
+    Clear,
+    /// From this day, the first a live part starts on where the series still repeats.
+    Overlap(NaiveDate),
+    /// The parts, or the occurrences they're checked against, weren't listed whole.
+    Unread,
+}
+
+/// Read `parts` (the live events PM's note says were split off `master`) against the series' own
+/// occurrences in `window` (an `instances` listing with cancelled ones) and its stored `exceptions`.
+/// A part overlaps when the series still has a live occurrence at or after the occurrence it was split
+/// at (its `pmSplitAt` note): a cut ends the original before that point, wherever the new part was
+/// moved to, and anything kept before it (an extra date earlier that day) isn't the overlap; an uncut
+/// original still holds the split occurrence itself (review rounds 4-6). A part from before the note
+/// is measured from its start. An occurrence changed on its own that a change couldn't move doesn't
+/// count. Outside the window nothing is checked, as for the exceptions' cross-check. A part's own
+/// exceptions, which may carry the notes too, aren't parts (C9a-3b critique L4).
+pub fn parts_overlap(
+    parts: &Listing,
+    master: &Master,
+    window: &Listing,
+    exceptions: &Exceptions,
+) -> Parts {
+    let (series, zone) = (master.id.as_str(), master.start.zone());
+    if !parts.complete {
+        return Parts::Unread;
+    }
+    let live = |item: &&Value| item.get("status").and_then(Value::as_str) != Some("cancelled");
+    let own = |item: &&Value| item.get("recurringEventId").and_then(Value::as_str) == Some(series);
+    // Each part's split point: its note, or (a part from before the note) its start.
+    let points: Vec<Point> = parts
+        .items
+        .iter()
+        .filter(live)
+        .filter(|p| {
+            p.get("recurringEventId").is_none()
+                && p.get("id").and_then(Value::as_str) != Some(series)
+        })
+        .filter(|p| {
+            p.pointer("/extendedProperties/private/pmSplitOf")
+                .and_then(Value::as_str)
+                == Some(series)
+        })
+        .filter_map(|p| {
+            p.pointer("/extendedProperties/private/pmSplitAt")
+                .and_then(Value::as_str)
+                .and_then(point_from_text)
+                .or_else(|| point_of(p.get("start")))
+        })
+        .collect();
+    let Some(first) = points.iter().copied().min_by(|a, b| a.cmp_in(b, zone)) else {
+        return Parts::Clear;
+    };
+    if !window.complete {
+        return Parts::Unread;
+    }
+    let stored: Vec<Point> = exceptions
+        .items
+        .iter()
+        .filter(own)
+        .filter_map(original_of)
+        .collect();
+    let still = window
+        .items
+        .iter()
+        .filter(own)
+        .filter(live)
+        .filter_map(original_of)
+        .filter(|p| !stored.contains(p))
+        .any(|p| p.cmp_in(&first, zone) != std::cmp::Ordering::Less);
+    if still {
+        Parts::Overlap(first.day_in(zone))
+    } else {
+        Parts::Clear
+    }
 }
 
 /// Google-shaped series and occurrences for the series tests: a weekly 09:00–10:00 "Standup" in
@@ -1326,5 +1446,131 @@ mod tests {
             complete: false,
         };
         assert!(!partial.cross_checked(&mj, &m, &window(Vec::new())).complete);
+    }
+
+    /// scope-M4: a part PM split off overlaps its original only while the original still has an
+    /// occurrence at or after the one it was split at.
+    #[test]
+    fn a_part_overlaps_only_where_the_original_still_repeats() {
+        let whole = |items: Vec<Value>| Listing {
+            items,
+            complete: true,
+        };
+        // Split at Monday 19-10 09:00 London, whatever the part's start was moved to.
+        let part = |start: &str| {
+            json!({
+                "id": "pmtail",
+                "status": "confirmed",
+                "start": { "dateTime": start, "timeZone": "Europe/London" },
+                "extendedProperties": { "private": {
+                    "pmSplitOf": "abc",
+                    "pmSplitAt": "2026-10-19T08:00:00+00:00",
+                    "pmSplitPlan": "p",
+                } },
+            })
+        };
+        let parts = whole(vec![part("2026-10-19T10:00:00+01:00")]);
+        let october = whole(vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            plain("2026-10-19T09:00:00+01:00"),
+            plain("2026-10-26T09:00:00Z"),
+        ]);
+        let none = complete(Vec::new());
+        let weekly_m = Master::read(&fresh(master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]))).unwrap();
+        let read = |parts: &Listing, window: &Listing, exceptions: &Exceptions| {
+            parts_overlap(parts, &weekly_m, window, exceptions)
+        };
+        let day = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        // Uncut: the original still holds 19-10 and 26-10.
+        assert_eq!(read(&parts, &october, &none), Parts::Overlap(day));
+        // Cut: it ends on 12-10, before the part.
+        let cut = whole(vec![plain("2026-10-12T09:00:00+01:00")]);
+        assert_eq!(read(&parts, &cut, &none), Parts::Clear);
+        // Uncut, its last occurrence in the window the split day's 09:00, the part retimed to 10:00
+        // that day: both show that day (review round 5).
+        let last_day = whole(vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            plain("2026-10-19T09:00:00+01:00"),
+        ]);
+        assert_eq!(read(&parts, &last_day, &none), Parts::Overlap(day));
+        // An extra date earlier on the split day stays on the cut original, wherever the part was
+        // moved to: before the split point, so no overlap (review rounds 4-6).
+        let extra = whole(vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            plain("2026-10-19T07:00:00+01:00"),
+        ]);
+        for start in [
+            "2026-10-19T10:00:00+01:00",
+            "2026-10-19T06:00:00+01:00",
+            "2026-10-15T09:00:00+01:00",
+        ] {
+            let moved_part = whole(vec![part(start)]);
+            assert_eq!(read(&moved_part, &extra, &none), Parts::Clear, "{start}");
+        }
+        // Moved to a later day, the original uncut with nothing after the split occurrence in the
+        // window (a yearly event, say, or the last of a COUNT): it still shows that occurrence.
+        let later = whole(vec![part("2026-10-21T09:00:00+01:00")]);
+        assert_eq!(read(&later, &last_day, &none), Parts::Overlap(day));
+        assert_eq!(read(&later, &cut, &none), Parts::Clear);
+        // A part from before the note is measured from its start.
+        let mut legacy = part("2026-10-19T10:00:00+01:00");
+        legacy["extendedProperties"]["private"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pmSplitAt");
+        let legacy = whole(vec![legacy]);
+        assert_eq!(read(&legacy, &october, &none), Parts::Overlap(day));
+        assert_eq!(read(&legacy, &extra, &none), Parts::Clear);
+        // An occurrence a change couldn't move, left on the original, isn't the rule repeating; nor
+        // is a cancelled one.
+        let left = moved(
+            "2026-10-26T09:00:00Z",
+            "2026-10-26T11:00:00Z",
+            "2026-10-26T12:00:00Z",
+        );
+        let with_left = whole(vec![
+            plain("2026-10-12T09:00:00+01:00"),
+            left.clone(),
+            cancelled("2026-11-02T09:00:00Z"),
+        ]);
+        assert_eq!(
+            read(&parts, &with_left, &complete(vec![left.clone()])),
+            Parts::Clear
+        );
+        assert_eq!(read(&parts, &with_left, &none), Parts::Overlap(day));
+        // A part's own exception carries the note too, and a cancelled part is no part.
+        let exception = with(
+            part("2026-10-05T10:00:00+01:00"),
+            "recurringEventId",
+            json!("pmtail"),
+        );
+        let gone = with(
+            part("2026-10-05T10:00:00+01:00"),
+            "status",
+            json!("cancelled"),
+        );
+        assert_eq!(
+            read(&whole(vec![exception, gone]), &october, &none),
+            Parts::Clear
+        );
+        // No parts at all needs no window; a part, a whole one.
+        let short = Listing {
+            items: october.items.clone(),
+            complete: false,
+        };
+        assert_eq!(read(&whole(Vec::new()), &short, &none), Parts::Clear);
+        assert_eq!(read(&parts, &short, &none), Parts::Unread);
+        let unread = Listing {
+            items: Vec::new(),
+            complete: false,
+        };
+        assert_eq!(read(&unread, &october, &none), Parts::Unread);
+        // Another series' note isn't this one's.
+        let other = with(
+            part("2026-10-19T10:00:00+01:00"),
+            "extendedProperties",
+            json!({ "private": { "pmSplitOf": "xyz" } }),
+        );
+        assert_eq!(read(&whole(vec![other]), &october, &none), Parts::Clear);
     }
 }

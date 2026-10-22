@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.8-alpha",
+    date: "2026-10-18",
+    highlights: [
+      "Under the hood, a “this and the following” change to a repeating event is now remembered while it runs, so if PM closes halfway, the next change to that event first checks what Google holds and says what happened. PM also won't change more of a repeating event while an earlier split of it still overlaps, so nothing shows twice by accident. None of this is in the app yet: repeating events stay read-only until the dialog that asks which occurrences you mean.",
+    ],
+  },
+  {
     version: "3.148.7-alpha",
     date: "2026-10-21",
     highlights: [

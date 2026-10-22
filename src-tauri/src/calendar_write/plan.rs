@@ -109,6 +109,32 @@ pub fn list_by_ical(calendar: &str, ical: &str, page_token: Option<&str>) -> Req
     }
 }
 
+/// The new parts PM split off the series `series` (its private `pmSplitOf` note), live ones only, as
+/// stored (`singleEvents=false`): only what reading an overlap needs. Google may copy the note onto a
+/// part's own exceptions, so `recurringEventId` comes too, to tell them apart (C9a-3b critique L4).
+/// A page of up to 250; `page_token` is the previous page's `nextPageToken`.
+pub fn split_parts(calendar: &str, series: &str, page_token: Option<&str>) -> RequestPlan {
+    let note = format!("pmSplitOf={series}");
+    let mut query = vec![
+        ("privateExtendedProperty", note.as_str()),
+        ("singleEvents", "false"),
+        ("maxResults", "250"),
+        (
+            "fields",
+            "nextPageToken,items(id,status,recurringEventId,start,extendedProperties)",
+        ),
+    ];
+    if let Some(token) = page_token {
+        query.push(("pageToken", token));
+    }
+    RequestPlan {
+        method: Method::Get,
+        url: url(&["calendars", calendar, "events"], &query),
+        if_match: None,
+        body: None,
+    }
+}
+
 /// Change the fields in `body`, only if the event is still at `etag`.
 pub fn patch_event(
     calendar: &str,
@@ -250,6 +276,25 @@ mod tests {
         let next = list_by_ical("me@example.com", "abc@google.com", Some("p2&x"));
         assert!(
             next.url.ends_with("&maxResults=100&pageToken=p2%26x"),
+            "{}",
+            next.url
+        );
+    }
+
+    #[test]
+    fn a_series_parts_are_listed_by_pms_note() {
+        let first = split_parts("me@example.com", "abc", None);
+        assert_eq!((first.method, first.if_match), (Method::Get, None));
+        assert_eq!(
+            first.url,
+            "https://www.googleapis.com/calendar/v3/calendars/me@example.com/events\
+             ?privateExtendedProperty=pmSplitOf%3Dabc&singleEvents=false&maxResults=250\
+             &fields=nextPageToken%2Citems%28id%2Cstatus%2CrecurringEventId%2Cstart%2C\
+             extendedProperties%29"
+        );
+        let next = split_parts("me@example.com", "a&b", Some("p2"));
+        assert!(
+            next.url.contains("pmSplitOf%3Da%26b&") && next.url.ends_with("&pageToken=p2"),
             "{}",
             next.url
         );

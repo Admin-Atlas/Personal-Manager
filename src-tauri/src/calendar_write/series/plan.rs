@@ -454,7 +454,7 @@ impl Undo {
 }
 
 /// Whether `event` is the new series the plan `plan` split off the series `of`.
-fn is_tail_of(event: &Value, of: &str, plan: &str) -> bool {
+pub(crate) fn is_tail_of(event: &Value, of: &str, plan: &str) -> bool {
     let note = |key: &str| {
         event
             .pointer(&format!("/extendedProperties/private/{key}"))
@@ -946,7 +946,7 @@ fn text(v: &Value, key: &str) -> String {
 }
 
 /// A `start` node as a series' start: its day, or its instant in its own zone (A27).
-fn start_of(node: &Value) -> Option<SeriesStart> {
+pub(crate) fn start_of(node: &Value) -> Option<SeriesStart> {
     if let Some(day) = node.get("date").and_then(Value::as_str) {
         return NaiveDate::parse_from_str(day, "%Y-%m-%d")
             .ok()
@@ -1871,6 +1871,9 @@ fn plan_split(
         let private = obj.entry("private").or_insert_with(|| json!({}));
         if let Some(private) = private.as_object_mut() {
             private.insert("pmSplitOf".into(), Value::from(master.id.clone()));
+            // And the occurrence it was split at, which an uncut original still holds whatever day
+            // the new part was moved to: what the overlap backstop measures from (review round 6).
+            private.insert("pmSplitAt".into(), Value::from(super::point_text(at)));
         }
     }
     body.insert("extendedProperties".into(), properties);
@@ -2367,7 +2370,11 @@ mod tests {
             tail["extendedProperties"],
             json!({
                 "shared": { "team": "core" },
-                "private": { "pmSplitOf": "abc", "pmSplitPlan": note }
+                "private": {
+                    "pmSplitOf": "abc",
+                    "pmSplitAt": "2026-10-19T08:00:00+00:00",
+                    "pmSplitPlan": note,
+                }
             })
         );
         for never in [

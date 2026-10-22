@@ -1681,7 +1681,8 @@ export type SplitAction = "remove" | "finish" | "check";
 /** The three choices for one change to a repeating occurrence, each planned against Google now. */
 export type SeriesChoices =
   | { outcome: "not_repeating" }
-  | { outcome: "ready"; this: ScopeRow; following: ScopeRow; all: ScopeRow }
+  /** `notice`: said once beside the rows, how a change PM was making when it closed came out. */
+  | { outcome: "ready"; this: ScopeRow; following: ScopeRow; all: ScopeRow; notice?: string }
   | { outcome: "refused"; result: WriteOutcome };
 
 /** Which occurrences of a repeating event a save or delete is for. */
