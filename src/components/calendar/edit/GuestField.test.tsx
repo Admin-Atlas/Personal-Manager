@@ -52,6 +52,7 @@ interface Opts {
   disabled?: boolean;
   omitted?: boolean;
   me?: string | null;
+  organizer?: string | null;
 }
 
 function setUp({
@@ -60,20 +61,27 @@ function setUp({
   disabled = false,
   omitted = false,
   me = "me@x.org",
+  organizer = "me@x.org",
 }: Opts = {}) {
   const onChange = vi.fn<(g: GuestDraft[]) => void>();
   const onPerms = vi.fn<(p: GuestPerms) => void>();
   const onReject = vi.fn<(t: string | null) => void>();
   const latest = { guests, perms };
+  // The editor's base: Google's list as opened, until a rebase hands it a newer one.
+  const editor: { rebase: (base: GuestDraft[]) => void } = { rebase: () => {} };
   function Harness() {
     const [list, setList] = useState(guests);
+    const [base, setBase] = useState<GuestDraft[]>(guests);
     const [p, setP] = useState(perms);
+    editor.rebase = setBase;
     return (
       <GuestField
         guests={list}
+        base={base}
         perms={p}
         suggestions={SUGGESTED}
         me={me}
+        organizer={organizer}
         disabled={disabled}
         omitted={omitted}
         onChange={(g) => {
@@ -94,7 +102,8 @@ function setUp({
   const box = screen.getByRole("combobox", { name: "Add guests" }) as HTMLInputElement;
   const type = (text: string) => fireEvent.change(box, { target: { value: text } });
   const emails = () => latest.guests.map((g) => g.email);
-  return { box, type, emails, latest, onChange, onPerms, onReject };
+  const rebase = (base: GuestDraft[]) => act(() => editor.rebase(base));
+  return { box, type, emails, latest, onChange, onPerms, onReject, rebase };
 }
 
 const rows = () => within(screen.getByRole("list", { name: "Guests" })).getAllByRole("listitem");
@@ -178,6 +187,46 @@ describe("GuestField, adding", () => {
     expect(screen.getByRole("status").textContent).toBe("");
   });
 
+  it("never adds the organiser, on Google's list or not, and says why", () => {
+    vi.useFakeTimers();
+    // An event the user organises with no guests: Google sends no list, only the organiser.
+    const { box, type, emails, onChange, onReject } = setUp({ guests: [] });
+    type("Me@x.org");
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toBe(
+      "That's the organiser, who is on it already.",
+    );
+    expect(box.value).toBe("");
+    expect(onReject).not.toHaveBeenCalledWith(expect.any(String));
+    // A pasted "To:" line with the organiser in it adds everyone else.
+    fireEvent.paste(box, { clipboardData: { getData: () => "me@x.org, ann@x.org" } });
+    expect(emails()).toEqual(["ann@x.org"]);
+  });
+
+  it("leaves an input method's keys to it", () => {
+    const { box, type, emails, onReject } = setUp({ guests: [ME] });
+    type("an");
+    expect(box.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.keyDown(box, { key: "ArrowDown", keyCode: 229 });
+    fireEvent.keyDown(box, { key: "ArrowDown", isComposing: true });
+    expect(box.getAttribute("aria-activedescendant")).toBeNull();
+    // The Enter that confirms a composed name neither adds nor refuses it.
+    type("王");
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    expect(emails()).toEqual(["me@x.org"]);
+    expect(onReject).not.toHaveBeenCalled();
+    expect(screen.queryByText(/isn't an email address/)).toBeNull();
+  });
+
+  it("wraps a long refused text rather than pushing the editor sideways", () => {
+    const { box, type } = setUp({ guests: [ME] });
+    type("https://meet.example.com/abc-defg-hij?authuser=0&hs=179");
+    fireEvent.blur(box);
+    expect(screen.getByText(/isn't an email address/).className).toContain("break-words");
+  });
+
   it("knows a room by its address", () => {
     const { box, type, latest } = setUp({ guests: [ME] });
     type("room1@resource.calendar.google.com");
@@ -195,13 +244,17 @@ describe("GuestField, suggestions", () => {
     expect(offered).toEqual(["Andyandy@x.org", "dana@x.org"]);
   });
 
-  it("never offers you, even on a list you aren't on", () => {
-    const { type } = setUp({ guests: [ANN], me: "ME@x.org" });
+  it("never offers you or the organiser, even on a list neither is on", () => {
+    const { type } = setUp({ guests: [ANN], me: "ME@x.org", organizer: null });
     type("me");
     expect(options()).toHaveLength(0);
     cleanup();
-    // Without an account to leave out, the same address is offered like anyone.
-    const other = setUp({ guests: [ANN], me: null });
+    const organiser = setUp({ guests: [ANN], me: null, organizer: "Me@X.org" });
+    organiser.type("me");
+    expect(options()).toHaveLength(0);
+    cleanup();
+    // Without an account or an organiser to leave out, the same address is offered like anyone.
+    const other = setUp({ guests: [ANN], me: null, organizer: null });
     other.type("me");
     expect(options().map((o) => o.textContent)).toEqual(["Meme@x.org"]);
   });
@@ -316,13 +369,58 @@ describe("GuestField, the list", () => {
     expect(latest.guests[1].optional).toBe(false);
   });
 
-  it("takes a guest off, and one added back is Google's entry again, reply and all", () => {
-    const { box, type, latest } = setUp({ guests: [ME, { ...ANN, optional: true }] });
+  it("shows who is optional by more than aria-pressed: filled when on, an --ink4 edge when off", () => {
+    setUp();
+    const toggle = () => screen.getByRole("button", { name: "Optional, Ann" });
+    expect(toggle().classList).toContain("shadow-[inset_0_0_0_1px_var(--ink4)]");
+    expect(toggle().classList).not.toContain("bg-accent");
+    fireEvent.click(toggle());
+    expect(toggle().classList).toContain("bg-accent");
+    expect(toggle().classList).toContain("text-accent-ink");
+    expect(toggle().className).not.toContain("border2");
+  });
+
+  it("takes a guest off, and one added back is Google's entry, reply and all, not the one taken off", () => {
+    const { box, type, latest } = setUp();
+    // Made optional, then taken off: added back, Ann is as Google has her (required, declined), so
+    // the save sends nothing for her.
+    fireEvent.click(screen.getByRole("button", { name: "Optional, Ann" }));
     fireEvent.click(screen.getByRole("button", { name: "Remove Ann" }));
     expect(latest.guests.map((g) => g.email)).toEqual(["me@x.org"]);
     type("Ann@X.org");
     fireEvent.keyDown(box, { key: "Enter" });
-    expect(latest.guests[1]).toEqual({ ...ANN, optional: true });
+    expect(latest.guests[1]).toEqual(ANN);
+  });
+
+  it("after a rebase, adds back Google's entry as it is now, or a new guest", () => {
+    const { box, type, latest, rebase } = setUp();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Ann" }));
+    // Google's copy now: Ann has accepted since.
+    rebase([ME, { ...ANN, response: "accepted" }]);
+    type("ann@x.org");
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(latest.guests[1]).toEqual({ ...ANN, response: "accepted" });
+    fireEvent.click(screen.getByRole("button", { name: "Remove Ann" }));
+    // Google took her off too: she's a new guest, with no reply.
+    rebase([ME]);
+    type("ann@x.org");
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(latest.guests[1]).toEqual(guest("ann@x.org"));
+  });
+
+  it("keeps focus in the field when a guest is taken off", () => {
+    const BO = guest("bo@x.org");
+    const CY = guest("cy@x.org");
+    setUp({ guests: [ME, ANN, BO, CY] });
+    const button = (name: string) => screen.getByRole("button", { name });
+    // The next row's ×, else the one before, else the box: never the page behind the dialog.
+    button("Remove Ann").focus();
+    fireEvent.click(button("Remove Ann"));
+    expect(document.activeElement).toBe(button("Remove bo@x.org"));
+    fireEvent.click(button("Remove cy@x.org"));
+    expect(document.activeElement).toBe(button("Remove bo@x.org"));
+    fireEvent.click(button("Remove bo@x.org"));
+    expect(document.activeElement).toBe(screen.getByRole("combobox", { name: "Add guests" }));
   });
 
   it("checks and locks the other two permissions with Modify event, as Google does", () => {
@@ -353,6 +451,23 @@ describe("GuestField, the list", () => {
       see_others: true,
     });
     expect(invite.disabled).toBe(false);
+  });
+
+  it("draws the other two checked under Modify event, whatever Google stored for them", () => {
+    // Google's API (or a merge after a conflict) can hold Modify on with the others off.
+    const { onPerms } = setUp({ perms: { modify: true, invite_others: false, see_others: false } });
+    const invite = screen.getByLabelText("Invite others") as HTMLInputElement;
+    const see = screen.getByLabelText("See guest list") as HTMLInputElement;
+    expect([invite.checked, see.checked]).toEqual([true, true]);
+    expect([invite.disabled, see.disabled]).toEqual([true, true]);
+    // Off again: what Google stored shows, and can change.
+    fireEvent.click(screen.getByLabelText("Modify event"));
+    expect(onPerms).toHaveBeenLastCalledWith({
+      modify: false,
+      invite_others: false,
+      see_others: false,
+    });
+    expect([invite.checked, invite.disabled]).toEqual([false, false]);
   });
 
   it("shows a list Google cut short, and changes none of it", () => {

@@ -81,6 +81,23 @@ describe("addresses", () => {
     expect(splitAddresses("bob at x")).toEqual(["bob", "at", "x"]);
     expect(splitAddresses(" , ;")).toEqual([]);
   });
+
+  it("split Outlook's unquoted “Last, First <a@b>” lists, and give each address once", () => {
+    // Outlook copies recipients so: the comma is the name's, and no surname is left for the box.
+    expect(splitAddresses("Smith, Jo <jo@x.org>; Doe, Al <al@x.org>")).toEqual([
+      "jo@x.org",
+      "al@x.org",
+    ]);
+    expect(splitAddresses("Smith, Jr., Jo <jo@x.org>")).toEqual(["jo@x.org"]);
+    expect(splitAddresses("'Smith, Jo' <jo@x.org>")).toEqual(["jo@x.org"]);
+    // An address before the comma is no name: kept.
+    expect(splitAddresses("a@b.co, Jo <jo@x.org>")).toEqual(["a@b.co", "jo@x.org"]);
+    // Names with no address after them stay, for the box.
+    expect(splitAddresses("Smith, Jones")).toEqual(["Smith", "Jones"]);
+    // An address with no name, as some mail apps copy one, and the same address twice.
+    expect(splitAddresses("jo@x.org <jo@x.org>")).toEqual(["jo@x.org"]);
+    expect(splitAddresses("jo@x.org, JO@x.org")).toEqual(["jo@x.org"]);
+  });
 });
 
 describe("replies", () => {
@@ -132,7 +149,12 @@ describe("replies", () => {
 });
 
 describe("suggestions", () => {
-  const calendar = (id: string, source_id: string, provider: string): Calendar => ({
+  const calendar = (
+    id: string,
+    source_id: string,
+    provider: string,
+    is_primary = false,
+  ): Calendar => ({
     id,
     source_id,
     provider,
@@ -140,7 +162,7 @@ describe("suggestions", () => {
     name: id,
     color: null,
     selected: true,
-    is_primary: false,
+    is_primary,
     quiet: false,
     kind: null,
     access_role: null,
@@ -171,8 +193,8 @@ describe("suggestions", () => {
     attendees,
   });
   const calendars = [
-    calendar("gcal:me@x.org:me@x.org", "gcal:me@x.org", "google"),
-    calendar("outlook:me@work.org:AAA", "outlook:me@work.org", "microsoft"),
+    calendar("gcal:me@x.org:me@x.org", "gcal:me@x.org", "google", true),
+    calendar("outlook:me@work.org:AAA", "outlook:me@work.org", "microsoft", true),
     // An Outlook-published feed calls itself "outlook": still a subscription (C12 critique C1-H3).
     calendar("ics:feed1", "ics:feed1", "outlook"),
     calendar("ics:feed2", "ics:feed2", "ical"),
@@ -185,9 +207,10 @@ describe("suggestions", () => {
       who("room1@resource.calendar.google.com", "Room 1"),
     ]),
     event("gcal:me@x.org:me@x.org", [who("ann@X.org", "Ann Smith"), who("cat@x.org", "Cat")]),
+    // Outlook never marks the user's own entry (`graph_attendees`): it's known by the account.
     event("outlook:me@work.org:AAA", [
       who("ANN@x.org", "Ann"),
-      who("me@work.org", null, true),
+      who("Me@Work.org", "Me"),
       who("dan@work.org", "Dan"),
       who("/O=EXCHANGELABS/OU=EXCHANGE ADMINISTRATIVE GROUP", "Legacy"),
     ]),
@@ -211,6 +234,20 @@ describe("suggestions", () => {
       expect(emails).not.toContain(never);
     }
     expect(guestSuggestions(events, calendars, null).map((s) => s.email)).toContain("bob@x.org");
+  });
+
+  it("know the user by every account's address, and a shared calendar's owner as a colleague", () => {
+    // A colleague's calendar shared into the Google account: their own entry on it is marked as the
+    // calendar's (Google's `self`), and the user's is not.
+    const shared = calendar("gcal:me@x.org:boss@x.org", "gcal:me@x.org", "google");
+    const theirs = [
+      event(shared.id, [who("boss@x.org", "Boss", true), who("me@x.org", "Me"), who("eve@x.org")]),
+      event("gcal:me@x.org:me@x.org", [who("me@x.org", "Me", true), who("boss@x.org", "Boss")]),
+    ];
+    // `me` is another account's here, so only the account addresses keep the user out.
+    const all = guestSuggestions(theirs, [...calendars, shared], "other@y.org");
+    expect(all.map((s) => s.email)).toEqual(["boss@x.org", "eve@x.org"]);
+    expect(all[0]).toEqual({ email: "boss@x.org", name: "Boss", count: 2 });
   });
 
   it("match by name or address, leaving out who is on the list, up to the limit", () => {
@@ -271,6 +308,7 @@ const opened: EventForEdit = {
   guests_can_invite_others: true,
   guests_can_see_other_guests: true,
   guests_omitted: false,
+  organizer_email: "me@x.org",
 };
 const fields = (guests: GuestDraft[]): EditorFields => seedDraft({ ...opened, guests });
 const retitled = (f: EditorFields): EditorFields => ({ ...f, summary: "Retro (moved)" });
@@ -392,13 +430,19 @@ describe("who a delete would tell (the backend's D1-D5, from the calendar's row)
     ).toBeNull();
     // The account's own address, unmarked in the mirror, is the user.
     expect(deleteNotice(row([who("me@x.org")]), "me@x.org")).toBeNull();
-    // So is the organiser of an event the calendar organises, as the backend's `Own` has it, even
-    // where the entry isn't marked as the calendar's own.
-    const team = { ...who("team@group.x.org"), organizer: true };
-    expect(deleteNotice(row([team, who("A@x.org")]))).toEqual(cancelled(1));
     // An event the user doesn't organise is no delete of theirs to tell anyone about (C14).
     expect(deleteNotice(row([who("me@x.org", true), who("A@x.org")], false))).toBeNull();
     expect(deleteNotice(row([]))).toBeNull();
+  });
+
+  // Not one of the backend's rows. The backend knows the organiser of an event the calendar
+  // organises by the calendar's id, which `Own` holds; the mirror row doesn't carry that id, so the
+  // editor knows it by the organiser's entry instead. Google marks that entry as the calendar's own
+  // too, so the two agree on every copy it sends; this pins the editor's side should a copy ever
+  // come without the mark.
+  it("counts the organiser of an event the calendar organises as the user, marked or not", () => {
+    const team = { ...who("team@group.x.org"), organizer: true };
+    expect(deleteNotice(row([team, who("A@x.org")]))).toEqual(cancelled(1));
   });
 });
 

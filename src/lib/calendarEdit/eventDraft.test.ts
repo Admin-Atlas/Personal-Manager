@@ -66,6 +66,7 @@ const event: EventForEdit = {
   guests_can_invite_others: true,
   guests_can_see_other_guests: true,
   guests_omitted: false,
+  organizer_email: "me@x.org",
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -552,6 +553,22 @@ describe("guests in the draft", () => {
     expect(toChanges(b, { ...b, guests: [...b.guests, ...theirs] })).toEqual({});
   });
 
+  it("never sends a change to the organiser's address, on Google's list or not", () => {
+    // An event the user organises with no guests: Google sends no list, only the organiser. The
+    // backend refuses any change to that address, so the whole save would fail.
+    const none = withGuests([], { organizer_email: "Me@X.org" });
+    expect(none.organizer_email).toBe("Me@X.org");
+    const typed = guest("me@x.org", { response: null });
+    expect(toChanges(none, { ...none, guests: [typed, A] })).toEqual({
+      guests: [{ email: "A@x.org", to: "required" }],
+    });
+    // On the list without Google's marks: still the organiser's.
+    const unmarked = withGuests([guest("me@x.org"), A], { organizer_email: "me@x.org" });
+    expect(
+      toChanges(unmarked, { ...unmarked, guests: [{ ...guest("me@x.org"), optional: true }] }),
+    ).toEqual({ guests: [{ email: "A@x.org", to: "absent" }] });
+  });
+
   it("sends only the permissions that changed", () => {
     const b = base();
     expect(
@@ -635,6 +652,38 @@ describe("carrying guests onto Google's newer copy", () => {
     const r = rebaseDraft(oldBase, newBase, draft);
     expect(r.draft.guests).toEqual([ME]);
     expect(r.overwritten).toEqual(["guests"]);
+    // Named, as the list showed them, so the banner can say whose change went.
+    expect(r.lost_guests).toEqual(["Ann"]);
+  });
+
+  it("takes off a guest the user took off while Google added another", () => {
+    const B = guest("B@x.org", { name: "Bo" });
+    const c = guest("c@x.org", { name: "Cy" });
+    const oldBase = withGuests([ME, A, B]);
+    const newBase = withGuests([ME, A, B, c]);
+    const r = rebaseDraft(oldBase, newBase, { ...oldBase, guests: [ME, A] });
+    expect(r.draft.guests).toEqual([ME, A, c]);
+    expect(r.overwritten).toEqual([]);
+    expect(r.lost_guests).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({ guests: [{ email: "B@x.org", to: "absent" }] });
+  });
+
+  it("makes a guest Google left alone optional, or required again, on Google's list", () => {
+    const B = guest("B@x.org", { name: "Bo" });
+    const c = guest("c@x.org");
+    // Google added c; the user made A required again (from optional) and B optional.
+    const oldBase = withGuests([ME, { ...A, optional: true }, B]);
+    const newBase = withGuests([ME, { ...A, optional: true }, B, c]);
+    const draft = { ...oldBase, guests: [ME, A, { ...B, optional: true }] };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guests).toEqual([ME, A, { ...B, optional: true }, c]);
+    expect(r.overwritten).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({
+      guests: [
+        { email: "A@x.org", to: "required" },
+        { email: "B@x.org", to: "optional" },
+      ],
+    });
   });
 
   it("Google added one and the user another: both, nothing lost", () => {
@@ -693,6 +742,24 @@ describe("carrying guests onto Google's newer copy", () => {
     // The rebase never shares the new copy's objects with the draft it makes.
     expect(r.draft.guest_perms).not.toBe(newBase.guest_perms);
     expect(r.draft.guests).not.toBe(newBase.guests);
+  });
+
+  it("keeps Google's Invite others when the user ticked Modify event, sending only that", () => {
+    // Ticking Modify ticks all three in the field; only Modify differs from what was opened, so
+    // Google's newer Invite others stands, and the field draws it checked under Modify.
+    const oldBase = base();
+    const newBase = {
+      ...oldBase,
+      guest_perms: { modify: false, invite_others: false, see_others: true },
+    };
+    const draft = {
+      ...oldBase,
+      guest_perms: { modify: true, invite_others: true, see_others: true },
+    };
+    const r = rebaseDraft(oldBase, newBase, draft);
+    expect(r.draft.guest_perms).toEqual({ modify: true, invite_others: false, see_others: true });
+    expect(r.overwritten).toEqual([]);
+    expect(toChanges(r.base, r.draft)).toEqual({ guests_can_modify: true });
   });
 });
 

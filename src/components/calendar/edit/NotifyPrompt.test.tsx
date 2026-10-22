@@ -111,15 +111,17 @@ describe("NotifyPrompt", () => {
     expect(screen.getByText(/never get the invitation:/)).toBeTruthy();
   });
 
-  it("says when the numbers changed since the user chose, without guessing why", () => {
-    ask({ again: true });
-    expect(
-      screen.getByText(
-        "PM checked with Google again, and these numbers have changed since you chose. Choose again.",
-      ),
-    ).toBeTruthy();
+  it("says when the numbers are the backend's, without guessing why or that the user chose", () => {
+    // The editor counted nobody and asked nothing; Google's copy has a guest now. This is the first
+    // question, so nothing may say the user chose before.
+    ask({ again: true, notice: { ...NOTICE, updated: 0, invited: 1 } });
+    const note = screen.getByText(
+      "PM checked with Google before saving, and these are the numbers it found.",
+    );
+    expect(note).toBeTruthy();
+    expect(screen.getByRole("dialog").textContent).not.toMatch(/you chose|choose again/i);
     cleanup();
     ask();
-    expect(screen.queryByText(/numbers have changed/)).toBeNull();
+    expect(screen.queryByText(/PM checked with Google/)).toBeNull();
   });
 });

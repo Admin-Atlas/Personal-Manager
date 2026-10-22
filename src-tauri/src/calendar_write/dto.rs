@@ -556,6 +556,9 @@ pub struct EventForEdit {
     pub guests_can_see_other_guests: bool,
     /// Google cut the guest list short (`attendeesOmitted`), so it can't be changed.
     pub guests_omitted: bool,
+    /// The organiser's address (Google's `organizer.email`), on the guest list or not: no guest
+    /// change may touch it (`attendees::check`), so the editor never makes one.
+    pub organizer_email: Option<String>,
 }
 
 /// What opening the editor came to.

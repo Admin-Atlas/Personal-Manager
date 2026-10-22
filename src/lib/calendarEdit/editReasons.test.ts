@@ -43,6 +43,7 @@ import {
   outcomeText,
   problemText,
   reasonText,
+  rebasedText,
   savedNotice,
   settleText,
   SPLIT_ORDER,
@@ -113,6 +114,25 @@ describe("edit reasons", () => {
     expect(conflictFields(["recurrence", "start"])).toEqual(["recurrence", "time"]);
     expect(fieldLabel("recurrence")).toBe("repeat");
     expect(listFields(["time", "recurrence"])).toBe("time and repeat");
+  });
+
+  it("after taking Google's copy, says whose guest change went, never that the list is Google's", () => {
+    const head = "Google changed this event while you were editing.";
+    expect(rebasedText(head, [], [])).toBe(
+      `${head} Your changes are still here; save again to apply them.`,
+    );
+    expect(rebasedText(head, ["summary"], [])).toBe(
+      `${head} Google's version of the title is shown now; your other changes are still here.`,
+    );
+    // The guest list merges: only the change to a guest Google changed too was dropped.
+    const guests = rebasedText(head, ["guests"], ["Ann"]);
+    expect(guests).toBe(
+      `${head} Google changed Ann on the guest list too, so your change to that guest wasn't kept; your other changes are still here.`,
+    );
+    expect(guests).not.toMatch(/version of the guests/);
+    expect(rebasedText(head, ["summary", "guests"], ["Ann", "bo@x.org"])).toBe(
+      `${head} Google's version of the title is shown now. Google changed Ann and bo@x.org on the guest list too, so your changes to those guests weren't kept; your other changes are still here.`,
+    );
   });
 
   it("explains every outcome, promising on a conflict only that nothing was saved over it", () => {

@@ -101,11 +101,38 @@ export function conflictFields(keys: readonly string[]): EditorField[] {
   return out;
 }
 
-/** "title", "title and time", "title, time and location". */
-export function listFields(fields: readonly EditorField[]): string {
-  const words = fields.map(fieldLabel);
+/** "a", "a and b", "a, b and c". */
+function listWords(words: readonly string[]): string {
   if (words.length <= 1) return words.join("");
   return `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/** "title", "title and time", "title, time and location". */
+export function listFields(fields: readonly EditorField[]): string {
+  return listWords(fields.map(fieldLabel));
+}
+
+/** The editor's banner after it took Google's newer copy (`head` says why). The guest list merges,
+ *  so it isn't Google's version that's shown: what was dropped is the change to each guest Google
+ *  changed too (`lostGuests`), named. */
+export function rebasedText(
+  head: string,
+  overwritten: readonly EditorField[],
+  lostGuests: readonly string[],
+): string {
+  const fields = lostGuests.length > 0 ? overwritten.filter((f) => f !== "guests") : overwritten;
+  const said: string[] = [];
+  if (fields.length > 0) said.push(`Google's version of the ${listFields(fields)} is shown now`);
+  if (lostGuests.length > 0) {
+    const one = lostGuests.length === 1;
+    said.push(
+      `Google changed ${listWords(lostGuests)} on the guest list too, so ${
+        one ? "your change to that guest wasn't kept" : "your changes to those guests weren't kept"
+      }`,
+    );
+  }
+  if (said.length === 0) return `${head} Your changes are still here; save again to apply them.`;
+  return `${head} ${said.join(". ")}; your other changes are still here.`;
 }
 
 export type Tone = "ok" | "warn" | "error";

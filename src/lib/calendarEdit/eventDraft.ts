@@ -75,9 +75,12 @@ export interface EditorFields {
   guest_perms: GuestPerms;
   show_as: ShowAs;
   visibility: EventVisibility;
+  /** The organiser's address, on the list or not (Google's copy; none on a new event). Not a field:
+   *  nothing edits it, and no guest change touches it, as the backend's `check` has it. */
+  organizer_email?: string | null;
 }
 
-export type EditorField = keyof EditorFields;
+export type EditorField = Exclude<keyof EditorFields, "organizer_email">;
 
 /** Every field, in the order the editor shows them: guests after the time, as Google's quick
  *  create has them (INFERRED). */
@@ -110,6 +113,7 @@ export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): Edit
     },
     show_as: event.show_as,
     visibility: event.visibility,
+    organizer_email: event.organizer_email,
   };
 }
 
@@ -189,17 +193,24 @@ const byAddress = (guests: readonly GuestDraft[]) =>
 /** The guest list's changes from `base` to `draft`, as Google's list should end up: one op per
  *  address added, taken off or made optional or required, in the base's spelling where it has one,
  *  sorted by lower-cased address so the same change always reads the same. Never one on the
- *  organiser's or the user's own entry: the field can't make one, and Google's copy would refuse it
- *  (the backend's `check`). */
-function guestOps(base: readonly GuestDraft[], draft: readonly GuestDraft[]): GuestOp[] {
+ *  organiser's or the user's own entry, by its flags or the organiser's address (`organizer`)
+ *  whether the list carries it or not: Google's copy would refuse the whole save (the backend's
+ *  `check`, which looks at both). */
+function guestOps(
+  base: readonly GuestDraft[],
+  draft: readonly GuestDraft[],
+  organizer: string | null | undefined,
+): GuestOp[] {
   const before = byAddress(base);
   const after = byAddress(draft);
+  const theOrganiser = organizer ? addressKey(organizer) : null;
   const ops: GuestOp[] = [];
   for (const key of [...new Set([...before.keys(), ...after.keys()])].sort()) {
     const was = before.get(key);
     const now = after.get(key);
     const entry = was ?? now;
-    if (!entry || was?.organizer || was?.self || now?.organizer || now?.self) continue;
+    if (!entry || key === theOrganiser) continue;
+    if (was?.organizer || was?.self || now?.organizer || now?.self) continue;
     const to = stateOf(now);
     if (to !== stateOf(was)) ops.push({ email: entry.email.trim(), to });
   }
@@ -235,7 +246,7 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
       // Changes to Google's own list, never the list (R1): the backend applies them to its fresh
       // copy, so a reply that landed meanwhile is kept.
       case "guests": {
-        const ops = guestOps(base.guests, draft.guests);
+        const ops = guestOps(base.guests, draft.guests, base.organizer_email);
         if (ops.length > 0) changes.guests = ops;
         break;
       }
@@ -563,6 +574,9 @@ export interface Rebased {
   draft: EditorFields;
   /** Fields the user had changed that Google changed too: Google's value is now in the draft. */
   overwritten: EditorField[];
+  /** For the guest list, which merges: each guest whose change of the user's was dropped, because
+   *  Google changed that guest too, by name or else address. */
+  lost_guests: string[];
 }
 
 /** Carry `draft` (made against `oldBase`) onto `newBase`, Google's copy now. A field only the user
@@ -581,12 +595,14 @@ export function rebaseDraft(
     guest_perms: { ...newBase.guest_perms },
   };
   const overwritten: EditorField[] = [];
+  let lost_guests: string[] = [];
   for (const f of EDITOR_FIELDS) {
     const mine = !sameField(f, oldBase, draft);
     if (!mine) continue;
     const theirs = !sameField(f, oldBase, newBase);
     if (f === "guests") {
-      if (rebaseGuests(oldBase, newBase, draft, theirs, next)) overwritten.push(f);
+      lost_guests = rebaseGuests(oldBase, newBase, draft, theirs, next);
+      if (lost_guests.length > 0) overwritten.push(f);
     } else if (f === "guest_perms") {
       rebasePerms(oldBase, draft, next);
     } else if (!theirs) {
@@ -595,37 +611,38 @@ export function rebaseDraft(
       overwritten.push(f);
     }
   }
-  return { base: newBase, draft: next, overwritten };
+  return { base: newBase, draft: next, overwritten, lost_guests };
 }
 
-/** The user's guest list carried onto Google's newer one, into `next`; true when a change of the
- *  user's was dropped. Only the user changed it: the user's list, each name and reply as Google has
- *  them now (someone's reply is no conflict). Both changed it: the user's changes made again on
- *  Google's list, except one to a guest Google changed too, which is dropped (Google's stands, R2);
- *  a guest the user added keeps the name the user saw. */
+/** The user's guest list carried onto Google's newer one, into `next`; each guest whose change of
+ *  the user's was dropped, by name or else address. Only the user changed it: the user's list, each
+ *  name and reply as Google has them now (someone's reply is no conflict). Both changed it: the
+ *  user's changes made again on Google's list, except one to a guest Google changed too, which is
+ *  dropped (Google's stands, R2); a guest the user added keeps the name the user saw. */
 function rebaseGuests(
   oldBase: EditorFields,
   newBase: EditorFields,
   draft: EditorFields,
   theirs: boolean,
   next: EditorFields,
-): boolean {
+): string[] {
   const fresh = byAddress(newBase.guests);
   if (!theirs) {
     next.guests = draft.guests.map((g) => {
       const now = fresh.get(addressKey(g.email));
       return now ? { ...g, name: now.name, response: now.response } : { ...g };
     });
-    return false;
+    return [];
   }
   const old = byAddress(oldBase.guests);
   const mine = byAddress(draft.guests);
-  let lost = false;
-  for (const op of guestOps(oldBase.guests, draft.guests)) {
+  const lost: string[] = [];
+  for (const op of guestOps(oldBase.guests, draft.guests, oldBase.organizer_email)) {
     const key = addressKey(op.email);
     const google = stateOf(fresh.get(key));
     if (google !== stateOf(old.get(key)) && google !== op.to) {
-      lost = true;
+      const seen = old.get(key) ?? mine.get(key) ?? fresh.get(key);
+      lost.push(seen?.name?.trim() || op.email);
       continue;
     }
     if (op.to === "absent") {

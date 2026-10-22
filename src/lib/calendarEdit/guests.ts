@@ -70,34 +70,46 @@ export const sameAddress = (a: string, b: string): boolean => addressKey(a) === 
 export const isRoomAddress = (email: string): boolean => addressKey(email).endsWith(ROOM_DOMAIN);
 
 /** `text` cut at commas, semicolons and new lines, outside double quotes, so a quoted name can hold
- *  a comma. */
-function chunks(text: string): string[] {
-  const out: string[] = [];
+ *  a comma; each piece with whether a comma ended it. */
+function chunks(text: string): { text: string; comma: boolean }[] {
+  const out: { text: string; comma: boolean }[] = [];
   let quoted = false;
   let start = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (c === '"') quoted = !quoted;
     else if (!quoted && (c === "," || c === ";" || c === "\n" || c === "\r")) {
-      out.push(text.slice(start, i));
+      out.push({ text: text.slice(start, i), comma: c === "," });
       start = i + 1;
     }
   }
-  out.push(text.slice(start));
+  out.push({ text: text.slice(start), comma: false });
   return out;
 }
 
 const words = (text: string) => text.split(/\s+/).filter((w) => w !== "");
 
+const NAMED = /<([^<>]*)>/;
+
 /** Addresses pasted or typed together: split on commas, semicolons, spaces and new lines. A
  *  "Name <a@b.c>" form gives its address and drops the name, which read as words of its own would be
- *  left in the box and stop the save (C12 critique C1). Empty pieces dropped; anything else kept, for
- *  the caller to leave in the box. */
+ *  left in the box and stop the save (C12 critique C1), and so does Outlook's unquoted
+ *  "Last, First <a@b.c>", whose comma is the name's. Each address once; empty pieces dropped;
+ *  anything else kept, for the caller to leave in the box. */
 export function splitAddresses(text: string): string[] {
   const out: string[] = [];
-  for (const chunk of chunks(text)) {
-    const named = /<([^<>]*)>/.exec(chunk);
+  const pieces = chunks(text);
+  for (let i = 0; i < pieces.length; i++) {
+    const chunk = pieces[i].text;
+    const named = NAMED.exec(chunk);
     if (!named) {
+      // The start of a name: pieces with no address, each ended by a comma, up to a "<a@b.c>".
+      let j = i;
+      while (j < pieces.length && pieces[j].comma && !/[@<>]/.test(pieces[j].text)) j++;
+      if (j > i && j < pieces.length && NAMED.test(pieces[j].text)) {
+        i = j - 1;
+        continue;
+      }
       out.push(...words(chunk));
       continue;
     }
@@ -106,7 +118,15 @@ export function splitAddresses(text: string): string[] {
     out.push(...words(named[1]));
     out.push(...words(chunk.slice(named.index + named[0].length)));
   }
-  return out;
+  // "a@b.c <a@b.c>", as some mail apps copy an address with no name, is one guest.
+  const once = new Set<string>();
+  return out.filter((p) => {
+    if (!isEmail(p)) return true;
+    const key = addressKey(p);
+    if (once.has(key)) return false;
+    once.add(key);
+    return true;
+  });
 }
 
 // --- replies ---
@@ -192,23 +212,31 @@ export interface GuestSuggestion {
 const fromAnAccount = (c: Calendar) =>
   c.source_id.startsWith("gcal:") || c.source_id.startsWith("outlook:");
 
+/** The account a calendar is read with: the address after `gcal:` or `outlook:`. */
+const accountOf = (c: Calendar) => c.source_id.slice(c.source_id.indexOf(":") + 1);
+
 /** Every address in PM's mirrored Google and Outlook calendars, once each, its name the most common
- *  non-empty one, most-seen first then by name. Never the user (an address any calendar marks as its
- *  own), a room, `me`, or anything that isn't an address. */
+ *  non-empty one, most-seen first then by name. Never the user, a room, `me`, or anything that
+ *  isn't an address. The user is every account's own address (Outlook never marks one as the
+ *  user's), and the entry Google marks as the calendar's own on the user's primary calendar only: on
+ *  a calendar shared into the account, that's the colleague whose calendar it is. */
 export function guestSuggestions(
   events: readonly CalendarEvent[],
   calendars: readonly Calendar[],
   me: string | null,
 ): GuestSuggestion[] {
-  const fromAccounts = new Set(calendars.filter(fromAnAccount).map((c) => c.id));
+  const accounts = calendars.filter(fromAnAccount);
+  const fromAccounts = new Set(accounts.map((c) => c.id));
+  const primary = new Set(accounts.filter((c) => c.is_primary).map((c) => c.id));
   const seen = new Map<string, { email: string; names: Map<string, number>; count: number }>();
   const mine = new Set<string>(me ? [addressKey(me)] : []);
+  for (const c of accounts) mine.add(addressKey(accountOf(c)));
   for (const event of events) {
     if (!fromAccounts.has(event.calendar_id)) continue;
     for (const a of event.attendees ?? []) {
       if (!a.email) continue;
       const key = addressKey(a.email);
-      if (a.self) {
+      if (a.self && primary.has(event.calendar_id)) {
         mine.add(key);
         continue;
       }

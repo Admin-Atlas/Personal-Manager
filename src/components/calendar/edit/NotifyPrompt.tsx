@@ -47,11 +47,12 @@ export function NotifyPrompt({ notice, kind, from, again, onSend, onBack }: Prop
       }}
       onClose={onBack}
     >
-      {/* Neutral: the backend knows only that its numbers differ, not why (C12 critique C2-L6). */}
+      {/* Neutral: the backend knows only that its numbers differ, not why (C12 critique C2-L6),
+          nor whether the user chose before: the editor asks nothing when it counts nobody, so
+          this can be the first question. */}
       {again && (
         <Callout tone="warning" size="md" className="mt-1">
-          PM checked with Google again, and these numbers have changed since you chose. Choose
-          again.
+          PM checked with Google before saving, and these are the numbers it found.
         </Callout>
       )}
       <NotifyChoice

@@ -8,8 +8,10 @@
 // The box is a combobox in the CommandPalette's model: focus stays in it, the arrow keys move
 // through the suggestions under it (in flow, so the editor's scroll never clips them), and nothing
 // is picked until ArrowDown, so Enter adds what was typed (C12 critique C2-L3). Its Escape is its
-// own while it has something to close or clear, never the editor's. A guest taken off and added back
-// is Google's entry again, reply and all, so the save sends nothing for them.
+// own while it has something to close or clear, never the editor's. A guest added back who is on
+// Google's list (`base`, as it is now) is Google's entry, reply and all, so the save sends nothing for
+// them; anyone else is a new guest. The organiser's address is never added: Google refuses any change
+// to it, so the whole save would fail.
 
 import {
   useEffect,
@@ -35,14 +37,19 @@ import {
 } from "../../../lib/calendarEdit/guests";
 import { problemText } from "../../../lib/calendarEdit/editReasons";
 import type { GuestDraft, GuestPerms } from "../../../lib/calendarEdit/eventDraft";
-import { Button, IconButton, Input, VisuallyHidden } from "../../ui";
+import { IconButton, Input, VisuallyHidden } from "../../ui";
 
 interface Props {
   guests: GuestDraft[];
+  /** Google's list as the editor last read it (its base, rebased after a conflict): a guest added
+   *  back gets their entry from here. */
+  base: readonly GuestDraft[];
   perms: GuestPerms;
   suggestions: readonly GuestSuggestion[];
   /** The account saving it: never suggested. */
   me: string | null;
+  /** The organiser's address, on the list or not: never suggested or added. */
+  organizer: string | null;
   disabled: boolean;
   /** Google cut the list short: shown, not changeable. */
   omitted: boolean;
@@ -57,13 +64,19 @@ interface Props {
 const NOTE_MS = 4000;
 
 const ALREADY = "Already on the list.";
+const ORGANISER = "That's the organiser, who is on it already.";
 const CUT_SHORT = "Google didn't send this event's whole guest list, so PM can't change it.";
+
+/** The organiser's and the user's own entries: shown, never changed. */
+const fixed = (g: GuestDraft) => g.organizer || g.self;
 
 export function GuestField({
   guests,
+  base,
   perms,
   suggestions,
   me,
+  organizer,
   disabled,
   omitted,
   onChange,
@@ -90,8 +103,11 @@ export function GuestField({
   const noteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [rejected, setRejected] = useState<string | null>(null);
   const rejectedRef = useRef<string | null>(null);
-  // Entries taken off, by address: added back, each is Google's entry again.
-  const removed = useRef(new Map<string, GuestDraft>());
+  const boxRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  // Where focus goes once a removed guest's row is gone (its × goes with it): the next row's ×, by
+  // address, or null for the box. Undefined: nothing removed.
+  const focusAfterRemove = useRef<string | null | undefined>(undefined);
 
   useEffect(
     () => () => {
@@ -100,10 +116,23 @@ export function GuestField({
     [],
   );
 
+  useEffect(() => {
+    const target = focusAfterRemove.current;
+    if (target === undefined) return;
+    focusAfterRemove.current = undefined;
+    const buttons = listRef.current?.querySelectorAll<HTMLButtonElement>("button[data-remove]");
+    const next = [...(buttons ?? [])].find((b) => b.dataset.remove === target);
+    (next ?? boxRef.current)?.focus();
+  }, [guests]);
+
   const locked = disabled || omitted;
+  const isOrganiser = (email: string) => organizer !== null && sameAddress(email, organizer);
   const offered = useMemo(
-    () => (me ? suggestions.filter((s) => !sameAddress(s.email, me)) : suggestions),
-    [suggestions, me],
+    () =>
+      suggestions.filter(
+        (s) => !(me && sameAddress(s.email, me)) && !(organizer && sameAddress(s.email, organizer)),
+      ),
+    [suggestions, me, organizer],
   );
   const candidates = locked
     ? []
@@ -135,14 +164,19 @@ export function GuestField({
   /** Add each of `people` not already on the list, in one change. */
   function add(people: readonly { email: string; name: string | null }[]) {
     const next = [...guests];
-    let repeated = false;
+    let said: string | null = null;
     for (const p of people) {
       const email = p.email.trim();
       if (next.some((g) => sameAddress(g.email, email))) {
-        repeated = true;
+        said ??= ALREADY;
         continue;
       }
-      const back = removed.current.get(addressKey(email));
+      // Off Google's list or on it, the organiser can't be changed (the backend's `check`).
+      if (isOrganiser(email)) {
+        said = ORGANISER;
+        continue;
+      }
+      const back = base.find((g) => sameAddress(g.email, email));
       next.push(
         back
           ? { ...back }
@@ -157,7 +191,7 @@ export function GuestField({
             },
       );
     }
-    if (repeated) flash(ALREADY);
+    if (said) flash(said);
     if (next.length > guests.length) onChange(next);
   }
 
@@ -183,11 +217,18 @@ export function GuestField({
   }
 
   function remove(g: GuestDraft) {
-    removed.current.set(addressKey(g.email), g);
+    // Focus never falls to the page behind the dialog when the row goes.
+    const removable = guests.filter((x) => !fixed(x));
+    const at = removable.indexOf(g);
+    const after = removable[at + 1] ?? removable[at - 1] ?? null;
+    focusAfterRemove.current = after ? addressKey(after.email) : null;
     onChange(guests.filter((x) => x !== g));
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    // An input method's keys are its own: WebKit sends the Enter that ends a composition after it,
+    // as key code 229 (the house guard of NewEventEditor and QuickCreatePopover).
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     const typed = textRef.current;
     switch (e.key) {
       case "ArrowDown":
@@ -256,8 +297,6 @@ export function GuestField({
     else commit(typed);
   }
 
-  const fixed = (g: GuestDraft) => g.organizer || g.self;
-
   return (
     <fieldset
       className="flex min-w-0 flex-col gap-2"
@@ -270,6 +309,7 @@ export function GuestField({
         </p>
       )}
       <Input
+        ref={boxRef}
         value={text}
         disabled={locked}
         aria-label="Add guests"
@@ -321,7 +361,8 @@ export function GuestField({
         ))}
       </ul>
       {rejected !== null && (
-        <p id={rejectId} className="text-xs text-st-due">
+        // A pasted link is one long word: it wraps rather than pushing the editor sideways.
+        <p id={rejectId} className="break-words text-xs text-st-due">
           {problemText({ kind: "bad_guest", email: rejected })}
         </p>
       )}
@@ -330,7 +371,7 @@ export function GuestField({
         {note}
       </div>
       {guests.length > 0 && (
-        <ul aria-label="Guests" className="flex flex-col gap-1">
+        <ul ref={listRef} aria-label="Guests" className="flex flex-col gap-1">
           {guests.map((g) => {
             const who = g.name?.trim() || g.email;
             const reply = replyOf(g.response);
@@ -357,23 +398,30 @@ export function GuestField({
                 {!fixed(g) && (
                   <>
                     {/* One name whatever its state, which aria-pressed carries (C12 critique
-                        C2-L2); pressed, it's drawn as the selected choice. */}
-                    <Button
-                      variant={g.optional ? "secondary" : "tertiary"}
-                      size="xs"
+                        C2-L2). On screen it's filled when on, as the recurrence dialog's weekday
+                        toggles are, and has an `--ink4` edge when off: the contrast floor a
+                        control's edge needs. */}
+                    <button
+                      type="button"
                       aria-pressed={g.optional}
                       aria-label={`Optional, ${who}`}
                       disabled={locked}
                       onClick={() =>
                         onChange(guests.map((x) => (x === g ? { ...x, optional: !x.optional } : x)))
                       }
+                      className={
+                        g.optional
+                          ? "inline-flex min-h-[var(--tap-min,24px)] shrink-0 items-center rounded-[var(--radius-sm)] bg-accent px-1.5 text-xs font-medium text-accent-ink transition disabled:cursor-not-allowed"
+                          : "inline-flex min-h-[var(--tap-min,24px)] shrink-0 items-center rounded-[var(--radius-sm)] px-1.5 text-xs text-ink2 shadow-[inset_0_0_0_1px_var(--ink4)] transition enabled:hover:text-ink disabled:cursor-not-allowed"
+                      }
                     >
                       Optional
-                    </Button>
+                    </button>
                     <IconButton
                       label={`Remove ${who}`}
                       variant="subtle"
                       disabled={locked}
+                      data-remove={addressKey(g.email)}
                       onClick={() => remove(g)}
                     >
                       ×
@@ -404,11 +452,14 @@ export function GuestField({
           />
           <label htmlFor={permId("modify")}>Modify event</label>
         </span>
+        {/* With Modify event on, the other two are on as far as guests go, whatever Google stored
+            for them (a merge after a conflict, or a list set through Google's API, can hold them
+            off): drawn checked, never as a locked, unchecked box. */}
         <span className="flex items-center gap-2 text-xs text-ink2">
           <input
             id={permId("invite_others")}
             type="checkbox"
-            checked={perms.invite_others}
+            checked={perms.modify || perms.invite_others}
             disabled={locked || perms.modify}
             onChange={(e) => onPerms({ ...perms, invite_others: e.target.checked })}
           />
@@ -418,7 +469,7 @@ export function GuestField({
           <input
             id={permId("see_others")}
             type="checkbox"
-            checked={perms.see_others}
+            checked={perms.modify || perms.see_others}
             disabled={locked || perms.modify}
             onChange={(e) => onPerms({ ...perms, see_others: e.target.checked })}
           />
