@@ -161,8 +161,6 @@ pub struct Master {
     pub organizer_self: bool,
     pub event_type: Option<String>,
     pub locked: bool,
-    /// Anyone besides the user on its guest list.
-    pub guests: bool,
 }
 
 impl Master {
@@ -228,14 +226,13 @@ impl Master {
                 .unwrap_or(false),
             event_type: text("eventType"),
             locked: it.get("locked").and_then(Value::as_bool).unwrap_or(false),
-            guests: !attendee_set(it.get("attendees")).is_empty(),
         })
     }
 
     /// Why nothing about the series may change, from its own facts. The calendar's role and the
     /// account's editing switch are the command layer's (gate.rs); a master can also be an invitation
     /// or a special kind of event, which the gate reads from the occurrence. Its guests are the
-    /// planners' to weigh ([`plan::SeriesInput::guests_allowed`]).
+    /// planners' to count, for the Send / Don't send choice (C12).
     pub fn read_only(&self) -> Option<ReadOnlyReason> {
         if !matches!(self.event_type.as_deref(), None | Some("default")) {
             return Some(ReadOnlyReason::SpecialType);
@@ -591,9 +588,6 @@ pub enum SeriesRefusal {
     /// An occurrence after the split has guests, attachments, a call, a label or a visibility of its
     /// own.
     CannotCarry(NaiveDate),
-    /// An occurrence the change would reach has guests of its own (until C12 brings Send / Don't
-    /// send).
-    GuestsElsewhere(NaiveDate),
     /// The series' description is formatted (HTML), and the draft would save it as plain text.
     FormattedDescription,
     /// Its visibility applies to every occurrence (Google), so it can't change for one.
@@ -685,12 +679,6 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "The occurrence on {} has its own guests, attachments, video call, label or who can \
                  see it, which PM can't move to the new part.",
-                day.format("%d-%m-%Y")
-            ),
-            SeriesRefusal::GuestsElsewhere(day) => write!(
-                f,
-                "The occurrence on {} has guests of its own, and PM can't change events with \
-                 guests yet. Choose “This event” to change only this one.",
                 day.format("%d-%m-%Y")
             ),
             SeriesRefusal::FormattedDescription => write!(
@@ -1210,7 +1198,6 @@ pub(crate) mod fixtures {
         pub instances: Option<Listing>,
         pub sibling: bool,
         pub later: LaterPart,
-        pub guests_allowed: bool,
     }
 
     impl Case {
@@ -1224,18 +1211,11 @@ pub(crate) mod fixtures {
                 instances: None,
                 sibling: false,
                 later: LaterPart::None,
-                guests_allowed: false,
             }
         }
 
         pub fn exceptions(mut self, items: Vec<Value>) -> Case {
             self.exceptions = complete(items);
-            self
-        }
-
-        /// As C12 will run it, a series with guests allowed.
-        pub fn guests(mut self) -> Case {
-            self.guests_allowed = true;
             self
         }
 
@@ -1254,7 +1234,6 @@ pub(crate) mod fixtures {
                 instances: self.instances.as_ref(),
                 sibling: self.sibling,
                 later: self.later,
-                guests_allowed: self.guests_allowed,
                 me: CALENDAR,
             }
         }

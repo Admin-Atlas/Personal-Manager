@@ -81,7 +81,8 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   then you can create events on its calendars (+ New event, or press c; Shift+C opens a quick box,
   and in the day, week, month and agenda views the new event shows as you type, except in the
   Terminal look), repeating ones too (Google's choices, or your own with Custom…), and change and
-  delete events you organise without guests, repeating ones included. Every change goes straight to
+  delete events you organise, repeating ones and ones with guests included (PM asks whether Google
+  should email the guests, as Google Calendar does). Every change goes straight to
   Google, a save never overwrites a field someone changed there in the meantime, and a new
   event whose save loses the connection is looked for in Google before it's ever sent again.
 - **Bring your own model.** Choose your model through OpenRouter — separate chat and

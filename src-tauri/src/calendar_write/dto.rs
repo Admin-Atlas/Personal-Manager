@@ -155,6 +155,9 @@ pub struct GuestNotice {
     pub invited: u32,
     /// Guests the change takes off: each is told.
     pub removed: u32,
+    /// Guests on an occurrence the change cancels and on nothing else it writes: each is told that
+    /// occurrence is cancelled, not of an update. Never among `updated`; none when `cancelled`.
+    pub told_cancelled: u32,
     /// The change deletes it (or every occurrence it reaches): `updated` are told it's cancelled.
     pub cancelled: bool,
     /// Different guests who'd hear, every write together.
@@ -266,8 +269,6 @@ pub enum ReadOnlyReason {
     NotOrganizer,
     /// A one-off in PM that has since become a repeating event in Google: open one of its occurrences.
     BecameRepeating,
-    /// It has guests, who Google would email (until Send / Don't send lands).
-    HasGuests,
     /// A birthday, a Gmail event, focus time, out of office or a working location.
     SpecialType,
     /// Google has locked its title, time, place and description.
@@ -382,13 +383,16 @@ pub enum WriteOutcome {
     /// it for settling; `offers` is what Google's state allows now; `from` is the day the change
     /// starts (`YYYY-MM-DD`, in the series' zone). Never an id or an etag (R5). `note`: a settle
     /// that didn't end the change says why here, while PM still holds it to settle (so its buttons
-    /// stay); left out for every other answer.
+    /// stay); left out for every other answer. `emails`: the offers that would email guests, since
+    /// the change went with Send (C12); left out when none would.
     PartialSplit {
         token: String,
         offers: Vec<SplitAction>,
         from: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        emails: Vec<SplitAction>,
     },
     /// The new part of a change PM couldn't finish was removed: the repeating event is as it was.
     SplitRemoved,
@@ -664,11 +668,13 @@ pub enum ScopeRow {
     /// Changed in Google since the editor opened, on these fields.
     Conflict { fields: Vec<String> },
     /// A change PM couldn't finish holds this series (C9 design review M1): settle it first, as
-    /// [`WriteOutcome::PartialSplit`] says.
+    /// [`WriteOutcome::PartialSplit`] says, `emails` included.
     Pending {
         token: String,
         offers: Vec<SplitAction>,
         from: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        emails: Vec<SplitAction>,
     },
 }
 
@@ -766,7 +772,7 @@ mod tests {
                     complete: true,
                     ..Default::default()
                 }),
-                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":2,"invited":0,"removed":0,"cancelled":false,"people":2,"emails":2,"complete":true}}"#,
+                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":2,"invited":0,"removed":0,"told_cancelled":0,"cancelled":false,"people":2,"emails":2,"complete":true}}"#,
             ),
             (
                 WriteOutcome::needs_notify_again(GuestNotice {
@@ -775,7 +781,7 @@ mod tests {
                     emails: 1,
                     ..Default::default()
                 }),
-                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":0,"invited":1,"removed":0,"cancelled":false,"people":1,"emails":1,"complete":false},"again":true}"#,
+                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":0,"invited":1,"removed":0,"told_cancelled":0,"cancelled":false,"people":1,"emails":1,"complete":false},"again":true}"#,
             ),
             (
                 WriteOutcome::IgnoredByGoogle { split: false },
@@ -791,6 +797,7 @@ mod tests {
                     offers: vec![SplitAction::Remove, SplitAction::Check],
                     from: "2026-11-02".into(),
                     note: None,
+                    emails: Vec::new(),
                 },
                 r#"{"outcome":"partial_split","token":"t","offers":["remove","check"],"from":"2026-11-02"}"#,
             ),
@@ -800,8 +807,20 @@ mod tests {
                     offers: vec![SplitAction::Check],
                     from: "2026-11-02".into(),
                     note: Some("Try again in a moment.".into()),
+                    emails: Vec::new(),
                 },
                 r#"{"outcome":"partial_split","token":"t","offers":["check"],"from":"2026-11-02","note":"Try again in a moment."}"#,
+            ),
+            // C12: sent with Send, Remove would email guests.
+            (
+                WriteOutcome::PartialSplit {
+                    token: "t".into(),
+                    offers: vec![SplitAction::Remove, SplitAction::Check],
+                    from: "2026-11-02".into(),
+                    note: None,
+                    emails: vec![SplitAction::Remove],
+                },
+                r#"{"outcome":"partial_split","token":"t","offers":["remove","check"],"from":"2026-11-02","emails":["remove"]}"#,
             ),
             (WriteOutcome::SplitRemoved, r#"{"outcome":"split_removed"}"#),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),
@@ -993,9 +1012,20 @@ mod tests {
                 token: "t".into(),
                 offers: vec![SplitAction::Finish],
                 from: "2026-11-02".into(),
+                emails: Vec::new(),
             })
             .unwrap(),
             r#"{"row":"pending","token":"t","offers":["finish"],"from":"2026-11-02"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScopeRow::Pending {
+                token: "t".into(),
+                offers: vec![SplitAction::Finish],
+                from: "2026-11-02".into(),
+                emails: vec![SplitAction::Finish],
+            })
+            .unwrap(),
+            r#"{"row":"pending","token":"t","offers":["finish"],"from":"2026-11-02","emails":["finish"]}"#
         );
         // C12: a row that would email someone says who, in numbers.
         assert_eq!(
@@ -1011,7 +1041,7 @@ mod tests {
                 }),
             })
             .unwrap(),
-            r#"{"row":"offered","warnings":[],"token":"t","guests":{"updated":0,"invited":1,"removed":0,"cancelled":false,"people":1,"emails":1,"complete":true}}"#
+            r#"{"row":"offered","warnings":[],"token":"t","guests":{"updated":0,"invited":1,"removed":0,"told_cancelled":0,"cancelled":false,"people":1,"emails":1,"complete":true}}"#
         );
         for (text, action) in [
             (r#""remove""#, SplitAction::Remove),
@@ -1226,7 +1256,7 @@ mod tests {
         };
         assert!(asked.answered_by(&asked));
         let read: GuestNotice = serde_json::from_str(
-            r#"{"updated":1,"invited":0,"removed":0,"cancelled":false,"people":1,"emails":1,
+            r#"{"updated":1,"invited":0,"removed":0,"told_cancelled":0,"cancelled":false,"people":1,"emails":1,
                 "complete":true}"#,
         )
         .unwrap();

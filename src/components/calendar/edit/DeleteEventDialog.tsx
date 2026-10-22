@@ -8,14 +8,27 @@
 // A repeating event asks which occurrences first, like Google Calendar; the held Undo still
 // applies. The choices are read from Google when the dialog opens, against what the user saw of the
 // row, and the delete sends the same, since the token binds it.
+//
+// An event with guests you organise also asks whether Google emails them the cancellation (C12),
+// in this dialog: Delete stays off until Send or Don't send is picked, and the answer goes with the
+// hold, so it's the one sent after the Undo window. A one-off's numbers come from its row, or from
+// the backend when it asked again; a repeating event's rows carry their own.
 
-import { useEffect, useRef, useState } from "react";
-import type { CalendarEvent, SeriesChoices, SplitAction } from "../../../lib/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type {
+  CalendarEvent,
+  GuestNotice,
+  Notify,
+  SeriesChoices,
+  SplitAction,
+} from "../../../lib/types";
 import { deleteText } from "../../../lib/calendarEdit/editReasons";
+import { deleteNotice, notifyOf } from "../../../lib/calendarEdit/guests";
 import { isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { parseLocal } from "../../../lib/calendar-layout";
 import { formatDateLocal } from "../../../lib/format";
-import { ConfirmDialog } from "../../ui";
+import { Callout, ConfirmDialog } from "../../ui";
+import { NotifyChoice } from "./NotifyChoice";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
 import { choicesForDelete, noteSeriesNotice, settleSplit } from "./useEventWrites";
 
@@ -25,12 +38,25 @@ interface Props {
   calendarName: string | null;
   /** When it happens, as the popover said it. */
   when: string;
+  /** The account the delete goes through: who Google sends guests' emails from, and never counted
+   *  as a guest. */
+  from?: string | null;
   /** Re-asked after a delete answered that the plan changed since the choice: the dialog says so. */
   again?: boolean;
   /** Re-asked because the backend wants the occurrences chosen, though the row looked like a
    *  one-off: ask, whatever the row says. */
   forceRepeating?: boolean;
-  onConfirm: (event: CalendarEvent, picked: Picked | null) => void;
+  /** Re-asked because the backend wants Send or Don't send: its numbers, and `again` when an
+   *  answer came for others. Asked as a one-off. */
+  guests?: { notice: GuestNotice; again: boolean } | null;
+  /** The delete: the occurrences picked (a repeating event), Send or Don't send when it would email
+   *  guests, and the numbers a one-off's question showed (null when nothing was asked). */
+  onConfirm: (
+    event: CalendarEvent,
+    picked: Picked | null,
+    notify: Notify | null,
+    asked: GuestNotice | null,
+  ) => void;
   onClose: () => void;
 }
 
@@ -38,18 +64,21 @@ export function DeleteEventDialog({
   event,
   calendarName,
   when,
+  from = null,
   again = false,
   forceRepeating = false,
+  guests = null,
   onConfirm,
   onClose,
 }: Props) {
-  if (event && (forceRepeating || isRepeating(event))) {
+  if (event && !guests && (forceRepeating || isRepeating(event))) {
     return (
       <RepeatingDelete
         key={event.id}
         event={event}
         calendarName={calendarName}
         when={when}
+        from={from}
         again={again}
         onConfirm={onConfirm}
         onClose={onClose}
@@ -61,28 +90,53 @@ export function DeleteEventDialog({
       event={event}
       calendarName={calendarName}
       when={when}
+      from={from}
+      guests={guests}
       onConfirm={onConfirm}
       onClose={onClose}
     />
   );
 }
 
-/** The one-event confirm. */
+/** The one-event confirm, with the email question when it has guests to tell. */
 function PlainDelete({
   event,
   calendarName,
   when,
+  from,
+  guests,
   onConfirm,
   onClose,
-}: Pick<Props, "event" | "calendarName" | "when" | "onConfirm" | "onClose">) {
+}: Pick<Props, "event" | "calendarName" | "when" | "onConfirm" | "onClose"> & {
+  from: string | null;
+  guests: { notice: GuestNotice; again: boolean } | null;
+}) {
   const title = event ? event.summary.trim() || "(no title)" : "";
+  // The backend's numbers when it asked again, else the row's own (null: nobody to tell).
+  const notice = useMemo(
+    () => guests?.notice ?? (event ? deleteNotice(event, from) : null),
+    [guests, event, from],
+  );
+  // Send or Don't send, for the numbers on screen: none until picked, and none again for others.
+  const [notify, setNotify] = useState<Notify | null>(null);
+  const [answeredFor, setAnsweredFor] = useState(notice);
+  if (notice !== answeredFor) {
+    setAnsweredFor(notice);
+    setNotify(null);
+  }
   return (
     <ConfirmDialog
       open={event !== null}
       title="Delete this event?"
       confirmLabel="Delete"
       danger
-      onConfirm={() => event && onConfirm(event, null)}
+      confirmDisabled={notice !== null && notify === null}
+      initialFocus="cancel"
+      // Delete is off until answered; were it pressed anyway, the backend asks (R9). Closing
+      // clears the event, so the next one asks afresh.
+      onConfirm={() =>
+        event && onConfirm(event, null, notice && notify ? notifyOf(notify) : null, notice)
+      }
       onClose={onClose}
     >
       <p>
@@ -93,6 +147,30 @@ function PlainDelete({
       <p className="mt-2">
         You can undo it for a few seconds. If you quit PM in that time, nothing is deleted.
       </p>
+      {/* Reopened by the backend: the delete didn't happen, which is said first, whether or not
+          anyone had answered (C12c review). Neutral, as the editor's question is: the backend knows
+          only that its numbers differ, not why (C12 critique C2-L6). With no answer yet it may be
+          asking from PM's older row, after Google dropped the guests, so it doesn't say the event
+          "has guests now"; the send checks Google's copy either way (C12c review round 2). */}
+      {guests && (
+        <Callout tone="warning" size="md" className="mt-3">
+          {guests.again
+            ? "It wasn't deleted. PM checked with Google before deleting, and these are the numbers it found."
+            : "It wasn't deleted. PM found guests who would be told. Choose whether Google emails them."}
+        </Callout>
+      )}
+      {notice && (
+        <NotifyChoice
+          notice={notice}
+          kind="delete"
+          scope={null}
+          from={from}
+          value={notify}
+          onChange={setNotify}
+          disabled={false}
+          legend="shown"
+        />
+      )}
     </ConfirmDialog>
   );
 }
@@ -102,6 +180,7 @@ function RepeatingDelete({
   event,
   calendarName,
   when,
+  from,
   again,
   onConfirm,
   onClose,
@@ -109,8 +188,9 @@ function RepeatingDelete({
   event: CalendarEvent;
   calendarName: string | null;
   when: string;
+  from: string | null;
   again: boolean;
-  onConfirm: (event: CalendarEvent, picked: Picked | null) => void;
+  onConfirm: Props["onConfirm"];
   onClose: () => void;
 }) {
   const title = event.summary.trim() || "(no title)";
@@ -198,7 +278,9 @@ function RepeatingDelete({
       when={when}
       calendarName={calendarName}
       day={start ? formatDateLocal(start) : undefined}
-      onChoose={(picked) => onConfirm(event, picked)}
+      from={from}
+      // The token binds who each row tells, so no numbers go with the answer.
+      onChoose={(picked, notify) => onConfirm(event, picked, notify, null)}
       onSettle={(token, action) => void onSettle(token, action)}
       onClose={close}
     />

@@ -16,7 +16,13 @@ import type {
   SeriesWarning,
   SplitAction,
 } from "../types";
-import { conflictFields, listFields, outcomeText, type ChoiceKind } from "./editReasons";
+import {
+  conflictFields,
+  listFields,
+  outcomeText,
+  withSettleEmails,
+  type ChoiceKind,
+} from "./editReasons";
 
 export type { ChoiceKind } from "./editReasons";
 export type ReadyChoices = Extract<SeriesChoices, { outcome: "ready" }>;
@@ -146,28 +152,42 @@ export function defaultScope(choices: ReadyChoices): SeriesScope | null {
 /** A pending row's change to settle first, once per dialog: every pending row shares one token. */
 export function pendingOf(
   choices: ReadyChoices,
-): { token: string; offers: SplitAction[]; from: string } | null {
+): { token: string; offers: SplitAction[]; from: string; emails: SplitAction[] } | null {
   for (const scope of SCOPES) {
     const row = choices[scope];
-    if (row.row === "pending") return { token: row.token, offers: row.offers, from: row.from };
+    if (row.row === "pending") {
+      return { token: row.token, offers: row.offers, from: row.from, emails: row.emails ?? [] };
+    }
   }
   return null;
 }
 
 /** The settle block's words, by what Google allows now: never a hint to delete unless Remove is
- *  offered, and never "lost touch" for Check alone, which a new part changed in Google also leaves. */
-export function pendingText(offers: readonly SplitAction[], from: string): string {
+ *  offered, and never "lost touch" for Check alone, which a new part changed in Google also leaves.
+ *  `emails`: the offers that would email guests, said before they're pressed (C12). */
+export function pendingText(
+  offers: readonly SplitAction[],
+  from: string,
+  emails?: readonly SplitAction[],
+): string {
   const day = formatDateOnly(from);
   const finish = offers.includes("finish");
   const remove = offers.includes("remove");
+  const said = (text: string) => withSettleEmails(text, offers, emails);
   if (finish && remove) {
-    return `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Finish it or remove the new part first.`;
+    return said(
+      `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Finish it or remove the new part first.`,
+    );
   }
   if (finish) {
-    return `An earlier change from ${day} is saved, but PM couldn't finish moving the occurrences you changed on their own. Finish it first.`;
+    return said(
+      `An earlier change from ${day} is saved, but PM couldn't finish moving the occurrences you changed on their own. Finish it first.`,
+    );
   }
   if (remove) {
-    return `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Remove the new part, or check again.`;
+    return said(
+      `PM couldn't finish an earlier change to this repeating event: it may show twice from ${day}. Remove the new part, or check again.`,
+    );
   }
   return `PM couldn't finish an earlier change to this repeating event from ${day}. Check again; if it still can't, look at that day in Google Calendar.`;
 }

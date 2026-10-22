@@ -338,6 +338,7 @@ const told = (updated: number, invited = 0, removed = 0): GuestNotice => ({
   updated,
   invited,
   removed,
+  told_cancelled: 0,
   cancelled: false,
   people: updated + invited + removed,
   emails: updated + invited + removed,
@@ -501,6 +502,37 @@ describe("the email question", () => {
     // "One update covers every occurrence" waits for probe L8-11 (C12 critique C2-M6).
     expect(guestLines(told(2), "all", "save")).toEqual([
       "2 guests already invited will get an update.",
+    ]);
+  });
+
+  // C12c review round 3: "Does not repeat" from an occurrence cuts the series and cancels a later
+  // occurrence with a guest of its own, whom nothing else reaches: Google emails them a
+  // cancellation, never an update.
+  it("tells guests only an occurrence's cancel reaches that it's cancelled", () => {
+    const cancelledOnly = (k: number, n: GuestNotice = told(0)): GuestNotice => ({
+      ...n,
+      told_cancelled: k,
+      people: n.people + k,
+      emails: n.emails + k,
+    });
+    expect(guestLines(cancelledOnly(1), "following", "save")).toEqual([
+      "1 guest will be told an occurrence is cancelled.",
+    ]);
+    expect(guestLines(cancelledOnly(2, told(1)), "following", "save")).toEqual([
+      "1 guest already invited will get an update.",
+      "2 guests will be told an occurrence is cancelled.",
+    ]);
+    // Not an invitation-only question, with someone told of a cancel.
+    expect(notifyQuestion(cancelledOnly(1, told(0, 1)), "save")).toBe(
+      "Send update emails to guests?",
+    );
+    expect(guestLines(cancelledOnly(1, told(0, 1)), "following", "save")).toEqual([
+      "1 guest will be told an occurrence is cancelled.",
+      "1 guest new to it will get an invitation.",
+    ]);
+    // A delete keeps its own words: everyone it reaches is told it's cancelled.
+    expect(guestLines(cancelledOnly(1, told(1)), "following", "delete")).toEqual([
+      "2 guests will be told it's cancelled.",
     ]);
   });
 

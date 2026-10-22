@@ -208,7 +208,7 @@ export function SaveChoicesDialog({
       )}
       {pending && (
         <Callout tone="warning" size="md" body="ink" live={false} className="mt-3">
-          <p>{pendingText(pending.offers, pending.from)}</p>
+          <p>{pendingText(pending.offers, pending.from, pending.emails)}</p>
           <div className="mt-2 flex flex-wrap gap-2">
             {SPLIT_ORDER.filter((a) => pending.offers.includes(a)).map((action) => (
               <Button

@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The event editor (#884): change one Google event you organise without guests, a repeating one
-// included: for an occurrence, the choices dialog asks which occurrences first. It opens on Google's
-// fresh copy (never the mirror, which clips text), greys out whatever the backend says can't change
-// and says why, and saves only the fields the user changed. If the event changed in Google
-// meanwhile on a field this save also sends, nothing is overwritten: the editor reloads Google's
-// copy, keeps the user's other changes, and names the fields where Google's version now shows. A
-// dirty draft asks before it is thrown away (closing, Escape, or Delete).
+// The event editor (#884): change one Google event you organise, a repeating one or one with guests
+// included: for an occurrence the choices dialog asks which occurrences first, and a change Google
+// would email guests about asks whether it should. It opens on Google's fresh copy (never the
+// mirror, which clips text), greys out whatever the backend says can't change and says why, and
+// saves only the fields the user changed. If the event changed in Google meanwhile on a field this
+// save also sends, nothing is overwritten: the editor reloads Google's copy, keeps the user's other
+// changes, and names the fields where Google's version now shows. A dirty draft asks before it is
+// thrown away (closing, Escape, or Delete).
+//
+// Guests (C12): the list, Optional, take off, and the three guest permissions, as Google Calendar
+// has them, with suggestions from people already in the user's calendars. Send or Don't send has no
+// default: a one-off's question opens from the editor's own count before anything is sent, and
+// again with the backend's numbers if Google's copy reaches someone else; a repeating event's rows
+// ask it inside the choices dialog. A change to only Busy/free emails nobody, so it never asks.
+// Like the choices dialog, the question sits inside the editor's dialog, so Escape closes only it.
 //
 // The choices dialog sits inside the editor's, so it alone hears Escape and holds Tab. Its answer
 // binds this session and these very changes, so the save sends the object the choices were asked
@@ -39,7 +47,9 @@ import type {
   EventForEdit,
   EventPatchDraft,
   FieldPermissions,
+  GuestNotice,
   Milestone,
+  Notify,
   SeenSummary,
   SeriesChoices,
   SeriesInfo,
@@ -59,6 +69,7 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   followStart,
+  guestNotice,
   halfInstant,
   hasBadDate,
   rebaseDraft,
@@ -90,9 +101,12 @@ import {
 } from "../../../lib/calendarEdit/editReasons";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
+import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { GuestField } from "./GuestField";
+import { NotifyPrompt } from "./NotifyPrompt";
 import {
   NO_ZONE,
   RepeatRow,
@@ -118,8 +132,12 @@ interface Props {
   /** The row that was clicked: its title while Google's copy loads, and its id. */
   row: CalendarEvent;
   calendar: Calendar | null;
-  /** The account the save goes through. */
+  /** The account the save goes through: who Google sends guests' emails from, and never suggested
+   *  as a guest. */
   account: string | null;
+  /** People already in the user's calendars, for the guest box (worked out by the calendar).
+   *  Required, so a caller can't leave the box without them unnoticed. */
+  suggestions: readonly GuestSuggestion[];
   /** A milestone linked to this event, which moves with it. */
   milestone: Milestone | null;
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
@@ -136,6 +154,15 @@ interface Loaded {
   seen: SeenSummary | null;
   /** Its repeating event, when it's an occurrence of one Google let PM read. */
   series: SeriesInfo | null;
+}
+
+/** The email question, open: the save it is for (the very changes the save sends, and the
+ *  occurrences picked, if any), the numbers, and `again` when the backend asked after an answer. */
+interface Prompt {
+  what: Omit<Asking, "view">;
+  picked: Picked | null;
+  notice: GuestNotice;
+  again: boolean;
 }
 
 /** The choices dialog, open: what it was asked for, and what it shows. */
@@ -180,7 +207,15 @@ const firstDay = (t: TimeDraft) => (t.kind === "timed" ? t.start_date : t.first_
 /** Said under the Repeat row of an occurrence whose repeating event PM couldn't read. */
 export const UNREADABLE_REPEAT = "PM couldn't read how this repeats, so it can't change it here.";
 
-export function EventEditor({ row, calendar, account, milestone, onDelete, onClose }: Props) {
+export function EventEditor({
+  row,
+  calendar,
+  account,
+  suggestions,
+  milestone,
+  onDelete,
+  onClose,
+}: Props) {
   const { showPower } = useDepth();
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
   // The row is the safer sign of a repeating event: the series is null when Google's copy of it
@@ -219,7 +254,24 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   const heldNotice = useRef<string | null>(null);
   // Times this Save was asked again because the plan changed: once, then it says so.
   const againRef = useRef(0);
+  // Times the backend asked this Save whether Google emails the guests: once, then it says so. Its
+  // own count, so a "doesn't repeat" before it doesn't use up that one ask (C12c review).
+  const guestAskRef = useRef(0);
   const [settlingSplit, setSettlingSplit] = useState(false);
+  // The email question (null = closed), readable at once: no save or close goes from behind it.
+  const [prompt, setPromptState] = useState<Prompt | null>(null);
+  const promptRef = useRef<Prompt | null>(null);
+  const setPrompt = (next: Prompt | null) => {
+    promptRef.current = next;
+    setPromptState(next);
+  };
+  // Text left in the guest box that isn't an address: no save until it's cleared or fixed.
+  const badGuestRef = useRef<string | null>(null);
+  const [badGuest, setBadGuestState] = useState<string | null>(null);
+  const setBadGuest = (text: string | null) => {
+    badGuestRef.current = text;
+    setBadGuestState(text);
+  };
   // The Custom dialog, while open: no save goes from behind it.
   const customRef = useRef(false);
   const [customOpen, setCustomOpenState] = useState(false);
@@ -304,18 +356,32 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     !!loaded && !!draftRef.current && changedFields(loaded.base, draftRef.current).length > 0;
 
   const requestClose = () => {
-    if (saving) return;
+    if (saving || promptRef.current) return;
     commitFocused();
-    if (isDirty() || hasBadDate(badDatesRef.current)) setAskDiscard("close");
-    else onClose();
+    // Text in the guest box that isn't an address never reached the draft: it would be lost too.
+    if (isDirty() || hasBadDate(badDatesRef.current) || badGuestRef.current !== null) {
+      setAskDiscard("close");
+    } else onClose();
   };
 
-  /** The row a delete from here compares: what the editor showed, not a possibly older mirror row. */
-  const deleteRow = (): CalendarEvent =>
-    loaded?.seen ? { ...row, ...loaded.seen, location: loaded.seen.location } : row;
+  /** The row a delete from here compares: what the editor showed, not a possibly older mirror row,
+   *  with the guest list Google's copy has, so the delete asks about those (C12 critique C1-H2). */
+  const deleteRow = (): CalendarEvent => {
+    if (!loaded) return row;
+    const attendees = loaded.event.guests.map((g) => ({
+      name: g.name,
+      email: g.email,
+      response: g.response,
+      optional: g.optional,
+      organizer: g.organizer,
+      self: g.self,
+    }));
+    const seen = loaded.seen ? { ...loaded.seen, location: loaded.seen.location } : {};
+    return { ...row, ...seen, attendees };
+  };
 
   const requestDelete = () => {
-    if (!onDelete || saving) return;
+    if (!onDelete || saving || promptRef.current) return;
     commitFocused();
     if (isDirty()) setAskDiscard("delete");
     else onDelete(deleteRow());
@@ -406,14 +472,16 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     repeating || repeat.saveable(fields.recurrence, repeatStartOf(fields.time));
 
   async function save() {
-    // Refused before anything is blurred, so focus stays put (in the Custom dialog too).
-    if (!loaded || saving || asking || customRef.current) return;
+    // Refused before anything is blurred, so focus stays put (in the Custom dialog, or the email
+    // question, too).
+    if (!loaded || saving || asking || customRef.current || promptRef.current) return;
     const focused = document.activeElement;
     commitFocused();
     const current = draftRef.current;
     if (!current) return;
     // A new Save: no earlier ask's count or words carry into it (C9b-1 critique 1 L8).
     againRef.current = 0;
+    guestAskRef.current = 0;
     heldNotice.current = null;
     // What stops this save is already said under When, as it happened; a banner repeating it would
     // outlive the fix. A date a field couldn't read puts focus on that field, which the line names
@@ -424,10 +492,12 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
       return;
     }
-    // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row.
+    // A repeat the backend refused, or hasn't answered for yet, is said under the Repeat row; text in
+    // the guest box that isn't an address, under the box and in the problem lines.
     if (
       checkDraft(loaded.base, current, loaded.event).problems.length > 0 ||
-      !repeatReady(current)
+      !repeatReady(current) ||
+      badGuestRef.current !== null
     ) {
       setBanner(null);
       refocus(focused);
@@ -446,8 +516,30 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       title: current.summary,
       from: firstDay(current.time),
     };
-    if (repeating) void ask(what, false);
-    else await send(what, null);
+    if (repeating) {
+      // Each row says who it would email, and asks there.
+      void ask(what, false);
+      return;
+    }
+    // Who this would email, counted as the backend counts: asked before anything is sent, as
+    // Google's own question is. Nobody, and it goes (the backend has the last word either way).
+    const notice = guestNotice(loaded.base, current, loaded.event.guests_omitted, account);
+    if (notice) setPrompt({ what, picked: null, notice, again: false });
+    else await send(what, null, null, null);
+  }
+
+  /** The email question answered: it closes and the save goes with the answer, for its numbers. */
+  function onNotify(n: Notify) {
+    const p = promptRef.current;
+    if (!p) return;
+    setPrompt(null);
+    void send(p.what, p.picked, n, p.notice);
+  }
+
+  /** Back (or Escape) from the email question: nothing was sent, and the draft stays. */
+  function onNotifyBack() {
+    setPrompt(null);
+    refocusSave();
   }
 
   /** The choices found Google changed the event: rebase, with Save held until it's done (a Save
@@ -501,7 +593,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           refocusSave();
           return;
         }
-        await send(what, null);
+        await send(what, null, null, null);
         return;
       case "refused":
         closeChoices();
@@ -533,14 +625,15 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     }
   }
 
-  /** The user picked which occurrences: the dialog closes and the save goes, with the very changes
-   *  the choices were asked for. */
-  function onChoose(picked: Picked) {
+  /** The user picked which occurrences (and Send or Don't send, when that row would email guests):
+   *  the dialog closes and the save goes, with the very changes the choices were asked for. The
+   *  token binds who it emails, so no numbers go with the answer. */
+  function onChoose(picked: Picked, notify: Notify | null) {
     if (!asking) return;
     const { session, changes, title, from } = asking;
     askSeq.current++;
     setAsking(null);
-    void send({ session, changes, title, from }, picked);
+    void send({ session, changes, title, from }, picked, notify, null);
   }
 
   /** Settle the earlier change the dialog's pending row names. Its notice says how it went; the
@@ -554,14 +647,20 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     refocusSave();
   }
 
-  /** Send the save, for `picked` when the choices were asked, and act on what came back. */
-  async function send(what: Omit<Asking, "view">, picked: Picked | null) {
+  /** Send the save, for `picked` when the choices were asked, with Send or Don't send (`notify`)
+   *  for the numbers `asked` when the save would email guests, and act on what came back. */
+  async function send(
+    what: Omit<Asking, "view">,
+    picked: Picked | null,
+    notify: Notify | null,
+    asked: GuestNotice | null,
+  ) {
     setSaving(true);
     let stayOpen = true;
-    // The choices opened again from here: focus is theirs.
+    // The choices or the email question opened again from here: focus is theirs.
     let reasked = false;
     try {
-      const outcome = await saveEdit(what.session, what.changes, picked, what.title);
+      const outcome = await saveEdit(what.session, what.changes, picked, what.title, notify, asked);
       if (outcome.outcome !== "needs_choice") heldNotice.current = null;
       switch (outcome.outcome) {
         case "saved":
@@ -582,10 +681,17 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           onClose();
           return;
         case "needs_choice":
-          // Whether Google emails the guests (C12): never answered by choosing occurrences, whose
-          // dialog would say "doesn't repeat" and send it again unanswered, round and round.
+          // Whether Google emails the guests (C12): asked with the backend's numbers, never by
+          // choosing occurrences, whose dialog would say "doesn't repeat" and send it again
+          // unanswered, round and round. Once per Save: a second ask is said instead.
           if (outcome.guests && !outcome.scope) {
-            setBanner(outcomeText(outcome));
+            if (++guestAskRef.current > 1) {
+              setBanner(outcomeText(outcome));
+              return;
+            }
+            reasked = true;
+            // "Again" only when an answer was given: the numbers changed since the user chose.
+            setPrompt({ what, picked, notice: outcome.guests, again: notify !== null });
             return;
           }
           // No choice sent, and the event repeats after all (R9): ask, saying nothing.
@@ -612,7 +718,10 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             onClose();
             return;
           }
-          setBanner({ tone: "warn", text: earlierChangeText(outcome.offers, outcome.from) });
+          setBanner({
+            tone: "warn",
+            text: earlierChangeText(outcome.offers, outcome.from, outcome.emails),
+          });
           return;
         case "conflict":
           await rebaseAfterConflict(outcomeText(outcome).text);
@@ -816,12 +925,34 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             ))}
             {/* What else would stop the save (a date a field couldn't read is said under When),
                 shown as it happens rather than only on Save (each sentence once: a start and an end
-                in the same skipped hour say the same thing). */}
-            {[...new Set(check?.problems.map(problemText) ?? [])].map((text) => (
+                in the same skipped hour say the same thing). Text left in the guest box that isn't
+                an address is one too, beside the box's own line under it. */}
+            {[
+              ...new Set([
+                ...(check?.problems.map(problemText) ?? []),
+                ...(badGuest !== null ? [problemText({ kind: "bad_guest", email: badGuest })] : []),
+              ]),
+            ].map((text) => (
               <p key={text} className="text-xs text-st-due">
                 {text}
               </p>
             ))}
+
+            <GuestField
+              guests={draft.guests}
+              base={loaded.base.guests}
+              perms={draft.guest_perms}
+              suggestions={suggestions}
+              me={account}
+              organizer={loaded.event.organizer_email}
+              disabled={!may("guests")}
+              omitted={loaded.event.guests_omitted}
+              onChange={(guests) => draftRef.current && setDraft({ ...draftRef.current, guests })}
+              onPerms={(guest_perms) =>
+                draftRef.current && setDraft({ ...draftRef.current, guest_perms })
+              }
+              onReject={setBadGuest}
+            />
 
             <TextRow
               label="Location"
@@ -916,12 +1047,24 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             onClose={() => setCustomOpen(false)}
           />
         )}
+        {/* The email question, nested the same way: Escape and Back close only it. */}
+        {prompt && (
+          <NotifyPrompt
+            kind="save"
+            notice={prompt.notice}
+            from={account}
+            again={prompt.again}
+            onSend={onNotify}
+            onBack={onNotifyBack}
+          />
+        )}
         {asking && (
           <SaveChoicesDialog
             kind="save"
             title={asking.title}
             view={asking.view}
             settling={settlingSplit}
+            from={account}
             onChoose={onChoose}
             onSettle={(token, action) => void onSettle(token, action)}
             onClose={() => {

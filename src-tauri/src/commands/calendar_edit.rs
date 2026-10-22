@@ -60,7 +60,7 @@ use crate::calendar_write::series::diff::{self, Expect, GoneRow, Refetch, Remove
 use crate::calendar_write::series::journal::{self, Entry, Look, Orphan};
 use crate::calendar_write::series::plan::{
     marks_from, plan_series_delete, plan_series_edit, Fresh, NotPlanned, Op, Opened, SeriesInput,
-    SeriesPlan, SeriesWarning, Shows, Undo,
+    SeriesPlan, SeriesWarning, Shows, Step, Undo,
 };
 use crate::calendar_write::series::run::{
     Answer, End, Machine, Next, Ran, Rollback, Run, Settle, SettleAction, Settled, Unfit, Unsent,
@@ -301,13 +301,6 @@ fn facts_from_fresh<'a>(
             .unwrap_or(false),
         visibility: text("visibility"),
         series_master: turned_series(fresh),
-        has_guests: fresh
-            .get("attendees")
-            .and_then(Value::as_array)
-            .is_some_and(|a| {
-                a.iter()
-                    .any(|g| !g.get("self").and_then(Value::as_bool).unwrap_or(false))
-            }),
         html_description: text("description").is_some_and(patch::description_is_html),
     }
 }
@@ -334,7 +327,6 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         // The mirror never holds a series itself (`calendar::parse_event`). An occurrence is
         // editable like a one-off here: which occurrences is asked at the write (rule R9).
         series_master: false,
-        has_guests: row.attendees.iter().any(|a| !a.is_self),
         html_description: false,
     }
 }
@@ -944,6 +936,7 @@ async fn held_new_part<W: Wire, H: Host>(
             offers: view.offers,
             from: view.from,
             note: None,
+            emails: view.emails,
         });
     }
     let failed = |e: Error| WriteOutcome::Failed {
@@ -2221,10 +2214,6 @@ async fn send_delete<W: Wire, H: Host>(
 
 // --- repeating events (C9) ---
 
-/// Whether a series with guests may change: not until C12 brings Send / Don't send, whatever the
-/// occurrence shows (C8b review G5).
-const GUESTS_ALLOWED: bool = false;
-
 /// Pages read of a series' exceptions (100 a page) and of its occurrences (250 a page) before PM
 /// gives up and calls the listing incomplete.
 const EXCEPTION_PAGES: usize = 10;
@@ -2591,11 +2580,6 @@ async fn gather<W: Wire>(
     if let Some(reason) = master.read_only() {
         return Err(WriteOutcome::ReadOnly { reason });
     }
-    if master.guests && !GUESTS_ALLOWED {
-        return Err(WriteOutcome::ReadOnly {
-            reason: ReadOnlyReason::HasGuests,
-        });
-    }
     let calendar = target.remote_calendar.as_str();
     let listed = match master_fresh.json().get("iCalUID").and_then(Value::as_str) {
         Some(ical) => {
@@ -2775,6 +2759,7 @@ async fn choices<W: Wire, H: Host>(
                 token: view.token.clone(),
                 offers: view.offers.clone(),
                 from: view.from.clone(),
+                emails: view.emails.clone(),
             };
         }
         // One from before PM closed has no token to settle by: refused, with what to do.
@@ -2846,7 +2831,6 @@ impl Planning {
             instances: self.series.counted.as_ref(),
             sibling: self.series.sibling,
             later: self.series.later,
-            guests_allowed: GUESTS_ALLOWED,
             me: &self.me,
         }
     }
@@ -3346,6 +3330,7 @@ async fn prepared_for<W: Wire, H: Host>(
                 offers: view.offers,
                 from: view.from,
                 note: None,
+                emails: view.emails,
             });
         }
     }
@@ -4594,10 +4579,36 @@ struct HeldSplit {
     tail_changed: bool,
 }
 
+impl HeldSplit {
+    /// The offers that would email guests (C12): Remove deletes the new part with its insert's own
+    /// Send / Don't send, and Finish sends the rest of the plan, each step with its own. Only a change
+    /// that went with Send, to someone, emails anyone this way.
+    fn emails(&self) -> Vec<SplitAction> {
+        let steps = &self.plan.steps;
+        let emails = |step: &Step| step.notify != Notify::None;
+        let insert = steps.iter().find(|s| matches!(s.op, Op::Insert { .. }));
+        self.offers
+            .iter()
+            .copied()
+            .filter(|action| match action {
+                SplitAction::Remove => insert.is_some_and(emails),
+                // What `Run::finish` sends: the steps after the one left unknown, which it proves.
+                SplitAction::Finish => match &self.ran {
+                    Ran::Unknown { step, .. } => steps.iter().skip(step + 1).any(emails),
+                    _ => false,
+                },
+                SplitAction::Check => false,
+            })
+            .collect()
+    }
+}
+
 /// What a blocked change or a choices row sees of a held split.
 struct HeldView {
     token: String,
     offers: Vec<SplitAction>,
+    /// The offers that would email guests ([`HeldSplit::emails`]).
+    emails: Vec<SplitAction>,
     from: String,
     master: String,
     tail: String,
@@ -4628,11 +4639,12 @@ impl CalendarEditState {
             .is_ok_and(|running| running.contains(key))
     }
 
-    /// What the split held under `token` allows now, and its day: `None` once it's settled or taken.
-    fn held_split(&self, token: &str) -> Option<(Vec<SplitAction>, String)> {
+    /// What the split held under `token` allows now, its day, and which offers would email guests:
+    /// `None` once it's settled or taken.
+    fn held_split(&self, token: &str) -> Option<(Vec<SplitAction>, String, Vec<SplitAction>)> {
         let partials = self.partials.lock().ok()?;
         let held = partials.get(token)?;
-        Some((held.offers.clone(), held.facts.from.clone()))
+        Some((held.offers.clone(), held.facts.from.clone(), held.emails()))
     }
 
     fn hold_partial(&self, token: String, held: HeldSplit) {
@@ -4653,6 +4665,7 @@ impl CalendarEditState {
             .map(|(token, h)| HeldView {
                 token: token.clone(),
                 offers: h.offers.clone(),
+                emails: h.emails(),
                 from: h.facts.from.clone(),
                 master: h.facts.master.clone(),
                 tail: h.facts.tail.clone(),
@@ -4857,6 +4870,7 @@ fn partial_outcome(token: &str, held: &HeldSplit) -> WriteOutcome {
         offers: held.offers.clone(),
         from: held.facts.from.clone(),
         note: None,
+        emails: held.emails(),
     }
 }
 
@@ -5049,25 +5063,18 @@ async fn look_and_hold<W: Wire, H: Host>(
             drop_hash(host, cal);
             host.landed(cal);
             let token = token.unwrap_or_else(new_split_ref);
-            let from = facts.from.clone();
-            host.edit().hold_partial(
-                token.clone(),
-                HeldSplit {
-                    target: ctx.target.clone(),
-                    plan,
-                    ran,
-                    facts,
-                    offers: offers.clone(),
-                    tail_seen,
-                    tail_changed: false,
-                },
-            );
-            WriteOutcome::PartialSplit {
-                token,
+            let held = HeldSplit {
+                target: ctx.target.clone(),
+                plan,
+                ran,
+                facts,
                 offers,
-                from,
-                note: None,
-            }
+                tail_seen,
+                tail_changed: false,
+            };
+            let outcome = partial_outcome(&token, &held);
+            host.edit().hold_partial(token, held);
+            outcome
         }
     }
 }
@@ -5337,7 +5344,7 @@ fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> W
         // Only creating an event answers this; a settle never does.
         | WriteOutcome::Ambiguous { .. } => return outcome,
     };
-    let Some((offers, from)) = edit.held_split(token) else {
+    let Some((offers, from, emails)) = edit.held_split(token) else {
         return outcome;
     };
     WriteOutcome::PartialSplit {
@@ -5345,6 +5352,7 @@ fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> W
         offers,
         from,
         note: Some(note),
+        emails,
     }
 }
 
@@ -6494,9 +6502,6 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
         ReadOnlyReason::BecameRepeating => {
             "This became a repeating event in Google. Refresh, then open one of its occurrences."
         }
-        ReadOnlyReason::HasGuests => {
-            "This event has guests, and PM can't change events with guests yet."
-        }
         ReadOnlyReason::SpecialType => {
             "Birthdays, events from Gmail, focus time, out of office and working locations can't \
              be changed here."
@@ -7284,13 +7289,13 @@ mod tests {
             "description": "<b>agenda</b>"
         });
         let f = facts_from_fresh(&mine, &facts, EditingStatus::On);
-        assert!(f.organizer_self && !f.has_guests && f.html_description && !f.series_master);
+        assert!(f.organizer_self && f.html_description && !f.series_master);
         let invite = json!({
             "organizer": { "email": "boss@x.com" }, "recurringEventId": "s1",
             "attendees": [{ "email": "me@x.com", "self": true }, { "email": "boss@x.com" }]
         });
         let f = facts_from_fresh(&invite, &facts, EditingStatus::On);
-        assert!(!f.organizer_self && f.has_guests && !f.series_master);
+        assert!(!f.organizer_self && !f.series_master);
         assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::NotOrganizer));
         // An occurrence, a one-off, and a one-off Google has since given a rule: only the last is a
         // series itself, with its own reason (C9 design critique 2 M6).
@@ -7401,7 +7406,6 @@ mod tests {
             locked: true,
             visibility: None,
             series_master: false,
-            has_guests: false,
             html_description: false,
         });
         let title = EventPatchDraft {
@@ -7728,8 +7732,9 @@ mod tests {
         );
     }
 
-    /// C12 §6.9: a series delete that would tell someone is never held, nor sent, unanswered. Until
-    /// the lift (C12c) no series with guests gets this far, so the order is read from the source.
+    /// C12 §6.9: a series delete that would tell someone is never held, nor sent, unanswered. The
+    /// send's check can't be reached by a plan held with its answer (the token binds who it tells),
+    /// so both orders are read from the source; the hold's is run below too.
     #[test]
     fn a_series_delete_is_never_held_or_sent_unanswered() {
         let source = include_str!("calendar_edit.rs");
@@ -8177,6 +8182,61 @@ mod tests {
         assert!(outcome == saved(), "deleted, as chosen");
     }
 
+    /// C12c review: a delete from the editor asks with Google's list, which can be newer than PM's
+    /// row. Here the row shows A, Google's copy (what the editor showed) A and B, and the answer is
+    /// Send for those two: it is held, not asked again with the row's one, and at the send Google's
+    /// copy matches it, so both are emailed and it is deleted.
+    #[tokio::test]
+    async fn an_editor_delete_answered_for_googles_newer_list_is_held_and_deleted() {
+        let event = dentist();
+        let me = json!({ "email": "me@example.com", "self": true, "organizer": true });
+        let a = json!({ "email": "a@x.org", "responseStatus": "accepted" });
+        let b = json!({ "email": "b@x.org", "responseStatus": "needsAction" });
+        let stored = written(
+            &event,
+            &[("attendees", json!([me.clone(), a.clone()]))],
+            "\"s1\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&stored));
+        let target = target(&event);
+        let row = host
+            .with_conn(|conn| row_guests(conn, &target.row_id, &own_of(&target, &[])))
+            .unwrap();
+        let two = GuestNotice {
+            updated: 2,
+            people: 2,
+            emails: 2,
+            cancelled: true,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(
+            row.as_ref().is_some_and(|r| r.people == 1),
+            "PM's row shows A alone"
+        );
+        let answer = answered(Notify::All, two.clone());
+        assert!(answer.before_hold(row) == Ok(()), "held, not asked again");
+        let google = written(&event, &[("attendees", json!([me, a, b]))], "\"s2\"");
+        assert!(
+            attendees::delete_notice(&google, &own_of(&target, &[&google])) == Some(two),
+            "the editor's numbers are Google's"
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", google),
+            told(
+                Method::Delete,
+                "/events/solo",
+                "\"s2\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+        ]);
+        let seen = seen_by_user(&fresh_event(stored));
+        let outcome = send_delete(&script, &*host, &target, &seen, &answer).await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, emailing both");
+    }
+
     /// C12 §6.10: a first guest added to a repeating event (allowed: it has none yet) is counted on
     /// every row the dialog offers.
     #[tokio::test]
@@ -8273,6 +8333,343 @@ mod tests {
             first_write(&script).body == Some(json!({ "attendees": [{ "email": "b@x.org" }] })),
             "the series' list with the guest"
         );
+    }
+
+    // --- guests on events you organise (C12c): the gate lifted ---
+
+    /// `event` you organise with one guest, `a@x.org`, who has said yes.
+    fn with_a_guest(event: Value) -> Value {
+        with(
+            event,
+            "attendees",
+            json!([
+                { "email": "me@example.com", "self": true, "organizer": true,
+                  "responseStatus": "accepted" },
+                { "email": "a@x.org", "responseStatus": "accepted" }
+            ]),
+        )
+    }
+
+    /// One guest already on it, told of a change.
+    fn one_updated() -> GuestNotice {
+        GuestNotice {
+            updated: 1,
+            people: 1,
+            emails: 1,
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// One guest already on it, told it's cancelled.
+    fn one_told() -> GuestNotice {
+        GuestNotice {
+            cancelled: true,
+            ..one_updated()
+        }
+    }
+
+    /// C12 §5.1, §6.9: deleting every occurrence of a series with a guest, unanswered, is asked
+    /// before anything is held, with only reads sent; with Send, the series' DELETE says so.
+    #[tokio::test]
+    async fn a_series_delete_with_guests_is_asked_before_its_hold() {
+        let guest = |event: Value| {
+            with(
+                event,
+                "attendees",
+                json!([{ "email": "a@example.com", "responseStatus": "accepted" }]),
+            )
+        };
+        let (series, instance) = (guest(weekly()), guest(monday_19()));
+        let window: Vec<Value> = october().into_iter().map(guest).collect();
+        let host = TestHost::holding(&window);
+        let target = target(&instance);
+        let seen = seen_by_user(&fresh_event(instance.clone()));
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone()],
+            window.clone(),
+        ));
+        let ctx = writer(&script, &host, &target);
+        let asked = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None).await;
+        script.finished();
+        assert!(
+            matches!(&asked, Err(outcome) if *outcome == WriteOutcome::needs_notify(one_told())),
+            "asked, one guest told"
+        );
+        assert!(script.sent().iter().all(|p| p.method == Method::Get));
+        let mut steps = reads(&instance, &series, vec![series.clone()], window.clone());
+        steps.extend(reads(&instance, &series, vec![series.clone()], window));
+        steps.push(told(
+            Method::Delete,
+            "/events/abc",
+            "\"m1\"",
+            "sendUpdates=all",
+            Scripted::Status(204),
+        ));
+        steps.push(refetch_read(Scripted::Status(410)));
+        let script = Script::new(steps);
+        let outcome =
+            held_delete_told(&host, &script, &instance, Scope::All, Some(Notify::All)).await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, the guest told");
+    }
+
+    /// C12 §7.3: an event you organise with guests is editable, in the list and in the editor, its
+    /// guest list included; an invitation still isn't (C14).
+    #[test]
+    fn an_organisers_event_with_guests_is_editable() {
+        let (_d, conn) = store();
+        let cal = "gcal:me@x.com:me@x.com";
+        add_calendar(&conn, "gcal:me@x.com", "google", cal, Some("me@x.com"));
+        let guest = |email: &str, me: bool| calendar::Attendee {
+            email: Some(email.into()),
+            is_self: me,
+            organizer: me,
+            ..Default::default()
+        };
+        let mine = CalendarEvent {
+            id: format!("{cal}:a"),
+            calendar_id: cal.into(),
+            summary: "Mine".into(),
+            start: "2026-10-12T09:00:00Z".into(),
+            organizer_self: true,
+            attendees: vec![guest("me@x.com", true), guest("a@x.org", false)],
+            ..Default::default()
+        };
+        let invite = CalendarEvent {
+            id: format!("{cal}:b"),
+            organizer_self: false,
+            ..mine.clone()
+        };
+        assert_eq!(
+            edit_blocks(&conn, &[mine, invite]).unwrap(),
+            vec![None, Some(ReadOnlyReason::NotOrganizer)],
+            "the list: editable when it's yours"
+        );
+        let facts = CalendarFacts {
+            access_role: Some("owner".into()),
+            ..Default::default()
+        };
+        let fresh = with_a_guest(dentist());
+        let perms = gate::edit_rights(&facts_from_fresh(&fresh, &facts, EditingStatus::On));
+        assert!(
+            perms.summary && perms.time && perms.guests && perms.delete && perms.reasons.is_empty(),
+            "the editor: every field, the guests too"
+        );
+    }
+
+    /// C12 §7.3: a title change on an event with a guest asks first, only the GET sent; Send goes
+    /// to Google with `all`, Don't send with `none`.
+    #[tokio::test]
+    async fn a_title_change_with_guests_asks_then_sends_all() {
+        let event = with_a_guest(dentist());
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &title("Retro"), Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(one_updated()),
+            "asked, one guest to update"
+        );
+        assert_eq!(script.sent().len(), 1, "only the GET");
+        for (notify, query) in [
+            (Notify::All, "sendUpdates=all"),
+            (Notify::None, "sendUpdates=none"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off_told(
+                &host,
+                &event,
+                target(&event),
+                &title("Retro"),
+                vec![told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    query,
+                    Scripted::Json(retitled(&event, "\"s2\"")),
+                )],
+                answered(notify, one_updated()),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "saved, as chosen");
+        }
+    }
+
+    /// C12 §7.3: Busy/free is the user's own on their copy: a change to only it never asks, and
+    /// sends `none` (R7).
+    #[tokio::test]
+    async fn a_busy_free_change_with_guests_never_asks() {
+        let event = with_a_guest(dentist());
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let draft = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &draft,
+            vec![told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                "sendUpdates=none",
+                Scripted::Json(written(
+                    &event,
+                    &[("transparency", json!("transparent"))],
+                    "\"s2\"",
+                )),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "saved, nobody asked or emailed");
+    }
+
+    /// C12 §5.3: the answer given before the hold is the one the delete sends after it.
+    #[tokio::test]
+    async fn the_answer_is_taken_into_the_hold() {
+        let event = with_a_guest(dentist());
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            told(
+                Method::Delete,
+                "/events/solo",
+                "\"s1\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+        ]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &answered(Notify::All, one_told()),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, the guest told");
+    }
+
+    /// C12 §5.3: a guest added in Google during the hold stops a delete nobody answered for: asked,
+    /// nothing deleted, and Google's copy, the guest on it, goes into the mirror, so a delete started
+    /// again asks before its hold (critique C1-H2).
+    #[tokio::test]
+    async fn guests_who_appear_during_the_hold_stop_the_delete() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let invited = written(&with_a_guest(dentist()), &[], "\"s2\"");
+        let script = Script::new(vec![Step::get("/events/solo", "", invited)]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &GuestAnswer::default(),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(one_told()),
+            "asked, nothing deleted"
+        );
+        let own = own_of(&target(&event), &[]);
+        let asked = host
+            .with_conn(|conn| row_guests(conn, "cal:solo", &own))
+            .unwrap();
+        assert!(asked == Some(one_told()), "the next delete asks first");
+    }
+
+    /// C12 §7.3: "this and following" on a series with a guest, unanswered, is asked with every
+    /// email the split sends (the new part's invitation and the earlier part's update) and nothing
+    /// written; with Send, each step that reaches the guest goes with `all`.
+    #[tokio::test]
+    async fn a_split_with_guests_sends_each_step_its_answer_and_counts_every_email() {
+        let guest = |event: Value| {
+            with(
+                event,
+                "attendees",
+                json!([{ "email": "a@example.com", "responseStatus": "accepted" }]),
+            )
+        };
+        let (series, instance) = (guest(weekly()), guest(monday_19()));
+        let window: Vec<Value> = october().into_iter().map(guest).collect();
+        let host = TestHost::holding(&window);
+        let reads = || reads(&instance, &series, vec![series.clone()], window.clone());
+        let script = Script::new(reads());
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &instance,
+            &series,
+            title("Retro"),
+            Scope::Following,
+        )
+        .await;
+        script.finished();
+        let both = GuestNotice {
+            emails: 2,
+            ..one_updated()
+        };
+        assert!(
+            outcome == WriteOutcome::needs_notify(both),
+            "asked, two emails to one guest"
+        );
+        assert!(
+            script.sent().iter().all(|p| p.method == Method::Get),
+            "only reads"
+        );
+        let plan = Case::new(series.clone(), instance.clone())
+            .edit(Scope::Following, title("Retro"))
+            .unwrap();
+        let Op::Patch { body: cut, .. } = &plan.steps[1].op else {
+            panic!("not a cut");
+        };
+        let mut steps = reads();
+        steps.push(Step::new(
+            Method::Insert,
+            "/events",
+            "sendUpdates=all conferenceDataVersion=1",
+            Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT)),
+        ));
+        steps.push(told(
+            Method::Patch,
+            "/events/abc",
+            "\"m1\"",
+            "sendUpdates=all",
+            Scripted::Json(written(
+                &series,
+                &[("recurrence", cut["recurrence"].clone())],
+                "\"m2\"",
+            )),
+        ));
+        steps.push(refetch_read(Scripted::Json(page(
+            vec![window[0].clone()],
+            None,
+        ))));
+        steps.push(tail_refetch(Scripted::Json(page(tail_october(), None))));
+        let script = Script::new(steps);
+        let (outcome, _) = save_told(
+            &host,
+            &script,
+            &instance,
+            &series,
+            title("Retro"),
+            Scope::Following,
+            Some(Notify::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "saved, each step as chosen");
     }
 
     #[test]
@@ -9045,9 +9442,10 @@ mod tests {
         assert_eq!(token(&following), token(&all));
     }
 
-    /// A29: a listing by iCal UID that didn't run to its end refuses what reaches past the occurrence
-    /// picked, and the occurrences' own listing never stands in for it. Until C12 that includes a
-    /// change of text to all of them: only a whole listing shows none has guests of its own.
+    /// A29: a listing by iCal UID that didn't run to its end refuses a split or a cut past the
+    /// occurrence picked, and the occurrences' own listing never stands in for it. A change of text
+    /// to all of them, or deleting them, goes ahead since C12 (no guests rule needs the listing
+    /// whole any more), saying "some" may keep or lose their changes and "at least" who is told.
     #[tokio::test]
     async fn an_exceptions_page_that_fails_refuses_incomplete_never_reads_instances() {
         let (series, instance) = (weekly(), monday_19());
@@ -9071,7 +9469,19 @@ mod tests {
             ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
         assert!(script.sent()[3].url.contains("pageToken=p2"));
         assert!(matches!(this, ScopeRow::Offered { .. }));
-        assert_eq!((following, all), (incomplete(), incomplete()));
+        assert_eq!(following, incomplete());
+        let at_least = |row: &ScopeRow, cancelled: bool| {
+            matches!(row, ScopeRow::Offered { guests: Some(g), .. }
+                if !g.complete && g.cancelled == cancelled && g.people == 0)
+        };
+        assert!(at_least(&all, false), "every occurrence, at least");
+        assert_eq!(
+            warnings(&all),
+            [SeriesWarningDto::ExceptionsMayReset {
+                count: 0,
+                complete: false
+            }]
+        );
         let script = Script::new(failing(&instance));
         let delete = ChoiceRequest::Delete {
             event_id: "cal:abc_20261019T080000Z".into(),
@@ -9079,13 +9489,13 @@ mod tests {
         };
         let (this, following, all) = ask(&script, &instance, delete, None, &["abc"]).await;
         assert!(matches!(this, ScopeRow::Offered { .. }));
-        assert_eq!((following, all), (incomplete(), incomplete()));
+        assert_eq!(following, incomplete());
+        assert!(at_least(&all, true), "every occurrence deleted, at least");
     }
 
     /// C9 design §0.8, review M3/L4: an occurrence moved or cancelled on its own that the listing by
     /// iCal UID misses refuses a split, and an "all events" move, which would otherwise lose or bring
-    /// it back. (Until C12 the guests rule refuses them first, a change of text to every occurrence
-    /// too; plan.rs tests each guard on its own with guests allowed.)
+    /// it back. A change of text to every occurrence goes ahead since C12, and says "some".
     #[tokio::test]
     async fn a_moved_occurrence_the_listing_misses_refuses_incomplete() {
         let series = weekly();
@@ -9102,10 +9512,14 @@ mod tests {
             let (this, following, all) =
                 ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
             assert!(matches!(this, ScopeRow::Offered { .. }));
+            assert_eq!(following, incomplete(), "no split past a missed occurrence");
             assert_eq!(
-                (&following, &all),
-                (&incomplete(), &incomplete()),
-                "{missed}"
+                warnings(&all),
+                [SeriesWarningDto::ExceptionsMayReset {
+                    count: 0,
+                    complete: false
+                }],
+                "a change of text to every occurrence, with some"
             );
             let window = vec![missed.clone(), instance.clone()];
             let script = Script::new(reads(&instance, &series, vec![series.clone()], window));
@@ -9179,39 +9593,38 @@ mod tests {
         assert!(matches!(all, ScopeRow::Offered { .. }));
     }
 
-    /// C8b review G5: a series with guests stays read-only until C12, even from an occurrence whose
-    /// guests were removed on its own.
+    /// C12 (C8b review G5's refusal lifted): a series with a guest offers every row, each saying who
+    /// it would email. "This and following" writes two events, the new part and the earlier one,
+    /// so the same guest gets two emails.
     #[tokio::test]
-    async fn a_series_with_a_guest_is_read_only_until_c12() {
-        let series = with(
-            weekly(),
-            "attendees",
-            json!([{ "email": "a@example.com", "responseStatus": "accepted" }]),
-        );
-        let instance = monday_19();
-        let script = Script::new(vec![
-            instance_read(&instance),
-            Step::get("/events/abc", "", series.clone()),
-        ]);
-        let got = choices(
-            &script,
-            &*TestHost::holding(&[]),
-            &target(&instance),
-            EditingStatus::On,
-            &mirror(&["abc"]),
-            &edit(title("Retro")),
-            Some((&instance, Some(&series))),
-        )
-        .await;
+    async fn a_series_with_guests_offers_every_row_with_its_emails() {
+        let guest = |event: Value| {
+            with(
+                event,
+                "attendees",
+                json!([{ "email": "a@example.com", "responseStatus": "accepted" }]),
+            )
+        };
+        let (series, instance) = (guest(weekly()), guest(monday_19()));
+        let window = october().into_iter().map(guest).collect();
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], window));
+        let opened = Some((&instance, Some(&series)));
+        let (this, following, all) =
+            ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
         script.finished();
-        assert_eq!(
-            got,
-            SeriesChoices::Refused {
-                result: WriteOutcome::ReadOnly {
-                    reason: ReadOnlyReason::HasGuests
-                }
-            }
-        );
+        let told = |emails| GuestNotice {
+            updated: 1,
+            people: 1,
+            emails,
+            complete: true,
+            ..Default::default()
+        };
+        for (row, want) in [(&this, told(1)), (&following, told(2)), (&all, told(1))] {
+            assert!(
+                matches!(row, ScopeRow::Offered { guests: Some(g), .. } if *g == want),
+                "every row offered, with its emails"
+            );
+        }
     }
 
     /// C9 design review L7: an occurrence with a plain description of its own, in a series whose
@@ -9880,11 +10293,12 @@ mod tests {
         );
     }
 
-    /// Until C12, a row that would reach an occurrence with guests of its own is refused: listed by
-    /// iCal UID (the planners) or only in Google's occurrences (here), and only from where it
-    /// reaches. "This event" on another occurrence is still offered.
+    /// C12: an occurrence with guests of its own is counted, not refused (C9a-2's refusal lifted),
+    /// whether listed by iCal UID or seen only in Google's occurrences. "All events" is offered as
+    /// "at least" (PM can't tell whether Google emails that occurrence's guests too); "this and
+    /// following" past it still can't carry its guests onto the new part (Q3).
     #[tokio::test]
-    async fn guests_on_another_occurrence_hold_back_the_rows_that_reach_it() {
+    async fn an_occurrence_with_guests_of_its_own_is_counted_not_refused() {
         let (series, instance) = (weekly(), monday_19());
         let invited = |at: &str| {
             with(
@@ -9894,12 +10308,15 @@ mod tests {
             )
         };
         let opened = Some((&instance, Some(&series)));
-        let held = |day: &str| ScopeRow::Refused {
-            message: format!(
-                "The occurrence on {day} has guests of its own, and PM can't change events with \
-                 guests yet. Choose “This event” to change only this one."
-            ),
+        let cant_carry = |y, m, d| ScopeRow::Refused {
+            message: SeriesRefusal::CannotCarry(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap())
+                .to_string(),
         };
+        let at_least = |row: &ScopeRow, cancelled: bool| {
+            matches!(row, ScopeRow::Offered { guests: Some(g), .. }
+                if !g.complete && g.cancelled == cancelled && g.people == 0)
+        };
+        let nobody = |row: &ScopeRow| matches!(row, ScopeRow::Offered { guests: None, .. });
         let later = invited("2026-10-26T09:00:00Z");
         let script = Script::new(reads(
             &instance,
@@ -9909,11 +10326,9 @@ mod tests {
         ));
         let (this, following, all) =
             ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
-        assert!(matches!(this, ScopeRow::Offered { .. }));
-        assert_eq!(
-            (&following, &all),
-            (&held("26-10-2026"), &held("26-10-2026"))
-        );
+        assert!(nobody(&this));
+        assert_eq!(following, cant_carry(2026, 10, 26));
+        assert!(at_least(&all, false), "all events, at least");
         let delete = || ChoiceRequest::Delete {
             event_id: "cal:abc_20261019T080000Z".into(),
             seen: seen_by_user(&fresh_event(instance.clone())),
@@ -9925,8 +10340,14 @@ mod tests {
             vec![instance.clone(), later.clone()],
         ));
         let (this, following, all) = ask(&script, &instance, delete(), None, &["abc"]).await;
-        assert!(matches!(this, ScopeRow::Offered { .. }));
-        assert_eq!((following, all), (held("26-10-2026"), held("26-10-2026")));
+        assert!(nobody(&this));
+        // The cut cancels that occurrence: its guest is told, counted.
+        assert!(
+            matches!(&following, ScopeRow::Offered { guests: Some(g), .. }
+                if g.cancelled && g.updated == 1 && g.complete),
+            "its guest told of the cancellation"
+        );
+        assert!(at_least(&all, true), "every occurrence deleted, at least");
         // Before the occurrence picked: "this and following" doesn't reach it.
         let earlier = invited("2026-10-12T09:00:00+01:00");
         let script = Script::new(reads(
@@ -9937,10 +10358,10 @@ mod tests {
         ));
         let (_, following, all) =
             ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
-        assert!(matches!(following, ScopeRow::Offered { .. }));
-        assert_eq!(all, held("12-10-2026"));
+        assert!(nobody(&following));
+        assert!(at_least(&all, false));
         // Missing from the listing, seen only in Google's occurrences: the cross-check counts it
-        // against the listing, which then can't show that nothing reached has guests.
+        // against the listing, which a split needs whole; "All events" says "some" and "at least".
         let script = Script::new(reads(
             &instance,
             &series,
@@ -9949,8 +10370,16 @@ mod tests {
         ));
         let (this, following, all) =
             ask(&script, &instance, edit(title("Retro")), opened, &["abc"]).await;
-        assert!(matches!(this, ScopeRow::Offered { .. }));
-        assert_eq!((following, all), (incomplete(), incomplete()));
+        assert!(nobody(&this));
+        assert_eq!(following, incomplete());
+        assert!(at_least(&all, false));
+        assert_eq!(
+            warnings(&all),
+            [SeriesWarningDto::ExceptionsMayReset {
+                count: 0,
+                complete: false
+            }]
+        );
     }
 
     /// A change to every occurrence says how many were changed on their own and may keep or lose
@@ -11224,8 +11653,133 @@ mod tests {
         }
     }
 
-    /// Design critique 1: until C12 a guest who appeared in Google before the resend a 412 calls for
-    /// is a conflict, whatever the step watches; nothing is sent again.
+    /// C12 critiques C1-M5, C2-H3: under Send, a guest who appeared in Google before the resend a 412
+    /// calls for is no one the user answered for, so the save stops there and the next one asks with
+    /// the new numbers, as a one-off's second round does; nothing is sent again.
+    #[tokio::test]
+    async fn a_guest_added_before_a_resend_under_send_is_a_conflict() {
+        let guest = |event: Value| {
+            with(
+                event,
+                "attendees",
+                json!([{ "email": "a@example.com", "responseStatus": "accepted" }]),
+            )
+        };
+        let (series, instance) = (guest(weekly()), guest(monday_19()));
+        let window: Vec<Value> = october().into_iter().map(guest).collect();
+        let host = TestHost::holding(&window);
+        let invited = written(
+            &series,
+            &[(
+                "attendees",
+                json!([{ "email": "a@example.com" }, { "email": "b@example.com" }]),
+            )],
+            "\"m2\"",
+        );
+        let mut steps = reads(&instance, &series, vec![series.clone()], window.clone());
+        steps.extend([
+            told(
+                Method::Patch,
+                "/events/abc",
+                "\"m1\"",
+                "sendUpdates=all",
+                Scripted::Status(412),
+            ),
+            Step::get("/events/abc", "", invited),
+        ]);
+        let script = Script::new(steps);
+        let (outcome, _) = save_told(
+            &host,
+            &script,
+            &instance,
+            &series,
+            title("Retro"),
+            Scope::All,
+            Some(Notify::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Conflict {
+                    fields: vec!["attendees".into()]
+                },
+            "stopped, to ask again"
+        );
+        let writes = script
+            .sent()
+            .iter()
+            .filter(|r| r.method == Method::Patch)
+            .count();
+        assert_eq!(writes, 1, "B is never emailed");
+    }
+
+    /// C12 decision 3 on a series with guests (C12c review): "All events" adds B under Send, and A
+    /// accepts in Google before the write lands, so it meets a 412. The guest list goes again built
+    /// on Google's copy then: A's reply stays, B is still added, and the answer still goes with it.
+    #[tokio::test]
+    async fn a_series_guest_change_sent_again_keeps_a_reply_that_landed_meanwhile() {
+        let a = |reply: &str| json!({ "email": "a@example.com", "responseStatus": reply });
+        let waiting = |event: Value| with(event, "attendees", json!([a("needsAction")]));
+        let (series, instance) = (waiting(weekly()), waiting(monday_19()));
+        let window: Vec<Value> = october().into_iter().map(waiting).collect();
+        let host = TestHost::holding(&window);
+        let replied = written(&series, &[("attendees", json!([a("accepted")]))], "\"m2\"");
+        let both = json!([a("accepted"), { "email": "b@example.com" }]);
+        let mut steps = reads(&instance, &series, vec![series.clone()], window.clone());
+        steps.extend([
+            told(
+                Method::Patch,
+                "/events/abc",
+                "\"m1\"",
+                "sendUpdates=all",
+                Scripted::Status(412),
+            ),
+            Step::get("/events/abc", "", replied.clone()),
+            told(
+                Method::Patch,
+                "/events/abc",
+                "\"m2\"",
+                "sendUpdates=all",
+                Scripted::Json(written(&replied, &[("attendees", both.clone())], "\"m3\"")),
+            ),
+            refetch_read(Scripted::Json(page(
+                window
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| written(e, &[("attendees", both.clone())], &format!("\"r{i}\"")))
+                    .collect(),
+                None,
+            ))),
+        ]);
+        let script = Script::new(steps);
+        let (outcome, _) = save_told(
+            &host,
+            &script,
+            &instance,
+            &series,
+            adding_guest("b@example.com"),
+            Scope::All,
+            Some(Notify::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "landed");
+        let patches: Vec<RequestPlan> = script
+            .sent()
+            .into_iter()
+            .filter(|r| r.method == Method::Patch)
+            .collect();
+        assert!(patches.len() == 2, "sent once more");
+        assert!(
+            patches[1].body.as_ref().map(|b| &b["attendees"]) == Some(&both),
+            "A's reply kept, B still added"
+        );
+    }
+
+    /// Design critique 1: a guest who appeared in Google before the resend a 412 calls for, on a
+    /// plan nobody was asked about (it reached nobody), is a conflict, whatever the step watches;
+    /// nothing is sent again (C12 §6.5).
     #[tokio::test]
     async fn a_guest_added_before_a_resend_is_a_conflict() {
         let host = TestHost::holding(&october());
@@ -12289,10 +12843,10 @@ mod tests {
     fn still_held_with(host: &TestHost, outcome: &WriteOutcome, token: &str, words: &str) {
         let held = host.edit.held_split(token);
         assert!(held.is_some(), "the change is still held");
-        let (offers, from) = held.unwrap();
+        let (offers, from, emails) = held.unwrap();
         assert!(
-            matches!(outcome, WriteOutcome::PartialSplit { token: t, offers: o, from: f, note: Some(n) }
-                if t == token && *o == offers && *f == from && n == words),
+            matches!(outcome, WriteOutcome::PartialSplit { token: t, offers: o, from: f, note: Some(n), emails: e }
+                if t == token && *o == offers && *f == from && n == words && *e == emails),
             "the answer is the held change with the outcome's words"
         );
     }
@@ -12963,6 +13517,64 @@ mod tests {
         }
     }
 
+    /// C12 (critiques C1-M4, C2-M2): a change held part-way says which settles would email guests:
+    /// Remove when its new part went with Send, Finish when what it would still send does. Sent with
+    /// Don't send, or to nobody, neither; the answer, the held view and the dialog's row agree.
+    #[tokio::test]
+    async fn a_held_split_says_which_settles_would_email_guests() {
+        use SplitAction::{Finish, Remove};
+        let plan = split_plan(Vec::new());
+        let host = TestHost::holding(&october());
+        let (held, _, _) = split_save(
+            &host,
+            vec![
+                insert_step(lost()),
+                event_read(TAIL, lost()),
+                event_read(TAIL, Scripted::Json(tail_copy(&plan, "\"t1\"", SAVED_AT))),
+            ],
+        )
+        .await;
+        assert_eq!(offers_of(&held), [Finish, Remove]);
+        assert!(
+            matches!(&held, WriteOutcome::PartialSplit { emails, .. } if emails.is_empty()),
+            "a series without guests emails nobody"
+        );
+        let token = held_token(&held);
+        let stamp = |insert: Notify, rest: Notify| {
+            let mut partials = host.edit.partials.lock().unwrap();
+            let split = partials.get_mut(&token).unwrap();
+            for step in split.plan.steps.iter_mut() {
+                step.notify = if matches!(step.op, Op::Insert { .. }) {
+                    insert
+                } else {
+                    rest
+                };
+            }
+        };
+        for (insert, rest, want) in [
+            (Notify::All, Notify::None, vec![Remove]),
+            (Notify::None, Notify::All, vec![Finish]),
+            (Notify::All, Notify::All, vec![Finish, Remove]),
+            (Notify::None, Notify::None, vec![]),
+        ] {
+            stamp(insert, rest);
+            let held = host.edit.held_split(&token).unwrap();
+            assert!(held.2 == want, "the settles that would email");
+            let view = host.edit.held_on(CALENDAR, "abc").unwrap();
+            assert!(view.emails == want, "the dialog's row says the same");
+            let held = host.edit.partials.lock().unwrap()[&token].clone();
+            assert!(
+                matches!(partial_outcome(&token, &held), WriteOutcome::PartialSplit { emails, .. } if emails == want),
+                "and the answer"
+            );
+            // A settle that leaves it held says so too, its buttons' emails with it.
+            assert!(
+                matches!(still_held(&host.edit, &token, WriteOutcome::Busy), WriteOutcome::PartialSplit { emails, .. } if emails == want),
+                "and a settle's answer"
+            );
+        }
+    }
+
     /// Review round 3: a split held after its rollback couldn't delete the new part, then the new
     /// part deleted in Google: a settle's first look settles it. The original cut (the cut ignored)
     /// says the part was removed; the original deleted in Google (the cut answered 404) says gone and
@@ -13089,7 +13701,7 @@ mod tests {
             vec![uncut(), event_read(TAIL, Scripted::Json(renamed))],
         )
         .await;
-        let from = host.edit.held_split(&token).map(|(_, from)| from);
+        let from = host.edit.held_split(&token).map(|(_, from, _)| from);
         let words = tail_changed_words(from.as_deref().unwrap_or_default());
         still_held_with(&host, &refused, &token, &words);
         assert_eq!(offers_of(&refused), [SplitAction::Check]);
@@ -14806,6 +15418,7 @@ mod tests {
         let view = HeldView {
             token: "t".into(),
             offers: Vec::new(),
+            emails: Vec::new(),
             from: "2026-10-19".into(),
             master: "abc".into(),
             tail: TAIL.into(),
@@ -16678,37 +17291,45 @@ mod tests {
     }
 
     /// A read-only reason outranks the choice: asking which occurrences of an event PM can't
-    /// change would lead nowhere.
+    /// change would lead nowhere. An occurrence you organise with a guest has no such reason since
+    /// C12: it is asked which occurrences, like any other.
     #[tokio::test]
     async fn an_unscoped_save_on_a_read_only_occurrence_says_why_first() {
-        let event = with(
+        let guest = |event: Value| with(event, "attendees", json!([{ "email": "guest@x.com" }]));
+        let invitation = guest(with(
             dentist_occurrence(),
-            "attendees",
-            json!([{ "email": "guest@x.com" }]),
-        );
-        let target = target(&event);
-        let host = TestHost::holding(std::slice::from_ref(&event));
-        let session = keep_session(&host.edit, target.clone(), event.clone(), None, None).unwrap();
-        let open = open_session(&host.edit, &session).unwrap().unwrap();
-        let script = Script::new(vec![Step::get("/events/solo", "", event)]);
-        let outcome = save_event(
-            &script,
-            &*host,
-            &session,
-            &open,
-            &title("Retro"),
-            EditingStatus::On,
-            &GuestAnswer::default(),
-        )
-        .await;
-        script.finished();
-        assert!(matches!(
-            outcome,
-            WriteOutcome::ReadOnly {
-                reason: ReadOnlyReason::HasGuests
-            }
+            "organizer",
+            json!({ "email": "guest@x.com" }),
         ));
-        assert_eq!(script.sent().len(), 1);
+        for (event, want) in [
+            (
+                invitation,
+                WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer,
+                },
+            ),
+            (guest(dentist_occurrence()), WriteOutcome::needs_scope()),
+        ] {
+            let target = target(&event);
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let session =
+                keep_session(&host.edit, target.clone(), event.clone(), None, None).unwrap();
+            let open = open_session(&host.edit, &session).unwrap().unwrap();
+            let script = Script::new(vec![Step::get("/events/solo", "", event)]);
+            let outcome = save_event(
+                &script,
+                &*host,
+                &session,
+                &open,
+                &title("Retro"),
+                EditingStatus::On,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.finished();
+            assert!(outcome == want, "the reason first, else which occurrences");
+            assert_eq!(script.sent().len(), 1);
+        }
     }
 
     /// A held delete with no choice whose row turned out to be an occurrence (the mirror row looked
@@ -16855,7 +17476,6 @@ mod tests {
                 SeriesRefusal::Incomplete,
                 SeriesRefusal::NoBase,
                 SeriesRefusal::CannotCarry(day),
-                SeriesRefusal::GuestsElsewhere(day),
                 SeriesRefusal::FormattedDescription,
                 SeriesRefusal::VisibilityIsSeriesWide,
                 SeriesRefusal::OnlyThisDiffers,
@@ -16873,6 +17493,13 @@ mod tests {
                 SeriesRefusal::NothingToKeep,
                 SeriesRefusal::KeptHasOwn(day),
                 SeriesRefusal::DeletedDayUnread(day),
+                // The guest refusals, which rows show now events with guests can change (C12).
+                SeriesRefusal::Guest(attendees::GuestError::NotAnAddress),
+                SeriesRefusal::Guest(attendees::GuestError::Repeated),
+                SeriesRefusal::Guest(attendees::GuestError::CantRemove),
+                SeriesRefusal::Guest(attendees::GuestError::Omitted),
+                SeriesRefusal::GuestsDifferHere,
+                SeriesRefusal::GuestPermissionsAreSeriesWide,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -16900,7 +17527,6 @@ mod tests {
             ReadOnlyReason::PrivateEvent,
             ReadOnlyReason::NotOrganizer,
             ReadOnlyReason::BecameRepeating,
-            ReadOnlyReason::HasGuests,
             ReadOnlyReason::SpecialType,
             ReadOnlyReason::Locked,
             ReadOnlyReason::HtmlDescription,

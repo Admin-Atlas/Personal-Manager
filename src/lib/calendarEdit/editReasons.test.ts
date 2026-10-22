@@ -41,6 +41,7 @@ import {
   moveLabel,
   moveOfferText,
   outcomeText,
+  partialText,
   problemText,
   reasonText,
   rebasedText,
@@ -56,6 +57,7 @@ const ONE_GUEST: GuestNotice = {
   updated: 1,
   invited: 0,
   removed: 0,
+  told_cancelled: 0,
   cancelled: false,
   people: 1,
   emails: 1,
@@ -78,7 +80,6 @@ const REASONS: ReadOnlyReason[] = [
   "private_event",
   "not_organizer",
   "became_repeating",
-  "has_guests",
   "special_type",
   "locked",
   "html_description",
@@ -261,13 +262,23 @@ describe("edit reasons", () => {
       tone: "warn",
       text: "“Standup” wasn't deleted. PM needs to ask which occurrences first. Delete it again to choose.",
     });
-    // Whether Google emails the guests is no choice of occurrences (C12).
+    // Whether Google emails the guests is no choice of occurrences (C12): guests nobody had
+    // answered about, or numbers changed since the answer (said neutrally, C2-L6, and true when
+    // Google dropped the guests after the last sync).
     expect(
       deleteText({ outcome: "needs_choice", scope: false, guests: ONE_GUEST }, "Standup"),
     ).toEqual({
       tone: "warn",
-      text: "“Standup” wasn't deleted. Choose whether Google emails the guests first.",
+      text: "“Standup” wasn't deleted. PM found guests who would be told. Delete it again to choose whether Google emails them.",
     });
+    expect(
+      deleteText(
+        { outcome: "needs_choice", scope: false, guests: ONE_GUEST, again: true },
+        "Standup",
+      ).text,
+    ).toBe(
+      "“Standup” wasn't deleted. Who Google would email has changed since you chose. Delete it again to choose whether Google emails the guests.",
+    );
     expect(deleteText({ outcome: "ignored_by_google", split: false }, "Standup").text).toMatch(
       /^“Standup” wasn't deleted\./,
     );
@@ -618,6 +629,38 @@ describe("settling a change PM couldn't finish", () => {
     ).toBe(
       "“Gym” wasn't deleted. PM is still finishing an earlier change to it from 02-11. Finish it first.",
     );
+  });
+
+  // C12 critiques C1-M4, C2-M2: a change that went with Send says, wherever it's held, which
+  // settles would email guests, before a button is pressed; only offers that would, and only after
+  // a Send (the backend's `emails`).
+  it("says which settles would email guests, after a Send", () => {
+    const held: WriteOutcome = {
+      outcome: "partial_split",
+      token: "t",
+      offers: ["finish", "remove"],
+      from: "2026-11-02",
+      emails: ["finish", "remove"],
+    };
+    const both =
+      "If you remove the new part, guests will get a cancellation email. If you finish it, guests will get the rest of the update emails.";
+    expect(outcomeText(held).text).toMatch(
+      new RegExp(`Finish the change, or remove the new part\\. ${both}$`),
+    );
+    expect(settleText(held, "Gym").text).toMatch(new RegExp(` ${both}$`));
+    expect(settleText({ ...held, note: "Try again in a moment." }, "Gym").text).toBe(
+      `“Gym”: Try again in a moment. ${both}`,
+    );
+    expect(deleteText(held, "Gym").text).toMatch(
+      new RegExp(`remove the new part first\\. ${both}$`),
+    );
+    expect(earlierChangeText(["remove", "check"], "2026-11-02", ["remove"])).toBe(
+      "PM is still finishing an earlier change to it from 02-11. Remove the new part, or check again. If you remove the new part, guests will get a cancellation email.",
+    );
+    // Don't send, or nobody to tell: nothing said.
+    expect(outcomeText({ ...held, emails: undefined }).text).not.toMatch(/guests/);
+    // Only what's offered now.
+    expect(partialText(["remove", "check"], "2026-11-02", ["finish"])).not.toMatch(/guests/);
   });
 });
 
