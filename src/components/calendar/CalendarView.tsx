@@ -1143,6 +1143,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               : undefined
           }
           editing={popoverEditing(eventPopup.ev)}
+          describeSeries={writes.describeSeries}
         />
       )}
 
@@ -1230,6 +1231,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               : { name: "that calendar", hidden: false },
           )
         }
+        // A move writes no calendar row, so no write-outcome follows: the milestones are read
+        // again here, for the popover's "Open in Project" and the editor's line to follow it.
+        onMove={(id) =>
+          void writes.moveMilestone(id).then((moved) => {
+            if (moved) void loadMilestones();
+          })
+        }
+        onMoveBack={(id) =>
+          void writes.moveMilestoneBack(id).then((moved) => {
+            if (moved) void loadMilestones();
+          })
+        }
+        onHold={writes.holdMoveBack}
       />
     </div>
   );

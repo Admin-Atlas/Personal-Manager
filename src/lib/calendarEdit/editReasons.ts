@@ -9,6 +9,7 @@ import type { Tone as CalloutTone } from "../../components/ui/tone";
 import { formatDateOnly } from "../format";
 import type {
   EditLoad,
+  MilestoneMove,
   ReadOnlyReason,
   SeriesScope,
   SplitAction,
@@ -145,6 +146,9 @@ export function writeWarningText(
     // Only a new event comes back with it.
     case "outside_mirror":
       return "It starts outside the months PM syncs, so PM's calendar won't show it.";
+    // A notice per milestone names each one (`milestoneStayedText`); this is the short form.
+    case "milestone_not_offered":
+      return "PM couldn't find the new part in Google, so a linked milestone stays on the earlier part.";
     default:
       return unreachable(warning);
   }
@@ -365,7 +369,10 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
   const t = quote(title);
   switch (result.outcome) {
     case "saved": {
-      const warnings = result.warnings.map((w) => writeWarningText(w, "save", result.left_behind));
+      // A milestone that stayed has a notice of its own, naming it.
+      const warnings = result.warnings
+        .filter((w) => w !== "milestone_not_offered")
+        .map((w) => writeWarningText(w, "save", result.left_behind));
       return {
         tone: result.warnings.includes("left_on_old_series") ? "warn" : "ok",
         text: [`Finished the change to ${t}.`, ...warnings].join(" "),
@@ -605,6 +612,67 @@ export function heldCreateText(title: string): { tone: Tone; text: string } {
     tone: "warn",
     text: `PM may already have made ${quote(title)}. Check again: PM looks for it in Google first and sends it again only if it isn't there.`,
   };
+}
+
+// --- moving a milestone after a "this and following" change (C9b-2) ---
+
+/** Where the earlier part ends and what a milestone left on it costs, for the words: a last day
+ *  before today has ended, so it shows as overdue now; one today or later, only after that (C9b-2
+ *  review round 3, R3-F3). With no last day PM can say, just that it ended. */
+const staysThere = (m: MilestoneMove) => {
+  const day = m.earlierLastDay;
+  if (!day) return "which has ended, and shows as overdue";
+  return day < m.today
+    ? `which ended on ${formatDateOnly(day)}, and shows as overdue`
+    : `whose last day is ${formatDateOnly(day)}, and shows as overdue after that`;
+};
+
+/** The question after a "this and following" change landed (DECISIONS 17-10 #2): the new part by
+ *  its title and first day, and what saying no costs (C9b-2 critique C2-H1). */
+export function moveOfferText(m: MilestoneMove): string {
+  const starts = m.toDate ? `, which starts on ${formatDateOnly(m.toDate)}` : "";
+  return `Move the “${m.label}” milestone in ${m.project} to the new part of ${quote(m.newTitle)}${starts}? If you don't, it stays on the earlier part, ${staysThere(m)}.`;
+}
+
+/** The Move button's accessible name. Each move button's name starts with the words it shows, so
+ *  saying "click Move back" or "click Keep it there" finds it (WCAG 2.5.3). */
+export function moveLabel(m: MilestoneMove): string {
+  return `Move “${m.label}” to the new part of ${quote(m.newTitle)}`;
+}
+
+/** The Keep it there button's accessible name. */
+export function keepLabel(m: MilestoneMove): string {
+  return `Keep it there: “${m.label}” stays on the earlier part of ${quote(m.earlierTitle)}`;
+}
+
+/** A move that landed; a new part PM's calendar doesn't show yet says when it will. */
+export function movedText(m: MilestoneMove): string {
+  const later = m.pending ? " PM's calendar will show its new date after the next refresh." : "";
+  return `Moved “${m.label}” to the new part of ${quote(m.newTitle)}.${later}`;
+}
+
+/** The Move back button's accessible name. */
+export function moveBackLabel(m: MilestoneMove): string {
+  return `Move back “${m.label}” to the earlier part of ${quote(m.earlierTitle)}`;
+}
+
+export function movedBackText(m: MilestoneMove): string {
+  return `“${m.label}” is back on the earlier part of ${quote(m.earlierTitle)}.`;
+}
+
+/** `why`: what the move threw ("That milestone no longer exists."). */
+export function moveFailedText(m: MilestoneMove, why: string): string {
+  return `Couldn't move “${m.label}”. ${why}`;
+}
+
+export function moveBackFailedText(m: MilestoneMove, why: string): string {
+  return `Couldn't move “${m.label}” back. ${why} Unlink it in ${m.project} if it shouldn't follow the new part.`;
+}
+
+/** A milestone PM couldn't offer to move, because it couldn't find the new part (C9b-2 critique
+ *  C2-M1): where it stays, what that costs, and the way out. */
+export function milestoneStayedText(m: MilestoneMove): string {
+  return `PM couldn't find the new part of ${quote(m.newTitle)} in Google, so “${m.label}” in ${m.project} stays on the earlier part, ${staysThere(m)}. Unlink it in ${m.project} to set its date yourself.`;
 }
 
 /** Why the editor couldn't open. */

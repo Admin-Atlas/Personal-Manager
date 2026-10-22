@@ -21,6 +21,11 @@
 // isn't there to say it: Created, or one PM can't tell was made, which keeps a Check again button
 // holding exactly what was sent until Google shows how it ended. A reload loses that notice; the
 // backend's record of it then lapses, and a copy that landed shows at the next sync.
+//
+// And two things beside the writes (C9b-2): how a repeating event repeats, for the event popover
+// (only a read), and, after a "this and following" change lands, a question per milestone linked to
+// it from that day on, whether to move it to the new part (DECISIONS 17-10 #2). Moving one changes
+// PM's own milestone, never Google; Move back is offered for a few seconds after.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
@@ -28,9 +33,11 @@ import {
   createCalendarEvent,
   deleteCalendarEvent,
   getCalendarEventForEdit,
+  getSeriesSummary,
   listHeldDeletes,
   onCalendarDeleteSettled,
   seriesChoices,
+  setMilestoneEvent,
   settleSeriesSplit,
   updateCalendarEvent,
 } from "../../../lib/ipc";
@@ -39,6 +46,7 @@ import type {
   DeleteSettled,
   EditLoad,
   EventPatchDraft,
+  MilestoneMove,
   NewEventDraft,
   SeenSummary,
   SeriesChoices,
@@ -52,6 +60,12 @@ import {
   deleteChangedText,
   deleteText,
   heldCreateText,
+  milestoneStayedText,
+  movedBackText,
+  movedText,
+  moveBackFailedText,
+  moveFailedText,
+  moveOfferText,
   retryAfter,
   savedNotice,
   settleText,
@@ -81,6 +95,12 @@ export interface WriteNotice {
   create?: { token: string; sent: CreateSent };
   /** Its Check again is on its way: the button is disabled. */
   checking?: boolean;
+  /** Asks whether to move a milestone to the new part (DECISIONS 17-10 #2): Move, and Keep it there. */
+  move?: MilestoneMove;
+  /** A move that just happened: Move back, for {@link MOVE_BACK_MS}. */
+  moveBack?: MilestoneMove;
+  /** A move or move back is on its way: its button does nothing meanwhile. */
+  moving?: boolean;
 }
 
 /** What creating an event sent: the calendar (PM's id) and the draft, kept as they were so a Check
@@ -157,7 +177,8 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
  *  once a view has shown it; the timer only removes the notice it was set for, never a later one
  *  under the same id. A delete still held or being sent isn't done, though its notice has lost its
  *  Undo: that one stays until the delete settles. Nor is a change PM couldn't finish: its notice
- *  keeps its buttons until it's settled, whatever its tone; nor a new event PM may have made. */
+ *  keeps its buttons until it's settled, whatever its tone; nor a new event PM may have made. Nor a
+ *  milestone's move offer, which waits for an answer, or its Move back, which has its own window. */
 function put(notice: WriteNotice) {
   const shown = state.notices.some((n) => n.id === notice.id);
   update({
@@ -166,7 +187,15 @@ function put(notice: WriteNotice) {
       : [...state.notices, notice],
   });
   const inFlight = state.held.some((h) => h.noticeId === notice.id);
-  if (notice.tone === "ok" && !notice.undoToken && !notice.split && !notice.create && !inFlight) {
+  if (
+    notice.tone === "ok" &&
+    !notice.undoToken &&
+    !notice.split &&
+    !notice.create &&
+    !notice.move &&
+    !notice.moveBack &&
+    !inFlight
+  ) {
     if (subscribers.size > 0) expire(notice);
     else unseen.add(notice);
   }
@@ -490,6 +519,8 @@ export async function settleSplit(
     });
   } else {
     put({ id, ...settleText(result, title) });
+    // A Finish that lands offers what the first send read, as a save does.
+    offerMoves(result);
   }
   return result;
 }
@@ -518,6 +549,204 @@ export function noteSaved(
 ) {
   if (outcome.outcome !== "saved") return;
   put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from) });
+  offerMoves(outcome);
+}
+
+// --- how a repeating event repeats, and moving its milestones (C9b-2) ---
+
+/** Asks on their way, by row, so the popover's two effect runs in StrictMode (and two quick clicks)
+ *  send one request. */
+const describing = new Map<string, Promise<string | null>>();
+
+/** How the repeating event a Google row belongs to repeats, in Google Calendar's words, or null when
+ *  PM can't say. Only a read; the backend keeps the answer a while. */
+export function describeSeries(eventId: string): Promise<string | null> {
+  const going = describing.get(eventId);
+  if (going) return going;
+  const ask = getSeriesSummary(eventId)
+    .catch(() => null)
+    .finally(() => describing.delete(eventId));
+  describing.set(eventId, ask);
+  return ask;
+}
+
+/** How long Move back is offered after a move, like a delete's Undo window; paused while the
+ *  pointer or focus is on its notice. */
+export const MOVE_BACK_MS = 8000;
+
+/** How long Move back ignores a press once it shows. It takes Move's place, so a press meant for
+ *  Move (a second Enter, a quick double-click) lands on it, and would undo the move just made. */
+const MOVE_BACK_ARMS_MS = 500;
+
+/** After a "this and following" change landed: one question per milestone the backend read as dated
+ *  on or after its first day, or, when PM couldn't find the new part, one notice per milestone
+ *  saying it stayed. Nothing for any other outcome. */
+function offerMoves(outcome: WriteOutcome): void {
+  if (outcome.outcome !== "saved" || !outcome.milestone_moves) return;
+  const moves = outcome.milestone_moves;
+  const pending = outcome.warnings.includes("mirror_refresh_pending");
+  for (const m of moves.milestones) {
+    const move: MilestoneMove = {
+      milestoneId: m.id,
+      label: m.label,
+      project: m.project,
+      newTitle: moves.new_title,
+      earlierTitle: moves.earlier_title,
+      toIcal: moves.new_series_ical ?? "",
+      toDate: moves.first_day,
+      backIcal: moves.earlier_series_ical,
+      backDate: m.date,
+      earlierLastDay: moves.earlier_last_day,
+      today: moves.today,
+      pending,
+    };
+    put(
+      moves.new_series_ical === null
+        ? { id: nextNotice++, tone: "warn", text: milestoneStayedText(move) }
+        : { id: nextNotice++, tone: "ok", text: moveOfferText(move), move },
+    );
+  }
+}
+
+/** Notices with a move or move back on its way: a second press sends nothing. */
+const movingIds = new Set<number>();
+
+/** Where the pointer and focus are, by notice with a move: on one, they hold its Move back open. */
+const holding = new Map<number, { pointer: boolean; focus: boolean }>();
+
+const held = (id: number) => {
+  const on = holding.get(id);
+  return !!on && (on.pointer || on.focus);
+};
+
+/** A Move back window open now: the notice it closes, its timer (null while held), when it ends,
+ *  the time it had left when it was held, and when Move back first takes a press. */
+interface MoveBackWindow {
+  notice: WriteNotice;
+  timer: ReturnType<typeof setTimeout> | null;
+  endsAt: number;
+  left: number;
+  armsAt: number;
+}
+const moveBackWindows = new Map<number, MoveBackWindow>();
+
+function runMoveBack(open: MoveBackWindow) {
+  open.endsAt = Date.now() + open.left;
+  open.timer = setTimeout(() => closeMoveBack(open.notice.id), open.left);
+}
+
+/** Offer Move back on `notice` for {@link MOVE_BACK_MS}, waiting first if it's held already. */
+function openMoveBack(notice: WriteNotice) {
+  const open: MoveBackWindow = {
+    notice,
+    timer: null,
+    endsAt: 0,
+    left: MOVE_BACK_MS,
+    armsAt: Date.now() + MOVE_BACK_ARMS_MS,
+  };
+  moveBackWindows.set(notice.id, open);
+  if (!held(notice.id)) runMoveBack(open);
+}
+
+/** End the Move back window on notice `id`, if one is open: the notice it was opened on. */
+function endMoveBack(id: number): WriteNotice | null {
+  const open = moveBackWindows.get(id);
+  if (!open) return null;
+  moveBackWindows.delete(id);
+  if (open.timer) clearTimeout(open.timer);
+  return open.notice;
+}
+
+/** The window over: Move back goes, and the notice then goes by itself like any done one. Only if
+ *  that very notice is still up. */
+function closeMoveBack(id: number) {
+  const notice = endMoveBack(id);
+  if (notice && state.notices.includes(notice)) {
+    put({ id: notice.id, tone: notice.tone, text: notice.text });
+  }
+}
+
+/** The pointer or focus (`by`) is on a notice with a move (`on`), or has left it. Move back waits
+ *  while either is there (WCAG 2.2.1), then goes on with the time it had left. */
+export function holdMoveBack(id: number, by: "pointer" | "focus", on: boolean) {
+  const where = { ...(holding.get(id) ?? { pointer: false, focus: false }), [by]: on };
+  if (where.pointer || where.focus) holding.set(id, where);
+  else holding.delete(id);
+  const open = moveBackWindows.get(id);
+  if (!open) return;
+  if (held(id) && open.timer) {
+    clearTimeout(open.timer);
+    open.timer = null;
+    open.left = Math.max(0, open.endsAt - Date.now());
+  } else if (!held(id) && !open.timer) {
+    runMoveBack(open);
+  }
+}
+
+/** A move or move back from the notice `noticeId`: marked on its way, sent, then said. Whether it
+ *  changed the milestone. */
+async function sendMove(
+  noticeId: number,
+  pick: (n: WriteNotice) => MilestoneMove | undefined,
+  send: (m: MilestoneMove) => Promise<void>,
+  done: (m: MilestoneMove) => void,
+  failed: (m: MilestoneMove, why: string) => void,
+): Promise<boolean> {
+  const shown = state.notices.find((n) => n.id === noticeId);
+  const move = shown && pick(shown);
+  if (!shown || !move || movingIds.has(noticeId)) return false;
+  movingIds.add(noticeId);
+  put({ ...shown, moving: true });
+  try {
+    await send(move);
+  } catch (e) {
+    failed(move, message(e));
+    return false;
+  } finally {
+    movingIds.delete(noticeId);
+  }
+  done(move);
+  return true;
+}
+
+/** Move the milestone a notice offers to the new part: only while it's still linked to the earlier
+ *  one, so an offer left up never undoes a change made since. Move back is then offered for
+ *  {@link MOVE_BACK_MS}. Whether it moved. */
+export function moveMilestone(noticeId: number): Promise<boolean> {
+  return sendMove(
+    noticeId,
+    (n) => n.move,
+    (m) => setMilestoneEvent(m.milestoneId, m.toIcal, m.toDate, m.backIcal),
+    (m) => {
+      // The notice's one button stays where it was, now Move back.
+      const notice: WriteNotice = { id: noticeId, tone: "ok", text: movedText(m), moveBack: m };
+      put(notice);
+      openMoveBack(notice);
+    },
+    // The Move button stays, for another try.
+    (m, why) => put({ id: noticeId, tone: "error", text: moveFailedText(m, why), move: m }),
+  );
+}
+
+/** Move it back to the earlier part, while the moved notice offers that: only while it's still
+ *  linked to the new part, and never in its first {@link MOVE_BACK_ARMS_MS}. Whether it moved. */
+export function moveMilestoneBack(noticeId: number): Promise<boolean> {
+  const open = moveBackWindows.get(noticeId);
+  if (open && Date.now() < open.armsAt) return Promise.resolve(false);
+  return sendMove(
+    noticeId,
+    (n) => n.moveBack,
+    (m) => setMilestoneEvent(m.milestoneId, m.backIcal, m.backDate, m.toIcal),
+    (m) => {
+      endMoveBack(noticeId);
+      put({ id: noticeId, tone: "ok", text: movedBackText(m) });
+    },
+    // No button: the window was the one chance, and the words name the way out.
+    (m, why) => {
+      endMoveBack(noticeId);
+      put({ id: noticeId, tone: "error", text: moveBackFailedText(m, why) });
+    },
+  );
 }
 
 // --- creating an event (C10) ---
@@ -757,5 +986,9 @@ export function useEventWrites() {
     noteSeriesNotice,
     dismissNotice,
     pruneRemoved,
+    describeSeries,
+    moveMilestone,
+    moveMilestoneBack,
+    holdMoveBack,
   };
 }

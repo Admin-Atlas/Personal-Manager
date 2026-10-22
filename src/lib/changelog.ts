@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.152.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "Repeating Google events now say how they repeat in their details, such as “Weekly on Monday”, just as Google Calendar does.",
+      "After you change “this and the following events”, PM offers to move a milestone already linked to that event over to the new part, so the milestone keeps following your schedule instead of being left on the part that has ended. If you move it by mistake, you have a few seconds to move it back.",
+    ],
+  },
+  {
     version: "3.151.0-alpha",
     date: "2026-10-20",
     highlights: [

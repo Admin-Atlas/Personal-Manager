@@ -246,7 +246,9 @@ export function seriesWarningText(
       return `The new repeating event this makes won't have ${andList(missing)}. The earlier part ${keeps}.${call}`;
     }
     case "new_identity":
-      return "From this occurrence on, it becomes a new repeating event in Google. A linked milestone stays with the earlier part, and reminders to prepare may show again for the new part.";
+      // The flags' warning (C9 design scope-L9) is the last sentence: they aren't moved, and no
+      // question follows the save for them (DECISIONS 17-10 #2).
+      return "From this occurrence on, it becomes a new repeating event in Google. If a milestone linked to it falls on or after this day, PM offers to move it to the new part after saving. Reminders to prepare may show again for the new part.";
     case "split_sibling": {
       const head = `Part of ${t} was made into a repeating event of its own by an earlier “this and following” change.`;
       return kind === "save"

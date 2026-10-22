@@ -129,9 +129,13 @@ pub enum End {
         reply: Option<Value>,
         date: Option<DateTime<Utc>>,
     },
-    /// A cleanup step not done or unknown, or one requiring such a step: left out, and reported
-    /// ([`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`] take these).
+    /// A cleanup step proved not done, or one requiring a step that isn't done, so never sent: left
+    /// out, and reported ([`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`] take these).
     Skipped,
+    /// A cleanup step whose answer PM couldn't read, a look included: it may have landed. Left out
+    /// and reported as [`End::Skipped`] is ([`Ran::skipped`]), but never taken for one that wasn't
+    /// done ([`Ran::not_done`], C9b-2 review round 2).
+    Unanswered,
     /// Landed, then undone by a rollback.
     Undone,
 }
@@ -174,7 +178,8 @@ pub enum Rollback {
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ran {
-    /// Every commit step landed; cleanup steps that didn't are [`End::Skipped`].
+    /// Every commit step landed; cleanup steps that didn't are [`End::Skipped`] or
+    /// [`End::Unanswered`].
     Done { ends: Vec<End> },
     /// Commit step `step` provably isn't in Google (it didn't land, or its event is gone), and the
     /// steps before it were rolled back.
@@ -200,12 +205,23 @@ impl Ran {
         }
     }
 
-    /// The steps left out, for [`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`].
+    /// The steps left out, for [`SeriesPlan::expect_after`] and [`SeriesPlan::removes_for`]: those
+    /// not done, and those whose answer was lost.
     pub fn skipped(&self) -> Vec<usize> {
+        self.left_out(|e| matches!(e, End::Skipped | End::Unanswered))
+    }
+
+    /// The steps left out that surely didn't land: proved not done, or never sent. Never one whose
+    /// answer was lost.
+    pub fn not_done(&self) -> Vec<usize> {
+        self.left_out(|e| *e == End::Skipped)
+    }
+
+    fn left_out(&self, of: impl Fn(&End) -> bool) -> Vec<usize> {
         self.ends()
             .iter()
             .enumerate()
-            .filter(|(_, e)| **e == End::Skipped)
+            .filter(|(_, e)| of(e))
             .map(|(i, _)| i)
             .collect()
     }
@@ -820,7 +836,10 @@ impl Run {
             Read::NotDone(_) | Read::Unknown
                 if self.plan.steps[self.at].stage == Stage::Cleanup =>
             {
-                self.ends[self.at] = End::Skipped;
+                self.ends[self.at] = match read {
+                    Read::Unknown => End::Unanswered,
+                    _ => End::Skipped,
+                };
                 self.at += 1;
                 self.phase = Phase::Start;
                 None
@@ -3598,8 +3617,36 @@ mod tests {
         });
         assert_eq!(ran.skipped(), vec![2, 3]);
         assert!(matches!(ran, Ran::Done { .. }));
-        // The cancel that required the carry was never sent.
+        // The cancel that required the carry was never sent: that one surely isn't done, while the
+        // carry, whose answer was lost, may be.
         assert!(!sent.iter().any(|r| to(r, "abc_20261102T090000Z")));
+        assert!(matches!(ran.ends(), [_, _, End::Unanswered, End::Skipped]));
+        assert_eq!(ran.not_done(), vec![3]);
+    }
+
+    /// C9b-2 review round 2: a cleanup cancel whose answer was lost, a look included, may have
+    /// landed, so it's never counted as not done; one Google refused is.
+    #[test]
+    fn a_cleanup_whose_answer_was_lost_is_never_taken_for_not_done() {
+        let (case, plan) = split_case(vec![renamed()]);
+        let tail = tail_of(&plan, "\"t1\"");
+        for (cancel, unanswered) in [(lost(), true), (status(Verdict::ReadOnly), false)] {
+            let (ran, sent, _) = drive(&mut Run::new(plan.clone()).unwrap(), |r| {
+                if to(r, "abc_20261102T090000Z") {
+                    return cancel.clone();
+                }
+                finished_split(&case, &plan, &tail, r)
+            });
+            assert!(sent.iter().any(|r| to(r, "abc_20261102T090000Z")));
+            assert_eq!(ran.skipped(), vec![3]);
+            if unanswered {
+                assert!(matches!(ran.ends()[3], End::Unanswered), "the lost one");
+                assert!(ran.not_done().is_empty());
+            } else {
+                assert!(matches!(ran.ends()[3], End::Skipped), "the refused one");
+                assert_eq!(ran.not_done(), vec![3]);
+            }
+        }
     }
 
     #[test]

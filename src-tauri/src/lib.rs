@@ -1791,6 +1791,7 @@ pub fn run() {
             commands::cancel_calendar_delete,
             commands::list_held_deletes,
             commands::series_choices,
+            commands::get_series_summary,
             commands::settle_series_split,
             #[cfg(debug_assertions)]
             commands::dev_series_report,

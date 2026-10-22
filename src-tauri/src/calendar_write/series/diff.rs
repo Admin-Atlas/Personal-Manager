@@ -113,7 +113,7 @@ pub fn floor_of<'a>(moments: impl IntoIterator<Item = &'a str>) -> Option<String
 
 /// Where a mirror row sits in its series: its `original_start` (or its start, for a row without one),
 /// as the mirror normalises them (`…Z`, or a bare date).
-fn row_point(row: &CalendarEvent) -> Option<Point> {
+pub fn row_point(row: &CalendarEvent) -> Option<Point> {
     mirror_point(row.original_start.as_deref().unwrap_or(&row.start))
 }
 

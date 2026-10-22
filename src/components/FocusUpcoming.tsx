@@ -35,6 +35,7 @@ import { formatEventWhen } from "../lib/format";
 import { Card, SegmentedControl } from "./ui";
 import { TimeGridView } from "./calendar/views/TimeGridView";
 import { CalendarEventPopover } from "./calendar/parts/CalendarEventPopover";
+import { describeSeries } from "./calendar/edit/useEventWrites";
 import { RangeControl } from "./calendar/RangeControl";
 import {
   FOCUS_UPCOMING_DAY_CHOICES,
@@ -328,6 +329,8 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
                 }
               : undefined
           }
+          // How a repeating event repeats, as on the Calendar tab: one lazy read per click.
+          describeSeries={describeSeries}
         />
       )}
     </Card>

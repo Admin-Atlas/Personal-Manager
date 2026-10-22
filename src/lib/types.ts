@@ -1704,14 +1704,74 @@ export type SeriesChoices =
 export type SeriesScope = "this" | "following" | "all";
 
 /** `outside_mirror`: a new event saved in Google that starts outside the months PM mirrors, so
- *  PM's calendar won't show it. */
-export type WriteWarning = "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror";
+ *  PM's calendar won't show it. `milestone_not_offered`: a "this and following" change landed, but
+ *  PM couldn't tell which repeating event Google made of the new part, so the milestones
+ *  `milestone_moves` lists stay on the earlier part. */
+export type WriteWarning =
+  "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror" | "milestone_not_offered";
+
+/** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
+ *  change. */
+export interface MilestoneOffer {
+  id: number;
+  label: string;
+  project: string;
+  date: string;
+}
+
+/** What moving milestones to a "this and following" change's new part needs. Days are YYYY-MM-DD
+ *  in the user's zone; null when PM can't say. */
+export interface MilestoneMoves {
+  /** Where Move sends a milestone; null: PM couldn't tell (`milestone_not_offered`). */
+  new_series_ical: string | null;
+  /** Where Move back sends it. */
+  earlier_series_ical: string;
+  new_title: string;
+  earlier_title: string;
+  /** The new part's first occurrence. */
+  first_day: string | null;
+  /** The earlier part's last occurrence: a milestone left on it reads overdue from then. */
+  earlier_last_day: string | null;
+  /** Today, as the change landed: whether that last day has passed yet, for the words. */
+  today: string;
+  milestones: MilestoneOffer[];
+}
+
+/** A milestone to move between the two parts of a repeating event a "this and following" change
+ *  made (C9b-2): what Move and Move back send, and the words. */
+export interface MilestoneMove {
+  milestoneId: number;
+  label: string;
+  project: string;
+  /** Each part's title, as Google holds it after the change. */
+  newTitle: string;
+  earlierTitle: string;
+  /** Where Move sends it, and the new part's first day: the date it shows until the next read
+   *  (null when PM can't say: it keeps its own). */
+  toIcal: string;
+  toDate: string | null;
+  /** Where Move back sends it, and its date before the change. */
+  backIcal: string;
+  backDate: string;
+  /** The earlier part's last day, and today as the change landed, for the words. */
+  earlierLastDay: string | null;
+  today: string;
+  /** The new part wasn't in PM's calendar yet when the change landed. */
+  pending: boolean;
+}
 
 /** What a save came to. `saved` and `no_change` are the successes. */
 export type WriteOutcome =
   /** `left_behind`: the days (YYYY-MM-DD) of occurrences changed on their own that a series delete
-   *  couldn't cancel, so they may still show. */
-  | { outcome: "saved"; warnings: WriteWarning[]; left_behind?: string[] }
+   *  couldn't cancel, so they may still show. `milestone_moves`: a "this and following" change that
+   *  landed, with milestones linked to the earlier part dated from its first day on, but not one on
+   *  an occurrence it left there (C9b-2). */
+  | {
+      outcome: "saved";
+      warnings: WriteWarning[];
+      left_behind?: string[];
+      milestone_moves?: MilestoneMoves;
+    }
   | { outcome: "no_change" }
   /** The repeating event's plan changed since the user chose: ask again; nothing was sent. */
   | { outcome: "needs_choice" }
