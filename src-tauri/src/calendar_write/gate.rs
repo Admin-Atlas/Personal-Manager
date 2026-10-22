@@ -40,6 +40,11 @@ pub struct EditFacts<'a> {
     pub series_master: bool,
     /// The description is formatted. Known only from a fresh copy (the mirror clips descriptions).
     pub html_description: bool,
+    /// The event has a Google Calendar label (`eventLabelId`), which sets its colour (C13).
+    pub labelled: bool,
+    /// PM can read every notification Google holds on it ([`super::patch::reminders_of`]). Known
+    /// only from a fresh copy: the mirror doesn't hold notifications, so the list reads true.
+    pub reminders_readable: bool,
 }
 
 /// What may change about the event described by `facts`.
@@ -55,13 +60,16 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         show_as: true,
         visibility: true,
         guests: true,
+        reminders: true,
+        colour: true,
         delete: true,
         reasons: Vec::new(),
     };
     if facts.locked {
         // Google refuses changes to a locked copy's summary, description, location, start, end and
         // recurrence. Whether it lets the copy be deleted, or its guests change, isn't documented,
-        // so PM offers neither (INFERRED: fails closed, C12 §4.4).
+        // so PM offers neither (INFERRED: fails closed, C12 §4.4). Its notifications and colour
+        // aren't among them, so they stay open (the editing plan's C6 card, from C13).
         perms.summary = false;
         perms.time = false;
         perms.location = false;
@@ -73,6 +81,16 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
     if facts.html_description && perms.description {
         perms.description = false;
         perms.reasons.push(ReadOnlyReason::HtmlDescription);
+    }
+    // A label sets the colour Google draws, and PM doesn't change labels (R-LABEL).
+    if facts.labelled {
+        perms.colour = false;
+        perms.reasons.push(ReadOnlyReason::LabelReadOnly);
+    }
+    // A list sent whole would lose the one PM can't read.
+    if !facts.reminders_readable {
+        perms.reminders = false;
+        perms.reasons.push(ReadOnlyReason::RemindersUnreadable);
     }
     perms
 }
@@ -107,6 +125,8 @@ pub fn create_block(
         visibility,
         series_master: false,
         html_description: false,
+        labelled: false,
+        reminders_readable: true,
     })
 }
 
@@ -161,6 +181,8 @@ mod tests {
             visibility: None,
             series_master: false,
             html_description: false,
+            labelled: false,
+            reminders_readable: true,
         }
     }
 
@@ -169,8 +191,9 @@ mod tests {
         let perms = edit_rights(&editable());
         assert!(perms.summary && perms.time && perms.location && perms.description);
         assert!(perms.show_as && perms.visibility && perms.delete);
-        // Guests may change wherever the rest may (C12).
+        // Guests may change wherever the rest may (C12), and so may notifications and colour (C13).
         assert!(perms.guests);
+        assert!(perms.reminders && perms.colour);
         assert!(perms.reasons.is_empty());
         assert_eq!(edit_block(&editable()), None);
         // Absent eventType is Google's documented default.
@@ -409,6 +432,8 @@ mod tests {
         // Not among Google's locked fields, but undocumented, so closed (C12 §4.4).
         assert!(!perms.guests);
         assert!(perms.show_as && perms.visibility);
+        // C13: notifications and colour aren't among Google's locked fields.
+        assert!(perms.reminders && perms.colour);
         assert_eq!(perms.reasons, vec![Locked]);
         // Something can still change, so the list offers Edit.
         assert_eq!(
@@ -436,5 +461,59 @@ mod tests {
             ..editable()
         });
         assert_eq!(both.reasons, vec![Locked]);
+    }
+
+    /// R-LABEL (C13): a label sets the colour Google draws, so a labelled event's colour is
+    /// read-only and says why; its notifications and everything else stay open.
+    #[test]
+    fn a_labelled_events_colour_is_read_only_and_says_why() {
+        let perms = edit_rights(&EditFacts {
+            labelled: true,
+            ..editable()
+        });
+        assert!(!perms.colour);
+        assert!(perms.reminders && perms.summary && perms.time && perms.delete);
+        assert_eq!(perms.reasons, vec![LabelReadOnly]);
+        // Locked as well: both reasons, the lock's first.
+        let both = edit_rights(&EditFacts {
+            labelled: true,
+            locked: true,
+            ..editable()
+        });
+        assert!(!both.colour && both.reminders);
+        assert_eq!(both.reasons, vec![Locked, LabelReadOnly]);
+        // Something can still change, so the list offers Edit.
+        assert_eq!(
+            edit_block(&EditFacts {
+                labelled: true,
+                ..editable()
+            }),
+            None
+        );
+    }
+
+    /// C13: a list PM can't read whole is read-only, with its reason; the colour stays open.
+    #[test]
+    fn unreadable_notifications_are_read_only_with_their_reason() {
+        let perms = edit_rights(&EditFacts {
+            reminders_readable: false,
+            ..editable()
+        });
+        assert!(!perms.reminders);
+        assert!(perms.colour && perms.summary);
+        assert_eq!(perms.reasons, vec![RemindersUnreadable]);
+    }
+
+    /// A blanket reason closes notifications and colour too: nothing at all may change.
+    #[test]
+    fn a_blanket_reason_closes_notifications_and_colour() {
+        let perms = edit_rights(&EditFacts {
+            organizer_self: false,
+            labelled: true,
+            reminders_readable: false,
+            ..editable()
+        });
+        assert!(!perms.reminders && !perms.colour && !perms.any());
+        assert_eq!(perms.reasons, vec![NotOrganizer]);
     }
 }

@@ -2906,6 +2906,8 @@ mod tests {
                 guests_can_modify: None,
                 guests_can_invite_others: None,
                 guests_can_see_other_guests: None,
+                reminders: None,
+                colour: None,
             })
             .unwrap();
         let own = crate::calendar_write::attendees::Own::default();

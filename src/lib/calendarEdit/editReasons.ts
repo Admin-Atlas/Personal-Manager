@@ -43,9 +43,22 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "Google has locked this event's title, time, place and description.";
     case "html_description":
       return "This description has formatting, so PM shows its text here and can't change it yet.";
+    case "label_read_only":
+      return "This event has a Google Calendar label, which sets its colour. Change it in Google Calendar.";
+    case "reminders_unreadable":
+      return "PM can't read one of this event's notifications, so it leaves them as they are.";
     default:
       return unreachable(reason);
   }
+}
+
+/** Reasons for rows the editor doesn't have yet (the notifications and colour rows): a line about
+ *  a control that isn't there would only puzzle (C13 critique C1-M10). */
+const ROWLESS: readonly ReadOnlyReason[] = ["label_read_only", "reminders_unreadable"];
+
+/** The reasons the editor says: those for the rows it shows. */
+export function shownReasons(reasons: readonly ReadOnlyReason[]): ReadOnlyReason[] {
+  return reasons.filter((r) => !ROWLESS.includes(r));
 }
 
 /** A field's name in a sentence. */

@@ -16,20 +16,25 @@
 //!   still matches the fresh copy ([`delete_still_matches`]). Re-deleting just because the etag moved
 //!   would delete a version of the event nobody looked at.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::{Map, Value};
 
 use super::attendees;
-use super::dto::{EventPatchDraft, NewEventDraft, SeenSummary, TimeDraft, Visibility};
+use super::dto::{
+    ColourDraft, EventPatchDraft, NewEventDraft, RemindersDraft, SeenSummary, TimeDraft, Visibility,
+};
 use super::time::{self, TimeError};
+use crate::calendar::Reminder;
 use crate::calendar_recur::expand::sync_start;
 use crate::calendar_recur::spec::{rule_from_spec, SpecError};
 use crate::calendar_recur::wire::RepeatRule;
 use crate::calendar_recur::SeriesStart;
 
 /// The only fields a single-event save sends: the guest list and what guests may do among them
-/// (C12).
+/// (C12), the event's notifications and its colour (C13). Never a label (`eventLabelId`): PM doesn't
+/// set Google's labels (the C13 spec's Adopted list).
 pub const PATCHABLE: &[&str] = &[
     "summary",
     "location",
@@ -42,6 +47,8 @@ pub const PATCHABLE: &[&str] = &[
     "guestsCanModify",
     "guestsCanInviteOthers",
     "guestsCanSeeOtherGuests",
+    "reminders",
+    "colorId",
 ];
 
 /// What a save that makes a one-off repeat may send (C11 §10): [`PATCHABLE`]'s fields and the rule,
@@ -59,13 +66,16 @@ pub const REPEAT_PATCHABLE: &[&str] = &[
     "guestsCanModify",
     "guestsCanInviteOthers",
     "guestsCanSeeOtherGuests",
+    "reminders",
+    "colorId",
     "recurrence",
 ];
 
-/// What a create may send: a save's fields, the repeat rule (C11), and the guests with what they may
-/// do (C12d). Still no reminders, conference, colour or private notes until their layers. Widening it
-/// is a decision, never a slip: `creatable_is_the_c11_list_and_the_guests` pins it to exactly this,
-/// and the create plan's own refusal test names what it still refuses (C10 critique 1 L10).
+/// What a create may send: a save's fields, the repeat rule (C11), the guests with what they may do
+/// (C12d), and the notifications and colour (C13). Still no conference, label or private notes until
+/// their layers. Widening it is a decision, never a slip:
+/// `creatable_is_the_c11_list_guests_notifications_and_colour` pins it to exactly this, and the
+/// create plan's own refusal test names what it still refuses (C10 critique 1 L10).
 pub const CREATABLE: &[&str] = &[
     "summary",
     "location",
@@ -79,7 +89,93 @@ pub const CREATABLE: &[&str] = &[
     "guestsCanModify",
     "guestsCanInviteOthers",
     "guestsCanSeeOtherGuests",
+    "reminders",
+    "colorId",
 ];
+
+/// Google's limits on an event's own notifications (the events reference): five at most, each 0 to
+/// 40 320 minutes (four weeks) before.
+pub const MAX_REMINDERS: usize = 5;
+pub const MAX_REMINDER_MINUTES: i64 = 40_320;
+/// The ways PM adds a notification: Google's two, a pop-up and an email.
+pub const REMINDER_METHODS: &[&str] = &["popup", "email"];
+
+/// Why a draft's body can't be built. Shown to the user as is: the inner words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchError {
+    Time(TimeError),
+    Reminders(ReminderError),
+    Colour(ColourError),
+}
+
+/// Why a draft's notifications can't be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderError {
+    /// More than Google's five.
+    TooMany,
+    /// The calendar's defaults and a list of its own at once.
+    DefaultWithOwn,
+    /// A new one outside 0 to four weeks before.
+    OutOfRange,
+    /// A new one sent a way PM doesn't add (an old text message).
+    UnknownMethod,
+    /// A new one the same as another on the list (C13 critique C1-L7).
+    Duplicate,
+    /// The copy the list goes onto holds one PM can't read, which a list sent whole would lose (C13
+    /// critique C1-M6).
+    Unreadable,
+}
+
+/// Why a draft's colour can't be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColourError {
+    /// Not one of Google's eleven.
+    UnknownColour,
+    /// The copy it goes onto has a Google Calendar label, which sets its colour (R-LABEL): a colour
+    /// under it wouldn't show, and PM doesn't change labels.
+    Labelled,
+}
+
+impl From<TimeError> for PatchError {
+    fn from(e: TimeError) -> Self {
+        PatchError::Time(e)
+    }
+}
+
+impl fmt::Display for PatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let words = match self {
+            PatchError::Time(e) => return e.fmt(f),
+            PatchError::Reminders(ReminderError::TooMany) => {
+                "Google allows up to 5 notifications on an event."
+            }
+            PatchError::Reminders(ReminderError::DefaultWithOwn) => {
+                "An event uses its calendar's default notifications or its own, not both."
+            }
+            PatchError::Reminders(ReminderError::OutOfRange) => {
+                "Google allows notifications up to 4 weeks before the event."
+            }
+            PatchError::Reminders(ReminderError::UnknownMethod) => {
+                "PM can only add notifications and emails."
+            }
+            PatchError::Reminders(ReminderError::Duplicate) => {
+                "The same notification is on the list twice. Remove one."
+            }
+            PatchError::Reminders(ReminderError::Unreadable) => {
+                "PM can't read one of this event's notifications, so it can't change them. Nothing \
+                 was saved."
+            }
+            PatchError::Colour(ColourError::UnknownColour) => {
+                "That isn't one of Google Calendar's colours, so nothing was saved."
+            }
+            PatchError::Colour(ColourError::Labelled) => {
+                "This event has a Google Calendar label, which sets its colour. Change it in Google \
+                 Calendar."
+            }
+        };
+        f.write_str(words)
+    }
+}
 
 /// Why a create's body can't be built. Shown to the user as is: the inner words.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +187,8 @@ pub enum InsertError {
     NoEventZone,
     /// A guest PM can't invite: not an address, or listed twice (C12d). Its words name no address.
     Guest(attendees::GuestError),
+    /// Notifications or a colour Google wouldn't take (C13).
+    Draft(PatchError),
 }
 
 impl fmt::Display for InsertError {
@@ -99,6 +197,7 @@ impl fmt::Display for InsertError {
             InsertError::Time(e) => e.fmt(f),
             InsertError::Rule(e) => e.fmt(f),
             InsertError::Guest(e) => e.fmt(f),
+            InsertError::Draft(e) => e.fmt(f),
             InsertError::NoEventZone => write!(
                 f,
                 "PM can't tell which time zone this event is in, so it can't make it repeat."
@@ -131,6 +230,10 @@ impl From<SpecError> for InsertError {
 ///
 /// Guests (C12d) go as new entries, in the order added ([`attendees::new_list`]), and only when
 /// there are any; each guest permission only where it isn't Google's default (C12 §3.2).
+///
+/// Notifications (C13) go only as a list of the event's own, checked as any new ones are; the
+/// calendar's defaults send nothing, since Google gives a new event those (INFERRED, probe E9). A
+/// colour goes only when it's one of Google's eleven, never the calendar's own.
 pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertError> {
     let (time, rule) = match &draft.recurrence {
         None => (draft.time.clone(), None),
@@ -196,6 +299,21 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
             body.insert(key.into(), Value::Bool(new));
         }
     }
+    let refused = |e| InsertError::Draft(PatchError::Reminders(e));
+    if let Some(reminders) = &draft.reminders {
+        check_reminders(reminders, &[]).map_err(refused)?;
+        if !reminders.use_default {
+            body.insert("reminders".into(), reminders_value(reminders));
+        }
+    }
+    if let Some(ColourDraft::Colour { id }) = &draft.colour {
+        if !is_event_colour(id) {
+            return Err(InsertError::Draft(PatchError::Colour(
+                ColourError::UnknownColour,
+            )));
+        }
+        body.insert("colorId".into(), Value::String(id.clone()));
+    }
     Ok(body)
 }
 
@@ -249,10 +367,35 @@ pub fn add_repeat(
 ///
 /// Switching between a timed and an all-day event sends the other key as `null` so Google drops it
 /// rather than holding both (INFERRED: confirmed or refuted by live test L6).
+///
+/// Notifications go whole, as the draft lists them, and only when they differ from Google's in more
+/// than order; a colour goes as one of Google's eleven, or `null` for the calendar's own (INFERRED:
+/// PATCH clears a field sent as null, probe E15b). Neither goes onto a copy they can't be checked
+/// against ([`check_draft_extras`]).
 pub fn build_patch(
     fresh: &Value,
     draft: &EventPatchDraft,
-) -> Result<Map<String, Value>, TimeError> {
+) -> Result<Map<String, Value>, PatchError> {
+    patch_onto(fresh, None, draft)
+}
+
+/// [`build_patch`] onto `master`, a repeating event's own copy, for a draft made in an editor opened
+/// on `occurrence`: a notification either copy holds goes back as Google holds it, since the editor
+/// showed the occurrence's (C13 critique C2-L6).
+pub fn series_patch(
+    master: &Value,
+    occurrence: &Value,
+    draft: &EventPatchDraft,
+) -> Result<Map<String, Value>, PatchError> {
+    patch_onto(master, Some(occurrence), draft)
+}
+
+fn patch_onto(
+    fresh: &Value,
+    shown: Option<&Value>,
+    draft: &EventPatchDraft,
+) -> Result<Map<String, Value>, PatchError> {
+    check_draft_extras(fresh, shown, draft)?;
     let mut body = Map::new();
     let mut text = |key: &str, new: &Option<String>| {
         if let Some(new) = new {
@@ -307,6 +450,31 @@ pub fn build_patch(
             }
         }
     }
+    if let Some(reminders) = &draft.reminders {
+        let mut value = reminders_value(reminders);
+        if !reminders_eq(Some(&value), fresh.get("reminders")) {
+            // `events.patch` merges an object it is sent (INFERRED, as for start and end): the
+            // defaults alone would leave Google's own list beside them, so it goes as an empty one
+            // (probe E9h).
+            let held = fresh
+                .pointer("/reminders/overrides")
+                .and_then(Value::as_array)
+                .is_some_and(|list| !list.is_empty());
+            if reminders.use_default && held {
+                value["overrides"] = Value::Array(Vec::new());
+            }
+            body.insert("reminders".into(), value);
+        }
+    }
+    match &draft.colour {
+        Some(ColourDraft::Calendar) if !text_of(fresh, "colorId").is_empty() => {
+            body.insert("colorId".into(), Value::Null);
+        }
+        Some(ColourDraft::Colour { id }) if text_of(fresh, "colorId") != id.as_str() => {
+            body.insert("colorId".into(), Value::String(id.clone()));
+        }
+        _ => {}
+    }
     if let Some(draft_time) = &draft.time {
         // Against Google's current start and end, so the half the user didn't change is sent exactly
         // as Google holds it (time::resolve_against).
@@ -326,6 +494,186 @@ pub fn build_patch(
         }
     }
     Ok(body)
+}
+
+/// Whether a draft's notifications and colour may go onto `fresh`, the copy they're sent to (C13),
+/// `shown` being the copy the editor showed when that's another (an occurrence saved onto its
+/// series). Its notifications need Google's own on `fresh` to be readable, since the list goes whole
+/// and would lose one PM can't read (C13 critique C1-M6), and are checked by [`check_reminders`]
+/// against what either copy holds. A colour can't go onto a copy with a Google Calendar label, which
+/// sets its colour and which PM doesn't change (R-LABEL), and must be one of Google's eleven.
+/// [`build_patch`] runs it; so does a "this and following" change, whose new part takes the draft's
+/// values without a body of its own.
+pub fn check_draft_extras(
+    fresh: &Value,
+    shown: Option<&Value>,
+    draft: &EventPatchDraft,
+) -> Result<(), PatchError> {
+    if let Some(reminders) = &draft.reminders {
+        let held = reminders_of(fresh).ok_or(PatchError::Reminders(ReminderError::Unreadable))?;
+        let other = shown.and_then(reminders_of).map(|r| r.overrides);
+        let held = held_by_either(held.overrides, other.unwrap_or_default());
+        check_reminders(reminders, &held).map_err(PatchError::Reminders)?;
+    }
+    if let Some(colour) = &draft.colour {
+        if !text_of(fresh, "eventLabelId").is_empty() {
+            return Err(PatchError::Colour(ColourError::Labelled));
+        }
+        if let ColourDraft::Colour { id } = colour {
+            if !is_event_colour(id) {
+                return Err(PatchError::Colour(ColourError::UnknownColour));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every notification `a` holds, and each of `b`'s beyond as many of it as `a` holds: a list either
+/// copy holds, counted one for one.
+fn held_by_either(a: Vec<Reminder>, b: Vec<Reminder>) -> Vec<Reminder> {
+    let count = |list: &[Reminder], r: &Reminder| list.iter().filter(|x| *x == r).count();
+    let mut out = a;
+    for r in &b {
+        if count(&out, r) < count(&b, r) {
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
+// --- notifications and colour (C13) ---
+
+/// An event's notifications as Google holds them: none at all reads as the calendar's defaults, and
+/// `useDefault` left out as true only where there's no list of its own (INFERRED). `None` when one
+/// can't be read (no method, minutes that aren't a whole number, a shape PM doesn't know), so a save
+/// that sends the list whole never loses it.
+pub fn reminders_of(event: &Value) -> Option<RemindersDraft> {
+    reminders_read(event.get("reminders"))
+}
+
+/// [`reminders_of`] for a `reminders` value itself, absent or null being the defaults.
+fn reminders_read(value: Option<&Value>) -> Option<RemindersDraft> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Some(RemindersDraft {
+            use_default: true,
+            overrides: Vec::new(),
+        });
+    };
+    value.as_object()?;
+    let overrides = match value.get("overrides").filter(|v| !v.is_null()) {
+        None => Vec::new(),
+        Some(list) => list
+            .as_array()?
+            .iter()
+            .map(|o| {
+                Some(Reminder {
+                    method: o.get("method")?.as_str()?.to_string(),
+                    minutes: o.get("minutes")?.as_i64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+    };
+    let use_default = match value.get("useDefault") {
+        Some(flag) => flag.as_bool()?,
+        None => overrides.is_empty(),
+    };
+    Some(RemindersDraft {
+        use_default,
+        overrides,
+    })
+}
+
+/// The `reminders` value for `draft`: `{"useDefault": true}`, or `{"useDefault": false,
+/// "overrides": […]}` with each `{method, minutes}` in the draft's order. The whole list, since
+/// Google replaces a list it is sent.
+pub fn reminders_value(draft: &RemindersDraft) -> Value {
+    if draft.use_default {
+        return serde_json::json!({ "useDefault": true });
+    }
+    let list: Vec<Value> = draft
+        .overrides
+        .iter()
+        .map(|r| serde_json::json!({ "method": r.method, "minutes": r.minutes }))
+        .collect();
+    serde_json::json!({ "useDefault": false, "overrides": list })
+}
+
+/// Whether `draft` may go onto an event whose own notifications are `held` (none for a new event):
+/// at most five, not the calendar's defaults and a list at once, and each one new to it (not among
+/// `held`, counted one for one) a way PM adds one, 0 to four weeks before, and not on the list
+/// twice. One Google holds goes back as it is, whatever it is.
+pub fn check_reminders(draft: &RemindersDraft, held: &[Reminder]) -> Result<(), ReminderError> {
+    if draft.use_default && !draft.overrides.is_empty() {
+        return Err(ReminderError::DefaultWithOwn);
+    }
+    if draft.overrides.len() > MAX_REMINDERS {
+        return Err(ReminderError::TooMany);
+    }
+    let key = |r: &Reminder| (r.method.clone(), r.minutes);
+    let mut left: BTreeMap<(String, i64), usize> = BTreeMap::new();
+    for r in held {
+        *left.entry(key(r)).or_default() += 1;
+    }
+    let mut listed: BTreeMap<(String, i64), usize> = BTreeMap::new();
+    for r in &draft.overrides {
+        *listed.entry(key(r)).or_default() += 1;
+    }
+    for r in &draft.overrides {
+        if let Some(n) = left.get_mut(&key(r)).filter(|n| **n > 0) {
+            *n -= 1;
+            continue;
+        }
+        if !REMINDER_METHODS.contains(&r.method.as_str()) {
+            return Err(ReminderError::UnknownMethod);
+        }
+        if !(0..=MAX_REMINDER_MINUTES).contains(&r.minutes) {
+            return Err(ReminderError::OutOfRange);
+        }
+        if listed.get(&key(r)).is_some_and(|n| *n > 1) {
+            return Err(ReminderError::Duplicate);
+        }
+    }
+    Ok(())
+}
+
+/// Whether two `reminders` values say the same: both the calendar's defaults, or the same
+/// notifications in any order (Google may hand a list back in another order than it was sent).
+/// Absent or null is the defaults, and a list left out an empty one (C13 critique C1-L7). A value
+/// PM can't read is the same only as itself. Every comparison of notifications goes through here:
+/// [`field_eq`], and the repeating-event planners'.
+pub(crate) fn reminders_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
+    let sorted = |v: Option<&Value>| {
+        reminders_read(v).map(|r| {
+            let mut list: Vec<(String, i64)> = r
+                .overrides
+                .into_iter()
+                .map(|o| (o.method, o.minutes))
+                .collect();
+            list.sort_unstable();
+            (r.use_default, list)
+        })
+    };
+    match (sorted(a), sorted(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.filter(|v| !v.is_null()) == b.filter(|v| !v.is_null()),
+    }
+}
+
+/// Whether `id` is one of Google's eleven event colours: "1" to "11", digits only, no leading zero.
+pub fn is_event_colour(id: &str) -> bool {
+    !id.starts_with('0')
+        && id.chars().all(|c| c.is_ascii_digit())
+        && matches!(id.parse::<u8>(), Ok(1..=11))
+}
+
+/// The keys a save's conflict check compares: those it sends, and with a colour the label too,
+/// which a colour saved while someone gave the event a label in Google would vanish under (C13).
+pub(crate) fn watched(body: &Map<String, Value>) -> Vec<String> {
+    let mut keys: Vec<String> = body.keys().cloned().collect();
+    if body.contains_key("colorId") && !body.contains_key("eventLabelId") {
+        keys.push("eventLabelId".into());
+    }
+    keys
 }
 
 /// A start or end node sent onto an event of the other kind (timed onto all-day, or back), with the
@@ -364,15 +712,14 @@ pub enum UpdateCheck {
 
 /// Decide an update against `base` (the copy the editor opened on) and `fresh` (Google's copy now).
 /// Fields the save doesn't send never count: a location changed in Google doesn't stop a title edit,
-/// and both changes are kept.
+/// and both changes are kept. A colour counts the label beside it ([`watched`]).
 pub fn update_check(base: &Value, fresh: &Value, body: &Map<String, Value>) -> UpdateCheck {
     if is_gone(fresh) {
         return UpdateCheck::Gone;
     }
-    let changed: Vec<String> = body
-        .keys()
+    let changed: Vec<String> = watched(body)
+        .into_iter()
         .filter(|key| !field_eq(key, base.get(key.as_str()), fresh.get(key.as_str())))
-        .cloned()
         .collect();
     if changed.is_empty() {
         UpdateCheck::Proceed
@@ -517,9 +864,12 @@ fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
         // A flag read as text would be "" either way, so any two would match (C12 §3.3).
         "guestsCanModify" => bool_of(a, false) == bool_of(b, false),
         "guestsCanInviteOthers" | "guestsCanSeeOtherGuests" => bool_of(a, true) == bool_of(b, true),
-        // A list or an object (`recurrence`, `reminders`…) by value: read as text, any two would be ""
+        // In any order, the defaults however Google writes them (C13): by value, a list handed back
+        // reordered would read as not landed after a lost answer, and as a conflict on the next save.
+        "reminders" => reminders_eq(a, b),
+        // A list or an object (`recurrence`…) by value: read as text, any two would be ""
         // and equal, so a changed one would never be a conflict (G4, found by C8's survey; the guest
-        // list, the one PM sends, has its own arm above).
+        // list and the notifications, the ones PM sends, have their own arms above).
         _ if [a, b]
             .iter()
             .any(|v| v.is_some_and(|v| v.is_array() || v.is_object())) =>
@@ -619,8 +969,15 @@ mod tests {
             .is_empty());
     }
 
+    /// Google's copy without its label, which holds the colour (R-LABEL).
+    fn unlabelled() -> Value {
+        let mut event = fresh();
+        event.as_object_mut().unwrap().remove("eventLabelId");
+        event
+    }
+
     /// Google's fields stay Google's: nothing outside the patchable set is ever in a body, however the
-    /// draft is built.
+    /// draft is built. C13 flips the colour to sendable on purpose; a label never is.
     #[test]
     fn nothing_but_the_patchable_fields_is_ever_sent() {
         let draft = EventPatchDraft {
@@ -642,15 +999,17 @@ mod tests {
             guests_can_modify: Some(true),
             guests_can_invite_others: Some(false),
             guests_can_see_other_guests: Some(false),
+            reminders: Some(own(&[("popup", 10)])),
+            colour: Some(ColourDraft::Colour { id: "9".into() }),
         };
-        let body = build_patch(&fresh(), &draft).unwrap();
+        let body = build_patch(&unlabelled(), &draft).unwrap();
         for key in body.keys() {
             assert!(PATCHABLE.contains(&key.as_str()), "{key}");
         }
         assert_eq!(
             body.len(),
-            11,
-            "every patchable field, the guests' included"
+            13,
+            "every patchable field, the guests', notifications and colour included"
         );
         for never in [
             "eventType",
@@ -662,9 +1021,7 @@ mod tests {
             "creator",
             "attachments",
             "extendedProperties",
-            // An event's own colour stays as Google holds it: a PATCH that leaves a field out keeps
-            // it (events.patch), so a title save never clears it (live test L-C1).
-            "colorId",
+            // PM doesn't set Google's labels (C13's Adopted list).
             "eventLabelId",
             "id",
             "etag",
@@ -764,7 +1121,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, TimeError::Gap { .. }));
+        assert!(matches!(err, PatchError::Time(TimeError::Gap { .. })));
     }
 
     /// An end-only change to an event that starts at the second 01:30 of London's fall-back: the
@@ -983,6 +1340,8 @@ mod tests {
             guests_can_modify: None,
             guests_can_invite_others: None,
             guests_can_see_other_guests: None,
+            reminders: None,
+            colour: None,
         }
     }
 
@@ -1004,8 +1363,8 @@ mod tests {
         }
     }
 
-    /// Every field a create may send, the rule and the guests included (C11, C12d), and nothing
-    /// else.
+    /// Every field a create may send, the rule, the guests, the notifications and the colour included
+    /// (C11, C12d, C13), and nothing else.
     #[test]
     fn insert_body_sends_only_what_a_create_may() {
         let body = insert_body(&NewEventDraft {
@@ -1014,6 +1373,8 @@ mod tests {
                 optional: false,
             }],
             guests_can_modify: Some(true),
+            reminders: Some(own(&[("popup", 10)])),
+            colour: Some(ColourDraft::Colour { id: "3".into() }),
             ..repeating(
                 timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
                 weekly_on(&[DayCode::Mon]),
@@ -1027,11 +1388,13 @@ mod tests {
             keys,
             [
                 "attendees",
+                "colorId",
                 "description",
                 "end",
                 "guestsCanModify",
                 "location",
                 "recurrence",
+                "reminders",
                 "start",
                 "summary",
                 "transparency",
@@ -1048,8 +1411,8 @@ mod tests {
             json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10"])
         );
         assert!(!body.contains_key("id"), "the insert request writes the id");
-        // No rule, no `recurrence` at all; no guests, no `attendees`, and Google's own permissions
-        // unsaid.
+        // No rule, no `recurrence` at all; no guests, no `attendees`, Google's own permissions
+        // unsaid; no notifications or colour, which the calendar's then give.
         let once = insert_body(&new_event(timed(
             "2026-10-26",
             "10:00",
@@ -1063,16 +1426,20 @@ mod tests {
             "guestsCanModify",
             "guestsCanInviteOthers",
             "guestsCanSeeOtherGuests",
+            "reminders",
+            "colorId",
+            "eventLabelId",
         ] {
             assert!(!once.contains_key(absent), "{absent}");
         }
     }
 
-    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4) and widened by C12d on purpose:
-    /// a create sends a save's fields before guests, the rule, then the guests' four, exactly; so it
-    /// may send whatever a save that makes a one-off repeat may.
+    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4) and widened by C12d and C13 on
+    /// purpose: a create sends a save's fields before guests, the rule, the guests' four, then the
+    /// notifications and colour (never a label), exactly; so it may send whatever a save that makes a
+    /// one-off repeat may.
     #[test]
-    fn creatable_is_the_c11_list_and_the_guests() {
+    fn creatable_is_the_c11_list_guests_notifications_and_colour() {
         assert_eq!(
             CREATABLE,
             [
@@ -1087,7 +1454,9 @@ mod tests {
                 "attendees",
                 "guestsCanModify",
                 "guestsCanInviteOthers",
-                "guestsCanSeeOtherGuests"
+                "guestsCanSeeOtherGuests",
+                "reminders",
+                "colorId"
             ]
         );
         let mut creatable = CREATABLE.to_vec();
@@ -1712,6 +2081,485 @@ mod tests {
             "café ☕ <",
         ] {
             assert!(!description_is_html(plain), "{plain}");
+        }
+    }
+
+    // --- notifications and colour (C13) ---
+
+    fn reminder(method: &str, minutes: i64) -> Reminder {
+        Reminder {
+            method: method.into(),
+            minutes,
+        }
+    }
+
+    /// The event's own list, in this order.
+    fn own(list: &[(&str, i64)]) -> RemindersDraft {
+        RemindersDraft {
+            use_default: false,
+            overrides: list.iter().map(|(m, n)| reminder(m, *n)).collect(),
+        }
+    }
+
+    fn defaults() -> RemindersDraft {
+        RemindersDraft {
+            use_default: true,
+            overrides: Vec::new(),
+        }
+    }
+
+    /// Google's copy holding `list` as its own notifications.
+    fn holding(list: &[(&str, i64)]) -> Value {
+        let mut event = unlabelled();
+        event["reminders"] = reminders_value(&own(list));
+        event
+    }
+
+    fn notifying(reminders: RemindersDraft) -> EventPatchDraft {
+        EventPatchDraft {
+            reminders: Some(reminders),
+            ..Default::default()
+        }
+    }
+
+    fn colouring(colour: ColourDraft) -> EventPatchDraft {
+        EventPatchDraft {
+            colour: Some(colour),
+            ..Default::default()
+        }
+    }
+
+    /// One of the eleven goes as `colorId`, alone, as text.
+    #[test]
+    fn a_colour_sends_color_id_and_never_a_label() {
+        let body = build_patch(
+            &unlabelled(),
+            &colouring(ColourDraft::Colour { id: "11".into() }),
+        )
+        .unwrap();
+        assert!(Value::Object(body) == serde_json::json!({ "colorId": "11" }));
+    }
+
+    /// "Calendar colour" clears a colour of its own with `null` (INFERRED, probe E15b) and sends
+    /// nothing when there's none.
+    #[test]
+    fn calendar_colour_clears_the_colour_and_nothing_else() {
+        let body = build_patch(&unlabelled(), &colouring(ColourDraft::Calendar)).unwrap();
+        assert!(Value::Object(body) == serde_json::json!({ "colorId": null }));
+        let mut plain = unlabelled();
+        plain.as_object_mut().unwrap().remove("colorId");
+        assert!(build_patch(&plain, &colouring(ColourDraft::Calendar))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// R-LABEL: a label sets the colour Google draws, and PM doesn't change labels, so any colour
+    /// onto a labelled copy is refused in words and builds nothing (C1-H1's case, an "all events"
+    /// save onto a labelled series, reaches here).
+    #[test]
+    fn a_colour_on_a_labelled_event_is_refused_with_words() {
+        for colour in [
+            ColourDraft::Calendar,
+            ColourDraft::Colour { id: "5".into() },
+        ] {
+            let refused = build_patch(&fresh(), &colouring(colour));
+            assert!(refused == Err(PatchError::Colour(ColourError::Labelled)));
+        }
+        assert_eq!(
+            PatchError::Colour(ColourError::Labelled).to_string(),
+            "This event has a Google Calendar label, which sets its colour. Change it in Google \
+             Calendar."
+        );
+        // Its notifications still go.
+        let body = build_patch(&fresh(), &notifying(own(&[("popup", 10)]))).unwrap();
+        assert!(body.contains_key("reminders") && !body.contains_key("colorId"));
+    }
+
+    /// Only "1" to "11" as Google writes them: nothing else reaches a body.
+    #[test]
+    fn an_unknown_colour_builds_nothing() {
+        for id in ["0", "12", "05", "", "+5", " 5", "1.0", "eleven"] {
+            assert!(!is_event_colour(id), "{id}");
+            let refused = build_patch(
+                &unlabelled(),
+                &colouring(ColourDraft::Colour { id: id.into() }),
+            );
+            assert!(
+                refused == Err(PatchError::Colour(ColourError::UnknownColour)),
+                "{id}"
+            );
+        }
+        for n in 1..=11 {
+            assert!(is_event_colour(&n.to_string()), "{n}");
+        }
+    }
+
+    #[test]
+    fn the_same_colour_sends_nothing() {
+        // `fresh` holds "5".
+        assert!(build_patch(
+            &unlabelled(),
+            &colouring(ColourDraft::Colour { id: "5".into() })
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    /// An event's own colour, and its label, stay as Google holds them: a PATCH that leaves a field
+    /// out keeps it (events.patch), so a title save never clears either (live test L-C1).
+    #[test]
+    fn a_title_save_never_touches_colour_or_label() {
+        let body = build_patch(
+            &fresh(),
+            &EventPatchDraft {
+                summary: Some("Dentist (moved)".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!body.contains_key("colorId") && !body.contains_key("eventLabelId"));
+        assert!(!body.contains_key("reminders"));
+    }
+
+    /// Sent whole, in the draft's order, and only when they differ in more than order.
+    #[test]
+    fn notifications_are_sent_whole_and_only_when_they_differ() {
+        let held = holding(&[("popup", 10)]);
+        let body = build_patch(&held, &notifying(own(&[("popup", 10), ("email", 60)]))).unwrap();
+        assert!(
+            Value::Object(body)
+                == serde_json::json!({ "reminders": { "useDefault": false, "overrides": [
+                    { "method": "popup", "minutes": 10 }, { "method": "email", "minutes": 60 }
+                ] } }),
+            "the whole list"
+        );
+        let both = holding(&[("email", 60), ("popup", 10)]);
+        assert!(
+            build_patch(&both, &notifying(own(&[("popup", 10), ("email", 60)])))
+                .unwrap()
+                .is_empty(),
+            "the same two in the other order"
+        );
+        // Every notification removed: an empty list of the event's own.
+        let none = build_patch(&held, &notifying(own(&[]))).unwrap();
+        assert!(
+            none["reminders"] == serde_json::json!({ "useDefault": false, "overrides": [] }),
+            "none at all"
+        );
+    }
+
+    /// The calendar's defaults: `useDefault` and, over a list Google holds, an empty one, since PATCH
+    /// merges an object (INFERRED, probe E9h); nothing when they're already the defaults.
+    #[test]
+    fn the_defaults_send_use_default_and_empty_googles_list() {
+        let body = build_patch(&holding(&[("popup", 10)]), &notifying(defaults())).unwrap();
+        assert!(
+            body["reminders"] == serde_json::json!({ "useDefault": true, "overrides": [] }),
+            "Google's list emptied"
+        );
+        let silent = build_patch(&holding(&[]), &notifying(defaults())).unwrap();
+        assert!(silent["reminders"] == serde_json::json!({ "useDefault": true }));
+        for already in [unlabelled(), {
+            let mut d = unlabelled();
+            d["reminders"] = serde_json::json!({ "useDefault": true });
+            d
+        }] {
+            assert!(build_patch(&already, &notifying(defaults()))
+                .unwrap()
+                .is_empty());
+        }
+        // And the empty list read back is the defaults landed.
+        let landed = {
+            let mut d = unlabelled();
+            d["reminders"] = serde_json::json!({ "useDefault": true });
+            d
+        };
+        assert!(already_applied(&landed, &body));
+    }
+
+    #[test]
+    fn defaults_with_a_list_of_their_own_are_refused() {
+        let both = RemindersDraft {
+            use_default: true,
+            overrides: vec![reminder("popup", 10)],
+        };
+        assert!(check_reminders(&both, &[]) == Err(ReminderError::DefaultWithOwn));
+        assert!(
+            build_patch(&unlabelled(), &notifying(both))
+                == Err(PatchError::Reminders(ReminderError::DefaultWithOwn))
+        );
+    }
+
+    #[test]
+    fn a_sixth_notification_is_refused() {
+        let five = own(&[
+            ("popup", 0),
+            ("popup", 10),
+            ("popup", 30),
+            ("email", 60),
+            ("email", 1440),
+        ]);
+        assert!(check_reminders(&five, &[]).is_ok());
+        let mut six = five.clone();
+        six.overrides.push(reminder("popup", 5));
+        assert!(check_reminders(&six, &[]) == Err(ReminderError::TooMany));
+    }
+
+    /// A new one outside 0 to four weeks is refused; one Google holds there goes back as it is.
+    #[test]
+    fn a_new_notification_outside_googles_range_is_refused_and_one_google_holds_is_kept() {
+        for minutes in [40_321, -1] {
+            assert!(
+                check_reminders(&own(&[("popup", minutes)]), &[]) == Err(ReminderError::OutOfRange),
+                "{minutes}"
+            );
+        }
+        assert!(check_reminders(&own(&[("email", 40_320), ("popup", 0)]), &[]).is_ok());
+        let held = [reminder("popup", -540)];
+        assert!(check_reminders(&own(&[("popup", -540), ("popup", 10)]), &held).is_ok());
+        let body = build_patch(
+            &holding(&[("popup", -540)]),
+            &notifying(own(&[("popup", -540), ("popup", 10)])),
+        )
+        .unwrap();
+        assert_eq!(body["reminders"]["overrides"][0]["minutes"], -540);
+    }
+
+    #[test]
+    fn an_old_method_google_holds_is_kept_and_a_new_one_is_refused() {
+        let held = [reminder("sms", 30)];
+        assert!(check_reminders(&own(&[("sms", 30), ("email", 15)]), &held).is_ok());
+        assert!(
+            check_reminders(&own(&[("sms", 30), ("sms", 15)]), &held)
+                == Err(ReminderError::UnknownMethod)
+        );
+    }
+
+    /// C1-L7: a new one the same as another on the list is refused; two Google holds go back.
+    #[test]
+    fn a_notification_on_the_list_twice_is_refused_unless_google_holds_both() {
+        let twice = own(&[("popup", 10), ("popup", 10)]);
+        assert!(check_reminders(&twice, &[]) == Err(ReminderError::Duplicate));
+        assert!(check_reminders(&twice, &[reminder("popup", 10)]) == Err(ReminderError::Duplicate));
+        let held = [reminder("popup", 10), reminder("popup", 10)];
+        assert!(check_reminders(&twice, &held).is_ok());
+        // The same time a different way is two notifications.
+        assert!(check_reminders(&own(&[("popup", 10), ("email", 10)]), &[]).is_ok());
+    }
+
+    /// C1-M6: a list PM can't read whole reads as `None`, and a new list never goes onto it.
+    #[test]
+    fn unreadable_notifications_read_as_none_and_take_no_new_list() {
+        let mut no_minutes = unlabelled();
+        no_minutes["reminders"] =
+            serde_json::json!({ "useDefault": false, "overrides": [{ "method": "popup" }] });
+        let mut fraction = unlabelled();
+        fraction["reminders"] = serde_json::json!({ "useDefault": false, "overrides":
+            [{ "method": "popup", "minutes": 7.5 }] });
+        let mut odd = unlabelled();
+        odd["reminders"] = serde_json::json!("soon");
+        for unreadable in [&no_minutes, &fraction, &odd] {
+            assert!(reminders_of(unreadable).is_none());
+            assert!(
+                build_patch(unreadable, &notifying(own(&[("popup", 10)])))
+                    == Err(PatchError::Reminders(ReminderError::Unreadable))
+            );
+        }
+        // No `reminders` at all is the defaults; a list without `useDefault` isn't.
+        assert!(reminders_of(&unlabelled()) == Some(defaults()));
+        let mut bare = unlabelled();
+        bare["reminders"] =
+            serde_json::json!({ "overrides": [{ "method": "email", "minutes": 5 }] });
+        assert!(reminders_of(&bare) == Some(own(&[("email", 5)])));
+    }
+
+    /// Everywhere a save compares them: in any order, an empty list left out alike, a changed
+    /// minute a change.
+    #[test]
+    fn notifications_compare_as_a_set_not_a_list() {
+        let ab = reminders_value(&own(&[("popup", 10), ("email", 60)]));
+        let ba = reminders_value(&own(&[("email", 60), ("popup", 10)]));
+        let moved = reminders_value(&own(&[("email", 60), ("popup", 15)]));
+        assert!(field_eq("reminders", Some(&ab), Some(&ba)));
+        assert!(!field_eq("reminders", Some(&ab), Some(&moved)));
+        let empty = serde_json::json!({ "useDefault": false, "overrides": [] });
+        let left_out = serde_json::json!({ "useDefault": false });
+        assert!(reminders_eq(Some(&empty), Some(&left_out)));
+        assert!(
+            !reminders_eq(Some(&empty), None),
+            "none of its own isn't the defaults"
+        );
+        // A reordered answer after a lost one reads as landed, and a changed one doesn't.
+        let body: Map<String, Value> = [("reminders".to_string(), ab.clone())]
+            .into_iter()
+            .collect();
+        let mut reordered = unlabelled();
+        reordered["reminders"] = ba.clone();
+        assert!(already_applied(&reordered, &body));
+        let mut changed = unlabelled();
+        changed["reminders"] = moved.clone();
+        assert!(!already_applied(&changed, &body));
+        // Google reordering since the editor opened is no conflict; a changed minute is.
+        let mut base = unlabelled();
+        base["reminders"] = ab;
+        assert_eq!(update_check(&base, &reordered, &body), UpdateCheck::Proceed);
+        assert_eq!(
+            update_check(&base, &changed, &body),
+            UpdateCheck::Conflict(vec!["reminders".into()])
+        );
+    }
+
+    /// A colour saved while someone gave the event a label in Google would vanish under it: a
+    /// conflict on the label, though the save never sends one.
+    #[test]
+    fn a_colour_write_conflicts_on_a_label_added_meanwhile() {
+        let base = unlabelled();
+        let body = build_patch(&base, &colouring(ColourDraft::Colour { id: "2".into() })).unwrap();
+        assert_eq!(watched(&body), ["colorId", "eventLabelId"]);
+        assert_eq!(
+            update_check(&base, &fresh(), &body),
+            UpdateCheck::Conflict(vec!["eventLabelId".into()])
+        );
+        // A title save doesn't watch it.
+        let title = build_patch(
+            &base,
+            &EventPatchDraft {
+                summary: Some("x".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(update_check(&base, &fresh(), &title), UpdateCheck::Proceed);
+    }
+
+    /// C2-L6: onto the series, from an editor that showed an occurrence, a notification either holds
+    /// goes back as it is; one neither holds is checked as new.
+    #[test]
+    fn a_series_save_keeps_a_notification_the_occurrence_holds() {
+        let master = holding(&[("popup", 10)]);
+        let occurrence = holding(&[("sms", 30)]);
+        let draft = notifying(own(&[("sms", 30), ("popup", 10)]));
+        assert!(
+            build_patch(&master, &draft)
+                == Err(PatchError::Reminders(ReminderError::UnknownMethod)),
+            "new to the series alone"
+        );
+        let body = series_patch(&master, &occurrence, &draft).unwrap();
+        assert_eq!(body["reminders"]["overrides"][0]["method"], "sms");
+        assert!(
+            series_patch(&master, &occurrence, &notifying(own(&[("sms", 15)])))
+                == Err(PatchError::Reminders(ReminderError::UnknownMethod))
+        );
+        // Held by both counts once: a second copy is new, and on the list twice.
+        let both = holding(&[("popup", 10)]);
+        assert!(
+            series_patch(
+                &master,
+                &both,
+                &notifying(own(&[("popup", 10), ("popup", 10)]))
+            ) == Err(PatchError::Reminders(ReminderError::Duplicate))
+        );
+    }
+
+    /// A new event's own list goes whole; the defaults, or none chosen, send nothing (Google gives
+    /// the calendar's, INFERRED E9); a list Google wouldn't take builds nothing.
+    #[test]
+    fn a_create_sends_notifications_only_when_not_the_defaults() {
+        let with = |reminders| {
+            insert_body(&NewEventDraft {
+                reminders,
+                ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+            })
+        };
+        let body = with(Some(own(&[("email", 30)]))).unwrap();
+        assert!(
+            body["reminders"]
+                == serde_json::json!({ "useDefault": false, "overrides": [
+                    { "method": "email", "minutes": 30 }
+                ] })
+        );
+        let none = with(Some(own(&[]))).unwrap();
+        assert!(none["reminders"] == serde_json::json!({ "useDefault": false, "overrides": [] }));
+        for quiet in [None, Some(defaults())] {
+            assert!(!with(quiet).unwrap().contains_key("reminders"));
+        }
+        assert!(
+            with(Some(own(&[("sms", 30)])))
+                == Err(InsertError::Draft(PatchError::Reminders(
+                    ReminderError::UnknownMethod
+                )))
+        );
+        assert!(
+            with(Some(RemindersDraft {
+                use_default: true,
+                overrides: vec![reminder("popup", 5)],
+            })) == Err(InsertError::Draft(PatchError::Reminders(
+                ReminderError::DefaultWithOwn
+            )))
+        );
+    }
+
+    /// One of the eleven goes as `colorId`; the calendar's own, or none, sends nothing; anything
+    /// else builds nothing.
+    #[test]
+    fn a_create_with_a_colour_sends_one_key() {
+        let with = |colour| {
+            insert_body(&NewEventDraft {
+                colour,
+                ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+            })
+        };
+        let body = with(Some(ColourDraft::Colour { id: "7".into() })).unwrap();
+        assert_eq!(body["colorId"], "7");
+        assert!(!body.contains_key("eventLabelId"));
+        for none in [None, Some(ColourDraft::Calendar)] {
+            assert!(!with(none).unwrap().contains_key("colorId"));
+        }
+        assert!(
+            with(Some(ColourDraft::Colour { id: "12".into() }))
+                == Err(InsertError::Draft(PatchError::Colour(
+                    ColourError::UnknownColour
+                )))
+        );
+    }
+
+    /// Every refusal has plain words: "notifications", never "reminders".
+    #[test]
+    fn every_draft_refusal_has_words() {
+        for (e, words) in [
+            (
+                PatchError::Reminders(ReminderError::TooMany),
+                "Google allows up to 5 notifications on an event.",
+            ),
+            (
+                PatchError::Reminders(ReminderError::DefaultWithOwn),
+                "An event uses its calendar's default notifications or its own, not both.",
+            ),
+            (
+                PatchError::Reminders(ReminderError::OutOfRange),
+                "Google allows notifications up to 4 weeks before the event.",
+            ),
+            (
+                PatchError::Reminders(ReminderError::UnknownMethod),
+                "PM can only add notifications and emails.",
+            ),
+            (
+                PatchError::Reminders(ReminderError::Duplicate),
+                "The same notification is on the list twice. Remove one.",
+            ),
+            (
+                PatchError::Reminders(ReminderError::Unreadable),
+                "PM can't read one of this event's notifications, so it can't change them. \
+                 Nothing was saved.",
+            ),
+            (
+                PatchError::Colour(ColourError::UnknownColour),
+                "That isn't one of Google Calendar's colours, so nothing was saved.",
+            ),
+        ] {
+            assert_eq!(e.to_string(), words);
+            assert_eq!(InsertError::Draft(e).to_string(), words);
+            assert!(!words.to_lowercase().contains("reminder"));
         }
     }
 }

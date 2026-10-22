@@ -1552,9 +1552,23 @@ export type ReadOnlyReason =
   | "became_repeating"
   | "special_type"
   | "locked"
-  | "html_description";
+  | "html_description"
+  /** A Google Calendar label sets its colour, and PM doesn't change labels (C13). */
+  | "label_read_only"
+  /** Google holds a notification PM can't read, so the list stays as it is (C13). */
+  | "reminders_unreadable";
 
 export type ShowAs = "busy" | "free";
+
+/** An event's notifications: the calendar's defaults, or its own list, sent whole (C13). */
+export interface RemindersDraft {
+  use_default: boolean;
+  overrides: Reminder[];
+}
+
+/** An event's colour: its calendar's, or one of Google's eleven by id ("1" to "11") (C13). A
+ *  Google Calendar label isn't PM's to set. */
+export type ColourChoice = { kind: "calendar" } | { kind: "colour"; id: string };
 export type EventVisibility = "default" | "public" | "private" | "confidential";
 
 /** When an event happens, as the editor holds it: wall-clock times in named zones, or whole days.
@@ -1590,6 +1604,10 @@ export interface EventPatchDraft {
   guests_can_modify?: boolean | null;
   guests_can_invite_others?: boolean | null;
   guests_can_see_other_guests?: boolean | null;
+  /** Its notifications, the whole list or the calendar's defaults (C13). */
+  reminders?: RemindersDraft | null;
+  /** Its colour (C13). */
+  colour?: ColourChoice | null;
 }
 
 /** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
@@ -1642,7 +1660,7 @@ export interface NewGuest {
 }
 
 /** A new event, for creating an event: every field as the editor holds it (empty text is left out
- *  of what goes to Google). No reminders or colour yet. */
+ *  of what goes to Google). */
 export interface NewEventDraft {
   summary: string;
   time: TimeDraft;
@@ -1660,6 +1678,10 @@ export interface NewEventDraft {
   guests_can_modify?: boolean;
   guests_can_invite_others?: boolean;
   guests_can_see_other_guests?: boolean;
+  /** Its own notifications (C13): left out, null or the defaults, Google gives the calendar's. */
+  reminders?: RemindersDraft | null;
+  /** One of Google's eleven colours (C13): left out, null or the calendar's, it has none. */
+  colour?: ColourChoice | null;
 }
 
 // --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---
@@ -1735,6 +1757,9 @@ export interface FieldPermissions {
   visibility: boolean;
   /** The guest list and what guests may do (C12). */
   guests: boolean;
+  /** Its notifications and its colour (C13). */
+  reminders: boolean;
+  colour: boolean;
   delete: boolean;
   reasons: ReadOnlyReason[];
 }
@@ -1766,6 +1791,11 @@ export interface EventForEdit {
   /** The organiser's address, on the guest list or not: no guest change may touch it (the
    *  backend's `check`). */
   organizer_email: string | null;
+  /** Its notifications as Google holds them; none at all reads as the calendar's defaults (C13). */
+  reminders: RemindersDraft;
+  /** Google's colour id and label id, null when unset. A label sets the colour Google draws. */
+  color_id: string | null;
+  label_id: string | null;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
