@@ -214,14 +214,24 @@ describe("calendar write fence", () => {
   });
 
   it("checks its own lists against the code", () => {
-    // A new command in calendar_edit.rs that the fence doesn't list.
+    // A new command in calendar_edit.rs that the fence doesn't list. Its name is one no layer will
+    // add, so the example can't become a listed command (C14 critique C1-H3).
     expect(
       problems({
         "src-tauri/src/commands/calendar_edit.rs":
           WRITE_COMMANDS.map(([c]) => `#[tauri::command]\npub async fn ${c}() {}\n`).join("") +
-          `#[tauri::command]\npub async fn respond_to_calendar_event() {}\nmod google_io {}`,
+          `#[tauri::command]\npub async fn send_raw_calendar_write() {}\nmod google_io {}`,
       }),
-    ).toMatch(/defines the commands .*respond_to_calendar_event.* but this fence lists/);
+    ).toMatch(/defines the commands .*send_raw_calendar_write.* but this fence lists/);
+    // A command defined twice can't stand in for a listed one that's missing (here the dev
+    // command): the lists are compared as sets, not by length.
+    expect(
+      problems({
+        "src-tauri/src/commands/calendar_edit.rs":
+          WRITE_COMMANDS.map(([c]) => `#[tauri::command]\npub async fn ${c}() {}\n`).join("") +
+          `#[tauri::command]\npub async fn ${WRITE_COMMANDS[0][0]}() {}\nmod google_io {}`,
+      }),
+    ).toMatch(/defines the commands .* but this fence lists .*dev_series_report/);
     // A plain `pub fn` the commands glob would re-export.
     expect(
       problems({

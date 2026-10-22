@@ -11,12 +11,15 @@ import type {
   EditLoad,
   MilestoneMove,
   ReadOnlyReason,
+  Rsvp,
+  RsvpScope,
   SeriesScope,
   SplitAction,
   WriteOutcome,
   WriteWarning,
 } from "../types";
 import type { DraftProblem, EditorField } from "./eventDraft";
+import { rsvpLabel } from "./rsvp";
 
 function unreachable(value: never): never {
   throw new Error(`unhandled calendar edit value: ${JSON.stringify(value)}`);
@@ -35,6 +38,8 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This is a private event on a calendar shared with you, and you can't change private events there.";
     case "not_organizer":
       return "Someone else organises this event, so only they can change it.";
+    case "not_invited":
+      return "This calendar isn't on the event's guest list, so there's no reply to send from it.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
@@ -204,9 +209,20 @@ export function writeWarningText(
     // "nothing changed", and never a plain "Saved".
     case "partly_applied":
       return "Google didn't keep all of your changes, so check the event.";
+    // Only a reply for every occurrence comes back with it (C14): the days are its `leftBehind`.
+    case "kept_own_reply":
+      return keptReplyText(leftBehind?.length ?? 0);
     default:
       return unreachable(warning);
   }
+}
+
+/** Occurrences answered on their own that kept their answer when the user replied for every
+ *  occurrence (C14 critiques C1-M3, C2-H1). */
+function keptReplyText(count: number): string {
+  if (count === 1) return "1 occurrence you answered on its own kept its answer.";
+  if (count > 1) return `${count} occurrences you answered on their own kept their answer.`;
+  return "Occurrences you answered on their own kept their answer.";
 }
 
 /** What settling a change that went with Send would email guests, before a button is pressed
@@ -460,6 +476,66 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       };
     case "failed":
       return notDeleted(outcome.message);
+    default:
+      return unreachable(outcome);
+  }
+}
+
+/** What a reply to an invitation came to (C14), for the reply control's line: Google's words for
+ *  the choice ("Yes", "No", "Maybe"), and "all events" as Google says it, never "every
+ *  occurrence", since an occurrence answered on its own may keep its answer (said when it did). */
+export function replyText(
+  outcome: WriteOutcome,
+  reply: Rsvp,
+  scope: RsvpScope | null,
+): { tone: Tone; text: string } {
+  switch (outcome.outcome) {
+    case "saved": {
+      const all = scope === "all" ? " for all events" : "";
+      const words = [`You replied ${rsvpLabel(reply)}${all}.`];
+      if (outcome.warnings.includes("mirror_refresh_pending")) {
+        words.push(writeWarningText("mirror_refresh_pending", "save"));
+      }
+      const kept = outcome.warnings.includes("kept_own_reply");
+      if (kept) words.push(writeWarningText("kept_own_reply", "save", outcome.left_behind));
+      return { tone: kept ? "warn" : "ok", text: words.join(" ") };
+    }
+    case "no_change":
+      return { tone: "ok", text: "That's already your reply." };
+    case "conflict":
+      return {
+        tone: "warn",
+        text: "This event kept changing in Google while PM sent your reply. Try again.",
+      };
+    case "needs_choice":
+      return { tone: "warn", text: "Choose this occurrence or all of them, then reply again." };
+    // Google answered as if it took the reply, and its copy doesn't hold it (C14 critiques C1-M2,
+    // C2-M2).
+    case "ignored_by_google":
+      return {
+        tone: "warn",
+        text: "Google didn't take the reply. Try again, or reply in Google Calendar.",
+      };
+    case "gone":
+      return { tone: "error", text: GONE };
+    case "read_only":
+      return { tone: "error", text: reasonText(outcome.reason) };
+    case "busy":
+      return { tone: "warn", text: "Google is busy right now. Reply again in a moment." };
+    case "reauth":
+      return { tone: "error", text: REAUTH };
+    case "unconfirmed":
+      return {
+        tone: "warn",
+        text: "PM lost touch with Google before it could confirm your reply. Refresh the calendar to see whether it went through.",
+      };
+    case "failed":
+      return { tone: "error", text: outcome.message };
+    // Never a reply's answer; the switch stays exhaustive.
+    case "partial_split":
+    case "split_removed":
+    case "ambiguous":
+      return { tone: "error", text: "Your reply wasn't sent." };
     default:
       return unreachable(outcome);
   }

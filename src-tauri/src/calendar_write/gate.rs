@@ -11,13 +11,14 @@
 //! editable, each with the choice it stood in for (rule R9): a change to an occurrence names which
 //! occurrences it's for ("this event", "this and following", "all events"), a change Google would
 //! email guests about names whether it should, and a write without that choice is asked again.
-//! Invitations stay read-only until C14. A one-off that Google has since turned into a repeating
-//! event is read-only with its own reason on every path, since a write to it would change every
-//! occurrence with no choice asked.
+//! Invitations stay read-only in the editor until C14's allow-list; replying is apart from that
+//! ([`reply_block`]): it follows whether the calendar is on the guest list, not who organises the
+//! event. A one-off that Google has since turned into a repeating event is read-only with its own
+//! reason on every path, since a write to it would change every occurrence with no choice asked.
 
 use crate::calendar_editing::EditingStatus;
 
-use super::dto::{FieldPermissions, ReadOnlyReason};
+use super::dto::{FieldPermissions, ListRights, ReadOnlyReason};
 
 /// Everything the gate needs to know about one event.
 #[derive(Debug, Clone, Copy)]
@@ -45,12 +46,19 @@ pub struct EditFacts<'a> {
     /// PM can read every notification Google holds on it ([`super::patch::reminders_of`]). Known
     /// only from a fresh copy: the mirror doesn't hold notifications, so the list reads true.
     pub reminders_readable: bool,
+    /// The calendar this copy is on has an entry on the guest list (Google's `self`): it has a reply
+    /// to give, the organiser's own included (C14).
+    pub invited: bool,
 }
 
-/// What may change about the event described by `facts`.
+/// What may change about the event described by `facts`, and whether the user may reply.
 pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
+    let respond = reply_block(facts).is_none();
     if let Some(reason) = blanket_reason(facts) {
-        return FieldPermissions::none(reason);
+        return FieldPermissions {
+            respond,
+            ..FieldPermissions::none(reason)
+        };
     }
     let mut perms = FieldPermissions {
         summary: true,
@@ -63,6 +71,8 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         reminders: true,
         colour: true,
         delete: true,
+        // A lock is Google's on the shared fields: a reply isn't among them.
+        respond,
         reasons: Vec::new(),
     };
     if facts.locked {
@@ -95,15 +105,29 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
     perms
 }
 
-/// The one reason the list shows when nothing about the event may change, or `None` when something
-/// can. Computed from the mirror's copy, so a formatted description (unknown there) never blocks it.
-pub fn edit_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
+/// What the list offers on a row (see [`ListRights`]): the one reason it shows when nothing in the
+/// editor may change (`None` when something can), Delete exactly where a delete's own check would
+/// allow it, and the reply. Computed from the mirror's copy, so a formatted description (unknown
+/// there) never blocks it.
+pub fn list_rights(facts: &EditFacts) -> ListRights {
     let perms = edit_rights(facts);
-    if perms.any() {
-        None
-    } else {
-        perms.reasons.first().copied()
+    ListRights {
+        edit_block: if perms.any() {
+            None
+        } else {
+            perms.reasons.first().copied()
+        },
+        can_delete: perms.delete,
+        can_respond: perms.respond,
     }
+}
+
+/// Why the user can't reply from this copy, or `None` when they can: the reasons nothing at all may
+/// be written from it, then an entry on the guest list. The organiser has one too, and may reply; a
+/// lock doesn't stop it (Google locks the shared fields), and neither does a one-off Google has
+/// since made repeating, which the reply's own read refuses as a save does.
+pub fn reply_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
+    access_reason(facts).or((!facts.invited).then_some(ReadOnlyReason::NotInvited))
 }
 
 /// Why PM may not create an event with `visibility` on a calendar, or `None` when it may: the account
@@ -127,12 +151,28 @@ pub fn create_block(
         html_description: false,
         labelled: false,
         reminders_readable: true,
+        invited: false,
     })
 }
 
 /// The reason nothing at all may change, checked account first, then calendar, then the event
 /// itself; the first one found is the one shown.
 fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
+    if let Some(reason) = access_reason(facts) {
+        return Some(reason);
+    }
+    if !facts.organizer_self {
+        return Some(ReadOnlyReason::NotOrganizer);
+    }
+    if facts.series_master {
+        return Some(ReadOnlyReason::BecameRepeating);
+    }
+    None
+}
+
+/// Account, calendar and kind: the reasons nothing at all may be written from this copy, a reply
+/// included. Checked in this order; the first found is the one shown.
+fn access_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
     if !facts.google {
         return Some(ReadOnlyReason::NotGoogle);
     }
@@ -154,12 +194,6 @@ fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
         None | Some("default") => {}
         // birthday, fromGmail, focusTime, outOfOffice, workingLocation, or a type Google adds later.
         Some(_) => return Some(ReadOnlyReason::SpecialType),
-    }
-    if !facts.organizer_self {
-        return Some(ReadOnlyReason::NotOrganizer);
-    }
-    if facts.series_master {
-        return Some(ReadOnlyReason::BecameRepeating);
     }
     None
 }
@@ -183,6 +217,22 @@ mod tests {
             html_description: false,
             labelled: false,
             reminders_readable: true,
+            invited: false,
+        }
+    }
+
+    /// The list's one reason, as [`list_rights`] gives it.
+    fn edit_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
+        list_rights(facts).edit_block
+    }
+
+    /// An invitation on your own calendar: someone else organises it, and your calendar is on its
+    /// guest list.
+    fn invitation() -> EditFacts<'static> {
+        EditFacts {
+            organizer_self: false,
+            invited: true,
+            ..editable()
         }
     }
 
@@ -515,5 +565,156 @@ mod tests {
         });
         assert!(!perms.reminders && !perms.colour && !perms.any());
         assert_eq!(perms.reasons, vec![NotOrganizer]);
+    }
+
+    /// C14: a reply follows the guest list, not who organises the event: the reasons nothing may be
+    /// written from the copy, then an entry of its own on the list. A lock doesn't stop it, nor does a
+    /// one-off made repeating (the reply's own read refuses that, as a save does).
+    #[test]
+    fn a_reply_needs_an_entry_on_the_guest_list_not_the_organisers_role() {
+        let i = invitation;
+        let rows: Vec<(&str, EditFacts, bool, Option<ReadOnlyReason>)> = vec![
+            ("R1", i(), true, None),
+            (
+                "R2",
+                EditFacts {
+                    organizer_self: true,
+                    ..i()
+                },
+                true,
+                None,
+            ),
+            (
+                "R3",
+                EditFacts {
+                    invited: false,
+                    ..i()
+                },
+                false,
+                Some(NotInvited),
+            ),
+            (
+                "R4",
+                EditFacts {
+                    event_type: Some("birthday"),
+                    ..i()
+                },
+                false,
+                Some(SpecialType),
+            ),
+            (
+                "R5",
+                EditFacts {
+                    editing: EditingStatus::Off,
+                    ..i()
+                },
+                false,
+                Some(EditingOff),
+            ),
+            (
+                "R6",
+                EditFacts {
+                    access_role: Some("reader"),
+                    ..i()
+                },
+                false,
+                Some(CalendarReadOnly),
+            ),
+            (
+                "R7",
+                EditFacts {
+                    access_role: Some("writerWithoutPrivateAccess"),
+                    visibility: Some("private"),
+                    ..i()
+                },
+                false,
+                Some(PrivateEvent),
+            ),
+            (
+                "R8",
+                EditFacts {
+                    locked: true,
+                    ..i()
+                },
+                true,
+                None,
+            ),
+            (
+                "R9",
+                EditFacts {
+                    google: false,
+                    ..i()
+                },
+                false,
+                Some(NotGoogle),
+            ),
+            (
+                "R10",
+                EditFacts {
+                    organizer_self: true,
+                    series_master: true,
+                    ..i()
+                },
+                true,
+                None,
+            ),
+            // The account's reasons come before the guest list's.
+            (
+                "R11",
+                EditFacts {
+                    editing: EditingStatus::Paused,
+                    invited: false,
+                    ..i()
+                },
+                false,
+                Some(EditingOff),
+            ),
+        ];
+        for (row, facts, respond, block) in rows {
+            assert_eq!(edit_rights(&facts).respond, respond, "{row}");
+            assert_eq!(reply_block(&facts), block, "{row}");
+            assert_eq!(list_rights(&facts).can_respond, respond, "{row}");
+        }
+    }
+
+    /// C14: on an invitation the reply is open while nothing in the editor is: the list still says
+    /// why the editor can't change it, offers no Delete, and offers the reply apart.
+    #[test]
+    fn a_reply_alone_is_not_an_edit() {
+        let perms = edit_rights(&invitation());
+        assert!(!perms.any() && perms.respond && !perms.delete);
+        assert_eq!(perms.reasons, vec![NotOrganizer]);
+        assert!(
+            list_rights(&invitation())
+                == ListRights {
+                    edit_block: Some(NotOrganizer),
+                    can_delete: false,
+                    can_respond: true,
+                },
+            "an invitation: no editor, no Delete, the reply"
+        );
+        // Your own event: Delete as the gate allows it, and a reply only with an entry of your own.
+        assert!(
+            list_rights(&editable())
+                == ListRights {
+                    edit_block: None,
+                    can_delete: true,
+                    can_respond: false,
+                }
+        );
+        let locked = EditFacts {
+            locked: true,
+            invited: true,
+            ..editable()
+        };
+        assert!(
+            list_rights(&locked)
+                == ListRights {
+                    edit_block: None,
+                    can_delete: false,
+                    can_respond: true,
+                },
+            "a lock keeps the delete closed and the reply open"
+        );
     }
 }

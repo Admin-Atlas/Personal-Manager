@@ -45,6 +45,7 @@ import {
   problemText,
   reasonText,
   rebasedText,
+  replyText,
   savedNotice,
   settleText,
   SPLIT_ORDER,
@@ -79,6 +80,7 @@ const REASONS: ReadOnlyReason[] = [
   "calendar_read_only",
   "private_event",
   "not_organizer",
+  "not_invited",
   "became_repeating",
   "special_type",
   "locked",
@@ -347,6 +349,7 @@ describe("a write's warnings", () => {
       "outside_mirror",
       "milestone_not_offered",
       "partly_applied",
+      "kept_own_reply",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
@@ -381,6 +384,71 @@ describe("a write's warnings", () => {
 
   it("maps every tone onto a Callout's", () => {
     expect(CALLOUT_TONE).toEqual({ ok: "info", warn: "warning", error: "danger" });
+  });
+});
+
+describe("what a reply came to (C14)", () => {
+  it("says the reply in Google's words, and all events as Google says it", () => {
+    expect(replyText(saved([]), "no", null)).toEqual({ tone: "ok", text: "You replied No." });
+    expect(replyText(saved([]), "maybe", "this").text).toBe("You replied Maybe.");
+    expect(replyText(saved([]), "yes", "all")).toEqual({
+      tone: "ok",
+      text: "You replied Yes for all events.",
+    });
+    expect(replyText(saved(["mirror_refresh_pending"]), "yes", null).text).toBe(
+      "You replied Yes. PM's calendar will show it after the next refresh.",
+    );
+    expect(replyText({ outcome: "no_change" }, "yes", null)).toEqual({
+      tone: "ok",
+      text: "That's already your reply.",
+    });
+  });
+
+  // C14 critiques C1-M3, C2-H1: "all events" never hides an occurrence that kept its own answer.
+  it("says how many occurrences answered on their own kept their answer", () => {
+    expect(
+      replyText(saved(["kept_own_reply"], ["2026-10-19", "2026-10-26"]), "yes", "all"),
+    ).toEqual({
+      tone: "warn",
+      text: "You replied Yes for all events. 2 occurrences you answered on their own kept their answer.",
+    });
+    expect(replyText(saved(["kept_own_reply"], ["2026-10-19"]), "no", "all").text).toBe(
+      "You replied No for all events. 1 occurrence you answered on its own kept its answer.",
+    );
+  });
+
+  it("has words for every outcome, never a promise it went when it may not have", () => {
+    const outcomes: WriteOutcome[] = [
+      { outcome: "needs_choice", scope: true },
+      { outcome: "ignored_by_google", split: false },
+      { outcome: "partial_split", token: "t", offers: ["check"], from: "2026-11-02" },
+      { outcome: "split_removed" },
+      { outcome: "conflict", fields: [] },
+      { outcome: "gone" },
+      { outcome: "read_only", reason: "not_invited" },
+      { outcome: "busy" },
+      { outcome: "reauth" },
+      { outcome: "unconfirmed" },
+      { outcome: "ambiguous", retry_token: "t" },
+      { outcome: "failed", message: "Google wouldn't take this reply from PM." },
+    ];
+    for (const o of outcomes) {
+      const said = replyText(o, "yes", null);
+      expect(said.text).toMatch(/^[A-Z“].*\.$/);
+      expect(said.text).not.toMatch(/^You replied/);
+      expect(said.tone).not.toBe("ok");
+      expect(said.text).not.toMatch(/rsvp|attendee|series|instance|organizer/i);
+    }
+    // Google answered as if it took it, and doesn't hold it: never "You replied".
+    expect(replyText({ outcome: "ignored_by_google", split: false }, "yes", null).text).toBe(
+      "Google didn't take the reply. Try again, or reply in Google Calendar.",
+    );
+    expect(replyText({ outcome: "read_only", reason: "not_invited" }, "no", null).text).toBe(
+      "This calendar isn't on the event's guest list, so there's no reply to send from it.",
+    );
+    expect(replyText({ outcome: "unconfirmed" }, "no", null).text).toMatch(
+      /whether it went through/,
+    );
   });
 });
 

@@ -43,6 +43,7 @@ export const WEB_ROOT = "src";
 export const WRITE_COMMANDS = [
   ["get_calendar_event_for_edit", "getCalendarEventForEdit"],
   ["update_calendar_event", "updateCalendarEvent"],
+  ["respond_to_calendar_event", "respondToCalendarEvent"],
   ["create_calendar_event", "createCalendarEvent"],
   ["delete_calendar_event", "deleteCalendarEvent"],
   ["cancel_calendar_delete", "cancelCalendarDelete"],
@@ -320,7 +321,12 @@ export function scan(root) {
   return { problems, rust: rust.length, web: web.length, modelPath: modelPath.length };
 }
 
-const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+/** The same names, as sets: a name given twice can't stand in for one left out. */
+const sameSet = (a, b) => {
+  const x = new Set(a);
+  const y = new Set(b);
+  return x.size === y.size && [...x].every((name) => y.has(name));
+};
 
 function main() {
   const { problems, rust, web, modelPath } = scan(repoRoot);

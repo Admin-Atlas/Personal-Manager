@@ -729,11 +729,11 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       if (ev.edit_block) return none(reasonText(ev.edit_block));
       if (cal?.provider !== "google") return none(null);
       if (overview?.editing[cal.source_id] !== "on") return none(reasonText("editing_off"));
-      // A locked copy keeps its busy/free and visibility editable, but Google's delete of one isn't
-      // documented, so PM doesn't offer it (the gate agrees on save).
+      // The gate decides Delete (C14): a locked copy, whose delete Google doesn't document, and an
+      // invitation can't be deleted. A row the list didn't mark gets none.
       return {
         canEdit: true,
-        canDelete: !ev.locked,
+        canDelete: ev.can_delete === true,
         reason: ev.locked ? reasonText("locked") : null,
       };
     },
