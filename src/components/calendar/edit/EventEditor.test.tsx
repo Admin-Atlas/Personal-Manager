@@ -31,6 +31,7 @@ import type {
   WriteOutcome,
 } from "../../../lib/types";
 import type { Picked } from "../../../lib/calendarEdit/saveChoices";
+import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
 
 type SaveAnswer = WriteOutcome & { newPartial?: boolean };
 const openForEdit = vi.fn<(id: string) => Promise<EditLoad>>();
@@ -177,6 +178,7 @@ async function open(
       row={clicked}
       calendar={null}
       account="me@x.com"
+      suggestions={NO_SUGGESTIONS}
       milestone={null}
       onClose={onClose}
       onDelete={onDelete}
@@ -185,6 +187,9 @@ async function open(
   await screen.findByLabelText("Title");
   return onClose;
 }
+
+/** No one to suggest as a guest. */
+const NO_SUGGESTIONS: readonly GuestSuggestion[] = [];
 
 /** A one-off's save: no scope, the draft's title for its notices, and nobody to email (no answer,
  *  no numbers). */
@@ -816,7 +821,14 @@ describe("EventEditor", () => {
   it("says why it couldn't open", async () => {
     openForEdit.mockResolvedValue({ outcome: "reauth" });
     render(
-      <EventEditor row={row} calendar={null} account={null} milestone={null} onClose={() => {}} />,
+      <EventEditor
+        row={row}
+        calendar={null}
+        account={null}
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        onClose={() => {}}
+      />,
     );
     expect(await screen.findByText(/Google needs you to sign in again/)).toBeTruthy();
   });
@@ -837,6 +849,8 @@ describe("EventEditor, a repeating event", () => {
       ...over,
     }) as SeriesChoices;
   const NOTICE = "PM closed before it finished an earlier change to this repeating event.";
+  /** A one-event save of the title "Gym": no scope, and no email answer yet. */
+  const UNSCOPED_GYM = [null, "Gym", null, null] as const;
 
   /** Open the occurrence, retitle it, press Save: the choices dialog, and the editor's Save. */
   async function retitle(title = "Gym") {
@@ -1209,6 +1223,37 @@ describe("EventEditor, a repeating event", () => {
     fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
     fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" }, null, "Gym", "all", guests);
+  });
+
+  // C12c review: the row still says it repeats, Google's copy no longer does, and it has guests. The
+  // one-event save that follows "doesn't repeat" is asked whether Google emails them: that question
+  // opens with the backend's numbers, rather than becoming a banner no Save could get past.
+  it("asks the guests question after the choices say it doesn't repeat", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue({ outcome: "not_repeating" });
+    const guests: GuestNotice = {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      cancelled: false,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    saveEdit.mockResolvedValueOnce({ outcome: "needs_choice", scope: false, guests });
+    const onClose = await open(vi.fn(), undefined, occurrence);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    expect(within(prompt).getByText("1 guest already invited will get an update.")).toBeTruthy();
+    expect(screen.queryByText(/Choose whether Google emails the guests/)).toBeNull();
+    expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Gym" }, ...UNSCOPED_GYM);
+    saveEdit.mockResolvedValueOnce({ outcome: "saved", warnings: [] });
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledTimes(2);
     expect(saveEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" }, null, "Gym", "all", guests);
   });
 
@@ -1785,6 +1830,7 @@ describe("EventEditor, a linked milestone", () => {
       row={clicked}
       calendar={null}
       account="me@x.com"
+      suggestions={NO_SUGGESTIONS}
       milestone={launch}
       onClose={() => {}}
     />
@@ -2066,6 +2112,22 @@ describe("EventEditor, guests", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(screen.getAllByText("“bob at x” isn't an email address.").length).toBeGreaterThan(0);
     expect(question()).toBeNull();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  // C12c review: like a date it couldn't read, an address it couldn't read never reached the draft,
+  // so closing would lose it without a word: the editor asks first.
+  it("asks before closing when only an address it couldn't read stands", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    const onClose = await open();
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    box.focus();
+    fireEvent.change(box, { target: { value: "bob at x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
     expect(saveEdit).not.toHaveBeenCalled();
   });
 

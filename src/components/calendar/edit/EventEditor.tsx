@@ -135,8 +135,9 @@ interface Props {
   /** The account the save goes through: who Google sends guests' emails from, and never suggested
    *  as a guest. */
   account: string | null;
-  /** People already in the user's calendars, for the guest box (worked out by the calendar). */
-  suggestions?: readonly GuestSuggestion[];
+  /** People already in the user's calendars, for the guest box (worked out by the calendar).
+   *  Required, so a caller can't leave the box without them unnoticed. */
+  suggestions: readonly GuestSuggestion[];
   /** A milestone linked to this event, which moves with it. */
   milestone: Milestone | null;
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
@@ -206,14 +207,11 @@ const firstDay = (t: TimeDraft) => (t.kind === "timed" ? t.start_date : t.first_
 /** Said under the Repeat row of an occurrence whose repeating event PM couldn't read. */
 export const UNREADABLE_REPEAT = "PM couldn't read how this repeats, so it can't change it here.";
 
-/** No suggestions: a stable empty list. */
-const NO_SUGGESTIONS: readonly GuestSuggestion[] = [];
-
 export function EventEditor({
   row,
   calendar,
   account,
-  suggestions = NO_SUGGESTIONS,
+  suggestions,
   milestone,
   onDelete,
   onClose,
@@ -256,6 +254,9 @@ export function EventEditor({
   const heldNotice = useRef<string | null>(null);
   // Times this Save was asked again because the plan changed: once, then it says so.
   const againRef = useRef(0);
+  // Times the backend asked this Save whether Google emails the guests: once, then it says so. Its
+  // own count, so a "doesn't repeat" before it doesn't use up that one ask (C12c review).
+  const guestAskRef = useRef(0);
   const [settlingSplit, setSettlingSplit] = useState(false);
   // The email question (null = closed), readable at once: no save or close goes from behind it.
   const [prompt, setPromptState] = useState<Prompt | null>(null);
@@ -357,8 +358,10 @@ export function EventEditor({
   const requestClose = () => {
     if (saving || promptRef.current) return;
     commitFocused();
-    if (isDirty() || hasBadDate(badDatesRef.current)) setAskDiscard("close");
-    else onClose();
+    // Text in the guest box that isn't an address never reached the draft: it would be lost too.
+    if (isDirty() || hasBadDate(badDatesRef.current) || badGuestRef.current !== null) {
+      setAskDiscard("close");
+    } else onClose();
   };
 
   /** The row a delete from here compares: what the editor showed, not a possibly older mirror row,
@@ -478,6 +481,7 @@ export function EventEditor({
     if (!current) return;
     // A new Save: no earlier ask's count or words carry into it (C9b-1 critique 1 L8).
     againRef.current = 0;
+    guestAskRef.current = 0;
     heldNotice.current = null;
     // What stops this save is already said under When, as it happened; a banner repeating it would
     // outlive the fix. A date a field couldn't read puts focus on that field, which the line names
@@ -681,7 +685,7 @@ export function EventEditor({
           // choosing occurrences, whose dialog would say "doesn't repeat" and send it again
           // unanswered, round and round. Once per Save: a second ask is said instead.
           if (outcome.guests && !outcome.scope) {
-            if (++againRef.current > 1) {
+            if (++guestAskRef.current > 1) {
               setBanner(outcomeText(outcome));
               return;
             }

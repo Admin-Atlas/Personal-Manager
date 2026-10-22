@@ -175,10 +175,44 @@ describe("DeleteEventDialog", () => {
     expect(screen.getByRole("dialog", { name: "Delete this event?" })).toBeTruthy();
     expect(choicesForDelete).not.toHaveBeenCalled();
     expect(screen.getByText("2 guests will be told it's cancelled.")).toBeTruthy();
-    expect(screen.getByText(/these numbers have changed since you chose/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        "It wasn't deleted. PM checked with Google before deleting, and these are the numbers it found.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/it has guests now/)).toBeNull();
     fireEvent.click(radio(/^Send/));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(onConfirm).toHaveBeenCalledWith(occurrence, null, "all", notice);
+  });
+
+  // C12c review: reopened for guests when nobody had answered (Google's copy has guests the row
+  // didn't show, found before the hold or at the send), it says the delete didn't happen and why,
+  // rather than coming back as if nothing had been tried.
+  it("says it wasn't deleted when reopened for guests nobody had answered about", () => {
+    const notice: GuestNotice = {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    const { onConfirm } = open(oneOff, { from: "me@x.com", guests: { notice, again: false } });
+    expect(
+      screen.getByText("It wasn't deleted: it has guests now. Choose whether Google emails them."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/PM checked with Google/)).toBeNull();
+    expect(screen.getByText("1 guest will be told it's cancelled.")).toBeTruthy();
+    fireEvent.click(radio(/^Don't send/));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(onConfirm).toHaveBeenCalledWith(oneOff, null, "none", notice);
+  });
+
+  it("says nothing of a delete that didn't happen when it opens the first time", () => {
+    open(oneOff);
+    expect(screen.queryByText(/wasn't deleted/)).toBeNull();
   });
 
   // An answer is for the numbers on screen: new ones ask afresh (R9).

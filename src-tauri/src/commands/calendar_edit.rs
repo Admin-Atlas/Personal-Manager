@@ -8182,6 +8182,61 @@ mod tests {
         assert!(outcome == saved(), "deleted, as chosen");
     }
 
+    /// C12c review: a delete from the editor asks with Google's list, which can be newer than PM's
+    /// row. Here the row shows A, Google's copy (what the editor showed) A and B, and the answer is
+    /// Send for those two: it is held, not asked again with the row's one, and at the send Google's
+    /// copy matches it, so both are emailed and it is deleted.
+    #[tokio::test]
+    async fn an_editor_delete_answered_for_googles_newer_list_is_held_and_deleted() {
+        let event = dentist();
+        let me = json!({ "email": "me@example.com", "self": true, "organizer": true });
+        let a = json!({ "email": "a@x.org", "responseStatus": "accepted" });
+        let b = json!({ "email": "b@x.org", "responseStatus": "needsAction" });
+        let stored = written(
+            &event,
+            &[("attendees", json!([me.clone(), a.clone()]))],
+            "\"s1\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&stored));
+        let target = target(&event);
+        let row = host
+            .with_conn(|conn| row_guests(conn, &target.row_id, &own_of(&target, &[])))
+            .unwrap();
+        let two = GuestNotice {
+            updated: 2,
+            people: 2,
+            emails: 2,
+            cancelled: true,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(
+            row.as_ref().is_some_and(|r| r.people == 1),
+            "PM's row shows A alone"
+        );
+        let answer = answered(Notify::All, two.clone());
+        assert!(answer.before_hold(row) == Ok(()), "held, not asked again");
+        let google = written(&event, &[("attendees", json!([me, a, b]))], "\"s2\"");
+        assert!(
+            attendees::delete_notice(&google, &own_of(&target, &[&google])) == Some(two),
+            "the editor's numbers are Google's"
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", google),
+            told(
+                Method::Delete,
+                "/events/solo",
+                "\"s2\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+        ]);
+        let seen = seen_by_user(&fresh_event(stored));
+        let outcome = send_delete(&script, &*host, &target, &seen, &answer).await;
+        script.asked_all();
+        assert!(outcome == saved(), "deleted, emailing both");
+    }
+
     /// C12 §6.10: a first guest added to a repeating event (allowed: it has none yet) is counted on
     /// every row the dialog offers.
     #[tokio::test]
@@ -11657,6 +11712,69 @@ mod tests {
             .filter(|r| r.method == Method::Patch)
             .count();
         assert_eq!(writes, 1, "B is never emailed");
+    }
+
+    /// C12 decision 3 on a series with guests (C12c review): "All events" adds B under Send, and A
+    /// accepts in Google before the write lands, so it meets a 412. The guest list goes again built
+    /// on Google's copy then: A's reply stays, B is still added, and the answer still goes with it.
+    #[tokio::test]
+    async fn a_series_guest_change_sent_again_keeps_a_reply_that_landed_meanwhile() {
+        let a = |reply: &str| json!({ "email": "a@example.com", "responseStatus": reply });
+        let waiting = |event: Value| with(event, "attendees", json!([a("needsAction")]));
+        let (series, instance) = (waiting(weekly()), waiting(monday_19()));
+        let window: Vec<Value> = october().into_iter().map(waiting).collect();
+        let host = TestHost::holding(&window);
+        let replied = written(&series, &[("attendees", json!([a("accepted")]))], "\"m2\"");
+        let both = json!([a("accepted"), { "email": "b@example.com" }]);
+        let mut steps = reads(&instance, &series, vec![series.clone()], window.clone());
+        steps.extend([
+            told(
+                Method::Patch,
+                "/events/abc",
+                "\"m1\"",
+                "sendUpdates=all",
+                Scripted::Status(412),
+            ),
+            Step::get("/events/abc", "", replied.clone()),
+            told(
+                Method::Patch,
+                "/events/abc",
+                "\"m2\"",
+                "sendUpdates=all",
+                Scripted::Json(written(&replied, &[("attendees", both.clone())], "\"m3\"")),
+            ),
+            refetch_read(Scripted::Json(page(
+                window
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| written(e, &[("attendees", both.clone())], &format!("\"r{i}\"")))
+                    .collect(),
+                None,
+            ))),
+        ]);
+        let script = Script::new(steps);
+        let (outcome, _) = save_told(
+            &host,
+            &script,
+            &instance,
+            &series,
+            adding_guest("b@example.com"),
+            Scope::All,
+            Some(Notify::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "landed");
+        let patches: Vec<RequestPlan> = script
+            .sent()
+            .into_iter()
+            .filter(|r| r.method == Method::Patch)
+            .collect();
+        assert!(patches.len() == 2, "sent once more");
+        assert!(
+            patches[1].body.as_ref().map(|b| &b["attendees"]) == Some(&both),
+            "A's reply kept, B still added"
+        );
     }
 
     /// Design critique 1: a guest who appeared in Google before the resend a 412 calls for, on a

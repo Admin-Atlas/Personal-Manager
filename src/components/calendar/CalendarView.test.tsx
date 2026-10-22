@@ -18,6 +18,9 @@ import type {
   CalendarAccount,
   CalendarEvent,
   CalendarOverview,
+  EditLoad,
+  EventForEdit,
+  GuestNotice,
   Milestone,
   WriteOutcome,
 } from "../../lib/types";
@@ -380,5 +383,128 @@ describe("CalendarView: a new event", () => {
     await act(async () => {});
     await mount(first.View);
     expect(screen.queryByRole("dialog", { name: "New event" })).toBeNull();
+  });
+});
+
+// The Calendar tab's guest wiring (#884, C12c review): the editor gets the people already in the
+// user's calendars for its guest box, and a delete the backend asks about guests reopens its dialog
+// with the backend's numbers and the account Google sends the emails from, not the row's own count.
+describe("CalendarView: guests", () => {
+  const ann = {
+    name: "Ann",
+    email: "ann@x.org",
+    response: "accepted",
+    optional: false,
+    organizer: false,
+    self: false,
+  } as const;
+
+  /** Click the Standup chip, then a button of its details. */
+  async function fromPopover(button: "Edit" | "Delete") {
+    fireEvent.click(screen.getByRole("button", { name: /Standup/ }));
+    fireEvent.click(await screen.findByRole("button", { name: button }));
+  }
+
+  it("suggests people from the user's calendars in the editor's guest box", async () => {
+    rows = [standup, row({ id: "e2", uid: "u2", summary: "Lunch", attendees: [ann] })];
+    const editable: EventForEdit = {
+      summary: "Standup",
+      location: "",
+      description: "",
+      description_html: false,
+      time: {
+        kind: "timed",
+        start_date: today,
+        start_time: "07:00",
+        start_zone: "Europe/London",
+        end_date: today,
+        end_time: "07:30",
+        end_zone: "Europe/London",
+      },
+      start_at: `${today}T06:00:00Z`,
+      end_at: `${today}T06:30:00Z`,
+      show_as: "busy",
+      visibility: "default",
+      attachments: [],
+      html_link: null,
+      guests: [],
+      guests_can_modify: false,
+      guests_can_invite_others: true,
+      guests_can_see_other_guests: true,
+      guests_omitted: false,
+      organizer_email: "me@x.com",
+    };
+    const load: EditLoad = {
+      outcome: "ready",
+      session: "s1",
+      event: editable,
+      permissions: {
+        summary: true,
+        time: true,
+        location: true,
+        description: true,
+        show_as: true,
+        visibility: true,
+        guests: true,
+        delete: true,
+        reasons: [],
+      },
+      seen: null,
+      series: null,
+    };
+    ipc.getCalendarEventForEdit.mockResolvedValue(load);
+    await mount();
+    await fromPopover("Edit");
+    const editor = await screen.findByRole("dialog", { name: "Edit event" });
+    const box = await within(editor).findByRole("combobox", { name: "Add guests" });
+    fireEvent.change(box, { target: { value: "ann" } });
+    const option = within(within(editor).getByRole("listbox", { name: "Suggestions" })).getByRole(
+      "option",
+    );
+    expect(option.textContent).toContain("Ann");
+    expect(option.textContent).toContain("ann@x.org");
+  });
+
+  it("reopens a delete the backend asks about guests with its numbers and the sending account", async () => {
+    const told: GuestNotice = {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    ipc.deleteCalendarEvent.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "needs_choice", scope: false, guests: told },
+    });
+    await mount();
+    await fromPopover("Delete");
+    const first = screen.getByRole("dialog", { name: "Delete this event?" });
+    // The row shows no guests: nothing to ask yet.
+    expect(within(first).queryByRole("radio")).toBeNull();
+    fireEvent.click(within(first).getByRole("button", { name: "Delete" }));
+    expect(await screen.findByText("1 guest will be told it's cancelled.")).toBeTruthy();
+    const again = screen.getByRole("dialog", { name: "Delete this event?" });
+    expect(within(again).getByText("Google sends the emails from me@x.com.")).toBeTruthy();
+    expect(
+      within(again).getByText(
+        "It wasn't deleted: it has guests now. Choose whether Google emails them.",
+      ),
+    ).toBeTruthy();
+    const del = within(again).getByRole<HTMLButtonElement>("button", { name: "Delete" });
+    expect(del.disabled).toBe(true);
+    fireEvent.click(within(again).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(del);
+    await waitFor(() => expect(ipc.deleteCalendarEvent).toHaveBeenCalledTimes(2));
+    expect(ipc.deleteCalendarEvent).toHaveBeenLastCalledWith(
+      standup.id,
+      expect.anything(),
+      null,
+      null,
+      "all",
+      told,
+    );
   });
 });

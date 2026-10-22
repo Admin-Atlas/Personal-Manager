@@ -147,11 +147,14 @@ function PlainDelete({
       <p className="mt-2">
         You can undo it for a few seconds. If you quit PM in that time, nothing is deleted.
       </p>
-      {/* Neutral: the backend knows only that its numbers differ, not why (C12 critique C2-L6). */}
-      {guests?.again && (
+      {/* Reopened by the backend: the delete didn't happen, which is said first, whether or not
+          anyone had answered (C12c review). Neutral, as the editor's question is: the backend knows
+          only that its numbers differ, not why (C12 critique C2-L6). */}
+      {guests && (
         <Callout tone="warning" size="md" className="mt-3">
-          PM checked with Google again, and these numbers have changed since you chose. Choose
-          again.
+          {guests.again
+            ? "It wasn't deleted. PM checked with Google before deleting, and these are the numbers it found."
+            : "It wasn't deleted: it has guests now. Choose whether Google emails them."}
         </Callout>
       )}
       {notice && (

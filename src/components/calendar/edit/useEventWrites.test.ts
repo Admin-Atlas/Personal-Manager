@@ -814,22 +814,23 @@ describe("a repeating event", () => {
 
     // C12 critique C1-H2: guests Google added during the Undo window stop the delete at the send;
     // the dialog asks again with the backend's numbers, and the "Deleting" notice goes. With
-    // something else open, a notice says to delete again instead.
+    // something else open, a notice says to delete again instead. Each settles as the backend
+    // answers: unanswered, a plain ask; answered for other numbers, `again` (C12c review).
     it("asks again when the send finds guests to tell", async () => {
       deleteCalendarEvent.mockResolvedValue(held);
       const { hook, act, settle, openOther } = await loadDialog();
-      const sent = (token: string) =>
+      const sent = (token: string, again: boolean) =>
         act(() =>
           settledHandler?.({
             undo_token: token,
             event_id: event.id,
-            result: { outcome: "needs_choice", scope: false, guests: TOLD },
+            result: { outcome: "needs_choice", scope: false, guests: TOLD, again },
           }),
         );
       act(() => hook.result.current.dialog.ask(event));
       act(() => hook.result.current.dialog.confirm(event, null));
       await settle();
-      sent("t1");
+      sent("t1", false);
       expect(hook.result.current.dialog.asked).toEqual({
         event,
         reask: null,
@@ -837,14 +838,36 @@ describe("a repeating event", () => {
       });
       expect(hook.result.current.writes.notices).toEqual([]);
       expect(hook.result.current.writes.hiddenIds.size).toBe(0);
+      // Answered, and the send found other numbers: reopened saying so.
       act(() => hook.result.current.dialog.close());
       deleteCalendarEvent.mockResolvedValue({ ...held, undo_token: "t2" });
       act(() => hook.result.current.dialog.confirm(event, null, "all", TOLD));
       await settle();
+      sent("t2", true);
+      expect(hook.result.current.dialog.asked).toEqual({
+        event,
+        reask: null,
+        guests: { notice: TOLD, again: true },
+      });
+      expect(hook.result.current.writes.notices).toEqual([]);
+      // The same with something else open: said instead, in the words for an answer given.
+      act(() => hook.result.current.dialog.close());
+      deleteCalendarEvent.mockResolvedValue({ ...held, undo_token: "t3" });
+      act(() => hook.result.current.dialog.confirm(event, null, "all", TOLD));
+      await settle();
       const other = openOther();
-      sent("t2");
+      sent("t3", true);
       expect(hook.result.current.dialog.asked).toBeNull();
       expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([
+        "“Dentist” wasn't deleted. Who Google would email has changed since you chose. Delete it again to choose whether Google emails the guests.",
+      ]);
+      // Unanswered, with something else open: said in the words for nobody having chosen.
+      deleteCalendarEvent.mockResolvedValue({ ...held, undo_token: "t4" });
+      act(() => hook.result.current.dialog.confirm(event, null));
+      await settle();
+      sent("t4", false);
+      expect(hook.result.current.dialog.asked).toBeNull();
+      expect(hook.result.current.writes.notices.map((n) => n.text).slice(1)).toEqual([
         "“Dentist” wasn't deleted. It has guests now. Delete it again to choose whether Google emails them.",
       ]);
       other.unmount();
