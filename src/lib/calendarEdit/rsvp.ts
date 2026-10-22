@@ -15,7 +15,16 @@
 // drawing each calendar's copy apart.
 
 import { occurrenceKey } from "../calendar-layout";
-import type { Attendee, Calendar, CalendarEvent, EventForEdit, GuestForEdit, Rsvp } from "../types";
+import type {
+  Attendee,
+  Calendar,
+  CalendarEvent,
+  EventForEdit,
+  GuestForEdit,
+  Rsvp,
+  RsvpScope,
+  WriteOutcome,
+} from "../types";
 import { addressKey, replyOf, trimmed, type Reply } from "./guests";
 
 /** The three replies, in Google's order. */
@@ -67,6 +76,26 @@ export const declinedByMe = (
 /** A `Reply` (with "awaiting") as one of the three, or null: with no reply yet, none is chosen. */
 export function asRsvp(r: Reply | null): Rsvp | null {
   return r === "yes" || r === "no" || r === "maybe" ? r : null;
+}
+
+/** Whether the copy a reply was sent from holds it now, by what the reply came to (`scope` as
+ *  sent), so "Going?" and the editor's guest list may say it before Google's rows land: a reply
+ *  Google already held, or one saved. One for all events may not have reached the occurrence replied
+ *  from (`day`, its first day, where known), if that occurrence was answered on its own: so only once
+ *  PM has read the occurrences back and that day isn't among those that kept their own answer
+ *  (`left_behind`). Not read back yet (`mirror_refresh_pending`), the answer Google held stays until
+ *  the next refresh says otherwise (PR B review round 2). */
+export function replyHeld(
+  outcome: WriteOutcome,
+  scope: RsvpScope | null,
+  day: string | null,
+): boolean {
+  if (outcome.outcome === "no_change") return true;
+  if (outcome.outcome !== "saved") return false;
+  if (scope !== "all") return true;
+  if (outcome.warnings.includes("mirror_refresh_pending")) return false;
+  if (!outcome.warnings.includes("kept_own_reply")) return true;
+  return day !== null && !(outcome.left_behind ?? []).includes(day);
 }
 
 /** Longest note PM sends, in characters, counted as the backend counts them: after tidying, by

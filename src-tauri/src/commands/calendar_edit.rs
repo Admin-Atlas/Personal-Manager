@@ -2756,7 +2756,7 @@ async fn land_reply<W: Wire, H: Host>(
 /// recorded and the next sync shows it (C14 critique C1-M2: never half landed). Every occurrence
 /// listed is upserted and none deleted: a reply removes nothing. Occurrences answered on their own
 /// that kept their answer are said, by day (`KeptOwnReply`), never hidden behind "all events"
-/// (C1-M3, C2-H1).
+/// (C1-M3, C2-H1), even when the mirror can't take the listing (PR B review round 2).
 async fn land_every_reply<W: Wire, H: Host>(
     wire: &W,
     host: &H,
@@ -2837,15 +2837,18 @@ async fn land_every_reply<W: Wire, H: Host>(
         })
         .filter_map(|item| start_day(item, zone))
         .collect();
-    if land(host, target, rows, Vec::new()).is_err() {
-        return saved_pending(host, target);
+    let mut warnings = match land(host, target, rows, Vec::new()) {
+        Ok(()) => Vec::new(),
+        Err(_) => {
+            drop_hash(host, &target.calendar_id);
+            vec![WriteWarning::MirrorRefreshPending]
+        }
+    };
+    if !kept.is_empty() {
+        warnings.push(WriteWarning::KeptOwnReply);
     }
     WriteOutcome::Saved {
-        warnings: if kept.is_empty() {
-            Vec::new()
-        } else {
-            vec![WriteWarning::KeptOwnReply]
-        },
+        warnings,
         left_behind: kept,
         milestone_moves: None,
     }
@@ -23305,6 +23308,64 @@ mod tests {
             row_reply(&host, occurrence["id"].as_str().unwrap()).as_deref(),
             Some("declined")
         );
+    }
+
+    /// PR B review round 2: a mirror that can't take the listing still has the occurrences that
+    /// kept their own answer said, by day, beside the calendar catching up.
+    #[tokio::test]
+    async fn all_events_says_which_kept_their_own_answer_when_the_mirror_cant_take_it() {
+        let occurrence = replied(&monday_invite(), "declined", None, "\"i1\"");
+        let series = replied(&weekly_invite(), "accepted", None, "\"m1\"");
+        let later = invitation_of(plain("2026-10-26T09:00:00Z"));
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        // The mirror refuses every row from now on, as a full disk would.
+        host.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER no_rows BEFORE INSERT ON calendar_events \
+                 BEGIN SELECT RAISE(ABORT, 'full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let mut steps = all_events_steps(
+            &occurrence,
+            &series,
+            "\"m1\"",
+            Scripted::Json(only_me(&series)),
+        );
+        steps.push(Step::get("/events/abc", "", series.clone()));
+        steps.push(refetch_read(Scripted::Json(page(
+            vec![
+                occurrence.clone(),
+                replied(&later, "accepted", None, "\"i2\""),
+            ],
+            None,
+        ))));
+        let script = Script::new(steps);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![
+                        WriteWarning::MirrorRefreshPending,
+                        WriteWarning::KeptOwnReply
+                    ],
+                    left_behind: vec!["2026-10-19".into()],
+                    milestone_moves: None,
+                },
+            "saved, shown after the next refresh, with the occurrence that kept its own answer"
+        );
+        assert!(host.hash_dropped(), "the next sync rewrites the calendar");
+        assert!(host.nothing_recorded());
     }
 
     /// PR B review round 1: from an occurrence answered on its own, "all events" can't wait for the

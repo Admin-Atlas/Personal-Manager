@@ -2824,6 +2824,40 @@ describe("EventEditor, an invitation", () => {
     }
   });
 
+  // PR B review round 2: an all-events reply PM couldn't read back yet may not have reached this
+  // occurrence, answered No on its own, so its own answer stays; to this occurrence alone, it shows.
+  it("an all-events reply not read back yet leaves the occurrence's own answer", async () => {
+    const occurrence: CalendarEvent = { ...row, series_id: "abc", recurring: true };
+    const declined = () =>
+      invitation({
+        guests: [boss, { ...mine, response: "declined" }, ann],
+        reply: { response: "declined", note: "" },
+      });
+    for (const [scope, which, shown, going] of [
+      ["all", "All events", "declined", "No"],
+      ["this", "This event", "accepted", "Yes"],
+    ] as const) {
+      openForEdit.mockResolvedValue(ready(declined(), THEIRS));
+      respond.mockResolvedValue({
+        outcome: "saved",
+        warnings: ["mirror_refresh_pending"],
+        left_behind: [],
+      });
+      await open(vi.fn(), undefined, occurrence, work);
+      fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+      fireEvent.click(screen.getByRole("button", { name: which }));
+      await screen.findByText(/^You replied Yes.*after the next refresh\.$/);
+      expect(respond).toHaveBeenLastCalledWith(occurrence.id, "yes", null, scope);
+      expect(within(myEntry()).getByText(shown)).toBeTruthy();
+      expect(
+        ["Yes", "No", "Maybe"].filter(
+          (name) => screen.getByRole("button", { name }).getAttribute("aria-pressed") === "true",
+        ),
+      ).toEqual([going]);
+      cleanup();
+    }
+  });
+
   it("where the organiser lets guests change it, says Google's warning and its fields are live", async () => {
     openForEdit.mockResolvedValue(ready(invitation({ guests_can_modify: true }), MODIFY));
     await open(vi.fn(), vi.fn(), row, work);

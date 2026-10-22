@@ -22,6 +22,7 @@ import {
   asRsvp,
   NOTE_MAX,
   noteLength,
+  replyHeld,
   RSVP_CHOICES,
   rsvpLabel,
   tidyNote,
@@ -151,11 +152,11 @@ export function RsvpControl({
       setStep({ reply: choice, note: text });
       return;
     }
-    // A reply for all events that some occurrence kept its own answer against: this one may be among
-    // them, so what it holds is left to `current` (the editor sets it from the days named, the
-    // popover reads Google's rows as they land), never shown as the reply sent.
-    const keptSome = outcome.outcome === "saved" && outcome.warnings.includes("kept_own_reply");
-    if (success && !keptSome) {
+    // A reply for all events that some occurrence kept its own answer against, or that PM couldn't
+    // read back yet: this one may be among those that kept theirs, so what it holds is left to
+    // `current` (the editor sets it from the days named, the popover reads Google's rows as they
+    // land), never shown as the reply sent.
+    if (replyHeld(outcome, scope, null)) {
       setShown({ reply: choice, over: against });
       if (text !== null) setSentNote({ text: tidyNote(text), over: noteAgainst });
     } else if (!success) {
