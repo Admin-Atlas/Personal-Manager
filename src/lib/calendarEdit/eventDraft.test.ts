@@ -468,6 +468,7 @@ describe("a new event's starting fields", () => {
       description: "Bring the form",
       show_as: "free",
       visibility: "private",
+      recurrence: null,
     });
     // A copy: a later edit to the draft can't change what was sent.
     expect(sent.time).not.toBe(draft.time);

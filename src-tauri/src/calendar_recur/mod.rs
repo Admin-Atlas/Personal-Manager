@@ -14,6 +14,8 @@
 //! - [`reanchor`]: what a rule becomes when one of its occurrences moves to another day.
 //! - [`remap`]: moving a whole series by one occurrence, its start, end and EXDATEs with it, proved
 //!   occurrence by occurrence.
+//! - [`wire`]: a rule from the editor's set as the webview sends and shows it, and a new series'
+//!   start read from the editor's fields.
 //!
 //! Three traps in rrule 0.14 shape this module (each read in the crate's source):
 //! - Its `Display` adds BYHOUR, BYMINUTE and BYSECOND to every rule, so a rule it prints pins the
@@ -29,6 +31,7 @@ pub mod reanchor;
 pub mod remap;
 pub mod spec;
 pub mod split;
+pub mod wire;
 
 use std::cmp::Ordering;
 use std::fmt;

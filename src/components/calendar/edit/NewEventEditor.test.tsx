@@ -123,7 +123,7 @@ const seed: EditorFields = {
 /** What the editor sends for the seed titled `summary`, on `calendarId`. */
 const sentFor = (summary: string, calendarId = PERSONAL) => ({
   calendarId,
-  draft: { ...seed, summary } as NewEventDraft,
+  draft: { ...seed, summary, recurrence: null } as NewEventDraft,
 });
 
 const saved: WriteOutcome = { outcome: "saved", warnings: [], left_behind: [] };
@@ -270,6 +270,7 @@ describe("NewEventEditor", () => {
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
       "description",
       "location",
+      "recurrence",
       "show_as",
       "summary",
       "time",

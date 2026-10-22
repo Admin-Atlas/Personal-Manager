@@ -166,6 +166,7 @@ describe("WriteNotices", () => {
             description: "",
             show_as: "free",
             visibility: "default",
+            recurrence: null,
           },
         },
       },

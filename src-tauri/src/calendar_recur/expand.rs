@@ -15,11 +15,11 @@
 
 use std::cmp::Ordering;
 
-use chrono::{DateTime, Month, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Month, NaiveDate, NaiveTime, TimeZone, Utc};
 use rrule::{Frequency, NWeekday, RRule, RRuleSet};
 
 use super::lines::{self, Freq, RuleFacts, Stamp};
-use super::spec::{rule_from_spec, RecurrenceSpec, SpecError};
+use super::spec::{days_in_month, rule_from_spec, MonthlyOn, Pattern, RecurrenceSpec, SpecError};
 use super::{end_of_day, first_instant, rfc_instant, Point, RecurError, SeriesStart};
 
 /// How many starts a count walks past before giving up: far more than the 730 Google allows.
@@ -295,13 +295,19 @@ pub fn last_before(
 /// The day comes from the rule run by days, in UTC, where none is ever skipped: in a zone, the crate
 /// moves an occurrence whose time the clocks skip, and drops one they skip at midnight. The time is
 /// the one chosen; if the clocks skip it on that day, it's refused, as any new start in a gap is.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands in C11, repeat rules")
-)]
+///
+/// The crate is asked for one occurrence only. In the editor's set, only "on day N" of every few
+/// months can have none at all (the 31st of every twelfth April), which the crate would look for to
+/// its 100,000-step guard; [`lands`] refuses that first, so this is quick for every rule the
+/// editor can send (C11 critique 1 L5).
 pub fn sync_start(spec: &RecurrenceSpec, start: &SeriesStart) -> Result<SeriesStart, SpecError> {
     let by_day = SeriesStart::AllDay(start.date());
     let rule = rule_from_spec(spec, &by_day)?;
+    if let Pattern::Monthly(MonthlyOn::Day(day)) = spec.pattern {
+        if !lands(day, spec.interval, start.date()) {
+            return Err(SpecError::NoOccurrence);
+        }
+    }
     let lines = lines::parse(&[rule]);
     let (_, facts) = lines::series_rule(&lines).map_err(|_| SpecError::NoOccurrence)?;
     let day = crate_set(&facts, &by_day)
@@ -318,10 +324,26 @@ pub fn sync_start(spec: &RecurrenceSpec, start: &SeriesStart) -> Result<SeriesSt
     }
 }
 
+/// Whether "on day `day`" of every `interval` months from `from` ever falls: a month it visits has
+/// that day (in `from`'s own month, on or after `from`). The months it visits, and which Februaries
+/// have a 29th, come round again within 4,800 of its steps (400 years of months), so that many
+/// decide it, in microseconds.
+fn lands(day: u8, interval: u16, from: NaiveDate) -> bool {
+    let (day, step) = (u32::from(day), i64::from(interval));
+    let first = i64::from(from.year()) * 12 + i64::from(from.month0());
+    (0..4_800_i64).any(|k| {
+        let month = first + k * step;
+        let month_start = i32::try_from(month.div_euclid(12)).ok().and_then(|year| {
+            NaiveDate::from_ymd_opt(year, u32::try_from(month.rem_euclid(12)).ok()? + 1, 1)
+        });
+        month_start.is_some_and(|m| days_in_month(m) >= day && (k > 0 || day >= from.day()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calendar_recur::spec::{Ends, Pattern};
+    use crate::calendar_recur::spec::Ends;
     use chrono::{NaiveDate, Weekday};
     use chrono_tz::Europe::London;
 
@@ -813,6 +835,47 @@ mod tests {
         assert_eq!(
             sync_start(&weekly(&[], Ends::Never), &london(2026, 10, 13, 9)),
             Err(SpecError::NoWeekdays)
+        );
+    }
+
+    /// "On day N" of every few months, where no month it visits has that day, is refused before the
+    /// crate is asked (it would look 100,000 months for it); one that lands at last is found.
+    #[test]
+    fn a_day_of_the_month_no_visited_month_has_is_refused_at_once() {
+        let monthly = |day: u8, interval: u16| RecurrenceSpec {
+            pattern: Pattern::Monthly(MonthlyOn::Day(day)),
+            interval,
+            ends: Ends::Never,
+        };
+        // The 31st of every twelfth month, from April: April never has one.
+        assert!(!lands(31, 12, day(2026, 4, 13)));
+        assert_eq!(
+            sync_start(&monthly(31, 12), &london(2026, 4, 13, 9)),
+            Err(SpecError::NoOccurrence)
+        );
+        // Every sixth month from June: June and December, and December has one.
+        assert!(lands(31, 6, day(2026, 6, 1)));
+        // Every second month from April: April and June haven't, August has.
+        assert!(lands(31, 2, day(2026, 4, 13)));
+        assert_eq!(
+            sync_start(&monthly(31, 2), &london(2026, 4, 13, 9)),
+            Ok(london(2026, 8, 31, 9))
+        );
+        // The 29th of every second February from 2027: odd years, never a leap one.
+        assert!(!lands(29, 24, day(2027, 2, 1)));
+        // From 2025 every year: 2028 has one.
+        assert!(lands(29, 12, day(2025, 2, 1)));
+        assert_eq!(
+            sync_start(&monthly(29, 12), &london(2025, 2, 1, 9)),
+            Ok(london(2028, 2, 29, 9))
+        );
+        // Every fourth February from 2100, which skips its leap day: 2104 has one.
+        assert!(lands(29, 48, day(2100, 2, 1)));
+        // A start's own month counts from its own day on: the 13th, from the 20th, is next month's.
+        assert!(lands(13, 1, day(2026, 10, 20)));
+        assert_eq!(
+            sync_start(&monthly(13, 1), &london(2026, 10, 20, 9)),
+            Ok(london(2026, 11, 13, 9))
         );
     }
 }
