@@ -43,7 +43,7 @@ import type {
 } from "../types";
 import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
 import { addressKey, changeNotice, isEmail } from "./guests";
-import { calendarDefaults, copyReminders, sameReminders } from "./reminders";
+import { calendarDefaults, copyReminders, sameReminders, type KindSwitchNote } from "./reminders";
 import {
   copyRule,
   followStartDate,
@@ -862,21 +862,28 @@ export function switchNewKind(
 /** A draft whose time just switched between timed and all-day (`draft`, with the new time), with
  *  its notifications fitted to the new kind: a list of its own goes back to the calendar's defaults,
  *  as Google web does (INFERRED, live probe E9f), since "30 minutes before" means nothing on an
- *  all-day event, which counts from the midnight before it; `reset` says the editor should say so.
- *  Back on the kind `base` has, the list `base` has comes back (C13 critique C2-L5): the event never
- *  changed kind, so a save sends nothing for it. Notifications the user can't change are never
+ *  all-day event, which counts from the midnight before it. Back on the kind `base` has, the list
+ *  `base` has comes back (C13 critique C2-L5): the event never changed kind, so a save sends nothing
+ *  for it. `note` says what the editor should say: that a list of the user's own was replaced, by
+ *  the defaults or by the event's own list in Google (C13 review round 1). The defaults the first
+ *  switch put there going back off say nothing. Notifications the user can't change are never
  *  touched (C1-L14): the save would be refused. */
 export function remindersAfterKindSwitch(
   base: EditorFields,
   draft: EditorFields,
   editable: boolean,
-): { draft: EditorFields; reset: boolean } {
-  if (!editable) return { draft, reset: false };
+): { draft: EditorFields; note: KindSwitchNote | null } {
+  if (!editable) return { draft, note: null };
   if (draft.time.kind === base.time.kind) {
-    return { draft: { ...draft, reminders: copyReminders(base.reminders) }, reset: false };
+    const replaced =
+      !draft.reminders.use_default && !sameReminders(draft.reminders, base.reminders);
+    return {
+      draft: { ...draft, reminders: copyReminders(base.reminders) },
+      note: !replaced ? null : base.reminders.use_default ? "defaults" : "event",
+    };
   }
-  if (draft.reminders.use_default) return { draft, reset: false };
-  return { draft: { ...draft, reminders: calendarDefaults() }, reset: true };
+  if (draft.reminders.use_default) return { draft, note: null };
+  return { draft: { ...draft, reminders: calendarDefaults() }, note: "defaults" };
 }
 
 /** `next`, a draft whose time just changed from `was`'s, with its rule following the start date

@@ -2422,13 +2422,21 @@ describe("EventEditor, notifications and colour", () => {
       screen.getByText("Notifications went back to Work's defaults for all-day events."),
     ).toBeTruthy();
     expect(screen.getByText("Work's default notifications for all-day events.")).toBeTruthy();
-    // Said until the list next changes.
-    fireEvent.click(screen.getByRole("button", { name: "Change" }));
-    expect(screen.queryByText(/Notifications went back/)).toBeNull();
     // Back to timed, as Google holds it: the event's own list returns, and nothing says otherwise
     // (C13 critique C2-L5).
     fireEvent.click(screen.getByRole("switch", { name: "All day" }));
     expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    expect(count("10 minutes before")).toBeTruthy();
+    // All day again; said until the list next changes.
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    // Back to timed over the list just made: the event's own replaces it, and that is said (C13
+    // review round 1).
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to the ones this event has in Google."),
+    ).toBeTruthy();
     expect(count("10 minutes before")).toBeTruthy();
     // All day again, and saved: the defaults go with the new time.
     fireEvent.click(screen.getByRole("switch", { name: "All day" }));
@@ -2436,6 +2444,66 @@ describe("EventEditor, notifications and colour", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveEdit.mock.calls[0][1].reminders).toEqual({ use_default: true, overrides: [] });
     expect(saveEdit.mock.calls[0][1].time?.kind).toBe("all_day");
+  });
+
+  // C13 review round 1: a conflict that puts Google's timed time back over the switch to all day
+  // puts back the notifications that switch replaced, as switching back would, and the switch's
+  // line goes; the next save sends none of them.
+  it("a conflict that undoes the switch to all day puts the event's own notifications back", async () => {
+    const list = own(["popup", 10], ["email", 60]);
+    const moved = event({
+      reminders: list,
+      time: {
+        kind: "timed",
+        start_date: "2026-10-12",
+        start_time: "15:00",
+        start_zone: "Europe/London",
+        end_date: "2026-10-12",
+        end_time: "16:00",
+        end_zone: "Europe/London",
+      },
+      start_at: "2026-10-12T14:00:00Z",
+      end_at: "2026-10-12T15:00:00Z",
+    });
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ reminders: list })))
+      .mockResolvedValueOnce(ready(moved, ALL, "s2"));
+    saveEdit
+      .mockResolvedValueOnce({ outcome: "conflict", fields: ["start", "end"] })
+      .mockResolvedValueOnce(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Work's defaults for all-day events."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/changed in Google while you were editing/);
+    expect(saveEdit.mock.calls[0][1].reminders).toEqual({ use_default: true, overrides: [] });
+    // Google's time, with the list that goes with it, as Google holds both.
+    expect(count("10 minutes before")).toBeTruthy();
+    expect(count("1 hour before, by email")).toBeTruthy();
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit.mock.calls[1][1]).toEqual({ summary: "Gym" });
+  });
+
+  // C13 review round 1: Google's list put in by a conflict is no longer the defaults the switch's
+  // line names, so the line goes.
+  it("a conflict that replaces the notifications drops the switch's line", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ reminders: own(["popup", 10]) })))
+      .mockResolvedValueOnce(ready(event({ reminders: own(["popup", 30]) }), ALL, "s2"));
+    saveEdit.mockResolvedValueOnce({ outcome: "conflict", fields: ["reminders"] });
+    await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Work's defaults for all-day events."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/changed in Google while you were editing/);
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
   });
 
   it("the kind switch leaves notifications it can't change as they are (C13 critique C1-L14)", async () => {

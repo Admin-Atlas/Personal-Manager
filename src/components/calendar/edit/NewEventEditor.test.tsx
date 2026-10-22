@@ -1775,6 +1775,84 @@ describe("NewEventEditor guests (C12d)", () => {
     ]);
   });
 
+  // C13 review round 1: on a calendar that isn't your primary one, your own address is a guest,
+  // counted as the backend counts it: as the account's own, never one Google invites.
+  it("on another of your calendars, your own address goes but is never counted", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ calendarId: FAMILY });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("me@x.com");
+    addGuest("b@example.org");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const p = within(
+      await screen.findByRole("dialog", { name: "Send invitation emails to guests?" }),
+    );
+    expect(p.getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    fireEvent.click(p.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(p.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    const guests = [
+      { email: "me@x.com", optional: false },
+      { email: "b@example.org", optional: false },
+    ];
+    expect(createEvent.mock.calls).toEqual([
+      [
+        FAMILY,
+        { ...sentFor("Dentist", FAMILY).draft, guests },
+        null,
+        { notify: "all", asked: ONE_INVITED },
+      ],
+    ]);
+    cleanup();
+    createEvent.mockClear();
+    // Only you: nobody to invite, so nothing is asked.
+    const alone = open({ calendarId: FAMILY });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("me@x.com");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(alone.onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    expect(createEvent.mock.calls).toEqual([
+      [
+        FAMILY,
+        { ...sentFor("Dentist", FAMILY).draft, guests: [{ email: "me@x.com", optional: false }] },
+        null,
+        null,
+      ],
+    ]);
+  });
+
+  // C13 review round 1: the calendar picked organises the event, so its address typed as a guest
+  // on another one comes off the list, saying so: never a row stuck as "Organiser", sent, and
+  // counted where the backend doesn't count it.
+  it("picking the calendar a guest's address names takes that guest off, and says so", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    addGuest("work@x.com");
+    addGuest("b@example.org");
+    pickCalendar("Personal", "Work");
+    expect(
+      screen.getByText("work@x.com organises this event now, so it came off the guest list."),
+    ).toBeTruthy();
+    const rows = within(screen.getByRole("list", { name: "Guests" })).getAllByRole("listitem");
+    expect(rows).toHaveLength(1);
+    expect(screen.queryByText("Organiser")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const p = within(
+      await screen.findByRole("dialog", { name: "Send invitation emails to guests?" }),
+    );
+    expect(p.getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    fireEvent.click(p.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(p.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [calendarId, draft, , answer] = createEvent.mock.calls[0];
+    expect(calendarId).toBe(WORK_CAL);
+    expect(draft.guests).toEqual([{ email: "b@example.org", optional: false }]);
+    expect(answer).toEqual({ notify: "all", asked: ONE_INVITED });
+  });
+
   it("the backend's numbers ask again, and the answer goes for them", async () => {
     const two: GuestNotice = { ...ONE_INVITED, invited: 2, people: 2, emails: 2 };
     createEvent
@@ -2048,5 +2126,24 @@ describe("NewEventEditor, notifications and colour", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls[0][1].reminders).toBeNull();
+  });
+
+  // C13 review round 1: switching back over a list made on the other kind says so too, and the
+  // line names the calendar picked since, whose defaults the event is on.
+  it("switching back over a list made says so, naming the calendar picked", async () => {
+    open();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(count("1 day before at 09:00")).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Personal's defaults for timed events."),
+    ).toBeTruthy();
+    pickCalendar("Personal", "Family");
+    expect(
+      screen.getByText("Notifications went back to Family's defaults for timed events."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Personal's defaults/)).toBeNull();
   });
 });

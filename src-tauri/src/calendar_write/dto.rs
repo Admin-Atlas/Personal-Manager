@@ -555,6 +555,10 @@ pub enum WriteWarning {
     /// of the new part, so it can't offer to move the milestones `Saved.milestone_moves` names: they
     /// stay on the earlier part (C9b-2 critique C2-M1).
     MilestoneNotOffered,
+    /// Google applied a one-event save without keeping all of it as sent (a colour it wouldn't clear
+    /// beside a new title, say): what Google holds is in the mirror, and the words say to look (C13
+    /// review round 1). Never "nothing changed", and never a plain "Saved".
+    PartlyApplied,
 }
 
 /// What moving milestones to the new part of a "this and following" change needs (C9b-2). Dates
@@ -835,6 +839,11 @@ mod tests {
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["mirror_refresh_pending"]}"#
+        );
+        // The webview's `WriteWarning` names it so (C13 review round 1).
+        assert_eq!(
+            serde_json::to_string(&WriteWarning::PartlyApplied).unwrap(),
+            r#""partly_applied""#
         );
         assert_eq!(
             serde_json::to_string(&WriteOutcome::Saved {

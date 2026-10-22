@@ -346,6 +346,7 @@ describe("a write's warnings", () => {
       "left_on_old_series",
       "outside_mirror",
       "milestone_not_offered",
+      "partly_applied",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
@@ -416,6 +417,26 @@ describe("a repeating event's save, said once the editor has closed", () => {
     );
     expect(savedNotice("Gym", saved(["mirror_refresh_pending"]), "all").text).toBe(
       "Saved “Gym” for every occurrence. PM's calendar will show it after the next refresh. To change it back, edit it again.",
+    );
+  });
+
+  // C13 review round 1: a save Google applied without keeping all of it (a colour it wouldn't clear
+  // beside a new title) is saved, never "nothing changed", and never a plain "Saved": it says to look.
+  it("says when Google didn't keep all of a save", () => {
+    expect(savedNotice("Gym", saved(["partly_applied"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym”. Google didn't keep all of your changes, so check the event.",
+    });
+    expect(savedNotice("Gym", saved(["mirror_refresh_pending", "partly_applied"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” to Google. Google didn't keep all of your changes, so check the event. PM's calendar will show it after the next refresh.",
+    });
+    expect(outcomeText(saved(["partly_applied"]))).toEqual({
+      tone: "warn",
+      text: "Saved to Google. Google didn't keep all of your changes, so check the event.",
+    });
+    expect(outcomeText(saved(["partly_applied", "mirror_refresh_pending"])).text).toBe(
+      "Saved to Google. Google didn't keep all of your changes, so check the event. PM's calendar will show it after the next refresh.",
     );
   });
 

@@ -1887,9 +1887,15 @@ export type SeriesScope = "this" | "following" | "all";
  *  not repeat" leaves of a repeating one (for all events or from one on), that starts outside the
  *  months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and
  *  following" change landed, but PM couldn't tell which repeating event Google made of the new
- *  part, so the milestones `milestone_moves` lists stay on the earlier part. */
+ *  part, so the milestones `milestone_moves` lists stay on the earlier part. `partly_applied`: Google
+ *  applied a one-event save without keeping all of it (a colour it wouldn't clear beside a new
+ *  title, say), so the event is as Google holds it (C13 review round 1). */
 export type WriteWarning =
-  "mirror_refresh_pending" | "left_on_old_series" | "outside_mirror" | "milestone_not_offered";
+  | "mirror_refresh_pending"
+  | "left_on_old_series"
+  | "outside_mirror"
+  | "milestone_not_offered"
+  | "partly_applied";
 
 /** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
  *  change. */

@@ -79,7 +79,9 @@ describe("notifications", () => {
     expect(rowProblem(-1, false)).toBe("Use a whole number.");
     expect(rowProblem(0, false)).toBeNull();
     expect(rowProblem(0, true)).toBe("Pick at least 1 day before.");
-    expect(rowProblem(-540, true)).toBe("Use a whole number.");
+    // 0 days at 09:00 is a whole number typed, on the day itself (C13 review round 1).
+    expect(rowProblem(-540, true)).toBe("Pick at least 1 day before.");
+    expect(rowProblem(null, true)).toBe("Use a whole number.");
     expect(rowProblem(15, true)).toBeNull();
     // What a row's box can hold.
     expect(parseCount(" 12 ")).toBe(12);

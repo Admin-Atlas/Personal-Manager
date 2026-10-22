@@ -122,10 +122,12 @@ export function parseCount(text: string): number | null {
 }
 
 /** Why a row can't be committed, or null: not a whole number (null), none for an all-day event (it
- *  counts from the midnight before it, so the day itself would be after that), or past four weeks. */
+ *  counts from the midnight before it, so the day itself, at any time of it, would be after that:
+ *  0 days at 09:00 is −540), or past four weeks. */
 export function rowProblem(minutes: number | null, allDay: boolean): string | null {
-  if (minutes === null || minutes < 0 || !Number.isInteger(minutes)) return "Use a whole number.";
+  if (minutes === null || !Number.isInteger(minutes)) return "Use a whole number.";
   if (allDay && minutes <= 0) return "Pick at least 1 day before.";
+  if (minutes < 0) return "Use a whole number.";
   if (minutes > MAX_MINUTES) return "Google allows notifications up to 4 weeks before.";
   return null;
 }
@@ -193,3 +195,14 @@ export const defaultsButtonLabel = (name: string | null) => `Use ${owner(name)} 
 /** Said under the list after a switch between timed and all-day put the defaults back. */
 export const kindSwitchText = (name: string | null, allDay: boolean) =>
   `Notifications went back to ${owner(name)} defaults for ${allDay ? "all-day" : "timed"} events.`;
+
+/** What a kind switch that replaced a list says under it (`remindersAfterKindSwitch`): the list went
+ *  back to the calendar's defaults, or to the one the event has in Google. */
+export type KindSwitchNote = "defaults" | "event";
+
+/** A kind switch's note in words, on `name`'s calendar, the event now all-day or not. Back to the
+ *  event's own list in Google over one the user made (C13 review round 1), or to the defaults. */
+export const kindNoteText = (note: KindSwitchNote, name: string | null, allDay: boolean) =>
+  note === "event"
+    ? "Notifications went back to the ones this event has in Google."
+    : kindSwitchText(name, allDay);
