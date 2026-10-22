@@ -433,6 +433,9 @@ describe("CalendarView: guests", () => {
       guests_can_see_other_guests: true,
       guests_omitted: false,
       organizer_email: "me@x.com",
+      reminders: { use_default: true, overrides: [] },
+      color_id: null,
+      label_id: null,
     };
     const load: EditLoad = {
       outcome: "ready",
@@ -446,6 +449,8 @@ describe("CalendarView: guests", () => {
         show_as: true,
         visibility: true,
         guests: true,
+        reminders: true,
+        colour: true,
         delete: true,
         reasons: [],
       },

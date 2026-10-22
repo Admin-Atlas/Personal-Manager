@@ -118,6 +118,8 @@ const ALL: FieldPermissions = {
   show_as: true,
   visibility: true,
   guests: true,
+  reminders: true,
+  colour: true,
   delete: true,
   reasons: [],
 };
@@ -149,6 +151,9 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     guests_can_see_other_guests: true,
     guests_omitted: false,
     organizer_email: "me@x.com",
+    reminders: { use_default: true, overrides: [] },
+    color_id: null,
+    label_id: null,
     ...over,
   };
 }
@@ -399,6 +404,21 @@ describe("EventEditor", () => {
     expect(screen.getByText(/Google has locked this event's title/)).toBeTruthy();
     // Delete is wired (onDelete given), and still not offered.
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("says no reason for the notifications or colour, which have no row yet (C13 critique C1-M10)", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ label_id: "label-1", color_id: "5" }), {
+        ...ALL,
+        reminders: false,
+        colour: false,
+        reasons: ["label_read_only", "reminders_unreadable", "html_description"],
+      }),
+    );
+    await open(vi.fn(), vi.fn());
+    expect(screen.getByText(/This description has formatting/)).toBeTruthy();
+    expect(screen.queryByText(/Google Calendar label/)).toBeNull();
+    expect(screen.queryByText(/notifications/)).toBeNull();
   });
 
   it("deletes what the editor showed, asking first when there are unsaved changes", async () => {

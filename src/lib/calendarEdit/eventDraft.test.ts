@@ -67,6 +67,9 @@ const event: EventForEdit = {
   guests_can_see_other_guests: true,
   guests_omitted: false,
   organizer_email: "me@x.org",
+  reminders: { use_default: true, overrides: [] },
+  color_id: null,
+  label_id: null,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -112,6 +115,8 @@ describe("the event draft", () => {
       show_as: true,
       visibility: true,
       guests: false,
+      reminders: true,
+      colour: true,
       delete: false,
       reasons: ["locked"],
     };
@@ -600,6 +605,8 @@ describe("guests in the draft", () => {
       show_as: true,
       visibility: true,
       guests: false,
+      reminders: true,
+      colour: true,
       delete: true,
       reasons: [],
     };

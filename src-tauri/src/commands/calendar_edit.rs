@@ -48,9 +48,9 @@ use crate::calendar_write::classify::{Method, Verdict};
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
     FieldPermissions, GuestForEdit, GuestNotice, HeldDeleteInfo, MilestoneMoves, MilestoneOffer,
-    NewEventDraft, Notify, ReadOnlyReason, RepeatDraft, ScopeRow, SeenSummary, SeriesChoices,
-    SeriesInfo, SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft, Visibility,
-    WriteOutcome, WriteWarning,
+    NewEventDraft, Notify, ReadOnlyReason, RemindersDraft, RepeatDraft, ScopeRow, SeenSummary,
+    SeriesChoices, SeriesInfo, SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft,
+    Visibility, WriteOutcome, WriteWarning,
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
@@ -302,6 +302,8 @@ fn facts_from_fresh<'a>(
         visibility: text("visibility"),
         series_master: turned_series(fresh),
         html_description: text("description").is_some_and(patch::description_is_html),
+        labelled: text("eventLabelId").is_some_and(|label| !label.is_empty()),
+        reminders_readable: patch::reminders_of(fresh).is_some(),
     }
 }
 
@@ -328,6 +330,9 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         // editable like a one-off here: which occurrences is asked at the write (rule R9).
         series_master: false,
         html_description: false,
+        labelled: row.event_label_id.is_some(),
+        // The mirror doesn't hold notifications; the editor's fresh copy says.
+        reminders_readable: true,
     }
 }
 
@@ -486,6 +491,13 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
             .and_then(|o| o.get("email"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        // A list PM can't read shows as the defaults only while the gate keeps it read-only.
+        reminders: patch::reminders_of(fresh).unwrap_or(RemindersDraft {
+            use_default: true,
+            overrides: Vec::new(),
+        }),
+        color_id: Some(text("colorId")).filter(|id| !id.is_empty()),
+        label_id: Some(text("eventLabelId")).filter(|id| !id.is_empty()),
     })
 }
 
@@ -505,7 +517,10 @@ fn guest_for_edit(entry: &Value) -> Option<GuestForEdit> {
     })
 }
 
-/// The reason to give when a draft touches a field the gate closed.
+/// The reason to give when a draft touches a field the gate closed: the first, or for a draft whose
+/// only closed fields are its notifications or colour, the one that closed them (a label holds the
+/// colour, a notification PM can't read holds the list; C13 critique C1-L1), never a lock or a
+/// formatted description that has nothing to do with them.
 fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<ReadOnlyReason> {
     let touched_closed = (draft.summary.is_some() && !perms.summary)
         || (draft.time.is_some() && !perms.time)
@@ -517,12 +532,34 @@ fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<Re
         || (draft.recurrence.is_some() && !perms.time)
         // The guest list and what guests may do (C12).
         || (draft.touches_guests() && !perms.guests);
-    touched_closed.then(|| {
+    let first = || {
         perms
             .reasons
             .first()
             .copied()
             .unwrap_or(ReadOnlyReason::CalendarReadOnly)
+    };
+    if touched_closed {
+        return Some(first());
+    }
+    let own = |closed: bool, reason: ReadOnlyReason| {
+        closed.then(|| {
+            if perms.reasons.contains(&reason) {
+                reason
+            } else {
+                first()
+            }
+        })
+    };
+    own(
+        draft.colour.is_some() && !perms.colour,
+        ReadOnlyReason::LabelReadOnly,
+    )
+    .or_else(|| {
+        own(
+            draft.reminders.is_some() && !perms.reminders,
+            ReadOnlyReason::RemindersUnreadable,
+        )
     })
 }
 
@@ -1133,6 +1170,13 @@ async fn save_event<W: Wire, H: Host>(
         match reply.verdict {
             Verdict::Ok => {
                 return match serde_json::from_str::<Value>(&reply.body) {
+                    // Google answered as if it had saved, and its copy doesn't hold what was sent
+                    // (a colour it wouldn't clear, say): never "Saved" (C13 critique C2-H1), as a
+                    // repeating event's write already says. A one-off made to repeat is read by
+                    // meaning when it lands.
+                    Ok(saved) if repeats.is_none() && !patch::already_applied(&saved, &body) => {
+                        WriteOutcome::IgnoredByGoogle { split: false }
+                    }
                     Ok(saved) => {
                         landed_save(wire, host, target, session, saved, &body, &repeats).await
                     }
@@ -3430,7 +3474,7 @@ async fn save_series<W: Wire, H: Host>(
     };
     let request = ChoiceRequest::Edit {
         session: session.to_string(),
-        draft,
+        draft: Box::new(draft),
     };
     let (mirror, planning) =
         match prepared_for(ctx, &request, Some(open.opened()), Some(&master_id), scope).await {
@@ -6545,6 +6589,13 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
         ReadOnlyReason::HtmlDescription => {
             "This description has formatting, so PM shows its text here and can't change it yet."
         }
+        ReadOnlyReason::LabelReadOnly => {
+            "This event has a Google Calendar label, which sets its colour. Change it in Google \
+             Calendar."
+        }
+        ReadOnlyReason::RemindersUnreadable => {
+            "PM can't read one of this event's notifications, so it leaves them as they are."
+        }
     }
 }
 
@@ -7323,6 +7374,16 @@ mod tests {
         });
         let f = facts_from_fresh(&mine, &facts, EditingStatus::On);
         assert!(f.organizer_self && f.html_description && !f.series_master);
+        // C13: no label and no notifications of its own read as unlabelled and readable.
+        assert!(!f.labelled && f.reminders_readable);
+        let mut labelled = mine.clone();
+        labelled["eventLabelId"] = json!("label-1");
+        labelled["reminders"] =
+            json!({ "useDefault": false, "overrides": [{ "method": "popup" }] });
+        let f = facts_from_fresh(&labelled, &facts, EditingStatus::On);
+        assert!(f.labelled && !f.reminders_readable);
+        labelled["eventLabelId"] = json!("");
+        assert!(!facts_from_fresh(&labelled, &facts, EditingStatus::On).labelled);
         let invite = json!({
             "organizer": { "email": "boss@x.com" }, "recurringEventId": "s1",
             "attendees": [{ "email": "me@x.com", "self": true }, { "email": "boss@x.com" }]
@@ -7356,6 +7417,8 @@ mod tests {
             show_as: true,
             visibility: true,
             guests: true,
+            reminders: true,
+            colour: true,
             delete: true,
             reasons: Vec::new(),
         };
@@ -7363,6 +7426,66 @@ mod tests {
             gate::edit_rights(&f) == open,
             "an occurrence edits like a one-off"
         );
+    }
+
+    /// C13: the editor reads notifications in Google's order, the colour and the label; none at
+    /// all reads as the calendar's defaults, and a list PM can't read shows as them too, while the
+    /// gate keeps it read-only.
+    #[test]
+    fn event_for_edit_reads_notifications_colour_and_label() {
+        let fresh = json!({
+            "start": { "dateTime": "2026-07-01T08:00:00Z", "timeZone": "Europe/London" },
+            "end": { "dateTime": "2026-07-01T09:00:00Z", "timeZone": "Europe/London" },
+            "reminders": { "useDefault": false, "overrides": [
+                { "method": "email", "minutes": 60 }, { "method": "popup", "minutes": 10 }
+            ] },
+            "colorId": "5",
+            "eventLabelId": "label-1"
+        });
+        let e = event_for_edit(&fresh, "Europe/London").unwrap();
+        assert!(
+            e.reminders
+                == RemindersDraft {
+                    use_default: false,
+                    overrides: vec![
+                        calendar::Reminder {
+                            method: "email".into(),
+                            minutes: 60
+                        },
+                        calendar::Reminder {
+                            method: "popup".into(),
+                            minutes: 10
+                        },
+                    ],
+                },
+            "Google's own list, in its order"
+        );
+        assert_eq!(e.color_id.as_deref(), Some("5"));
+        assert_eq!(e.label_id.as_deref(), Some("label-1"));
+        let defaults = RemindersDraft {
+            use_default: true,
+            overrides: Vec::new(),
+        };
+        let bare = json!({
+            "start": { "date": "2026-07-01" }, "end": { "date": "2026-07-02" },
+            "colorId": "", "eventLabelId": ""
+        });
+        let e = event_for_edit(&bare, "Europe/London").unwrap();
+        assert!(e.reminders == defaults, "no list: the calendar's defaults");
+        assert!(e.color_id.is_none() && e.label_id.is_none());
+        let mut unreadable = bare.clone();
+        unreadable["reminders"] = json!({ "useDefault": false, "overrides": [{ "minutes": 5 }] });
+        let e = event_for_edit(&unreadable, "Europe/London").unwrap();
+        assert!(e.reminders == defaults);
+        let facts = CalendarFacts {
+            access_role: Some("owner".into()),
+            ..Default::default()
+        };
+        let mut mine = unreadable.clone();
+        mine["organizer"] = json!({ "self": true });
+        let perms = gate::edit_rights(&facts_from_fresh(&mine, &facts, EditingStatus::On));
+        assert!(!perms.reminders);
+        assert_eq!(perms.reasons, vec![ReadOnlyReason::RemindersUnreadable]);
     }
 
     #[test]
@@ -7440,6 +7563,8 @@ mod tests {
             visibility: None,
             series_master: false,
             html_description: false,
+            labelled: false,
+            reminders_readable: true,
         });
         let title = EventPatchDraft {
             summary: Some("x".into()),
@@ -7484,6 +7609,69 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(refused_field(&locked, &untouched), None);
+    }
+
+    /// C13: a lock leaves notifications and colour open; closed, each names its own reason (C1-L1),
+    /// even under a lock, and the lock's when something it closes is touched too.
+    #[test]
+    fn refused_field_covers_notifications_and_colour() {
+        let rights = |locked, labelled, reminders_readable| {
+            gate::edit_rights(&EditFacts {
+                google: true,
+                editing: EditingStatus::On,
+                access_role: Some("owner"),
+                event_type: None,
+                organizer_self: true,
+                locked,
+                visibility: None,
+                series_master: false,
+                html_description: false,
+                labelled,
+                reminders_readable,
+            })
+        };
+        let colour = EventPatchDraft {
+            colour: Some(crate::calendar_write::dto::ColourDraft::Colour { id: "3".into() }),
+            ..Default::default()
+        };
+        let notifications = EventPatchDraft {
+            reminders: Some(RemindersDraft {
+                use_default: true,
+                overrides: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        for draft in [&colour, &notifications] {
+            assert_eq!(refused_field(&rights(true, false, true), draft), None);
+        }
+        let labelled = rights(true, true, true);
+        assert_eq!(
+            refused_field(&labelled, &colour),
+            Some(ReadOnlyReason::LabelReadOnly)
+        );
+        assert_eq!(refused_field(&labelled, &notifications), None);
+        let unreadable = rights(true, false, false);
+        assert_eq!(
+            refused_field(&unreadable, &notifications),
+            Some(ReadOnlyReason::RemindersUnreadable)
+        );
+        assert_eq!(refused_field(&unreadable, &colour), None);
+        let both = EventPatchDraft {
+            summary: Some("x".into()),
+            ..colour.clone()
+        };
+        assert_eq!(
+            refused_field(&labelled, &both),
+            Some(ReadOnlyReason::Locked)
+        );
+        // Closed by a blanket reason, that reason.
+        let none = FieldPermissions::none(ReadOnlyReason::NotOrganizer);
+        for draft in [&colour, &notifications] {
+            assert_eq!(
+                refused_field(&none, draft),
+                Some(ReadOnlyReason::NotOrganizer)
+            );
+        }
     }
 
     // --- guests (C12a): who a write would email, asked before anything is sent ---
@@ -8303,7 +8491,7 @@ mod tests {
         let (session, open) = open_in(&host, &instance, &series);
         let request = ChoiceRequest::Edit {
             session: session.clone(),
-            draft: draft.clone(),
+            draft: Box::new(draft.clone()),
         };
         let script = Script::new(october_reads());
         let (_, _, all) = ask(&script, &instance, request, Some(open.opened()), &["abc"]).await;
@@ -8770,12 +8958,24 @@ mod tests {
             recurring: true,
             ..mine.clone()
         };
+        // A Google Calendar label holds only the colour (C13): the row still gets Edit, and the
+        // gate reads the label from the row.
+        let labelled = CalendarEvent {
+            id: format!("{cal}:d"),
+            event_label_id: Some("label-1".into()),
+            ..mine.clone()
+        };
+        let calendars = calendar::list_calendars(&conn).unwrap();
+        let facts = facts_from_row(&labelled, &calendars[0]);
+        assert!(facts.labelled && facts.reminders_readable);
+        assert!(!facts_from_row(&mine, &calendars[0]).labelled);
         assert_eq!(
-            edit_blocks(&conn, &[mine, invite, orphan, occurrence]).unwrap(),
+            edit_blocks(&conn, &[mine, invite, orphan, occurrence, labelled]).unwrap(),
             vec![
                 None,
                 Some(ReadOnlyReason::NotOrganizer),
                 Some(ReadOnlyReason::NotGoogle),
+                None,
                 None
             ]
         );
@@ -9153,7 +9353,7 @@ mod tests {
     fn edit(draft: EventPatchDraft) -> ChoiceRequest {
         ChoiceRequest::Edit {
             session: "s1".into(),
-            draft,
+            draft: Box::new(draft),
         }
     }
 
@@ -10157,7 +10357,7 @@ mod tests {
             &instance,
             ChoiceRequest::Edit {
                 session,
-                draft: title("Retro"),
+                draft: Box::new(title("Retro")),
             },
             Some(open.opened()),
             &["abc"],
@@ -11964,7 +12164,7 @@ mod tests {
         let (session, open) = open_in(&host, &instance, &series);
         let request = ChoiceRequest::Edit {
             session: session.clone(),
-            draft: title("Retro"),
+            draft: Box::new(title("Retro")),
         };
         let script = Script::new(october_reads());
         let (_, _, all) = ask(&script, &instance, request, Some(open.opened()), &["abc"]).await;
@@ -12188,7 +12388,7 @@ mod tests {
         let (session, open) = open_in(&host, &instance, &series);
         let request = ChoiceRequest::Edit {
             session: session.clone(),
-            draft: repeating(every_day()),
+            draft: Box::new(repeating(every_day())),
         };
         let script = Script::new(october_reads());
         let (_, _, all) = ask(&script, &instance, request, Some(open.opened()), &["abc"]).await;
@@ -15612,7 +15812,7 @@ mod tests {
             let (session, open) = open_in(&host, &first, &series);
             let request = ChoiceRequest::Edit {
                 session: session.clone(),
-                draft: title("Retro"),
+                draft: Box::new(title("Retro")),
             };
             let script = Script::new(reads_now());
             let (this, following, all) =
@@ -16843,6 +17043,273 @@ mod tests {
         );
     }
 
+    // --- notifications and colour (C13) ---
+
+    fn notifying(list: &[(&str, i64)]) -> EventPatchDraft {
+        EventPatchDraft {
+            reminders: Some(RemindersDraft {
+                use_default: false,
+                overrides: list
+                    .iter()
+                    .map(|(method, minutes)| calendar::Reminder {
+                        method: (*method).into(),
+                        minutes: *minutes,
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn colouring(id: &str) -> EventPatchDraft {
+        EventPatchDraft {
+            colour: Some(crate::calendar_write::dto::ColourDraft::Colour { id: id.into() }),
+            ..Default::default()
+        }
+    }
+
+    /// A body of one key.
+    fn only(key: &str, value: Value) -> Value {
+        let mut body = serde_json::Map::new();
+        body.insert(key.into(), value);
+        Value::Object(body)
+    }
+
+    /// Notifications go whole, a colour as `colorId`, each alone on the fresh etag, never with a
+    /// label version and never asking anyone (they're the user's own).
+    #[tokio::test]
+    async fn a_notification_or_colour_save_sends_its_one_key_on_the_fresh_etag() {
+        let event = dentist();
+        let list = json!({ "useDefault": false, "overrides": [
+            { "method": "popup", "minutes": 10 }, { "method": "email", "minutes": 60 }
+        ] });
+        for (draft, key, value) in [
+            (
+                notifying(&[("popup", 10), ("email", 60)]),
+                "reminders",
+                list,
+            ),
+            (colouring("3"), "colorId", json!("3")),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let landed = written(&event, &[(key, value.clone())], "\"s2\"");
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &draft,
+                vec![Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(landed),
+                )],
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "{key} saved");
+            let sent = first_write(&script);
+            assert!(sent.body == Some(only(key, value)), "{key} alone");
+            assert!(!sent.url.contains("eventLabelVersion"), "{key}");
+        }
+    }
+
+    /// R-LABEL: a colour onto an event with a Google Calendar label is refused with its own reason
+    /// before any write; its notifications still go.
+    #[tokio::test]
+    async fn a_colour_save_on_a_labelled_event_is_refused_and_sends_nothing() {
+        let labelled = with(dentist(), "eventLabelId", json!("label-1"));
+        let host = TestHost::holding(std::slice::from_ref(&labelled));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &labelled,
+            target(&labelled),
+            &colouring("3"),
+            Vec::new(),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::LabelReadOnly
+                },
+            "the label's reason"
+        );
+        let landed = written(
+            &labelled,
+            &[(
+                "reminders",
+                json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 5 }] }),
+            )],
+            "\"s2\"",
+        );
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &labelled,
+            target(&labelled),
+            &notifying(&[("popup", 5)]),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "notifications saved");
+    }
+
+    /// Plan C6/C13: Google's lock leaves notifications and colour open, so a locked event saves them.
+    #[tokio::test]
+    async fn a_locked_event_saves_its_notifications_and_colour() {
+        let locked = with(dentist(), "locked", json!(true));
+        for (draft, key, value) in [
+            (
+                notifying(&[("email", 30)]),
+                "reminders",
+                json!({ "useDefault": false, "overrides": [{ "method": "email", "minutes": 30 }] }),
+            ),
+            (colouring("6"), "colorId", json!("6")),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&locked));
+            let landed = written(&locked, &[(key, value)], "\"s2\"");
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &locked,
+                target(&locked),
+                &draft,
+                vec![Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(landed),
+                )],
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "{key} saved");
+        }
+    }
+
+    /// C13 critique C2-H1: Google answering 200 with its copy unchanged (the colour it wouldn't clear)
+    /// is never "Saved": the outcome says Google ignored it, and the mirror keeps what Google has.
+    #[tokio::test]
+    async fn google_ignoring_a_single_save_says_so() {
+        let coloured = with(dentist(), "colorId", json!("5"));
+        let host = TestHost::holding(std::slice::from_ref(&coloured));
+        let unchanged = written(&coloured, &[], "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &coloured,
+            target(&coloured),
+            &EventPatchDraft {
+                colour: Some(crate::calendar_write::dto::ColourDraft::Calendar),
+                ..Default::default()
+            },
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(unchanged),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            first_write(&script).body == Some(only("colorId", Value::Null)),
+            "the calendar's colour as null"
+        );
+        assert!(
+            outcome == WriteOutcome::IgnoredByGoogle { split: false },
+            "ignored, said so"
+        );
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.color_id.as_deref(), Some("5"));
+    }
+
+    /// Google may hand a list back in another order than sent: after a lost answer that reads as
+    /// landed, as it does on a 200.
+    #[tokio::test]
+    async fn a_reordered_answer_after_a_lost_answer_reads_landed() {
+        let event = dentist();
+        let reordered = json!({ "useDefault": false, "overrides": [
+            { "method": "email", "minutes": 60 }, { "method": "popup", "minutes": 10 }
+        ] });
+        let landed = written(&event, &[("reminders", reordered)], "\"s2\"");
+        for answer in [
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Lost { retried: false },
+                ),
+                Step::get("/events/solo", "", landed.clone()),
+            ],
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed.clone()),
+            )],
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &notifying(&[("popup", 10), ("email", 60)]),
+                answer,
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "landed");
+        }
+    }
+
+    /// Notifications and colour are the user's own (C12's personal fields): on an event with guests
+    /// nobody is asked, and Google emails nobody.
+    #[tokio::test]
+    async fn a_notification_or_colour_save_with_guests_asks_nobody() {
+        let invited = with(
+            dentist(),
+            "attendees",
+            json!([{ "email": "me@example.com", "self": true, "organizer": true },
+                   { "email": "b@x.org", "responseStatus": "accepted" }]),
+        );
+        for (draft, key, value) in [
+            (
+                notifying(&[("popup", 15)]),
+                "reminders",
+                json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 15 }] }),
+            ),
+            (colouring("10"), "colorId", json!("10")),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&invited));
+            let landed = written(&invited, &[(key, value)], "\"s2\"");
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &invited,
+                target(&invited),
+                &draft,
+                vec![Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(landed),
+                )],
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "{key} saved without asking");
+        }
+    }
+
     /// R6: a node with no zone on a calendar with none is read in this computer's zone, as the editor
     /// showed it (C11d review 1); with no zone anywhere it's never read as UTC, nothing is sent, and
     /// the words say it's the event's zone PM can't tell.
@@ -16927,6 +17394,32 @@ mod tests {
         )
         .await;
         assert!(outcome == saved());
+    }
+
+    /// C13 critique C2-H1 reads a 200 against what was sent, but a one-off made to repeat lands by
+    /// meaning: Google's own spelling of the rule in its answer is the save, never "ignored".
+    #[tokio::test]
+    async fn a_one_off_given_a_repeat_answered_in_googles_spelling_is_saved() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &weekly_on(&[DayCode::Mon]),
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(dentist_weekly("RRULE:BYDAY=MO;FREQ=WEEKLY;INTERVAL=1")),
+                ),
+                dentist_listing(dentist_mondays()),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "saved");
     }
 
     /// C11 critique 1 M3: an answer that never came, or a server error on the way, is read by meaning:
@@ -17876,6 +18369,8 @@ mod tests {
             guests_can_modify: None,
             guests_can_invite_others: None,
             guests_can_see_other_guests: None,
+            reminders: None,
+            colour: None,
         }
     }
 
@@ -18105,9 +18600,11 @@ mod tests {
         assert_eq!(held_creates(&host), 0);
     }
 
-    /// C10's tripwire, as C12d leaves it: guests go only with a draft that has them (below).
+    /// C10's tripwire, as C12d and C13 leave it: guests go only with a draft that has them, and
+    /// notifications and a colour only with one that sets its own (below); never a call, notes or a
+    /// label.
     #[tokio::test]
-    async fn a_create_sends_no_reminders_conference_or_notes() {
+    async fn a_create_sends_no_conference_or_notes_and_no_defaults() {
         let host = TestHost::holding(&[]);
         let draft = NewEventDraft {
             location: "High St".into(),
@@ -18133,15 +18630,78 @@ mod tests {
             "conferenceData",
             "extendedProperties",
             "colorId",
+            "eventLabelId",
         ] {
             assert!(body.get(never).is_none(), "{never}");
         }
+        assert!(!script.sent()[0].url.contains("eventLabelVersion"));
         // A rule goes only with a draft that repeats (C11), guests only with one that has them
         // (C12d).
         assert!(body.get("recurrence").is_none(), "no rule, no recurrence");
         assert!(body.get("attendees").is_none(), "no guests, no attendees");
         assert_eq!(body["transparency"], "transparent");
         assert_eq!(body["visibility"], "private");
+    }
+
+    /// C13: a new event's own notifications go whole and its colour as one of the eleven; neither
+    /// asks anyone anything, and the defaults or the calendar's colour send nothing (above).
+    #[tokio::test]
+    async fn a_create_with_notifications_and_a_colour_sends_them() {
+        let host = TestHost::holding(&[]);
+        let draft = NewEventDraft {
+            reminders: Some(RemindersDraft {
+                use_default: false,
+                overrides: vec![calendar::Reminder {
+                    method: "email".into(),
+                    minutes: 60,
+                }],
+            }),
+            colour: Some(crate::calendar_write::dto::ColourDraft::Colour { id: "4".into() }),
+            ..dentist_draft()
+        };
+        let copy = google_copy(&draft, "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![insert_step(Scripted::Json(copy))],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "saved");
+        let sent = &script.sent()[0];
+        let body = sent.body.clone().unwrap();
+        assert_eq!(body["colorId"], "4");
+        assert!(
+            body["reminders"]
+                == json!({ "useDefault": false, "overrides": [{ "method": "email", "minutes": 60 }] })
+        );
+        assert!(body.get("eventLabelId").is_none());
+        assert!(!sent.url.contains("eventLabelVersion"));
+        // One Google wouldn't take builds nothing and sends nothing.
+        let host = TestHost::holding(&[]);
+        let (refused, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            Vec::new(),
+            NewEventDraft {
+                colour: Some(crate::calendar_write::dto::ColourDraft::Colour { id: "0".into() }),
+                ..dentist_draft()
+            },
+            None,
+        )
+        .await;
+        assert!(script.sent().is_empty());
+        assert!(
+            refused
+                == WriteOutcome::Failed {
+                    message: "That isn't one of Google Calendar's colours, so nothing was saved."
+                        .into()
+                },
+            "refused in words"
+        );
     }
 
     // --- creating an event with guests (C12d) ---

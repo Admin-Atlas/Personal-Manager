@@ -32,7 +32,7 @@ use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
 use super::super::attendees::Own;
 use super::super::dto::{EventPatchDraft, Notify, RepeatDraft, TimeDraft};
-use super::super::patch::{build_patch, drop_other_kind, is_gone, when_eq};
+use super::super::patch::{check_draft_extras, drop_other_kind, is_gone, series_patch, when_eq};
 use super::super::plan::is_plain_segment;
 use super::super::time;
 use super::diff::{Expect, Removes};
@@ -579,7 +579,7 @@ pub(super) fn plan_all_rule(
         recurrence: None,
         ..draft.clone()
     };
-    let mut body = build_patch(master_json, &text)?;
+    let mut body = series_patch(master_json, instance, &text)?;
     let zone = master.start.zone();
     let asked = asked_time(draft, instance)?;
     let (wall, length, end_zone) = match &asked {
@@ -846,6 +846,9 @@ pub(super) fn plan_split_rule(
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     keeps_formatting(master_json, draft)?;
+    // The new part takes the draft's notifications and colour, checked as a save onto the series'
+    // own copy is (C13).
+    check_draft_extras(master_json, Some(instance), draft)?;
     // An id PM minted for this plan, never the series' own (C8b review ADV-5).
     if !is_plain_segment(tail_id) || tail_id == master.id {
         return Err(SeriesRefusal::Unreadable.into());
@@ -1699,6 +1702,61 @@ mod tests {
             case.edit(Scope::All, repeat(weekly_on(&[DayCode::Mon]))),
             Err(NotPlanned::NoChange)
         );
+    }
+
+    /// C13: a new rule's save takes the draft's notifications and colour, onto every occurrence or
+    /// onto the new part, checked against the series' own copy: a notification only the occurrence
+    /// holds goes back as it is (critique C2-L6), and a series with a label takes no colour.
+    #[test]
+    fn a_new_rule_takes_the_drafts_notifications_and_colour() {
+        use crate::calendar_write::dto::{ColourDraft, RemindersDraft};
+        use crate::calendar_write::patch::{ColourError, PatchError};
+        let sms = json!({ "useDefault": false, "overrides": [{ "method": "sms", "minutes": 30 }] });
+        let case = Case::new(weekly(), with(monday_19(), "reminders", sms.clone()));
+        let draft = |colour: ColourDraft| EventPatchDraft {
+            reminders: Some(RemindersDraft {
+                use_default: false,
+                overrides: vec![crate::calendar::Reminder {
+                    method: "sms".into(),
+                    minutes: 30,
+                }],
+            }),
+            colour: Some(colour),
+            ..repeat(daily())
+        };
+        let six = || ColourDraft::Colour { id: "6".into() };
+        let all = case.edit(Scope::All, draft(six())).unwrap();
+        let sent = body(&all, 0);
+        assert_eq!(sent["recurrence"], json!(["RRULE:FREQ=DAILY"]));
+        assert!(
+            sent["reminders"] == sms,
+            "the occurrence's own, as Google holds it"
+        );
+        assert_eq!(sent["colorId"], "6");
+        assert!(all.steps[0].op.fits());
+        let following = case.edit(Scope::Following, draft(six())).unwrap();
+        let tail = body(&following, 0);
+        assert!(matches!(following.steps[0].op, Op::Insert { .. }));
+        assert_eq!(tail["colorId"], "6");
+        assert!(tail["reminders"] == sms);
+        let labelled = Case::new(
+            with(weekly(), "eventLabelId", json!("label-1")),
+            monday_19(),
+        );
+        for scope in [Scope::All, Scope::Following] {
+            assert_eq!(
+                labelled.edit(
+                    scope,
+                    EventPatchDraft {
+                        colour: Some(ColourDraft::Calendar),
+                        ..repeat(daily())
+                    }
+                ),
+                Err(NotPlanned::Refused(SeriesRefusal::Draft(
+                    PatchError::Colour(ColourError::Labelled)
+                )))
+            );
+        }
     }
 
     /// A rule PM can only show is replaced whole by one from the editor's set.

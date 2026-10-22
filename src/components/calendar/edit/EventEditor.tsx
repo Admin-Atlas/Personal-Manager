@@ -97,6 +97,7 @@ import {
   problemText,
   reasonText,
   rebasedText,
+  shownReasons,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
@@ -763,7 +764,7 @@ export function EventEditor({
   const timeOff = deviceZone === null;
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
   const reasons = [
-    ...(perms?.reasons.map(reasonText) ?? []),
+    ...(perms ? shownReasons(perms.reasons).map(reasonText) : []),
     ...(timeOff && perms?.time ? [NO_ZONE] : []),
   ];
   const heldTimed = loaded?.base.time.kind === "timed" ? loaded.base.time : null;

@@ -110,6 +110,32 @@ pub struct EventPatchDraft {
     pub guests_can_modify: Option<bool>,
     pub guests_can_invite_others: Option<bool>,
     pub guests_can_see_other_guests: Option<bool>,
+    /// Its notifications: the whole list, or the calendar's defaults (C13).
+    pub reminders: Option<RemindersDraft>,
+    /// Its colour (C13).
+    pub colour: Option<ColourDraft>,
+}
+
+/// An event's notifications, as the editor holds them and as a save sends them: whole, since Google
+/// replaces a list it is sent (C13). `use_default` is the calendar's own defaults, `overrides` then
+/// empty. One Google holds that PM wouldn't add itself (an old method, a time outside Google's
+/// documented range) goes back as it is unless the user removes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemindersDraft {
+    pub use_default: bool,
+    #[serde(default)]
+    pub overrides: Vec<crate::calendar::Reminder>,
+}
+
+/// An event's colour as the picker sets it (C13). Google's labels, which outrank a colour, aren't
+/// PM's to set: an event with one keeps its colour as it is (the C13 spec's Adopted list, R-LABEL).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ColourDraft {
+    /// No colour of its own: it shows in its calendar's colour.
+    Calendar,
+    /// One of Google's eleven event colours (`colorId` "1" to "11").
+    Colour { id: String },
 }
 
 impl EventPatchDraft {
@@ -214,8 +240,7 @@ pub struct NewGuest {
     pub optional: bool,
 }
 
-/// A new event as the editor holds it (A22: defined with its first caller, the create command). No
-/// reminders or colour (C13): Google gives the calendar's default reminders when none are sent.
+/// A new event as the editor holds it (A22: defined with its first caller, the create command).
 /// Empty text is left out of the insert, never sent as "".
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewEventDraft {
@@ -248,6 +273,13 @@ pub struct NewEventDraft {
     pub guests_can_invite_others: Option<bool>,
     #[serde(default)]
     pub guests_can_see_other_guests: Option<bool>,
+    /// Its notifications (C13). `None`, or the calendar's defaults, sends nothing: Google gives a
+    /// new event the calendar's own (INFERRED, probe E9).
+    #[serde(default)]
+    pub reminders: Option<RemindersDraft>,
+    /// Its colour (C13). `None`, or the calendar's, sends nothing.
+    #[serde(default)]
+    pub colour: Option<ColourDraft>,
 }
 
 /// What the user saw of an event when they chose to delete it, taken from the mirror row they
@@ -294,6 +326,12 @@ pub enum ReadOnlyReason {
     Locked,
     /// The description is formatted (HTML); editing it as plain text would strip that.
     HtmlDescription,
+    /// The event has a Google Calendar label, which sets its colour, and PM doesn't change labels:
+    /// its colour stays as it is (R-LABEL, C13). Its notifications may still change.
+    LabelReadOnly,
+    /// Google holds a notification PM can't read, so a save that sends the list whole would lose
+    /// it: the notifications stay as they are (C13).
+    RemindersUnreadable,
 }
 
 /// What may change on one event, field by field, and why the rest can't. The backend is the
@@ -308,6 +346,9 @@ pub struct FieldPermissions {
     pub visibility: bool,
     /// The guest list and what guests may do (C12).
     pub guests: bool,
+    /// Its notifications and its colour (C13).
+    pub reminders: bool,
+    pub colour: bool,
     pub delete: bool,
     /// Every reason something is read-only, most important first. Empty when everything may change.
     pub reasons: Vec<ReadOnlyReason>,
@@ -331,6 +372,8 @@ impl FieldPermissions {
             || self.show_as
             || self.visibility
             || self.guests
+            || self.reminders
+            || self.colour
             || self.delete
     }
 }
@@ -582,6 +625,13 @@ pub struct EventForEdit {
     /// The organiser's address (Google's `organizer.email`), on the guest list or not: no guest
     /// change may touch it (`attendees::check`), so the editor never makes one.
     pub organizer_email: Option<String>,
+    /// Its notifications as Google holds them; none at all reads as the calendar's defaults (C13).
+    /// A list PM can't read is shown as the defaults only while the permission keeps it read-only.
+    pub reminders: RemindersDraft,
+    /// Google's `colorId` and `eventLabelId`, `None` when unset. A label, which PM doesn't change,
+    /// sets the colour Google draws (C13).
+    pub color_id: Option<String>,
+    pub label_id: Option<String>,
 }
 
 /// What opening the editor came to.
@@ -633,7 +683,8 @@ pub struct SeriesInfo {
 pub enum ChoiceRequest {
     Edit {
         session: String,
-        draft: EventPatchDraft,
+        /// Boxed, as its notifications and colour (C13) make it the request's largest part.
+        draft: Box<EventPatchDraft>,
     },
     Delete {
         event_id: String,
@@ -760,6 +811,22 @@ mod tests {
             .unwrap(),
             r#"{"outcome":"read_only","reason":"became_repeating"}"#
         );
+        // C13: a label holding the colour, and notifications PM can't read.
+        for (reason, json) in [
+            (
+                ReadOnlyReason::LabelReadOnly,
+                r#"{"outcome":"read_only","reason":"label_read_only"}"#,
+            ),
+            (
+                ReadOnlyReason::RemindersUnreadable,
+                r#"{"outcome":"read_only","reason":"reminders_unreadable"}"#,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&WriteOutcome::ReadOnly { reason }).unwrap(),
+                json
+            );
+        }
         assert_eq!(
             serde_json::to_string(&WriteOutcome::Saved {
                 warnings: vec![WriteWarning::MirrorRefreshPending],
@@ -1230,12 +1297,84 @@ mod tests {
         let none = FieldPermissions::none(ReadOnlyReason::NotGoogle);
         assert!(!none.any());
         assert_eq!(none.reasons, vec![ReadOnlyReason::NotGoogle]);
-        // The guest list alone is something that may change.
-        let guests = FieldPermissions {
-            guests: true,
-            ..Default::default()
-        };
-        assert!(guests.any());
+        // The guest list alone is something that may change, and so are notifications or the
+        // colour alone (C13).
+        for one in [
+            FieldPermissions {
+                guests: true,
+                ..Default::default()
+            },
+            FieldPermissions {
+                reminders: true,
+                ..Default::default()
+            },
+            FieldPermissions {
+                colour: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(one.any());
+        }
+    }
+
+    /// C13: notifications and a colour as the editor will send them; left out, each is untouched,
+    /// and a colour of a kind PM doesn't set (a label) is refused, never guessed.
+    #[test]
+    fn reminders_and_colour_drafts_read_what_the_editor_sends() {
+        let draft: EventPatchDraft = serde_json::from_str(
+            r#"{"reminders":{"use_default":false,"overrides":[{"method":"popup","minutes":10}]},
+                "colour":{"kind":"colour","id":"5"}}"#,
+        )
+        .unwrap();
+        assert!(
+            draft.reminders
+                == Some(RemindersDraft {
+                    use_default: false,
+                    overrides: vec![crate::calendar::Reminder {
+                        method: "popup".into(),
+                        minutes: 10,
+                    }],
+                }),
+            "the event's own list"
+        );
+        assert!(draft.colour == Some(ColourDraft::Colour { id: "5".into() }));
+        let calendar: ColourDraft = serde_json::from_str(r#"{"kind":"calendar"}"#).unwrap();
+        assert!(calendar == ColourDraft::Calendar);
+        // The defaults need no list.
+        let defaults: RemindersDraft = serde_json::from_str(r#"{"use_default":true}"#).unwrap();
+        assert!(defaults.use_default && defaults.overrides.is_empty());
+        for refused in [
+            r#"{"colour":{"kind":"label","id":"x"}}"#,
+            r#"{"colour":{"kind":"tomato"}}"#,
+            r#"{"reminders":{"overrides":[]}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<EventPatchDraft>(refused).is_err(),
+                "{refused}"
+            );
+        }
+        let untouched: EventPatchDraft = serde_json::from_str(r#"{"summary":"Gym"}"#).unwrap();
+        assert!(untouched.reminders.is_none() && untouched.colour.is_none());
+        let new: NewEventDraft = serde_json::from_str(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"}}"#,
+        )
+        .unwrap();
+        assert!(new.reminders.is_none() && new.colour.is_none());
+        let null: NewEventDraft = serde_json::from_str(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"},
+                "reminders":null,"colour":null}"#,
+        )
+        .unwrap();
+        assert!(null.reminders.is_none() && null.colour.is_none());
+        let coloured: NewEventDraft = serde_json::from_str(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"},
+                "reminders":{"use_default":false,"overrides":[]},"colour":{"kind":"colour","id":"11"}}"#,
+        )
+        .unwrap();
+        assert!(coloured
+            .reminders
+            .is_some_and(|r| !r.use_default && r.overrides.is_empty()));
+        assert!(coloured.colour == Some(ColourDraft::Colour { id: "11".into() }));
     }
 
     /// C12: guest changes come as changes to Google's own list, each a wanted state; a state PM

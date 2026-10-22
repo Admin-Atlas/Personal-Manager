@@ -47,6 +47,7 @@ import {
   rebasedText,
   savedNotice,
   settleText,
+  shownReasons,
   SPLIT_ORDER,
   splitActionLabel,
   writeWarningText,
@@ -83,6 +84,8 @@ const REASONS: ReadOnlyReason[] = [
   "special_type",
   "locked",
   "html_description",
+  "label_read_only",
+  "reminders_unreadable",
 ];
 
 describe("edit reasons", () => {
@@ -90,6 +93,23 @@ describe("edit reasons", () => {
     const lines = REASONS.map(reasonText);
     for (const line of lines) expect(line).toMatch(/^[A-Z].*\.$/);
     expect(new Set(lines).size).toBe(REASONS.length);
+  });
+
+  it("words a label and unreadable notifications plainly, as the backend does (C13)", () => {
+    expect(reasonText("label_read_only")).toBe(
+      "This event has a Google Calendar label, which sets its colour. Change it in Google Calendar.",
+    );
+    expect(reasonText("reminders_unreadable")).toBe(
+      "PM can't read one of this event's notifications, so it leaves them as they are.",
+    );
+    for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/reminder/i);
+  });
+
+  it("says no reason for a row the editor doesn't have yet (C13 critique C1-M10)", () => {
+    expect(
+      shownReasons(["locked", "label_read_only", "reminders_unreadable", "html_description"]),
+    ).toEqual(["locked", "html_description"]);
+    expect(shownReasons(REASONS)).toHaveLength(REASONS.length - 2);
   });
 
   it("names conflicting fields in the editor's words", () => {
