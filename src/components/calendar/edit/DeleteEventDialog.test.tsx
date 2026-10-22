@@ -6,12 +6,14 @@
 // Deleting an event (#884): a one-off confirms as it always has; a repeating one asks which
 // occurrences first, like Google Calendar, from Google's answer for the row the user saw, and the
 // delete names the occurrences picked with their token. Words the choices say once are never lost.
+// One with guests asks whether Google emails them, Delete waiting for the answer (C12).
 
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CalendarEvent,
+  GuestNotice,
   ScopeRow,
   SeriesChoices,
   SplitAction,
@@ -62,7 +64,15 @@ const ready = (
 });
 const NOTICE = "PM closed before it finished an earlier change to this repeating event.";
 
-function open(event: CalendarEvent, props: { again?: boolean; forceRepeating?: boolean } = {}) {
+function open(
+  event: CalendarEvent,
+  props: {
+    again?: boolean;
+    forceRepeating?: boolean;
+    from?: string;
+    guests?: { notice: GuestNotice; again: boolean };
+  } = {},
+) {
   const onConfirm = vi.fn();
   const onClose = vi.fn();
   const utils = render(
@@ -95,8 +105,109 @@ describe("DeleteEventDialog", () => {
     const { onConfirm } = open(oneOff);
     expect(screen.getByRole("dialog", { name: "Delete this event?" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
-    expect(onConfirm).toHaveBeenCalledWith(oneOff, null);
+    expect(onConfirm).toHaveBeenCalledWith(oneOff, null, null, null);
     expect(choicesForDelete).not.toHaveBeenCalled();
+    // No guests to tell: no email question.
+    expect(screen.queryByRole("radio")).toBeNull();
+  });
+
+  // C12 §14.3: a one-off you organise with a guest asks whether Google emails the cancellation, in
+  // the same dialog; Delete waits for the answer and focus starts on Cancel.
+  it("asks a one-off with guests whether to email them, Delete waiting for the answer", () => {
+    const withGuest: CalendarEvent = {
+      ...oneOff,
+      organizer_self: true,
+      attendees: [
+        {
+          name: null,
+          email: "me@x.com",
+          response: "accepted",
+          optional: false,
+          organizer: true,
+          self: true,
+        },
+        {
+          name: "Ann",
+          email: "ann@x.org",
+          response: "accepted",
+          optional: false,
+          organizer: false,
+          self: false,
+        },
+      ],
+    };
+    const { onConfirm } = open(withGuest, { from: "me@x.com" });
+    expect(screen.getByText("Send cancellation emails to guests?")).toBeTruthy();
+    expect(screen.getByText("1 guest will be told it's cancelled.")).toBeTruthy();
+    expect(screen.getByText("Google sends the emails from me@x.com.")).toBeTruthy();
+    const del = screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement;
+    expect(del.disabled).toBe(true);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(del);
+    expect(onConfirm).not.toHaveBeenCalled();
+    fireEvent.click(radio(/^Don't send/));
+    expect(del.disabled).toBe(false);
+    fireEvent.click(del);
+    expect(onConfirm).toHaveBeenCalledWith(withGuest, null, "none", {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 1,
+      emails: 1,
+      complete: true,
+    });
+  });
+
+  // C12 critique C1-H2: reopened with the backend's numbers (Google's copy had guests the row
+  // didn't), it asks with those, as a one-off, saying so when an answer came for others.
+  it("asks with the backend's numbers when reopened for the guests", () => {
+    const notice = {
+      updated: 2,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 2,
+      emails: 2,
+      complete: true,
+    };
+    const { onConfirm } = open(occurrence, { guests: { notice, again: true } });
+    expect(screen.getByRole("dialog", { name: "Delete this event?" })).toBeTruthy();
+    expect(choicesForDelete).not.toHaveBeenCalled();
+    expect(screen.getByText("2 guests will be told it's cancelled.")).toBeTruthy();
+    expect(screen.getByText(/these numbers have changed since you chose/)).toBeTruthy();
+    fireEvent.click(radio(/^Send/));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(onConfirm).toHaveBeenCalledWith(occurrence, null, "all", notice);
+  });
+
+  // An answer is for the numbers on screen: new ones ask afresh (R9).
+  it("asks afresh when the numbers change under an answer", () => {
+    const notice: GuestNotice = {
+      updated: 2,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 2,
+      emails: 2,
+      complete: true,
+    };
+    const props = {
+      event: oneOff,
+      calendarName: "Personal",
+      when: "12-10",
+      onConfirm: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const { rerender } = render(<DeleteEventDialog {...props} guests={{ notice, again: false }} />);
+    fireEvent.click(radio(/^Send/));
+    const del = screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement;
+    expect(del.disabled).toBe(false);
+    const three = { ...notice, updated: 3, people: 3, emails: 3 };
+    rerender(<DeleteEventDialog {...props} guests={{ notice: three, again: true }} />);
+    expect(screen.getByText("3 guests will be told it's cancelled.")).toBeTruthy();
+    expect(radio(/^Send/).checked).toBe(false);
+    expect(del.disabled).toBe(true);
   });
 
   it("asks which occurrences of a repeating one, and deletes those with their token", async () => {
@@ -118,13 +229,42 @@ describe("DeleteEventDialog", () => {
     fireEvent.click(radio(/^This and following events/));
     expect(screen.getByText(/can't restore these from its Trash/)).toBeTruthy();
     fireEvent.click(del);
-    expect(onConfirm).toHaveBeenCalledWith(occurrence, {
-      scope: "following",
-      token: "f",
-      asAll: false,
-    });
+    expect(onConfirm).toHaveBeenCalledWith(
+      occurrence,
+      { scope: "following", token: "f", asAll: false },
+      null,
+      null,
+    );
     // The held Undo still applies.
     expect(screen.getByText(/You can undo it for a few seconds/)).toBeTruthy();
+  });
+
+  // C12 §14.3: a row that would tell guests asks there, and the answer goes with the token.
+  it("passes the email answer of a repeating one's row", async () => {
+    const notice: GuestNotice = {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      cancelled: true,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    choicesForDelete.mockResolvedValue(
+      ready({ all: { row: "offered", warnings: [], token: "a", guests: notice } }),
+    );
+    const { onConfirm } = open(occurrence, { from: "me@x.com" });
+    fireEvent.click(await screen.findByRole("radio", { name: /^All events/ }));
+    const del = screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement;
+    expect(del.disabled).toBe(true);
+    fireEvent.click(radio(/^Send/));
+    fireEvent.click(del);
+    expect(onConfirm).toHaveBeenCalledWith(
+      occurrence,
+      { scope: "all", token: "a", asAll: false },
+      "all",
+      null,
+    );
   });
 
   it("says Google changed it, offering no rows", async () => {

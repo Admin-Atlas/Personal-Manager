@@ -13,7 +13,8 @@
 //
 // A repeating event's writes come through here too: the choices the dialog shows, a save or delete
 // for the occurrences picked (always with its token), and settling a "this and following" change PM
-// couldn't finish. A change like that keeps a notice with its buttons until it's settled, in this
+// couldn't finish. A write that would email guests carries Send or Don't send and the numbers the
+// question showed (C12); a held delete whose send finds guests to tell asks the delete dialog again. A change like that keeps a notice with its buttons until it's settled, in this
 // store, so it outlives the editor and the tab. A reload loses the notice, not the change: the
 // backend still holds it, and the dialog's pending row offers the same buttons on the next change.
 //
@@ -46,8 +47,10 @@ import type {
   DeleteSettled,
   EditLoad,
   EventPatchDraft,
+  GuestNotice,
   MilestoneMove,
   NewEventDraft,
+  Notify,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -119,7 +122,16 @@ interface HeldDelete {
   /** The title the user saw. */
   summary: string;
   noticeId: number;
+  /** The row the user asked to delete, so the dialog can ask again with it when Google's copy has
+   *  guests to tell (C12 critique C1-H2). Unknown for a delete picked up after a reload. */
+  event?: CalendarEvent;
 }
+
+/** Ask about a delete's guests again: Google's copy had guests to tell at the send (added during
+ *  the Undo window, or numbers that changed since the answer). Whether the delete dialog opened;
+ *  set while the calendar shows one ({@link useDeleteDialog}). */
+type GuestReask = (event: CalendarEvent, guests: GuestNotice, again: boolean) => boolean;
+let guestReask: GuestReask | null = null;
 
 type PartialSplit = Extract<WriteOutcome, { outcome: "partial_split" }>;
 
@@ -277,6 +289,19 @@ function settle(settled: DeleteSettled) {
     holdPartial(held.summary, result, deleteText(result, held.summary).text, held.noticeId);
     return;
   }
+  // Google's copy had guests to tell, and nothing was deleted: the dialog asks again with the
+  // backend's numbers, which Google's copy, now in PM's calendar, also gives a delete started again.
+  // Where it can't open, the notice says to delete again (C12 critique C1-H2).
+  if (
+    result.outcome === "needs_choice" &&
+    result.guests &&
+    !result.scope &&
+    held.event &&
+    guestReask?.(held.event, result.guests, !!result.again)
+  ) {
+    dismissNotice(held.noticeId);
+    return;
+  }
   put({ id: held.noticeId, ...deleteText(result, held.summary) });
 }
 
@@ -308,15 +333,26 @@ export function watchHeldDeletes() {
     .catch(() => {});
 }
 
-/** Ask to delete `event` (for `picked`, when it repeats). The backend holds it for an Undo window;
- *  hidden meanwhile are the row and every row a delete of several occurrences reaches. "ask": the
- *  backend wants the occurrences chosen first, or chosen again (R9), and nothing was held or said;
- *  the caller opens the choices. Whether Google emails the guests is no choice of occurrences: it
- *  is said, never asked by reopening them (C12). */
+/** What a delete the backend wants asked again needs: `guests`, the backend's numbers when it's
+ *  whether Google emails the guests (null: which occurrences); `again`, when an answer came for
+ *  other numbers. */
+export interface DeleteReask {
+  ask: GuestNotice | null;
+  again: boolean;
+}
+
+/** Ask to delete `event` (for `picked`, when it repeats; `notify`, Send or Don't send, for the
+ *  numbers `asked` the question showed, when it has guests). The backend holds it for an Undo
+ *  window; hidden meanwhile are the row and every row a delete of several occurrences reaches.
+ *  `{ ask }`: the backend wants the occurrences chosen, or chosen again (`ask` null), or whether
+ *  Google emails the guests (`ask`, its numbers; R9), and nothing was held or said: the caller asks.
+ *  Whether Google emails the guests is never asked by reopening the occurrences (C12). */
 export async function startDelete(
   event: CalendarEvent,
   picked: Picked | null = null,
-): Promise<"held" | "ask" | "refused"> {
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+): Promise<"held" | DeleteReask | "refused"> {
   watchHeldDeletes();
   const title = quoted(event.summary);
   try {
@@ -326,10 +362,15 @@ export async function startDelete(
       seenOf(event),
       picked?.scope ?? null,
       picked?.token ?? null,
+      notify,
+      asked,
     );
     if (start.outcome === "refused") {
       const result = start.result;
-      if (result.outcome === "needs_choice" && result.scope) return "ask";
+      if (result.outcome === "needs_choice" && result.guests && !result.scope) {
+        return { ask: result.guests, again: !!result.again };
+      }
+      if (result.outcome === "needs_choice" && result.scope) return { ask: null, again: false };
       if (result.outcome === "partial_split") {
         holdPartial(event.summary, result, deleteText(result, event.summary).text);
         return "refused";
@@ -352,6 +393,7 @@ export async function startDelete(
       hidden: hiddenOf(event.id, start.hidden),
       summary: event.summary,
       noticeId: nextNotice++,
+      event,
     };
     update({ held: [...state.held, held] });
     showHeld(held, start.undo_seconds);
@@ -453,20 +495,26 @@ export function choicesForDelete(event: CalendarEvent): Promise<SeriesChoices> {
 export type SaveAnswer = WriteOutcome & { newPartial?: boolean };
 
 /** Save an editor's changes; `picked` names the occurrences and the plan chosen (a scope never goes
- *  without its token), and `title` is the event's for a notice. The outcome comes back as data; the
- *  editor explains it. A change PM couldn't finish keeps its notice and buttons here, in the store,
- *  so it outlives the editor and the Calendar tab. */
+ *  without its token), and `title` is the event's for a notice. `notify` is Send or Don't send
+ *  when the save would email guests, and `asked` the numbers the question showed (a repeating
+ *  event's token binds them instead). The outcome comes back as data; the editor explains it. A
+ *  change PM couldn't finish keeps its notice and buttons here, in the store, so it outlives the
+ *  editor and the Calendar tab. */
 export async function saveEdit(
   session: string,
   changes: EventPatchDraft,
   picked: Picked | null,
   title: string,
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
 ): Promise<SaveAnswer> {
   const outcome = await updateCalendarEvent(
     session,
     changes,
     picked?.scope ?? null,
     picked?.token ?? null,
+    notify,
+    asked,
   );
   if (outcome.outcome === "partial_split") {
     return { ...outcome, newPartial: notePartial(title, outcome) };
@@ -905,18 +953,22 @@ export function useMirrorReads<T extends readonly CalendarEvent[]>(
 }
 
 /** What the delete dialog is asking about: the event, and `reask` when it reopened because the
- *  backend wanted the occurrences chosen (`again`: a choice was made, but the plan changed since). */
+ *  backend wanted the occurrences chosen (`again`: a choice was made, but the plan changed since).
+ *  `guests`: it reopened to ask whether Google emails the guests, with the backend's numbers
+ *  (`again`: an answer came, for other numbers); the event is asked about as a one-off. */
 export interface DeleteAsk {
   event: CalendarEvent;
   reask: { again: boolean } | null;
+  guests?: { notice: GuestNotice; again: boolean } | null;
 }
 
 /** The delete dialog's state and its delete. A delete's answer can come seconds later (a delete of
- *  chosen occurrences reads Google first), and one that wants the occurrences chosen reopens the
- *  dialog once, asking whatever the row says. It never replaces a dialog opened meanwhile, nor
- *  opens over any other dialog (the editor, the command palette) or over what `openElsewhere` says
- *  is open that isn't one (the event popover), nor once the Calendar tab has gone: a notice says to
- *  delete again instead, as it does when the plan keeps changing under the user. */
+ *  chosen occurrences reads Google first), and one that wants the occurrences chosen, or whether
+ *  Google emails the guests, reopens the dialog once, asking that. It never replaces a dialog
+ *  opened meanwhile, nor opens over any other dialog (the editor, the command palette) or over what
+ *  `openElsewhere` says is open that isn't one (the event popover), nor once the Calendar tab has
+ *  gone: a notice says to delete again instead, as it does when the plan keeps changing under the
+ *  user. A held delete whose send found guests to tell asks the same way (C12 critique C1-H2). */
 export function useDeleteDialog(openElsewhere: () => boolean) {
   const [asked, setAskedState] = useState<DeleteAsk | null>(null);
   // What's open now, readable when a delete's answer lands.
@@ -939,32 +991,59 @@ export function useDeleteDialog(openElsewhere: () => boolean) {
   }, []);
   const ask = useCallback((event: CalendarEvent) => setAsked({ event, reask: null }), [setAsked]);
   const close = useCallback(() => setAsked(null), [setAsked]);
+  /** Whether the dialog may open by itself now: the calendar shows, and nothing else is open. */
+  const free = useCallback(
+    () => alive.current && open.current === null && !isAnyDialogOpen() && !elsewhere.current(),
+    [],
+  );
+  // A held delete's send that found guests to tell asks here, when it can.
+  useEffect(() => {
+    const reask: GuestReask = (event, notice, again) => {
+      if (!free()) return false;
+      setAsked({ event, reask: null, guests: { notice, again } });
+      return true;
+    };
+    guestReask = reask;
+    return () => {
+      if (guestReask === reask) guestReask = null;
+    };
+  }, [free, setAsked]);
   const confirm = useCallback(
-    (event: CalendarEvent, picked: Picked | null) => {
-      const reasked = open.current?.reask != null;
+    (
+      event: CalendarEvent,
+      picked: Picked | null,
+      notify: Notify | null = null,
+      asked: GuestNotice | null = null,
+    ) => {
+      const was = open.current;
       setAsked(null);
-      void startDelete(event, picked).then((r) => {
-        if (r !== "ask") return;
-        if (
-          reasked ||
-          !alive.current ||
-          open.current !== null ||
-          isAnyDialogOpen() ||
-          elsewhere.current()
-        ) {
-          // Chosen, and the plan changed since; or never asked, and the calendar has gone or
-          // something else is open now.
+      void startDelete(event, picked, notify, asked).then((r) => {
+        if (r === "held" || r === "refused") return;
+        // Asked once already (a reopened dialog), or nowhere to ask: said instead, so nothing
+        // loops. Occurrences chosen: their token binds who the delete tells, so a guests ask
+        // there is the plan changing under the user too.
+        const reasked = (r.ask ? was?.guests : was?.reask) != null || (!!r.ask && !!picked);
+        if (reasked || !free()) {
           noteSeriesNotice(
             picked
               ? deleteChangedText(event.summary).text
-              : deleteText({ outcome: "needs_choice", scope: true }, event.summary).text,
+              : r.ask
+                ? deleteText(
+                    { outcome: "needs_choice", scope: false, guests: r.ask, again: r.again },
+                    event.summary,
+                  ).text
+                : deleteText({ outcome: "needs_choice", scope: true }, event.summary).text,
           );
           return;
         }
-        setAsked({ event, reask: { again: picked !== null } });
+        setAsked(
+          r.ask
+            ? { event, reask: null, guests: { notice: r.ask, again: r.again } }
+            : { event, reask: { again: picked !== null } },
+        );
       });
     },
-    [setAsked],
+    [free, setAsked],
   );
   return { asked, ask, close, confirm };
 }

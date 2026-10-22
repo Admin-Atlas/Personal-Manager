@@ -1785,8 +1785,7 @@ mod tests {
         let case = Case::new(
             guests_on_it(weekly(), &["a@example.com"]),
             guests_on_it(monday_19(), &["a@example.com"]),
-        )
-        .guests();
+        );
         let unanswered = case.edit(Scope::All, title("Retro")).unwrap();
         assert!(unanswered.needs_notify());
         assert_eq!(Run::new(unanswered).err(), Some(Unfit));
@@ -1906,7 +1905,7 @@ mod tests {
             v["attendees"][1]["responseStatus"] = json!("needsAction");
             v
         };
-        let case = Case::new(waiting(weekly()), waiting(monday_19())).guests();
+        let case = Case::new(waiting(weekly()), waiting(monday_19()));
         let add_b = EventPatchDraft {
             guests: Some(vec![GuestOp {
                 email: "b@example.com".into(),
@@ -3332,7 +3331,6 @@ mod tests {
             let param = format!("sendUpdates={}", notify.as_param());
             let case =
                 Case::new(guest(weekly()), guest(monday_19())).exceptions(vec![guest(renamed())]);
-            let case = case.guests();
             let plan = plan_series_edit(
                 Scope::Following,
                 &case.input(),
@@ -3393,7 +3391,7 @@ mod tests {
             assert!(sent.last().unwrap().url.contains(&param));
 
             // A half-landed move put back, on a series retimed with this `sendUpdates`.
-            let case = Case::new(guest(weekly()), guest(monday_19())).guests();
+            let case = Case::new(guest(weekly()), guest(monday_19()));
             let draft = at("09:00", "2026-10-20");
             let plan =
                 plan_series_edit(Scope::All, &case.input(), &draft, TAIL, Some(notify)).unwrap();

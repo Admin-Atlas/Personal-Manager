@@ -6,13 +6,14 @@
 //! save runs it again on a fresh copy from Google before sending anything. It fails closed: a role or
 //! an event type PM doesn't know reads as read-only, never as editable.
 //!
-//! Events PM can change are the ones you organise on a calendar you can edit, with no guests,
-//! repeating ones included: a change to an occurrence of one names which occurrences it's for
-//! ("this event", "this and following", "all events"), and a write without that choice is asked
-//! again (rule R9). Events with guests and invitations are read-only with a reason until the layers
-//! that handle them (C12, C14) lift it, each replacing it with the rule it stood in for. A one-off
-//! that Google has since turned into a repeating event is read-only with its own reason on every
-//! path, since a write to it would change every occurrence with no choice asked.
+//! Events PM can change are the ones you organise on a calendar you can edit. The first layers
+//! edited only solo, one-off events; repeating events (C9) and events with guests (C12) are now
+//! editable, each with the choice it stood in for (rule R9): a change to an occurrence names which
+//! occurrences it's for ("this event", "this and following", "all events"), a change Google would
+//! email guests about names whether it should, and a write without that choice is asked again.
+//! Invitations stay read-only until C14. A one-off that Google has since turned into a repeating
+//! event is read-only with its own reason on every path, since a write to it would change every
+//! occurrence with no choice asked.
 
 use crate::calendar_editing::EditingStatus;
 
@@ -37,8 +38,6 @@ pub struct EditFacts<'a> {
     /// would change every occurrence with no choice asked (C9 design §0.7, critique 2 M6). Known only
     /// from a fresh copy; the mirror never holds a series itself.
     pub series_master: bool,
-    /// Guests besides the calendar itself.
-    pub has_guests: bool,
     /// The description is formatted. Known only from a fresh copy (the mirror clips descriptions).
     pub html_description: bool,
 }
@@ -107,7 +106,6 @@ pub fn create_block(
         locked: false,
         visibility,
         series_master: false,
-        has_guests: false,
         html_description: false,
     })
 }
@@ -143,9 +141,6 @@ fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
     if facts.series_master {
         return Some(ReadOnlyReason::BecameRepeating);
     }
-    if facts.has_guests {
-        return Some(ReadOnlyReason::HasGuests);
-    }
     None
 }
 
@@ -165,7 +160,6 @@ mod tests {
             locked: false,
             visibility: None,
             series_master: false,
-            has_guests: false,
             html_description: false,
         }
     }
@@ -175,8 +169,7 @@ mod tests {
         let perms = edit_rights(&editable());
         assert!(perms.summary && perms.time && perms.location && perms.description);
         assert!(perms.show_as && perms.visibility && perms.delete);
-        // C12a: guests may change wherever the rest may (the gate still refuses an event that has
-        // any until C12c).
+        // Guests may change wherever the rest may (C12).
         assert!(perms.guests);
         assert!(perms.reasons.is_empty());
         assert_eq!(edit_block(&editable()), None);
@@ -321,22 +314,6 @@ mod tests {
                     ..e()
                 },
                 BecameRepeating,
-            ),
-            (
-                EditFacts {
-                    has_guests: true,
-                    ..e()
-                },
-                HasGuests,
-            ),
-            // The first reason wins: a read-only shared calendar outranks "it has guests".
-            (
-                EditFacts {
-                    access_role: Some("reader"),
-                    has_guests: true,
-                    ..e()
-                },
-                CalendarReadOnly,
             ),
             // A read-only shared calendar outranks "it became a repeating event".
             (

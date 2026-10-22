@@ -1550,7 +1550,6 @@ export type ReadOnlyReason =
   | "not_organizer"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
-  | "has_guests"
   | "special_type"
   | "locked"
   | "html_description";
@@ -1821,8 +1820,9 @@ export type ScopeRow =
   | { row: "as_all"; warnings: SeriesWarning[]; token: string; guests?: GuestNotice }
   | { row: "refused"; message: string }
   | { row: "conflict"; fields: string[] }
-  /** A change PM couldn't finish holds this series: settle it first (as `partial_split` says). */
-  | { row: "pending"; token: string; offers: SplitAction[]; from: string };
+  /** A change PM couldn't finish holds this series: settle it first (as `partial_split` says,
+   *  `emails` included). */
+  | { row: "pending"; token: string; offers: SplitAction[]; from: string; emails?: SplitAction[] };
 
 /** What to do about a "this and following" change PM couldn't finish. */
 export type SplitAction = "remove" | "finish" | "check";
@@ -1917,8 +1917,16 @@ export type WriteOutcome =
   | { outcome: "ignored_by_google"; split: boolean }
   /** A "this and following" change PM couldn't finish: Google may hold part of it. `offers` is what
    *  Google's state allows now; `from` is the day the change starts (YYYY-MM-DD). `note`: a settle
-   *  that didn't end it says why, while PM still holds it (so its buttons stay). */
-  | { outcome: "partial_split"; token: string; offers: SplitAction[]; from: string; note?: string }
+   *  that didn't end it says why, while PM still holds it (so its buttons stay). `emails`: the
+   *  offers that would email guests, since the change went with Send (C12); left out when none. */
+  | {
+      outcome: "partial_split";
+      token: string;
+      offers: SplitAction[];
+      from: string;
+      note?: string;
+      emails?: SplitAction[];
+    }
   /** The new part of a change PM couldn't finish was removed: the event is as it was. */
   | { outcome: "split_removed" }
   | { outcome: "conflict"; fields: string[] }

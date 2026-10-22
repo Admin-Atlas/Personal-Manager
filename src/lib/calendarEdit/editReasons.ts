@@ -37,8 +37,6 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "Someone else organises this event, so only they can change it.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
-    case "has_guests":
-      return "This event has guests, and PM can't change events with guests yet.";
     case "special_type":
       return "Birthdays, events from Gmail, focus time, out of office and working locations can't be changed here.";
     case "locked":
@@ -194,35 +192,80 @@ export function writeWarningText(
   }
 }
 
+/** What settling a change that went with Send would email guests, before a button is pressed
+ *  (C12 critiques C1-M4, C2-M2): a line for each offer that would, none for the rest. `emails` is
+ *  the backend's (left out when none would). */
+function settleEmailsText(
+  offers: readonly SplitAction[],
+  emails: readonly SplitAction[] = [],
+): string {
+  const lines: string[] = [];
+  if (offers.includes("remove") && emails.includes("remove")) {
+    lines.push("If you remove the new part, guests will get a cancellation email.");
+  }
+  if (offers.includes("finish") && emails.includes("finish")) {
+    lines.push("If you finish it, guests will get the rest of the update emails.");
+  }
+  return lines.join(" ");
+}
+
+/** `text`, then what settling would email guests, when anything. */
+export function withSettleEmails(
+  text: string,
+  offers: readonly SplitAction[],
+  emails?: readonly SplitAction[],
+): string {
+  const said = settleEmailsText(offers, emails);
+  return said ? `${text} ${said}` : text;
+}
+
 /** A "this and following" change PM couldn't finish, worded by what Google's state allows now
  *  (review H3/M3): never "Saved" while the event may show twice, and never a hint to delete while
  *  the earlier part already ends before the day. Check alone is also what a new part changed in
- *  Google since leaves, so it never says PM lost touch (C9b-1 critique 2 M5). */
-export function partialText(offers: readonly SplitAction[], from: string): string {
+ *  Google since leaves, so it never says PM lost touch (C9b-1 critique 2 M5). `emails`: the offers
+ *  that would email guests (C12). */
+export function partialText(
+  offers: readonly SplitAction[],
+  from: string,
+  emails?: readonly SplitAction[],
+): string {
   const day = formatDateOnly(from);
   const finish = offers.includes("finish");
   const remove = offers.includes("remove");
+  const said = (text: string) => withSettleEmails(text, offers, emails);
   if (finish && remove) {
-    return `PM couldn't finish this change: it may show twice from ${day}. Finish the change, or remove the new part.`;
+    return said(
+      `PM couldn't finish this change: it may show twice from ${day}. Finish the change, or remove the new part.`,
+    );
   }
   if (finish) {
-    return `Saved from ${day}, but PM couldn't finish moving the occurrences you changed on their own. Press Finish.`;
+    return said(
+      `Saved from ${day}, but PM couldn't finish moving the occurrences you changed on their own. Press Finish.`,
+    );
   }
   if (remove) {
-    return `PM couldn't finish this change: it may show twice from ${day}. Remove the new part, or check again.`;
+    return said(
+      `PM couldn't finish this change: it may show twice from ${day}. Remove the new part, or check again.`,
+    );
   }
   return `PM couldn't finish this change from ${day}. Check again; if it still can't, look at that day in Google Calendar: only if it shows twice, delete the newer one.`;
 }
 
 /** An earlier change PM couldn't finish blocks this one: what it is and what to press first,
- *  worded by what Google allows now. Never a hint to delete unless Remove is offered. */
-export function earlierChangeText(offers: readonly SplitAction[], from: string): string {
+ *  worded by what Google allows now. Never a hint to delete unless Remove is offered. `emails`:
+ *  the offers that would email guests (C12). */
+export function earlierChangeText(
+  offers: readonly SplitAction[],
+  from: string,
+  emails?: readonly SplitAction[],
+): string {
   const head = `PM is still finishing an earlier change to it from ${formatDateOnly(from)}.`;
   const finish = offers.includes("finish");
   const remove = offers.includes("remove");
-  if (finish && remove) return `${head} Finish it or remove the new part first.`;
-  if (finish) return `${head} Finish it first.`;
-  if (remove) return `${head} Remove the new part, or check again.`;
+  const said = (text: string) => withSettleEmails(text, offers, emails);
+  if (finish && remove) return said(`${head} Finish it or remove the new part first.`);
+  if (finish) return said(`${head} Finish it first.`);
+  if (remove) return said(`${head} Remove the new part, or check again.`);
   return `${head} Check again; if it still can't, look at that day in Google Calendar.`;
 }
 
@@ -267,7 +310,7 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
           : "Google answered as if it saved this, but kept the event as it was. Nothing changed.",
       };
     case "partial_split":
-      return { tone: "warn", text: partialText(outcome.offers, outcome.from) };
+      return { tone: "warn", text: partialText(outcome.offers, outcome.from, outcome.emails) };
     case "split_removed":
       return {
         tone: "ok",
@@ -341,9 +384,16 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     case "no_change":
       return notDeleted("Google had nothing to change.", "warn");
     case "needs_choice":
-      // Whether Google emails the guests (C12): never answered here by choosing occurrences.
+      // Whether Google emails the guests (C12): never answered here by choosing occurrences. Said
+      // when the dialog can't ask again: guests Google added during the Undo window, or numbers
+      // that changed since the user chose (neutral: the backend knows only that, C2-L6).
       if (outcome.guests && !outcome.scope) {
-        return notDeleted("Choose whether Google emails the guests first.", "warn");
+        return notDeleted(
+          outcome.again
+            ? "Who Google would email has changed since you chose. Delete it again to choose whether Google emails the guests."
+            : "It has guests now. Delete it again to choose whether Google emails them.",
+          "warn",
+        );
       }
       // Also a delete sent with no choice that the backend wants one for: a held delete can't
       // reopen the dialog seconds later, so the user deletes again and chooses then.
@@ -354,7 +404,7 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     case "ignored_by_google":
       return notDeleted("Google answered as if it deleted it, but kept it.", "warn");
     case "partial_split":
-      return notDeleted(earlierChangeText(outcome.offers, outcome.from), "warn");
+      return notDeleted(earlierChangeText(outcome.offers, outcome.from, outcome.emails), "warn");
     case "split_removed":
       return notDeleted("PM removed the new part of an earlier change instead.", "warn");
     case "conflict": {
@@ -434,7 +484,11 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
     case "partial_split":
       return {
         tone: "warn",
-        text: `${t}: ${result.note ?? partialText(result.offers, result.from)}`,
+        text: `${t}: ${
+          result.note
+            ? withSettleEmails(result.note, result.offers, result.emails)
+            : partialText(result.offers, result.from, result.emails)
+        }`,
       };
     // PM's own claim on the repeating event comes back as `partial_split` with a note, the change still
     // held. A plain busy means Google refused Finish's next step and PM took its new part back, the

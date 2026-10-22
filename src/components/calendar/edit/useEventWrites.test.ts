@@ -14,9 +14,11 @@ import type {
   DeleteSettled,
   DeleteStart,
   EventPatchDraft,
+  GuestNotice,
   HeldDeleteInfo,
   MilestoneMoves,
   NewEventDraft,
+  Notify,
   SeriesChoices,
   SplitAction,
   WriteOutcome,
@@ -24,13 +26,23 @@ import type {
 } from "../../../lib/types";
 
 type Scope = string | null;
+/** Send or Don't send, and the numbers it was given for (C12). */
+type Told = [notify: Notify | null, asked: GuestNotice | null];
 const deleteCalendarEvent =
-  vi.fn<(id: string, seen: unknown, scope: Scope, choice: Scope) => Promise<DeleteStart>>();
+  vi.fn<
+    (id: string, seen: unknown, scope: Scope, choice: Scope, ...told: Told) => Promise<DeleteStart>
+  >();
 const cancelCalendarDelete = vi.fn<(token: string) => Promise<boolean>>();
 const listHeldDeletes = vi.fn<() => Promise<HeldDeleteInfo[]>>();
 const updateCalendarEvent =
   vi.fn<
-    (session: string, draft: EventPatchDraft, scope: Scope, choice: Scope) => Promise<WriteOutcome>
+    (
+      session: string,
+      draft: EventPatchDraft,
+      scope: Scope,
+      choice: Scope,
+      ...told: Told
+    ) => Promise<WriteOutcome>
   >();
 const seriesChoices = vi.fn<(request: ChoiceRequest) => Promise<SeriesChoices>>();
 const settleSeriesSplit = vi.fn<(token: string, action: SplitAction) => Promise<WriteOutcome>>();
@@ -55,12 +67,17 @@ vi.mock("../../../lib/ipc", () => ({
   getSeriesSummary: (eventId: string) => getSeriesSummary(eventId),
   setMilestoneEvent: (id: number, uid: string | null, date: string | null, only: string | null) =>
     setMilestoneEvent(id, uid, date, only),
-  deleteCalendarEvent: (id: string, seen: unknown, scope: Scope, choice: Scope) =>
-    deleteCalendarEvent(id, seen, scope, choice),
+  deleteCalendarEvent: (id: string, seen: unknown, scope: Scope, choice: Scope, ...told: Told) =>
+    deleteCalendarEvent(id, seen, scope, choice, ...told),
   cancelCalendarDelete: (token: string) => cancelCalendarDelete(token),
   listHeldDeletes: () => listHeldDeletes(),
-  updateCalendarEvent: (session: string, draft: EventPatchDraft, scope: Scope, choice: Scope) =>
-    updateCalendarEvent(session, draft, scope, choice),
+  updateCalendarEvent: (
+    session: string,
+    draft: EventPatchDraft,
+    scope: Scope,
+    choice: Scope,
+    ...told: Told
+  ) => updateCalendarEvent(session, draft, scope, choice, ...told),
   seriesChoices: (request: ChoiceRequest) => seriesChoices(request),
   settleSeriesSplit: (token: string, action: SplitAction) => settleSeriesSplit(token, action),
   onCalendarDeleteSettled: (h: (s: DeleteSettled) => void) => {
@@ -83,6 +100,19 @@ const event: CalendarEvent = {
 };
 
 const held: DeleteStart = { outcome: "held", undo_token: "t1", undo_seconds: 8 };
+
+/** One guest already on it, told of a change (C12). */
+const GUESTS: GuestNotice = {
+  updated: 1,
+  invited: 0,
+  removed: 0,
+  cancelled: false,
+  people: 1,
+  emails: 1,
+  complete: true,
+};
+/** The same guest, told it's cancelled. */
+const TOLD: GuestNotice = { ...GUESTS, cancelled: true };
 
 /** A fresh store, read through the hook the calendar uses. */
 async function load() {
@@ -121,6 +151,9 @@ describe("a held delete", () => {
         all_day: false,
         location: "High St",
       },
+      null,
+      null,
+      // Nobody to email: no answer, no numbers.
       null,
       null,
     );
@@ -647,9 +680,12 @@ describe("a repeating event", () => {
     });
     const { mod, hook, act } = await load();
     await act(async () => {
-      expect(await mod.startDelete(occurrence)).toBe("ask");
+      expect(await mod.startDelete(occurrence)).toEqual({ ask: null, again: false });
       // Chosen, but the plan changed since: ask again, too.
-      expect(await mod.startDelete(occurrence, { scope: "all", token: "a" })).toBe("ask");
+      expect(await mod.startDelete(occurrence, { scope: "all", token: "a" })).toEqual({
+        ask: null,
+        again: false,
+      });
     });
     expect(hook.result.current.notices).toEqual([]);
     expect(hook.result.current.hiddenIds.size).toBe(0);
@@ -663,28 +699,25 @@ describe("a repeating event", () => {
     expect(hook.result.current.notices[0].text).toMatch(/^“Gym” wasn't deleted\. Editing isn't on/);
   });
 
-  // C12: whether Google emails the guests is no choice of occurrences, so it never reopens them.
-  it("says a delete needs the guests' answer, never asking which occurrences", async () => {
-    const guests = {
-      updated: 1,
-      invited: 0,
-      removed: 0,
-      cancelled: true,
-      people: 1,
-      emails: 1,
-      complete: true,
-    };
+  // C12: whether Google emails the guests is no choice of occurrences: the caller asks it, with the
+  // backend's numbers, and nothing is held or said meanwhile.
+  it("answers ask with the guests' numbers when the backend wants Send or Don't send", async () => {
     deleteCalendarEvent.mockResolvedValue({
       outcome: "refused",
-      result: { outcome: "needs_choice", scope: false, guests },
+      result: { outcome: "needs_choice", scope: false, guests: TOLD },
     });
     const { mod, hook, act } = await load();
     await act(async () => {
-      expect(await mod.startDelete(occurrence)).toBe("refused");
+      expect(await mod.startDelete(event)).toEqual({ ask: TOLD, again: false });
     });
-    expect(hook.result.current.notices[0].text).toBe(
-      "“Gym” wasn't deleted. Choose whether Google emails the guests first.",
-    );
+    deleteCalendarEvent.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "needs_choice", scope: false, guests: TOLD, again: true },
+    });
+    await act(async () => {
+      expect(await mod.startDelete(event, null, "all", GUESTS)).toEqual({ ask: TOLD, again: true });
+    });
+    expect(hook.result.current.notices).toEqual([]);
     expect(hook.result.current.hiddenIds.size).toBe(0);
   });
 
@@ -746,6 +779,89 @@ describe("a repeating event", () => {
       expect(hook.result.current.writes.notices).toEqual([]);
       // Chosen this time, and the plan changed again: no third dialog.
       act(() => hook.result.current.dialog.confirm(occurrence, { scope: "this", token: "t" }));
+      await settle();
+      expect(hook.result.current.dialog.asked).toBeNull();
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([CHANGED]);
+    });
+
+    // C12: the backend wants Send or Don't send: the dialog reopens once with its numbers (as a
+    // one-off), and a second ask in a row is said instead, so nothing loops.
+    it("reopens once for the guests' answer, then says so", async () => {
+      deleteCalendarEvent.mockResolvedValue({
+        outcome: "refused",
+        result: { outcome: "needs_choice", scope: false, guests: TOLD },
+      });
+      const { hook, act, settle } = await loadDialog();
+      act(() => hook.result.current.dialog.ask(event));
+      act(() => hook.result.current.dialog.confirm(event, null));
+      await settle();
+      expect(hook.result.current.dialog.asked).toEqual({
+        event,
+        reask: null,
+        guests: { notice: TOLD, again: false },
+      });
+      deleteCalendarEvent.mockResolvedValue({
+        outcome: "refused",
+        result: { outcome: "needs_choice", scope: false, guests: TOLD, again: true },
+      });
+      act(() => hook.result.current.dialog.confirm(event, null, "all", TOLD));
+      await settle();
+      expect(hook.result.current.dialog.asked).toBeNull();
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([
+        "“Dentist” wasn't deleted. Who Google would email has changed since you chose. Delete it again to choose whether Google emails the guests.",
+      ]);
+    });
+
+    // C12 critique C1-H2: guests Google added during the Undo window stop the delete at the send;
+    // the dialog asks again with the backend's numbers, and the "Deleting" notice goes. With
+    // something else open, a notice says to delete again instead.
+    it("asks again when the send finds guests to tell", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      const { hook, act, settle, openOther } = await loadDialog();
+      const sent = (token: string) =>
+        act(() =>
+          settledHandler?.({
+            undo_token: token,
+            event_id: event.id,
+            result: { outcome: "needs_choice", scope: false, guests: TOLD },
+          }),
+        );
+      act(() => hook.result.current.dialog.ask(event));
+      act(() => hook.result.current.dialog.confirm(event, null));
+      await settle();
+      sent("t1");
+      expect(hook.result.current.dialog.asked).toEqual({
+        event,
+        reask: null,
+        guests: { notice: TOLD, again: false },
+      });
+      expect(hook.result.current.writes.notices).toEqual([]);
+      expect(hook.result.current.writes.hiddenIds.size).toBe(0);
+      act(() => hook.result.current.dialog.close());
+      deleteCalendarEvent.mockResolvedValue({ ...held, undo_token: "t2" });
+      act(() => hook.result.current.dialog.confirm(event, null, "all", TOLD));
+      await settle();
+      const other = openOther();
+      sent("t2");
+      expect(hook.result.current.dialog.asked).toBeNull();
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([
+        "“Dentist” wasn't deleted. It has guests now. Delete it again to choose whether Google emails them.",
+      ]);
+      other.unmount();
+    });
+
+    // Occurrences chosen: their token binds who the delete tells, so a guests ask there is the plan
+    // changing under the user, said as such, and never reopened as a one-off.
+    it("says the plan changed when chosen occurrences are asked about guests", async () => {
+      deleteCalendarEvent.mockResolvedValue({
+        outcome: "refused",
+        result: { outcome: "needs_choice", scope: false, guests: TOLD },
+      });
+      const { hook, act, settle } = await loadDialog();
+      act(() => hook.result.current.dialog.ask(occurrence));
+      act(() =>
+        hook.result.current.dialog.confirm(occurrence, { scope: "all", token: "a" }, "all"),
+      );
       await settle();
       expect(hook.result.current.dialog.asked).toBeNull();
       expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([CHANGED]);
@@ -830,17 +946,47 @@ describe("a repeating event", () => {
       expect.anything(),
       "following",
       "f",
+      null,
+      null,
     );
     await act(async () => {
       await mod.saveEdit("sess", changes, { scope: "all", token: "a" }, "Gym");
       await mod.saveEdit("sess", changes, null, "Gym");
     });
     expect(updateCalendarEvent.mock.calls).toEqual([
-      ["sess", changes, "all", "a"],
-      ["sess", changes, null, null],
+      ["sess", changes, "all", "a", null, null],
+      ["sess", changes, null, null, null, null],
     ]);
     // The very draft the choices were asked for goes to the save (the token binds it).
     expect(updateCalendarEvent.mock.calls[0][1]).toBe(changes);
+  });
+
+  // C12 §14.4: Send or Don't send, and the numbers it was given for, reach both writes.
+  it("sends the email answer with a save and a delete", async () => {
+    deleteCalendarEvent.mockResolvedValue({ outcome: "held", undo_token: "t1", undo_seconds: 8 });
+    updateCalendarEvent.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const { mod, act } = await load();
+    const changes: EventPatchDraft = { summary: "Retro" };
+    await act(async () => {
+      await mod.saveEdit("sess", changes, null, "Gym", "all", GUESTS);
+      await mod.startDelete(event, null, "none", TOLD);
+    });
+    expect(updateCalendarEvent).toHaveBeenLastCalledWith(
+      "sess",
+      changes,
+      null,
+      null,
+      "all",
+      GUESTS,
+    );
+    expect(deleteCalendarEvent).toHaveBeenLastCalledWith(
+      event.id,
+      expect.anything(),
+      null,
+      null,
+      "none",
+      TOLD,
+    );
   });
 
   it("asks for the choices as the token binds them, once per row while one is on its way", async () => {

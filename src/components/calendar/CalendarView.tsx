@@ -29,6 +29,7 @@ import {
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import { reasonText } from "../../lib/calendarEdit/editReasons";
+import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import {
   createdWhere,
   createReasonFor,
@@ -806,6 +807,12 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // dialogs (the editor among them) itself; the popover isn't one.
   const deleteDialog = useDeleteDialog(popoverOpen);
   const confirmDelete = deleteDialog.asked?.event ?? null;
+  // People already in the user's Google and Outlook calendars, for the editor's guest box: worked out
+  // here, over the rows this view holds, so no contacts are read (C12; never a subscription's).
+  const suggestions = useMemo(
+    () => guestSuggestions(events, overview?.calendars ?? [], null),
+    [events, overview],
+  );
   // The address of the account a synced event's calendar belongs to.
   const accountOf = (ev: CalendarEvent): string | null => {
     const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
@@ -1155,6 +1162,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           row={editing}
           calendar={overview?.calendars.find((c) => c.id === editing.calendar_id) ?? null}
           account={accountOf(editing)}
+          suggestions={suggestions}
           milestone={
             editing.uid
               ? (milestones.find((m) => m.event_uid && m.event_uid === editing.uid) ?? null)
@@ -1214,8 +1222,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           overview?.calendars.find((c) => c.id === confirmDelete?.calendar_id)?.name ?? null
         }
         when={confirmDelete ? whenText(confirmDelete) : ""}
+        from={confirmDelete ? accountOf(confirmDelete) : null}
         again={deleteDialog.asked?.reask?.again ?? false}
         forceRepeating={!!deleteDialog.asked?.reask}
+        guests={deleteDialog.asked?.guests ?? null}
         onClose={deleteDialog.close}
         onConfirm={deleteDialog.confirm}
       />

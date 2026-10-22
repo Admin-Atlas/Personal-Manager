@@ -194,7 +194,25 @@ describe("an earlier change PM couldn't finish", () => {
       token: "p",
       offers: ["remove", "check"],
       from: "2026-11-02",
+      emails: [],
     });
+    // C12: which settles would email guests comes with it.
+    const sent: ScopeRow = { ...pending, emails: ["remove"] } as ScopeRow;
+    expect(pendingOf(ready(offered("t"), sent, sent))?.emails).toEqual(["remove"]);
+  });
+
+  // C12 critiques C1-M4, C2-M2: a change that went with Send says, before a button is pressed,
+  // which settles email guests; only the offers that would, and none after Don't send.
+  it("says which settles would email guests", () => {
+    expect(pendingText(["finish", "remove"], "2026-11-02", ["finish", "remove"])).toBe(
+      "PM couldn't finish an earlier change to this repeating event: it may show twice from 02-11. Finish it or remove the new part first. If you remove the new part, guests will get a cancellation email. If you finish it, guests will get the rest of the update emails.",
+    );
+    expect(pendingText(["remove", "check"], "2026-11-02", ["remove"])).toMatch(
+      /Remove the new part, or check again\. If you remove the new part, guests will get a cancellation email\.$/,
+    );
+    // Only what's offered: a Finish no longer offered says nothing of its emails.
+    expect(pendingText(["remove", "check"], "2026-11-02", ["finish"])).not.toMatch(/guests/);
+    expect(pendingText(["finish", "remove"], "2026-11-02", [])).not.toMatch(/guests/);
   });
 
   it("is worded by what Google allows now, never hinting at deleting without Remove", () => {

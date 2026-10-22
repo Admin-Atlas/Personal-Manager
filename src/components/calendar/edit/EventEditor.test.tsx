@@ -16,7 +16,10 @@ import type {
   EventForEdit,
   EventPatchDraft,
   FieldPermissions,
+  GuestForEdit,
+  GuestNotice,
   Milestone,
+  Notify,
   RepeatPreset,
   RepeatRule,
   RepeatStart,
@@ -38,6 +41,8 @@ const saveEdit =
       changes: EventPatchDraft,
       picked: Picked | null,
       title: string,
+      notify: Notify | null,
+      asked: GuestNotice | null,
     ) => Promise<SaveAnswer>
   >();
 const choicesForEdit = vi.fn<(session: string, draft: EventPatchDraft) => Promise<SeriesChoices>>();
@@ -51,8 +56,16 @@ let deviceZone: string | null = "Europe/London";
 
 vi.mock("./useEventWrites", () => ({
   openForEdit: (id: string) => openForEdit(id),
-  // Every argument passes through, so a scope sent without its token couldn't pass for free.
-  saveEdit: (s: string, c: EventPatchDraft, p: Picked | null, t: string) => saveEdit(s, c, p, t),
+  // Every argument passes through, so a scope sent without its token, or an email answer sent
+  // without being asked, couldn't pass for free.
+  saveEdit: (
+    s: string,
+    c: EventPatchDraft,
+    p: Picked | null,
+    t: string,
+    n: Notify | null,
+    a: GuestNotice | null,
+  ) => saveEdit(s, c, p, t, n, a),
   choicesForEdit: (s: string, d: EventPatchDraft) => choicesForEdit(s, d),
   settleSplit: (token: string, action: SplitAction, title: string) =>
     settleSplit(token, action, title),
@@ -173,8 +186,9 @@ async function open(
   return onClose;
 }
 
-/** A one-off's save: no scope, and the draft's title for its notices. */
-const UNSCOPED = [null, "Dentist"] as const;
+/** A one-off's save: no scope, the draft's title for its notices, and nobody to email (no answer,
+ *  no numbers). */
+const UNSCOPED = [null, "Dentist", null, null] as const;
 
 /** A rule from the repeat menu's set: `pattern`, every week or day, never ending. */
 const ruleOf = (pattern: RepeatRule["pattern"], interval = 1): RepeatRule => ({
@@ -260,6 +274,8 @@ describe("EventEditor", () => {
       { summary: "Dentist (moved)" },
       null,
       "Dentist (moved)",
+      null,
+      null,
     );
     expect(noteSaved).toHaveBeenCalledWith(
       "Dentist (moved)",
@@ -344,6 +360,8 @@ describe("EventEditor", () => {
       { location: "Room 2" },
       null,
       "Dentist (Google)",
+      null,
+      null,
     );
   });
 
@@ -850,6 +868,8 @@ describe("EventEditor, a repeating event", () => {
       { summary: "Gym" },
       { scope: "all", token: "t-all", asAll: false },
       "Gym",
+      null,
+      null,
     );
     // The very object the choices were asked for: the token binds it.
     expect(saveEdit.mock.calls[0][1]).toBe(choicesForEdit.mock.calls[0][1]);
@@ -1109,12 +1129,12 @@ describe("EventEditor, a repeating event", () => {
     openForEdit.mockResolvedValue(ready(event()));
     choicesForEdit.mockResolvedValue({
       outcome: "refused",
-      result: { outcome: "read_only", reason: "has_guests" },
+      result: { outcome: "read_only", reason: "special_type" },
     });
     await open(vi.fn(), undefined, occurrence);
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByText(/This event has guests/)).toBeTruthy();
+    expect(await screen.findByText(/can't be changed here/)).toBeTruthy();
     expect(choicesOpen()).toBeNull();
     expect(saveEdit).not.toHaveBeenCalled();
   });
@@ -1129,7 +1149,7 @@ describe("EventEditor, a repeating event", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveEdit).toHaveBeenCalledTimes(1);
-    expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Gym" }, null, "Gym");
+    expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Gym" }, null, "Gym", null, null);
     expect(saveEdit.mock.calls[0][1]).toBe(choicesForEdit.mock.calls[0][1]);
   });
 
@@ -1159,9 +1179,10 @@ describe("EventEditor, a repeating event", () => {
     await waitFor(() => expect(document.activeElement).toBe(editorSave));
   });
 
-  // C12 §14.1: whether Google emails the guests is no choice of occurrences. Asking those would
-  // say "doesn't repeat" and send it again unanswered, round and round; it's said instead.
-  it("says a save needs the guests' answer, and never asks which occurrences", async () => {
+  // C12 §14.1, §14.2: whether Google emails the guests is no choice of occurrences. Asking those
+  // would say "doesn't repeat" and send it again unanswered, round and round; the email question
+  // asks it instead, with the backend's numbers (no "again": nobody had answered).
+  it("asks the backend's guests question itself, and never which occurrences", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     const guests = {
       updated: 0,
@@ -1177,15 +1198,18 @@ describe("EventEditor, a repeating event", () => {
     const editorSave = screen.getByRole("button", { name: "Save" });
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
     fireEvent.click(editorSave);
-    expect(
-      await screen.findByText("Choose whether Google emails the guests. Nothing was saved."),
-    ).toBeTruthy();
-    await new Promise((r) => setTimeout(r, 20));
+    const prompt = await screen.findByRole("dialog", { name: "Send invitation emails to guests?" });
+    expect(within(prompt).getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    expect(within(prompt).queryByText(/PM checked with Google/)).toBeNull();
     expect(saveEdit).toHaveBeenCalledTimes(1);
     expect(choicesForEdit).not.toHaveBeenCalled();
     expect(choicesOpen()).toBeNull();
     expect(onClose).not.toHaveBeenCalled();
-    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+    saveEdit.mockResolvedValueOnce({ outcome: "saved", warnings: [] });
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" }, null, "Gym", "all", guests);
   });
 
   it("says why the choices couldn't be read, with focus back on Save", async () => {
@@ -1401,6 +1425,8 @@ describe("EventEditor, how it repeats", () => {
       { recurrence: { kind: "once" } },
       { scope: "all", token: "t-all", asAll: false },
       "Dentist",
+      null,
+      null,
     );
     // Its notice says one event is left (C11d review 1).
     expect(noteSaved).toHaveBeenCalledWith(
@@ -1779,5 +1805,327 @@ describe("EventEditor, a linked milestone", () => {
         "Linked to the “Launch” milestone in Atlas: moving this event moves the milestone too.",
       ),
     ).toBeTruthy();
+  });
+});
+
+// Guests (#884, C12c): the list in the editor, and Send / Don't send with no default. A one-off asks
+// from the editor's own count before anything is sent; the backend's numbers ask again; Busy/free
+// alone never asks; a repeating event's rows ask in the choices dialog.
+describe("EventEditor, guests", () => {
+  const me: GuestForEdit = {
+    email: "me@x.com",
+    name: null,
+    response: "accepted",
+    optional: false,
+    organizer: true,
+    self: true,
+    room: false,
+  };
+  const ann: GuestForEdit = {
+    email: "ann@x.org",
+    name: "Ann",
+    response: "accepted",
+    optional: false,
+    organizer: false,
+    self: false,
+    room: false,
+  };
+  const withAnn = () => event({ guests: [me, ann] });
+  /** Ann, told of a change. */
+  const ONE: GuestNotice = {
+    updated: 1,
+    invited: 0,
+    removed: 0,
+    cancelled: false,
+    people: 1,
+    emails: 1,
+    complete: true,
+  };
+  const question = () => screen.queryByRole("dialog", { name: "Send update emails to guests?" });
+
+  /** Open the one-off with Ann, retitle it, press Save. */
+  async function retitle() {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    const onClose = await open();
+    const editorSave = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(editorSave);
+    const prompt = await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    return { onClose, editorSave, prompt };
+  }
+
+  it("a one-off with guests asks before saving, and Back returns to Save", async () => {
+    const { onClose, editorSave, prompt } = await retitle();
+    const p = within(prompt);
+    expect(p.getByText("1 guest already invited will get an update.")).toBeTruthy();
+    expect(p.getByText("Google sends the emails from me@x.com.")).toBeTruthy();
+    // No default: Save waits for a pick, and focus starts on Back.
+    expect(p.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+    expect(p.getByRole<HTMLInputElement>("radio", { name: /^Send/ }).checked).toBe(false);
+    expect(document.activeElement).toBe(p.getByRole("button", { name: "Back" }));
+    expect(saveEdit).not.toHaveBeenCalled();
+    fireEvent.click(p.getByRole("button", { name: "Back" }));
+    expect(question()).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Gym");
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("Send saves with all, Don't send with none, each for the numbers it showed", async () => {
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    for (const [label, notify] of [
+      [/^Send/, "all"],
+      [/^Don't send/, "none"],
+    ] as const) {
+      const { onClose, prompt } = await retitle();
+      fireEvent.click(within(prompt).getByRole("radio", { name: label }));
+      fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+      expect(saveEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" }, null, "Gym", notify, ONE);
+      cleanup();
+    }
+  });
+
+  // Nothing goes from behind the question (C12 critique C2-L3): the editor's own Save, Cancel and
+  // Delete do nothing while it's open, whatever reaches them.
+  it("holds the editor's own buttons while the email question is open", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    const onDelete = vi.fn();
+    const onClose = await open(vi.fn(), onDelete);
+    const [editorSave, cancel, del] = ["Save", "Cancel", "Delete"].map((name) =>
+      screen.getByRole("button", { name }),
+    );
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(editorSave);
+    await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    for (const button of [editorSave, cancel, del]) fireEvent.click(button);
+    expect(screen.getAllByRole("dialog", { name: "Send update emails to guests?" })).toHaveLength(
+      1,
+    );
+    expect(screen.queryByRole("dialog", { name: /^Discard your changes/ })).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("Escape closes only the email question", async () => {
+    const { onClose, prompt } = await retitle();
+    fireEvent.keyDown(prompt, { key: "Escape" });
+    expect(question()).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Discard your changes?" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Edit event" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("a Busy/free change with guests saves without asking", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Free" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    expect(saveEdit).toHaveBeenCalledWith("s1", { show_as: "free" }, ...UNSCOPED);
+  });
+
+  it("the backend's guests question opens the prompt with its numbers and the again line", async () => {
+    const two: GuestNotice = { ...ONE, updated: 2, people: 2, emails: 2 };
+    saveEdit.mockResolvedValueOnce({
+      outcome: "needs_choice",
+      scope: false,
+      guests: two,
+      again: true,
+    });
+    const { onClose, editorSave, prompt } = await retitle();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    const again = await screen.findByText("2 guests already invited will get an update.");
+    const reasked = within(again.closest('[role="dialog"]') as HTMLElement);
+    expect(
+      reasked.getByText(
+        "PM checked with Google before saving, and these are the numbers it found.",
+      ),
+    ).toBeTruthy();
+    // Asked afresh: nothing picked.
+    expect(reasked.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+    // A Save from behind it never swaps the backend's numbers for the editor's own count.
+    fireEvent.click(editorSave);
+    expect(screen.getByText("2 guests already invited will get an update.")).toBeTruthy();
+    expect(screen.queryByText("1 guest already invited will get an update.")).toBeNull();
+    saveEdit.mockResolvedValueOnce({ outcome: "saved", warnings: [] });
+    fireEvent.click(reasked.getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(reasked.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" }, null, "Gym", "none", two);
+  });
+
+  it("a second one in one Save is a banner", async () => {
+    const two: GuestNotice = { ...ONE, updated: 2, people: 2, emails: 2 };
+    saveEdit.mockResolvedValue({ outcome: "needs_choice", scope: false, guests: two, again: true });
+    const { onClose, editorSave, prompt } = await retitle();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    const again = await screen.findByText("2 guests already invited will get an update.");
+    const reasked = within(again.closest('[role="dialog"]') as HTMLElement);
+    fireEvent.click(reasked.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(reasked.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText("Choose whether Google emails the guests. Nothing was saved."),
+    ).toBeTruthy();
+    expect(screen.queryByText("2 guests already invited will get an update.")).toBeNull();
+    expect(saveEdit).toHaveBeenCalledTimes(2);
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(editorSave));
+  });
+
+  it("a repeating save passes the dialog's answer", async () => {
+    const occurrence: CalendarEvent = { ...row, series_id: "abc", recurring: true };
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    choicesForEdit.mockResolvedValue({
+      outcome: "ready",
+      this: { row: "offered", warnings: [], token: "t-this", guests: ONE },
+      following: { row: "offered", warnings: [], token: "t-following", guests: ONE },
+      all: { row: "offered", warnings: [], token: "t-all", guests: ONE },
+    });
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), undefined, occurrence);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const d = within(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    await d.findByRole("radio", { name: /^This event/ });
+    // Asked inside the dialog, never in a second one.
+    expect(question()).toBeNull();
+    fireEvent.click(d.getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(d.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { summary: "Gym" },
+      { scope: "this", token: "t-this", asAll: false },
+      "Gym",
+      "all",
+      null,
+    );
+  });
+
+  it("the guest field is disabled with the reason when guests can't change", async () => {
+    const locked: FieldPermissions = {
+      ...ALL,
+      summary: false,
+      time: false,
+      location: false,
+      description: false,
+      guests: false,
+      reasons: ["locked"],
+    };
+    openForEdit.mockResolvedValue(ready(withAnn(), locked));
+    await open();
+    expect(screen.getByRole<HTMLInputElement>("combobox", { name: "Add guests" }).disabled).toBe(
+      true,
+    );
+    expect(screen.getByText(/Google has locked this event's/)).toBeTruthy();
+    // The list still shows.
+    expect(screen.getByText("Ann")).toBeTruthy();
+  });
+
+  // A guest added is invited, and the guest already there hears of the change, as Google counts it.
+  it("adding a guest asks with an invitation, and sends the change to Google's list", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    fireEvent.change(box, { target: { value: "bo@x.org" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    expect(within(prompt).getByText("1 guest new to it will get an invitation.")).toBeTruthy();
+    expect(within(prompt).getByText("1 guest already invited will get an update.")).toBeTruthy();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { guests: [{ email: "bo@x.org", to: "required" }] },
+      null,
+      "Dentist",
+      "all",
+      { ...ONE, invited: 1, people: 2, emails: 2 },
+    );
+  });
+
+  it("a rejected address stops the save", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    await open();
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    fireEvent.change(box, { target: { value: "bob at x" } });
+    fireEvent.blur(box);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getAllByText("“bob at x” isn't an email address.").length).toBeGreaterThan(0);
+    expect(question()).toBeNull();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  // The field takes Google's list from the editor: a guest taken off and added back is Google's
+  // entry again, reply and all, so there's nothing to save and nobody to ask about.
+  it("a guest taken off and added back is Google's entry, so nothing is sent", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Ann" }));
+    expect(screen.queryByText("Ann")).toBeNull();
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    fireEvent.change(box, { target: { value: "ann@x.org" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(screen.getByText("Ann")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  // And the organiser's address from Google's copy, on the list or not: Google refuses any change
+  // to it, so the field never adds it.
+  it("never adds the organiser, who isn't on Google's list", async () => {
+    openForEdit.mockResolvedValue(ready(event({ guests: [ann], organizer_email: "boss@x.org" })));
+    const onClose = await open();
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    fireEvent.change(box, { target: { value: "Boss@x.org" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(screen.getByText("That's the organiser, who is on it already.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Remove Boss/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  // C12 critique C1-H2: a delete from the editor asks about the guests Google's copy has, not the
+  // mirror's (possibly older) list.
+  it("deletes with the guest list Google's copy has", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    const onDelete = vi.fn();
+    await open(vi.fn(), onDelete);
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete.mock.calls[0][0].attendees).toEqual([
+      {
+        name: null,
+        email: "me@x.com",
+        response: "accepted",
+        optional: false,
+        organizer: true,
+        self: true,
+      },
+      {
+        name: "Ann",
+        email: "ann@x.org",
+        response: "accepted",
+        optional: false,
+        organizer: false,
+        self: false,
+      },
+    ]);
   });
 });

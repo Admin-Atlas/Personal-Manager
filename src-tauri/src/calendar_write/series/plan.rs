@@ -85,8 +85,8 @@ use super::diff::{Expect, Removes, SeriesDiff};
 use super::rule::{plan_all_rule, plan_split_rule, rule_ask, RuleAsk};
 use super::scope::{is_first, zones_changed, Scope};
 use super::{
-    attendee_set, classify_instance, excluded, google_before, guests_on, original_of, point_of,
-    Exceptions, FreshEvent, InstanceKind, LaterPart, Length, Listing, Master, SeriesRefusal,
+    attendee_set, classify_instance, excluded, google_before, original_of, point_of, Exceptions,
+    FreshEvent, InstanceKind, LaterPart, Length, Listing, Master, SeriesRefusal,
 };
 
 /// Everything a series plan is built from. C9 makes the GETs; nothing here fetches.
@@ -107,10 +107,6 @@ pub struct SeriesInput<'a> {
     /// Where the earliest later part of the series starts, which a new rule mustn't repeat over (C11
     /// critique 1 H2).
     pub later: LaterPart,
-    /// Whether a series with guests may change: false until C12 brings invitations, whatever the
-    /// occurrence shows. One whose guests were removed on its own passes the gate, and a split would
-    /// invite the series' guests again (C8b review G5).
-    pub guests_allowed: bool,
     /// The address the account reads this calendar with: the user, never a guest Google emails,
     /// whatever a list PM built calls it (C12 critiques C1-H1, C2-H1).
     pub me: &'a str,
@@ -1065,9 +1061,6 @@ fn prepare(input: &SeriesInput) -> Result<(Master, Point), NotPlanned> {
     if let Some(reason) = master.read_only() {
         return Err(NotPlanned::ReadOnly(reason));
     }
-    if master.guests && !input.guests_allowed {
-        return Err(NotPlanned::ReadOnly(ReadOnlyReason::HasGuests));
-    }
     if instance.get("recurringEventId").and_then(Value::as_str) != Some(master.id.as_str()) {
         return Err(SeriesRefusal::NotInSeries.into());
     }
@@ -1207,36 +1200,6 @@ pub(super) fn exceptions_from<'a>(
         }
     }
     Ok(out)
-}
-
-/// Until C12 brings Send / Don't send, a plan that reaches past the occurrence picked mustn't reach
-/// one with guests of its own (the series' own guests are refused in [`prepare`]): Google would
-/// change or cancel it with nobody told, and no choice of who is. `from` is a split's or a cut's
-/// occurrence (only those from it on are reached); `None` for the whole series. Only a complete
-/// listing can show there's none, so an incomplete one refuses too, a change of text included; the
-/// cross-check counts an occurrence with guests the listing lacks against it (C9a-2 review).
-pub(super) fn no_guests_from(
-    master: &Master,
-    input: &SeriesInput,
-    from: Option<Point>,
-) -> Result<(), NotPlanned> {
-    if input.guests_allowed {
-        return Ok(());
-    }
-    if !input.exceptions.complete {
-        return Err(SeriesRefusal::Incomplete.into());
-    }
-    let zone = master.start.zone();
-    for item in own_exceptions(master, input.exceptions) {
-        if item.get("status").and_then(Value::as_str) == Some("cancelled") || !guests_on(item) {
-            continue;
-        }
-        let at = original_of(item).ok_or(SeriesRefusal::Unreadable)?;
-        if from.is_none_or(|from| !at.cmp_in(&from, zone).is_lt()) {
-            return Err(SeriesRefusal::GuestsElsewhere(at.day_in(zone)).into());
-        }
-    }
-    Ok(())
 }
 
 /// The gate reads the occurrence's description; a draft for the series writes the series' own, and
@@ -1395,10 +1358,9 @@ fn delete_plan(
     if input.sibling && scope != Scope::This {
         warnings.push(SeriesWarning::SplitSibling);
     }
-    // Every arm that deletes the whole series comes through here, guests checked.
-    let whole = |warnings: Vec<SeriesWarning>| -> Result<SeriesPlan, NotPlanned> {
-        no_guests_from(&master, input, None)?;
-        Ok(SeriesPlan {
+    // Every arm that deletes the whole series comes through here.
+    let whole = |warnings: Vec<SeriesWarning>| -> SeriesPlan {
+        SeriesPlan {
             scope: Scope::All,
             steps: vec![Step {
                 op: Op::Delete {
@@ -1432,7 +1394,7 @@ fn delete_plan(
             guests: None,
             chosen: None,
             own: Own::default(),
-        })
+        }
     };
     match scope {
         Scope::This => Ok(SeriesPlan {
@@ -1471,33 +1433,30 @@ fn delete_plan(
             chosen: None,
             own: Own::default(),
         }),
-        Scope::All => whole(warnings),
-        Scope::Following if is_first(&master, input.fresh.instance) => whole(warnings),
+        Scope::All => Ok(whole(warnings)),
+        Scope::Following if is_first(&master, input.fresh.instance) => Ok(whole(warnings)),
         Scope::Following => match cut_at(&master, input, original)? {
-            None => whole(warnings),
-            Some(SplitCut { cut, .. }) => {
-                no_guests_from(&master, input, Some(original))?;
-                Ok(SeriesPlan {
-                    scope,
-                    steps: plan_cut_delete(&master, input, original, cut, notify)?,
-                    warnings,
-                    expect: vec![Expect::EndsBefore {
-                        series: master.id.clone(),
-                        at: original,
-                        left: Vec::new(),
-                    }],
-                    removes: Removes::From {
-                        series: master.id.clone(),
-                        at: original,
-                        left: Vec::new(),
-                    },
-                    start: master.start,
-                    rule_start: master.start,
-                    guests: None,
-                    chosen: None,
-                    own: Own::default(),
-                })
-            }
+            None => Ok(whole(warnings)),
+            Some(SplitCut { cut, .. }) => Ok(SeriesPlan {
+                scope,
+                steps: plan_cut_delete(&master, input, original, cut, notify)?,
+                warnings,
+                expect: vec![Expect::EndsBefore {
+                    series: master.id.clone(),
+                    at: original,
+                    left: Vec::new(),
+                }],
+                removes: Removes::From {
+                    series: master.id.clone(),
+                    at: original,
+                    left: Vec::new(),
+                },
+                start: master.start,
+                rule_start: master.start,
+                guests: None,
+                chosen: None,
+                own: Own::default(),
+            }),
         },
     }
 }
@@ -2044,7 +2003,6 @@ fn plan_all(
     }
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    no_guests_from(master, input, None)?;
     keeps_formatting(master_json, draft)?;
     let text_only = EventPatchDraft {
         time: None,
@@ -2295,7 +2253,6 @@ fn plan_split(
     let zone = master.start.zone();
     let rest_start = rest_start(master, at)?;
     let exceptions = exceptions_from(master, input.exceptions, at)?;
-    no_guests_from(master, input, Some(at))?;
     let cancelled: Vec<Point> = exceptions
         .iter()
         .filter(|(item, _)| classify_instance(master_json, master, item) == InstanceKind::Cancelled)
@@ -3202,8 +3159,7 @@ mod tests {
             }
         };
         let invited = Case::new(guest(case.master.json()), guest(&monday_19()))
-            .exceptions(case.exceptions.items.iter().map(guest).collect())
-            .guests();
+            .exceptions(case.exceptions.items.iter().map(guest).collect());
         let plan = plan_series_edit(
             Scope::Following,
             &invited.input(),
@@ -3481,39 +3437,44 @@ mod tests {
         )
     }
 
-    /// G5: a series with guests stays read-only until C12, whatever the occurrence shows. Once guests
-    /// are allowed, an occurrence whose guests were removed on its own is a change PM can't carry.
+    /// G5, C12: a series with guests plans like any other and says who it would email, whatever
+    /// the occurrence shows (C12 lifted the gate's refusal). An occurrence whose guests were removed
+    /// on its own is still a change PM can't carry.
     #[test]
-    fn a_series_with_guests_is_judged_by_its_own_guest_list() {
+    fn a_series_with_guests_plans_and_counts_them() {
         let no_guests_here = monday_19();
         let case = Case::new(with_guests(), no_guests_here);
-        for scope in [Scope::All, Scope::Following] {
-            assert_eq!(
-                case.edit(scope, title("Retro")),
-                Err(NotPlanned::ReadOnly(ReadOnlyReason::HasGuests))
-            );
-        }
-        assert_eq!(
-            case.delete(Scope::Following),
-            Err(NotPlanned::ReadOnly(ReadOnlyReason::HasGuests))
-        );
+        let two = |cancelled: bool| GuestNotice {
+            updated: 2,
+            cancelled,
+            people: 2,
+            emails: 2,
+            complete: true,
+            ..GuestNotice::default()
+        };
+        let all = case.edit(Scope::All, title("Retro")).unwrap();
+        assert!(all.guests == Some(two(false)), "a and b get the update");
+        assert!(all.needs_notify(), "unanswered, it may not run");
+        let gone = case.delete(Scope::All).unwrap();
+        assert!(gone.guests == Some(two(true)), "a and b are told");
+        let split = case.edit(Scope::Following, title("Retro")).unwrap();
+        assert!(split.guests.is_some() && split.needs_notify());
         // Only the user on the list isn't a guest.
         let just_me = with(
             weekly(),
             "attendees",
             json!([{ "email": "me@example.com", "self": true }]),
         );
-        assert!(Case::new(just_me, monday_19())
+        let alone = Case::new(just_me, monday_19())
             .edit(Scope::All, title("Retro"))
-            .is_ok());
+            .unwrap();
+        assert!(alone.guests.is_none() && !alone.needs_notify());
         let solo = with(
             plain("2026-10-26T09:00:00Z"),
             "summary",
             json!("Solo review"),
         );
-        let case = Case::new(with_guests(), monday_19())
-            .exceptions(vec![solo])
-            .guests();
+        let case = Case::new(with_guests(), monday_19()).exceptions(vec![solo]);
         assert_eq!(
             case.edit(Scope::Following, title("Retro")),
             Err(NotPlanned::Refused(SeriesRefusal::CannotCarry(day(
@@ -3527,7 +3488,7 @@ mod tests {
     /// shared property changed, does.
     #[test]
     fn a_split_watches_the_guests_it_copies_but_not_their_replies() {
-        let mut case = Case::new(with_guests(), monday_19()).guests();
+        let mut case = Case::new(with_guests(), monday_19());
         let replied = with(
             weekly(),
             "attendees",
@@ -4787,58 +4748,61 @@ mod tests {
         assert_ne!(split(&busier, TAIL).choice_digest("s1"), token);
     }
 
-    /// Until C12, nothing past the occurrence picked reaches one with guests of its own: not a split
-    /// or a cut from before it, nor anything for every occurrence. "This event" elsewhere, and a split
-    /// after it, still go ahead; with guests allowed (C12), all of them do.
+    /// C12: an occurrence with guests of its own no longer holds back what reaches it (C9a-2's
+    /// refusal until Send / Don't send). A write to the whole series counts it as "at least", since
+    /// PM can't tell whether Google emails that occurrence's guests too (probe L-R13-4); "this and
+    /// following" past it still can't carry its guests onto the new part (Q3).
     #[test]
-    fn an_occurrence_with_guests_of_its_own_holds_back_what_reaches_it() {
+    fn an_occurrence_with_guests_of_its_own_is_counted_by_a_whole_series_write() {
         let invited = with(
             plain("2026-10-26T09:00:00Z"),
             "attendees",
             json!([{ "email": "a@example.com", "responseStatus": "needsAction" }]),
         );
-        let held = Err(NotPlanned::Refused(SeriesRefusal::GuestsElsewhere(day(
+        let cant_carry = Err(NotPlanned::Refused(SeriesRefusal::CannotCarry(day(
             2026, 10, 26,
         ))));
+        let at_least = |plan: SeriesPlan| {
+            plan.needs_notify()
+                && plan
+                    .guests
+                    .is_some_and(|g| !g.complete && g.people == 0 && g.emails == 0)
+        };
         let case = Case::new(weekly(), monday_19()).exceptions(vec![invited.clone()]);
         assert!(case.edit(Scope::This, title("Retro")).is_ok());
         assert!(case.delete(Scope::This).is_ok());
-        assert_eq!(case.edit(Scope::Following, title("Retro")), held);
-        assert_eq!(case.edit(Scope::All, title("Retro")), held);
-        assert_eq!(case.delete(Scope::Following), held);
-        assert_eq!(case.delete(Scope::All), held);
+        assert_eq!(case.edit(Scope::Following, title("Retro")), cant_carry);
+        assert!(at_least(case.edit(Scope::All, title("Retro")).unwrap()));
+        assert!(at_least(case.delete(Scope::All).unwrap()));
+        // A cut cancels that occurrence on the way: its guest is told, by count.
+        let cut = case.delete(Scope::Following).unwrap();
+        assert!(cut
+            .guests
+            .is_some_and(|g| g.cancelled && g.updated == 1 && g.complete));
         let after =
             Case::new(weekly(), plain("2026-11-02T09:00:00Z")).exceptions(vec![invited.clone()]);
-        assert!(after.edit(Scope::Following, title("Retro")).is_ok());
+        let split = after.edit(Scope::Following, title("Retro")).unwrap();
+        assert!(split.guests.is_none(), "nobody past it to tell");
         assert!(after.delete(Scope::Following).is_ok());
-        assert_eq!(after.edit(Scope::All, title("Retro")), held);
+        assert!(at_least(after.edit(Scope::All, title("Retro")).unwrap()));
         // From the first occurrence, "this and following" is every occurrence.
-        let first = Case::new(weekly(), plain("2026-10-05T09:00:00+01:00"))
-            .exceptions(vec![invited.clone()]);
-        assert_eq!(first.delete(Scope::Following), held);
-        assert_eq!(first.edit(Scope::Following, title("Retro")), held);
-        let allowed = Case::new(weekly(), monday_19())
-            .exceptions(vec![invited])
-            .guests();
-        assert!(allowed.delete(Scope::All).is_ok());
+        let first =
+            Case::new(weekly(), plain("2026-10-05T09:00:00+01:00")).exceptions(vec![invited]);
+        assert!(at_least(first.delete(Scope::Following).unwrap()));
     }
 
-    /// Until C12, only a whole listing shows that nothing a plan reaches has guests of its own, so a
-    /// short one refuses even a change of text to every occurrence, and deleting them. With guests
-    /// allowed, the change of text goes ahead and says "some" may keep or lose their changes; the
-    /// warning carries that, so the token tells "some" from a count.
+    /// The over-correction named (C12 §7.2): C9a-2's guests rule refused a short listing for a change
+    /// of text to every occurrence and for deleting them, since only a whole listing showed no
+    /// occurrence had guests. With guests allowed those run, and say "some" may keep or lose their
+    /// changes; the warning carries that, so the token tells "some" from a count. On a series with
+    /// guests the count is "at least" too.
     #[test]
-    fn a_short_listing_refuses_what_reaches_past_this_occurrence_until_c12() {
+    fn a_short_listing_lets_text_go_to_all_events_and_says_some() {
         let mut short = Case::new(weekly(), monday_19());
         short.exceptions.complete = false;
-        let incomplete = Err(NotPlanned::Refused(SeriesRefusal::Incomplete));
         assert!(short.edit(Scope::This, title("Retro")).is_ok());
-        assert_eq!(short.edit(Scope::All, title("Retro")), incomplete);
-        assert_eq!(short.delete(Scope::All), incomplete);
-        assert_eq!(short.delete(Scope::Following), incomplete);
-        let mut allowed = Case::new(weekly(), monday_19()).guests();
-        allowed.exceptions.complete = false;
-        let some = allowed.edit(Scope::All, title("Retro")).unwrap();
+        assert!(short.delete(Scope::All).is_ok());
+        let some = short.edit(Scope::All, title("Retro")).unwrap();
         assert_eq!(
             some.warnings,
             [SeriesWarning::ExceptionsMayReset {
@@ -4847,21 +4811,24 @@ mod tests {
             }]
         );
         let seen = Case::new(weekly(), monday_19())
-            .guests()
             .edit(Scope::All, title("Retro"))
             .unwrap();
         assert!(seen.warnings.is_empty());
         assert_ne!(some.choice_digest("s1"), seen.choice_digest("s1"));
+        let mut guests = Case::new(with_guests(), monday_19());
+        guests.exceptions.complete = false;
+        let counted = guests.edit(Scope::All, title("Retro")).unwrap();
+        assert!(counted
+            .guests
+            .is_some_and(|g| !g.complete && g.updated == 2 && g.people == 2));
         // The same count, seen whole or not: two tokens.
         let retitled = with(
             plain("2026-10-26T09:00:00Z"),
             "summary",
             json!("Standup (room 4)"),
         );
-        let whole = Case::new(weekly(), monday_19())
-            .exceptions(vec![retitled])
-            .guests();
-        let mut part = Case::new(weekly(), monday_19()).guests();
+        let whole = Case::new(weekly(), monday_19()).exceptions(vec![retitled]);
+        let mut part = Case::new(weekly(), monday_19());
         part.exceptions = Exceptions {
             items: whole.exceptions.items.clone(),
             complete: false,
@@ -4886,11 +4853,11 @@ mod tests {
         assert_ne!(whole.choice_digest("s1"), part.choice_digest("s1"));
     }
 
-    /// With guests allowed (C12), the guests rule no longer refuses a short listing, and the guards
-    /// that need it whole still do: a cut, a split, and a move of every occurrence.
+    /// No guests rule refuses a short listing any more (C12), and the guards that need it whole
+    /// still do: a cut, a split, and a move of every occurrence.
     #[test]
-    fn a_short_listing_still_refuses_cuts_splits_and_moves_with_guests_allowed() {
-        let mut short = Case::new(weekly(), monday_19()).guests();
+    fn a_short_listing_still_refuses_cuts_splits_and_moves() {
+        let mut short = Case::new(weekly(), monday_19());
         short.exceptions.complete = false;
         let incomplete = Err(NotPlanned::Refused(SeriesRefusal::Incomplete));
         assert_eq!(short.delete(Scope::Following), incomplete);
@@ -5193,13 +5160,12 @@ mod tests {
     }
 
     /// The weekly series and its Monday 19-10 occurrence, both with `list` as guests besides the
-    /// user, as C12c will plan them (guests allowed).
+    /// user.
     fn invited(list: &[&str]) -> Case {
         Case::new(
             guests_on_it(weekly(), list),
             guests_on_it(monday_19(), list),
         )
-        .guests()
     }
 
     /// Who each step reaches, as the plan was stamped by.
@@ -5399,7 +5365,7 @@ mod tests {
 
     /// C12 §6.2: a write to every occurrence is "at least" where an occurrence has a guest list of
     /// its own, or where PM couldn't see every occurrence changed on its own; a short listing asks
-    /// even with nobody seen (C12 critique C1, "short listings ask"), as C12c will run it.
+    /// even with nobody seen (C12 critique C1, "short listings ask").
     #[test]
     fn a_whole_series_write_is_at_least_when_an_occurrence_has_guests_of_its_own() {
         let own_list = guests_on_it(
@@ -5429,7 +5395,7 @@ mod tests {
             .unwrap();
         assert!(plan.guests == Some(told(1, 0, 0, 1)), "exact");
         // A short listing, on a series with nobody else on it.
-        let mut short = Case::new(weekly(), monday_19()).guests();
+        let mut short = Case::new(weekly(), monday_19());
         short.exceptions.complete = false;
         let plan = short.edit(Scope::All, title("Retro")).unwrap();
         assert!(
@@ -5626,7 +5592,7 @@ mod tests {
             v["attendees"][1]["responseStatus"] = json!("needsAction");
             v
         };
-        let case = Case::new(waiting(weekly()), waiting(monday_19())).guests();
+        let case = Case::new(waiting(weekly()), waiting(monday_19()));
         let add_b = guests_to(&[(B, GuestState::Required)]);
         let conflict = Resend::Conflict(vec!["attendees".into()]);
         for (scope, now) in [(Scope::All, weekly()), (Scope::This, monday_19())] {
@@ -5675,7 +5641,7 @@ mod tests {
                 json!([{ "email": ME, "responseStatus": "accepted" }]),
             )
         };
-        let case = Case::new(unmarked(weekly()), unmarked(monday_19())).guests();
+        let case = Case::new(unmarked(weekly()), unmarked(monday_19()));
         let input = SeriesInput {
             me: ME,
             ..case.input()
@@ -5749,7 +5715,7 @@ mod tests {
         // A series whose list Google cut short: no new part copies part of it.
         let mut cut_short = guests_on_it(weekly(), &[A]);
         cut_short["attendeesOmitted"] = json!(true);
-        let short = Case::new(cut_short, guests_on_it(monday_19(), &[A])).guests();
+        let short = Case::new(cut_short, guests_on_it(monday_19(), &[A]));
         assert!(refused_for(
             short.edit(Scope::Following, title("Retro")),
             SeriesRefusal::Guest(GuestError::Omitted)

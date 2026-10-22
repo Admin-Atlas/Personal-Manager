@@ -38,10 +38,10 @@ use super::super::time;
 use super::diff::{Expect, Removes};
 use super::plan::{
     all_plan, cancel_exception, cancelled_points, cut_step, draft_fields, exceptions_from,
-    insert_step, keeps_formatting, last_kept, no_guests_from, not_carried, own_exceptions,
-    rest_start, snapshot, split_unchanged_since_opened, start_of, tail_body,
-    unchanged_since_opened, when_nodes_in, NotPlanned, Op, Recheck, SeriesInput, SeriesPlan,
-    SeriesWarning, Shows, SplitCut, Stage, Step, Undo, TAIL_WATCH,
+    insert_step, keeps_formatting, last_kept, not_carried, own_exceptions, rest_start, snapshot,
+    split_unchanged_since_opened, start_of, tail_body, unchanged_since_opened, when_nodes_in,
+    NotPlanned, Op, Recheck, SeriesInput, SeriesPlan, SeriesWarning, Shows, SplitCut, Stage, Step,
+    Undo, TAIL_WATCH,
 };
 use super::scope::{RuleChange, Scope};
 use super::{
@@ -569,7 +569,6 @@ pub(super) fn plan_all_rule(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    no_guests_from(master, input, None)?;
     keeps_formatting(master_json, draft)?;
     every_line_readable(master)?;
     // The draft's time is read against the occurrence as Google holds it now, and a new rule moves
@@ -856,7 +855,6 @@ pub(super) fn plan_split_rule(
     let zone = master.start.zone();
     let rest = rest_start(master, at)?;
     let exceptions = exceptions_from(master, input.exceptions, at)?;
-    no_guests_from(master, input, Some(at))?;
     if draft.time.is_some() {
         // Read against the occurrence as Google holds it now: it must still be where the user saw it
         // (R2; C8b reviews ADV-1).
@@ -3514,24 +3512,37 @@ mod tests {
         }
     }
 
-    /// Until C12, a change that would reach an occurrence with guests of its own is refused, for every
-    /// occurrence and from one on, a new rule or none.
+    /// C12: a rule change that reaches an occurrence with guests of its own is no longer refused
+    /// for it, but asks Send / Don't send first. For every occurrence, a new rule or none, it counts
+    /// them as "at least", since PM can't tell whether Google emails that occurrence's guests too
+    /// (probe L-R13-4); from one on, a new rule still can't carry its guests onto the new part (Q3),
+    /// and "Does not repeat" cancels that occurrence, its guest counted.
     #[test]
-    fn a_rule_change_refuses_to_reach_an_occurrence_with_guests() {
+    fn a_rule_change_that_reaches_an_occurrence_with_guests_asks_first() {
         let guests = with(
             plain("2026-10-26T09:00:00Z"),
             "attendees",
             json!([{ "email": "ana@example.com" }]),
         );
         let case = Case::new(weekly(), monday_19()).exceptions(vec![guests]);
-        let refused = Err(NotPlanned::Refused(SeriesRefusal::GuestsElsewhere(day(
-            2026, 10, 26,
-        ))));
-        for scope in [Scope::All, Scope::Following] {
-            for draft in [repeat(daily()), stop()] {
-                assert_eq!(case.edit(scope, draft), refused);
-            }
+        for draft in [repeat(daily()), stop()] {
+            let plan = case.edit(Scope::All, draft).unwrap();
+            assert!(plan.needs_notify());
+            assert!(plan
+                .guests
+                .is_some_and(|g| !g.complete && g.people == 0 && g.emails == 0));
         }
+        assert_eq!(
+            case.edit(Scope::Following, repeat(daily())),
+            Err(NotPlanned::Refused(SeriesRefusal::CannotCarry(day(
+                2026, 10, 26
+            ))))
+        );
+        let stopped = case.edit(Scope::Following, stop()).unwrap();
+        assert!(stopped.needs_notify());
+        assert!(stopped
+            .guests
+            .is_some_and(|g| g.updated == 1 && g.people == 1 && g.complete));
     }
 
     /// A formatted description is never saved over as plain text, whatever the rule.
