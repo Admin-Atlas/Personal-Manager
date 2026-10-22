@@ -777,6 +777,37 @@ describe("creating an event", () => {
       /^“Dentist” wasn't sent again: .* so it isn't made twice\.$/,
     );
   });
+
+  // C12d: whether Google sends the invitations, said only where it can't be asked again; nothing
+  // was sent, and the words never say "guests" emailed or name a command.
+  it("says a create waiting on the invitations question wasn't created", () => {
+    const one = {
+      updated: 0,
+      invited: 1,
+      removed: 0,
+      told_cancelled: 0,
+      cancelled: false,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    expect(
+      createText({ outcome: "needs_choice", scope: false, guests: one }, "Dentist", false),
+    ).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't created: Choose whether Google sends the invitations, then save it again.",
+    });
+    expect(
+      createText(
+        { outcome: "needs_choice", scope: false, guests: one, again: true },
+        "Dentist",
+        false,
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't created: PM's count of who Google would invite differs from the one you answered. Save it again to choose whether Google sends the invitations.",
+    });
+  });
 });
 
 // C9b-2: moving a milestone after a "this and following" change.

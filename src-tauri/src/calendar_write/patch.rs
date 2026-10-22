@@ -62,9 +62,9 @@ pub const REPEAT_PATCHABLE: &[&str] = &[
     "recurrence",
 ];
 
-/// What a create may send: a save's fields before guests, and the repeat rule (C11). Still no
-/// attendees (C12d), reminders, conference, colour or private notes until their layers. Widening it
-/// is a decision, never a slip: `creatable_is_the_c11_list_with_no_guests` pins it to exactly this,
+/// What a create may send: a save's fields, the repeat rule (C11), and the guests with what they may
+/// do (C12d). Still no reminders, conference, colour or private notes until their layers. Widening it
+/// is a decision, never a slip: `creatable_is_the_c11_list_and_the_guests` pins it to exactly this,
 /// and the create plan's own refusal test names what it still refuses (C10 critique 1 L10).
 pub const CREATABLE: &[&str] = &[
     "summary",
@@ -75,6 +75,10 @@ pub const CREATABLE: &[&str] = &[
     "transparency",
     "visibility",
     "recurrence",
+    "attendees",
+    "guestsCanModify",
+    "guestsCanInviteOthers",
+    "guestsCanSeeOtherGuests",
 ];
 
 /// Why a create's body can't be built. Shown to the user as is: the inner words.
@@ -85,6 +89,8 @@ pub enum InsertError {
     /// A one-off given a repeat, its time left alone, whose start or end has no zone, with none to
     /// read it in: not the calendar's, nor this computer's (C11d review 1).
     NoEventZone,
+    /// A guest PM can't invite: not an address, or listed twice (C12d). Its words name no address.
+    Guest(attendees::GuestError),
 }
 
 impl fmt::Display for InsertError {
@@ -92,6 +98,7 @@ impl fmt::Display for InsertError {
         match self {
             InsertError::Time(e) => e.fmt(f),
             InsertError::Rule(e) => e.fmt(f),
+            InsertError::Guest(e) => e.fmt(f),
             InsertError::NoEventZone => write!(
                 f,
                 "PM can't tell which time zone this event is in, so it can't make it repeat."
@@ -121,6 +128,9 @@ impl From<SpecError> for InsertError {
 /// Wednesday" chosen on a Tuesday starts on the Wednesday, A27), its end moved the same number of
 /// days, and carries one rule line and nothing else (no EXDATE or RDATE). A timed one names its
 /// zone on both nodes, as every timed node does; an all-day one sends dates only (probe P-R1).
+///
+/// Guests (C12d) go as new entries, in the order added ([`attendees::new_list`]), and only when
+/// there are any; each guest permission only where it isn't Google's default (C12 §3.2).
 pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertError> {
     let (time, rule) = match &draft.recurrence {
         None => (draft.time.clone(), None),
@@ -136,6 +146,7 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
         }
     };
     let when = time::resolve(&time)?;
+    let guests = attendees::new_list(&draft.guests).map_err(InsertError::Guest)?;
     let mut body = Map::new();
     for (key, text) in [
         ("summary", &draft.summary),
@@ -163,6 +174,27 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
     }
     if let Some(line) = rule {
         body.insert("recurrence".into(), Value::from(vec![line]));
+    }
+    if !guests.is_empty() {
+        body.insert("attendees".into(), Value::from(guests));
+    }
+    for (key, default, new) in [
+        ("guestsCanModify", false, draft.guests_can_modify),
+        (
+            "guestsCanInviteOthers",
+            true,
+            draft.guests_can_invite_others,
+        ),
+        (
+            "guestsCanSeeOtherGuests",
+            true,
+            draft.guests_can_see_other_guests,
+        ),
+    ] {
+        // Google's own default goes unsaid, as a save leaves an unchanged one.
+        if let Some(new) = new.filter(|new| *new != default) {
+            body.insert(key.into(), Value::Bool(new));
+        }
     }
     Ok(body)
 }
@@ -527,7 +559,9 @@ pub(crate) fn when_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
 mod tests {
     use super::*;
     use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
-    use crate::calendar_write::dto::{GuestOp, GuestState, ShowAs, TimeDraft, Visibility};
+    use crate::calendar_write::dto::{
+        GuestOp, GuestState, NewGuest, ShowAs, TimeDraft, Visibility,
+    };
     use serde_json::json;
 
     fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
@@ -945,6 +979,10 @@ mod tests {
             show_as: Some(ShowAs::Free),
             visibility: Some(Visibility::Private),
             recurrence: None,
+            guests: Vec::new(),
+            guests_can_modify: None,
+            guests_can_invite_others: None,
+            guests_can_see_other_guests: None,
         }
     }
 
@@ -966,22 +1004,32 @@ mod tests {
         }
     }
 
-    /// Every field a create may send, the rule included, and nothing else.
+    /// Every field a create may send, the rule and the guests included (C11, C12d), and nothing
+    /// else.
     #[test]
     fn insert_body_sends_only_what_a_create_may() {
-        let body = insert_body(&repeating(
-            timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
-            weekly_on(&[DayCode::Mon]),
-            RepeatEnds::After { count: 10 },
-        ))
+        let body = insert_body(&NewEventDraft {
+            guests: vec![NewGuest {
+                email: "b@example.org".into(),
+                optional: false,
+            }],
+            guests_can_modify: Some(true),
+            ..repeating(
+                timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
+                weekly_on(&[DayCode::Mon]),
+                RepeatEnds::After { count: 10 },
+            )
+        })
         .unwrap();
         let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
             [
+                "attendees",
                 "description",
                 "end",
+                "guestsCanModify",
                 "location",
                 "recurrence",
                 "start",
@@ -1000,7 +1048,8 @@ mod tests {
             json!(["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10"])
         );
         assert!(!body.contains_key("id"), "the insert request writes the id");
-        // No rule, no `recurrence` at all.
+        // No rule, no `recurrence` at all; no guests, no `attendees`, and Google's own permissions
+        // unsaid.
         let once = insert_body(&new_event(timed(
             "2026-10-26",
             "10:00",
@@ -1008,13 +1057,22 @@ mod tests {
             "11:00",
         )))
         .unwrap();
-        assert!(!once.contains_key("recurrence"));
+        for absent in [
+            "recurrence",
+            "attendees",
+            "guestsCanModify",
+            "guestsCanInviteOthers",
+            "guestsCanSeeOtherGuests",
+        ] {
+            assert!(!once.contains_key(absent), "{absent}");
+        }
     }
 
-    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4): a create still sends a save's
-    /// fields as they were before guests, and the rule, exactly; C12d adds the guests' four.
+    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4) and widened by C12d on purpose:
+    /// a create sends a save's fields before guests, the rule, then the guests' four, exactly; so it
+    /// may send whatever a save that makes a one-off repeat may.
     #[test]
-    fn creatable_is_the_c11_list_with_no_guests() {
+    fn creatable_is_the_c11_list_and_the_guests() {
         assert_eq!(
             CREATABLE,
             [
@@ -1025,22 +1083,101 @@ mod tests {
                 "end",
                 "transparency",
                 "visibility",
-                "recurrence"
+                "recurrence",
+                "attendees",
+                "guestsCanModify",
+                "guestsCanInviteOthers",
+                "guestsCanSeeOtherGuests"
             ]
         );
-        let guests = [
-            "attendees",
+        let mut creatable = CREATABLE.to_vec();
+        let mut repeat = REPEAT_PATCHABLE.to_vec();
+        creatable.sort_unstable();
+        repeat.sort_unstable();
+        assert_eq!(creatable, repeat);
+    }
+
+    fn guest(email: &str, optional: bool) -> NewGuest {
+        NewGuest {
+            email: email.into(),
+            optional,
+        }
+    }
+
+    /// C12d: a new event's guests go as new entries in the order added, `optional` only where it's
+    /// so; nothing of a reply, a name or Google's own keys, which only Google writes.
+    #[test]
+    fn insert_body_sends_guests_as_new_entries() {
+        let body = insert_body(&NewEventDraft {
+            guests: vec![
+                guest("b@example.org", false),
+                guest(" a@example.org ", true),
+            ],
+            ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+        })
+        .unwrap();
+        assert!(
+            body["attendees"]
+                == json!([
+                    { "email": "b@example.org" },
+                    { "email": "a@example.org", "optional": true }
+                ]),
+            "both guests, trimmed and in order"
+        );
+    }
+
+    /// An address that isn't one, or one listed twice, builds nothing, in words naming no address.
+    #[test]
+    fn insert_body_refuses_a_guest_google_would() {
+        let with = |guests: Vec<NewGuest>| {
+            insert_body(&NewEventDraft {
+                guests,
+                ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+            })
+        };
+        let not_one = with(vec![guest("bob at example", false)]);
+        assert!(not_one == Err(InsertError::Guest(attendees::GuestError::NotAnAddress)));
+        assert_eq!(
+            InsertError::Guest(attendees::GuestError::NotAnAddress).to_string(),
+            "One of the guests isn't an email address."
+        );
+        let twice = with(vec![
+            guest("b@example.org", false),
+            guest("B@Example.org", true),
+        ]);
+        assert!(twice == Err(InsertError::Guest(attendees::GuestError::Repeated)));
+    }
+
+    /// Each guest permission goes only where it isn't Google's default (C12 §3.2): guests may
+    /// invite others and see the list, not change the event.
+    #[test]
+    fn a_creates_guest_permissions_go_only_where_they_arent_googles() {
+        let with = |modify, invite, see| {
+            insert_body(&NewEventDraft {
+                guests_can_modify: modify,
+                guests_can_invite_others: invite,
+                guests_can_see_other_guests: see,
+                ..new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"))
+            })
+            .unwrap()
+        };
+        let googles = with(Some(false), Some(true), Some(true));
+        for key in [
             "guestsCanModify",
             "guestsCanInviteOthers",
             "guestsCanSeeOtherGuests",
-        ];
-        let before_guests: Vec<&str> = PATCHABLE
-            .iter()
-            .copied()
-            .filter(|k| !guests.contains(k))
-            .chain(["recurrence"])
-            .collect();
-        assert_eq!(CREATABLE, before_guests.as_slice());
+        ] {
+            assert!(!googles.contains_key(key), "{key}");
+        }
+        let changed = with(Some(true), Some(false), Some(false));
+        assert_eq!(changed["guestsCanModify"], true);
+        assert_eq!(changed["guestsCanInviteOthers"], false);
+        assert_eq!(changed["guestsCanSeeOtherGuests"], false);
+        let one = with(None, Some(false), None);
+        assert_eq!(one["guestsCanInviteOthers"], false);
+        assert!(
+            !one.contains_key("guestsCanModify") && !one.contains_key("guestsCanSeeOtherGuests")
+        );
     }
 
     /// A one-off made to repeat may send whatever a save may, and the rule (C11 §10): guests changed

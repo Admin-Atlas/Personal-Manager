@@ -1635,8 +1635,14 @@ export interface GuestForEdit {
 /** A change to how an event repeats: a rule from the editor's set, or "Does not repeat". */
 export type RepeatDraft = { kind: "rule"; rule: RepeatRule } | { kind: "once" };
 
+/** A guest on a new event: who, and whether they're optional. */
+export interface NewGuest {
+  email: string;
+  optional: boolean;
+}
+
 /** A new event, for creating an event: every field as the editor holds it (empty text is left out
- *  of what goes to Google). No guests, reminders or colour yet. */
+ *  of what goes to Google). No reminders or colour yet. */
 export interface NewEventDraft {
   summary: string;
   time: TimeDraft;
@@ -1647,6 +1653,13 @@ export interface NewEventDraft {
   /** How it repeats; null doesn't repeat. The backend starts it on the first day the rule makes
    *  (the repeat menu's words say which) and moves the end with it. */
   recurrence: RepeatRule | null;
+  /** Who it invites, in the order added: each gets an invitation if the user chooses Send. */
+  guests: NewGuest[];
+  /** What guests may do, only where it isn't Google's own (they may invite others and see the
+   *  list, not change the event): left out, Google's applies. */
+  guests_can_modify?: boolean;
+  guests_can_invite_others?: boolean;
+  guests_can_see_other_guests?: boolean;
 }
 
 // --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---

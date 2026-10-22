@@ -206,9 +206,17 @@ pub enum RepeatDraft {
     Once,
 }
 
+/// A guest on a new event (C12d): who, and whether they're optional.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewGuest {
+    pub email: String,
+    #[serde(default)]
+    pub optional: bool,
+}
+
 /// A new event as the editor holds it (A22: defined with its first caller, the create command). No
-/// guests (C12), reminders or colour (C13): Google gives the calendar's default reminders when none
-/// are sent. Empty text is left out of the insert, never sent as "".
+/// reminders or colour (C13): Google gives the calendar's default reminders when none are sent.
+/// Empty text is left out of the insert, never sent as "".
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewEventDraft {
     #[serde(default)]
@@ -229,6 +237,17 @@ pub struct NewEventDraft {
     /// ([`crate::calendar_recur::expand::sync_start`]), its end moved with it (C11).
     #[serde(default)]
     pub recurrence: Option<RepeatRule>,
+    /// Who it invites, in the order added (C12d): each gets an invitation if the user chooses Send.
+    #[serde(default)]
+    pub guests: Vec<NewGuest>,
+    /// Google's `guestsCanModify`, `guestsCanInviteOthers` and `guestsCanSeeOtherGuests`: `None`, or
+    /// Google's own default, isn't sent.
+    #[serde(default)]
+    pub guests_can_modify: Option<bool>,
+    #[serde(default)]
+    pub guests_can_invite_others: Option<bool>,
+    #[serde(default)]
+    pub guests_can_see_other_guests: Option<bool>,
 }
 
 /// What the user saw of an event when they chose to delete it, taken from the mirror row they
@@ -1144,6 +1163,36 @@ mod tests {
             .recurrence
             .is_some_and(|rule| rule.interval == 1 && rule.to_spec().is_ok()));
 
+        // C12d: guests in the order added, optional only when it says so, and the permissions.
+        let invited: NewEventDraft = serde_json::from_str(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"},
+                "guests":[{"email":"b@example.org","optional":true},{"email":"a@example.org"}],
+                "guests_can_modify":true,"guests_can_invite_others":null}"#,
+        )
+        .unwrap();
+        assert!(
+            invited.guests
+                == [
+                    NewGuest {
+                        email: "b@example.org".into(),
+                        optional: true,
+                    },
+                    NewGuest {
+                        email: "a@example.org".into(),
+                        optional: false,
+                    },
+                ],
+            "both guests, in order, the second required"
+        );
+        assert_eq!(invited.guests_can_modify, Some(true));
+        assert_eq!(invited.guests_can_invite_others, None);
+        assert_eq!(invited.guests_can_see_other_guests, None);
+        let nameless = serde_json::from_str::<NewEventDraft>(
+            r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"},
+                "guests":[{"optional":true}]}"#,
+        );
+        assert!(nameless.is_err(), "a guest without an address is refused");
+
         let bare: NewEventDraft = serde_json::from_str(
             r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"}}"#,
         )
@@ -1151,8 +1200,17 @@ mod tests {
         assert!(bare.summary.is_empty() && bare.location.is_empty());
         assert!(bare.description.is_empty());
         assert_eq!((bare.show_as, bare.visibility), (None, None));
-        // Left out or null, it doesn't repeat.
+        // Left out or null, it doesn't repeat; left out, it has no guests and Google's permissions.
         assert!(bare.recurrence.is_none());
+        assert!(bare.guests.is_empty());
+        assert_eq!(
+            (
+                bare.guests_can_modify,
+                bare.guests_can_invite_others,
+                bare.guests_can_see_other_guests
+            ),
+            (None, None, None)
+        );
         let null: NewEventDraft = serde_json::from_str(
             r#"{"time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"},
                 "recurrence":null}"#,

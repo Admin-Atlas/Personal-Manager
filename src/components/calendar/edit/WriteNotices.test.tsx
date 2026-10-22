@@ -167,6 +167,7 @@ describe("WriteNotices", () => {
             show_as: "free",
             visibility: "default",
             recurrence: null,
+            guests: [],
           },
         },
       },

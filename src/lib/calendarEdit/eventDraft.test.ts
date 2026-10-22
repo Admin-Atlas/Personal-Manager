@@ -621,8 +621,31 @@ describe("guests in the draft", () => {
     expect(seed.guest_perms).toEqual({ modify: false, invite_others: true, see_others: true });
     expect(NEW_EVENT_BASE.guest_perms).toEqual(seed.guest_perms);
     expect(changedFields(NEW_EVENT_BASE, seed)).not.toContain("guest_perms");
-    // A create doesn't send guests yet (C12d).
-    expect(Object.keys(toNewEvent(seed))).not.toContain("guests");
+    // A create sends its guest list, empty, and none of Google's own permissions (C12d).
+    const sent = toNewEvent(seed);
+    expect(sent.guests).toEqual([]);
+    expect(Object.keys(sent).filter((k) => k.startsWith("guests_"))).toEqual([]);
+  });
+
+  it("toNewEvent sends guests and only permissions Google doesn't default", () => {
+    const B = guest("B@x.org", { optional: true });
+    const draft: EditorFields = {
+      ...NEW_EVENT_BASE,
+      time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
+      // An entry Google marks as the organiser's or the calendar's own is only Google's to write.
+      guests: [A, ME, B],
+      guest_perms: { modify: true, invite_others: true, see_others: false },
+    };
+    const sent = toNewEvent(draft);
+    expect(sent.guests).toEqual([
+      { email: "A@x.org", optional: false },
+      { email: "B@x.org", optional: true },
+    ]);
+    expect(sent.guests_can_modify).toBe(true);
+    expect(sent.guests_can_see_other_guests).toBe(false);
+    expect("guests_can_invite_others" in sent).toBe(false);
+    // Who and whether optional only: never a name or a reply, which only Google writes.
+    expect(Object.keys(sent.guests[0]).sort()).toEqual(["email", "optional"]);
   });
 
   it("asks before a round trip only when the save would email someone", () => {
@@ -866,9 +889,11 @@ describe("a new event's starting fields", () => {
       show_as: "free",
       visibility: "private",
       recurrence: null,
+      guests: [],
     });
     // A copy: a later edit to the draft can't change what was sent.
     expect(sent.time).not.toBe(draft.time);
+    expect(sent.guests).not.toBe(draft.guests);
   });
 
   // --- repeating (C11) ---

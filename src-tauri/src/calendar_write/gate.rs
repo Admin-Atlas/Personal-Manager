@@ -89,7 +89,7 @@ pub fn edit_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
 }
 
 /// Why PM may not create an event with `visibility` on a calendar, or `None` when it may: the account
-/// and calendar rules of [`edit_rights`], for an event that would be a solo one-off you organise.
+/// and calendar rules of [`edit_rights`], for a new event you organise, with guests or none (C12d).
 /// Q1: a `writerWithoutPrivateAccess` calendar takes every event but a private one. `google` holds
 /// already: the caller resolved the calendar, and a feed or an Outlook calendar never gets here.
 pub fn create_block(
