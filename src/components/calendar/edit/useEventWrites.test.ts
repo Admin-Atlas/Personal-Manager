@@ -106,6 +106,7 @@ const GUESTS: GuestNotice = {
   updated: 1,
   invited: 0,
   removed: 0,
+  told_cancelled: 0,
   cancelled: false,
   people: 1,
   emails: 1,

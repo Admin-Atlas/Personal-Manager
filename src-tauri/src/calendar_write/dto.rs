@@ -155,6 +155,9 @@ pub struct GuestNotice {
     pub invited: u32,
     /// Guests the change takes off: each is told.
     pub removed: u32,
+    /// Guests on an occurrence the change cancels and on nothing else it writes: each is told that
+    /// occurrence is cancelled, not of an update. Never among `updated`; none when `cancelled`.
+    pub told_cancelled: u32,
     /// The change deletes it (or every occurrence it reaches): `updated` are told it's cancelled.
     pub cancelled: bool,
     /// Different guests who'd hear, every write together.
@@ -769,7 +772,7 @@ mod tests {
                     complete: true,
                     ..Default::default()
                 }),
-                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":2,"invited":0,"removed":0,"cancelled":false,"people":2,"emails":2,"complete":true}}"#,
+                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":2,"invited":0,"removed":0,"told_cancelled":0,"cancelled":false,"people":2,"emails":2,"complete":true}}"#,
             ),
             (
                 WriteOutcome::needs_notify_again(GuestNotice {
@@ -778,7 +781,7 @@ mod tests {
                     emails: 1,
                     ..Default::default()
                 }),
-                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":0,"invited":1,"removed":0,"cancelled":false,"people":1,"emails":1,"complete":false},"again":true}"#,
+                r#"{"outcome":"needs_choice","scope":false,"guests":{"updated":0,"invited":1,"removed":0,"told_cancelled":0,"cancelled":false,"people":1,"emails":1,"complete":false},"again":true}"#,
             ),
             (
                 WriteOutcome::IgnoredByGoogle { split: false },
@@ -1038,7 +1041,7 @@ mod tests {
                 }),
             })
             .unwrap(),
-            r#"{"row":"offered","warnings":[],"token":"t","guests":{"updated":0,"invited":1,"removed":0,"cancelled":false,"people":1,"emails":1,"complete":true}}"#
+            r#"{"row":"offered","warnings":[],"token":"t","guests":{"updated":0,"invited":1,"removed":0,"told_cancelled":0,"cancelled":false,"people":1,"emails":1,"complete":true}}"#
         );
         for (text, action) in [
             (r#""remove""#, SplitAction::Remove),
@@ -1253,7 +1256,7 @@ mod tests {
         };
         assert!(asked.answered_by(&asked));
         let read: GuestNotice = serde_json::from_str(
-            r#"{"updated":1,"invited":0,"removed":0,"cancelled":false,"people":1,"emails":1,
+            r#"{"updated":1,"invited":0,"removed":0,"told_cancelled":0,"cancelled":false,"people":1,"emails":1,
                 "complete":true}"#,
         )
         .unwrap();

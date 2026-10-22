@@ -169,6 +169,7 @@ describe("the rows", () => {
       updated: 2,
       invited: 0,
       removed: 0,
+      told_cancelled: 0,
       cancelled: false,
       people: 2,
       emails: 2,

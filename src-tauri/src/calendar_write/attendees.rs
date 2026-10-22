@@ -328,6 +328,9 @@ pub struct Reach {
     reached: BTreeSet<String>,
     /// Who it takes off.
     removed: BTreeSet<String>,
+    /// Who only a delete or a cancel reaches: no other write merged reaches them, so all they hear
+    /// is that an occurrence is cancelled, never an update.
+    only_cancelled: BTreeSet<String>,
     /// Emails it would send: one per guest per event written.
     emails: u32,
     /// PM saw every guest list it counted.
@@ -349,6 +352,7 @@ impl Reach {
             was: BTreeSet::new(),
             reached: BTreeSet::new(),
             removed: BTreeSet::new(),
+            only_cancelled: BTreeSet::new(),
             emails: 0,
             complete: true,
             cancelled: false,
@@ -388,6 +392,7 @@ impl Reach {
             was: before,
             reached,
             removed,
+            only_cancelled: BTreeSet::new(),
             // A personal-only change emails nobody, however much of the list Google sent.
             complete: !cut_short || !shared,
             cancelled: false,
@@ -401,6 +406,7 @@ impl Reach {
         Reach {
             emails: count(everyone.len()),
             reached: everyone.clone(),
+            only_cancelled: everyone.clone(),
             was: everyone,
             removed: BTreeSet::new(),
             complete: !omitted(event),
@@ -417,6 +423,7 @@ impl Reach {
             reached: everyone,
             was: BTreeSet::new(),
             removed: BTreeSet::new(),
+            only_cancelled: BTreeSet::new(),
             complete: true,
             cancelled: false,
             shared: true,
@@ -425,6 +432,15 @@ impl Reach {
 
     /// The two together, as one plan sends them.
     pub fn merge(mut self, other: Reach) -> Reach {
+        // Anyone a write other than a cancel reaches, on either side, hears more than a cancel.
+        let told_more: BTreeSet<String> = self
+            .reached
+            .difference(&self.only_cancelled)
+            .chain(other.reached.difference(&other.only_cancelled))
+            .cloned()
+            .collect();
+        self.only_cancelled.extend(other.only_cancelled);
+        self.only_cancelled.retain(|a| !told_more.contains(a));
         self.was.extend(other.was);
         self.reached.extend(other.reached);
         self.removed.extend(other.removed);
@@ -467,16 +483,27 @@ impl Reach {
             return None;
         }
         let already = |a: &&String| self.was.contains(*a);
+        // When everything it reaches is cancelled, those are among `updated`, told it's cancelled.
+        let only_cancelled = |a: &&String| !self.cancelled && self.only_cancelled.contains(*a);
+        let kept = |a: &&String| !self.removed.contains(*a);
         Some(GuestNotice {
             updated: count(
                 self.reached
                     .iter()
                     .filter(already)
-                    .filter(|a| !self.removed.contains(*a))
+                    .filter(kept)
+                    .filter(|a| !only_cancelled(a))
                     .count(),
             ),
             invited: count(self.reached.iter().filter(|a| !already(a)).count()),
             removed: count(self.removed.len()),
+            told_cancelled: count(
+                self.reached
+                    .iter()
+                    .filter(kept)
+                    .filter(only_cancelled)
+                    .count(),
+            ),
             cancelled: self.cancelled,
             people: count(self.reached.len()),
             emails: self.emails,
@@ -523,6 +550,7 @@ pub fn row_delete_notice(guests: &[Attendee], own: &Own) -> Option<GuestNotice> 
     Reach {
         emails: count(everyone.len()),
         reached: everyone.clone(),
+        only_cancelled: everyone.clone(),
         was: everyone,
         removed: BTreeSet::new(),
         complete: true,
@@ -782,6 +810,7 @@ mod tests {
             updated,
             invited,
             removed,
+            told_cancelled: 0,
             cancelled: false,
             people,
             emails: people,
@@ -963,6 +992,7 @@ mod tests {
                     updated: 2,
                     invited: 1,
                     removed: 0,
+                    told_cancelled: 0,
                     cancelled: false,
                     people: 3,
                     emails: 3 + 2 + 2,
@@ -973,6 +1003,99 @@ mod tests {
         // Without the calendar's own addresses the user would be "new".
         let blind = Reach::of_insert(&new_part, &Own::default());
         assert!(blind.notice().is_some_and(|n| n.invited == 4));
+    }
+
+    /// C12c review round 3: a guest only a cancel reaches, in a plan that also changes something
+    /// else, is told that occurrence is cancelled, never of an update; anyone another write reaches
+    /// hears more than the cancel, whichever side of the merge, in whatever order.
+    #[test]
+    fn a_guest_only_a_cancel_reaches_is_told_of_the_cancel() {
+        let series = event(&[me()]);
+        let own = Own::of(&["cal@x.org"], &[&series]);
+        let until = body(json!({ "recurrence": ["RRULE:FREQ=WEEKLY;UNTIL=20261018"] }));
+        let cut = || Reach::of_patch(&series, &until, &own);
+        let occurrence = event(&[me(), a()]);
+        let cancel = || Reach::of_delete(&occurrence, &own);
+        let told = GuestNotice {
+            told_cancelled: 1,
+            people: 1,
+            emails: 1,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(
+            cut().merge(cancel()).notice() == Some(told.clone()),
+            "cut, then cancel"
+        );
+        assert!(
+            cancel().merge(cut()).notice() == Some(told),
+            "cancel, then cut"
+        );
+        // A write other than the cancel reaches A too: A hears of an update, on either side.
+        let shared = event(&[me(), a()]);
+        let retitle = || Reach::of_patch(&shared, &title(), &own);
+        let update = GuestNotice {
+            updated: 1,
+            people: 1,
+            emails: 2,
+            complete: true,
+            ..Default::default()
+        };
+        for all in [
+            cancel().merge(retitle()),
+            retitle().merge(cancel()),
+            cut().merge(cancel()).merge(retitle()),
+            retitle().merge(cut().merge(cancel())),
+        ] {
+            assert!(all.notice() == Some(update.clone()));
+        }
+        // Two cancels of A, and a guest only the other write reaches: one each.
+        let b_only = event(&[me(), b_guest()]);
+        let both = cancel()
+            .merge(Reach::of_patch(&b_only, &title(), &own))
+            .merge(cancel());
+        assert!(
+            both.notice()
+                == Some(GuestNotice {
+                    updated: 1,
+                    told_cancelled: 1,
+                    people: 2,
+                    emails: 3,
+                    complete: true,
+                    ..Default::default()
+                })
+        );
+        // Taken off as well (left off a new part): counted once, as taken off.
+        let gone = cancel()
+            .merge(Reach::of_insert(
+                &body(json!({ "attendees": [me()] })),
+                &own,
+            ))
+            .taking_off(BTreeSet::from([key("A@x.org")]));
+        assert!(
+            gone.notice()
+                == Some(GuestNotice {
+                    removed: 1,
+                    people: 1,
+                    emails: 1,
+                    complete: true,
+                    ..Default::default()
+                })
+        );
+        // A plain delete, or a delete's plan, keeps its own words: everyone is told it's cancelled.
+        let deleted = GuestNotice {
+            updated: 1,
+            cancelled: true,
+            people: 1,
+            emails: 1,
+            complete: true,
+            ..Default::default()
+        };
+        assert!(cancel().notice() == Some(deleted.clone()), "a plain delete");
+        assert!(
+            cut().merge(cancel()).cancelling(true).notice() == Some(deleted),
+            "a delete's plan"
+        );
     }
 
     /// A user's entry Google hasn't marked `self` (the new part's, as PM sent it) is still the user,

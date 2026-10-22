@@ -1606,11 +1606,14 @@ export interface GuestOp {
 }
 
 /** Who Google would email with Send, in numbers only: never the user, never a room. `people` are
- *  different guests, `emails` one per guest per event written; `complete` false: "at least". */
+ *  different guests, `emails` one per guest per event written; `complete` false: "at least".
+ *  `told_cancelled`: guests on an occurrence the change cancels and on nothing else it writes, told
+ *  that occurrence is cancelled, never among `updated`; none when `cancelled`. */
 export interface GuestNotice {
   updated: number;
   invited: number;
   removed: number;
+  told_cancelled: number;
   cancelled: boolean;
   people: number;
   emails: number;

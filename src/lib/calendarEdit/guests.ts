@@ -357,6 +357,7 @@ export function changeNotice(
     updated: updated.length,
     invited: invited.length,
     removed: removed.length,
+    told_cancelled: 0,
     cancelled: false,
     people,
     emails: people,
@@ -379,6 +380,7 @@ export function deleteNotice(row: CalendarEvent, me: string | null = null): Gues
     updated: told,
     invited: 0,
     removed: 0,
+    told_cancelled: 0,
     cancelled: true,
     people: told,
     emails: told,
@@ -403,7 +405,7 @@ const cancels = (n: GuestNotice, kind: NotifyKind) => n.cancelled || kind === "d
 /** The question, as Google asks it. */
 export function notifyQuestion(n: GuestNotice, kind: NotifyKind): string {
   if (cancels(n, kind)) return "Send cancellation emails to guests?";
-  if (n.invited > 0 && n.updated === 0 && n.removed === 0) {
+  if (n.invited > 0 && n.updated === 0 && n.removed === 0 && n.told_cancelled === 0) {
     return "Send invitation emails to guests?";
   }
   return "Send update emails to guests?";
@@ -415,9 +417,15 @@ export function guestLines(n: GuestNotice, scope: SeriesScope | null, kind: Noti
   const lines: string[] = [];
   const cancelled = cancels(n, kind);
   if (cancelled) {
-    if (n.updated > 0) lines.push(`${guestCount(n.updated)} will be told it's cancelled.`);
-  } else if (n.updated > 0) {
-    lines.push(`${guestCount(n.updated)} already invited will get an update.`);
+    // Everyone a delete reaches hears the same: those only an occurrence's cancel reaches too.
+    const told = n.updated + n.told_cancelled;
+    if (told > 0) lines.push(`${guestCount(told)} will be told it's cancelled.`);
+  } else {
+    if (n.updated > 0) lines.push(`${guestCount(n.updated)} already invited will get an update.`);
+    // On an occurrence the change cancels and nothing else it writes: no update reaches them.
+    if (n.told_cancelled > 0) {
+      lines.push(`${guestCount(n.told_cancelled)} will be told an occurrence is cancelled.`);
+    }
   }
   if (n.invited > 0) lines.push(`${guestCount(n.invited)} new to it will get an invitation.`);
   if (n.removed > 0) {

@@ -3516,7 +3516,8 @@ mod tests {
     /// for it, but asks Send / Don't send first. For every occurrence, a new rule or none, it counts
     /// them as "at least", since PM can't tell whether Google emails that occurrence's guests too
     /// (probe L-R13-4); from one on, a new rule still can't carry its guests onto the new part (Q3),
-    /// and "Does not repeat" cancels that occurrence, its guest counted.
+    /// and "Does not repeat" cancels that occurrence, its guest counted as told of the cancel, never
+    /// of an update: the plan's other writes don't reach them.
     #[test]
     fn a_rule_change_that_reaches_an_occurrence_with_guests_asks_first() {
         let guests = with(
@@ -3540,9 +3541,11 @@ mod tests {
         );
         let stopped = case.edit(Scope::Following, stop()).unwrap();
         assert!(stopped.needs_notify());
-        assert!(stopped
-            .guests
-            .is_some_and(|g| g.updated == 1 && g.people == 1 && g.complete));
+        assert!(stopped.guests.is_some_and(|g| g.updated == 0
+            && g.told_cancelled == 1
+            && !g.cancelled
+            && g.people == 1
+            && g.complete));
     }
 
     /// A formatted description is never saved over as plain text, whatever the rule.
