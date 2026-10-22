@@ -160,6 +160,9 @@ pub struct Master {
     /// The zone its end is written in (a flight can end in another).
     pub end_zone: Tz,
     pub organizer_self: bool,
+    /// Google's `guestsCanModify` (absent = false): on someone else's series, whether its shared
+    /// fields may change from a guest's copy (C14).
+    pub guests_can_modify: bool,
     pub event_type: Option<String>,
     pub locked: bool,
 }
@@ -225,23 +228,25 @@ impl Master {
                 .and_then(|o| o.get("self"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            guests_can_modify: it
+                .get("guestsCanModify")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             event_type: text("eventType"),
             locked: it.get("locked").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
     /// Why nothing about the series may change, from its own facts. The calendar's role and the
-    /// account's editing switch are the command layer's (gate.rs); a master can also be an invitation
-    /// or a special kind of event, which the gate reads from the occurrence. Its guests are the
-    /// planners' to count, for the Send / Don't send choice (C12). A lock isn't here: it closes only
-    /// some fields, so the planners refuse what it closes (`plan::locks`), and a locked series'
-    /// notifications and colour still change (C13 critique C1-M1).
+    /// account's editing switch are the command layer's (gate.rs); a master can also be a special
+    /// kind of event, which the gate reads from the occurrence. Its guests are the planners' to
+    /// count, for the Send / Don't send choice (C12). A lock isn't here: it closes only some fields,
+    /// so the planners refuse what it closes (`plan::locks`), and a locked series' notifications and
+    /// colour still change (C13 critique C1-M1). Nor is someone else's series: an invitation's rules
+    /// are the planners' (`plan::invitation_check`), so a refused row says its own words (C14).
     pub fn read_only(&self) -> Option<ReadOnlyReason> {
         if !matches!(self.event_type.as_deref(), None | Some("default")) {
             return Some(ReadOnlyReason::SpecialType);
-        }
-        if !self.organizer_self {
-            return Some(ReadOnlyReason::NotOrganizer);
         }
         None
     }
@@ -643,6 +648,12 @@ pub enum SeriesRefusal {
     GuestPermissionsAreSeriesWide,
     /// The draft's notifications or colour can't go onto the copy they're for (C13).
     Draft(PatchError),
+    /// "This and following" on someone else's repeating event: it would make a new event on the
+    /// user's calendar, apart from the invitation (C14 §0.4 item 8).
+    InvitationFollowing,
+    /// A new rule, or a move of every occurrence, on someone else's repeating event: re-ruling the
+    /// user's copy would leave it apart from the organiser's event (C14 §0.5 row 5).
+    InvitationRule,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -797,6 +808,16 @@ impl fmt::Display for SeriesRefusal {
                  change for this one only."
             ),
             SeriesRefusal::Draft(e) => e.fmt(f),
+            SeriesRefusal::InvitationFollowing => write!(
+                f,
+                "Someone else organises this repeating event, so PM can change this occurrence or \
+                 all of them, not this one and the ones after it."
+            ),
+            SeriesRefusal::InvitationRule => write!(
+                f,
+                "Someone else organises this repeating event, so only they can change how it \
+                 repeats or move all of it. You can move this occurrence."
+            ),
         }
     }
 }
@@ -1382,7 +1403,19 @@ mod tests {
             "organizer",
             json!({ "email": "boss@example.com" }),
         ));
-        assert_eq!(theirs.read_only(), Some(ReadOnlyReason::NotOrganizer));
+        // Someone else's series is the planners' to judge, field by field (C14's allow-list).
+        assert!(!theirs.organizer_self && !theirs.guests_can_modify);
+        assert_eq!(theirs.read_only(), None);
+        let modifiable = read(with(
+            with(
+                master(&["RRULE:FREQ=DAILY"]),
+                "organizer",
+                json!({ "email": "boss@example.com" }),
+            ),
+            "guestsCanModify",
+            json!(true),
+        ));
+        assert!(modifiable.guests_can_modify);
         let focus = read(with(
             master(&["RRULE:FREQ=DAILY"]),
             "eventType",

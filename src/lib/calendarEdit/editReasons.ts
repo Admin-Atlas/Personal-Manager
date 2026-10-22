@@ -27,6 +27,25 @@ function unreachable(value: never): never {
 
 const NOT_ORGANISER = "Someone else organises this event.";
 
+/** What stays the organiser's on an event they haven't let guests change (C14c). */
+const THEIRS =
+  "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+
+/** What the user may change on someone else's event: their reply only where its calendar is on the
+ *  guest list (C14 critique C2-L1). */
+const ownSettings = (canReply: boolean) =>
+  canReply
+    ? "Your reply, notifications, colour and busy or free are yours to change."
+    : "Your notifications, colour and busy or free are yours to change.";
+
+/** Under an event someone else organises who lets guests change it (A11): a paraphrase of Google's
+ *  developer guide ("only reflected on their own copy and might be lost if the organizer makes a
+ *  change"). Live test L-I3 records whether Google keeps a guest's change on their copy alone, as
+ *  the guide says, or shows it to everyone, as Workspace help reads; the wording follows it (C14
+ *  critiques C1-L10, C2-M5). */
+export const A11_NOTE =
+  "The organiser lets guests change this event. Your changes show on your copy, and may be lost if the organiser changes the event.";
+
 /** Why PM won't change an event, or a part of it. */
 export function reasonText(reason: ReadOnlyReason): string {
   switch (reason) {
@@ -38,11 +57,16 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This calendar is shared with you to view only, so its events can't be changed here.";
     case "private_event":
       return "This is a private event on a calendar shared with you, and you can't change private events there.";
-    // A reply follows the guest list, not who organises the event (C14 critiques C1-L10, C2-L1).
+    // Never promises a reply: the calendar may not be on the guest list (C14 critiques C1-L10,
+    // C2-L1). Where PM knows it is, `notOrganizerText` says so.
     case "not_organizer":
-      return `${NOT_ORGANISER} You can reply, and change only your own settings.`;
+      return `${THEIRS} ${ownSettings(false)}`;
+    // Group invitations list the group, not the user, so there's no entry of theirs to answer from
+    // (C14 critique C2-M8).
     case "not_invited":
-      return "This calendar isn't on the event's guest list, so there's no reply to send from it.";
+      return "PM can only reply where this calendar is on the guest list itself (not through a group).";
+    case "organizer_only_guests":
+      return "In PM, only the organiser can change who's invited.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
@@ -60,16 +84,24 @@ export function reasonText(reason: ReadOnlyReason): string {
   }
 }
 
-/** The popover's line under an event someone else organises (C14 critiques C1-L10, C2-L1, C2-L10):
- *  what the user may still do from this copy. `canReply`: its calendar is on the guest list;
- *  `editingOn`: its account has editing on, without which nothing is sent, a reply included. */
+/** The line under an event someone else organises, in the popover and the editor (C14 critiques
+ *  C1-L10, C2-L1, C2-L10): what the user may still do from this copy. `canReply`: its calendar is on
+ *  the guest list; `editingOn`: its account has editing on, without which nothing is sent, a reply
+ *  included. Where the organiser lets guests change the event, `A11_NOTE` says it instead. */
 export function notOrganizerText(canReply: boolean, editingOn: boolean): string {
   if (!editingOn) {
-    const what = canReply ? "reply" : "change your own settings";
+    const what = canReply ? "reply and change your own settings" : "change your own settings";
     return `${NOT_ORGANISER} Turn on editing for this account to ${what} from PM.`;
   }
-  if (canReply) return reasonText("not_organizer");
-  return `${NOT_ORGANISER} You can change only your own settings.`;
+  return `${THEIRS} ${ownSettings(canReply)}`;
+}
+
+/** Under the Repeat row of an event someone else organises: how it repeats stays theirs, whatever
+ *  they let guests change (C14 critiques C1-H2, C2-H2; the backend's `InvitationRule`). */
+export function repeatTheirsText(repeating: boolean): string {
+  return repeating
+    ? "Someone else organises this repeating event, so only they can change how it repeats."
+    : "Someone else organises this event, so only they can make it repeat.";
 }
 
 /** A field's name in a sentence. */

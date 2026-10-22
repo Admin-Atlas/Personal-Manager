@@ -367,11 +367,15 @@ pub enum ReadOnlyReason {
     CalendarReadOnly,
     /// You can edit this shared calendar's events except private ones, and this one is private.
     PrivateEvent,
-    /// Someone else organises it: an invitation.
+    /// Someone else organises it and hasn't let guests change it: its shared fields stay theirs
+    /// (C14).
     NotOrganizer,
     /// The calendar this copy is on has no entry on the event's guest list, so it has no reply to
     /// send (C14).
     NotInvited,
+    /// The guest list of someone else's event stays the organiser's, even where they let guests
+    /// change the rest (C14).
+    OrganizerOnlyGuests,
     /// A one-off in PM that has since become a repeating event in Google: open one of its occurrences.
     BecameRepeating,
     /// A birthday, a Gmail event, focus time, out of office or a working location.
@@ -394,6 +398,9 @@ pub enum ReadOnlyReason {
 pub struct FieldPermissions {
     pub summary: bool,
     pub time: bool,
+    /// How it repeats: closed with the time (Google locks the rule with the start), and on every
+    /// event someone else organises, whatever they let guests change (C14 critiques C1-H2, C2-H2).
+    pub repeat: bool,
     pub location: bool,
     pub description: bool,
     pub show_as: bool,
@@ -424,6 +431,7 @@ impl FieldPermissions {
     pub fn any(&self) -> bool {
         self.summary
             || self.time
+            || self.repeat
             || self.location
             || self.description
             || self.show_as
@@ -896,6 +904,11 @@ mod tests {
             (
                 ReadOnlyReason::NotInvited,
                 r#"{"outcome":"read_only","reason":"not_invited"}"#,
+            ),
+            // C14c: the guest list of someone else's event stays the organiser's.
+            (
+                ReadOnlyReason::OrganizerOnlyGuests,
+                r#"{"outcome":"read_only","reason":"organizer_only_guests"}"#,
             ),
         ] {
             assert_eq!(
@@ -1403,6 +1416,11 @@ mod tests {
                 colour: true,
                 ..Default::default()
             },
+            // How it repeats, alone (C14 critique C1-H2: its own right now, not the time's).
+            FieldPermissions {
+                repeat: true,
+                ..Default::default()
+            },
         ] {
             assert!(one.any());
         }
@@ -1413,6 +1431,19 @@ mod tests {
         };
         assert!(!reply.any());
         assert!(!FieldPermissions::none(ReadOnlyReason::NotOrganizer).respond);
+    }
+
+    /// C14c: the editor's Repeat row reads its own right by this name (`canEdit`'s `repeat`); under
+    /// any other the row would stay off on every event.
+    #[test]
+    fn the_repeat_right_goes_to_the_editor_by_its_name() {
+        let open = FieldPermissions {
+            repeat: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&open).unwrap();
+        assert_eq!(json["repeat"], serde_json::json!(true));
+        assert_eq!(json["time"], serde_json::json!(false));
     }
 
     /// C14: the reply control's three words, and its two scopes; "no reply yet", Google's own words

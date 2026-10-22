@@ -296,6 +296,7 @@ fn facts_from_fresh<'a>(
             .and_then(|o| o.get("self"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        guests_can_modify: patch::bool_of(fresh.get("guestsCanModify"), false),
         locked: fresh
             .get("locked")
             .and_then(Value::as_bool)
@@ -326,6 +327,8 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         access_role: calendar.facts.access_role.as_deref(),
         event_type: row.event_type.as_deref(),
         organizer_self: row.organizer_self,
+        // Mirrored since v57, absent read as false as Google documents.
+        guests_can_modify: row.guests_can_modify,
         locked: row.locked,
         visibility: row.visibility.as_deref(),
         // The mirror never holds a series itself (`calendar::parse_event`). An occurrence is
@@ -532,50 +535,39 @@ fn guest_for_edit(entry: &Value) -> Option<GuestForEdit> {
     })
 }
 
-/// The reason to give when a draft touches a field the gate closed: the first, or for a draft whose
-/// only closed fields are its notifications or colour, the one that closed them (a label holds the
-/// colour, a notification PM can't read holds the list; C13 critique C1-L1), never a lock or a
-/// formatted description that has nothing to do with them.
+/// The reason to give when a draft touches a field the gate closed: the first closed field's own
+/// ([`gate::reason_for`]). The guest list is looked at first, so under "modify" a guest change says
+/// the guest list is the organiser's (C14 §9.1); notifications and colour last, so their own
+/// reasons (a label, a notification PM can't read; C13 critique C1-L1) are given only when nothing
+/// else the draft touches is closed.
 fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<ReadOnlyReason> {
-    let touched_closed = (draft.summary.is_some() && !perms.summary)
-        || (draft.time.is_some() && !perms.time)
-        || (draft.location.is_some() && !perms.location)
-        || (draft.description.is_some() && !perms.description)
-        || (draft.show_as.is_some() && !perms.show_as)
-        || (draft.visibility.is_some() && !perms.visibility)
-        // How it repeats moves its times, so it takes the time's permission (C11).
-        || (draft.recurrence.is_some() && !perms.time)
+    use gate::Field;
+    [
         // The guest list and what guests may do (C12).
-        || (draft.touches_guests() && !perms.guests);
-    let first = || {
-        perms
-            .reasons
-            .first()
-            .copied()
-            .unwrap_or(ReadOnlyReason::CalendarReadOnly)
-    };
-    if touched_closed {
-        return Some(first());
-    }
-    let own = |closed: bool, reason: ReadOnlyReason| {
-        closed.then(|| {
-            if perms.reasons.contains(&reason) {
-                reason
-            } else {
-                first()
-            }
-        })
-    };
-    own(
-        draft.colour.is_some() && !perms.colour,
-        ReadOnlyReason::LabelReadOnly,
-    )
-    .or_else(|| {
-        own(
+        (draft.touches_guests() && !perms.guests, Field::Guests),
+        (draft.summary.is_some() && !perms.summary, Field::Summary),
+        (draft.time.is_some() && !perms.time, Field::Time),
+        // How it repeats: closed with the time, and on someone else's event (C14 critique C1-H2).
+        (draft.recurrence.is_some() && !perms.repeat, Field::Repeat),
+        (draft.location.is_some() && !perms.location, Field::Location),
+        (
+            draft.description.is_some() && !perms.description,
+            Field::Description,
+        ),
+        (draft.show_as.is_some() && !perms.show_as, Field::ShowAs),
+        (
+            draft.visibility.is_some() && !perms.visibility,
+            Field::Visibility,
+        ),
+        (draft.colour.is_some() && !perms.colour, Field::Colour),
+        (
             draft.reminders.is_some() && !perms.reminders,
-            ReadOnlyReason::RemindersUnreadable,
-        )
-    })
+            Field::Reminders,
+        ),
+    ]
+    .into_iter()
+    .find(|(closed, _)| *closed)
+    .map(|(_, field)| gate::reason_for(perms, field))
 }
 
 /// Move an editor's base onto Google's copy after a save, for the fields the save sent and no
@@ -2308,11 +2300,7 @@ async fn send_delete<W: Wire, H: Host>(
         let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
         if !perms.delete {
             return WriteOutcome::ReadOnly {
-                reason: perms
-                    .reasons
-                    .first()
-                    .copied()
-                    .unwrap_or(ReadOnlyReason::CalendarReadOnly),
+                reason: gate::reason_for(&perms, gate::Field::Delete),
             };
         }
         // An occurrence of a repeating event: which occurrences is the user's choice, never a
@@ -3583,13 +3571,9 @@ async fn prepare_change<W: Wire>(
     let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
     let closed = match request {
         ChoiceRequest::Edit { draft, .. } => refused_field(&perms, draft),
-        ChoiceRequest::Delete { .. } => (!perms.delete).then(|| {
-            perms
-                .reasons
-                .first()
-                .copied()
-                .unwrap_or(ReadOnlyReason::CalendarReadOnly)
-        }),
+        ChoiceRequest::Delete { .. } => {
+            (!perms.delete).then(|| gate::reason_for(&perms, gate::Field::Delete))
+        }
     };
     if let Some(reason) = closed {
         return refused(WriteOutcome::ReadOnly { reason });
@@ -7126,11 +7110,19 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
             "This is a private event on a calendar shared with you, and you can't change private \
              events there."
         }
+        // Never promises a reply: the calendar may not be on the guest list (C14 critique C2-L1).
         ReadOnlyReason::NotOrganizer => {
-            "Someone else organises this event. You can reply, and change only your own settings."
+            "Someone else organises this event, so only they can change its title, time, place, \
+             description, visibility and guests. Your notifications, colour and busy or free are \
+             yours to change."
         }
+        // A group invitation lists the group, not this calendar (C14 critique C2-M8).
         ReadOnlyReason::NotInvited => {
-            "This calendar isn't on the event's guest list, so there's no reply to send from it."
+            "PM can only reply where this calendar is on the guest list itself (not through a \
+             group)."
+        }
+        ReadOnlyReason::OrganizerOnlyGuests => {
+            "In PM, only the organiser can change who's invited."
         }
         ReadOnlyReason::BecameRepeating => {
             "This became a repeating event in Google. Refresh, then open one of its occurrences."
@@ -7956,11 +7948,14 @@ mod tests {
         let f = facts_from_fresh(&invite, &facts, EditingStatus::On);
         assert!(!f.organizer_self && !f.series_master);
         assert!(f.invited);
-        assert_eq!(
-            gate::list_rights(&f).edit_block,
-            Some(ReadOnlyReason::NotOrganizer)
-        );
+        // Absent, Google's `guestsCanModify` is false.
+        assert!(!f.guests_can_modify);
+        // C14c: an invitation's own settings are editable, so nothing blocks the editor.
+        assert_eq!(gate::list_rights(&f).edit_block, None);
         assert!(gate::list_rights(&f).can_respond && !gate::list_rights(&f).can_delete);
+        let mut modifiable = invite.clone();
+        modifiable["guestsCanModify"] = json!(true);
+        assert!(facts_from_fresh(&modifiable, &facts, EditingStatus::On).guests_can_modify);
         // An occurrence, a one-off, and a one-off Google has since given a rule: only the last is a
         // series itself, with its own reason (C9 design critique 2 M6).
         let mine = || json!({ "organizer": { "self": true }, "eventType": "default" });
@@ -7985,6 +7980,7 @@ mod tests {
         let open = FieldPermissions {
             summary: true,
             time: true,
+            repeat: true,
             location: true,
             description: true,
             show_as: true,
@@ -8134,6 +8130,7 @@ mod tests {
             access_role: Some("owner"),
             event_type: None,
             organizer_self: true,
+            guests_can_modify: false,
             locked: true,
             visibility: None,
             series_master: false,
@@ -8152,14 +8149,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(refused_field(&locked, &busy), None);
-        // How it repeats moves its times: a locked time locks it too (C11).
+        // How it repeats moves its times: a locked time locks it too (C11). It has its own right
+        // since C14 (critique C1-H2), so an open time alone doesn't open it.
         let stop = EventPatchDraft {
             recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
             ..Default::default()
         };
         assert_eq!(refused_field(&locked, &stop), Some(ReadOnlyReason::Locked));
-        let open = FieldPermissions {
+        let time_only = FieldPermissions {
             time: true,
+            ..locked.clone()
+        };
+        assert_eq!(
+            refused_field(&time_only, &stop),
+            Some(ReadOnlyReason::Locked)
+        );
+        let open = FieldPermissions {
+            repeat: true,
             ..locked.clone()
         };
         assert_eq!(refused_field(&open, &stop), None);
@@ -8198,6 +8204,7 @@ mod tests {
                 access_role: Some("owner"),
                 event_type: None,
                 organizer_self: true,
+                guests_can_modify: false,
                 locked,
                 visibility: None,
                 series_master: false,
@@ -9241,15 +9248,16 @@ mod tests {
             organizer_self: false,
             ..mine.clone()
         };
-        let blocks: Vec<Option<ReadOnlyReason>> = list_rights(&conn, &[mine, invite])
+        let blocks: Vec<(Option<ReadOnlyReason>, bool)> = list_rights(&conn, &[mine, invite])
             .unwrap()
             .into_iter()
-            .map(|r| r.edit_block)
+            .map(|r| (r.edit_block, r.can_delete))
             .collect();
+        // C14c: an invitation's own settings are editable too, but it is never deleted from PM.
         assert_eq!(
             blocks,
-            vec![None, Some(ReadOnlyReason::NotOrganizer)],
-            "the list: editable when it's yours"
+            vec![(None, true), (None, false)],
+            "the list: editable either way, Delete only when it's yours"
         );
         let facts = CalendarFacts {
             access_role: Some("owner".into()),
@@ -9595,6 +9603,13 @@ mod tests {
             ..mine.clone()
         };
         assert!(facts_from_row(&invited, &calendars[0]).invited);
+        // C14c: whether the organiser lets guests change it, from the mirror.
+        assert!(!facts_from_row(&invited, &calendars[0]).guests_can_modify);
+        let modifiable = CalendarEvent {
+            guests_can_modify: true,
+            ..invited.clone()
+        };
+        assert!(facts_from_row(&modifiable, &calendars[0]).guests_can_modify);
         let rights = |edit_block, can_delete, can_respond| ListRights {
             edit_block,
             can_delete,
@@ -9611,16 +9626,18 @@ mod tests {
             no_address,
             locked,
         ];
+        // C14c: someone else's event opens in the editor for the user's own settings, and is never
+        // deleted from PM (Remove is a later layer's).
         let want = vec![
             rights(None, true, false),
-            rights(Some(ReadOnlyReason::NotOrganizer), false, false),
+            rights(None, false, false),
             rights(Some(ReadOnlyReason::NotGoogle), false, false),
             rights(None, true, false),
             rights(None, true, false),
             // Yours, with your own entry: the organiser may reply too.
             rights(None, true, true),
-            rights(Some(ReadOnlyReason::NotOrganizer), false, true),
-            rights(Some(ReadOnlyReason::NotOrganizer), false, false),
+            rights(None, false, true),
+            rights(None, false, false),
             rights(None, false, true),
         ];
         let got = list_rights(&conn, &rows).unwrap();
@@ -11157,6 +11174,8 @@ mod tests {
             .await,
             read_only(ReadOnlyReason::HtmlDescription)
         );
+        // Someone else's occurrence: its title is the organiser's, refused before any row; its
+        // busy or free is the user's own, so the gate lets it through to the rows (C14c).
         let invitation = with(
             instance.clone(),
             "organizer",
@@ -11169,6 +11188,46 @@ mod tests {
                 EditingStatus::On,
                 "owner",
                 edit(title("Retro"))
+            )
+            .await,
+            read_only(ReadOnlyReason::NotOrganizer)
+        );
+        let series = with(
+            weekly(),
+            "organizer",
+            json!({ "email": "boss@example.com" }),
+        );
+        let script = Script::new(reads(&invitation, &series, vec![series.clone()], october()));
+        let busy = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let (this, _, _) = ask(
+            &script,
+            &invitation,
+            edit(busy),
+            Some((&invitation, Some(&series))),
+            &["abc"],
+        )
+        .await;
+        assert!(
+            matches!(this, ScopeRow::Offered { .. }),
+            "busy or free is offered"
+        );
+        // A delete of someone else's occurrence whose organiser lets guests change it says the
+        // organiser's reason, never the guest list's (C14 critique C1-L1).
+        let modifiable = with(invitation.clone(), "guestsCanModify", json!(true));
+        let delete = ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(modifiable.clone())),
+        };
+        assert_eq!(
+            refused(
+                only(&modifiable),
+                &modifiable,
+                EditingStatus::On,
+                "owner",
+                delete
             )
             .await,
             read_only(ReadOnlyReason::NotOrganizer)
@@ -18865,6 +18924,9 @@ mod tests {
                 SeriesRefusal::Guest(attendees::GuestError::Omitted),
                 SeriesRefusal::GuestsDifferHere,
                 SeriesRefusal::GuestPermissionsAreSeriesWide,
+                // What a guest may not do to someone else's repeating event (C14).
+                SeriesRefusal::InvitationFollowing,
+                SeriesRefusal::InvitationRule,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -18892,6 +18954,7 @@ mod tests {
             ReadOnlyReason::PrivateEvent,
             ReadOnlyReason::NotOrganizer,
             ReadOnlyReason::NotInvited,
+            ReadOnlyReason::OrganizerOnlyGuests,
             ReadOnlyReason::BecameRepeating,
             ReadOnlyReason::SpecialType,
             ReadOnlyReason::Locked,
@@ -23218,8 +23281,9 @@ mod tests {
         );
     }
 
-    /// C14 §4.6: the editor opens with the user's own reply and whether they organise it; the
-    /// reply is open on an invitation while nothing in the editor is.
+    /// C14 §4.6: the editor opens with the user's own reply and whether they organise it; on an
+    /// invitation the reply is open, and from C14c the user's own settings, never the shared fields
+    /// (the organiser hasn't let guests change them here).
     #[tokio::test]
     async fn the_editor_opens_with_the_users_reply() {
         let event = replied(&invite(), "needsAction", None, "\"s1\"");
@@ -23251,7 +23315,9 @@ mod tests {
             "the user's own entry, no note"
         );
         assert!(!event.organizer_self);
-        assert!(permissions.respond && !permissions.any());
+        assert!(permissions.respond && permissions.show_as && permissions.colour);
+        assert!(!permissions.summary && !permissions.guests && !permissions.delete);
+        assert!(!permissions.repeat);
         // The dentist you organise, with nobody invited: no reply to give.
         let script = Script::new(Vec::new());
         let load = open_editor(
@@ -23303,6 +23369,335 @@ mod tests {
         assert_eq!(
             dev_allow::decide(None, None, "home@group", true),
             Err(dev_allow::UNSET)
+        );
+    }
+
+    // --- your own settings on someone else's event (C14c) ---
+
+    /// The dentist invitation, its organiser letting guests change it.
+    fn modifiable_invite() -> Value {
+        with(invite(), "guestsCanModify", json!(true))
+    }
+
+    /// The organiser and the other guest, each told of an update.
+    fn two_updated() -> GuestNotice {
+        GuestNotice {
+            updated: 2,
+            people: 2,
+            emails: 2,
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// C14 §9.2: busy or free, a notification and a colour are the user's own on an invitation:
+    /// one PATCH of that key alone, emailing nobody, asked nothing.
+    #[tokio::test]
+    async fn an_invitations_own_settings_save_without_an_email_question() {
+        let busy = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        for event in [invite(), modifiable_invite()] {
+            for (draft, key, value) in [
+                (busy.clone(), "transparency", json!("transparent")),
+                (
+                    notifying(&[("popup", 10)]),
+                    "reminders",
+                    json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 10 }] }),
+                ),
+                (colouring("10"), "colorId", json!("10")),
+            ] {
+                let host = TestHost::holding(std::slice::from_ref(&event));
+                let landed = written(&event, &[(key, value.clone())], "\"s2\"");
+                let (outcome, script, _) = save_one_off(
+                    &host,
+                    &event,
+                    target(&event),
+                    &draft,
+                    vec![Step::write(
+                        Method::Patch,
+                        "/events/solo",
+                        "\"s1\"",
+                        Scripted::Json(landed),
+                    )],
+                )
+                .await;
+                script.asked_all();
+                assert!(outcome == saved(), "{key}: saved without asking");
+                let body = first_write(&script).body.unwrap();
+                assert!(body == json!({ key: value }), "{key} alone");
+            }
+        }
+    }
+
+    /// C14 §9.2, Q16: without "modify event", an invitation's title is the organiser's: refused
+    /// with their reason after the one GET.
+    #[tokio::test]
+    async fn an_invitations_title_is_read_only_without_modify() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &title("Retro"), Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer
+                }
+        );
+    }
+
+    /// C14 §9.2, A11: with "modify event", a title change on an invitation asks Send / Don't send
+    /// with the organiser counted among those Google would email, only the GET sent; each answer
+    /// goes to Google as given.
+    #[tokio::test]
+    async fn with_modify_a_title_change_asks_and_counts_the_organiser() {
+        let event = modifiable_invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &title("Retro"), Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(two_updated()),
+            "asked: the organiser and the other guest"
+        );
+        for (notify, query) in [
+            (Notify::All, "sendUpdates=all"),
+            (Notify::None, "sendUpdates=none"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off_told(
+                &host,
+                &event,
+                target(&event),
+                &title("Retro"),
+                vec![told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    query,
+                    Scripted::Json(retitled(&event, "\"s2\"")),
+                )],
+                answered(notify, two_updated()),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "saved, as chosen");
+        }
+    }
+
+    /// C14 §9.2, Q4: the guest list of someone else's event stays the organiser's, saying so with
+    /// "modify event" on and the organiser's reason without it. Nothing but the GET goes out.
+    #[tokio::test]
+    async fn an_invitations_guest_list_is_the_organisers() {
+        for (event, reason) in [
+            (modifiable_invite(), ReadOnlyReason::OrganizerOnlyGuests),
+            (invite(), ReadOnlyReason::NotOrganizer),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &adding_guest("b@x.org"),
+                Vec::new(),
+            )
+            .await;
+            script.finished();
+            assert!(outcome == WriteOutcome::ReadOnly { reason });
+        }
+    }
+
+    /// C14 critiques C1-H2, C2-H2: a guest can't give someone else's one-off a repeat, whatever
+    /// the organiser lets guests change: refused after the GET, nothing sent.
+    #[tokio::test]
+    async fn a_guest_cant_make_an_invitation_repeat() {
+        for event in [invite(), modifiable_invite()] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &weekly_on(&[DayCode::Mon]),
+                Vec::new(),
+            )
+            .await;
+            script.finished();
+            assert!(
+                outcome
+                    == WriteOutcome::ReadOnly {
+                        reason: ReadOnlyReason::NotOrganizer
+                    }
+            );
+        }
+    }
+
+    /// C14 §9.2, L-I3's backstop: Google refusing a guest's shared change (403
+    /// `forbiddenForNonOrganizer`) is the organiser's reason, not a failure.
+    #[tokio::test]
+    async fn google_refusing_a_guests_shared_change_is_read_only() {
+        let event = modifiable_invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let refusal = json!({ "error": { "code": 403, "message": "Shared properties can only be changed by the organizer of the event.",
+            "errors": [{ "domain": "calendar", "reason": "forbiddenForNonOrganizer", "message": "Shared properties can only be changed by the organizer of the event." }] } });
+        let (outcome, script, _) = save_one_off_told(
+            &host,
+            &event,
+            target(&event),
+            &title("Retro"),
+            vec![told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                "sendUpdates=none",
+                Scripted::Reply {
+                    status: 403,
+                    body: Some(refusal),
+                    date: None,
+                    maybe_applied: false,
+                },
+            )],
+            answered(Notify::None, two_updated()),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer
+                }
+        );
+    }
+
+    /// C14 §9.2: an invitation isn't deleted from PM until Remove (a later layer): a delete that
+    /// reached its send is refused with the organiser's reason, never the guest list's (critique
+    /// C1-L1), and nothing is deleted.
+    #[tokio::test]
+    async fn an_invitation_cant_be_deleted_until_remove() {
+        for event in [invite(), modifiable_invite()] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &answered(Notify::All, two_updated()),
+            )
+            .await;
+            script.finished();
+            assert!(
+                outcome
+                    == WriteOutcome::ReadOnly {
+                        reason: ReadOnlyReason::NotOrganizer
+                    }
+            );
+        }
+    }
+
+    /// C14 §9.1: a refused draft names the refused field's own reason. With "modify event" and a
+    /// lock, a title says the lock and a guest says the guest list; without "modify event", both
+    /// say the organiser's; a label still names itself for the colour.
+    #[test]
+    fn refused_field_names_the_fields_own_reason() {
+        let rights = |organizer_self: bool, guests_can_modify: bool, locked: bool| {
+            gate::edit_rights(&EditFacts {
+                google: true,
+                editing: EditingStatus::On,
+                access_role: Some("owner"),
+                event_type: None,
+                organizer_self,
+                guests_can_modify,
+                locked,
+                visibility: None,
+                series_master: false,
+                html_description: false,
+                labelled: true,
+                reminders_readable: true,
+                invited: true,
+            })
+        };
+        let guest = adding_guest("b@x.org");
+        let both = EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..guest.clone()
+        };
+        let a5 = rights(false, true, true);
+        assert_eq!(
+            refused_field(&a5, &title("Retro")),
+            Some(ReadOnlyReason::Locked)
+        );
+        assert_eq!(
+            refused_field(&a5, &guest),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        // The guest list is looked at first, whatever else the draft touches.
+        assert_eq!(
+            refused_field(&a5, &both),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        let a3 = rights(false, true, false);
+        assert_eq!(refused_field(&a3, &title("Retro")), None);
+        assert_eq!(
+            refused_field(&a3, &guest),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        // The guest list is looked at first.
+        assert_eq!(
+            refused_field(&a3, &both),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        assert_eq!(
+            refused_field(&a3, &weekly_on(&[DayCode::Mon])),
+            Some(ReadOnlyReason::NotOrganizer)
+        );
+        assert_eq!(
+            refused_field(&a3, &colouring("3")),
+            Some(ReadOnlyReason::LabelReadOnly)
+        );
+        let a2 = rights(false, false, false);
+        for draft in [guest.clone(), title("Retro"), both] {
+            assert_eq!(
+                refused_field(&a2, &draft),
+                Some(ReadOnlyReason::NotOrganizer)
+            );
+        }
+        let mine_locked = rights(true, false, true);
+        assert_eq!(
+            refused_field(&mine_locked, &title("Retro")),
+            Some(ReadOnlyReason::Locked)
+        );
+    }
+
+    /// C14 §9.3: an occurrence of someone else's repeating event offers "this event" and "all
+    /// events" for the user's own settings, and refuses "this and following" in its own words.
+    #[tokio::test]
+    async fn an_invitations_rows_say_why_following_is_refused() {
+        let (series, instance) = (weekly_invite(), monday_invite());
+        let window: Vec<Value> = october().into_iter().map(invitation_of).collect();
+        let busy = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], window));
+        let opened = Some((&instance, Some(&series)));
+        let (this, following, all) = ask(&script, &instance, edit(busy), opened, &["abc"]).await;
+        assert!(
+            matches!(this, ScopeRow::Offered { guests: None, .. }),
+            "this event, asking nobody"
+        );
+        assert!(
+            matches!(all, ScopeRow::Offered { guests: None, .. }),
+            "all events, asking nobody"
+        );
+        assert!(
+            following
+                == ScopeRow::Refused {
+                    message: SeriesRefusal::InvitationFollowing.to_string()
+                },
+            "this and following, refused in words"
         );
     }
 }

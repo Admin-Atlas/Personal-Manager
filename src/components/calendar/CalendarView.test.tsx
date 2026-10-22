@@ -25,6 +25,7 @@ import type {
   WriteOutcome,
 } from "../../lib/types";
 import { dayKey, startOfDay } from "../../lib/calendar-layout";
+import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
 
 const ipc = vi.hoisted(() => ({
   calendarOverview: vi.fn(),
@@ -452,6 +453,7 @@ describe("CalendarView: guests", () => {
       permissions: {
         summary: true,
         time: true,
+        repeat: true,
         location: true,
         description: true,
         show_as: true,
@@ -548,11 +550,12 @@ describe("CalendarView: invitations", () => {
     organizer,
     self: true,
   });
-  /** Bobby's copy of someone else's invitation, on his main calendar. */
+  /** Bobby's copy of someone else's invitation, on his main calendar: editable for his own
+   *  settings since C14c, never deleted. */
   const invite = (response = "needsAction") =>
     row({
       id: "i1",
-      edit_block: "not_organizer",
+      edit_block: null,
       can_delete: false,
       can_respond: true,
       organizer_self: false,
@@ -590,20 +593,81 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event. You can reply, and change only your own settings.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your reply, notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
     expect(screen.getByRole("group", { name: "Going?" })).toBeTruthy();
+    // C14c: Edit, for the user's own settings, and never Delete.
+    expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
     cleanup();
     ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
     await mount();
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event. Turn on editing for this account to reply from PM.",
+        "Someone else organises this event. Turn on editing for this account to reply and change your own settings from PM.",
       ),
     ).toBeTruthy();
     expect(screen.queryByRole("group", { name: /^Going\?/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  // C14c: where the organiser lets guests change it, the line is Google's warning; with no entry of
+  // the user's own, it never offers the reply.
+  it("says Google's warning where guests may change it, and never a reply it can't send", async () => {
+    rows = [row({ ...invite(), guests_can_modify: true })];
+    await mount();
+    fireEvent.click(chip());
+    expect(screen.getByText(A11_NOTE)).toBeTruthy();
+    cleanup();
+    rows = [row({ ...invite(), can_respond: false, attendees: [] })];
+    await mount();
+    fireEvent.click(chip());
+    expect(
+      screen.getByText(
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your notifications, colour and busy or free are yours to change.",
+      ),
+    ).toBeTruthy();
+  });
+
+  // C14 §9.5: an invitation can be changed now (its own settings), so "can be changed" no longer
+  // means "yours": the organiser's copy is kept, even one that can't be deleted (locked), over an
+  // editable invitation listed first.
+  it("keeps the organiser's copy over an editable invitation of the same occurrence", async () => {
+    rows = [invite(), row({ ...organiser(), locked: true, can_delete: false })];
+    await mount();
+    fireEvent.click(chip());
+    const groups = screen.getAllByRole("group", { name: /^Going\?/ });
+    expect(groups[0]).toBe(screen.getByRole("group", { name: "Going? Replying for Work." }));
+    expect(
+      screen.getByText("Google has locked this event's title, time, place and description."),
+    ).toBeTruthy();
+    // An invitation still wins over a copy that can't be changed at all.
+    cleanup();
+    rows = [row({ ...organiser(), edit_block: "calendar_read_only", can_delete: false }), invite()];
+    await mount();
+    fireEvent.click(chip());
+    expect(screen.getAllByRole("group", { name: /^Going\?/ })[0]).toBe(
+      screen.getByRole("group", { name: "Going? Replying for Personal." }),
+    );
+    // Two invitations' copies rank the same: the first listed is kept.
+    for (const [first, name] of [
+      [PERSONAL, "Personal"],
+      [WORK_CAL, "Work"],
+    ] as const) {
+      cleanup();
+      const other = first === PERSONAL ? WORK_CAL : PERSONAL;
+      rows = [
+        row({ ...invite(), id: "i1", calendar_id: first }),
+        row({ ...invite(), id: "i2", calendar_id: other }),
+      ];
+      await mount();
+      fireEvent.click(chip());
+      expect(screen.getAllByRole("group", { name: /^Going\?/ })[0]).toBe(
+        screen.getByRole("group", { name: `Going? Replying for ${name}.` }),
+      );
+    }
   });
 
   it("after a reply lands, the popover shows it, and the event is struck through", async () => {

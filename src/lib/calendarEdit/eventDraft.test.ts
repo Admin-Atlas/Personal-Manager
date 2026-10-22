@@ -113,6 +113,7 @@ describe("the event draft", () => {
     const perms: FieldPermissions = {
       summary: false,
       time: false,
+      repeat: false,
       location: false,
       description: false,
       show_as: true,
@@ -126,9 +127,11 @@ describe("the event draft", () => {
     };
     expect(canEdit(perms, "summary")).toBe(false);
     expect(canEdit(perms, "show_as")).toBe(true);
-    // How it repeats goes with the time: Google locks both together.
+    // How it repeats has its own right (C14 critiques C1-H2, C2-H2): the backend closes it with the
+    // time, and on someone else's event whatever its time may do.
     expect(canEdit(perms, "recurrence")).toBe(false);
-    expect(canEdit({ ...perms, time: true }, "recurrence")).toBe(true);
+    expect(canEdit({ ...perms, time: true }, "recurrence")).toBe(false);
+    expect(canEdit({ ...perms, repeat: true }, "recurrence")).toBe(true);
   });
 });
 
@@ -604,6 +607,7 @@ describe("guests in the draft", () => {
     const perms: FieldPermissions = {
       summary: true,
       time: true,
+      repeat: true,
       location: true,
       description: true,
       show_as: true,
@@ -1113,6 +1117,7 @@ describe("notifications and colour in the draft", () => {
     const perms: FieldPermissions = {
       summary: false,
       time: false,
+      repeat: false,
       location: false,
       description: false,
       show_as: true,

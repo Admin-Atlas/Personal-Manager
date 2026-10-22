@@ -83,7 +83,7 @@ use super::super::plan::{
 };
 use super::super::time;
 use super::diff::{Expect, Removes, SeriesDiff};
-use super::rule::{plan_all_rule, plan_split_rule, rule_ask, RuleAsk};
+use super::rule::{plan_all_rule, plan_split_rule, rule_ask, rule_change, RuleAsk};
 use super::scope::{is_first, zones_changed, Scope};
 use super::{
     attendee_set, classify_instance, excluded, google_before, original_of, point_of, Exceptions,
@@ -696,9 +696,12 @@ impl SeriesPlan {
             return Resend::Gone;
         }
         let guests_changed = Resend::Conflict(vec!["attendees".into()]);
-        // R9: who hears is the user's to say, and they said it for no one here.
+        // R9: who hears is the user's to say, and they said it for no one here. A write of only the
+        // user's own settings emails nobody, whoever is on the event, so it goes again as any other
+        // write would (C14 critique C1-M6: an invitation always has guests).
         if step.notify == Notify::None
             && self.chosen != Some(Notify::None)
+            && !personal_only(&step.op)
             && attendees::reaches_anyone(fresh, &self.own)
         {
             return guests_changed;
@@ -1064,6 +1067,13 @@ impl SeriesPlan {
     }
 }
 
+/// A PATCH of nothing but the user's own settings ([`attendees::PERSONAL`]: busy or free,
+/// notifications, colour), which Google emails nobody about.
+fn personal_only(op: &Op) -> bool {
+    matches!(op, Op::Patch { body, .. }
+        if !body.is_empty() && body.keys().all(|k| attendees::PERSONAL.contains(&k.as_str())))
+}
+
 /// The checks every series plan starts with: both copies there, the series' own facts, the
 /// occurrence one of its own. `draft` is the change, `None` for a delete.
 fn prepare(
@@ -1382,6 +1392,11 @@ fn delete_plan(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let (master, original) = prepare(input, None)?;
+    // Someone else's repeating event: removing it from the user's calendar is a later layer's
+    // (C14d), so it stays as the gate has it (C14 §9.3).
+    if !master.organizer_self {
+        return Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer));
+    }
     let instance = input.fresh.instance.json();
     match delete_still_matches(seen, instance) {
         DeleteCheck::Matches => {}
@@ -1794,6 +1809,9 @@ fn edit_plan(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let (master, original) = prepare(input, Some(draft))?;
+    // Before the guest list's own checks, so a guest change says whose list it is (C14 critique
+    // C1-L10).
+    invitation_check(input, &master, original, draft, scope)?;
     guests_ready(scope, input, draft)?;
     match scope {
         Scope::This => plan_this(input, &master, draft, notify),
@@ -1818,6 +1836,77 @@ fn edit_plan(
             }
         },
     }
+}
+
+/// What a guest may do to someone else's repeating event (C14, A11): their own notifications, colour
+/// and busy or free, for this occurrence or all of them; the shared fields too where the organiser
+/// lets guests change the event; never "this and following" (a new event on their calendar, apart
+/// from the invitation), how it repeats, the time of every occurrence, or who is invited. Checked
+/// in this order, so the words never offer a change the user can't make: without "modify", a new
+/// rule or a move says the organiser's reason, never "you can move this occurrence". The reasons
+/// are the gate's own for the same fields (`gate::reason_for`, C14 critique C1-L1).
+fn invitation_check(
+    input: &SeriesInput,
+    master: &Master,
+    original: Point,
+    draft: &EventPatchDraft,
+    scope: Scope,
+) -> Result<(), NotPlanned> {
+    if master.organizer_self {
+        return Ok(());
+    }
+    // From the first occurrence, "this and following" is every occurrence.
+    if scope == Scope::Following && !is_first(master, input.fresh.instance) {
+        return Err(SeriesRefusal::InvitationFollowing.into());
+    }
+    if draft.touches_guests() {
+        return Err(NotPlanned::ReadOnly(if master.guests_can_modify {
+            ReadOnlyReason::OrganizerOnlyGuests
+        } else {
+            ReadOnlyReason::NotOrganizer
+        }));
+    }
+    // The rule as the choices read it: the very rule it has is no change (C11 critique 1 L12).
+    let new_rule = rule_change(draft, master).is_some();
+    let shared = draft.summary.is_some()
+        || draft.location.is_some()
+        || draft.description.is_some()
+        || draft.time.is_some()
+        || draft.visibility.is_some()
+        || new_rule;
+    if shared && !master.guests_can_modify {
+        return Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer));
+    }
+    // "Modify event" is on: the rule, and with it every occurrence's time, stays the organiser's.
+    // One occurrence's time may change.
+    let every =
+        scope != Scope::This && moves_every_start(draft, input.fresh.instance.json(), original)?;
+    if new_rule || every {
+        return Err(SeriesRefusal::InvitationRule.into());
+    }
+    Ok(())
+}
+
+/// Whether `draft`'s time, sent for every occurrence, moves them all: it puts the occurrence
+/// (`original`) at another start (between all-day and timed included: a day is never an instant),
+/// or into another zone, each of which `plan_all` does by moving or rebuilding the rule. A new
+/// length alone leaves the rule as it is, and so the starts (C14 critique C2-L6); so does the time
+/// an occurrence moved on its own already shows.
+fn moves_every_start(
+    draft: &EventPatchDraft,
+    instance: &Value,
+    original: Point,
+) -> Result<bool, NotPlanned> {
+    let Some(draft_time) = &draft.time else {
+        return Ok(false);
+    };
+    let when = time::resolve_against(draft_time, instance.get("start"), instance.get("end"))?;
+    if when_eq(instance.get("start"), Some(&when.start))
+        && when_eq(instance.get("end"), Some(&when.end))
+    {
+        return Ok(false);
+    }
+    Ok(zones_changed(draft_time, instance) || point_of(Some(&when.start)) != Some(original))
 }
 
 /// The draft's guest changes, checked on the copy they go to: the occurrence for "This event", the
@@ -2908,7 +2997,13 @@ mod tests {
             json!({ "email": "boss@example.com" }),
         );
         assert_eq!(
-            Case::new(theirs, monday_19()).delete(Scope::All),
+            Case::new(theirs.clone(), monday_19()).delete(Scope::All),
+            Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer))
+        );
+        // Someone else's series no longer refuses everything (C14): a title on it does, where its
+        // organiser hasn't let guests change it.
+        assert_eq!(
+            Case::new(theirs, monday_19()).edit(Scope::All, title("Retro")),
             Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer))
         );
         let focus = with(weekly(), "eventType", json!("focusTime"));
@@ -6244,6 +6339,335 @@ mod tests {
         for key in ["colorId", "reminders"] {
             assert!(patch(body_of(key)).fits(), "{key}");
             assert!(insert(body_of(key)).fits(), "{key}");
+        }
+    }
+
+    // --- C14: someone else's repeating event ---
+
+    const ORGANISER: &str = "o@example.com";
+
+    /// `event` as an invitation from [`ORGANISER`], the calendar and A on its guest list; `modify`:
+    /// the organiser lets guests change it.
+    fn theirs(event: Value, modify: bool) -> Value {
+        let list = json!([
+            { "email": ORGANISER, "organizer": true, "responseStatus": "accepted" },
+            { "email": CALENDAR, "self": true, "responseStatus": "accepted" },
+            { "email": A, "responseStatus": "accepted" }
+        ]);
+        let event = with(
+            with(event, "organizer", json!({ "email": ORGANISER })),
+            "attendees",
+            list,
+        );
+        with(event, "guestsCanModify", json!(modify))
+    }
+
+    /// The weekly series and its Monday 19-10 occurrence, someone else's.
+    fn invitation(modify: bool) -> Case {
+        Case::new(theirs(weekly(), modify), theirs(monday_19(), modify))
+    }
+
+    /// Busy or free and a colour: the user's own settings.
+    fn own_settings() -> EventPatchDraft {
+        EventPatchDraft {
+            show_as: Some(crate::calendar_write::dto::ShowAs::Free),
+            ..coloured(colour("3"))
+        }
+    }
+
+    /// The event each step writes, in order.
+    fn written_events(plan: &SeriesPlan) -> Vec<String> {
+        plan.steps
+            .iter()
+            .map(|s| match &s.op {
+                Op::Patch { event, .. } => event.clone(),
+                _ => "not a PATCH".into(),
+            })
+            .collect()
+    }
+
+    /// C14 §9.3: the user's own busy or free and colour on someone else's repeating event: "This
+    /// event" PATCHes the occurrence, "All events" the repeating event, each telling nobody and
+    /// asking nothing, the organiser letting guests change it or not.
+    #[test]
+    fn an_invitations_own_settings_plan_for_this_and_all() {
+        for modify in [false, true] {
+            let case = invitation(modify);
+            for (scope, event) in [(Scope::This, "abc_20261019T080000Z"), (Scope::All, "abc")] {
+                let plan = case.edit(scope, own_settings()).unwrap();
+                assert_eq!(written_events(&plan), [event], "{scope:?}");
+                let mut keys: Vec<&String> = body(&plan.steps[0]).keys().collect();
+                keys.sort();
+                assert_eq!(keys, ["colorId", "transparency"], "{scope:?}");
+                assert_eq!(plan.steps[0].notify, Notify::None, "{scope:?}");
+                assert!(plan.guests.is_none(), "{scope:?}: nobody to ask about");
+                assert!(!plan.needs_notify(), "{scope:?}");
+            }
+        }
+    }
+
+    /// C14 §9.3: "this and following" on someone else's repeating event would make an event of the
+    /// user's own, apart from the invitation, so it's refused in words for any change; from the
+    /// first occurrence it is every occurrence, and plans as "all events".
+    #[test]
+    fn an_invitation_refuses_this_and_following() {
+        let case = invitation(true);
+        for draft in [own_settings(), title("Retro")] {
+            assert!(refused_for(
+                case.edit(Scope::Following, draft),
+                SeriesRefusal::InvitationFollowing
+            ));
+        }
+        let first = Case::new(
+            theirs(weekly(), false),
+            theirs(plain("2026-10-05T09:00:00+01:00"), false),
+        );
+        let plan = first.edit(Scope::Following, own_settings()).unwrap();
+        assert_eq!(
+            written_events(&plan),
+            ["abc"],
+            "the first occurrence on is all of it"
+        );
+        // Not on the user's own repeating event, where it's a split.
+        let mine = Case::new(weekly(), monday_19());
+        assert!(mine.edit(Scope::Following, title("Retro")).is_ok());
+    }
+
+    /// C14 §9.3, A11: the shared fields of someone else's repeating event change only where the
+    /// organiser lets guests change it, and then the email question counts the organiser and the
+    /// other guest.
+    #[test]
+    fn an_invitations_shared_field_needs_modify() {
+        assert_eq!(
+            invitation(false).edit(Scope::All, title("Retro")),
+            Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer))
+        );
+        let plan = invitation(true).edit(Scope::All, title("Retro")).unwrap();
+        assert_eq!(written_events(&plan), ["abc"]);
+        assert!(
+            plan.guests == Some(told(2, 0, 0, 2)),
+            "the organiser and A, told of the update"
+        );
+        assert!(plan.needs_notify(), "asked before anything is sent");
+        let plan = invitation(true)
+            .edit_told(Scope::All, title("Retro"), Some(Notify::None))
+            .unwrap();
+        assert_eq!(plan.steps[0].notify, Notify::None);
+        assert!(!plan.needs_notify());
+    }
+
+    /// C14 §0.5 row 5, critiques C1-L10 and C2-L6: with "modify event" on, a guest still never
+    /// changes how it repeats or moves every occurrence (the planner would re-rule their copy), but
+    /// may move this occurrence, asked about as any shared change, and may change every
+    /// occurrence's length, which leaves the rule as it is. Without "modify event", both say the
+    /// organiser's reason first, so the words never offer a move the user can't make.
+    #[test]
+    fn a_guest_never_changes_how_it_repeats() {
+        let new_rule = || EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            ..Default::default()
+        };
+        let later = || at("10:00", "2026-10-19");
+        let modify = invitation(true);
+        for draft in [new_rule(), later()] {
+            assert!(refused_for(
+                modify.edit(Scope::All, draft),
+                SeriesRefusal::InvitationRule
+            ));
+        }
+        assert!(refused_for(
+            modify.edit(Scope::This, new_rule()),
+            SeriesRefusal::InvitationRule
+        ));
+        let plan = modify.edit(Scope::This, later()).unwrap();
+        assert_eq!(written_events(&plan), ["abc_20261019T080000Z"]);
+        assert!(
+            plan.guests == Some(told(2, 0, 0, 2)),
+            "asked, the organiser counted"
+        );
+        // Every occurrence an hour longer: the starts stay, so the rule does.
+        let longer = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-10-19".into(),
+                start_time: "09:00".into(),
+                start_zone: "Europe/London".into(),
+                end_date: "2026-10-19".into(),
+                end_time: "11:00".into(),
+                end_zone: "Europe/London".into(),
+            }),
+            ..Default::default()
+        };
+        let plan = modify.edit(Scope::All, longer).unwrap();
+        assert_eq!(written_events(&plan), ["abc"], "a new length alone plans");
+        let without = invitation(false);
+        for draft in [new_rule(), later()] {
+            assert_eq!(
+                without.edit(Scope::All, draft),
+                Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer))
+            );
+        }
+        // The very rule it has is no change to how it repeats (as the choices read it), so the
+        // user's own settings beside it still plan.
+        use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
+        let same_rule = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Rule {
+                rule: RepeatRule {
+                    pattern: RepeatPattern::Weekly {
+                        days: vec![DayCode::Mon],
+                    },
+                    interval: 1,
+                    ends: RepeatEnds::Never,
+                },
+            }),
+            ..own_settings()
+        };
+        assert!(without.edit(Scope::All, same_rule).is_ok());
+    }
+
+    /// What counts as moving every occurrence (critique C2-L6): a new start, a new kind or zone;
+    /// never a new length, and never an occurrence moved on its own sent at the time it shows.
+    #[test]
+    fn only_a_new_start_moves_every_occurrence() {
+        let original = point("2026-10-19T09:00:00+01:00");
+        let plain = monday_19();
+        let moved_one = moved(
+            "2026-10-19T09:00:00+01:00",
+            "2026-10-19T11:00:00+01:00",
+            "2026-10-19T12:00:00+01:00",
+        );
+        let moves = |draft: &EventPatchDraft, instance: &Value| {
+            moves_every_start(draft, instance, original).unwrap()
+        };
+        let timed = |start: &str, end: &str| EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-10-19".into(),
+                start_time: start.into(),
+                start_zone: "Europe/London".into(),
+                end_date: "2026-10-19".into(),
+                end_time: end.into(),
+                end_zone: "Europe/London".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(!moves(&EventPatchDraft::default(), &plain), "no time");
+        assert!(moves(&timed("10:00", "11:00"), &plain), "an hour later");
+        assert!(!moves(&timed("09:00", "11:00"), &plain), "a new length");
+        assert!(
+            !moves(&timed("11:00", "12:00"), &moved_one),
+            "the time it already shows"
+        );
+        assert!(moves(&timed("12:00", "13:00"), &moved_one), "moved again");
+        let all_day = EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-10-19".into(),
+                last_day: "2026-10-19".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(moves(&all_day, &plain), "to all day");
+        // The same instant in Paris's time: the rule is rebuilt in the new zone.
+        let elsewhere = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-10-19".into(),
+                start_time: "10:00".into(),
+                start_zone: "Europe/Paris".into(),
+                end_date: "2026-10-19".into(),
+                end_time: "11:00".into(),
+                end_zone: "Europe/Paris".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(moves(&elsewhere, &plain), "into another zone");
+    }
+
+    /// C14 §9.3, critique C1-L10: who is invited stays the organiser's, said before the guest
+    /// list's own checks (taking the organiser off would otherwise say "can't remove").
+    #[test]
+    fn an_invitations_guest_list_is_the_organisers() {
+        for (modify, reason) in [
+            (false, ReadOnlyReason::NotOrganizer),
+            (true, ReadOnlyReason::OrganizerOnlyGuests),
+        ] {
+            let case = invitation(modify);
+            for draft in [
+                guests_to(&[(B, GuestState::Required)]),
+                guests_to(&[(ORGANISER, GuestState::Absent)]),
+                EventPatchDraft {
+                    guests_can_invite_others: Some(false),
+                    ..Default::default()
+                },
+            ] {
+                for scope in [Scope::This, Scope::All] {
+                    assert_eq!(
+                        case.edit(scope, draft.clone()),
+                        Err(NotPlanned::ReadOnly(reason)),
+                        "{scope:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// C14 critique C1-M6: a write of only the user's own settings emails nobody, so neither a
+    /// listing PM couldn't see whole nor guests on the event make it ask, and a 412 from another
+    /// guest's reply goes again rather than stopping as "the guests changed".
+    #[test]
+    fn an_invitations_own_settings_never_ask_or_stop_for_guests() {
+        let mut case = invitation(false);
+        case.exceptions.complete = false;
+        let plan = case.edit(Scope::All, coloured(colour("3"))).unwrap();
+        assert!(plan.guests.is_none() && !plan.needs_notify());
+        let mut replied = theirs(weekly(), false);
+        replied["attendees"][2]["responseStatus"] = json!("declined");
+        replied["etag"] = json!("\"m2\"");
+        assert_eq!(plan.resend(0, &replied), Resend::Proceed);
+        // A shared change under "modify", unanswered, still stops: who hears is the user's to say.
+        let shared = invitation(true).edit(Scope::All, title("Retro")).unwrap();
+        assert_eq!(
+            shared.resend(0, &replied),
+            Resend::Conflict(vec!["attendees".into()])
+        );
+    }
+
+    /// The test the 412 rule uses: a PATCH whose every key is the user's own, and that sends
+    /// something; never a delete, a cancel or a body with a shared key.
+    #[test]
+    fn only_the_users_own_keys_make_a_personal_write() {
+        let patch = |keys: &[&str]| Op::Patch {
+            calendar: CALENDAR.into(),
+            event: "abc".into(),
+            etag: "\"m1\"".into(),
+            body: keys.iter().map(|k| (k.to_string(), json!("x"))).collect(),
+        };
+        assert!(personal_only(&patch(&[
+            "colorId",
+            "transparency",
+            "reminders"
+        ])));
+        assert!(!personal_only(&patch(&["colorId", "summary"])));
+        assert!(
+            !personal_only(&patch(&[])),
+            "nothing sent is no write of the user's"
+        );
+        assert!(!personal_only(&Op::Delete {
+            calendar: CALENDAR.into(),
+            event: "abc".into(),
+            etag: "\"m1\"".into(),
+        }));
+    }
+
+    /// C14 §9.3: removing someone else's repeating event from the user's calendar is a later
+    /// layer's; until then every scope is refused with the organiser's reason.
+    #[test]
+    fn an_invitations_delete_is_refused_for_every_scope() {
+        for modify in [false, true] {
+            for scope in [Scope::This, Scope::Following, Scope::All] {
+                assert_eq!(
+                    invitation(modify).delete(scope),
+                    Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer)),
+                    "{scope:?}"
+                );
+            }
         }
     }
 }
