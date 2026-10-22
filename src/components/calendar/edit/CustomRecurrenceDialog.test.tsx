@@ -39,10 +39,18 @@ afterEach(() => {
 
 const T2 = "2026-10-13"; // a Tuesday
 
-function open(rule: RepeatRule | null = null) {
+function open(rule: RepeatRule | null = null, earliestEnd?: string) {
   const onDone = vi.fn();
   const onClose = vi.fn();
-  render(<CustomRecurrenceDialog rule={rule} startDate={T2} onDone={onDone} onClose={onClose} />);
+  render(
+    <CustomRecurrenceDialog
+      rule={rule}
+      startDate={T2}
+      earliestEnd={earliestEnd}
+      onDone={onDone}
+      onClose={onClose}
+    />,
+  );
   return { onDone, onClose };
 }
 
@@ -115,6 +123,26 @@ describe("CustomRecurrenceDialog", () => {
       interval: 1,
       ends: { kind: "on_date", date: T2 },
     });
+  });
+
+  // Opened at a later occurrence, the end date is checked against the repeating event's first day
+  // (C11d review 5); a first day after this one never makes it stricter.
+  it("an Ends date is checked against the earliest end it's given, never later than the start", () => {
+    for (const [earliest, before, fine] of [
+      ["2026-10-06", "05-10-2026", "08-10-2026"],
+      ["2026-10-20", "12-10-2026", "13-10-2026"],
+    ]) {
+      const { onDone } = open(null, earliest);
+      fireEvent.click(screen.getByLabelText("On"));
+      typeDate(endDate(), before);
+      expect(screen.getByText("The end date is before the first occurrence.")).toBeTruthy();
+      expect(done().disabled).toBe(true);
+      typeDate(endDate(), fine);
+      expect(done().disabled).toBe(false);
+      fireEvent.click(done());
+      expect(onDone).toHaveBeenCalledTimes(1);
+      cleanup();
+    }
   });
 
   // The field shows its date again after text it can't read: Done must not end the rule on it.

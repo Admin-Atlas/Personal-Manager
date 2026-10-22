@@ -904,6 +904,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           <CustomRecurrenceDialog
             rule={draft.recurrence.kind === "rule" ? draft.recurrence.rule : null}
             startDate={startDateOf(draft.time)}
+            earliestEnd={repeating && loaded?.series ? loaded.series.starts : undefined}
             onDone={(rule) => {
               if (draftRef.current) {
                 setDraft({ ...draftRef.current, recurrence: { kind: "rule", rule } });

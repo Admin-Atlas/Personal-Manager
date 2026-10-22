@@ -3549,7 +3549,8 @@ mod tests {
     /// 01:00 on the same Monday, it stays on Mondays, for every occurrence and from this one on: the
     /// day the series' own rule names is the one on the clock, wherever the rebuild reads days from
     /// (C11c review). No day moved, so nothing asks to move every occurrence a day or says the
-    /// series' start moves (C11d review 4). Kept at the same moment, Sunday in New York, its day
+    /// series' start moves (C11d review 4), nor, made "Does not repeat", that the one kept moves
+    /// (C11d review 5). Kept at the same moment, Sunday in New York, its day
     /// moves: refused in words.
     #[test]
     fn a_zone_change_past_midnight_keeps_the_rules_own_day() {
@@ -3597,6 +3598,21 @@ mod tests {
             from: day(5),
             to: day(6)
         }));
+        // "Does not repeat" on the same Monday keeps the first, Monday 05-10, on its own day: it
+        // becomes one event there and nothing says it moves (C11d review 5).
+        let once = EventPatchDraft {
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
+            ..monday.clone()
+        };
+        let stopped = case.edit(Scope::All, once).unwrap();
+        assert_eq!(
+            body(&stopped.steps[0])["start"],
+            json!({ "dateTime": "2026-10-05T01:00:00-04:00", "timeZone": "America/New_York" })
+        );
+        assert_eq!(
+            stopped.warnings,
+            [SeriesWarning::BecomesOneEvent { day: day(5) }]
+        );
         let rest = case.edit(Scope::Following, monday).unwrap();
         let new_part =
             json!({ "dateTime": "2026-10-19T01:00:00-04:00", "timeZone": "America/New_York" });

@@ -1377,6 +1377,51 @@ describe("EventEditor, how it repeats", () => {
     );
   });
 
+  // Google lets every occurrence end before the one opened: Custom… checks the end date against the
+  // repeating event's first day, never this occurrence's, and the choices say what each would do
+  // (C11d review 5).
+  it("Custom… on a later occurrence takes an end date between the first and it", async () => {
+    openForEdit.mockResolvedValue(repeatingLoad());
+    choicesForEdit.mockResolvedValue(choices());
+    await open(vi.fn(), undefined, occurrence);
+    await act(async () => {});
+    fireEvent.click(repeat());
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Repeat" })).getByRole("button", {
+        name: "Custom…",
+      }),
+      { detail: 1 },
+    );
+    const custom = within(await screen.findByRole("dialog", { name: "Custom recurrence" }));
+    fireEvent.click(custom.getByLabelText("On"));
+    const end = custom.getByLabelText<HTMLInputElement>("End date");
+    // Before the first occurrence, Monday 05-10: said, and Done waits.
+    for (const [text, refused] of [
+      ["04-10-2026", true],
+      ["08-10-2026", false],
+    ] as const) {
+      end.focus();
+      fireEvent.change(end, { target: { value: text } });
+      fireEvent.blur(end);
+      expect(!!custom.queryByText("The end date is before the first occurrence.")).toBe(refused);
+      expect(custom.getByRole<HTMLButtonElement>("button", { name: "Done" }).disabled).toBe(
+        refused,
+      );
+    }
+    // After the first, before this one (Monday 12-10): it goes.
+    fireEvent.click(custom.getByRole("button", { name: "Done" }));
+    await act(async () => {});
+    expect(screen.queryByRole("dialog", { name: "Custom recurrence" })).toBeNull();
+    fireEvent.click(editorSave());
+    await screen.findByRole("dialog", { name: "Edit repeating event" });
+    expect(choicesForEdit).toHaveBeenCalledWith("s1", {
+      recurrence: {
+        kind: "rule",
+        rule: { ...MONDAYS, ends: { kind: "on_date", date: "2026-10-08" } },
+      },
+    });
+  });
+
   it("a one-off given a preset saves without the dialog", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
