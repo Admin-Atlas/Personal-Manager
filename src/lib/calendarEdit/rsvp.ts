@@ -15,7 +15,7 @@
 // drawing each calendar's copy apart.
 
 import { occurrenceKey } from "../calendar-layout";
-import type { Attendee, Calendar, CalendarEvent, Rsvp } from "../types";
+import type { Attendee, Calendar, CalendarEvent, EventForEdit, GuestForEdit, Rsvp } from "../types";
 import { addressKey, replyOf, trimmed, type Reply } from "./guests";
 
 /** The three replies, in Google's order. */
@@ -42,10 +42,10 @@ export function myReply(
 }
 
 /** The user's own entry on a row's guest list (see `myReply`), or null without one. */
-function ownEntry(
-  ev: Pick<CalendarEvent, "attendees">,
+function ownEntry<A extends Attendee>(
+  ev: { attendees?: readonly A[] | null },
   ownAddress: string | null,
-): Attendee | null {
+): A | null {
   const marked = (ev.attendees ?? []).filter(
     (a) => a.self && a.email !== null && trimmed(a.email) !== "",
   );
@@ -85,6 +85,42 @@ export function tidyNote(text: string): string {
 
 /** How long a note is, as the backend counts it. */
 export const noteLength = (text: string): number => [...tidyNote(text)].length;
+
+/** A reply as Google words it on the guest list (the backend's `Rsvp::as_google`). */
+const GOOGLE_RESPONSE: Record<Rsvp, string> = {
+  yes: "accepted",
+  no: "declined",
+  maybe: "tentative",
+};
+
+/** The editor's copy once Google holds a reply sent from it (C14c): the reply and its note (`note`
+ *  null left the one Google held), and the user's own entry on `guests` (the one the backend
+ *  answers for: `ownAddress`'s, else the first marked) saying it. Nothing else changes: a reply is
+ *  none of the editor's fields, so it never makes a draft to save. */
+export function withReply(
+  event: EventForEdit,
+  reply: Rsvp,
+  note: string | null,
+  ownAddress: string | null,
+): EventForEdit {
+  const response = GOOGLE_RESPONSE[reply];
+  return {
+    ...event,
+    reply: { response, note: note === null ? (event.reply?.note ?? "") : tidyNote(note) },
+    guests: guestsWithReply(event.guests, reply, ownAddress),
+  };
+}
+
+/** `guests` with the user's own entry (as `withReply` picks it) saying `reply`; the same list when
+ *  there's none. A new list, every other entry as it was. */
+export function guestsWithReply<T extends GuestForEdit>(
+  guests: readonly T[],
+  reply: Rsvp,
+  ownAddress: string | null,
+): T[] {
+  const own = ownEntry({ attendees: guests }, ownAddress);
+  return guests.map((g) => (g === own ? { ...g, response: GOOGLE_RESPONSE[reply] } : g));
+}
 
 // --- declined events, and the copies a reply can come from (C14b) ---
 

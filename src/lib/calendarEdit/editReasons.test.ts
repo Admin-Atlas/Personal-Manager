@@ -15,6 +15,7 @@ import type {
   WriteWarning,
 } from "../types";
 import {
+  A11_NOTE,
   CALLOUT_TONE,
   CREATE_CHANGED,
   CREATE_LOST,
@@ -46,6 +47,7 @@ import {
   problemText,
   reasonText,
   rebasedText,
+  repeatTheirsText,
   replyNoticeText,
   replyText,
   savedNotice,
@@ -83,6 +85,7 @@ const REASONS: ReadOnlyReason[] = [
   "private_event",
   "not_organizer",
   "not_invited",
+  "organizer_only_guests",
   "became_repeating",
   "special_type",
   "locked",
@@ -446,7 +449,7 @@ describe("what a reply came to (C14)", () => {
       "Google didn't take the reply. Try again, or reply in Google Calendar.",
     );
     expect(replyText({ outcome: "read_only", reason: "not_invited" }, "no", null).text).toBe(
-      "This calendar isn't on the event's guest list, so there's no reply to send from it.",
+      "PM can only reply where this calendar is on the guest list itself (not through a group).",
     );
     expect(replyText({ outcome: "unconfirmed" }, "no", null).text).toMatch(
       /whether it went through/,
@@ -487,21 +490,49 @@ describe("what a reply came to (C14)", () => {
 });
 
 // C14 critiques C1-L10, C2-L1, C2-L10: under someone else's event, what the user may still do.
-describe("the line under someone else's event (C14b)", () => {
-  it("says the user can reply, only when this copy can, and how when editing is off", () => {
+describe("the line under someone else's event (C14b, C14c)", () => {
+  const theirs =
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+
+  it("says what stays the organiser's and what the user may change, the reply only when this copy can", () => {
+    // The reason alone never promises a reply: the calendar may not be on the guest list.
     expect(reasonText("not_organizer")).toBe(
-      "Someone else organises this event. You can reply, and change only your own settings.",
+      `${theirs} Your notifications, colour and busy or free are yours to change.`,
     );
-    expect(notOrganizerText(true, true)).toBe(reasonText("not_organizer"));
-    expect(notOrganizerText(false, true)).toBe(
-      "Someone else organises this event. You can change only your own settings.",
+    expect(notOrganizerText(true, true)).toBe(
+      `${theirs} Your reply, notifications, colour and busy or free are yours to change.`,
     );
+    expect(notOrganizerText(false, true)).toBe(reasonText("not_organizer"));
     expect(notOrganizerText(true, false)).toBe(
-      "Someone else organises this event. Turn on editing for this account to reply from PM.",
+      "Someone else organises this event. Turn on editing for this account to reply and change your own settings from PM.",
     );
     expect(notOrganizerText(false, false)).toBe(
       "Someone else organises this event. Turn on editing for this account to change your own settings from PM.",
     );
+  });
+
+  it("says the guest list is the organiser's, and why a group invitation can't be answered", () => {
+    expect(reasonText("organizer_only_guests")).toBe(
+      "In PM, only the organiser can change who's invited.",
+    );
+    expect(reasonText("not_invited")).toBe(
+      "PM can only reply where this calendar is on the guest list itself (not through a group).",
+    );
+  });
+
+  it("words the A11 note and the Repeat row's line without jargon", () => {
+    expect(A11_NOTE).toBe(
+      "The organiser lets guests change this event. Your changes show on your copy, and may be lost if the organiser changes the event.",
+    );
+    expect(repeatTheirsText(true)).toBe(
+      "Someone else organises this repeating event, so only they can change how it repeats.",
+    );
+    expect(repeatTheirsText(false)).toBe(
+      "Someone else organises this event, so only they can make it repeat.",
+    );
+    for (const line of [A11_NOTE, repeatTheirsText(true), repeatTheirsText(false)]) {
+      expect(line).not.toMatch(/series|recurr|attendee|organizer|guestsCanModify|instance/i);
+    }
   });
 });
 

@@ -1553,9 +1553,14 @@ export type ReadOnlyReason =
   | "editing_off"
   | "calendar_read_only"
   | "private_event"
+  /** Someone else organises it and hasn't let guests change it: its shared fields stay theirs
+   *  (C14). */
   | "not_organizer"
   /** The calendar this copy is on isn't on the event's guest list: there's no reply to send (C14). */
   | "not_invited"
+  /** The guest list of someone else's event stays the organiser's, even where they let guests
+   *  change the rest (C14). */
+  | "organizer_only_guests"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
   | "special_type"
@@ -1771,6 +1776,9 @@ export interface SeenSummary {
 export interface FieldPermissions {
   summary: boolean;
   time: boolean;
+  /** How it repeats: closed with the time, and on every event someone else organises, whatever
+   *  they let guests change (C14). */
+  repeat: boolean;
   location: boolean;
   description: boolean;
   show_as: boolean;
@@ -1781,8 +1789,8 @@ export interface FieldPermissions {
   reminders: boolean;
   colour: boolean;
   delete: boolean;
-  /** The user may reply (Yes, No, Maybe). No field of the editor's: a reply alone leaves the
-   *  editor read-only (C14). */
+  /** The user may reply (Yes, No, Maybe). No field of the editor's: the reply sits apart from
+   *  them, and never makes a draft to save (C14). */
   respond: boolean;
   reasons: ReadOnlyReason[];
 }

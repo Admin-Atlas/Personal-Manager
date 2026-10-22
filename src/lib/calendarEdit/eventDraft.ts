@@ -332,13 +332,14 @@ export function guestNotice(
   return changeNotice(base.guests, draft.guests, shared, omitted, me);
 }
 
-/** Whether the editor may change `field` (the permission names match the fields). How it repeats is
- *  the time's right: Google locks `recurrence` exactly when it locks the start. The guest list and
- *  its permissions are one right. */
+/** Whether the editor may change `field` (the permission names match the fields). How it repeats
+ *  has its own right: Google locks `recurrence` exactly when it locks the start, and on someone
+ *  else's event it stays the organiser's even where guests may change the time (C14 critiques
+ *  C1-H2, C2-H2). The guest list and its permissions are one right. */
 export function canEdit(permissions: FieldPermissions, field: EditorField): boolean {
   switch (field) {
     case "recurrence":
-      return permissions.time;
+      return permissions.repeat;
     case "guests":
     case "guest_perms":
       return permissions.guests;

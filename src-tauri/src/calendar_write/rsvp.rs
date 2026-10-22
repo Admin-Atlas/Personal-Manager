@@ -37,8 +37,10 @@ pub enum RsvpError {
 impl fmt::Display for RsvpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            // A group invitation lists the group, not this calendar (C14 critique C2-M8).
             RsvpError::NotInvited => {
-                "This calendar isn't on the event's guest list, so there's no reply to send from it."
+                "PM can only reply where this calendar is on the guest list itself (not through a \
+                 group)."
             }
             RsvpError::NoteTooLong => {
                 "A note can be up to 1,000 characters, so your reply wasn't sent."

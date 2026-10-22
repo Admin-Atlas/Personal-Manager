@@ -25,6 +25,8 @@ import type {
   RepeatRule,
   RepeatStart,
   RepeatView,
+  Rsvp,
+  RsvpScope,
   ScopeRow,
   SeriesChoices,
   SeriesInfo,
@@ -52,6 +54,11 @@ const settleSplit =
   vi.fn<(token: string, action: SplitAction, title: string) => Promise<WriteOutcome | null>>();
 const noteSaved = vi.fn();
 const noteSeriesNotice = vi.fn();
+const respond =
+  vi.fn<
+    (id: string, reply: Rsvp, note: string | null, scope: RsvpScope | null) => Promise<WriteOutcome>
+  >();
+const noteReply = vi.fn();
 const recurrencePresets = vi.fn<(day: string) => Promise<RepeatPreset[]>>();
 const describeRecurrence = vi.fn<(rule: RepeatRule, start: RepeatStart) => Promise<RepeatView>>();
 let deviceZone: string | null = "Europe/London";
@@ -73,6 +80,10 @@ vi.mock("./useEventWrites", () => ({
     settleSplit(token, action, title),
   noteSaved: (...a: unknown[]) => noteSaved(...a),
   noteSeriesNotice: (text: string) => noteSeriesNotice(text),
+  // A reply from the editor (C14c), and the notice one leaves when it doesn't land.
+  respond: (id: string, reply: Rsvp, note: string | null, scope: RsvpScope | null) =>
+    respond(id, reply, note, scope),
+  noteReply: (...a: unknown[]) => noteReply(...a),
 }));
 
 // The repeat menu's two reads, answered as each test says.
@@ -97,6 +108,10 @@ vi.mock("../../../lib/markdown", () => ({
 }));
 
 import { EventEditor, UNREADABLE_REPEAT } from "./EventEditor";
+import { A11_NOTE } from "../../../lib/calendarEdit/editReasons";
+
+/** What the user may change on someone else's event whose copy can reply (C14c). */
+const YOURS_WITH_REPLY = "Your reply, notifications, colour and busy or free are yours to change.";
 
 const row: CalendarEvent = {
   id: "gcal:me@x.com:me@x.com:abc",
@@ -114,6 +129,7 @@ const row: CalendarEvent = {
 const ALL: FieldPermissions = {
   summary: true,
   time: true,
+  repeat: true,
   location: true,
   description: true,
   show_as: true,
@@ -2598,5 +2614,276 @@ describe("EventEditor, notifications and colour", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(Object.keys(saveEdit.mock.calls[0][1])).toEqual(["time"]);
+  });
+});
+
+// Invitations (#884, C14c): the reply on top and apart from the fields, the user's own settings
+// live, the shared fields only where the organiser lets guests change them (with Google's warning),
+// how it repeats never, and an email question for a shared change that counts the organiser.
+describe("EventEditor, an invitation", () => {
+  const work: Calendar = {
+    id: row.calendar_id,
+    source_id: "gcal:me@x.com",
+    provider: "google",
+    remote_id: "me@x.com",
+    name: "Work",
+    color: null,
+    selected: true,
+    is_primary: true,
+    quiet: false,
+    kind: null,
+    access_role: "owner",
+    time_zone: "Europe/London",
+    default_reminders: [{ method: "popup", minutes: 30 }],
+    conference_types: [],
+    data_owner: null,
+  };
+  const guest = (email: string, over: Partial<GuestForEdit> = {}): GuestForEdit => ({
+    email,
+    name: null,
+    response: "accepted",
+    optional: false,
+    organizer: false,
+    self: false,
+    room: false,
+    ...over,
+  });
+  const boss = guest("boss@x.org", { organizer: true });
+  const mine = guest("me@x.com", { self: true, response: "needsAction" });
+  const ann = guest("ann@x.org");
+  /** Someone else's event with the calendar, the organiser and Ann on its list. */
+  const invitation = (over: Partial<EventForEdit> = {}) =>
+    event({
+      guests: [boss, mine, ann],
+      organizer_email: "boss@x.org",
+      organizer_self: false,
+      reply: { response: "needsAction", note: "" },
+      ...over,
+    });
+  /** The backend's allow-list without "modify event" (gate.rs row A2). */
+  const THEIRS: FieldPermissions = {
+    ...ALL,
+    summary: false,
+    time: false,
+    repeat: false,
+    location: false,
+    description: false,
+    visibility: false,
+    guests: false,
+    delete: false,
+    respond: true,
+    reasons: ["not_organizer"],
+  };
+  /** With "modify event" (row A3). */
+  const MODIFY: FieldPermissions = {
+    ...ALL,
+    repeat: false,
+    guests: false,
+    delete: false,
+    respond: true,
+    reasons: ["organizer_only_guests"],
+  };
+  const saved: SaveAnswer = { outcome: "saved", warnings: [] };
+  const theirsLine =
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+  /** What the guest list says of the user's own entry. */
+  const myEntry = () =>
+    within(screen.getByRole("list", { name: "Guests" }))
+      .getByText("me@x.com")
+      .closest("li")!;
+
+  it("opens with the reply on top and the shared fields greyed, saying why", async () => {
+    openForEdit.mockResolvedValue(ready(invitation(), THEIRS));
+    await open(vi.fn(), vi.fn(), row, work);
+    const yes = screen.getByRole("button", { name: "Yes" });
+    const title = screen.getByLabelText<HTMLInputElement>("Title");
+    // Above the fields, as on Google's event page.
+    expect(yes.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText("Going?")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add a note" })).toBeTruthy();
+    expect(title.disabled).toBe(true);
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").disabled).toBe(true);
+    expect(screen.getByLabelText<HTMLInputElement>("Location").disabled).toBe(true);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / }).disabled).toBe(
+      true,
+    );
+    // The user's own settings stay live.
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Free" }).disabled).toBe(false);
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Add notification" }).disabled,
+    ).toBe(false);
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Colour: Calendar colour" }).disabled,
+    ).toBe(false);
+    // Why, with the reply among what's the user's, since this copy can send one.
+    expect(screen.getByText(`${theirsLine} ${YOURS_WITH_REPLY}`)).toBeTruthy();
+    expect(
+      screen.getByText("Someone else organises this event, so only they can make it repeat."),
+    ).toBeTruthy();
+    // No Google warning without "modify event", and no Delete (Remove is a later layer's).
+    expect(screen.queryByText(/lets guests change this event/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("says the reply is the user's only where this copy can send one", async () => {
+    openForEdit.mockResolvedValue(
+      ready(invitation({ reply: null }), { ...THEIRS, respond: false }),
+    );
+    await open(vi.fn(), undefined, row, work);
+    expect(screen.queryByRole("button", { name: "Yes" })).toBeNull();
+    expect(
+      screen.getByText(
+        `${theirsLine} Your notifications, colour and busy or free are yours to change.`,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("a reply doesn't make the draft dirty, and Save doesn't send it", async () => {
+    openForEdit.mockResolvedValue(ready(invitation(), THEIRS));
+    respond.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    await screen.findByText("You replied Yes.");
+    expect(respond).toHaveBeenCalledWith(row.id, "yes", null, null);
+    // Nothing to save, so Save closes, sending nothing, and asking nothing.
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(onClose).toHaveBeenCalled();
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: /^Discard your changes/ })).toBeNull();
+  });
+
+  it("after a reply the guest list shows it, and Yes stays pressed", async () => {
+    openForEdit.mockResolvedValue(ready(invitation(), THEIRS));
+    respond.mockResolvedValue(saved);
+    await open(vi.fn(), undefined, row, work);
+    expect(within(myEntry()).getByText("no reply")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    await screen.findByText("You replied Yes.");
+    expect(within(myEntry()).getByText("accepted")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Yes" }).getAttribute("aria-pressed")).toBe("true");
+    // Nobody else's entry changes.
+    const annRow = within(screen.getByRole("list", { name: "Guests" }))
+      .getByText("ann@x.org")
+      .closest("li")!;
+    expect(within(annRow).getByText("accepted")).toBeTruthy();
+  });
+
+  it("sends the note with the reply shown", async () => {
+    openForEdit.mockResolvedValue(
+      ready(
+        invitation({
+          guests: [boss, { ...mine, response: "accepted" }, ann],
+          reply: { response: "accepted", note: "late" },
+        }),
+        THEIRS,
+      ),
+    );
+    respond.mockResolvedValue(saved);
+    await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Change note" }));
+    const note = screen.getByLabelText<HTMLTextAreaElement>("Note");
+    expect(note.value).toBe("late");
+    fireEvent.change(note, { target: { value: "running late " } });
+    fireEvent.click(screen.getByRole("button", { name: "Send note" }));
+    await screen.findByText("You replied Yes.");
+    expect(respond).toHaveBeenCalledWith(row.id, "yes", "running late ", null);
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("an occurrence that kept its own answer for all events still shows its own", async () => {
+    const occurrence: CalendarEvent = { ...row, series_id: "abc", recurring: true };
+    const declined = () =>
+      invitation({
+        guests: [boss, { ...mine, response: "declined" }, ann],
+        reply: { response: "declined", note: "" },
+      });
+    for (const [left, shown] of [
+      [["2026-10-12"], "declined"],
+      [["2026-10-19"], "accepted"],
+    ] as const) {
+      openForEdit.mockResolvedValue(ready(declined(), THEIRS));
+      respond.mockResolvedValue({
+        outcome: "saved",
+        warnings: ["kept_own_reply"],
+        left_behind: [...left],
+      });
+      await open(vi.fn(), undefined, occurrence, work);
+      fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+      fireEvent.click(screen.getByRole("button", { name: "All events" }));
+      await screen.findByText(/You replied Yes for all events\./);
+      expect(respond).toHaveBeenLastCalledWith(occurrence.id, "yes", null, "all");
+      expect(within(myEntry()).getByText(shown)).toBeTruthy();
+      cleanup();
+    }
+  });
+
+  it("where the organiser lets guests change it, says Google's warning and its fields are live", async () => {
+    openForEdit.mockResolvedValue(ready(invitation({ guests_can_modify: true }), MODIFY));
+    await open(vi.fn(), vi.fn(), row, work);
+    expect(screen.getByText(A11_NOTE)).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").disabled).toBe(false);
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").disabled).toBe(false);
+    // How it repeats, and who is invited, stay the organiser's (C14 critiques C1-H2, C2-H2; Q4).
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / }).disabled).toBe(
+      true,
+    );
+    expect(
+      screen.getByText("Someone else organises this event, so only they can make it repeat."),
+    ).toBeTruthy();
+    expect(screen.getByText("In PM, only the organiser can change who's invited.")).toBeTruthy();
+    expect(screen.queryByText(theirsLine, { exact: false })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("your own event that lets guests change it has no warning, and its Repeat stays yours", async () => {
+    openForEdit.mockResolvedValue(ready(event({ guests_can_modify: true })));
+    await open(vi.fn(), undefined, row, work);
+    expect(screen.queryByText(A11_NOTE)).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / }).disabled).toBe(
+      false,
+    );
+    expect(screen.queryByText(/so only they can make it repeat/)).toBeNull();
+    cleanup();
+    // The row reads its own right, never the time's (C14 critiques C1-H2, C2-H2).
+    openForEdit.mockResolvedValue(ready(event(), { ...ALL, repeat: false }));
+    await open(vi.fn(), undefined, row, work);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / }).disabled).toBe(
+      true,
+    );
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").disabled).toBe(false);
+  });
+
+  it("busy or free on an invitation saves with no email question", async () => {
+    openForEdit.mockResolvedValue(ready(invitation(), THEIRS));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Free" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(screen.queryByRole("dialog", { name: "Send update emails to guests?" })).toBeNull();
+    expect(saveEdit).toHaveBeenCalledWith("s1", { show_as: "free" }, ...UNSCOPED);
+  });
+
+  it("a title change where guests may change it asks Send / Don't send, the organiser counted", async () => {
+    openForEdit.mockResolvedValue(ready(invitation({ guests_can_modify: true }), MODIFY));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    expect(within(prompt).getByText("2 guests already invited will get an update.")).toBeTruthy();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { summary: "Retro" }, null, "Retro", "none", {
+      updated: 2,
+      invited: 0,
+      removed: 0,
+      told_cancelled: 0,
+      cancelled: false,
+      people: 2,
+      emails: 2,
+      complete: true,
+    });
   });
 });

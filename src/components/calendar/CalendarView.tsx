@@ -29,7 +29,7 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { notOrganizerText, reasonText } from "../../lib/calendarEdit/editReasons";
+import { A11_NOTE, notOrganizerText, reasonText } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
 import { isRepeating } from "../../lib/calendarEdit/saveChoices";
@@ -731,20 +731,30 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
       const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
       // Someone else's event says what the user may still do from this copy: reply when it's on
-      // the guest list, which the strip above the line offers, and how when editing is off (C14b).
+      // the guest list, which the strip above the line offers, their own settings, and how when
+      // editing is off (C14b, C14c).
+      const theirs = ev.organizer_self === false;
       if (ev.edit_block === "not_organizer") {
         return none(notOrganizerText(ev.can_respond === true, on));
       }
       if (ev.edit_block) return none(reasonText(ev.edit_block));
       if (cal?.provider !== "google") return none(null);
-      if (!on) return none(reasonText("editing_off"));
+      if (!on) {
+        return none(
+          theirs ? notOrganizerText(ev.can_respond === true, false) : reasonText("editing_off"),
+        );
+      }
       // The gate decides Delete (C14): a locked copy, whose delete Google doesn't document, and an
-      // invitation can't be deleted. A row the list didn't mark gets none.
-      return {
-        canEdit: true,
-        canDelete: ev.can_delete === true,
-        reason: ev.locked ? reasonText("locked") : null,
-      };
+      // invitation can't be deleted. A row the list didn't mark gets none. On an invitation the line
+      // says what stays the organiser's, or Google's warning where they let guests change it.
+      const reason = ev.locked
+        ? reasonText("locked")
+        : theirs
+          ? ev.guests_can_modify
+            ? A11_NOTE
+            : notOrganizerText(ev.can_respond === true, true)
+          : null;
+      return { canEdit: true, canDelete: ev.can_delete === true, reason };
     },
     [overview],
   );
@@ -755,8 +765,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // grid/agenda. Done after the hide filter so hiding one calendar still shows the copy on the
     // calendar left visible. Keyed on the UID alone this also collapsed every recurring series to one
     // occurrence across the whole mirror — see `occurrenceKey`, which FocusUpcoming shares. The copy
-    // kept is the first, unless a later one can be changed and it can't: an event you organise on
-    // your own calendar beats the invitation copy of it on a shared one.
+    // kept is the first, unless a later one ranks higher (`keepRank`): the copy you organise and can
+    // change, then any you can change. An invitation can be changed too (your own settings, C14c), so
+    // being editable no longer means "yours"; the organiser's copy still wins over it.
     //
     // A row a delete is hiding takes every copy of its occurrence with it: the same Google event
     // seen through a second connected account is the same event, and showing that copy instead
@@ -771,6 +782,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         .map(occurrenceKey)
         .filter((k): k is string => k !== null),
     );
+    const keepRank = (e: CalendarEvent) =>
+      editingFor(e).canEdit ? (e.organizer_self === true ? 2 : 1) : 0;
     const at = new Map<string, number>();
     const out: CalendarEvent[] = [];
     const copies: CalendarEvent[] = [];
@@ -782,7 +795,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       if (key !== null) {
         const i = at.get(key);
         if (i !== undefined) {
-          if (!editingFor(out[i]).canDelete && editingFor(e).canDelete) out[i] = e;
+          if (keepRank(e) > keepRank(out[i])) out[i] = e;
           continue;
         }
         at.set(key, out.length);

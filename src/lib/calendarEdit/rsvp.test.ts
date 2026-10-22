@@ -7,11 +7,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Attendee, Calendar, CalendarEvent } from "../types";
+import type { Attendee, Calendar, CalendarEvent, EventForEdit, GuestForEdit } from "../types";
 import {
   asRsvp,
   declinedByMe,
   declinedName,
+  guestsWithReply,
   isDeclined,
   markDeclined,
   myReply,
@@ -21,6 +22,7 @@ import {
   RSVP_CHOICES,
   rsvpLabel,
   tidyNote,
+  withReply,
 } from "./rsvp";
 
 const entry = (email: string | null, response: string | null, self = false): Attendee => ({
@@ -244,5 +246,58 @@ describe("the copies a reply can come from (C14b)", () => {
     expect(ids(replyCopies([occurrence, other], occurrence, calendars, all))).toEqual([
       ["e1", null],
     ]);
+  });
+});
+
+// The editor's copy once a reply sent from it lands (C14c).
+describe("the editor after a reply (C14c)", () => {
+  const guest = (email: string, response: string, self = false): GuestForEdit => ({
+    email,
+    name: null,
+    response,
+    optional: false,
+    organizer: false,
+    self,
+    room: false,
+  });
+  const opened = (): EventForEdit =>
+    ({
+      guests: [
+        guest("boss@x.org", "accepted"),
+        guest("Me+pm@x.org", "needsAction", true),
+        guest("me@x.org", "needsAction", true),
+      ],
+      reply: { response: "needsAction", note: "late" },
+    }) as EventForEdit;
+
+  it("takes the reply in Google's word, and the note sent, tidied, or the one Google held", () => {
+    const after = withReply(opened(), "maybe", " running\r\nlate ", "me@x.org");
+    expect(after.reply).toEqual({ response: "tentative", note: "running\nlate" });
+    expect(withReply(opened(), "yes", null, "me@x.org").reply).toEqual({
+      response: "accepted",
+      note: "late",
+    });
+    expect(withReply(opened(), "no", "", "me@x.org").reply).toEqual({
+      response: "declined",
+      note: "",
+    });
+    expect(withReply({ ...opened(), reply: null }, "no", null, null).reply?.note).toBe("");
+  });
+
+  it("changes only the user's own entry on the guest list, the calendar's own address first", () => {
+    const list = opened().guests;
+    const own = guestsWithReply(list, "yes", "ME@x.org").map((g) => g.response);
+    expect(own).toEqual(["accepted", "needsAction", "accepted"]);
+    // No address to pick by: the first marked, as the backend picks.
+    expect(guestsWithReply(list, "no", null).map((g) => g.response)).toEqual([
+      "accepted",
+      "declined",
+      "needsAction",
+    ]);
+    // Nobody marked: the same list.
+    const none = [guest("boss@x.org", "accepted")];
+    expect(guestsWithReply(none, "no", "me@x.org")).toEqual(none);
+    // A new list, the entry given a copy.
+    expect(list[2].response).toBe("needsAction");
   });
 });

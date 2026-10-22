@@ -6,15 +6,17 @@
 //! save runs it again on a fresh copy from Google before sending anything. It fails closed: a role or
 //! an event type PM doesn't know reads as read-only, never as editable.
 //!
-//! Events PM can change are the ones you organise on a calendar you can edit. The first layers
-//! edited only solo, one-off events; repeating events (C9) and events with guests (C12) are now
-//! editable, each with the choice it stood in for (rule R9): a change to an occurrence names which
+//! Events PM can change are on a calendar you can edit. The first layers edited only solo, one-off
+//! events you organise; repeating events (C9), events with guests (C12) and invitations (C14) are now
+//! editable, each with the rule it stood in for (R9): a change to an occurrence names which
 //! occurrences it's for ("this event", "this and following", "all events"), a change Google would
-//! email guests about names whether it should, and a write without that choice is asked again.
-//! Invitations stay read-only in the editor until C14's allow-list; replying is apart from that
-//! ([`reply_block`]): it follows whether the calendar is on the guest list, not who organises the
-//! event. A one-off that Google has since turned into a repeating event is read-only with its own
-//! reason on every path, since a write to it would change every occurrence with no choice asked.
+//! email guests about names whether it should, and a write without that choice is asked again. On an
+//! invitation, the user's own notifications, colour and busy or free, their reply, and the shared
+//! fields only when the organiser lets guests change them; never how it repeats, who is invited, or
+//! deleting it. Replying is apart from the rest ([`reply_block`]): it follows whether the calendar is
+//! on the guest list, not who organises the event. A one-off that Google has since turned into a
+//! repeating event is read-only with its own reason on every path, since a write to it would change
+//! every occurrence with no choice asked.
 
 use crate::calendar_editing::EditingStatus;
 
@@ -32,6 +34,9 @@ pub struct EditFacts<'a> {
     pub event_type: Option<&'a str>,
     /// Google's `organizer.self`: the organiser is the calendar this copy is on.
     pub organizer_self: bool,
+    /// Google's `guestsCanModify` (absent = false): the organiser lets guests change the shared
+    /// fields (C14).
+    pub guests_can_modify: bool,
     pub locked: bool,
     pub visibility: Option<&'a str>,
     /// Google's copy is a repeating event's series itself (its rule, no `recurringEventId`), while PM
@@ -63,6 +68,7 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
     let mut perms = FieldPermissions {
         summary: true,
         time: true,
+        repeat: true,
         location: true,
         description: true,
         show_as: true,
@@ -75,6 +81,30 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         respond,
         reasons: Vec::new(),
     };
+    if !facts.organizer_self {
+        // Google: notifications, colour and busy/free are each guest's own (its inviting-attendees
+        // guide); the rest is shared, and a guest's change to it shows on their own copy (A11), so
+        // it changes only where the organiser lets guests change the event (Q16).
+        if !facts.guests_can_modify {
+            perms.summary = false;
+            perms.time = false;
+            perms.location = false;
+            perms.description = false;
+            perms.visibility = false;
+            perms.reasons.push(ReadOnlyReason::NotOrganizer);
+        }
+        // How it repeats stays the organiser's whatever guests may change: a new rule on a guest's
+        // copy would leave it apart from the organiser's event (C14 §0.5 row 5, critique C1-H2).
+        perms.repeat = false;
+        // Who is invited, and what guests may do, stay the organiser's in PM (Google: the three
+        // permissions are organiser-only; a guest adding guests is a Backlog card, Q4).
+        perms.guests = false;
+        if facts.guests_can_modify {
+            perms.reasons.push(ReadOnlyReason::OrganizerOnlyGuests);
+        }
+        // Removing your copy from your calendar is a later layer's (C14d).
+        perms.delete = false;
+    }
     if facts.locked {
         // Google refuses changes to a locked copy's summary, description, location, start, end and
         // recurrence. Whether it lets the copy be deleted, or its guests change, isn't documented,
@@ -82,6 +112,7 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         // aren't among them, so they stay open (the editing plan's C6 card, from C13).
         perms.summary = false;
         perms.time = false;
+        perms.repeat = false;
         perms.location = false;
         perms.description = false;
         perms.guests = false;
@@ -122,6 +153,56 @@ pub fn list_rights(facts: &EditFacts) -> ListRights {
     }
 }
 
+/// A part of an event a write may be refused for, as [`reason_for`] names its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Summary,
+    Time,
+    Repeat,
+    Location,
+    Description,
+    ShowAs,
+    Visibility,
+    Guests,
+    Reminders,
+    Colour,
+    Delete,
+}
+
+/// Reasons that close one field only: each is given for its own field alone, never for another
+/// field it says nothing about (C14 critique C1-L1; C13's C1-L1 for the colour and notifications).
+const ONE_FIELD: [ReadOnlyReason; 4] = [
+    ReadOnlyReason::OrganizerOnlyGuests,
+    ReadOnlyReason::HtmlDescription,
+    ReadOnlyReason::LabelReadOnly,
+    ReadOnlyReason::RemindersUnreadable,
+];
+
+/// The reason to give when a write touches `field` and `perms` (from [`edit_rights`]) closed it: the
+/// field's own reason when the gate closed it for that, else the first reason that isn't another
+/// field's own. Every refusal says this, so a delete on an event whose organiser lets guests change
+/// it never says "only the organiser can change who's invited" (C14 critique C1-L1).
+pub fn reason_for(perms: &FieldPermissions, field: Field) -> ReadOnlyReason {
+    let own = match field {
+        Field::Guests => Some(ReadOnlyReason::OrganizerOnlyGuests),
+        Field::Description => Some(ReadOnlyReason::HtmlDescription),
+        Field::Colour => Some(ReadOnlyReason::LabelReadOnly),
+        Field::Reminders => Some(ReadOnlyReason::RemindersUnreadable),
+        _ => None,
+    };
+    if let Some(own) = own.filter(|r| perms.reasons.contains(r)) {
+        return own;
+    }
+    // Nothing else said: someone else's event, whose organiser lets guests change it, closes the
+    // guest list with its own reason, and how it repeats and the delete with none of their own.
+    perms
+        .reasons
+        .iter()
+        .copied()
+        .find(|r| !ONE_FIELD.contains(r))
+        .unwrap_or(ReadOnlyReason::NotOrganizer)
+}
+
 /// Why the user can't reply from this copy, or `None` when they can: the reasons nothing at all may
 /// be written from it, then an entry on the guest list. The organiser has one too, and may reply; a
 /// lock doesn't stop it (Google locks the shared fields), and neither does a one-off Google has
@@ -145,6 +226,7 @@ pub fn create_block(
         access_role,
         event_type: None,
         organizer_self: true,
+        guests_can_modify: false,
         locked: false,
         visibility,
         series_master: false,
@@ -156,13 +238,11 @@ pub fn create_block(
 }
 
 /// The reason nothing at all may change, checked account first, then calendar, then the event
-/// itself; the first one found is the one shown.
+/// itself; the first one found is the one shown. Someone else's event isn't one: what a guest may
+/// change is [`edit_rights`]' allow-list (C14).
 fn blanket_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
     if let Some(reason) = access_reason(facts) {
         return Some(reason);
-    }
-    if !facts.organizer_self {
-        return Some(ReadOnlyReason::NotOrganizer);
     }
     if facts.series_master {
         return Some(ReadOnlyReason::BecameRepeating);
@@ -211,6 +291,7 @@ mod tests {
             access_role: Some("owner"),
             event_type: Some("default"),
             organizer_self: true,
+            guests_can_modify: false,
             locked: false,
             visibility: None,
             series_master: false,
@@ -241,6 +322,8 @@ mod tests {
         let perms = edit_rights(&editable());
         assert!(perms.summary && perms.time && perms.location && perms.description);
         assert!(perms.show_as && perms.visibility && perms.delete);
+        // How it repeats is the organiser's, so yours (C14 critique C1-H2).
+        assert!(perms.repeat);
         // Guests may change wherever the rest may (C12), and so may notifications and colour (C13).
         assert!(perms.guests);
         assert!(perms.reminders && perms.colour);
@@ -374,13 +457,7 @@ mod tests {
                 },
                 SpecialType,
             ),
-            (
-                EditFacts {
-                    organizer_self: false,
-                    ..e()
-                },
-                NotOrganizer,
-            ),
+            // Someone else's event is no longer one (C14's allow-list).
             (
                 EditFacts {
                     series_master: true,
@@ -479,6 +556,8 @@ mod tests {
         });
         assert!(!perms.summary && !perms.time && !perms.location && !perms.description);
         assert!(!perms.delete);
+        // Google locks the rule with the start.
+        assert!(!perms.repeat);
         // Not among Google's locked fields, but undocumented, so closed (C12 §4.4).
         assert!(!perms.guests);
         assert!(perms.show_as && perms.visibility);
@@ -554,17 +633,18 @@ mod tests {
         assert_eq!(perms.reasons, vec![RemindersUnreadable]);
     }
 
-    /// A blanket reason closes notifications and colour too: nothing at all may change.
+    /// A blanket reason closes notifications and colour too: nothing at all may change. (Someone
+    /// else's event was the example until C14 made it one whose own settings change.)
     #[test]
     fn a_blanket_reason_closes_notifications_and_colour() {
         let perms = edit_rights(&EditFacts {
-            organizer_self: false,
+            access_role: Some("reader"),
             labelled: true,
             reminders_readable: false,
             ..editable()
         });
         assert!(!perms.reminders && !perms.colour && !perms.any());
-        assert_eq!(perms.reasons, vec![NotOrganizer]);
+        assert_eq!(perms.reasons, vec![CalendarReadOnly]);
     }
 
     /// C14: a reply follows the guest list, not who organises the event: the reasons nothing may be
@@ -677,21 +757,28 @@ mod tests {
         }
     }
 
-    /// C14: on an invitation the reply is open while nothing in the editor is: the list still says
-    /// why the editor can't change it, offers no Delete, and offers the reply apart.
+    /// C14: where the reply is open and nothing in the editor is (a one-off of yours that Google has
+    /// since made repeating, whose reply the reply's own read refuses), the list still says why the
+    /// editor can't change it, offers no Delete, and offers the reply apart. (An invitation was the
+    /// example until C14c opened its own settings: `an_invitation_is_editable_in_the_list`.)
     #[test]
     fn a_reply_alone_is_not_an_edit() {
-        let perms = edit_rights(&invitation());
+        let turned = EditFacts {
+            organizer_self: true,
+            series_master: true,
+            ..invitation()
+        };
+        let perms = edit_rights(&turned);
         assert!(!perms.any() && perms.respond && !perms.delete);
-        assert_eq!(perms.reasons, vec![NotOrganizer]);
+        assert_eq!(perms.reasons, vec![BecameRepeating]);
         assert!(
-            list_rights(&invitation())
+            list_rights(&turned)
                 == ListRights {
-                    edit_block: Some(NotOrganizer),
+                    edit_block: Some(BecameRepeating),
                     can_delete: false,
                     can_respond: true,
                 },
-            "an invitation: no editor, no Delete, the reply"
+            "no editor, no Delete, the reply"
         );
         // Your own event: Delete as the gate allows it, and a reply only with an entry of your own.
         assert!(
@@ -715,6 +802,216 @@ mod tests {
                     can_respond: true,
                 },
             "a lock keeps the delete closed and the reply open"
+        );
+    }
+
+    /// C14c's allow-list, field by field (`G`: the organiser lets guests change it). Someone else's
+    /// event: the user's own busy or free, notifications and colour always, the shared fields only
+    /// with `G`, never how it repeats (C1-H2), who is invited or a delete; the reply wherever the
+    /// calendar is on the guest list. Reasons in order, the organiser's first.
+    #[test]
+    fn the_allow_list_table() {
+        let i = invitation;
+        let with_g = |facts: EditFacts<'static>| EditFacts {
+            guests_can_modify: true,
+            ..facts
+        };
+        // (row, facts, title/time/place/description, visibility, busy/notifications/colour, repeat,
+        // guests, delete, reply, reasons)
+        type Row = (
+            &'static str,
+            EditFacts<'static>,
+            [bool; 6],
+            bool,
+            Vec<ReadOnlyReason>,
+        );
+        let rows: Vec<Row> = vec![
+            ("A1", editable(), [true; 6], false, vec![]),
+            (
+                "A2",
+                i(),
+                [false, false, true, false, false, false],
+                true,
+                vec![NotOrganizer],
+            ),
+            (
+                "A3",
+                with_g(i()),
+                [true, true, true, false, false, false],
+                true,
+                vec![OrganizerOnlyGuests],
+            ),
+            (
+                "A4",
+                EditFacts {
+                    locked: true,
+                    ..i()
+                },
+                [false, false, true, false, false, false],
+                true,
+                vec![NotOrganizer, Locked],
+            ),
+            (
+                "A5",
+                EditFacts {
+                    locked: true,
+                    ..with_g(i())
+                },
+                [false, true, true, false, false, false],
+                true,
+                vec![OrganizerOnlyGuests, Locked],
+            ),
+            (
+                "A6",
+                EditFacts {
+                    invited: false,
+                    ..i()
+                },
+                [false, false, true, false, false, false],
+                false,
+                vec![NotOrganizer],
+            ),
+            (
+                "A7",
+                EditFacts {
+                    event_type: Some("birthday"),
+                    ..i()
+                },
+                [false; 6],
+                false,
+                vec![SpecialType],
+            ),
+            (
+                "A8",
+                with_g(EditFacts {
+                    invited: true,
+                    ..editable()
+                }),
+                [true; 6],
+                true,
+                vec![],
+            ),
+            // The description is closed already, so its formatting isn't a second reason.
+            (
+                "A9",
+                EditFacts {
+                    html_description: true,
+                    ..i()
+                },
+                [false, false, true, false, false, false],
+                true,
+                vec![NotOrganizer],
+            ),
+            // With G the description is open but for its formatting: that reason, after the guests'.
+            (
+                "A10",
+                EditFacts {
+                    html_description: true,
+                    ..with_g(i())
+                },
+                [true, true, true, false, false, false],
+                true,
+                vec![OrganizerOnlyGuests, HtmlDescription],
+            ),
+        ];
+        for (row, facts, open, respond, reasons) in rows {
+            let p = edit_rights(&facts);
+            let [shared, visibility, own, repeat, guests, delete] = open;
+            let description = shared && !facts.html_description;
+            assert_eq!(
+                [p.summary, p.time, p.location],
+                [shared; 3],
+                "{row}: title, time, place"
+            );
+            assert_eq!(p.description, description, "{row}: description");
+            assert_eq!(p.visibility, visibility, "{row}: visibility");
+            assert_eq!(
+                [p.show_as, p.reminders, p.colour],
+                [own; 3],
+                "{row}: busy or free, notifications, colour"
+            );
+            assert_eq!(p.repeat, repeat, "{row}: how it repeats");
+            assert_eq!(p.guests, guests, "{row}: guests");
+            assert_eq!(p.delete, delete, "{row}: delete");
+            assert_eq!(p.respond, respond, "{row}: reply");
+            assert_eq!(p.reasons, reasons, "{row}: reasons");
+        }
+    }
+
+    /// C14c: an invitation is something the editor can change (its own settings), so the list
+    /// offers Edit with no reason, never Delete, and the reply.
+    #[test]
+    fn an_invitation_is_editable_in_the_list() {
+        for facts in [
+            invitation(),
+            EditFacts {
+                guests_can_modify: true,
+                ..invitation()
+            },
+        ] {
+            assert!(
+                list_rights(&facts)
+                    == ListRights {
+                        edit_block: None,
+                        can_delete: false,
+                        can_respond: true,
+                    },
+                "editable, no Delete, the reply"
+            );
+        }
+    }
+
+    /// C14 critique C1-L1: a refusal names the refused field's own reason, never another field's: the
+    /// guest list's under "modify", a label's for the colour, a formatted description's, and for a
+    /// delete or a repeat on someone else's event the organiser's.
+    #[test]
+    fn a_refusal_names_the_fields_own_reason() {
+        let rights = |facts: EditFacts| edit_rights(&facts);
+        let g = rights(EditFacts {
+            guests_can_modify: true,
+            ..invitation()
+        });
+        assert_eq!(reason_for(&g, Field::Guests), OrganizerOnlyGuests);
+        assert_eq!(reason_for(&g, Field::Delete), NotOrganizer);
+        assert_eq!(reason_for(&g, Field::Repeat), NotOrganizer);
+        let g_locked = rights(EditFacts {
+            guests_can_modify: true,
+            locked: true,
+            ..invitation()
+        });
+        assert_eq!(reason_for(&g_locked, Field::Summary), Locked);
+        assert_eq!(reason_for(&g_locked, Field::Delete), Locked);
+        assert_eq!(reason_for(&g_locked, Field::Guests), OrganizerOnlyGuests);
+        let g_formatted = rights(EditFacts {
+            guests_can_modify: true,
+            html_description: true,
+            ..invitation()
+        });
+        assert_eq!(
+            reason_for(&g_formatted, Field::Description),
+            HtmlDescription
+        );
+        assert_eq!(reason_for(&g_formatted, Field::Delete), NotOrganizer);
+        let plain = rights(invitation());
+        for field in [Field::Guests, Field::Summary, Field::Repeat, Field::Delete] {
+            assert_eq!(reason_for(&plain, field), NotOrganizer, "{field:?}");
+        }
+        // Your own event: a lock for the repeat, a label for the colour (even under a lock).
+        let locked = rights(EditFacts {
+            locked: true,
+            labelled: true,
+            ..editable()
+        });
+        assert_eq!(reason_for(&locked, Field::Repeat), Locked);
+        assert_eq!(reason_for(&locked, Field::Colour), LabelReadOnly);
+        assert_eq!(reason_for(&locked, Field::Time), Locked);
+        let unreadable = rights(EditFacts {
+            reminders_readable: false,
+            ..editable()
+        });
+        assert_eq!(
+            reason_for(&unreadable, Field::Reminders),
+            RemindersUnreadable
         );
     }
 }
